@@ -7,4 +7,3 @@ pub mod sanitize;
 pub mod socket;
 
 pub const API_VERSION: u32 = 1;
-

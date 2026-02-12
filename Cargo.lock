@@ -39,6 +39,7 @@ dependencies = [
  "block2",
  "bytes",
  "futures-util",
+ "libc",
  "objc2",
  "objc2-foundation",
  "objc2-local-authentication",

@@ -55,7 +55,10 @@ async fn main() {
 
     match call(&sock, method, params).await {
         Ok(resp) => {
-            println!("{}", serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_string()));
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_string())
+            );
         }
         Err(e) => {
             eprintln!("agentpass: {e}");
@@ -64,7 +67,11 @@ async fn main() {
     }
 }
 
-async fn call(sock: &PathBuf, method: &str, params: serde_json::Value) -> std::io::Result<Response> {
+async fn call(
+    sock: &PathBuf,
+    method: &str,
+    params: serde_json::Value,
+) -> std::io::Result<Response> {
     let stream = UnixStream::connect(sock).await.map_err(|e| {
         std::io::Error::new(
             e.kind(),
@@ -85,7 +92,7 @@ async fn call(sock: &PathBuf, method: &str, params: serde_json::Value) -> std::i
         method: method.to_string(),
         params,
     };
-    let out = serde_json::to_vec(&req).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let out = serde_json::to_vec(&req).map_err(std::io::Error::other)?;
     framed.send(Bytes::from(out)).await?;
 
     let Some(frame) = framed.next().await else {

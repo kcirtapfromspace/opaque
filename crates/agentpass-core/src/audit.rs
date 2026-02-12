@@ -101,7 +101,10 @@ impl From<(&ClientIdentity, ClientType)> for ClientSummary {
             uid: id.uid,
             gid: id.gid,
             pid: id.pid,
-            exe_path: id.exe_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            exe_path: id
+                .exe_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
             exe_sha256_prefix: id.exe_sha256.as_ref().map(|h| {
                 let len = h.len().min(16);
                 h[..len].to_owned()
@@ -431,7 +434,7 @@ impl AuditSink for TracingAuditEmitter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operation::{ClientIdentity, ClientType};
+    use crate::operation::{ApprovalRequirement, ClientIdentity, ClientType, OperationSafety};
 
     #[test]
     fn audit_event_builder() {
@@ -442,7 +445,10 @@ mod tests {
             .with_latency_ms(42);
 
         assert_eq!(event.kind, AuditEventKind::RequestReceived);
-        assert_eq!(event.operation.as_deref(), Some("github.set_actions_secret"));
+        assert_eq!(
+            event.operation.as_deref(),
+            Some("github.set_actions_secret")
+        );
         assert_eq!(event.outcome.as_deref(), Some("ok"));
         assert_eq!(event.latency_ms, Some(42));
         assert_eq!(event.level, AuditLevel::Info);
@@ -513,7 +519,10 @@ mod tests {
         };
         let summary = ClientSummary::from((&id, ClientType::Agent));
         assert_eq!(summary.uid, 501);
-        assert_eq!(summary.exe_sha256_prefix.as_deref(), Some("abcdef0123456789"));
+        assert_eq!(
+            summary.exe_sha256_prefix.as_deref(),
+            Some("abcdef0123456789")
+        );
         assert_eq!(summary.codesign_team_id.as_deref(), Some("TEAM123"));
     }
 
@@ -524,5 +533,168 @@ mod tests {
         let dbg = format!("{event:?}");
         // Debug impl only shows selected fields, not detail.
         assert!(!dbg.contains("hunter2"));
+    }
+
+    #[test]
+    fn all_event_kind_display() {
+        let kinds = vec![
+            (AuditEventKind::RequestReceived, "request.received"),
+            (AuditEventKind::PolicyDenied, "policy.denied"),
+            (AuditEventKind::ApprovalRequired, "approval.required"),
+            (AuditEventKind::ApprovalPresented, "approval.presented"),
+            (AuditEventKind::ApprovalGranted, "approval.granted"),
+            (AuditEventKind::ApprovalDenied, "approval.denied"),
+            (AuditEventKind::OperationStarted, "operation.started"),
+            (AuditEventKind::OperationSucceeded, "operation.succeeded"),
+            (AuditEventKind::OperationFailed, "operation.failed"),
+            (
+                AuditEventKind::ProviderFetchStarted,
+                "provider.fetch.started",
+            ),
+            (
+                AuditEventKind::ProviderFetchFinished,
+                "provider.fetch.finished",
+            ),
+        ];
+        for (kind, expected) in kinds {
+            assert_eq!(format!("{kind}"), expected);
+        }
+    }
+
+    #[test]
+    fn all_audit_level_display() {
+        assert_eq!(format!("{}", AuditLevel::Info), "info");
+        assert_eq!(format!("{}", AuditLevel::Warn), "warn");
+        assert_eq!(format!("{}", AuditLevel::Error), "error");
+    }
+
+    #[test]
+    fn audit_event_all_builder_methods() {
+        let id = Uuid::new_v4();
+        let approval_id = Uuid::new_v4();
+        let summary = ClientSummary {
+            uid: 501,
+            gid: 20,
+            pid: Some(1234),
+            exe_path: Some("/usr/bin/test".into()),
+            exe_sha256_prefix: Some("aabb".into()),
+            codesign_team_id: None,
+            client_type: ClientType::Agent,
+        };
+        let target = TargetSummary {
+            fields: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("repo".into(), "org/repo".into());
+                m
+            },
+        };
+        let event = AuditEvent::new(AuditEventKind::OperationSucceeded)
+            .with_request_id(id)
+            .with_approval_id(approval_id)
+            .with_client(summary)
+            .with_operation("test.op")
+            .with_safety(OperationSafety::Safe)
+            .with_target(target)
+            .with_outcome("ok")
+            .with_latency_ms(100)
+            .with_secret_names(vec!["SECRET".into()])
+            .with_detail("test detail");
+
+        assert_eq!(event.request_id, Some(id));
+        assert_eq!(event.approval_id, Some(approval_id));
+        assert!(event.client.is_some());
+        assert_eq!(event.operation.as_deref(), Some("test.op"));
+        assert_eq!(event.safety, Some(OperationSafety::Safe));
+        assert!(event.target.is_some());
+        assert_eq!(event.outcome.as_deref(), Some("ok"));
+        assert_eq!(event.latency_ms, Some(100));
+        assert_eq!(event.secret_names, vec!["SECRET"]);
+        assert_eq!(event.detail.as_deref(), Some("test detail"));
+    }
+
+    #[test]
+    fn audit_event_with_level_override() {
+        let event =
+            AuditEvent::new(AuditEventKind::OperationSucceeded).with_level(AuditLevel::Error);
+        assert_eq!(event.level, AuditLevel::Error);
+    }
+
+    #[test]
+    fn audit_event_with_policy_decision() {
+        let decision = PolicyDecision {
+            allowed: false,
+            required_factors: vec![],
+            approval_requirement: ApprovalRequirement::Never,
+            lease_ttl: None,
+            one_time: false,
+            matched_rule: Some("deny-rule".into()),
+            denial_reason: Some("denied".into()),
+        };
+        let event = AuditEvent::new(AuditEventKind::PolicyDenied).with_policy_decision(&decision);
+        assert!(event.policy_decision.is_some());
+        let pd = event.policy_decision.unwrap();
+        assert!(pd.contains("DENY"));
+    }
+
+    #[test]
+    fn client_summary_no_hash() {
+        let id = ClientIdentity {
+            uid: 501,
+            gid: 20,
+            pid: None,
+            exe_path: None,
+            exe_sha256: None,
+            codesign_team_id: None,
+        };
+        let summary = ClientSummary::from((&id, ClientType::Human));
+        assert!(summary.exe_sha256_prefix.is_none());
+        assert!(summary.pid.is_none());
+        assert!(summary.exe_path.is_none());
+    }
+
+    #[test]
+    fn client_summary_short_hash() {
+        let id = ClientIdentity {
+            uid: 501,
+            gid: 20,
+            pid: Some(1),
+            exe_path: None,
+            exe_sha256: Some("abcdef01".into()),
+            codesign_team_id: None,
+        };
+        let summary = ClientSummary::from((&id, ClientType::Agent));
+        assert_eq!(summary.exe_sha256_prefix.as_deref(), Some("abcdef01"));
+    }
+
+    #[test]
+    fn in_memory_emitter_events_of_kind_empty() {
+        let emitter = InMemoryAuditEmitter::new();
+        emitter.emit(AuditEvent::new(AuditEventKind::RequestReceived));
+        let policy_events = emitter.events_of_kind(AuditEventKind::PolicyDenied);
+        assert!(policy_events.is_empty());
+    }
+
+    #[test]
+    fn in_memory_emitter_default() {
+        let emitter = InMemoryAuditEmitter::default();
+        assert!(emitter.is_empty());
+    }
+
+    #[test]
+    fn target_summary_default() {
+        let target = TargetSummary::default();
+        assert!(target.fields.is_empty());
+    }
+
+    #[test]
+    fn tracing_emitter_does_not_panic() {
+        let emitter = TracingAuditEmitter;
+        emitter.emit(AuditEvent::new(AuditEventKind::RequestReceived));
+        emitter.emit(
+            AuditEvent::new(AuditEventKind::OperationFailed)
+                .with_operation("test.op")
+                .with_outcome("error")
+                .with_latency_ms(5),
+        );
     }
 }

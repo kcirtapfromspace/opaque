@@ -49,11 +49,11 @@ pub fn peer_info_from_fd(fd: RawFd) -> io::Result<PeerInfo> {
         // Fallback to pid=None if we can't retrieve it.
         let pid = local_peer_pid(fd).ok();
 
-        return Ok(PeerInfo {
+        Ok(PeerInfo {
             pid,
             uid: uid as u32,
             gid: gid as u32,
-        });
+        })
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -88,4 +88,3 @@ fn local_peer_pid(fd: RawFd) -> io::Result<i32> {
     }
     Ok(pid as i32)
 }
-

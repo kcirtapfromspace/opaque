@@ -38,10 +38,10 @@ pub struct ClientMatch {
 impl ClientMatch {
     /// Returns `true` if the given identity matches this pattern.
     pub fn matches(&self, identity: &ClientIdentity) -> bool {
-        if let Some(uid) = self.uid {
-            if identity.uid != uid {
-                return false;
-            }
+        if let Some(uid) = self.uid
+            && identity.uid != uid
+        {
+            return false;
         }
 
         if let Some(ref pattern) = self.exe_path {
@@ -339,16 +339,10 @@ impl PolicyEngine {
     /// - `REVEAL` operations are always denied for `Agent` clients.
     /// - `SENSITIVE_OUTPUT` operations are denied for `Agent` clients unless
     ///   the matching rule explicitly allows agent client types.
-    pub fn evaluate(
-        &self,
-        request: &OperationRequest,
-        safety: OperationSafety,
-    ) -> PolicyDecision {
+    pub fn evaluate(&self, request: &OperationRequest, safety: OperationSafety) -> PolicyDecision {
         // Hard safety-class enforcement before rule evaluation.
         if request.client_type == ClientType::Agent && safety == OperationSafety::Reveal {
-            return PolicyDecision::deny(
-                "REVEAL operations are never permitted for agent clients",
-            );
+            return PolicyDecision::deny("REVEAL operations are never permitted for agent clients");
         }
 
         // Find the first matching rule.
@@ -406,6 +400,8 @@ mod tests {
     use std::time::SystemTime;
 
     use uuid::Uuid;
+
+    use std::time::Duration;
 
     use super::*;
     use crate::operation::{ClientIdentity, ClientType, OperationRequest};
@@ -560,5 +556,196 @@ mod tests {
 
         let deny = PolicyDecision::deny("no rule matched");
         assert!(format!("{deny}").starts_with("DENY"));
+    }
+
+    #[test]
+    fn client_match_exe_sha256_mismatch() {
+        let cm = ClientMatch {
+            exe_sha256: Some("expected_hash".into()),
+            ..Default::default()
+        };
+        let mut id = test_identity();
+        id.exe_sha256 = Some("different_hash".into());
+        assert!(!cm.matches(&id));
+    }
+
+    #[test]
+    fn client_match_exe_sha256_none() {
+        let cm = ClientMatch {
+            exe_sha256: Some("expected_hash".into()),
+            ..Default::default()
+        };
+        let mut id = test_identity();
+        id.exe_sha256 = None;
+        assert!(!cm.matches(&id));
+    }
+
+    #[test]
+    fn client_match_codesign_mismatch() {
+        let cm = ClientMatch {
+            codesign_team_id: Some("TEAM_A".into()),
+            ..Default::default()
+        };
+        let mut id = test_identity();
+        id.codesign_team_id = Some("TEAM_B".into());
+        assert!(!cm.matches(&id));
+    }
+
+    #[test]
+    fn client_match_codesign_none() {
+        let cm = ClientMatch {
+            codesign_team_id: Some("TEAM_A".into()),
+            ..Default::default()
+        };
+        let mut id = test_identity();
+        id.codesign_team_id = None;
+        assert!(!cm.matches(&id));
+    }
+
+    #[test]
+    fn client_match_exe_path_none() {
+        let cm = ClientMatch {
+            exe_path: Some("/usr/bin/*".into()),
+            ..Default::default()
+        };
+        let mut id = test_identity();
+        id.exe_path = None;
+        assert!(!cm.matches(&id));
+    }
+
+    #[test]
+    fn client_match_all_none() {
+        let cm = ClientMatch::default();
+        let id = test_identity();
+        assert!(cm.matches(&id));
+    }
+
+    #[test]
+    fn target_match_empty_matches_all() {
+        let tm = TargetMatch::default();
+        let mut target = HashMap::new();
+        target.insert("repo".into(), "anything".into());
+        assert!(tm.matches(&target));
+    }
+
+    #[test]
+    fn target_match_missing_field() {
+        let tm = TargetMatch {
+            fields: {
+                let mut m = HashMap::new();
+                m.insert("repo".into(), "org/*".into());
+                m
+            },
+        };
+        let target = HashMap::new();
+        assert!(!tm.matches(&target));
+    }
+
+    #[test]
+    fn policy_engine_add_rule_and_count() {
+        let mut engine = PolicyEngine::new();
+        assert_eq!(engine.rule_count(), 0);
+        engine.add_rule(allow_rule());
+        assert_eq!(engine.rule_count(), 1);
+    }
+
+    #[test]
+    fn policy_engine_default() {
+        let engine = PolicyEngine::default();
+        assert_eq!(engine.rule_count(), 0);
+    }
+
+    #[test]
+    fn client_type_filter_mismatch() {
+        let mut rule = allow_rule();
+        rule.client_types = vec![ClientType::Human];
+        let engine = PolicyEngine::with_rules(vec![rule]);
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let decision = engine.evaluate(&req, OperationSafety::Safe);
+        assert!(!decision.allowed);
+    }
+
+    #[test]
+    fn operation_pattern_mismatch() {
+        let engine = PolicyEngine::with_rules(vec![allow_rule()]);
+        let req = test_request("k8s.set_secret", ClientType::Human);
+        let decision = engine.evaluate(&req, OperationSafety::Safe);
+        assert!(!decision.allowed);
+    }
+
+    #[test]
+    fn reveal_allowed_for_human() {
+        let mut rule = allow_rule();
+        rule.operation_pattern = "*".into();
+        let engine = PolicyEngine::with_rules(vec![rule]);
+        let req = test_request("secret.reveal", ClientType::Human);
+        let decision = engine.evaluate(&req, OperationSafety::Reveal);
+        assert!(decision.allowed);
+    }
+
+    #[test]
+    fn human_sensitive_output_allowed() {
+        let mut rule = allow_rule();
+        rule.client_types = vec![ClientType::Human];
+        let engine = PolicyEngine::with_rules(vec![rule]);
+        let req = test_request("github.set_actions_secret", ClientType::Human);
+        let decision = engine.evaluate(&req, OperationSafety::SensitiveOutput);
+        assert!(decision.allowed);
+    }
+
+    #[test]
+    fn policy_decision_display_no_rule() {
+        let decision = PolicyDecision {
+            allowed: true,
+            required_factors: vec![],
+            approval_requirement: ApprovalRequirement::Never,
+            lease_ttl: None,
+            one_time: false,
+            matched_rule: None,
+            denial_reason: None,
+        };
+        assert_eq!(format!("{decision}"), "ALLOW");
+    }
+
+    #[test]
+    fn policy_decision_display_deny_no_reason() {
+        let decision = PolicyDecision {
+            allowed: false,
+            required_factors: vec![],
+            approval_requirement: ApprovalRequirement::Never,
+            lease_ttl: None,
+            one_time: false,
+            matched_rule: None,
+            denial_reason: None,
+        };
+        assert_eq!(format!("{decision}"), "DENY");
+    }
+
+    #[test]
+    fn approval_config_serde_with_lease_ttl() {
+        let config = ApprovalConfig {
+            require: ApprovalRequirement::FirstUse,
+            factors: vec![ApprovalFactor::LocalBio],
+            lease_ttl: Some(Duration::from_secs(300)),
+            one_time: false,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let roundtripped: ApprovalConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtripped.lease_ttl, Some(Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn approval_config_serde_without_lease_ttl() {
+        let config = ApprovalConfig {
+            require: ApprovalRequirement::Always,
+            factors: vec![],
+            lease_ttl: None,
+            one_time: true,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("lease_ttl"));
+        let roundtripped: ApprovalConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtripped.lease_ttl, None);
+        assert!(roundtripped.one_time);
     }
 }

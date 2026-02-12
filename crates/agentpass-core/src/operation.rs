@@ -372,13 +372,174 @@ mod tests {
             gid: 20,
             pid: Some(12345),
             exe_path: Some("/usr/bin/test".into()),
-            exe_sha256: Some("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".into()),
+            exe_sha256: Some(
+                "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".into(),
+            ),
             codesign_team_id: None,
         };
         let dbg = format!("{id:?}");
         // The full hash should NOT appear in debug output.
         assert!(!dbg.contains("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"));
         assert!(dbg.contains("abcdef0123456789..."));
+    }
+
+    #[test]
+    fn operation_safety_display() {
+        assert_eq!(format!("{}", OperationSafety::Safe), "SAFE");
+        assert_eq!(
+            format!("{}", OperationSafety::SensitiveOutput),
+            "SENSITIVE_OUTPUT"
+        );
+        assert_eq!(format!("{}", OperationSafety::Reveal), "REVEAL");
+    }
+
+    #[test]
+    fn approval_factor_display() {
+        assert_eq!(format!("{}", ApprovalFactor::LocalBio), "local_bio");
+        assert_eq!(format!("{}", ApprovalFactor::IosFaceId), "ios_faceid");
+        assert_eq!(format!("{}", ApprovalFactor::Fido2), "fido2");
+    }
+
+    #[test]
+    fn registry_iter_and_is_empty() {
+        let reg = OperationRegistry::new();
+        assert!(reg.is_empty());
+        assert_eq!(reg.iter().count(), 0);
+
+        let mut reg = OperationRegistry::new();
+        reg.register(OperationDef {
+            name: "test.op".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Never,
+            default_factors: vec![],
+            description: "test".into(),
+        })
+        .unwrap();
+        assert!(!reg.is_empty());
+        assert_eq!(reg.iter().count(), 1);
+        assert_eq!(reg.len(), 1);
+    }
+
+    #[test]
+    fn registry_default() {
+        let reg = OperationRegistry::default();
+        assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn client_identity_display_full() {
+        let id = ClientIdentity {
+            uid: 501,
+            gid: 20,
+            pid: Some(1234),
+            exe_path: Some("/usr/bin/claude-code".into()),
+            exe_sha256: Some("aabb".into()),
+            codesign_team_id: Some("TEAM123".into()),
+        };
+        let display = format!("{id}");
+        assert!(display.contains("uid=501"));
+        assert!(display.contains("gid=20"));
+        assert!(display.contains("pid=1234"));
+        assert!(display.contains("exe=/usr/bin/claude-code"));
+        assert!(display.contains("team=TEAM123"));
+    }
+
+    #[test]
+    fn client_identity_display_minimal() {
+        let id = ClientIdentity {
+            uid: 0,
+            gid: 0,
+            pid: None,
+            exe_path: None,
+            exe_sha256: None,
+            codesign_team_id: None,
+        };
+        let display = format!("{id}");
+        assert!(display.contains("uid=0"));
+        assert!(display.contains("gid=0"));
+        assert!(!display.contains("pid="));
+        assert!(!display.contains("exe="));
+        assert!(!display.contains("team="));
+    }
+
+    #[test]
+    fn client_identity_debug_short_hash() {
+        let id = ClientIdentity {
+            uid: 501,
+            gid: 20,
+            pid: None,
+            exe_path: None,
+            exe_sha256: Some("abcdef01".into()),
+            codesign_team_id: None,
+        };
+        let dbg = format!("{id:?}");
+        assert!(dbg.contains("abcdef01"));
+        assert!(!dbg.contains("..."));
+    }
+
+    #[test]
+    fn client_identity_debug_no_hash() {
+        let id = ClientIdentity {
+            uid: 501,
+            gid: 20,
+            pid: None,
+            exe_path: None,
+            exe_sha256: None,
+            codesign_team_id: None,
+        };
+        let dbg = format!("{id:?}");
+        assert!(dbg.contains("exe_sha256: None"));
+    }
+
+    #[test]
+    fn registry_error_display() {
+        let err = RegistryError::AlreadyRegistered("test.op".into());
+        assert!(format!("{err}").contains("already registered"));
+
+        let err = RegistryError::UnknownOperation("nope".into());
+        assert!(format!("{err}").contains("unknown operation"));
+    }
+
+    #[test]
+    fn operation_def_serde_roundtrip() {
+        let def = OperationDef {
+            name: "github.set_actions_secret".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio, ApprovalFactor::Fido2],
+            description: "Set a GitHub Actions secret".into(),
+        };
+        let json = serde_json::to_string(&def).unwrap();
+        let roundtripped: OperationDef = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtripped.name, def.name);
+        assert_eq!(roundtripped.safety, def.safety);
+        assert_eq!(roundtripped.default_factors.len(), 2);
+    }
+
+    #[test]
+    fn operation_request_serde_roundtrip() {
+        let req = OperationRequest {
+            request_id: Uuid::new_v4(),
+            client_identity: ClientIdentity {
+                uid: 501,
+                gid: 20,
+                pid: Some(1),
+                exe_path: Some("/usr/bin/test".into()),
+                exe_sha256: Some("aabb".into()),
+                codesign_team_id: None,
+            },
+            client_type: ClientType::Agent,
+            operation: "test.op".into(),
+            target: HashMap::new(),
+            secret_ref_names: vec!["SECRET".into()],
+            created_at: SystemTime::now(),
+            expires_at: None,
+            params: serde_json::json!({"key": "value"}),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let roundtripped: OperationRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtripped.operation, "test.op");
+        assert_eq!(roundtripped.secret_ref_names, vec!["SECRET"]);
     }
 
     #[test]
