@@ -6,6 +6,7 @@ pub enum ApprovalError {
     InvalidReason,
 
     #[error("approval not supported on this platform")]
+    #[allow(dead_code)] // Used on platforms without macOS/Linux approval
     Unsupported,
 
     #[error("approval failed: {0}")]
@@ -38,10 +39,9 @@ pub async fn prompt(reason: &str) -> Result<bool, ApprovalError> {
 #[cfg(target_os = "macos")]
 async fn prompt_macos(reason: &str) -> Result<bool, ApprovalError> {
     let reason = reason.to_string();
-    let res = tokio::task::spawn_blocking(move || prompt_macos_blocking(&reason))
+    tokio::task::spawn_blocking(move || prompt_macos_blocking(&reason))
         .await
-        .map_err(|e| ApprovalError::Failed(format!("approval task failed: {e}")))?;
-    res
+        .map_err(|e| ApprovalError::Failed(format!("approval task failed: {e}")))?
 }
 
 #[cfg(target_os = "macos")]
@@ -98,9 +98,7 @@ async fn prompt_linux(reason: &str) -> Result<bool, ApprovalError> {
     use std::collections::HashMap;
 
     use zbus::Connection;
-    use zbus_polkit::policykit1::{
-        AuthorityProxy, CheckAuthorizationFlags, Subject,
-    };
+    use zbus_polkit::policykit1::{AuthorityProxy, CheckAuthorizationFlags, Subject};
 
     let connection = Connection::system()
         .await

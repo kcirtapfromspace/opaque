@@ -1,7 +1,13 @@
+use std::collections::HashMap;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
+use agentpass_core::audit::TracingAuditEmitter;
+use agentpass_core::operation::{ClientIdentity, ClientType, OperationRegistry, OperationRequest};
 use agentpass_core::peer::peer_info_from_fd;
+use agentpass_core::policy::PolicyEngine;
 use agentpass_core::proto::{Request, Response};
 use agentpass_core::socket::{ensure_socket_parent_dir, socket_path};
 use bytes::Bytes;
@@ -9,13 +15,16 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing::{info, warn};
+use uuid::Uuid;
 
 mod approval;
 mod enclave;
 
-struct AppState {
+use enclave::{Enclave, NativeApprovalGate};
+
+struct DaemonState {
+    enclave: Arc<Enclave>,
     version: &'static str,
-    approval_gate: tokio::sync::Semaphore,
 }
 
 #[tokio::main]
@@ -59,9 +68,22 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
 
     info!("listening on {}", socket.display());
 
-    let state = Arc::new(AppState {
+    // Build enclave with deny-all defaults.
+    // Operations are registered as provider integrations are built.
+    let registry = OperationRegistry::new();
+    let policy = PolicyEngine::new();
+    let audit = Arc::new(TracingAuditEmitter);
+
+    let enclave = Enclave::builder()
+        .registry(registry)
+        .policy(policy)
+        .approval_gate(Box::new(NativeApprovalGate))
+        .audit(audit)
+        .build();
+
+    let state = Arc::new(DaemonState {
+        enclave: Arc::new(enclave),
         version: env!("CARGO_PKG_VERSION"),
-        approval_gate: tokio::sync::Semaphore::new(1),
     });
 
     let shutdown = tokio::signal::ctrl_c();
@@ -120,11 +142,84 @@ impl Drop for SocketGuard {
     }
 }
 
-async fn handle_conn(state: Arc<AppState>, stream: UnixStream) -> std::io::Result<()> {
+/// Build a [`ClientIdentity`] from peer credentials obtained via the Unix socket.
+fn build_client_identity(peer: Option<&agentpass_core::peer::PeerInfo>) -> ClientIdentity {
+    match peer {
+        Some(info) => {
+            let exe_path = info.pid.and_then(exe_path_for_pid);
+            ClientIdentity {
+                uid: info.uid,
+                gid: info.gid,
+                pid: info.pid,
+                exe_path,
+                exe_sha256: None,
+                codesign_team_id: None,
+            }
+        }
+        None => ClientIdentity {
+            uid: u32::MAX,
+            gid: u32::MAX,
+            pid: None,
+            exe_path: None,
+            exe_sha256: None,
+            codesign_team_id: None,
+        },
+    }
+}
+
+/// Resolve the executable path for a given PID.
+fn exe_path_for_pid(pid: i32) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        return std::fs::read_link(format!("/proc/{pid}/exe")).ok();
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        exe_path_macos(pid)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn exe_path_macos(pid: i32) -> Option<PathBuf> {
+    const PROC_PIDPATHINFO_MAXSIZE: u32 = 4096;
+
+    unsafe extern "C" {
+        fn proc_pidpath(
+            pid: libc::c_int,
+            buffer: *mut libc::c_char,
+            buffersize: u32,
+        ) -> libc::c_int;
+    }
+
+    let mut buf = vec![0u8; PROC_PIDPATHINFO_MAXSIZE as usize];
+    let ret = unsafe {
+        proc_pidpath(
+            pid,
+            buf.as_mut_ptr() as *mut libc::c_char,
+            PROC_PIDPATHINFO_MAXSIZE,
+        )
+    };
+    if ret > 0 {
+        let cstr = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr() as *const libc::c_char) };
+        cstr.to_str().ok().map(PathBuf::from)
+    } else {
+        None
+    }
+}
+
+async fn handle_conn(state: Arc<DaemonState>, stream: UnixStream) -> std::io::Result<()> {
     let fd = stream.as_raw_fd();
     let peer = peer_info_from_fd(fd).ok();
+    let identity = build_client_identity(peer.as_ref());
 
-    if let Some(peer) = peer {
+    if let Some(ref peer) = peer {
         info!(
             "client connected uid={} gid={} pid={:?}",
             peer.uid, peer.gid, peer.pid
@@ -134,7 +229,7 @@ async fn handle_conn(state: Arc<AppState>, stream: UnixStream) -> std::io::Resul
     }
 
     let codec = LengthDelimitedCodec::builder()
-        .max_frame_length(1024 * 1024)
+        .max_frame_length(128 * 1024) // 128KB max frame
         .new_codec();
     let mut framed = Framed::new(stream, codec);
 
@@ -143,7 +238,8 @@ async fn handle_conn(state: Arc<AppState>, stream: UnixStream) -> std::io::Resul
             Ok(b) => b,
             Err(e) => {
                 let resp = Response::err(None, "bad_frame", e.to_string());
-                let bytes = serde_json::to_vec(&resp).unwrap_or_else(|_| b"{\"error\":\"encode\"}".to_vec());
+                let bytes = serde_json::to_vec(&resp)
+                    .unwrap_or_else(|_| b"{\"error\":\"encode\"}".to_vec());
                 let _ = framed.send(Bytes::from(bytes)).await;
                 return Err(e);
             }
@@ -153,48 +249,89 @@ async fn handle_conn(state: Arc<AppState>, stream: UnixStream) -> std::io::Resul
             Ok(r) => r,
             Err(e) => {
                 let resp = Response::err(None, "bad_json", e.to_string());
-                let bytes = serde_json::to_vec(&resp).unwrap_or_else(|_| b"{\"error\":\"encode\"}".to_vec());
+                let bytes = serde_json::to_vec(&resp)
+                    .unwrap_or_else(|_| b"{\"error\":\"encode\"}".to_vec());
                 let _ = framed.send(Bytes::from(bytes)).await;
                 continue;
             }
         };
 
         // Never log params (may contain secrets due to client bugs).
-        let resp = handle_request(state.as_ref(), req).await;
-        let out = serde_json::to_vec(&resp).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let resp = handle_request(&state, req, &identity).await;
+        let out = serde_json::to_vec(&resp).map_err(std::io::Error::other)?;
         framed.send(Bytes::from(out)).await?;
     }
 
     Ok(())
 }
 
-async fn handle_request(state: &AppState, req: Request) -> Response {
+async fn handle_request(state: &DaemonState, req: Request, identity: &ClientIdentity) -> Response {
     match req.method.as_str() {
         "ping" => Response::ok(req.id, serde_json::json!({ "ok": true })),
         "version" => Response::ok(req.id, serde_json::json!({ "version": state.version })),
-        "approval.prompt" => {
-            let reason = req
+        "whoami" => Response::ok(
+            req.id,
+            serde_json::json!({
+                "uid": identity.uid,
+                "gid": identity.gid,
+                "pid": identity.pid,
+                "exe_path": identity.exe_path.as_ref().map(|p| p.display().to_string()),
+            }),
+        ),
+        "execute" => {
+            let operation = req
                 .params
-                .get("reason")
+                .get("operation")
                 .and_then(|v| v.as_str())
-                .unwrap_or("");
+                .unwrap_or("")
+                .to_owned();
 
-            let Ok(_permit) = state.approval_gate.acquire().await else {
-                return Response::err(Some(req.id), "internal", "approval gate closed");
+            if operation.is_empty() {
+                return Response::err(Some(req.id), "bad_request", "missing 'operation' field");
+            }
+
+            let target: HashMap<String, String> = req
+                .params
+                .get("target")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+
+            let secret_ref_names: Vec<String> = req
+                .params
+                .get("secret_ref_names")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+
+            // Default to Agent (safer — more restrictive).
+            let client_type = match req.params.get("client_type").and_then(|v| v.as_str()) {
+                Some("human") => ClientType::Human,
+                _ => ClientType::Agent,
             };
 
-            match approval::prompt(reason).await {
-                Ok(approved) => Response::ok(req.id, serde_json::json!({ "approved": approved })),
-                Err(e) => Response::err(Some(req.id), "approval_failed", e.to_string()),
-            }
-        }
-        "whoami" => {
-            // Placeholder. In v1, this should return the server-observed client identity (uid/pid/exe hash).
-            Response::ok(req.id, serde_json::json!({ "note": "not implemented" }))
+            let op_params = req
+                .params
+                .get("params")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+
+            let op_req = OperationRequest {
+                request_id: Uuid::new_v4(),
+                client_identity: identity.clone(),
+                client_type,
+                operation,
+                target,
+                secret_ref_names,
+                created_at: SystemTime::now(),
+                expires_at: None,
+                params: op_params,
+            };
+
+            state
+                .enclave
+                .execute(op_req)
+                .await
+                .into_proto_response(req.id)
         }
         _ => Response::err(Some(req.id), "unknown_method", "unknown method"),
     }
 }
-
-// tokio::net::UnixStream implements AsRawFd on unix platforms.
-use std::os::unix::io::AsRawFd;
