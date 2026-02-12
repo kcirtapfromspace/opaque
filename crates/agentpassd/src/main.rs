@@ -11,6 +11,7 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing::{info, warn};
 
 mod approval;
+mod enclave;
 
 struct AppState {
     version: &'static str,

@@ -1,0 +1,528 @@
+//! Audit event model and emission.
+//!
+//! Every operation, approval, and policy decision emits structured audit events.
+//! Events carry correlation IDs ([`request_id`], [`approval_id`], [`event_id`])
+//! for end-to-end tracing.
+//!
+//! Secret values NEVER appear in audit events.
+
+use std::fmt;
+use std::time::SystemTime;
+
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::operation::{ClientIdentity, ClientType, OperationSafety};
+use crate::policy::PolicyDecision;
+
+// ---------------------------------------------------------------------------
+// Audit event kind
+// ---------------------------------------------------------------------------
+
+/// The kind of audit event. Maps to the event taxonomy in `docs/audit-analytics.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditEventKind {
+    /// A new operation request was received by the daemon.
+    RequestReceived,
+
+    /// The policy engine denied the request.
+    PolicyDenied,
+
+    /// An approval is required before the operation can proceed.
+    ApprovalRequired,
+
+    /// An approval challenge was presented to the user.
+    ApprovalPresented,
+
+    /// The user granted approval.
+    ApprovalGranted,
+
+    /// The user denied approval (or it timed out).
+    ApprovalDenied,
+
+    /// The operation handler has started execution.
+    OperationStarted,
+
+    /// The operation completed successfully.
+    OperationSucceeded,
+
+    /// The operation failed.
+    OperationFailed,
+
+    /// A provider fetch (secret retrieval) has started.
+    ProviderFetchStarted,
+
+    /// A provider fetch has completed.
+    ProviderFetchFinished,
+}
+
+impl fmt::Display for AuditEventKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::RequestReceived => "request.received",
+            Self::PolicyDenied => "policy.denied",
+            Self::ApprovalRequired => "approval.required",
+            Self::ApprovalPresented => "approval.presented",
+            Self::ApprovalGranted => "approval.granted",
+            Self::ApprovalDenied => "approval.denied",
+            Self::OperationStarted => "operation.started",
+            Self::OperationSucceeded => "operation.succeeded",
+            Self::OperationFailed => "operation.failed",
+            Self::ProviderFetchStarted => "provider.fetch.started",
+            Self::ProviderFetchFinished => "provider.fetch.finished",
+        };
+        write!(f, "{s}")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Client summary (safe for audit)
+// ---------------------------------------------------------------------------
+
+/// A summary of the client identity, safe for inclusion in audit events.
+/// Does not contain secrets or full hashes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientSummary {
+    pub uid: u32,
+    pub gid: u32,
+    pub pid: Option<i32>,
+    pub exe_path: Option<String>,
+    /// Truncated hash prefix (first 16 hex chars) for identification without
+    /// full disclosure.
+    pub exe_sha256_prefix: Option<String>,
+    pub codesign_team_id: Option<String>,
+    pub client_type: ClientType,
+}
+
+impl From<(&ClientIdentity, ClientType)> for ClientSummary {
+    fn from((id, ct): (&ClientIdentity, ClientType)) -> Self {
+        Self {
+            uid: id.uid,
+            gid: id.gid,
+            pid: id.pid,
+            exe_path: id.exe_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            exe_sha256_prefix: id.exe_sha256.as_ref().map(|h| {
+                let len = h.len().min(16);
+                h[..len].to_owned()
+            }),
+            codesign_team_id: id.codesign_team_id.clone(),
+            client_type: ct,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Target summary (safe for audit)
+// ---------------------------------------------------------------------------
+
+/// A summary of the operation target, safe for audit.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TargetSummary {
+    /// Key-value pairs describing the target (e.g. repo, cluster, namespace).
+    pub fields: std::collections::HashMap<String, String>,
+}
+
+// ---------------------------------------------------------------------------
+// Audit event
+// ---------------------------------------------------------------------------
+
+/// A structured audit event.
+///
+/// Fields align with the schema in `docs/audit-analytics.md`.
+/// Secret values NEVER appear here.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct AuditEvent {
+    /// Unique event identifier.
+    pub event_id: Uuid,
+
+    /// UTC timestamp in milliseconds since epoch.
+    pub ts_utc_ms: i64,
+
+    /// Event severity level.
+    pub level: AuditLevel,
+
+    /// The kind of event.
+    pub kind: AuditEventKind,
+
+    /// Correlation: end-to-end request identifier.
+    pub request_id: Option<Uuid>,
+
+    /// Correlation: approval request identifier (may differ per step-up).
+    pub approval_id: Option<Uuid>,
+
+    /// Client summary.
+    pub client: Option<ClientSummary>,
+
+    /// Operation name (e.g. `"github.set_actions_secret"`).
+    pub operation: Option<String>,
+
+    /// Operation safety classification.
+    pub safety: Option<OperationSafety>,
+
+    /// Target summary.
+    pub target: Option<TargetSummary>,
+
+    /// Outcome string: `"ok"`, `"denied"`, `"error"`.
+    pub outcome: Option<String>,
+
+    /// Latency in milliseconds (approval latency, operation latency, etc.).
+    pub latency_ms: Option<i64>,
+
+    /// Secret variable names referenced (never values).
+    pub secret_names: Vec<String>,
+
+    /// Policy decision summary (for policy events).
+    pub policy_decision: Option<String>,
+
+    /// Human-readable detail message (sanitized).
+    pub detail: Option<String>,
+}
+
+// Custom Debug to avoid any accidental leakage.
+impl fmt::Debug for AuditEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuditEvent")
+            .field("event_id", &self.event_id)
+            .field("kind", &self.kind)
+            .field("request_id", &self.request_id)
+            .field("operation", &self.operation)
+            .field("outcome", &self.outcome)
+            .field("latency_ms", &self.latency_ms)
+            .finish()
+    }
+}
+
+/// Severity level for audit events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuditLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+impl fmt::Display for AuditLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Info => write!(f, "info"),
+            Self::Warn => write!(f, "warn"),
+            Self::Error => write!(f, "error"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AuditEvent builder
+// ---------------------------------------------------------------------------
+
+impl AuditEvent {
+    /// Create a new audit event with the given kind. Timestamps and event_id
+    /// are set automatically.
+    pub fn new(kind: AuditEventKind) -> Self {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default();
+
+        Self {
+            event_id: Uuid::new_v4(),
+            ts_utc_ms: now.as_millis() as i64,
+            level: default_level_for_kind(kind),
+            kind,
+            request_id: None,
+            approval_id: None,
+            client: None,
+            operation: None,
+            safety: None,
+            target: None,
+            outcome: None,
+            latency_ms: None,
+            secret_names: vec![],
+            policy_decision: None,
+            detail: None,
+        }
+    }
+
+    /// Set the request correlation ID.
+    pub fn with_request_id(mut self, id: Uuid) -> Self {
+        self.request_id = Some(id);
+        self
+    }
+
+    /// Set the approval correlation ID.
+    pub fn with_approval_id(mut self, id: Uuid) -> Self {
+        self.approval_id = Some(id);
+        self
+    }
+
+    /// Set the client summary.
+    pub fn with_client(mut self, client: ClientSummary) -> Self {
+        self.client = Some(client);
+        self
+    }
+
+    /// Set the operation name.
+    pub fn with_operation(mut self, operation: impl Into<String>) -> Self {
+        self.operation = Some(operation.into());
+        self
+    }
+
+    /// Set the safety classification.
+    pub fn with_safety(mut self, safety: OperationSafety) -> Self {
+        self.safety = Some(safety);
+        self
+    }
+
+    /// Set the target summary.
+    pub fn with_target(mut self, target: TargetSummary) -> Self {
+        self.target = Some(target);
+        self
+    }
+
+    /// Set the outcome.
+    pub fn with_outcome(mut self, outcome: impl Into<String>) -> Self {
+        self.outcome = Some(outcome.into());
+        self
+    }
+
+    /// Set the latency.
+    pub fn with_latency_ms(mut self, ms: i64) -> Self {
+        self.latency_ms = Some(ms);
+        self
+    }
+
+    /// Set secret names.
+    pub fn with_secret_names(mut self, names: Vec<String>) -> Self {
+        self.secret_names = names;
+        self
+    }
+
+    /// Set policy decision summary.
+    pub fn with_policy_decision(mut self, decision: &PolicyDecision) -> Self {
+        self.policy_decision = Some(format!("{decision}"));
+        self
+    }
+
+    /// Set a detail message.
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    /// Override the level.
+    pub fn with_level(mut self, level: AuditLevel) -> Self {
+        self.level = level;
+        self
+    }
+}
+
+/// Default severity level based on event kind.
+fn default_level_for_kind(kind: AuditEventKind) -> AuditLevel {
+    match kind {
+        AuditEventKind::PolicyDenied | AuditEventKind::ApprovalDenied => AuditLevel::Warn,
+        AuditEventKind::OperationFailed => AuditLevel::Error,
+        _ => AuditLevel::Info,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Audit emitter trait
+// ---------------------------------------------------------------------------
+
+/// Trait for emitting audit events.
+///
+/// Implementations should be non-blocking. For I/O-bound backends (SQLite,
+/// network), buffer events internally and flush asynchronously.
+///
+/// This is the primary interface used by the enclave.
+pub trait AuditSink: Send + Sync + fmt::Debug {
+    /// Emit an audit event. Must not block the caller.
+    fn emit(&self, event: AuditEvent);
+}
+
+// ---------------------------------------------------------------------------
+// In-memory audit emitter (for testing)
+// ---------------------------------------------------------------------------
+
+/// An in-memory audit emitter that stores events in a `Vec` behind a mutex.
+/// Useful for testing.
+#[derive(Debug, Clone)]
+pub struct InMemoryAuditEmitter {
+    events: std::sync::Arc<std::sync::Mutex<Vec<AuditEvent>>>,
+}
+
+impl InMemoryAuditEmitter {
+    /// Create a new empty emitter.
+    pub fn new() -> Self {
+        Self {
+            events: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Retrieve a snapshot of all emitted events.
+    pub fn events(&self) -> Vec<AuditEvent> {
+        self.events.lock().expect("audit mutex poisoned").clone()
+    }
+
+    /// Number of emitted events.
+    pub fn len(&self) -> usize {
+        self.events.lock().expect("audit mutex poisoned").len()
+    }
+
+    /// Whether any events have been emitted.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Clear all stored events.
+    pub fn clear(&self) {
+        self.events.lock().expect("audit mutex poisoned").clear();
+    }
+
+    /// Get events of a specific kind.
+    pub fn events_of_kind(&self, kind: AuditEventKind) -> Vec<AuditEvent> {
+        self.events
+            .lock()
+            .expect("audit mutex poisoned")
+            .iter()
+            .filter(|e| e.kind == kind)
+            .cloned()
+            .collect()
+    }
+}
+
+impl Default for InMemoryAuditEmitter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AuditSink for InMemoryAuditEmitter {
+    fn emit(&self, event: AuditEvent) {
+        self.events
+            .lock()
+            .expect("audit mutex poisoned")
+            .push(event);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tracing audit emitter (logs events via tracing)
+// ---------------------------------------------------------------------------
+
+/// An audit emitter that logs events via the `tracing` crate.
+#[derive(Debug, Clone, Copy)]
+pub struct TracingAuditEmitter;
+
+impl AuditSink for TracingAuditEmitter {
+    fn emit(&self, event: AuditEvent) {
+        tracing::info!(
+            event_id = %event.event_id,
+            kind = %event.kind,
+            request_id = ?event.request_id,
+            operation = ?event.operation,
+            outcome = ?event.outcome,
+            latency_ms = ?event.latency_ms,
+            "audit event"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::operation::{ClientIdentity, ClientType};
+
+    #[test]
+    fn audit_event_builder() {
+        let event = AuditEvent::new(AuditEventKind::RequestReceived)
+            .with_request_id(Uuid::new_v4())
+            .with_operation("github.set_actions_secret")
+            .with_outcome("ok")
+            .with_latency_ms(42);
+
+        assert_eq!(event.kind, AuditEventKind::RequestReceived);
+        assert_eq!(event.operation.as_deref(), Some("github.set_actions_secret"));
+        assert_eq!(event.outcome.as_deref(), Some("ok"));
+        assert_eq!(event.latency_ms, Some(42));
+        assert_eq!(event.level, AuditLevel::Info);
+    }
+
+    #[test]
+    fn audit_event_kind_display() {
+        assert_eq!(
+            format!("{}", AuditEventKind::RequestReceived),
+            "request.received"
+        );
+        assert_eq!(
+            format!("{}", AuditEventKind::ApprovalGranted),
+            "approval.granted"
+        );
+        assert_eq!(
+            format!("{}", AuditEventKind::OperationFailed),
+            "operation.failed"
+        );
+    }
+
+    #[test]
+    fn default_levels() {
+        assert_eq!(
+            default_level_for_kind(AuditEventKind::PolicyDenied),
+            AuditLevel::Warn
+        );
+        assert_eq!(
+            default_level_for_kind(AuditEventKind::OperationFailed),
+            AuditLevel::Error
+        );
+        assert_eq!(
+            default_level_for_kind(AuditEventKind::OperationSucceeded),
+            AuditLevel::Info
+        );
+    }
+
+    #[test]
+    fn in_memory_emitter() {
+        let emitter = InMemoryAuditEmitter::new();
+        assert!(emitter.is_empty());
+
+        emitter.emit(AuditEvent::new(AuditEventKind::RequestReceived));
+        emitter.emit(AuditEvent::new(AuditEventKind::PolicyDenied));
+        emitter.emit(AuditEvent::new(AuditEventKind::OperationSucceeded));
+
+        assert_eq!(emitter.len(), 3);
+        assert_eq!(
+            emitter.events_of_kind(AuditEventKind::PolicyDenied).len(),
+            1
+        );
+
+        emitter.clear();
+        assert!(emitter.is_empty());
+    }
+
+    #[test]
+    fn client_summary_from_identity() {
+        let id = ClientIdentity {
+            uid: 501,
+            gid: 20,
+            pid: Some(1234),
+            exe_path: Some("/usr/bin/test".into()),
+            exe_sha256: Some(
+                "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".into(),
+            ),
+            codesign_team_id: Some("TEAM123".into()),
+        };
+        let summary = ClientSummary::from((&id, ClientType::Agent));
+        assert_eq!(summary.uid, 501);
+        assert_eq!(summary.exe_sha256_prefix.as_deref(), Some("abcdef0123456789"));
+        assert_eq!(summary.codesign_team_id.as_deref(), Some("TEAM123"));
+    }
+
+    #[test]
+    fn audit_event_debug_is_safe() {
+        let event = AuditEvent::new(AuditEventKind::OperationSucceeded)
+            .with_detail("some detail with password=hunter2");
+        let dbg = format!("{event:?}");
+        // Debug impl only shows selected fields, not detail.
+        assert!(!dbg.contains("hunter2"));
+    }
+}
