@@ -37,4 +37,3 @@ pub fn ensure_socket_parent_dir(path: &Path) -> std::io::Result<()> {
 
     Ok(())
 }
-

@@ -45,6 +45,7 @@ use uuid::Uuid;
 #[derive(Debug, thiserror::Error)]
 pub enum EnclaveError {
     #[error("client identity verification failed: {0}")]
+    #[allow(dead_code)] // Will be used when identity verification is implemented
     IdentityVerification(String),
 
     #[error("unknown operation: {0}")]
@@ -133,9 +134,7 @@ pub trait ApprovalGate: Send + Sync + fmt::Debug {
         request: &OperationRequest,
         factors: &[ApprovalFactor],
         description: &str,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>,
-    >;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -215,6 +214,7 @@ impl EnclaveBuilder {
     }
 
     /// Register an operation handler.
+    #[allow(dead_code)] // Part of the builder API; used once provider integrations land
     pub fn handler(
         mut self,
         operation_name: impl Into<String>,
@@ -237,6 +237,7 @@ impl EnclaveBuilder {
     }
 
     /// Set a custom sanitizer.
+    #[allow(dead_code)] // Part of the builder API; used once provider integrations land
     pub fn sanitizer(mut self, sanitizer: Sanitizer) -> Self {
         self.sanitizer = sanitizer;
         self
@@ -248,9 +249,7 @@ impl EnclaveBuilder {
             registry: self.registry,
             policy: self.policy,
             handlers: self.handlers,
-            approval_gate: self
-                .approval_gate
-                .expect("approval gate is required"),
+            approval_gate: self.approval_gate.expect("approval gate is required"),
             audit: self.audit.expect("audit sink is required"),
             sanitizer: self.sanitizer,
             approval_semaphore: Semaphore::new(1),
@@ -285,14 +284,10 @@ impl Enclave {
     /// 6. Execute operation handler
     /// 7. Sanitize response
     /// 8. Emit audit events
-    pub async fn execute(
-        &self,
-        request: OperationRequest,
-    ) -> SanitizedResponse<Sanitized> {
+    pub async fn execute(&self, request: OperationRequest) -> SanitizedResponse<Sanitized> {
         let start = Instant::now();
         let request_id = request.request_id;
-        let client_summary =
-            ClientSummary::from((&request.client_identity, request.client_type));
+        let client_summary = ClientSummary::from((&request.client_identity, request.client_type));
         let target_summary = TargetSummary {
             fields: request.target.clone(),
         };
@@ -363,7 +358,13 @@ impl Enclave {
 
         // --- Step 5: Approval gate ---
         if let Err(err) = self
-            .handle_approval(&request, &op_def, &decision, &client_summary, &target_summary)
+            .handle_approval(
+                &request,
+                &op_def,
+                &decision,
+                &client_summary,
+                &target_summary,
+            )
             .await
         {
             return self.emit_and_sanitize_error(
@@ -463,11 +464,9 @@ impl Enclave {
     ) -> Result<(), EnclaveError> {
         match (request.client_type, op_def.safety) {
             // REVEAL is never allowed for agent clients.
-            (ClientType::Agent, OperationSafety::Reveal) => {
-                Err(EnclaveError::SafetyViolation(
-                    "REVEAL operations are never permitted for agent clients".into(),
-                ))
-            }
+            (ClientType::Agent, OperationSafety::Reveal) => Err(EnclaveError::SafetyViolation(
+                "REVEAL operations are never permitted for agent clients".into(),
+            )),
             // All other combinations are checked by the policy engine.
             _ => Ok(()),
         }
@@ -603,6 +602,7 @@ impl Enclave {
     }
 
     /// Emit an error audit event and return a sanitized error response.
+    #[allow(clippy::too_many_arguments)]
     fn emit_and_sanitize_error(
         &self,
         request_id: Uuid,
@@ -638,78 +638,108 @@ impl Enclave {
 }
 
 // ---------------------------------------------------------------------------
+// Native approval gate (production)
+// ---------------------------------------------------------------------------
+
+/// Native OS approval gate that delegates to the platform-specific
+/// approval prompt (macOS LocalAuthentication / Linux polkit).
+#[derive(Debug)]
+pub struct NativeApprovalGate;
+
+impl ApprovalGate for NativeApprovalGate {
+    fn request_approval(
+        &self,
+        _approval_id: Uuid,
+        _request: &OperationRequest,
+        _factors: &[ApprovalFactor],
+        description: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>>
+    {
+        let desc = description.to_owned();
+        Box::pin(async move {
+            crate::approval::prompt(&desc)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Test support: stub implementations
 // ---------------------------------------------------------------------------
 
-/// A no-op approval gate that always approves. For testing only.
-#[derive(Debug)]
-pub struct AlwaysApproveGate;
+#[cfg(test)]
+mod test_support {
+    use super::*;
 
-impl ApprovalGate for AlwaysApproveGate {
-    fn request_approval(
-        &self,
-        _approval_id: Uuid,
-        _request: &OperationRequest,
-        _factors: &[ApprovalFactor],
-        _description: &str,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>,
-    > {
-        Box::pin(async { Ok(true) })
+    /// A no-op approval gate that always approves. For testing only.
+    #[derive(Debug)]
+    pub struct AlwaysApproveGate;
+
+    impl ApprovalGate for AlwaysApproveGate {
+        fn request_approval(
+            &self,
+            _approval_id: Uuid,
+            _request: &OperationRequest,
+            _factors: &[ApprovalFactor],
+            _description: &str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>>
+        {
+            Box::pin(async { Ok(true) })
+        }
     }
-}
 
-/// A no-op approval gate that always denies. For testing only.
-#[derive(Debug)]
-pub struct AlwaysDenyGate;
+    /// A no-op approval gate that always denies. For testing only.
+    #[derive(Debug)]
+    pub struct AlwaysDenyGate;
 
-impl ApprovalGate for AlwaysDenyGate {
-    fn request_approval(
-        &self,
-        _approval_id: Uuid,
-        _request: &OperationRequest,
-        _factors: &[ApprovalFactor],
-        _description: &str,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>,
-    > {
-        Box::pin(async { Ok(false) })
+    impl ApprovalGate for AlwaysDenyGate {
+        fn request_approval(
+            &self,
+            _approval_id: Uuid,
+            _request: &OperationRequest,
+            _factors: &[ApprovalFactor],
+            _description: &str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>>
+        {
+            Box::pin(async { Ok(false) })
+        }
     }
-}
 
-/// A stub operation handler that returns a fixed payload. For testing only.
-#[derive(Debug)]
-pub struct StubHandler {
-    pub response: serde_json::Value,
-}
-
-impl OperationHandler for StubHandler {
-    fn execute(
-        &self,
-        _request: &OperationRequest,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + '_>,
-    > {
-        let resp = self.response.clone();
-        Box::pin(async move { Ok(resp) })
+    /// A stub operation handler that returns a fixed payload. For testing only.
+    #[derive(Debug)]
+    pub struct StubHandler {
+        pub response: serde_json::Value,
     }
-}
 
-/// A stub operation handler that always fails. For testing only.
-#[derive(Debug)]
-pub struct FailingHandler {
-    pub error_message: String,
-}
+    impl OperationHandler for StubHandler {
+        fn execute(
+            &self,
+            _request: &OperationRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + '_>,
+        > {
+            let resp = self.response.clone();
+            Box::pin(async move { Ok(resp) })
+        }
+    }
 
-impl OperationHandler for FailingHandler {
-    fn execute(
-        &self,
-        _request: &OperationRequest,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + '_>,
-    > {
-        let msg = self.error_message.clone();
-        Box::pin(async move { Err(msg) })
+    /// A stub operation handler that always fails. For testing only.
+    #[derive(Debug)]
+    pub struct FailingHandler {
+        pub error_message: String,
+    }
+
+    impl OperationHandler for FailingHandler {
+        fn execute(
+            &self,
+            _request: &OperationRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + '_>,
+        > {
+            let msg = self.error_message.clone();
+            Box::pin(async move { Err(msg) })
+        }
     }
 }
 
@@ -719,6 +749,7 @@ impl OperationHandler for FailingHandler {
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::*;
     use super::*;
     use agentpass_core::audit::InMemoryAuditEmitter;
     use std::time::SystemTime;
@@ -806,10 +837,7 @@ mod tests {
         }])
     }
 
-    fn build_enclave(
-        gate: Box<dyn ApprovalGate>,
-        audit: Arc<InMemoryAuditEmitter>,
-    ) -> Enclave {
+    fn build_enclave(gate: Box<dyn ApprovalGate>, audit: Arc<InMemoryAuditEmitter>) -> Enclave {
         Enclave::builder()
             .registry(test_registry())
             .policy(test_policy())
@@ -1003,7 +1031,11 @@ mod tests {
         let events = audit.events();
         // Expected chain: RequestReceived, ApprovalRequired, ApprovalPresented,
         // ApprovalGranted, OperationStarted, OperationSucceeded
-        assert!(events.len() >= 6, "expected at least 6 audit events, got {}", events.len());
+        assert!(
+            events.len() >= 6,
+            "expected at least 6 audit events, got {}",
+            events.len()
+        );
 
         // All events should share the same request_id.
         let rid = events[0].request_id.unwrap();
