@@ -2,11 +2,12 @@ use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::SystemTime;
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use opaque_core::audit::TracingAuditEmitter;
+use opaque_core::audit::{MultiAuditSink, SqliteAuditSink, TracingAuditEmitter};
 use opaque_core::operation::{
     ApprovalFactor, ApprovalRequirement, ClientIdentity, ClientType, OperationDef,
     OperationRegistry, OperationRequest, OperationSafety,
@@ -48,6 +49,10 @@ struct DaemonConfig {
     /// Policy rules loaded from config. Deny-all default when empty.
     #[serde(default)]
     rules: Vec<PolicyRule>,
+
+    /// Audit log retention in days. Defaults to 90 if not specified.
+    #[serde(default)]
+    audit_retention_days: Option<u64>,
 }
 
 /// A single entry in the known human clients allowlist.
@@ -191,6 +196,13 @@ impl OperationHandler for NoopHandler {
 async fn run(socket: PathBuf) -> std::io::Result<()> {
     ensure_socket_parent_dir(&socket)?;
 
+    // Acquire PID file lock before anything else.
+    let pid_path = socket
+        .parent()
+        .expect("socket path should have a parent directory")
+        .join("opaqued.pid");
+    let _pid_guard = PidFileGuard::acquire(pid_path)?;
+
     if socket.exists() {
         match UnixStream::connect(&socket).await {
             Ok(_) => {
@@ -239,7 +251,21 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
     let policy = PolicyEngine::with_rules(config.rules.clone());
     info!("policy engine loaded with {} rules", policy.rule_count());
 
-    let audit = Arc::new(TracingAuditEmitter::new());
+    let tracing_sink = Arc::new(TracingAuditEmitter::new());
+    let audit_db_path = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+        .join(".opaque")
+        .join("audit.db");
+    let retention_days = config.audit_retention_days.unwrap_or(90);
+    let sqlite_sink = Arc::new(
+        SqliteAuditSink::new(audit_db_path.clone(), retention_days)
+            .expect("failed to open audit database"),
+    );
+    info!(
+        "audit database at {} (retention: {} days)",
+        audit_db_path.display(),
+        retention_days
+    );
+    let audit = Arc::new(MultiAuditSink::new(vec![tracing_sink, sqlite_sink]));
 
     let enclave = Enclave::builder()
         .registry(registry)
@@ -256,6 +282,10 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         daemon_token,
         connection_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
     });
+
+    // Shutdown coordination: watch channel + active connection counter.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let active_connections = Arc::new(AtomicUsize::new(0));
 
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
@@ -283,15 +313,33 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
                     }
                 };
                 let state = state.clone();
+                let conn_shutdown_rx = shutdown_rx.clone();
+                let conn_counter = active_connections.clone();
+                conn_counter.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(async move {
-                    // Hold the permit for the connection lifetime.
                     let _permit = permit;
-                    if let Err(e) = handle_conn(state, stream).await {
+                    if let Err(e) = handle_conn(state, stream, conn_shutdown_rx).await {
                         warn!("connection error: {e}");
                     }
+                    conn_counter.fetch_sub(1, Ordering::SeqCst);
                 });
             }
         }
+    }
+
+    // Graceful drain: signal all connections to stop accepting new requests.
+    let _ = shutdown_tx.send(true);
+    let drain_deadline = std::time::Duration::from_secs(5);
+    info!("draining active connections (up to 5s)...");
+    let drain_start = std::time::Instant::now();
+    while active_connections.load(Ordering::SeqCst) > 0 && drain_start.elapsed() < drain_deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let remaining = active_connections.load(Ordering::SeqCst);
+    if remaining > 0 {
+        warn!("{remaining} connections still active after drain timeout");
+    } else {
+        info!("all connections drained");
     }
 
     Ok(())
@@ -319,6 +367,96 @@ impl SocketGuard {
 impl Drop for SocketGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PID file guard (advisory flock)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct PidFileGuard {
+    _file: std::fs::File, // Keep file open to hold flock
+    path: PathBuf,
+}
+
+impl PidFileGuard {
+    fn acquire(path: PathBuf) -> std::io::Result<Self> {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)?;
+        // Acquire exclusive advisory lock (non-blocking).
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if ret != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    "daemon already running (PID file locked)",
+                ));
+            }
+        }
+        write!(file, "{}", std::process::id())?;
+        file.flush()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(Self { _file: file, path })
+    }
+}
+
+impl Drop for PidFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-connection rate limiter
+// ---------------------------------------------------------------------------
+
+struct ConnectionRateLimiter {
+    timestamps: std::collections::VecDeque<std::time::Instant>,
+    burst: usize,
+    sustained_per_sec: f64,
+}
+
+impl ConnectionRateLimiter {
+    fn new(burst: usize, sustained_per_sec: f64) -> Self {
+        Self {
+            timestamps: std::collections::VecDeque::new(),
+            burst,
+            sustained_per_sec,
+        }
+    }
+
+    fn check(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let window = std::time::Duration::from_secs(1);
+        // Remove timestamps older than 1 second.
+        while let Some(&front) = self.timestamps.front() {
+            if now.duration_since(front) > window {
+                self.timestamps.pop_front();
+            } else {
+                break;
+            }
+        }
+        // Check sustained rate (requests in last second).
+        if self.timestamps.len() >= self.sustained_per_sec as usize {
+            return false;
+        }
+        // Check burst.
+        if self.timestamps.len() >= self.burst {
+            return false;
+        }
+        self.timestamps.push_back(now);
+        true
     }
 }
 
@@ -679,7 +817,11 @@ fn verify_peer_uid(peer: &opaque_core::peer::PeerInfo) -> bool {
     }
 }
 
-async fn handle_conn(state: Arc<DaemonState>, stream: UnixStream) -> std::io::Result<()> {
+async fn handle_conn(
+    state: Arc<DaemonState>,
+    stream: UnixStream,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> std::io::Result<()> {
     let fd = stream.as_raw_fd();
     let peer = peer_info_from_fd(fd).ok();
 
@@ -731,10 +873,24 @@ async fn handle_conn(state: Arc<DaemonState>, stream: UnixStream) -> std::io::Re
         return Ok(());
     }
 
+    // Per-connection rate limiter: burst of 10, sustained 2 req/s.
+    let mut rate_limiter = ConnectionRateLimiter::new(10, 2.0);
+
     loop {
+        // Stop accepting new requests when shutdown is signaled.
+        if *shutdown_rx.borrow() {
+            info!("shutdown signaled, closing connection");
+            break;
+        }
+
         // Idle timeout: disconnect clients that send no frames for 30 seconds.
-        let next_frame =
-            tokio::time::timeout(std::time::Duration::from_secs(30), framed.next()).await;
+        let next_frame = tokio::select! {
+            frame = tokio::time::timeout(std::time::Duration::from_secs(30), framed.next()) => frame,
+            _ = shutdown_rx.changed() => {
+                info!("shutdown signaled, closing connection");
+                break;
+            }
+        };
 
         match next_frame {
             Ok(Some(Ok(frame))) => {
@@ -750,8 +906,30 @@ async fn handle_conn(state: Arc<DaemonState>, stream: UnixStream) -> std::io::Re
                     }
                 };
 
+                // Per-connection rate limiting.
+                if !rate_limiter.check() {
+                    warn!("rate limit exceeded for connection");
+                    let resp = Response::err(Some(req.id), "rate_limited", "too many requests");
+                    let out = serde_json::to_vec(&resp).map_err(std::io::Error::other)?;
+                    framed.send(Bytes::from(out)).await?;
+                    continue;
+                }
+
                 // Never log params (may contain secrets due to client bugs).
-                let resp = handle_request(&state, req, &identity, client_type).await;
+                // Request timeout: 120 seconds.
+                let req_id = req.id;
+                let resp = match tokio::time::timeout(
+                    std::time::Duration::from_secs(120),
+                    handle_request(&state, req, &identity, client_type),
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => {
+                        warn!("request timed out after 120s");
+                        Response::err(Some(req_id), "timeout", "request timed out")
+                    }
+                };
                 let out = serde_json::to_vec(&resp).map_err(std::io::Error::other)?;
                 framed.send(Bytes::from(out)).await?;
             }
@@ -816,8 +994,14 @@ async fn handle_request(
     client_type: ClientType,
 ) -> Response {
     match req.method.as_str() {
-        "ping" => Response::ok(req.id, serde_json::json!({ "ok": true })),
-        "version" => Response::ok(req.id, serde_json::json!({ "version": state.version })),
+        "ping" => Response::ok(
+            req.id,
+            serde_json::json!({ "ok": true, "api_version": opaque_core::API_VERSION }),
+        ),
+        "version" => Response::ok(
+            req.id,
+            serde_json::json!({ "version": state.version, "api_version": opaque_core::API_VERSION }),
+        ),
         "whoami" => {
             // Agent clients get minimal info to prevent reconnaissance.
             // Human clients get the full dump.
@@ -1257,5 +1441,211 @@ exe_sha256 = "deadbeef"
             config.known_human_clients[1].exe_sha256.as_deref(),
             Some("deadbeef")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // PID file tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pid_file_acquire_creates_file_with_pid() {
+        let dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir())
+            .join(format!("opaque-pid-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_path = dir.join("opaqued.pid");
+
+        let guard = PidFileGuard::acquire(pid_path.clone()).unwrap();
+        let contents = std::fs::read_to_string(&pid_path).unwrap();
+        assert_eq!(contents, format!("{}", std::process::id()));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let meta = pid_path.metadata().unwrap();
+            assert_eq!(meta.mode() & 0o777, 0o600);
+        }
+
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pid_file_double_acquire_fails() {
+        let dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir())
+            .join(format!("opaque-pid-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_path = dir.join("opaqued.pid");
+
+        let _guard1 = PidFileGuard::acquire(pid_path.clone()).unwrap();
+        let result = PidFileGuard::acquire(pid_path.clone());
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+        assert!(err.to_string().contains("daemon already running"));
+
+        drop(_guard1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pid_file_cleaned_up_on_drop() {
+        let dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir())
+            .join(format!("opaque-pid-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_path = dir.join("opaqued.pid");
+
+        let guard = PidFileGuard::acquire(pid_path.clone()).unwrap();
+        assert!(pid_path.exists());
+        drop(guard);
+        assert!(!pid_path.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pid_file_reacquire_after_drop() {
+        let dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir())
+            .join(format!("opaque-pid-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_path = dir.join("opaqued.pid");
+
+        let guard1 = PidFileGuard::acquire(pid_path.clone()).unwrap();
+        drop(guard1);
+        // Should succeed after first guard is dropped.
+        let _guard2 = PidFileGuard::acquire(pid_path.clone()).unwrap();
+
+        drop(_guard2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Rate limiter tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rate_limiter_allows_burst() {
+        let mut rl = ConnectionRateLimiter::new(5, 10.0);
+        for _ in 0..5 {
+            assert!(rl.check());
+        }
+    }
+
+    #[test]
+    fn rate_limiter_rejects_above_burst() {
+        let mut rl = ConnectionRateLimiter::new(3, 10.0);
+        assert!(rl.check());
+        assert!(rl.check());
+        assert!(rl.check());
+        // 4th should be rejected (burst = 3).
+        assert!(!rl.check());
+    }
+
+    #[test]
+    fn rate_limiter_rejects_above_sustained() {
+        // sustained_per_sec = 2 means max 2 requests in the 1s window.
+        let mut rl = ConnectionRateLimiter::new(10, 2.0);
+        assert!(rl.check());
+        assert!(rl.check());
+        // 3rd should be rejected (sustained = 2).
+        assert!(!rl.check());
+    }
+
+    // -----------------------------------------------------------------------
+    // api_version tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn ping_includes_api_version() {
+        let state = make_test_state();
+        let req = Request {
+            id: 1,
+            method: "ping".into(),
+            params: serde_json::Value::Null,
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human).await;
+        let result = resp.result.unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["api_version"], opaque_core::API_VERSION);
+    }
+
+    #[tokio::test]
+    async fn version_includes_api_version() {
+        let state = make_test_state();
+        let req = Request {
+            id: 2,
+            method: "version".into(),
+            params: serde_json::Value::Null,
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human).await;
+        let result = resp.result.unwrap();
+        assert!(result["version"].is_string());
+        assert_eq!(result["api_version"], opaque_core::API_VERSION);
+    }
+
+    #[tokio::test]
+    async fn unknown_method_returns_error() {
+        let state = make_test_state();
+        let req = Request {
+            id: 3,
+            method: "nonexistent".into(),
+            params: serde_json::Value::Null,
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human).await;
+        assert!(resp.error.is_some());
+        assert_eq!(resp.error.unwrap().code, "unknown_method");
+    }
+
+    // -----------------------------------------------------------------------
+    // Request timeout test
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn request_timeout_produces_timeout_response() {
+        tokio::time::pause();
+        let slow_future = async {
+            tokio::time::sleep(std::time::Duration::from_secs(200)).await;
+            Response::ok(1, serde_json::json!({"ok": true}))
+        };
+        let req_id = 42u64;
+        let resp =
+            match tokio::time::timeout(std::time::Duration::from_secs(120), slow_future).await {
+                Ok(r) => r,
+                Err(_) => Response::err(Some(req_id), "timeout", "request timed out"),
+            };
+        assert!(resp.error.is_some());
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, "timeout");
+        assert_eq!(resp.id, Some(42));
+    }
+
+    // -----------------------------------------------------------------------
+    // Test helpers
+    // -----------------------------------------------------------------------
+
+    fn make_test_state() -> DaemonState {
+        let registry = OperationRegistry::new();
+        let policy = PolicyEngine::with_rules(vec![]);
+        let audit = Arc::new(TracingAuditEmitter::new());
+        let enclave = Enclave::builder()
+            .registry(registry)
+            .policy(policy)
+            .approval_gate(Box::new(NativeApprovalGate))
+            .audit(audit)
+            .build();
+        DaemonState {
+            enclave: Arc::new(enclave),
+            config: DaemonConfig::default(),
+            version: env!("CARGO_PKG_VERSION"),
+            daemon_token: "test_token".into(),
+            connection_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+        }
     }
 }
