@@ -27,6 +27,7 @@ use opaque_core::operation::OperationRequest;
 use opaque_core::profile::{self, ExecProfile};
 use opaque_core::proto::ExecFrame;
 use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 
 use crate::enclave::OperationHandler;
 use crate::secret::SecretValue;
@@ -150,10 +151,46 @@ impl OperationHandler for SandboxExecutor {
             audit.emit(sandbox_event);
 
             // Create the frame channel for streaming.
+            //
+            // IMPORTANT: Drain this concurrently while the sandbox runs. If we
+            // only collect after completion, the bounded channel can fill up
+            // and deadlock output tasks that are awaiting `send()`.
             let (tx, mut rx) = mpsc::channel::<ExecFrame>(64);
+
+            #[derive(Debug, Default)]
+            struct FrameSummary {
+                stdout_len: u64,
+                stderr_len: u64,
+                duration_ms: u64,
+            }
+
+            let summary = Arc::new(Mutex::new(FrameSummary::default()));
+            let summary_rx = summary.clone();
+
+            let drain_task = tokio::spawn(async move {
+                while let Some(frame) = rx.recv().await {
+                    let mut s = summary_rx.lock().await;
+                    match frame {
+                        ExecFrame::Output {
+                            stream: opaque_core::proto::ExecStream::Stdout,
+                            data,
+                        } => s.stdout_len = s.stdout_len.saturating_add(data.len() as u64),
+                        ExecFrame::Output {
+                            stream: opaque_core::proto::ExecStream::Stderr,
+                            data,
+                        } => s.stderr_len = s.stderr_len.saturating_add(data.len() as u64),
+                        ExecFrame::ExecCompleted { duration_ms: d, .. } => s.duration_ms = d,
+                        _ => {}
+                    }
+                }
+            });
 
             // Dispatch to platform-specific sandbox.
             let exit_code = execute_platform_sandbox(&profile, command, env, tx).await?;
+
+            // Best-effort: wait for the drain task to finish once the channel closes.
+            // Ignore join errors (panic) and fall back to default zero values.
+            let _ = drain_task.await;
 
             // Emit SandboxCompleted audit event.
             let completed_event = AuditEvent::new(AuditEventKind::SandboxCompleted)
@@ -163,33 +200,14 @@ impl OperationHandler for SandboxExecutor {
                 .with_detail(format!("profile={profile_name} exit_code={exit_code}"));
             audit.emit(completed_event);
 
-            // Collect all frames for the response.
-            // In the streaming case, the daemon would send these as they arrive.
-            // For the non-streaming OperationHandler, we collect and return summary.
-            let mut stdout_output = String::new();
-            let mut stderr_output = String::new();
-            let mut duration_ms = 0u64;
-            while let Ok(frame) = rx.try_recv() {
-                match frame {
-                    ExecFrame::Output {
-                        stream: opaque_core::proto::ExecStream::Stdout,
-                        data,
-                    } => stdout_output.push_str(&data),
-                    ExecFrame::Output {
-                        stream: opaque_core::proto::ExecStream::Stderr,
-                        data,
-                    } => stderr_output.push_str(&data),
-                    ExecFrame::ExecCompleted { duration_ms: d, .. } => duration_ms = d,
-                    _ => {}
-                }
-            }
+            let s = summary.lock().await;
 
             // Return a summary result (the streaming handler sends frames directly).
             Ok(serde_json::json!({
                 "exit_code": exit_code,
-                "duration_ms": duration_ms,
-                "stdout_length": stdout_output.len(),
-                "stderr_length": stderr_output.len(),
+                "duration_ms": s.duration_ms,
+                "stdout_length": s.stdout_len,
+                "stderr_length": s.stderr_len,
             }))
         })
     }
