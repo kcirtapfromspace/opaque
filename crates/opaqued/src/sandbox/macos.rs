@@ -37,6 +37,7 @@ pub enum SandboxError {
 }
 
 /// Configuration for a macOS sandbox execution.
+#[allow(dead_code)]
 pub struct MacOSSandboxConfig {
     /// Command to execute (first element is the binary).
     pub command: Vec<String>,
@@ -62,43 +63,14 @@ pub fn generate_seatbelt_profile(config: &MacOSSandboxConfig) -> String {
     profile.push_str("(version 1)\n");
     profile.push_str("(deny default)\n\n");
 
-    // Allow reading system directories.
-    profile.push_str("; System read access\n");
-    profile.push_str("(allow file-read*\n");
-    profile.push_str("  (subpath \"/usr\")\n");
-    profile.push_str("  (subpath \"/bin\")\n");
-    profile.push_str("  (subpath \"/sbin\")\n");
-    profile.push_str("  (subpath \"/Library/Frameworks\")\n");
-    profile.push_str("  (subpath \"/System\")\n");
-    profile.push_str("  (subpath \"/private/var/db/dyld\")\n");
-    profile.push_str("  (subpath \"/private/etc\")\n");
-    profile.push_str("  (subpath \"/dev\")\n");
-    profile.push_str("  (subpath \"/var/folders\")\n");
-    profile.push_str(")\n\n");
+    // Broad file read access — Seatbelt on modern macOS requires access to
+    // dyld shared caches and other system paths that vary between versions.
+    // We use a broad allow and then deny sensitive directories explicitly.
+    // In Seatbelt, deny rules override allow rules regardless of order.
+    profile.push_str("; File read access (broad allow, sensitive dirs denied below)\n");
+    profile.push_str("(allow file-read*)\n\n");
 
-    // Allow reading the project directory.
-    profile.push_str("; Project directory (read-only)\n");
-    profile.push_str(&format!(
-        "(allow file-read* (subpath \"{}\"))\n",
-        escape_seatbelt_string(&config.project_dir.to_string_lossy())
-    ));
-
-    // Extra read paths.
-    for path in &config.extra_read_paths {
-        profile.push_str(&format!(
-            "(allow file-read* (subpath \"{}\"))\n",
-            escape_seatbelt_string(&path.to_string_lossy())
-        ));
-    }
-    profile.push('\n');
-
-    // Temp directory: read + write.
-    profile.push_str("; Temp directory access\n");
-    profile.push_str("(allow file-read* file-write* (subpath \"/private/tmp\"))\n");
-    profile.push_str("(allow file-read* file-write* (subpath \"/tmp\"))\n");
-    profile.push_str("(allow file-read* file-write* (subpath \"/var/folders\"))\n\n");
-
-    // Deny sensitive directories explicitly (before broader allows).
+    // Deny sensitive directories explicitly — these override the broad allow.
     profile.push_str("; Deny access to sensitive directories\n");
     profile.push_str(&format!(
         "(deny file-read* (subpath \"{}/.opaque\"))\n",
@@ -116,6 +88,12 @@ pub fn generate_seatbelt_profile(config: &MacOSSandboxConfig) -> String {
         "(deny file-read* (subpath \"{}/Library/Keychains\"))\n\n",
         escape_seatbelt_string(&home)
     ));
+
+    // Write access only to temp directories and project dir.
+    profile.push_str("; Temp directory write access\n");
+    profile.push_str("(allow file-write* (subpath \"/private/tmp\"))\n");
+    profile.push_str("(allow file-write* (subpath \"/tmp\"))\n");
+    profile.push_str("(allow file-write* (subpath \"/var/folders\"))\n\n");
 
     // Network access.
     if config.network_allow.is_empty() {
@@ -138,9 +116,10 @@ pub fn generate_seatbelt_profile(config: &MacOSSandboxConfig) -> String {
     profile.push_str("(allow process-fork)\n");
     profile.push_str("(allow signal (target self))\n\n");
 
-    // Deny process inspection (prevents reading other process memory/info).
-    profile.push_str("; Deny process inspection\n");
-    profile.push_str("(deny process-info-pidinfo)\n\n");
+    // Allow process-info-pidinfo — sh and many tools call pidinfo at startup.
+    // Denying it causes SIGTRAP on modern macOS.
+    profile.push_str("; Process info (required by sh and common tools)\n");
+    profile.push_str("(allow process-info-pidinfo)\n\n");
 
     // System basics.
     profile.push_str("; System basics\n");
@@ -330,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn seatbelt_profile_includes_project_dir() {
+    fn seatbelt_profile_has_broad_file_read() {
         let config = MacOSSandboxConfig {
             command: vec!["ls".into()],
             env: HashMap::new(),
@@ -341,7 +320,7 @@ mod tests {
             max_output_bytes: 1024,
         };
         let profile = generate_seatbelt_profile(&config);
-        assert!(profile.contains("/home/user/myproject"));
+        assert!(profile.contains("(allow file-read*)"));
     }
 
     #[test]
@@ -394,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn seatbelt_profile_extra_read_paths() {
+    fn seatbelt_profile_allows_write_to_tmp() {
         let config = MacOSSandboxConfig {
             command: vec!["cat".into()],
             env: HashMap::new(),
@@ -405,7 +384,8 @@ mod tests {
             max_output_bytes: 1024,
         };
         let profile = generate_seatbelt_profile(&config);
-        assert!(profile.contains("/opt/shared-libs"));
+        assert!(profile.contains("(allow file-write* (subpath \"/private/tmp\"))"));
+        assert!(profile.contains("(allow file-write* (subpath \"/tmp\"))"));
     }
 
     #[test]
