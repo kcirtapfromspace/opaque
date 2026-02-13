@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use opaque_core::audit::{AuditEventKind, AuditFilter, query_audit_db};
 use opaque_core::policy::PolicyRule;
+use opaque_core::profile;
 use opaque_core::proto::{Request, Response};
 use opaque_core::socket::{socket_path, verify_socket_safety};
 use tokio::net::UnixStream;
@@ -94,6 +95,21 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         force: bool,
     },
+    /// Execute a command in a sandboxed environment.
+    Exec {
+        /// Profile name (loads ~/.opaque/profiles/<name>.toml).
+        #[arg(long)]
+        profile: String,
+
+        /// Command and arguments to execute in the sandbox.
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+    /// Manage execution profiles.
+    Profile {
+        #[command(subcommand)]
+        action: ProfileAction,
+    },
     /// Query the audit log.
     Audit {
         #[command(subcommand)]
@@ -108,6 +124,22 @@ enum PolicyAction {
         /// Path to config file (default: ~/.opaque/config.toml or $OPAQUE_CONFIG).
         #[arg(long)]
         file: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProfileAction {
+    /// List available profiles.
+    List,
+    /// Show a profile's contents.
+    Show {
+        /// Profile name.
+        name: String,
+    },
+    /// Validate a profile.
+    Validate {
+        /// Profile name.
+        name: String,
     },
 }
 
@@ -178,6 +210,18 @@ async fn main() {
             }
             return;
         }
+        Cmd::Profile { action } => {
+            match run_profile_action(action) {
+                Ok(msg) => {
+                    println!("{msg}");
+                }
+                Err(e) => {
+                    eprintln!("opaque: {e}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
         Cmd::Audit { action } => {
             match action {
                 AuditAction::Tail {
@@ -236,8 +280,17 @@ async fn main() {
             });
             ("execute", params)
         }
+        Cmd::Exec { profile, command } => {
+            let params = serde_json::json!({
+                "profile": profile,
+                "command": command,
+            });
+            ("exec", params)
+        }
         // Already handled above; unreachable.
-        Cmd::Policy { .. } | Cmd::Init { .. } | Cmd::Audit { .. } => unreachable!(),
+        Cmd::Policy { .. } | Cmd::Init { .. } | Cmd::Audit { .. } | Cmd::Profile { .. } => {
+            unreachable!()
+        }
     };
 
     match call(&sock, method, params).await {
@@ -626,9 +679,12 @@ fn run_init_at(base: &Path, force: bool) -> Result<String, String> {
         ));
     }
 
+    let profiles_dir = base.join("profiles");
+
     // Create directories with mode 0700.
     create_dir_0700(base)?;
     create_dir_0700(&run_dir)?;
+    create_dir_0700(&profiles_dir)?;
 
     // Write config file.
     std::fs::write(&config_path, SAMPLE_CONFIG)
@@ -638,6 +694,7 @@ fn run_init_at(base: &Path, force: bool) -> Result<String, String> {
     summary.push_str(&format!("initialized opaque at {}\n", base.display()));
     summary.push_str(&format!("  created {}\n", base.display()));
     summary.push_str(&format!("  created {}\n", run_dir.display()));
+    summary.push_str(&format!("  created {}\n", profiles_dir.display()));
     summary.push_str(&format!("  wrote {}", config_path.display()));
     Ok(summary)
 }
@@ -658,6 +715,66 @@ fn create_dir_0700(path: &Path) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Profile management
+// ---------------------------------------------------------------------------
+
+/// Handle profile subcommands (list, show, validate).
+fn run_profile_action(action: &ProfileAction) -> Result<String, String> {
+    let profiles_dir = profile::profiles_dir();
+
+    match action {
+        ProfileAction::List => {
+            if !profiles_dir.exists() {
+                return Ok("no profiles directory found (run `opaque init` first)".into());
+            }
+
+            let entries = std::fs::read_dir(&profiles_dir)
+                .map_err(|e| format!("failed to read profiles dir: {e}"))?;
+
+            let mut names: Vec<String> = entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "toml"))
+                .filter_map(|e| {
+                    e.path()
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                })
+                .collect();
+
+            names.sort();
+
+            if names.is_empty() {
+                return Ok("no profiles found".into());
+            }
+
+            let mut output = format!("{} profile(s) found:\n", names.len());
+            for name in &names {
+                output.push_str(&format!("  {name}\n"));
+            }
+            Ok(output.trim_end().to_string())
+        }
+
+        ProfileAction::Show { name } => {
+            let path = profiles_dir.join(format!("{name}.toml"));
+            let contents = std::fs::read_to_string(&path)
+                .map_err(|e| format!("failed to read profile '{name}': {e}"))?;
+            Ok(contents)
+        }
+
+        ProfileAction::Validate { name } => {
+            let path = profiles_dir.join(format!("{name}.toml"));
+            let contents = std::fs::read_to_string(&path)
+                .map_err(|e| format!("failed to read profile '{name}': {e}"))?;
+
+            profile::load_profile(&contents, Some(name))
+                .map_err(|e| format!("profile validation failed: {e}"))?;
+
+            Ok(format!("profile '{name}' is valid"))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -2,6 +2,7 @@ pub mod audit;
 pub mod operation;
 pub mod peer;
 pub mod policy;
+pub mod profile;
 pub mod proto;
 pub mod sanitize;
 pub mod socket;

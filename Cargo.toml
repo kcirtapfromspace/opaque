@@ -21,9 +21,10 @@ serde_json = "1.0.135"
 sha2 = "0.10"
 thiserror = "2.0.11"
 toml_edit = { version = "0.22", features = ["serde"] }
-tokio = { version = "1.43.0", features = ["rt-multi-thread", "macros", "net", "io-util", "fs", "signal", "sync", "time"] }
+tokio = { version = "1.43.0", features = ["rt-multi-thread", "macros", "net", "io-util", "fs", "signal", "sync", "time", "process"] }
 tokio-util = { version = "0.7.13", features = ["codec"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 uuid = { version = "1.11", features = ["v4", "serde"] }
+nix = { version = "0.29", features = ["sched", "mount", "signal", "process", "user"] }
