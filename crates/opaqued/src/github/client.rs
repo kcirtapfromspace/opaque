@@ -1,8 +1,9 @@
-//! GitHub REST API client for Actions secrets management.
+//! GitHub REST API client for secrets management.
 //!
-//! Wraps the two endpoints needed to set a repository secret:
-//! - `GET /repos/{owner}/{repo}/actions/secrets/public-key`
-//! - `PUT /repos/{owner}/{repo}/actions/secrets/{secret_name}`
+//! Wraps the endpoints needed to set secrets across GitHub secret scopes:
+//! - Repo Actions, Environment Actions, Codespaces (user/repo), Dependabot, Org Actions
+//!
+//! Uses [`SecretScope`] to generate correct endpoint paths for all variants.
 //!
 //! **Never** leaks raw GitHub API error bodies to callers — all errors
 //! are mapped to sanitized [`GitHubApiError`] variants.
@@ -59,7 +60,117 @@ impl GitHubApiError {
     }
 }
 
-/// Response from `GET /repos/{owner}/{repo}/actions/secrets/public-key`.
+/// Identifies which GitHub secret scope (API endpoint family) to use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecretScope<'a> {
+    /// `repos/{owner}/{repo}/actions/secrets`
+    RepoActions { owner: &'a str, repo: &'a str },
+    /// `repos/{owner}/{repo}/environments/{env}/secrets`
+    EnvActions {
+        owner: &'a str,
+        repo: &'a str,
+        environment: &'a str,
+    },
+    /// `user/codespaces/secrets`
+    CodespacesUser,
+    /// `repos/{owner}/{repo}/codespaces/secrets`
+    CodespacesRepo { owner: &'a str, repo: &'a str },
+    /// `repos/{owner}/{repo}/dependabot/secrets`
+    Dependabot { owner: &'a str, repo: &'a str },
+    /// `orgs/{org}/actions/secrets`
+    OrgActions { org: &'a str },
+}
+
+impl<'a> SecretScope<'a> {
+    /// Returns the API path segment for fetching the public key.
+    pub fn public_key_path(&self) -> String {
+        match self {
+            SecretScope::RepoActions { owner, repo } => {
+                format!("/repos/{owner}/{repo}/actions/secrets/public-key")
+            }
+            SecretScope::EnvActions {
+                owner,
+                repo,
+                environment,
+            } => {
+                format!("/repos/{owner}/{repo}/environments/{environment}/secrets/public-key")
+            }
+            SecretScope::CodespacesUser => "/user/codespaces/secrets/public-key".into(),
+            SecretScope::CodespacesRepo { owner, repo } => {
+                format!("/repos/{owner}/{repo}/codespaces/secrets/public-key")
+            }
+            SecretScope::Dependabot { owner, repo } => {
+                format!("/repos/{owner}/{repo}/dependabot/secrets/public-key")
+            }
+            SecretScope::OrgActions { org } => {
+                format!("/orgs/{org}/actions/secrets/public-key")
+            }
+        }
+    }
+
+    /// Returns the API path segment for setting (PUT) a secret.
+    pub fn set_secret_path(&self, name: &str) -> String {
+        match self {
+            SecretScope::RepoActions { owner, repo } => {
+                format!("/repos/{owner}/{repo}/actions/secrets/{name}")
+            }
+            SecretScope::EnvActions {
+                owner,
+                repo,
+                environment,
+            } => {
+                format!("/repos/{owner}/{repo}/environments/{environment}/secrets/{name}")
+            }
+            SecretScope::CodespacesUser => {
+                format!("/user/codespaces/secrets/{name}")
+            }
+            SecretScope::CodespacesRepo { owner, repo } => {
+                format!("/repos/{owner}/{repo}/codespaces/secrets/{name}")
+            }
+            SecretScope::Dependabot { owner, repo } => {
+                format!("/repos/{owner}/{repo}/dependabot/secrets/{name}")
+            }
+            SecretScope::OrgActions { org } => {
+                format!("/orgs/{org}/actions/secrets/{name}")
+            }
+        }
+    }
+
+    /// Returns a human-readable target description for error messages and audit logs.
+    /// Never includes secret values.
+    pub fn display_target(&self) -> String {
+        match self {
+            SecretScope::RepoActions { owner, repo } => format!("repo={owner}/{repo}"),
+            SecretScope::EnvActions {
+                owner,
+                repo,
+                environment,
+            } => format!("repo={owner}/{repo} environment={environment}"),
+            SecretScope::CodespacesUser => "scope=user/codespaces".into(),
+            SecretScope::CodespacesRepo { owner, repo } => {
+                format!("repo={owner}/{repo} scope=codespaces")
+            }
+            SecretScope::Dependabot { owner, repo } => {
+                format!("repo={owner}/{repo} scope=dependabot")
+            }
+            SecretScope::OrgActions { org } => format!("org={org}"),
+        }
+    }
+
+    /// Returns the 404 context string for error messages.
+    fn not_found_context(&self) -> String {
+        match self {
+            SecretScope::RepoActions { owner, repo }
+            | SecretScope::EnvActions { owner, repo, .. }
+            | SecretScope::CodespacesRepo { owner, repo }
+            | SecretScope::Dependabot { owner, repo } => format!("{owner}/{repo}"),
+            SecretScope::CodespacesUser => "user/codespaces".into(),
+            SecretScope::OrgActions { org } => format!("org/{org}"),
+        }
+    }
+}
+
+/// Response from `GET .../secrets/public-key`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PublicKeyResponse {
     /// The ID of the key used for encryption.
@@ -68,7 +179,7 @@ pub struct PublicKeyResponse {
     pub key: String,
 }
 
-/// Response variants from `PUT /repos/{owner}/{repo}/actions/secrets/{name}`.
+/// Response variants from `PUT .../secrets/{name}`.
 #[derive(Debug, Clone)]
 pub enum SetSecretResponse {
     /// Secret was created (HTTP 201).
@@ -82,9 +193,13 @@ pub enum SetSecretResponse {
 struct SetSecretPayload {
     encrypted_value: String,
     key_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    visibility: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_repository_ids: Option<Vec<i64>>,
 }
 
-/// GitHub REST API client for Actions secrets.
+/// GitHub REST API client for secrets.
 #[derive(Debug, Clone)]
 pub struct GitHubClient {
     http: reqwest::Client,
@@ -123,19 +238,13 @@ impl GitHubClient {
         Self { http, base_url }
     }
 
-    /// Fetch the repository's public key for encrypting secrets.
-    ///
-    /// `GET /repos/{owner}/{repo}/actions/secrets/public-key`
-    pub async fn get_public_key(
+    /// Fetch the public key for a given secret scope.
+    pub async fn get_public_key_scoped(
         &self,
         token: &str,
-        owner: &str,
-        repo: &str,
+        scope: &SecretScope<'_>,
     ) -> Result<PublicKeyResponse, GitHubApiError> {
-        let url = format!(
-            "{}/repos/{owner}/{repo}/actions/secrets/public-key",
-            self.base_url
-        );
+        let url = format!("{}{}", self.base_url, scope.public_key_path());
 
         let resp = self
             .http
@@ -153,33 +262,43 @@ impl GitHubClient {
                 .await
                 .map_err(GitHubApiError::Network),
             401 | 403 => Err(GitHubApiError::Unauthorized),
-            404 => Err(GitHubApiError::NotFound(format!("{owner}/{repo}"))),
+            404 => Err(GitHubApiError::NotFound(scope.not_found_context())),
             429 => Err(GitHubApiError::RateLimited),
             500..=599 => Err(GitHubApiError::ServerError),
             other => Err(GitHubApiError::UnexpectedStatus(other)),
         }
     }
 
-    /// Set (create or update) a repository secret.
+    /// Set (create or update) a secret for a given scope.
     ///
-    /// `PUT /repos/{owner}/{repo}/actions/secrets/{secret_name}`
-    pub async fn set_secret(
+    /// `extra_body` merges additional fields into the PUT payload (e.g.,
+    /// `visibility` and `selected_repository_ids` for org/codespaces-user secrets).
+    pub async fn set_secret_scoped(
         &self,
         token: &str,
-        owner: &str,
-        repo: &str,
+        scope: &SecretScope<'_>,
         name: &str,
         encrypted_value: &str,
         key_id: &str,
+        extra_body: Option<&serde_json::Value>,
     ) -> Result<SetSecretResponse, GitHubApiError> {
-        let url = format!(
-            "{}/repos/{owner}/{repo}/actions/secrets/{name}",
-            self.base_url
-        );
+        let url = format!("{}{}", self.base_url, scope.set_secret_path(name));
+
+        let visibility = extra_body
+            .and_then(|v| v.get("visibility"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_owned());
+
+        let selected_repository_ids = extra_body
+            .and_then(|v| v.get("selected_repository_ids"))
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect::<Vec<i64>>());
 
         let payload = SetSecretPayload {
             encrypted_value: encrypted_value.to_owned(),
             key_id: key_id.to_owned(),
+            visibility,
+            selected_repository_ids,
         };
 
         let resp = self
@@ -197,12 +316,50 @@ impl GitHubClient {
             201 => Ok(SetSecretResponse::Created),
             204 => Ok(SetSecretResponse::Updated),
             401 | 403 => Err(GitHubApiError::Unauthorized),
-            404 => Err(GitHubApiError::NotFound(format!("{owner}/{repo}"))),
+            404 => Err(GitHubApiError::NotFound(scope.not_found_context())),
             422 => Err(GitHubApiError::UnexpectedStatus(422)),
             429 => Err(GitHubApiError::RateLimited),
             500..=599 => Err(GitHubApiError::ServerError),
             other => Err(GitHubApiError::UnexpectedStatus(other)),
         }
+    }
+
+    /// Fetch the repository's public key for encrypting secrets.
+    ///
+    /// Delegates to [`get_public_key_scoped`] with `SecretScope::RepoActions`.
+    #[allow(dead_code)]
+    pub async fn get_public_key(
+        &self,
+        token: &str,
+        owner: &str,
+        repo: &str,
+    ) -> Result<PublicKeyResponse, GitHubApiError> {
+        self.get_public_key_scoped(token, &SecretScope::RepoActions { owner, repo })
+            .await
+    }
+
+    /// Set (create or update) a repository Actions secret.
+    ///
+    /// Delegates to [`set_secret_scoped`] with `SecretScope::RepoActions`.
+    #[allow(dead_code)]
+    pub async fn set_secret(
+        &self,
+        token: &str,
+        owner: &str,
+        repo: &str,
+        name: &str,
+        encrypted_value: &str,
+        key_id: &str,
+    ) -> Result<SetSecretResponse, GitHubApiError> {
+        self.set_secret_scoped(
+            token,
+            &SecretScope::RepoActions { owner, repo },
+            name,
+            encrypted_value,
+            key_id,
+            None,
+        )
+        .await
     }
 }
 
@@ -298,5 +455,165 @@ mod tests {
         let resp: PublicKeyResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.key_id, "568250167242549743");
         assert_eq!(resp.key, "dGVzdC1rZXktYmFzZTY0");
+    }
+
+    // -----------------------------------------------------------------------
+    // SecretScope path generation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scope_repo_actions_paths() {
+        let scope = SecretScope::RepoActions {
+            owner: "myorg",
+            repo: "myrepo",
+        };
+        assert_eq!(
+            scope.public_key_path(),
+            "/repos/myorg/myrepo/actions/secrets/public-key"
+        );
+        assert_eq!(
+            scope.set_secret_path("MY_SECRET"),
+            "/repos/myorg/myrepo/actions/secrets/MY_SECRET"
+        );
+    }
+
+    #[test]
+    fn scope_env_actions_paths() {
+        let scope = SecretScope::EnvActions {
+            owner: "myorg",
+            repo: "myrepo",
+            environment: "production",
+        };
+        assert_eq!(
+            scope.public_key_path(),
+            "/repos/myorg/myrepo/environments/production/secrets/public-key"
+        );
+        assert_eq!(
+            scope.set_secret_path("DB_PASSWORD"),
+            "/repos/myorg/myrepo/environments/production/secrets/DB_PASSWORD"
+        );
+    }
+
+    #[test]
+    fn scope_codespaces_user_paths() {
+        let scope = SecretScope::CodespacesUser;
+        assert_eq!(
+            scope.public_key_path(),
+            "/user/codespaces/secrets/public-key"
+        );
+        assert_eq!(
+            scope.set_secret_path("TOKEN"),
+            "/user/codespaces/secrets/TOKEN"
+        );
+    }
+
+    #[test]
+    fn scope_codespaces_repo_paths() {
+        let scope = SecretScope::CodespacesRepo {
+            owner: "myorg",
+            repo: "myrepo",
+        };
+        assert_eq!(
+            scope.public_key_path(),
+            "/repos/myorg/myrepo/codespaces/secrets/public-key"
+        );
+        assert_eq!(
+            scope.set_secret_path("API_KEY"),
+            "/repos/myorg/myrepo/codespaces/secrets/API_KEY"
+        );
+    }
+
+    #[test]
+    fn scope_dependabot_paths() {
+        let scope = SecretScope::Dependabot {
+            owner: "myorg",
+            repo: "myrepo",
+        };
+        assert_eq!(
+            scope.public_key_path(),
+            "/repos/myorg/myrepo/dependabot/secrets/public-key"
+        );
+        assert_eq!(
+            scope.set_secret_path("NPM_TOKEN"),
+            "/repos/myorg/myrepo/dependabot/secrets/NPM_TOKEN"
+        );
+    }
+
+    #[test]
+    fn scope_org_actions_paths() {
+        let scope = SecretScope::OrgActions { org: "myorg" };
+        assert_eq!(
+            scope.public_key_path(),
+            "/orgs/myorg/actions/secrets/public-key"
+        );
+        assert_eq!(
+            scope.set_secret_path("ORG_SECRET"),
+            "/orgs/myorg/actions/secrets/ORG_SECRET"
+        );
+    }
+
+    #[test]
+    fn scope_display_target() {
+        assert_eq!(
+            SecretScope::RepoActions {
+                owner: "o",
+                repo: "r"
+            }
+            .display_target(),
+            "repo=o/r"
+        );
+        assert_eq!(
+            SecretScope::EnvActions {
+                owner: "o",
+                repo: "r",
+                environment: "prod"
+            }
+            .display_target(),
+            "repo=o/r environment=prod"
+        );
+        assert_eq!(
+            SecretScope::CodespacesUser.display_target(),
+            "scope=user/codespaces"
+        );
+        assert_eq!(
+            SecretScope::CodespacesRepo {
+                owner: "o",
+                repo: "r"
+            }
+            .display_target(),
+            "repo=o/r scope=codespaces"
+        );
+        assert_eq!(
+            SecretScope::Dependabot {
+                owner: "o",
+                repo: "r"
+            }
+            .display_target(),
+            "repo=o/r scope=dependabot"
+        );
+        assert_eq!(
+            SecretScope::OrgActions { org: "myorg" }.display_target(),
+            "org=myorg"
+        );
+    }
+
+    #[test]
+    fn scope_not_found_context() {
+        assert_eq!(
+            SecretScope::RepoActions {
+                owner: "o",
+                repo: "r"
+            }
+            .not_found_context(),
+            "o/r"
+        );
+        assert_eq!(
+            SecretScope::CodespacesUser.not_found_context(),
+            "user/codespaces"
+        );
+        assert_eq!(
+            SecretScope::OrgActions { org: "myorg" }.not_found_context(),
+            "org/myorg"
+        );
     }
 }
