@@ -362,6 +362,68 @@ pub struct OperationRequest {
     pub workspace: Option<WorkspaceContext>,
 }
 
+impl OperationRequest {
+    /// Compute a SHA-256 content hash over the canonical fields of this request.
+    ///
+    /// The hash covers: operation name, sorted target entries, sorted secret_ref_names,
+    /// client identity (uid, gid, pid), and workspace (remote_url, branch).
+    ///
+    /// Excludes: `params` (ephemeral), `request_id`, timestamps.
+    ///
+    /// Null-byte delimiters between fields prevent prefix collisions.
+    pub fn content_hash(&self) -> String {
+        use sha2::{Digest, Sha256};
+
+        let mut hasher = Sha256::new();
+
+        // Operation name
+        hasher.update(self.operation.as_bytes());
+        hasher.update(b"\0");
+
+        // Sorted target entries (key=value)
+        let mut target_entries: Vec<_> = self.target.iter().collect();
+        target_entries.sort_by_key(|(k, _)| k.as_str());
+        for (k, v) in &target_entries {
+            hasher.update(k.as_bytes());
+            hasher.update(b"=");
+            hasher.update(v.as_bytes());
+            hasher.update(b"\0");
+        }
+
+        // Sorted secret_ref_names
+        let mut refs = self.secret_ref_names.clone();
+        refs.sort();
+        for r in &refs {
+            hasher.update(r.as_bytes());
+            hasher.update(b"\0");
+        }
+
+        // Client identity: uid, gid, pid as little-endian bytes
+        hasher.update(self.client_identity.uid.to_le_bytes());
+        hasher.update(self.client_identity.gid.to_le_bytes());
+        hasher.update(b"\0");
+        if let Some(pid) = self.client_identity.pid {
+            hasher.update(pid.to_le_bytes());
+        }
+        hasher.update(b"\0");
+
+        // Workspace remote_url + branch
+        if let Some(ref ws) = self.workspace {
+            if let Some(ref url) = ws.remote_url {
+                hasher.update(url.as_bytes());
+            }
+            hasher.update(b"\0");
+            if let Some(ref branch) = ws.branch {
+                hasher.update(branch.as_bytes());
+            }
+            hasher.update(b"\0");
+        }
+
+        let result = hasher.finalize();
+        format!("{result:x}")
+    }
+}
+
 // Custom Debug to avoid any accidental secret leakage.
 impl fmt::Debug for OperationRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -720,6 +782,163 @@ mod tests {
         );
         assert_eq!(rt.branch.as_deref(), Some("main"));
         assert!(!rt.dirty);
+    }
+
+    #[test]
+    fn content_hash_deterministic() {
+        let req1 = OperationRequest {
+            request_id: Uuid::new_v4(),
+            client_identity: ClientIdentity {
+                uid: 501,
+                gid: 20,
+                pid: Some(1),
+                exe_path: None,
+                exe_sha256: None,
+                codesign_team_id: None,
+            },
+            client_type: ClientType::Agent,
+            operation: "test.op".into(),
+            target: {
+                let mut m = HashMap::new();
+                m.insert("repo".into(), "org/repo".into());
+                m
+            },
+            secret_ref_names: vec!["SECRET".into()],
+            created_at: SystemTime::now(),
+            expires_at: None,
+            params: serde_json::json!({"key": "value"}),
+            workspace: None,
+        };
+
+        // Same canonical fields, different request_id and params.
+        let req2 = OperationRequest {
+            request_id: Uuid::new_v4(),                   // Different
+            params: serde_json::json!({"other": "data"}), // Different
+            created_at: SystemTime::now(),                // Different
+            ..req1.clone()
+        };
+
+        assert_eq!(req1.content_hash(), req2.content_hash());
+    }
+
+    #[test]
+    fn content_hash_differs_on_operation() {
+        let req1 = OperationRequest {
+            request_id: Uuid::new_v4(),
+            client_identity: ClientIdentity {
+                uid: 501,
+                gid: 20,
+                pid: Some(1),
+                exe_path: None,
+                exe_sha256: None,
+                codesign_team_id: None,
+            },
+            client_type: ClientType::Agent,
+            operation: "op.a".into(),
+            target: HashMap::new(),
+            secret_ref_names: vec![],
+            created_at: SystemTime::now(),
+            expires_at: None,
+            params: serde_json::Value::Null,
+            workspace: None,
+        };
+
+        let mut req2 = req1.clone();
+        req2.operation = "op.b".into();
+
+        assert_ne!(req1.content_hash(), req2.content_hash());
+    }
+
+    #[test]
+    fn content_hash_differs_on_target() {
+        let req1 = OperationRequest {
+            request_id: Uuid::new_v4(),
+            client_identity: ClientIdentity {
+                uid: 501,
+                gid: 20,
+                pid: Some(1),
+                exe_path: None,
+                exe_sha256: None,
+                codesign_team_id: None,
+            },
+            client_type: ClientType::Agent,
+            operation: "test.op".into(),
+            target: {
+                let mut m = HashMap::new();
+                m.insert("repo".into(), "org/alpha".into());
+                m
+            },
+            secret_ref_names: vec![],
+            created_at: SystemTime::now(),
+            expires_at: None,
+            params: serde_json::Value::Null,
+            workspace: None,
+        };
+
+        let mut req2 = req1.clone();
+        req2.target.insert("repo".into(), "org/beta".into());
+
+        assert_ne!(req1.content_hash(), req2.content_hash());
+    }
+
+    #[test]
+    fn content_hash_is_64_hex_chars() {
+        let req = OperationRequest {
+            request_id: Uuid::new_v4(),
+            client_identity: ClientIdentity {
+                uid: 501,
+                gid: 20,
+                pid: Some(1),
+                exe_path: None,
+                exe_sha256: None,
+                codesign_team_id: None,
+            },
+            client_type: ClientType::Agent,
+            operation: "test.op".into(),
+            target: HashMap::new(),
+            secret_ref_names: vec![],
+            created_at: SystemTime::now(),
+            expires_at: None,
+            params: serde_json::Value::Null,
+            workspace: None,
+        };
+        let hash = req.content_hash();
+        assert_eq!(hash.len(), 64);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn content_hash_includes_workspace() {
+        let req_no_ws = OperationRequest {
+            request_id: Uuid::new_v4(),
+            client_identity: ClientIdentity {
+                uid: 501,
+                gid: 20,
+                pid: Some(1),
+                exe_path: None,
+                exe_sha256: None,
+                codesign_team_id: None,
+            },
+            client_type: ClientType::Agent,
+            operation: "test.op".into(),
+            target: HashMap::new(),
+            secret_ref_names: vec![],
+            created_at: SystemTime::now(),
+            expires_at: None,
+            params: serde_json::Value::Null,
+            workspace: None,
+        };
+
+        let mut req_with_ws = req_no_ws.clone();
+        req_with_ws.workspace = Some(WorkspaceContext {
+            repo_root: PathBuf::from("/tmp/repo"),
+            remote_url: Some("https://github.com/org/repo".into()),
+            branch: Some("main".into()),
+            head_sha: None,
+            dirty: false,
+        });
+
+        assert_ne!(req_no_ws.content_hash(), req_with_ws.content_hash());
     }
 
     #[test]

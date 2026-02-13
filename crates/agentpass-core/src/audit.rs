@@ -206,6 +206,10 @@ pub struct AuditEvent {
 
     /// Workspace summary (git repo/branch info).
     pub workspace: Option<WorkspaceSummary>,
+
+    /// SHA-256 content hash of the operation request (for approval binding).
+    /// Not secret — safe for display and audit.
+    pub request_hash: Option<String>,
 }
 
 // Custom Debug to avoid any accidental leakage.
@@ -219,6 +223,7 @@ impl fmt::Debug for AuditEvent {
             .field("operation", &self.operation)
             .field("outcome", &self.outcome)
             .field("latency_ms", &self.latency_ms)
+            .field("request_hash", &self.request_hash)
             .finish()
     }
 }
@@ -272,6 +277,7 @@ impl AuditEvent {
             policy_decision: None,
             detail: None,
             workspace: None,
+            request_hash: None,
         }
     }
 
@@ -356,6 +362,12 @@ impl AuditEvent {
     /// Set the workspace summary.
     pub fn with_workspace(mut self, workspace: WorkspaceSummary) -> Self {
         self.workspace = Some(workspace);
+        self
+    }
+
+    /// Set the request content hash (for approval binding).
+    pub fn with_request_hash(mut self, hash: impl Into<String>) -> Self {
+        self.request_hash = Some(hash.into());
         self
     }
 }
@@ -820,6 +832,25 @@ mod tests {
             default_level_for_kind(AuditEventKind::RateLimited),
             AuditLevel::Warn
         );
+    }
+
+    #[test]
+    fn audit_event_with_request_hash() {
+        let event = AuditEvent::new(AuditEventKind::ApprovalRequired)
+            .with_request_hash("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789");
+        assert_eq!(
+            event.request_hash.as_deref(),
+            Some("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"),
+        );
+    }
+
+    #[test]
+    fn audit_event_debug_shows_request_hash() {
+        let event =
+            AuditEvent::new(AuditEventKind::ApprovalGranted).with_request_hash("deadbeef01234567");
+        let dbg = format!("{event:?}");
+        assert!(dbg.contains("request_hash"));
+        assert!(dbg.contains("deadbeef01234567"));
     }
 
     #[test]
