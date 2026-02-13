@@ -26,8 +26,8 @@ use opaque_core::audit::{AuditEvent, AuditEventKind, AuditSink};
 use opaque_core::operation::OperationRequest;
 use opaque_core::profile::{self, ExecProfile};
 use opaque_core::proto::ExecFrame;
-use tokio::sync::mpsc;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 
 use crate::enclave::OperationHandler;
 use crate::secret::SecretValue;
