@@ -22,3 +22,4 @@ Run:
 
 This will (re)build release binaries, record casts, and write GIFs under `assets/demos/`.
 
+The demos intentionally include small pauses and slower rendering to make the flow easier to follow.

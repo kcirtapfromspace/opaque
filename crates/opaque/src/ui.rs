@@ -156,20 +156,30 @@ fn format_operation_result(result: &serde_json::Value) {
         }
     };
 
-    // Check status first
-    let status = obj
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-
-    match status {
-        "ok" | "success" | "created" | "updated" => {
-            // Build a descriptive success line
-            let desc = build_operation_description(obj);
-            success(&desc);
+    // sandbox.exec returns a summary without a status field.
+    if let Some(exit_code) = obj.get("exit_code").and_then(|v| v.as_i64()) {
+        if exit_code == 0 {
+            success("Sandbox exec succeeded");
+        } else {
+            warn(&format!("Sandbox exec failed (exit_code={exit_code})"));
         }
-        _ => {
-            warn(&format!("Operation returned status: {status}"));
+    } else {
+        // Check status first
+        let status = obj
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        match status {
+            "ok" | "success" | "created" | "updated" => {
+                // Build a descriptive success line.
+                // For non-provider operations, fall back to a generic message.
+                let desc = build_operation_description(obj);
+                success(&desc);
+            }
+            _ => {
+                warn(&format!("Operation returned status: {status}"));
+            }
         }
     }
 
@@ -210,10 +220,9 @@ fn format_operation_result(result: &serde_json::Value) {
 
 /// Build a short description from operation result fields.
 fn build_operation_description(obj: &serde_json::Map<String, serde_json::Value>) -> String {
-    let secret = obj
-        .get("secret_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("secret");
+    let Some(secret) = obj.get("secret_name").and_then(|v| v.as_str()) else {
+        return "Operation succeeded".into();
+    };
 
     if let Some(env) = obj.get("environment").and_then(|v| v.as_str())
         && let Some(repo) = obj.get("repo").and_then(|v| v.as_str())

@@ -22,19 +22,20 @@ cargo build --release >/dev/null
 record() {
   local name="$1"
   local script="$2"
+  local cols="${3:-80}"
+  local rows="${4:-24}"
   local cast="assets/demos/${name}.cast"
   local gif="assets/demos/${name}.gif"
 
   echo "==> Recording ${cast}"
   rm -f "$cast" "$gif"
-  asciinema rec -q -c "bash \"$script\"" "$cast"
+  asciinema rec -q --cols "$cols" --rows "$rows" -c "bash \"$script\"" "$cast"
 
   echo "==> Rendering ${gif}"
-  agg --quiet --theme github-light --idle-time-limit 1.5 "$cast" "$gif"
+  agg --quiet --theme github-light --idle-time-limit 2.0 --speed 0.8 "$cast" "$gif"
 }
 
-record "quickstart" "scripts/demo_quickstart.sh"
-record "sandbox-exec" "scripts/demo_sandbox_exec.sh"
+record "quickstart" "scripts/demo_quickstart.sh" 132 28
+record "sandbox-exec" "scripts/demo_sandbox_exec.sh" 100 28
 
 echo "==> Done"
-
