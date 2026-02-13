@@ -437,7 +437,6 @@ impl EnclaveBuilder {
     }
 
     /// Register an operation handler.
-    #[allow(dead_code)] // Part of the builder API; used once provider integrations land
     pub fn handler(
         mut self,
         operation_name: impl Into<String>,
