@@ -18,15 +18,16 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use agentpass_core::audit::{
     AuditEvent, AuditEventKind, AuditLevel, AuditSink, ClientSummary, TargetSummary,
+    WorkspaceSummary,
 };
 use agentpass_core::operation::{
     ApprovalFactor, ApprovalRequirement, ClientType, OperationDef, OperationRegistry,
-    OperationRequest, OperationSafety,
+    OperationRequest, OperationSafety, validate_params,
 };
 use agentpass_core::policy::{PolicyDecision, PolicyEngine};
 use agentpass_core::sanitize::{Sanitized, SanitizedResponse, Sanitizer, Unsanitized};
@@ -66,6 +67,12 @@ pub enum EnclaveError {
     #[error("operation execution failed: {0}")]
     OperationFailed(String),
 
+    #[error("rate limited: {0}")]
+    RateLimited(String),
+
+    #[error("invalid params: {0}")]
+    InvalidParams(String),
+
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -81,8 +88,63 @@ impl EnclaveError {
             Self::ApprovalNotGranted(_) => "approval_not_granted",
             Self::ApprovalUnavailable(_) => "approval_unavailable",
             Self::OperationFailed(_) => "operation_failed",
+            Self::RateLimited(_) => "rate_limited",
+            Self::InvalidParams(_) => "invalid_params",
             Self::Internal(_) => "internal_error",
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Approval rate limiter
+// ---------------------------------------------------------------------------
+
+/// Rate limiter for approval requests. Prevents rapid-fire approval prompt
+/// fatigue attacks by limiting requests per (pid, operation) window.
+struct ApprovalRateLimiter {
+    /// Map from (pid, operation) to timestamps of recent requests.
+    #[allow(clippy::type_complexity)]
+    window: Mutex<HashMap<(Option<i32>, String), Vec<Instant>>>,
+    /// Maximum requests allowed in the window.
+    max_requests: usize,
+    /// Duration of the sliding window.
+    window_duration: Duration,
+}
+
+impl ApprovalRateLimiter {
+    fn new(max_requests: usize, window_duration: Duration) -> Self {
+        Self {
+            window: Mutex::new(HashMap::new()),
+            max_requests,
+            window_duration,
+        }
+    }
+
+    /// Check if a request is allowed. Returns `true` if within limits.
+    fn check_and_record(&self, pid: Option<i32>, operation: &str) -> bool {
+        let key = (pid, operation.to_owned());
+        let now = Instant::now();
+        let mut window = self.window.lock().expect("rate limiter mutex poisoned");
+        let entries = window.entry(key).or_default();
+
+        // Remove expired entries.
+        entries.retain(|t| now.duration_since(*t) < self.window_duration);
+
+        if entries.len() >= self.max_requests {
+            return false;
+        }
+
+        entries.push(now);
+        true
+    }
+}
+
+impl fmt::Debug for ApprovalRateLimiter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ApprovalRateLimiter")
+            .field("max_requests", &self.max_requests)
+            .field("window_duration", &self.window_duration)
+            .finish()
     }
 }
 
@@ -166,6 +228,9 @@ pub struct Enclave {
 
     /// Semaphore to serialize approval prompts (avoid prompt races).
     approval_semaphore: Semaphore,
+
+    /// Rate limiter for approval requests.
+    rate_limiter: ApprovalRateLimiter,
 }
 
 impl fmt::Debug for Enclave {
@@ -253,6 +318,7 @@ impl EnclaveBuilder {
             audit: self.audit.expect("audit sink is required"),
             sanitizer: self.sanitizer,
             approval_semaphore: Semaphore::new(1),
+            rate_limiter: ApprovalRateLimiter::new(3, Duration::from_secs(60)),
         }
     }
 }
@@ -292,15 +358,23 @@ impl Enclave {
             fields: request.target.clone(),
         };
 
+        let workspace_summary = request.workspace.as_ref().map(|ws| WorkspaceSummary {
+            remote_url: ws.remote_url.clone(),
+            branch: ws.branch.clone(),
+            dirty: ws.dirty,
+        });
+
         // --- Step 1: Emit request received ---
-        self.audit.emit(
-            AuditEvent::new(AuditEventKind::RequestReceived)
-                .with_request_id(request_id)
-                .with_client(client_summary.clone())
-                .with_operation(&request.operation)
-                .with_target(target_summary.clone())
-                .with_secret_names(request.secret_ref_names.clone()),
-        );
+        let mut event = AuditEvent::new(AuditEventKind::RequestReceived)
+            .with_request_id(request_id)
+            .with_client(client_summary.clone())
+            .with_operation(&request.operation)
+            .with_target(target_summary.clone())
+            .with_secret_names(request.secret_ref_names.clone());
+        if let Some(ref ws) = workspace_summary {
+            event = event.with_workspace(ws.clone());
+        }
+        self.audit.emit(event);
 
         // --- Step 2: Look up operation in registry ---
         let op_def = match self.registry.get(&request.operation) {
@@ -318,6 +392,22 @@ impl Enclave {
                 );
             }
         };
+
+        // --- Step 2b: Validate params against schema ---
+        if let Some(ref schema) = op_def.params_schema
+            && let Err(errors) = validate_params(schema, &request.params)
+        {
+            let err = EnclaveError::InvalidParams(errors.join("; "));
+            return self.emit_and_sanitize_error(
+                request_id,
+                &client_summary,
+                &request.operation,
+                &target_summary,
+                &request.secret_ref_names,
+                &err,
+                start,
+            );
+        }
 
         // --- Step 3: Safety-class / client-type constraints ---
         if let Err(err) = self.check_safety_constraints(&request, &op_def) {
@@ -495,6 +585,18 @@ impl Enclave {
             return Ok(());
         }
 
+        // Rate limit check before presenting approval prompt.
+        // The audit event is emitted by emit_and_sanitize_error in execute().
+        if !self
+            .rate_limiter
+            .check_and_record(request.client_identity.pid, &request.operation)
+        {
+            return Err(EnclaveError::RateLimited(format!(
+                "too many approval requests for operation '{}'",
+                request.operation,
+            )));
+        }
+
         let approval_id = Uuid::new_v4();
 
         // Emit approval required event.
@@ -508,13 +610,21 @@ impl Enclave {
         );
 
         // Build the approval description that the user will see.
-        let description = format!(
+        let mut description = format!(
             "Operation: {}\nTarget: {:?}\nClient: {}\nSecrets: [{}]",
             op_def.description,
             request.target,
             request.client_identity,
             request.secret_ref_names.join(", "),
         );
+        if let Some(ref ws) = request.workspace {
+            description.push_str(&format!(
+                "\nWorkspace: repo={}, branch={}, dirty={}",
+                ws.remote_url.as_deref().unwrap_or("?"),
+                ws.branch.as_deref().unwrap_or("?"),
+                ws.dirty,
+            ));
+        }
 
         // Serialize approval prompts to avoid races.
         let _permit = self
@@ -618,6 +728,7 @@ impl Enclave {
             EnclaveError::ApprovalNotGranted(_) | EnclaveError::ApprovalUnavailable(_) => {
                 AuditEventKind::ApprovalDenied
             }
+            EnclaveError::RateLimited(_) => AuditEventKind::RateLimited,
             _ => AuditEventKind::OperationFailed,
         };
 
@@ -786,6 +897,7 @@ mod tests {
             created_at: SystemTime::now(),
             expires_at: None,
             params: serde_json::Value::Null,
+            workspace: None,
         }
     }
 
@@ -797,6 +909,7 @@ mod tests {
             default_approval: ApprovalRequirement::Always,
             default_factors: vec![ApprovalFactor::LocalBio],
             description: "Set a GitHub Actions repository secret".into(),
+            params_schema: None,
         })
         .unwrap();
         reg.register(OperationDef {
@@ -805,6 +918,7 @@ mod tests {
             default_approval: ApprovalRequirement::Always,
             default_factors: vec![ApprovalFactor::Fido2],
             description: "Reveal a secret value (human only)".into(),
+            params_schema: None,
         })
         .unwrap();
         reg
@@ -826,6 +940,7 @@ mod tests {
                     m
                 },
             },
+            workspace: WorkspaceMatch::default(),
             allow: true,
             client_types: vec![ClientType::Agent, ClientType::Human],
             approval: ApprovalConfig {
@@ -896,6 +1011,7 @@ mod tests {
             client: ClientMatch::default(),
             operation_pattern: "secret.*".into(),
             target: TargetMatch::default(),
+            workspace: WorkspaceMatch::default(),
             allow: true,
             client_types: vec![ClientType::Agent, ClientType::Human],
             approval: ApprovalConfig {
@@ -1044,5 +1160,72 @@ mod tests {
                 assert_eq!(eid, rid, "all events should share the same request_id");
             }
         }
+    }
+
+    // -- Rate limiter unit tests --
+
+    #[test]
+    fn rate_limiter_allows_within_limit() {
+        let limiter = ApprovalRateLimiter::new(3, Duration::from_secs(60));
+        assert!(limiter.check_and_record(Some(1), "op1"));
+        assert!(limiter.check_and_record(Some(1), "op1"));
+        assert!(limiter.check_and_record(Some(1), "op1"));
+    }
+
+    #[test]
+    fn rate_limiter_blocks_over_limit() {
+        let limiter = ApprovalRateLimiter::new(2, Duration::from_secs(60));
+        assert!(limiter.check_and_record(Some(1), "op1"));
+        assert!(limiter.check_and_record(Some(1), "op1"));
+        assert!(!limiter.check_and_record(Some(1), "op1"));
+    }
+
+    #[test]
+    fn rate_limiter_different_ops_independent() {
+        let limiter = ApprovalRateLimiter::new(1, Duration::from_secs(60));
+        assert!(limiter.check_and_record(Some(1), "op1"));
+        assert!(limiter.check_and_record(Some(1), "op2"));
+        // op1 is now exhausted
+        assert!(!limiter.check_and_record(Some(1), "op1"));
+        // op2 is also exhausted
+        assert!(!limiter.check_and_record(Some(1), "op2"));
+    }
+
+    #[test]
+    fn rate_limiter_different_pids_independent() {
+        let limiter = ApprovalRateLimiter::new(1, Duration::from_secs(60));
+        assert!(limiter.check_and_record(Some(1), "op1"));
+        assert!(limiter.check_and_record(Some(2), "op1"));
+        assert!(!limiter.check_and_record(Some(1), "op1"));
+    }
+
+    #[test]
+    fn rate_limiter_window_expires() {
+        let limiter = ApprovalRateLimiter::new(1, Duration::from_millis(1));
+        assert!(limiter.check_and_record(Some(1), "op1"));
+        // Sleep to let the window expire.
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(limiter.check_and_record(Some(1), "op1"));
+    }
+
+    #[tokio::test]
+    async fn rate_limited_emits_audit_event() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let enclave = build_enclave(Box::new(AlwaysApproveGate), audit.clone());
+
+        // Exhaust the rate limit (default 3 per 60s).
+        for _ in 0..3 {
+            let req = test_request("github.set_actions_secret", ClientType::Agent);
+            let _ = enclave.execute(req).await;
+        }
+        audit.clear();
+
+        // Fourth request should be rate limited.
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let resp = enclave.execute(req).await;
+        assert_eq!(resp.error_code(), Some("rate_limited"));
+
+        let rate_events = audit.events_of_kind(AuditEventKind::RateLimited);
+        assert_eq!(rate_events.len(), 1);
     }
 }

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::operation::{
     ApprovalFactor, ApprovalRequirement, ClientIdentity, ClientType, OperationRequest,
-    OperationSafety,
+    OperationSafety, WorkspaceContext,
 };
 
 // ---------------------------------------------------------------------------
@@ -114,6 +114,80 @@ impl TargetMatch {
 }
 
 // ---------------------------------------------------------------------------
+// Workspace match pattern
+// ---------------------------------------------------------------------------
+
+/// Pattern for matching git workspace context. When a rule has workspace
+/// constraints, requests without workspace context are denied.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkspaceMatch {
+    /// Glob pattern for the git remote URL (e.g. `"*github.com:org/*"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_url_pattern: Option<String>,
+
+    /// Glob pattern for the branch name (e.g. `"main"`, `"release/*"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_pattern: Option<String>,
+
+    /// If true, deny requests from dirty (uncommitted changes) workspaces.
+    #[serde(default)]
+    pub require_clean: bool,
+}
+
+impl WorkspaceMatch {
+    /// Returns `true` if the workspace context (or lack thereof) matches.
+    ///
+    /// - No constraints + no workspace = match (backward compat)
+    /// - Constraints + no workspace = deny
+    /// - Constraints + workspace = check each field via glob
+    /// - `require_clean && dirty = deny`
+    pub fn matches(&self, workspace: Option<&WorkspaceContext>) -> bool {
+        let has_constraints = self.remote_url_pattern.is_some()
+            || self.branch_pattern.is_some()
+            || self.require_clean;
+
+        match (has_constraints, workspace) {
+            // No constraints, no workspace — backward compat match.
+            (false, None) => true,
+            // No constraints, workspace present — match.
+            (false, Some(_)) => true,
+            // Constraints but no workspace — deny.
+            (true, None) => false,
+            // Constraints + workspace — check each.
+            (true, Some(ws)) => {
+                if let Some(ref pattern) = self.remote_url_pattern {
+                    match &ws.remote_url {
+                        Some(url) => {
+                            if !glob_match::glob_match(pattern, url) {
+                                return false;
+                            }
+                        }
+                        None => return false,
+                    }
+                }
+
+                if let Some(ref pattern) = self.branch_pattern {
+                    match &ws.branch {
+                        Some(branch) => {
+                            if !glob_match::glob_match(pattern, branch) {
+                                return false;
+                            }
+                        }
+                        None => return false,
+                    }
+                }
+
+                if self.require_clean && ws.dirty {
+                    return false;
+                }
+
+                true
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Approval configuration within a rule
 // ---------------------------------------------------------------------------
 
@@ -184,6 +258,10 @@ pub struct PolicyRule {
     #[serde(default)]
     pub target: TargetMatch,
 
+    /// Workspace (git repo/branch) constraints.
+    #[serde(default)]
+    pub workspace: WorkspaceMatch,
+
     /// Whether this rule allows the matched request.
     #[serde(default = "default_true")]
     pub allow: bool,
@@ -221,6 +299,11 @@ impl PolicyRule {
 
         // Target constraints.
         if !self.target.matches(&request.target) {
+            return false;
+        }
+
+        // Workspace constraints.
+        if !self.workspace.matches(request.workspace.as_ref()) {
             return false;
         }
 
@@ -432,6 +515,7 @@ mod tests {
             created_at: SystemTime::now(),
             expires_at: None,
             params: serde_json::Value::Null,
+            workspace: None,
         }
     }
 
@@ -451,6 +535,7 @@ mod tests {
                     m
                 },
             },
+            workspace: WorkspaceMatch::default(),
             allow: true,
             client_types: vec![ClientType::Agent, ClientType::Human],
             approval: ApprovalConfig {
@@ -747,5 +832,118 @@ mod tests {
         let roundtripped: ApprovalConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(roundtripped.lease_ttl, None);
         assert!(roundtripped.one_time);
+    }
+
+    // -- Workspace match tests --
+
+    fn test_workspace() -> WorkspaceContext {
+        WorkspaceContext {
+            repo_root: "/home/user/project".into(),
+            remote_url: Some("git@github.com:org/repo.git".into()),
+            branch: Some("main".into()),
+            head_sha: Some("abc123".into()),
+            dirty: false,
+        }
+    }
+
+    #[test]
+    fn workspace_match_empty_matches_all() {
+        let wm = WorkspaceMatch::default();
+        assert!(wm.matches(None));
+        assert!(wm.matches(Some(&test_workspace())));
+    }
+
+    #[test]
+    fn workspace_match_remote_url_pattern() {
+        let wm = WorkspaceMatch {
+            remote_url_pattern: Some("*github.com:org/*".into()),
+            ..Default::default()
+        };
+        assert!(wm.matches(Some(&test_workspace())));
+    }
+
+    #[test]
+    fn workspace_match_remote_url_mismatch() {
+        let wm = WorkspaceMatch {
+            remote_url_pattern: Some("*gitlab.com:org/*".into()),
+            ..Default::default()
+        };
+        assert!(!wm.matches(Some(&test_workspace())));
+    }
+
+    #[test]
+    fn workspace_match_branch_pattern() {
+        let wm = WorkspaceMatch {
+            branch_pattern: Some("main".into()),
+            ..Default::default()
+        };
+        assert!(wm.matches(Some(&test_workspace())));
+    }
+
+    #[test]
+    fn workspace_match_branch_mismatch() {
+        let wm = WorkspaceMatch {
+            branch_pattern: Some("release/*".into()),
+            ..Default::default()
+        };
+        assert!(!wm.matches(Some(&test_workspace())));
+    }
+
+    #[test]
+    fn workspace_match_require_clean_dirty_fails() {
+        let wm = WorkspaceMatch {
+            require_clean: true,
+            ..Default::default()
+        };
+        let mut ws = test_workspace();
+        ws.dirty = true;
+        assert!(!wm.matches(Some(&ws)));
+    }
+
+    #[test]
+    fn workspace_match_require_clean_clean_passes() {
+        let wm = WorkspaceMatch {
+            require_clean: true,
+            ..Default::default()
+        };
+        let ws = test_workspace(); // dirty = false
+        assert!(wm.matches(Some(&ws)));
+    }
+
+    #[test]
+    fn workspace_match_no_ws_with_constraints_fails() {
+        let wm = WorkspaceMatch {
+            remote_url_pattern: Some("*".into()),
+            ..Default::default()
+        };
+        assert!(!wm.matches(None));
+    }
+
+    #[test]
+    fn workspace_match_no_ws_no_constraints_passes() {
+        let wm = WorkspaceMatch::default();
+        assert!(wm.matches(None));
+    }
+
+    #[test]
+    fn policy_rule_with_workspace_constraint() {
+        let mut rule = allow_rule();
+        rule.workspace = WorkspaceMatch {
+            remote_url_pattern: Some("*github.com:org/*".into()),
+            branch_pattern: Some("main".into()),
+            require_clean: false,
+        };
+        let engine = PolicyEngine::with_rules(vec![rule]);
+
+        // Request with matching workspace.
+        let mut req = test_request("github.set_actions_secret", ClientType::Agent);
+        req.workspace = Some(test_workspace());
+        let decision = engine.evaluate(&req, OperationSafety::Safe);
+        assert!(decision.allowed);
+
+        // Request without workspace — denied.
+        let req2 = test_request("github.set_actions_secret", ClientType::Agent);
+        let decision2 = engine.evaluate(&req2, OperationSafety::Safe);
+        assert!(!decision2.allowed);
     }
 }
