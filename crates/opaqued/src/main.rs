@@ -1268,12 +1268,17 @@ async fn handle_request(
             }
 
             // Validate value_ref starts with a known scheme.
-            const KNOWN_SCHEMES: &[&str] = &["env:", "keychain:", "profile:"];
-            if !KNOWN_SCHEMES.iter().any(|s| value_ref.starts_with(s)) {
+            if !opaque_core::profile::ALLOWED_REF_SCHEMES
+                .iter()
+                .any(|s| value_ref.starts_with(s))
+            {
                 return Response::err(
                     Some(req.id),
                     "bad_request",
-                    "value_ref must start with a known scheme (env:, keychain:, profile:)",
+                    format!(
+                        "value_ref must start with a known scheme ({:?})",
+                        opaque_core::profile::ALLOWED_REF_SCHEMES
+                    ),
                 );
             }
 
