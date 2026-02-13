@@ -1,11 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE policyconfig PUBLIC
   "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
-  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+  "http://www.freedesktop.org/standards/PolicyKit/1.0/policyconfig.dtd">
 <policyconfig>
+  <vendor>Opaque</vendor>
+  <vendor_url>https://github.com/kcirtapfromspace/opaque</vendor_url>
+
   <action id="com.opaque.approve">
-    <description>Approve Opaque operation</description>
-    <message>Authentication is required to approve an Opaque operation.</message>
+    <description>Approve an Opaque secret operation</description>
+    <message>Authentication is required to approve an Opaque secret operation.</message>
     <defaults>
       <allow_any>no</allow_any>
       <allow_inactive>no</allow_inactive>
@@ -13,4 +16,3 @@
     </defaults>
   </action>
 </policyconfig>
-
