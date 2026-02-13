@@ -29,6 +29,7 @@ use opaque_core::proto::ExecFrame;
 use tokio::sync::mpsc;
 
 use crate::enclave::OperationHandler;
+use crate::secret::SecretValue;
 use resolve::{CompositeResolver, resolve_all};
 
 /// The sandbox executor handles `sandbox.exec` operations.
@@ -58,16 +59,20 @@ impl SandboxExecutor {
     }
 
     /// Resolve all secret references in the profile.
-    fn resolve_secrets(profile: &ExecProfile) -> Result<HashMap<String, String>, String> {
+    fn resolve_secrets(profile: &ExecProfile) -> Result<HashMap<String, SecretValue>, String> {
         let resolver = CompositeResolver::new();
         resolve_all(&profile.secrets, &resolver)
             .map_err(|e| format!("secret resolution failed: {e}"))
     }
 
     /// Build the combined environment for the sandbox (secrets + literal env).
+    ///
+    /// Extracts the string value from each `SecretValue` for injection into the
+    /// child process environment. The `SecretValue`s remain alive (and will be
+    /// zeroed on drop) in the caller's `resolved_secrets` map.
     fn build_env(
         profile: &ExecProfile,
-        resolved_secrets: &HashMap<String, String>,
+        resolved_secrets: &HashMap<String, SecretValue>,
     ) -> HashMap<String, String> {
         let mut env = HashMap::with_capacity(profile.env.len() + resolved_secrets.len());
 
@@ -77,8 +82,10 @@ impl SandboxExecutor {
         }
 
         // Resolved secrets (overwrite if conflict — secrets take precedence).
-        for (key, value) in resolved_secrets {
-            env.insert(key.clone(), value.clone());
+        for (key, secret) in resolved_secrets {
+            if let Some(s) = secret.as_str() {
+                env.insert(key.clone(), s.to_owned());
+            }
         }
 
         env
@@ -264,9 +271,13 @@ mod tests {
 
     #[test]
     fn build_env_combines_secrets_and_literals() {
+        use crate::secret::SecretValue;
         let profile = test_profile();
         let mut secrets = HashMap::new();
-        secrets.insert("API_KEY".into(), "secret_value".into());
+        secrets.insert(
+            "API_KEY".into(),
+            SecretValue::from_string("secret_value".into()),
+        );
 
         let env = SandboxExecutor::build_env(&profile, &secrets);
         assert_eq!(env.get("RUST_LOG").unwrap(), "info");
@@ -275,13 +286,17 @@ mod tests {
 
     #[test]
     fn build_env_secrets_override_literals() {
+        use crate::secret::SecretValue;
         let mut profile = test_profile();
         profile
             .env
             .insert("SHARED_KEY".into(), "literal_value".into());
 
         let mut secrets = HashMap::new();
-        secrets.insert("SHARED_KEY".into(), "secret_value".into());
+        secrets.insert(
+            "SHARED_KEY".into(),
+            SecretValue::from_string("secret_value".into()),
+        );
 
         let env = SandboxExecutor::build_env(&profile, &secrets);
         assert_eq!(env.get("SHARED_KEY").unwrap(), "secret_value");

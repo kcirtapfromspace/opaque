@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 
+use crate::secret::SecretValue;
+
 // ---------------------------------------------------------------------------
 // Resolver trait
 // ---------------------------------------------------------------------------
@@ -14,15 +16,14 @@ use std::collections::HashMap;
 pub trait SecretResolver: Send + Sync {
     /// Resolve a secret reference string to its value.
     ///
-    /// The returned value is the actual secret. It must be zeroized
-    /// after use (handled by the sandbox orchestrator).
-    fn resolve(&self, ref_str: &str) -> Result<String, ResolveError>;
+    /// Returns a [`SecretValue`] that is automatically zeroed on drop.
+    fn resolve(&self, ref_str: &str) -> Result<SecretValue, ResolveError>;
 }
 
 /// Errors from secret resolution.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ResolveError {
-    #[error("unknown ref scheme in '{0}' (expected env: or keychain:)")]
+    #[error("unknown ref scheme in '{0}' (expected env:, keychain:, or profile:)")]
     UnknownScheme(String),
 
     #[error("environment variable '{0}' not found")]
@@ -33,6 +34,9 @@ pub enum ResolveError {
 
     #[error("empty ref value for '{0}'")]
     EmptyValue(String),
+
+    #[error("profile resolution failed for '{0}': {1}")]
+    ProfileError(String, String),
 }
 
 // ---------------------------------------------------------------------------
@@ -44,7 +48,7 @@ pub enum ResolveError {
 pub struct EnvResolver;
 
 impl SecretResolver for EnvResolver {
-    fn resolve(&self, ref_str: &str) -> Result<String, ResolveError> {
+    fn resolve(&self, ref_str: &str) -> Result<SecretValue, ResolveError> {
         let name = ref_str
             .strip_prefix("env:")
             .ok_or_else(|| ResolveError::UnknownScheme(ref_str.to_owned()))?;
@@ -53,7 +57,8 @@ impl SecretResolver for EnvResolver {
             return Err(ResolveError::EmptyValue(ref_str.to_owned()));
         }
 
-        std::env::var(name).map_err(|_| ResolveError::EnvNotFound(name.to_owned()))
+        let val = std::env::var(name).map_err(|_| ResolveError::EnvNotFound(name.to_owned()))?;
+        Ok(SecretValue::from_string(val))
     }
 }
 
@@ -92,7 +97,7 @@ impl KeychainResolver {
 
 impl SecretResolver for KeychainResolver {
     #[allow(clippy::needless_return)]
-    fn resolve(&self, ref_str: &str) -> Result<String, ResolveError> {
+    fn resolve(&self, ref_str: &str) -> Result<SecretValue, ResolveError> {
         let (service, account) = Self::parse_ref(ref_str)?;
 
         #[cfg(target_os = "macos")]
@@ -118,7 +123,7 @@ impl SecretResolver for KeychainResolver {
             if value.is_empty() {
                 return Err(ResolveError::EmptyValue(ref_str.to_owned()));
             }
-            return Ok(value);
+            return Ok(SecretValue::from_string(value));
         }
 
         #[cfg(target_os = "linux")]
@@ -144,7 +149,7 @@ impl SecretResolver for KeychainResolver {
             if value.is_empty() {
                 return Err(ResolveError::EmptyValue(ref_str.to_owned()));
             }
-            return Ok(value);
+            return Ok(SecretValue::from_string(value));
         }
 
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -159,15 +164,95 @@ impl SecretResolver for KeychainResolver {
 }
 
 // ---------------------------------------------------------------------------
+// Profile resolver
+// ---------------------------------------------------------------------------
+
+/// Resolves `profile:<name>:<key>` refs by loading a named profile and
+/// resolving the underlying secret ref through the base resolvers.
+///
+/// Cycle prevention: the base resolver used for the underlying ref excludes
+/// `ProfileResolver` itself.
+#[derive(Debug)]
+pub struct ProfileResolver;
+
+impl ProfileResolver {
+    /// Parse a profile ref: `profile:<name>:<key>` -> (name, key).
+    fn parse_ref(ref_str: &str) -> Result<(&str, &str), ResolveError> {
+        let rest = ref_str
+            .strip_prefix("profile:")
+            .ok_or_else(|| ResolveError::UnknownScheme(ref_str.to_owned()))?;
+
+        let (name, key) = rest.split_once(':').ok_or_else(|| {
+            ResolveError::ProfileError(
+                ref_str.to_owned(),
+                "expected format profile:<name>:<key>".into(),
+            )
+        })?;
+
+        if name.is_empty() || key.is_empty() {
+            return Err(ResolveError::EmptyValue(ref_str.to_owned()));
+        }
+
+        Ok((name, key))
+    }
+}
+
+impl SecretResolver for ProfileResolver {
+    fn resolve(&self, ref_str: &str) -> Result<SecretValue, ResolveError> {
+        let (profile_name, key) = Self::parse_ref(ref_str)?;
+
+        let profile = opaque_core::profile::load_named_profile(profile_name).map_err(|e| {
+            ResolveError::ProfileError(ref_str.to_owned(), format!("failed to load profile: {e}"))
+        })?;
+
+        let underlying_ref = profile.secrets.get(key).ok_or_else(|| {
+            ResolveError::ProfileError(
+                ref_str.to_owned(),
+                format!("key '{key}' not found in profile '{profile_name}'"),
+            )
+        })?;
+
+        // Resolve the underlying ref through base resolvers only (no ProfileResolver)
+        // to prevent cycles.
+        let base = BaseResolver {
+            env: EnvResolver,
+            keychain: KeychainResolver,
+        };
+        base.resolve(underlying_ref)
+    }
+}
+
+/// Internal base resolver that dispatches to env: and keychain: only.
+/// Used by ProfileResolver to prevent resolution cycles.
+#[derive(Debug)]
+struct BaseResolver {
+    env: EnvResolver,
+    keychain: KeychainResolver,
+}
+
+impl SecretResolver for BaseResolver {
+    fn resolve(&self, ref_str: &str) -> Result<SecretValue, ResolveError> {
+        if ref_str.starts_with("env:") {
+            self.env.resolve(ref_str)
+        } else if ref_str.starts_with("keychain:") {
+            self.keychain.resolve(ref_str)
+        } else {
+            Err(ResolveError::UnknownScheme(ref_str.to_owned()))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Composite resolver
 // ---------------------------------------------------------------------------
 
 /// A composite resolver that dispatches to the correct resolver based on
-/// the ref scheme prefix.
+/// the ref scheme prefix (`env:`, `keychain:`, `profile:`).
 #[derive(Debug)]
 pub struct CompositeResolver {
     env: EnvResolver,
     keychain: KeychainResolver,
+    profile: ProfileResolver,
 }
 
 impl CompositeResolver {
@@ -175,6 +260,7 @@ impl CompositeResolver {
         Self {
             env: EnvResolver,
             keychain: KeychainResolver,
+            profile: ProfileResolver,
         }
     }
 }
@@ -186,11 +272,13 @@ impl Default for CompositeResolver {
 }
 
 impl SecretResolver for CompositeResolver {
-    fn resolve(&self, ref_str: &str) -> Result<String, ResolveError> {
+    fn resolve(&self, ref_str: &str) -> Result<SecretValue, ResolveError> {
         if ref_str.starts_with("env:") {
             self.env.resolve(ref_str)
         } else if ref_str.starts_with("keychain:") {
             self.keychain.resolve(ref_str)
+        } else if ref_str.starts_with("profile:") {
+            self.profile.resolve(ref_str)
         } else {
             Err(ResolveError::UnknownScheme(ref_str.to_owned()))
         }
@@ -199,11 +287,11 @@ impl SecretResolver for CompositeResolver {
 
 /// Resolve all secret refs in a profile to their values.
 ///
-/// Returns a map of `ENV_NAME -> secret_value`.
+/// Returns a map of `ENV_NAME -> SecretValue`.
 pub fn resolve_all(
     secrets: &HashMap<String, String>,
     resolver: &dyn SecretResolver,
-) -> Result<HashMap<String, String>, ResolveError> {
+) -> Result<HashMap<String, SecretValue>, ResolveError> {
     let mut resolved = HashMap::with_capacity(secrets.len());
     for (env_name, ref_str) in secrets {
         let value = resolver.resolve(ref_str)?;
@@ -226,7 +314,7 @@ mod tests {
         unsafe { std::env::set_var("OPAQUE_TEST_SECRET_42", "test_value_42") };
         let resolver = EnvResolver;
         let value = resolver.resolve("env:OPAQUE_TEST_SECRET_42").unwrap();
-        assert_eq!(value, "test_value_42");
+        assert_eq!(value.as_str().unwrap(), "test_value_42");
         unsafe { std::env::remove_var("OPAQUE_TEST_SECRET_42") };
     }
 
@@ -290,7 +378,7 @@ mod tests {
         unsafe { std::env::set_var("OPAQUE_COMPOSITE_TEST", "comp_val") };
         let resolver = CompositeResolver::new();
         let value = resolver.resolve("env:OPAQUE_COMPOSITE_TEST").unwrap();
-        assert_eq!(value, "comp_val");
+        assert_eq!(value.as_str().unwrap(), "comp_val");
         unsafe { std::env::remove_var("OPAQUE_COMPOSITE_TEST") };
     }
 
@@ -315,8 +403,8 @@ mod tests {
 
         let resolver = CompositeResolver::new();
         let resolved = resolve_all(&secrets, &resolver).unwrap();
-        assert_eq!(resolved["VAR_A"], "val_a");
-        assert_eq!(resolved["VAR_B"], "val_b");
+        assert_eq!(resolved["VAR_A"].as_str().unwrap(), "val_a");
+        assert_eq!(resolved["VAR_B"].as_str().unwrap(), "val_b");
 
         unsafe { std::env::remove_var("OPAQUE_RA_A") };
         unsafe { std::env::remove_var("OPAQUE_RA_B") };
@@ -350,5 +438,70 @@ mod tests {
 
         let err = ResolveError::KeychainError("kc:x/y".into(), "failed".into());
         assert!(format!("{err}").contains("keychain lookup failed"));
+
+        let err = ResolveError::ProfileError("profile:x:y".into(), "not found".into());
+        assert!(format!("{err}").contains("profile resolution failed"));
+    }
+
+    // -- ProfileResolver tests --
+
+    #[test]
+    fn profile_parse_ref_valid() {
+        let (name, key) = ProfileResolver::parse_ref("profile:myapp:JWT").unwrap();
+        assert_eq!(name, "myapp");
+        assert_eq!(key, "JWT");
+    }
+
+    #[test]
+    fn profile_parse_ref_wrong_scheme() {
+        let result = ProfileResolver::parse_ref("env:FOO");
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ResolveError::UnknownScheme(_)
+        ));
+    }
+
+    #[test]
+    fn profile_parse_ref_no_key_separator() {
+        let result = ProfileResolver::parse_ref("profile:myapp");
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ResolveError::ProfileError(..)
+        ));
+    }
+
+    #[test]
+    fn profile_parse_ref_empty_parts() {
+        let result = ProfileResolver::parse_ref("profile::KEY");
+        assert!(result.is_err());
+
+        let result = ProfileResolver::parse_ref("profile:name:");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn profile_resolver_missing_profile_errors() {
+        let resolver = ProfileResolver;
+        let result = resolver.resolve("profile:nonexistent_profile_xyz:KEY");
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ResolveError::ProfileError(..)
+        ));
+    }
+
+    #[test]
+    fn composite_resolver_dispatches_profile() {
+        let resolver = CompositeResolver::new();
+        // This will fail because the profile doesn't exist, but it proves
+        // dispatch to ProfileResolver is working.
+        let result = resolver.resolve("profile:nonexistent:KEY");
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ResolveError::ProfileError(..)
+        ));
     }
 }

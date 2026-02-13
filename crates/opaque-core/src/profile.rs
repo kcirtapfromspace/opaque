@@ -173,8 +173,8 @@ pub enum ProfileError {
     ZeroMaxOutput,
 }
 
-/// Allowed secret ref schemes for Phase 2.
-const ALLOWED_REF_SCHEMES: &[&str] = &["env:", "keychain:"];
+/// Allowed secret ref schemes.
+const ALLOWED_REF_SCHEMES: &[&str] = &["env:", "keychain:", "profile:"];
 
 /// Load and validate an `ExecProfile` from a TOML string.
 ///
