@@ -9,6 +9,20 @@
 
 use serde::{Deserialize, Serialize};
 
+/// GitHub API version header value.
+/// See: https://docs.github.com/en/rest/about-the-rest-api/api-versions
+const GITHUB_API_VERSION: &str = "2022-11-28";
+
+/// GitHub API accept header for JSON responses.
+const GITHUB_ACCEPT: &str = "application/vnd.github+json";
+
+/// Default GitHub API base URL. Override with `OPAQUE_GITHUB_API_URL` env var
+/// (useful for GitHub Enterprise Server or testing).
+const DEFAULT_GITHUB_API_URL: &str = "https://api.github.com";
+
+/// Environment variable to override the GitHub API base URL.
+const GITHUB_API_URL_ENV: &str = "OPAQUE_GITHUB_API_URL";
+
 /// GitHub API error types. Raw API error messages are never exposed.
 #[derive(Debug, thiserror::Error)]
 pub enum GitHubApiError {
@@ -29,6 +43,20 @@ pub enum GitHubApiError {
 
     #[error("unexpected GitHub API response: status {0}")]
     UnexpectedStatus(u16),
+}
+
+impl GitHubApiError {
+    /// Returns `true` if the error is transient and the request may succeed on retry.
+    ///
+    /// Transient: network issues, rate limits, server errors.
+    /// Permanent: auth failure, not found, unexpected status.
+    #[allow(dead_code)]
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            GitHubApiError::Network(_) | GitHubApiError::RateLimited | GitHubApiError::ServerError
+        )
+    }
 }
 
 /// Response from `GET /repos/{owner}/{repo}/actions/secrets/public-key`.
@@ -64,24 +92,31 @@ pub struct GitHubClient {
 }
 
 impl GitHubClient {
-    /// Create a new client pointing at the public GitHub API.
+    /// Build the user-agent string from the crate version.
+    fn user_agent() -> String {
+        format!("opaqued/{}", env!("CARGO_PKG_VERSION"))
+    }
+
+    /// Create a new client. Uses `OPAQUE_GITHUB_API_URL` env var if set,
+    /// otherwise defaults to `https://api.github.com`.
     pub fn new() -> Self {
+        let base_url =
+            std::env::var(GITHUB_API_URL_ENV).unwrap_or_else(|_| DEFAULT_GITHUB_API_URL.to_owned());
+
         let http = reqwest::Client::builder()
-            .user_agent("opaqued/0.1")
+            .user_agent(Self::user_agent())
             .build()
             .expect("failed to build reqwest client");
 
-        Self {
-            http,
-            base_url: "https://api.github.com".into(),
-        }
+        Self { http, base_url }
     }
 
     /// Create a client pointing at a custom base URL (for testing with mock servers).
     #[cfg(test)]
+    #[allow(dead_code)]
     pub fn with_base_url(base_url: String) -> Self {
         let http = reqwest::Client::builder()
-            .user_agent("opaqued/0.1")
+            .user_agent(Self::user_agent())
             .build()
             .expect("failed to build reqwest client");
 
@@ -106,8 +141,8 @@ impl GitHubClient {
             .http
             .get(&url)
             .bearer_auth(token)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("Accept", GITHUB_ACCEPT)
+            .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
             .send()
             .await
             .map_err(GitHubApiError::Network)?;
@@ -151,8 +186,8 @@ impl GitHubClient {
             .http
             .put(&url)
             .bearer_auth(token)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("Accept", GITHUB_ACCEPT)
+            .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
             .json(&payload)
             .send()
             .await
@@ -180,6 +215,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn transient_errors_identified() {
+        assert!(GitHubApiError::RateLimited.is_transient());
+        assert!(GitHubApiError::ServerError.is_transient());
+        // Permanent errors.
+        assert!(!GitHubApiError::Unauthorized.is_transient());
+        assert!(!GitHubApiError::NotFound("x".into()).is_transient());
+        assert!(!GitHubApiError::UnexpectedStatus(422).is_transient());
+    }
+
+    #[test]
     fn github_api_error_display() {
         let err = GitHubApiError::Unauthorized;
         assert!(format!("{err}").contains("authentication failed"));
@@ -199,8 +244,37 @@ mod tests {
 
     #[test]
     fn client_default_base_url() {
+        // Remove env override if set, to test the default.
+        let prev = std::env::var(super::GITHUB_API_URL_ENV).ok();
+        unsafe { std::env::remove_var(super::GITHUB_API_URL_ENV) };
+
         let client = GitHubClient::new();
-        assert_eq!(client.base_url, "https://api.github.com");
+        assert_eq!(client.base_url, super::DEFAULT_GITHUB_API_URL);
+
+        // Restore if it was set.
+        if let Some(v) = prev {
+            unsafe { std::env::set_var(super::GITHUB_API_URL_ENV, v) };
+        }
+    }
+
+    #[test]
+    fn client_respects_env_override() {
+        unsafe {
+            std::env::set_var(
+                super::GITHUB_API_URL_ENV,
+                "https://github.example.com/api/v3",
+            )
+        };
+        let client = GitHubClient::new();
+        assert_eq!(client.base_url, "https://github.example.com/api/v3");
+        unsafe { std::env::remove_var(super::GITHUB_API_URL_ENV) };
+    }
+
+    #[test]
+    fn user_agent_contains_version() {
+        let ua = GitHubClient::user_agent();
+        assert!(ua.starts_with("opaqued/"));
+        assert!(!ua.contains("0.1") || ua == format!("opaqued/{}", env!("CARGO_PKG_VERSION")));
     }
 
     #[test]

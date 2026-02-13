@@ -15,17 +15,21 @@ use std::sync::Arc;
 use opaque_core::audit::{AuditEvent, AuditEventKind, AuditSink};
 use opaque_core::operation::OperationRequest;
 
+use opaque_core::profile::ALLOWED_REF_SCHEMES;
+
 use crate::enclave::OperationHandler;
 use crate::sandbox::resolve::{CompositeResolver, SecretResolver};
 
 use client::GitHubClient;
 use crypto::encrypt_secret;
 
-/// Known ref schemes that are allowed as `value_ref`.
-const ALLOWED_REF_PREFIXES: &[&str] = &["env:", "keychain:", "profile:"];
-
-/// Default keychain ref for the GitHub PAT when not specified.
+/// Default keychain ref for the GitHub PAT when not specified by the caller.
+/// Override with the `OPAQUE_GITHUB_TOKEN_REF` environment variable to use a
+/// different keychain entry or ref scheme for the GitHub personal access token.
 const DEFAULT_GITHUB_TOKEN_REF: &str = "keychain:opaque/github-pat";
+
+/// Environment variable to override the default GitHub PAT ref.
+const GITHUB_TOKEN_REF_ENV: &str = "OPAQUE_GITHUB_TOKEN_REF";
 
 /// The GitHub Actions secret handler.
 ///
@@ -100,11 +104,11 @@ fn validate_secret_name(name: &str) -> Result<(), String> {
 
 /// Validate that a value_ref uses a known scheme.
 fn validate_value_ref(ref_str: &str) -> Result<(), String> {
-    if ALLOWED_REF_PREFIXES.iter().any(|p| ref_str.starts_with(p)) {
+    if ALLOWED_REF_SCHEMES.iter().any(|p| ref_str.starts_with(p)) {
         Ok(())
     } else {
         Err(format!(
-            "value_ref must start with a known scheme ({ALLOWED_REF_PREFIXES:?}), got: '{ref_str}'"
+            "value_ref must start with a known scheme ({ALLOWED_REF_SCHEMES:?}), got: '{ref_str}'"
         ))
     }
 }
@@ -135,9 +139,11 @@ impl OperationHandler for GitHubHandler {
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "missing 'value_ref' parameter".to_string())?;
 
+            let env_token_ref = std::env::var(GITHUB_TOKEN_REF_ENV).ok();
             let github_token_ref = params
                 .get("github_token_ref")
                 .and_then(|v| v.as_str())
+                .or(env_token_ref.as_deref())
                 .unwrap_or(DEFAULT_GITHUB_TOKEN_REF);
 
             // 2. Validate inputs.

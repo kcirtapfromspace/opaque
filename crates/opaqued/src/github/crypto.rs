@@ -15,6 +15,9 @@ pub enum CryptoError {
 
     #[error("invalid public key length: expected 32 bytes, got {0}")]
     InvalidKeyLength(usize),
+
+    #[error("sealed box encryption failed")]
+    EncryptionFailed,
 }
 
 /// Encrypt a secret value for the GitHub Actions API using sealed box encryption.
@@ -37,7 +40,7 @@ pub fn encrypt_secret(plaintext: &[u8], public_key_b64: &str) -> Result<String, 
     let mut rng = crypto_box::aead::OsRng;
     let ciphertext = public_key
         .seal(&mut rng, plaintext)
-        .expect("sealed box encryption should not fail with valid key");
+        .map_err(|_| CryptoError::EncryptionFailed)?;
 
     Ok(BASE64.encode(&ciphertext))
 }
@@ -110,6 +113,9 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("expected 32 bytes"));
         assert!(msg.contains("16"));
+
+        let err = CryptoError::EncryptionFailed;
+        assert!(format!("{err}").contains("encryption failed"));
     }
 
     #[test]

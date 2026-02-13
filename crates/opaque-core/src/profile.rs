@@ -173,8 +173,12 @@ pub enum ProfileError {
     ZeroMaxOutput,
 }
 
-/// Allowed secret ref schemes.
-const ALLOWED_REF_SCHEMES: &[&str] = &["env:", "keychain:", "profile:"];
+/// Allowed secret ref scheme prefixes.
+///
+/// This is the single canonical list of supported secret ref schemes.
+/// All validation code (profile loader, GitHub handler, daemon method handlers)
+/// must reference this constant instead of defining local copies.
+pub const ALLOWED_REF_SCHEMES: &[&str] = &["env:", "keychain:", "profile:"];
 
 /// Load and validate an `ExecProfile` from a TOML string.
 ///
