@@ -188,6 +188,36 @@ impl WorkspaceMatch {
 }
 
 // ---------------------------------------------------------------------------
+// Secret name match pattern
+// ---------------------------------------------------------------------------
+
+/// Pattern for matching secret ref names referenced in an operation request.
+/// Constrains which secrets a policy rule permits, preventing "secret
+/// transporter" attacks where a client with access to one operation can
+/// reference any secret.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SecretNameMatch {
+    /// Glob patterns for allowed secret ref names. Empty = match any.
+    #[serde(default)]
+    pub patterns: Vec<String>,
+}
+
+impl SecretNameMatch {
+    /// Returns `true` if all secret ref names match at least one pattern.
+    /// An empty pattern list matches any set of names (backward compat).
+    pub fn matches(&self, secret_ref_names: &[String]) -> bool {
+        if self.patterns.is_empty() {
+            return true;
+        }
+        secret_ref_names.iter().all(|name| {
+            self.patterns
+                .iter()
+                .any(|p| glob_match::glob_match(p, name))
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Approval configuration within a rule
 // ---------------------------------------------------------------------------
 
@@ -262,6 +292,10 @@ pub struct PolicyRule {
     #[serde(default)]
     pub workspace: WorkspaceMatch,
 
+    /// Secret ref name constraints (glob patterns).
+    #[serde(default)]
+    pub secret_names: SecretNameMatch,
+
     /// Whether this rule allows the matched request.
     #[serde(default = "default_true")]
     pub allow: bool,
@@ -304,6 +338,11 @@ impl PolicyRule {
 
         // Workspace constraints.
         if !self.workspace.matches(request.workspace.as_ref()) {
+            return false;
+        }
+
+        // Secret ref name constraints.
+        if !self.secret_names.matches(&request.secret_ref_names) {
             return false;
         }
 
@@ -536,6 +575,7 @@ mod tests {
                 },
             },
             workspace: WorkspaceMatch::default(),
+            secret_names: SecretNameMatch::default(),
             allow: true,
             client_types: vec![ClientType::Agent, ClientType::Human],
             approval: ApprovalConfig {
@@ -945,5 +985,98 @@ mod tests {
         let req2 = test_request("github.set_actions_secret", ClientType::Agent);
         let decision2 = engine.evaluate(&req2, OperationSafety::Safe);
         assert!(!decision2.allowed);
+    }
+
+    // -- SecretNameMatch tests --
+
+    #[test]
+    fn secret_name_empty_allows_any() {
+        let snm = SecretNameMatch::default();
+        assert!(snm.matches(&["ANY_SECRET".into(), "OTHER".into()]));
+        assert!(snm.matches(&[]));
+    }
+
+    #[test]
+    fn secret_name_exact() {
+        let snm = SecretNameMatch {
+            patterns: vec!["JWT".into()],
+        };
+        assert!(snm.matches(&["JWT".into()]));
+        assert!(!snm.matches(&["AWS_KEY".into()]));
+    }
+
+    #[test]
+    fn secret_name_glob() {
+        let snm = SecretNameMatch {
+            patterns: vec!["db/*".into()],
+        };
+        assert!(snm.matches(&["db/password".into()]));
+        assert!(snm.matches(&["db/username".into()]));
+        assert!(!snm.matches(&["aws/key".into()]));
+    }
+
+    #[test]
+    fn secret_name_rejects_unmatched() {
+        let snm = SecretNameMatch {
+            patterns: vec!["JWT".into()],
+        };
+        assert!(!snm.matches(&["JWT".into(), "UNALLOWED_SECRET".into()]));
+    }
+
+    #[test]
+    fn secret_name_multiple_patterns() {
+        let snm = SecretNameMatch {
+            patterns: vec!["JWT".into(), "AWS_*".into()],
+        };
+        assert!(snm.matches(&["JWT".into()]));
+        assert!(snm.matches(&["AWS_ACCESS_KEY".into()]));
+        assert!(snm.matches(&["JWT".into(), "AWS_SECRET".into()]));
+        assert!(!snm.matches(&["GH_TOKEN".into()]));
+    }
+
+    #[test]
+    fn secret_name_all_refs_must_match() {
+        let snm = SecretNameMatch {
+            patterns: vec!["allowed_*".into()],
+        };
+        // All refs match
+        assert!(snm.matches(&["allowed_one".into(), "allowed_two".into()]));
+        // One ref doesn't match
+        assert!(!snm.matches(&["allowed_one".into(), "forbidden".into()]));
+    }
+
+    #[test]
+    fn policy_with_secret_constraint() {
+        let mut rule = allow_rule();
+        rule.secret_names = SecretNameMatch {
+            patterns: vec!["JWT".into(), "GH_*".into()],
+        };
+        let engine = PolicyEngine::with_rules(vec![rule]);
+
+        // Request with JWT — allowed.
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let decision = engine.evaluate(&req, OperationSafety::Safe);
+        assert!(decision.allowed);
+    }
+
+    #[test]
+    fn policy_denies_unlisted_secret() {
+        let mut rule = allow_rule();
+        rule.secret_names = SecretNameMatch {
+            patterns: vec!["ONLY_THIS".into()],
+        };
+        let engine = PolicyEngine::with_rules(vec![rule]);
+
+        // Request has "JWT" which doesn't match "ONLY_THIS".
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let decision = engine.evaluate(&req, OperationSafety::Safe);
+        assert!(!decision.allowed);
+        assert!(
+            decision
+                .denial_reason
+                .as_ref()
+                .unwrap()
+                .contains("default deny")
+        );
     }
 }

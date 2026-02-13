@@ -26,8 +26,8 @@ use agentpass_core::audit::{
     WorkspaceSummary,
 };
 use agentpass_core::operation::{
-    ApprovalFactor, ApprovalRequirement, ClientType, OperationDef, OperationRegistry,
-    OperationRequest, OperationSafety, validate_params,
+    ApprovalFactor, ApprovalRequirement, OperationDef, OperationRegistry, OperationRequest,
+    OperationSafety, validate_params,
 };
 use agentpass_core::policy::{PolicyDecision, PolicyEngine};
 use agentpass_core::sanitize::{Sanitized, SanitizedResponse, Sanitizer, Unsanitized};
@@ -70,6 +70,9 @@ pub enum EnclaveError {
     #[error("rate limited: {0}")]
     RateLimited(String),
 
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+
     #[error("invalid params: {0}")]
     InvalidParams(String),
 
@@ -82,6 +85,7 @@ impl EnclaveError {
     fn error_code(&self) -> &'static str {
         match self {
             Self::IdentityVerification(_) => "identity_verification_failed",
+            Self::InvalidInput(_) => "bad_request",
             Self::UnknownOperation(_) => "unknown_operation",
             Self::SafetyViolation(_) => "safety_violation",
             Self::PolicyDenied(_) => "policy_denied",
@@ -354,15 +358,9 @@ impl Enclave {
         let start = Instant::now();
         let request_id = request.request_id;
         let client_summary = ClientSummary::from((&request.client_identity, request.client_type));
-        let target_summary = TargetSummary {
-            fields: request.target.clone(),
-        };
+        let target_summary = TargetSummary::sanitized(&request.target);
 
-        let workspace_summary = request.workspace.as_ref().map(|ws| WorkspaceSummary {
-            remote_url: ws.remote_url.clone(),
-            branch: ws.branch.clone(),
-            dirty: ws.dirty,
-        });
+        let workspace_summary = request.workspace.as_ref().map(WorkspaceSummary::sanitized);
 
         // --- Step 1: Emit request received ---
         let mut event = AuditEvent::new(AuditEventKind::RequestReceived)
@@ -393,7 +391,25 @@ impl Enclave {
             }
         };
 
-        // --- Step 2b: Validate params against schema ---
+        // --- Step 2b: Validate target keys against allowed set ---
+        if !op_def.allowed_target_keys.is_empty() {
+            for key in request.target.keys() {
+                if !op_def.allowed_target_keys.iter().any(|k| k == key) {
+                    let err = EnclaveError::InvalidInput(format!("unexpected target key: {key}"));
+                    return self.emit_and_sanitize_error(
+                        request_id,
+                        &client_summary,
+                        &request.operation,
+                        &target_summary,
+                        &request.secret_ref_names,
+                        &err,
+                        start,
+                    );
+                }
+            }
+        }
+
+        // --- Step 2c: Validate params against schema ---
         if let Some(ref schema) = op_def.params_schema
             && let Err(errors) = validate_params(schema, &request.params)
         {
@@ -549,17 +565,18 @@ impl Enclave {
     /// Check safety-class constraints before policy evaluation.
     fn check_safety_constraints(
         &self,
-        request: &OperationRequest,
+        _request: &OperationRequest,
         op_def: &OperationDef,
     ) -> Result<(), EnclaveError> {
-        match (request.client_type, op_def.safety) {
-            // REVEAL is never allowed for agent clients.
-            (ClientType::Agent, OperationSafety::Reveal) => Err(EnclaveError::SafetyViolation(
-                "REVEAL operations are never permitted for agent clients".into(),
-            )),
-            // All other combinations are checked by the policy engine.
-            _ => Ok(()),
+        // REVEAL operations are hard-blocked for ALL clients in v1.
+        // This is a defense-in-depth measure: even if policy somehow allows it,
+        // the safety check prevents plaintext secret disclosure.
+        if op_def.safety == OperationSafety::Reveal {
+            return Err(EnclaveError::SafetyViolation(
+                "REVEAL operations are not permitted in v1".into(),
+            ));
         }
+        Ok(())
     }
 
     /// Handle the approval gate if the policy decision requires it.
@@ -612,19 +629,27 @@ impl Enclave {
         );
 
         // Build the approval description that the user will see.
-        let mut description = format!(
-            "Operation: {}\nTarget: {:?}\nClient: {}\nSecrets: [{}]",
-            op_def.description,
-            request.target,
-            request.client_identity,
-            request.secret_ref_names.join(", "),
-        );
+        // SECURITY: Never use {:?} on raw client-controlled maps — it could
+        // embed secrets or control characters in the approval UI.
+        let mut description = format!("Operation: {}", op_def.description);
+        for (k, v) in &request.target {
+            let v_display = if v.len() > 128 { &v[..128] } else { v };
+            description.push_str(&format!("\n  {k}: {v_display}"));
+        }
+        description.push_str(&format!("\nClient: {}", request.client_identity));
+        let ref_display: Vec<&str> = request
+            .secret_ref_names
+            .iter()
+            .take(8)
+            .map(|s| s.as_str())
+            .collect();
+        description.push_str(&format!("\nSecrets: [{}]", ref_display.join(", ")));
         if let Some(ref ws) = request.workspace {
+            let url = ws.remote_url.as_deref().unwrap_or("?");
             description.push_str(&format!(
-                "\nWorkspace: repo={}, branch={}, dirty={}",
-                ws.remote_url.as_deref().unwrap_or("?"),
+                "\nWorkspace: repo={}, branch={}",
+                agentpass_core::validate::InputValidator::sanitize_url(url),
                 ws.branch.as_deref().unwrap_or("?"),
-                ws.dirty,
             ));
         }
         // Append truncated content hash for cryptographic binding.
@@ -918,6 +943,7 @@ mod tests {
             default_factors: vec![ApprovalFactor::LocalBio],
             description: "Set a GitHub Actions repository secret".into(),
             params_schema: None,
+            allowed_target_keys: vec![],
         })
         .unwrap();
         reg.register(OperationDef {
@@ -927,6 +953,7 @@ mod tests {
             default_factors: vec![ApprovalFactor::Fido2],
             description: "Reveal a secret value (human only)".into(),
             params_schema: None,
+            allowed_target_keys: vec![],
         })
         .unwrap();
         reg
@@ -949,6 +976,7 @@ mod tests {
                 },
             },
             workspace: WorkspaceMatch::default(),
+            secret_names: SecretNameMatch::default(),
             allow: true,
             client_types: vec![ClientType::Agent, ClientType::Human],
             approval: ApprovalConfig {
@@ -1020,6 +1048,7 @@ mod tests {
             operation_pattern: "secret.*".into(),
             target: TargetMatch::default(),
             workspace: WorkspaceMatch::default(),
+            secret_names: SecretNameMatch::default(),
             allow: true,
             client_types: vec![ClientType::Agent, ClientType::Human],
             approval: ApprovalConfig {
@@ -1053,6 +1082,58 @@ mod tests {
         let resp = enclave.execute(req).await;
 
         assert_eq!(resp.error_code(), Some("safety_violation"));
+        // Verify error message reflects v1 hard-block.
+        let msg = resp.error_message.as_deref().unwrap_or("");
+        assert!(msg.contains("not permitted in v1"));
+    }
+
+    #[tokio::test]
+    async fn reveal_denied_for_human() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let mut policy = test_policy();
+        policy.add_rule(PolicyRule {
+            name: "allow-reveal".into(),
+            client: ClientMatch::default(),
+            operation_pattern: "secret.*".into(),
+            target: TargetMatch::default(),
+            workspace: WorkspaceMatch::default(),
+            secret_names: SecretNameMatch::default(),
+            allow: true,
+            client_types: vec![ClientType::Human],
+            approval: ApprovalConfig {
+                require: ApprovalRequirement::Always,
+                factors: vec![ApprovalFactor::LocalBio],
+                lease_ttl: None,
+                one_time: true,
+            },
+        });
+
+        let enclave = Enclave::builder()
+            .registry(test_registry())
+            .policy(policy)
+            .handler(
+                "secret.reveal",
+                Box::new(StubHandler {
+                    response: serde_json::json!({"value": "supersecret"}),
+                }),
+            )
+            .handler(
+                "github.set_actions_secret",
+                Box::new(StubHandler {
+                    response: serde_json::json!({"status": "ok"}),
+                }),
+            )
+            .approval_gate(Box::new(AlwaysApproveGate))
+            .audit(audit.clone())
+            .build();
+
+        // Human client should ALSO be blocked from REVEAL in v1.
+        let req = test_request("secret.reveal", ClientType::Human);
+        let resp = enclave.execute(req).await;
+
+        assert_eq!(resp.error_code(), Some("safety_violation"));
+        let msg = resp.error_message.as_deref().unwrap_or("");
+        assert!(msg.contains("not permitted in v1"));
     }
 
     #[tokio::test]

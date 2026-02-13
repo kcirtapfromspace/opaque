@@ -123,12 +123,12 @@ impl fmt::Debug for SanitizedResponse<Sanitized> {
 
 /// Compiled set of patterns for detecting secret-like content.
 #[derive(Clone)]
-struct SecretPatterns {
+pub(crate) struct SecretPatterns {
     patterns: Vec<(String, Regex)>,
 }
 
 impl SecretPatterns {
-    fn compile() -> Self {
+    pub(crate) fn compile() -> Self {
         // Each pattern is (label, regex).
         let raw = vec![
             // JWT tokens (header.payload.signature).
@@ -177,12 +177,12 @@ impl SecretPatterns {
     }
 
     /// Returns true if the text contains any secret-like pattern.
-    fn contains_secret(&self, text: &str) -> bool {
+    pub(crate) fn contains_secret(&self, text: &str) -> bool {
         self.patterns.iter().any(|(_, re)| re.is_match(text))
     }
 
     /// Replace all secret-like patterns in text with `[REDACTED]`.
-    fn redact(&self, text: &str) -> String {
+    pub(crate) fn redact(&self, text: &str) -> String {
         let mut result = text.to_owned();
         for (label, re) in &self.patterns {
             result = re
@@ -214,7 +214,7 @@ fn scrub_paths(text: &str) -> String {
 }
 
 /// Scrub URLs that may contain credentials or tokens.
-fn scrub_urls(text: &str) -> String {
+pub(crate) fn scrub_urls(text: &str) -> String {
     // URLs with embedded credentials (user:pass@host).
     let cred_url_re = Regex::new(r"https?://[^\s@]+:[^\s@]+@[^\s]+").expect("valid regex");
     let result = cred_url_re.replace_all(text, "[URL:REDACTED]");
