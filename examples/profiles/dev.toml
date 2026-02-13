@@ -1,0 +1,34 @@
+# Example development sandbox profile for Opaque.
+#
+# Place this file at ~/.opaque/profiles/dev.toml and run:
+#   opaque exec --profile dev -- npm test
+
+[profile]
+name = "dev"
+description = "Development sandbox example"
+project_dir = "/home/user/src/myproject"
+extra_read_paths = []
+
+[network]
+# No network access (safest default).
+# Add entries like "api.github.com:443" to allow specific egress.
+allow = []
+
+[secrets]
+# Secret env vars are resolved by the daemon — the CLI never sees the values.
+# Uncomment to inject a GitHub token from the OS keychain:
+# GITHUB_TOKEN = "keychain:opaque/github-token"
+#
+# Or from the daemon's own environment:
+# API_KEY = "env:MY_API_KEY"
+
+[env]
+# Literal (non-secret) environment variables.
+RUST_LOG = "info"
+NODE_ENV = "development"
+
+[limits]
+# Maximum execution time (seconds). Default: 3600 (1 hour).
+timeout_secs = 3600
+# Maximum output capture (bytes). Default: 10 MB.
+max_output_bytes = 10485760
