@@ -7,6 +7,7 @@
 //! Secret values NEVER appear in audit events.
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -55,6 +56,9 @@ pub enum AuditEventKind {
 
     /// A provider fetch has completed.
     ProviderFetchFinished,
+
+    /// A request was rate-limited.
+    RateLimited,
 }
 
 impl fmt::Display for AuditEventKind {
@@ -71,6 +75,7 @@ impl fmt::Display for AuditEventKind {
             Self::OperationFailed => "operation.failed",
             Self::ProviderFetchStarted => "provider.fetch.started",
             Self::ProviderFetchFinished => "provider.fetch.finished",
+            Self::RateLimited => "rate.limited",
         };
         write!(f, "{s}")
     }
@@ -127,6 +132,21 @@ pub struct TargetSummary {
 }
 
 // ---------------------------------------------------------------------------
+// Workspace summary (safe for audit)
+// ---------------------------------------------------------------------------
+
+/// A summary of the workspace context, safe for inclusion in audit events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceSummary {
+    /// Git remote URL.
+    pub remote_url: Option<String>,
+    /// Current branch name.
+    pub branch: Option<String>,
+    /// Whether the working tree is dirty.
+    pub dirty: bool,
+}
+
+// ---------------------------------------------------------------------------
 // Audit event
 // ---------------------------------------------------------------------------
 
@@ -138,6 +158,9 @@ pub struct TargetSummary {
 pub struct AuditEvent {
     /// Unique event identifier.
     pub event_id: Uuid,
+
+    /// Monotonically increasing sequence number assigned by the emitter.
+    pub sequence_number: u64,
 
     /// UTC timestamp in milliseconds since epoch.
     pub ts_utc_ms: i64,
@@ -180,6 +203,9 @@ pub struct AuditEvent {
 
     /// Human-readable detail message (sanitized).
     pub detail: Option<String>,
+
+    /// Workspace summary (git repo/branch info).
+    pub workspace: Option<WorkspaceSummary>,
 }
 
 // Custom Debug to avoid any accidental leakage.
@@ -187,6 +213,7 @@ impl fmt::Debug for AuditEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AuditEvent")
             .field("event_id", &self.event_id)
+            .field("sequence_number", &self.sequence_number)
             .field("kind", &self.kind)
             .field("request_id", &self.request_id)
             .field("operation", &self.operation)
@@ -229,6 +256,7 @@ impl AuditEvent {
 
         Self {
             event_id: Uuid::new_v4(),
+            sequence_number: 0,
             ts_utc_ms: now.as_millis() as i64,
             level: default_level_for_kind(kind),
             kind,
@@ -243,7 +271,14 @@ impl AuditEvent {
             secret_names: vec![],
             policy_decision: None,
             detail: None,
+            workspace: None,
         }
+    }
+
+    /// Set the sequence number.
+    pub fn with_sequence_number(mut self, seq: u64) -> Self {
+        self.sequence_number = seq;
+        self
     }
 
     /// Set the request correlation ID.
@@ -317,12 +352,20 @@ impl AuditEvent {
         self.level = level;
         self
     }
+
+    /// Set the workspace summary.
+    pub fn with_workspace(mut self, workspace: WorkspaceSummary) -> Self {
+        self.workspace = Some(workspace);
+        self
+    }
 }
 
 /// Default severity level based on event kind.
 fn default_level_for_kind(kind: AuditEventKind) -> AuditLevel {
     match kind {
-        AuditEventKind::PolicyDenied | AuditEventKind::ApprovalDenied => AuditLevel::Warn,
+        AuditEventKind::PolicyDenied
+        | AuditEventKind::ApprovalDenied
+        | AuditEventKind::RateLimited => AuditLevel::Warn,
         AuditEventKind::OperationFailed => AuditLevel::Error,
         _ => AuditLevel::Info,
     }
@@ -347,29 +390,47 @@ pub trait AuditSink: Send + Sync + fmt::Debug {
 // In-memory audit emitter (for testing)
 // ---------------------------------------------------------------------------
 
+/// Internal state for `InMemoryAuditEmitter`.
+#[derive(Debug)]
+struct InMemoryAuditState {
+    events: Vec<AuditEvent>,
+    next_sequence: u64,
+}
+
 /// An in-memory audit emitter that stores events in a `Vec` behind a mutex.
-/// Useful for testing.
+/// Assigns monotonically increasing sequence numbers. Useful for testing.
 #[derive(Debug, Clone)]
 pub struct InMemoryAuditEmitter {
-    events: std::sync::Arc<std::sync::Mutex<Vec<AuditEvent>>>,
+    state: std::sync::Arc<std::sync::Mutex<InMemoryAuditState>>,
 }
 
 impl InMemoryAuditEmitter {
     /// Create a new empty emitter.
     pub fn new() -> Self {
         Self {
-            events: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            state: std::sync::Arc::new(std::sync::Mutex::new(InMemoryAuditState {
+                events: Vec::new(),
+                next_sequence: 0,
+            })),
         }
     }
 
     /// Retrieve a snapshot of all emitted events.
     pub fn events(&self) -> Vec<AuditEvent> {
-        self.events.lock().expect("audit mutex poisoned").clone()
+        self.state
+            .lock()
+            .expect("audit mutex poisoned")
+            .events
+            .clone()
     }
 
     /// Number of emitted events.
     pub fn len(&self) -> usize {
-        self.events.lock().expect("audit mutex poisoned").len()
+        self.state
+            .lock()
+            .expect("audit mutex poisoned")
+            .events
+            .len()
     }
 
     /// Whether any events have been emitted.
@@ -379,14 +440,16 @@ impl InMemoryAuditEmitter {
 
     /// Clear all stored events.
     pub fn clear(&self) {
-        self.events.lock().expect("audit mutex poisoned").clear();
+        let mut state = self.state.lock().expect("audit mutex poisoned");
+        state.events.clear();
     }
 
     /// Get events of a specific kind.
     pub fn events_of_kind(&self, kind: AuditEventKind) -> Vec<AuditEvent> {
-        self.events
+        self.state
             .lock()
             .expect("audit mutex poisoned")
+            .events
             .iter()
             .filter(|e| e.kind == kind)
             .cloned()
@@ -401,11 +464,11 @@ impl Default for InMemoryAuditEmitter {
 }
 
 impl AuditSink for InMemoryAuditEmitter {
-    fn emit(&self, event: AuditEvent) {
-        self.events
-            .lock()
-            .expect("audit mutex poisoned")
-            .push(event);
+    fn emit(&self, mut event: AuditEvent) {
+        let mut state = self.state.lock().expect("audit mutex poisoned");
+        event.sequence_number = state.next_sequence;
+        state.next_sequence += 1;
+        state.events.push(event);
     }
 }
 
@@ -414,13 +477,33 @@ impl AuditSink for InMemoryAuditEmitter {
 // ---------------------------------------------------------------------------
 
 /// An audit emitter that logs events via the `tracing` crate.
-#[derive(Debug, Clone, Copy)]
-pub struct TracingAuditEmitter;
+/// Assigns monotonically increasing sequence numbers.
+#[derive(Debug)]
+pub struct TracingAuditEmitter {
+    next_sequence: AtomicU64,
+}
+
+impl TracingAuditEmitter {
+    /// Create a new tracing audit emitter.
+    pub fn new() -> Self {
+        Self {
+            next_sequence: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Default for TracingAuditEmitter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl AuditSink for TracingAuditEmitter {
-    fn emit(&self, event: AuditEvent) {
+    fn emit(&self, mut event: AuditEvent) {
+        event.sequence_number = self.next_sequence.fetch_add(1, Ordering::Relaxed);
         tracing::info!(
             event_id = %event.event_id,
+            sequence_number = event.sequence_number,
             kind = %event.kind,
             request_id = ?event.request_id,
             operation = ?event.operation,
@@ -555,6 +638,7 @@ mod tests {
                 AuditEventKind::ProviderFetchFinished,
                 "provider.fetch.finished",
             ),
+            (AuditEventKind::RateLimited, "rate.limited"),
         ];
         for (kind, expected) in kinds {
             assert_eq!(format!("{kind}"), expected);
@@ -688,13 +772,68 @@ mod tests {
 
     #[test]
     fn tracing_emitter_does_not_panic() {
-        let emitter = TracingAuditEmitter;
+        let emitter = TracingAuditEmitter::new();
         emitter.emit(AuditEvent::new(AuditEventKind::RequestReceived));
         emitter.emit(
             AuditEvent::new(AuditEventKind::OperationFailed)
                 .with_operation("test.op")
                 .with_outcome("error")
                 .with_latency_ms(5),
+        );
+    }
+
+    #[test]
+    fn sequence_numbers_monotonic() {
+        let emitter = InMemoryAuditEmitter::new();
+        for _ in 0..10 {
+            emitter.emit(AuditEvent::new(AuditEventKind::RequestReceived));
+        }
+        let events = emitter.events();
+        for (i, event) in events.iter().enumerate() {
+            assert_eq!(event.sequence_number, i as u64);
+        }
+    }
+
+    #[test]
+    fn sequence_starts_at_zero() {
+        let emitter = InMemoryAuditEmitter::new();
+        emitter.emit(AuditEvent::new(AuditEventKind::RequestReceived));
+        let events = emitter.events();
+        assert_eq!(events[0].sequence_number, 0);
+    }
+
+    #[test]
+    fn sequence_in_debug() {
+        let event = AuditEvent::new(AuditEventKind::RequestReceived).with_sequence_number(42);
+        let dbg = format!("{event:?}");
+        assert!(dbg.contains("sequence_number: 42"));
+    }
+
+    #[test]
+    fn rate_limited_kind_display() {
+        assert_eq!(format!("{}", AuditEventKind::RateLimited), "rate.limited");
+    }
+
+    #[test]
+    fn rate_limited_default_level() {
+        assert_eq!(
+            default_level_for_kind(AuditEventKind::RateLimited),
+            AuditLevel::Warn
+        );
+    }
+
+    #[test]
+    fn tracing_emitter_assigns_sequence_numbers() {
+        let emitter = TracingAuditEmitter::new();
+        emitter.emit(AuditEvent::new(AuditEventKind::RequestReceived));
+        emitter.emit(AuditEvent::new(AuditEventKind::OperationSucceeded));
+        // We can't inspect the events directly from TracingAuditEmitter,
+        // but we can verify the counter advanced.
+        assert_eq!(
+            emitter
+                .next_sequence
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
         );
     }
 }

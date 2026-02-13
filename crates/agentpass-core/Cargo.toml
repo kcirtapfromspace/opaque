@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 glob-match = { workspace = true }
+jsonschema = { workspace = true }
 libc = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
