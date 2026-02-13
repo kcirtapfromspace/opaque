@@ -45,10 +45,8 @@ impl fmt::Display for ValidationError {
             Self::TooManyEntries { kind, max, actual } => {
                 write!(f, "too many {kind}: {actual} (max {max})")
             }
-            Self::InvalidCharset { field, value } => {
-                // Don't include the full value — it might contain control chars.
-                let preview: String = value.chars().take(32).collect();
-                write!(f, "{field} contains invalid characters: {preview:?}")
+            Self::InvalidCharset { field, .. } => {
+                write!(f, "{field} contains invalid characters")
             }
             Self::SecretDetected { field } => {
                 write!(f, "{field} appears to contain a secret value")
@@ -68,8 +66,8 @@ impl std::error::Error for ValidationError {}
 pub struct InputValidator;
 
 impl InputValidator {
-    /// Validate a string field: max length, no control chars (0x00-0x1F except
-    /// newline), no RTL overrides (U+202A-U+202E, U+2066-U+2069), strip
+    /// Validate a string field: max length, no control chars (0x00-0x1F),
+    /// no RTL overrides (U+202A-U+202E, U+2066-U+2069), strip
     /// leading/trailing whitespace.
     pub fn validate_field(
         field_name: &str,
@@ -86,11 +84,11 @@ impl InputValidator {
             });
         }
 
-        // Reject control characters (0x00-0x1F) except \n (0x0A).
+        // Reject all control characters (0x00-0x1F).
         // Reject RTL overrides and bidi isolates.
         for ch in trimmed.chars() {
             let cp = ch as u32;
-            if cp <= 0x1F && cp != 0x0A {
+            if cp <= 0x1F {
                 return Err(ValidationError::InvalidCharset {
                     field: field_name.into(),
                     value: trimmed.into(),
@@ -419,10 +417,14 @@ mod tests {
     }
 
     #[test]
-    fn validate_field_allows_newline() {
-        // Newline (0x0A) is the one control char we permit.
+    fn validate_field_rejects_newline() {
+        // Newlines are rejected to prevent approval prompt injection.
         let result = InputValidator::validate_field("test", "line1\nline2", 256);
-        assert!(result.is_ok());
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ValidationError::InvalidCharset { field, .. } => assert_eq!(field, "test"),
+            other => panic!("expected InvalidCharset, got {other}"),
+        }
     }
 
     #[test]
