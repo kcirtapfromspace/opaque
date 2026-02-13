@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
+use console::style;
 use futures_util::{SinkExt, StreamExt};
 use opaque_core::audit::{AuditEventKind, AuditFilter, query_audit_db};
 use opaque_core::policy::PolicyRule;
@@ -11,6 +12,8 @@ use opaque_core::proto::{Request, Response};
 use opaque_core::socket::{socket_path, verify_socket_safety};
 use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
+
+mod ui;
 
 /// Name of the daemon token file expected next to the socket.
 const DAEMON_TOKEN_FILENAME: &str = "daemon.token";
@@ -149,6 +152,7 @@ enum ProfileAction {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::enum_variant_names)]
 enum GithubAction {
     /// Set a GitHub Actions repository secret.
     SetSecret {
@@ -171,6 +175,72 @@ enum GithubAction {
         /// GitHub environment name (for environment secrets).
         #[arg(long)]
         environment: Option<String>,
+    },
+    /// Set a GitHub Codespaces secret (user-level or repo-level).
+    SetCodespacesSecret {
+        /// Repository in "owner/repo" format (omit for user-level secret).
+        #[arg(long)]
+        repo: Option<String>,
+
+        /// Secret name (e.g. "DOTFILES_TOKEN").
+        #[arg(long)]
+        secret_name: String,
+
+        /// Secret ref (e.g. "keychain:opaque/codespaces-token").
+        #[arg(long)]
+        value_ref: String,
+
+        /// GitHub token ref (default: "keychain:opaque/github-pat").
+        #[arg(long)]
+        github_token_ref: Option<String>,
+
+        /// Selected repository IDs (comma-separated, for user-level secrets).
+        #[arg(long, value_delimiter = ',')]
+        selected_repository_ids: Option<Vec<i64>>,
+    },
+    /// Set a GitHub Dependabot repository secret.
+    SetDependabotSecret {
+        /// Repository in "owner/repo" format.
+        #[arg(long)]
+        repo: String,
+
+        /// Secret name (e.g. "NPM_TOKEN").
+        #[arg(long)]
+        secret_name: String,
+
+        /// Secret ref (e.g. "keychain:opaque/npm-token").
+        #[arg(long)]
+        value_ref: String,
+
+        /// GitHub token ref (default: "keychain:opaque/github-pat").
+        #[arg(long)]
+        github_token_ref: Option<String>,
+    },
+    /// Set a GitHub Actions organization secret.
+    SetOrgSecret {
+        /// Organization name.
+        #[arg(long)]
+        org: String,
+
+        /// Secret name (e.g. "ORG_DEPLOY_KEY").
+        #[arg(long)]
+        secret_name: String,
+
+        /// Secret ref (e.g. "keychain:opaque/org-deploy-key").
+        #[arg(long)]
+        value_ref: String,
+
+        /// GitHub token ref (default: "keychain:opaque/github-pat").
+        #[arg(long)]
+        github_token_ref: Option<String>,
+
+        /// Secret visibility: "all", "private", or "selected" (default: "private").
+        #[arg(long, default_value = "private")]
+        visibility: String,
+
+        /// Selected repository IDs (comma-separated, when visibility is "selected").
+        #[arg(long, value_delimiter = ',')]
+        selected_repository_ids: Option<Vec<i64>>,
     },
 }
 
@@ -218,11 +288,9 @@ async fn main() {
         Cmd::Policy { action } => match action {
             PolicyAction::Check { file } => {
                 match policy_check_path(file.as_deref()) {
-                    Ok(msg) => {
-                        println!("{msg}");
-                    }
+                    Ok(msg) => ui::success(&msg),
                     Err(e) => {
-                        eprintln!("opaque: {e}");
+                        ui::error(&e);
                         std::process::exit(1);
                     }
                 }
@@ -230,12 +298,10 @@ async fn main() {
             }
         },
         Cmd::Init { force } => {
-            match run_init_at(&default_opaque_dir(), *force) {
-                Ok(msg) => {
-                    println!("{msg}");
-                }
+            match run_init(*force) {
+                Ok(()) => {}
                 Err(e) => {
-                    eprintln!("opaque: {e}");
+                    ui::error(&e);
                     std::process::exit(1);
                 }
             }
@@ -243,11 +309,9 @@ async fn main() {
         }
         Cmd::Profile { action } => {
             match run_profile_action(action) {
-                Ok(msg) => {
-                    println!("{msg}");
-                }
+                Ok(()) => {}
                 Err(e) => {
-                    eprintln!("opaque: {e}");
+                    ui::error(&e);
                     std::process::exit(1);
                 }
             }
@@ -271,7 +335,7 @@ async fn main() {
                     ) {
                         Ok(()) => {}
                         Err(e) => {
-                            eprintln!("opaque: {e}");
+                            ui::error(&e);
                             std::process::exit(1);
                         }
                     }
@@ -326,7 +390,13 @@ async fn main() {
                 github_token_ref,
                 environment,
             } => {
+                let scope = if environment.is_some() {
+                    "env_actions"
+                } else {
+                    "repo_actions"
+                };
                 let mut params = serde_json::json!({
+                    "scope": scope,
                     "repo": repo,
                     "secret_name": secret_name,
                     "value_ref": value_ref,
@@ -339,6 +409,74 @@ async fn main() {
                 }
                 ("github", params)
             }
+            GithubAction::SetCodespacesSecret {
+                repo,
+                secret_name,
+                value_ref,
+                github_token_ref,
+                selected_repository_ids,
+            } => {
+                let scope = if repo.is_some() {
+                    "codespaces_repo"
+                } else {
+                    "codespaces_user"
+                };
+                let mut params = serde_json::json!({
+                    "scope": scope,
+                    "secret_name": secret_name,
+                    "value_ref": value_ref,
+                });
+                if let Some(ref r) = repo {
+                    params["repo"] = serde_json::Value::String(r.clone());
+                }
+                if let Some(ref tok) = github_token_ref {
+                    params["github_token_ref"] = serde_json::Value::String(tok.clone());
+                }
+                if let Some(ref ids) = selected_repository_ids {
+                    params["selected_repository_ids"] = serde_json::json!(ids);
+                }
+                ("github", params)
+            }
+            GithubAction::SetDependabotSecret {
+                repo,
+                secret_name,
+                value_ref,
+                github_token_ref,
+            } => {
+                let mut params = serde_json::json!({
+                    "scope": "dependabot",
+                    "repo": repo,
+                    "secret_name": secret_name,
+                    "value_ref": value_ref,
+                });
+                if let Some(ref tok) = github_token_ref {
+                    params["github_token_ref"] = serde_json::Value::String(tok.clone());
+                }
+                ("github", params)
+            }
+            GithubAction::SetOrgSecret {
+                org,
+                secret_name,
+                value_ref,
+                github_token_ref,
+                visibility,
+                selected_repository_ids,
+            } => {
+                let mut params = serde_json::json!({
+                    "scope": "org_actions",
+                    "org": org,
+                    "secret_name": secret_name,
+                    "value_ref": value_ref,
+                    "visibility": visibility,
+                });
+                if let Some(ref tok) = github_token_ref {
+                    params["github_token_ref"] = serde_json::Value::String(tok.clone());
+                }
+                if let Some(ref ids) = selected_repository_ids {
+                    params["selected_repository_ids"] = serde_json::json!(ids);
+                }
+                ("github", params)
+            }
         },
         // Already handled above; unreachable.
         Cmd::Policy { .. } | Cmd::Init { .. } | Cmd::Audit { .. } | Cmd::Profile { .. } => {
@@ -346,15 +484,22 @@ async fn main() {
         }
     };
 
+    let sp = ui::spinner(&format!("Calling {method}..."));
     match call(&sock, method, params).await {
         Ok(resp) => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_string())
-            );
+            sp.finish_and_clear();
+            if let Some(err) = &resp.error {
+                ui::format_error(err);
+                std::process::exit(1);
+            }
+            if let Some(result) = &resp.result {
+                ui::format_response(method, result);
+            } else {
+                ui::success("Done (no result payload)");
+            }
         }
         Err(e) => {
-            eprintln!("opaque: {e}");
+            ui::spinner_error(&sp, &format!("Connection failed: {e}"));
             std::process::exit(1);
         }
     }
@@ -556,20 +701,23 @@ fn run_audit_tail(
     let events = query_audit_db(&db_path, &filter).map_err(|e| format!("query failed: {e}"))?;
 
     if events.is_empty() {
-        println!("no audit events found");
+        ui::info("No audit events found.");
         return Ok(());
     }
 
+    ui::header(&format!("{} audit event(s)", events.len()));
+    ui::audit_header();
+
     for event in &events {
         let ts = chrono_format_ms(event.ts_utc_ms);
-        let kind = &event.kind;
+        let kind = event.kind.to_string();
         let op = event.operation.as_deref().unwrap_or("-");
         let outcome = event.outcome.as_deref().unwrap_or("-");
         let rid = event
             .request_id
             .map(|u| u.to_string())
             .unwrap_or_else(|| "-".into());
-        println!("{ts}  {kind:<24}  op={op:<30}  outcome={outcome:<8}  req={rid}");
+        ui::audit_row(&ts, &kind, op, outcome, &rid);
     }
 
     Ok(())
@@ -719,8 +867,32 @@ fn dirs_or_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Run the init command with styled output.
+fn run_init(force: bool) -> Result<(), String> {
+    let base = default_opaque_dir();
+    run_init_at(&base, force)?;
+
+    ui::header("Initialized opaque");
+    ui::init_step(&format!("Created {}", style(base.display()).cyan()));
+    ui::init_step(&format!(
+        "Created {}",
+        style(base.join("run").display()).cyan()
+    ));
+    ui::init_step(&format!(
+        "Created {}",
+        style(base.join("profiles").display()).cyan()
+    ));
+    ui::init_step(&format!(
+        "Wrote   {}",
+        style(base.join("config.toml").display()).cyan()
+    ));
+    println!();
+    ui::info("Edit ~/.opaque/config.toml to configure policy rules.");
+    Ok(())
+}
+
 /// Initialize the opaque config directory at the given base path.
-fn run_init_at(base: &Path, force: bool) -> Result<String, String> {
+fn run_init_at(base: &Path, force: bool) -> Result<(), String> {
     let config_path = base.join("config.toml");
     let run_dir = base.join("run");
 
@@ -743,13 +915,7 @@ fn run_init_at(base: &Path, force: bool) -> Result<String, String> {
     std::fs::write(&config_path, SAMPLE_CONFIG)
         .map_err(|e| format!("failed to write {}: {e}", config_path.display()))?;
 
-    let mut summary = String::new();
-    summary.push_str(&format!("initialized opaque at {}\n", base.display()));
-    summary.push_str(&format!("  created {}\n", base.display()));
-    summary.push_str(&format!("  created {}\n", run_dir.display()));
-    summary.push_str(&format!("  created {}\n", profiles_dir.display()));
-    summary.push_str(&format!("  wrote {}", config_path.display()));
-    Ok(summary)
+    Ok(())
 }
 
 /// Create a directory with mode 0700 if it does not already exist.
@@ -775,13 +941,14 @@ fn create_dir_0700(path: &Path) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 /// Handle profile subcommands (list, show, validate).
-fn run_profile_action(action: &ProfileAction) -> Result<String, String> {
+fn run_profile_action(action: &ProfileAction) -> Result<(), String> {
     let profiles_dir = profile::profiles_dir();
 
     match action {
         ProfileAction::List => {
             if !profiles_dir.exists() {
-                return Ok("no profiles directory found (run `opaque init` first)".into());
+                ui::warn("No profiles directory found (run `opaque init` first)");
+                return Ok(());
             }
 
             let entries = std::fs::read_dir(&profiles_dir)
@@ -800,21 +967,24 @@ fn run_profile_action(action: &ProfileAction) -> Result<String, String> {
             names.sort();
 
             if names.is_empty() {
-                return Ok("no profiles found".into());
+                ui::info("No profiles found.");
+                return Ok(());
             }
 
-            let mut output = format!("{} profile(s) found:\n", names.len());
+            ui::header(&format!("{} profile(s)", names.len()));
             for name in &names {
-                output.push_str(&format!("  {name}\n"));
+                println!("  {} {}", style(ui::PAPER).dim(), style(name).cyan().bold());
             }
-            Ok(output.trim_end().to_string())
+            Ok(())
         }
 
         ProfileAction::Show { name } => {
             let path = profiles_dir.join(format!("{name}.toml"));
             let contents = std::fs::read_to_string(&path)
                 .map_err(|e| format!("failed to read profile '{name}': {e}"))?;
-            Ok(contents)
+            ui::header(&format!("Profile: {name}"));
+            println!("{contents}");
+            Ok(())
         }
 
         ProfileAction::Validate { name } => {
@@ -825,7 +995,8 @@ fn run_profile_action(action: &ProfileAction) -> Result<String, String> {
             profile::load_profile(&contents, Some(name))
                 .map_err(|e| format!("profile validation failed: {e}"))?;
 
-            Ok(format!("profile '{name}' is valid"))
+            ui::success(&format!("Profile '{name}' is valid"));
+            Ok(())
         }
     }
 }
@@ -1050,6 +1221,7 @@ lease_ttl = 0
 
         let content = fs::read_to_string(base.join("config.toml")).unwrap();
         assert!(content.contains("Opaque configuration file"));
+        // Old content should be replaced
         assert!(!content.contains("old content"));
     }
 
