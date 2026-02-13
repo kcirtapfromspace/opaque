@@ -16,10 +16,10 @@ Do not start a phase until the prior phase is shipped, tested with real users, a
 |---------|-------------|---------------------------|--------|
 | **GitLab CI variable sync** | `gitlab.set_ci_variable` operation | Same pattern as GitHub. Blocked on proving the architecture with one provider first. | Medium |
 | **GitHub Codespaces secrets** | `github.set_codespaces_secret` operation (user + repo scope) | Minor variant of GitHub Actions secrets. | Small |
-| **MCP server** | Expose AgentPass operations as MCP tools for Claude Code and other MCP-aware tools | Requires a stable operation interface to expose. Designing the MCP contract before the CLI contract is proven risks building the wrong abstraction. | Large |
+| **MCP server** | Expose Opaque operations as MCP tools for Claude Code and other MCP-aware tools | Requires a stable operation interface to expose. Designing the MCP contract before the CLI contract is proven risks building the wrong abstraction. | Large |
 | **1Password provider connector** | Fetch secrets from 1Password vaults via Connect API or service accounts | v1 uses mock/env-backed secret refs. Real provider connectors need the operation + sanitization pipeline to be solid. | Medium |
 | **HashiCorp Vault provider connector** | Fetch secrets from Vault KV, dynamic secrets (DB, AWS) | Same reasoning as 1Password. Vault adds lease management complexity. | Large |
-| **SQLite FTS5 audit search** | Full-text search over sanitized audit event text | Defer until there's enough audit data to justify search. `agentpass audit tail --follow` with grep is sufficient for v1. | Small |
+| **SQLite FTS5 audit search** | Full-text search over sanitized audit event text | Defer until there's enough audit data to justify search. `opaque audit tail --follow` with grep is sufficient for v1. | Small |
 
 ---
 
@@ -34,7 +34,7 @@ Do not start a phase until the prior phase is shipped, tested with real users, a
 | **FIDO2 / WebAuthn** | Hardware security key approval factor | Requires a WebAuthn relying party identifier (domain) and either a browser/webview ceremony or a CLI-based CTAP2 flow. Adding this before the local-bio path is proven adds complexity without user demand. | Large |
 | **Step-up authentication** | Policy requiring multiple factors (e.g., `local_bio + ios_faceid` for production targets) | Requires at least two working approval factors. Step-up logic is simple once the factors exist. | Medium |
 | **Push notifications for mobile approvals** | APNs integration for real-time approval delivery when the phone is not on the same LAN | Requires Apple Developer provisioning, a relay component, and the iOS app. v3 minimum. | Large |
-| **Device management** | `agentpass devices list`, `agentpass devices remove <id>`, paired device revocation | Requires mobile pairing infrastructure. | Small |
+| **Device management** | `opaque devices list`, `opaque devices remove <id>`, paired device revocation | Requires mobile pairing infrastructure. | Small |
 
 ---
 
@@ -47,7 +47,7 @@ Do not start a phase until the prior phase is shipped, tested with real users, a
 | **Arrow/Parquet audit export** | Periodically export audit events to Parquet files for long-term analytics | No users have enough data to justify columnar storage. SQLite handles months of single-user audit data trivially. Revisit when multi-user or enterprise deployment creates data volume. | Medium |
 | **DuckDB analytics queries** | Query Parquet-exported audit data with DuckDB | Depends on Parquet export. | Small |
 | **LanceDB semantic search** | Embed sanitized audit event text and support natural language search over history | Requires: choosing an embedding model (local ONNX or cloud API), async indexing pipeline, redaction-safe text generation, and a query interface with role-gated access. Massive dependency surface area (ONNX runtime or cloud API) for a feature nobody has asked for. Revisit if users demonstrate they can't find events with structured SQL + FTS5. | Large |
-| **SSE live feed** | HTTP `localhost` endpoint with Server-Sent Events for web/desktop UI | Adds an HTTP server dependency to a local daemon. `agentpass audit tail --follow` over UDS is sufficient until a web UI exists. | Medium |
+| **SSE live feed** | HTTP `localhost` endpoint with Server-Sent Events for web/desktop UI | Adds an HTTP server dependency to a local daemon. `opaque audit tail --follow` over UDS is sufficient until a web UI exists. | Medium |
 | **Arrow Flight feed** | Arrow-native streaming for BI/analytics tools | Enterprise feature. No justification until there are enterprise users. | Large |
 | **Audit retention policies** | Configurable retention with automatic purge and Parquet rolloff | v1 has basic 90-day retention with row deletion. Parquet rolloff is only needed when data volume justifies it. | Medium |
 | **Compliance reporting** | Pre-built audit reports for SOX, HIPAA, SOC2 | Enterprise feature with significant regulatory research. | XL |
@@ -76,7 +76,7 @@ Features explicitly decided against. Reopen only with strong user demand.
 | Feature | Reason |
 |---------|--------|
 | **Windows support** | Unix domain sockets, peer creds, polkit, LocalAuthentication — the entire architecture is Unix-first. Windows would require a parallel implementation (named pipes, Windows Hello, etc). Not enough demand to justify. |
-| **Multi-user daemon** | AgentPass is a single-user local tool. Multi-user adds access control complexity (which user's keychain? which policy?). Use separate daemon instances per user. |
+| **Multi-user daemon** | Opaque is a single-user local tool. Multi-user adds access control complexity (which user's keychain? which policy?). Use separate daemon instances per user. |
 | **GUI / menubar app** | CLI + LaunchAgent/systemd is the v1 model. A GUI adds a frontend project. Revisit if user research shows the CLI is a barrier to adoption. |
 | **Cloud-hosted relay for mobile approvals** | Adds a cloud dependency and a hosted service to operate. Local-network-only pairing (v3) is simpler and has a tighter threat model. Push notifications via APNs are acceptable if needed. |
-| **Generic "reveal secret" API** | Fundamentally contradicts the design. AgentPass never returns plaintext secrets to clients. |
+| **Generic "reveal secret" API** | Fundamentally contradicts the design. Opaque never returns plaintext secrets to clients. |

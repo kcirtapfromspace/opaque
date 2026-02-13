@@ -1,6 +1,6 @@
 //! Operation registry, request envelope, and client identity types.
 //!
-//! Every valid operation in AgentPass is registered here with its safety class
+//! Every valid operation in Opaque is registered here with its safety class
 //! and required approval factors. The [`OperationRequest`] is the canonical
 //! envelope that flows through the entire enforcement funnel.
 

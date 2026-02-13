@@ -1,6 +1,6 @@
 # Policy Model (Draft)
 
-AgentPass policy answers two questions:
+Opaque policy answers two questions:
 
 1. **Who** is calling (client identity)?
 2. **What** are they allowed to do (operation + target + secret refs), and under what conditions (approval factors, TTL, sandbox)?

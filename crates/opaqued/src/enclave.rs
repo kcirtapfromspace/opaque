@@ -21,16 +21,16 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use agentpass_core::audit::{
+use opaque_core::audit::{
     AuditEvent, AuditEventKind, AuditLevel, AuditSink, ClientSummary, TargetSummary,
     WorkspaceSummary,
 };
-use agentpass_core::operation::{
+use opaque_core::operation::{
     ApprovalFactor, ApprovalRequirement, OperationDef, OperationRegistry, OperationRequest,
     OperationSafety, validate_params,
 };
-use agentpass_core::policy::{PolicyDecision, PolicyEngine};
-use agentpass_core::sanitize::{Sanitized, SanitizedResponse, Sanitizer, Unsanitized};
+use opaque_core::policy::{PolicyDecision, PolicyEngine};
+use opaque_core::sanitize::{Sanitized, SanitizedResponse, Sanitizer, Unsanitized};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
@@ -814,7 +814,7 @@ impl Enclave {
             let url = ws.remote_url.as_deref().unwrap_or("?");
             description.push_str(&format!(
                 "\nWorkspace: repo={}, branch={}",
-                agentpass_core::validate::InputValidator::sanitize_url(url),
+                opaque_core::validate::InputValidator::sanitize_url(url),
                 ws.branch.as_deref().unwrap_or("?"),
             ));
         }
@@ -1103,14 +1103,14 @@ mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
-    use agentpass_core::audit::InMemoryAuditEmitter;
+    use opaque_core::audit::InMemoryAuditEmitter;
     use std::time::SystemTime;
 
-    use agentpass_core::operation::{
+    use opaque_core::operation::{
         ApprovalFactor, ApprovalRequirement, ClientIdentity, ClientType, OperationDef,
         OperationRequest, OperationSafety,
     };
-    use agentpass_core::policy::*;
+    use opaque_core::policy::*;
 
     fn test_identity() -> ClientIdentity {
         ClientIdentity {

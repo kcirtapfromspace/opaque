@@ -1,10 +1,10 @@
 # LLM Harness: Safe Secret Usage Without Disclosure
 
-This doc defines how LLM tools (Codex, Claude Code, etc) interact with AgentPass to use secrets **without ever receiving plaintext secret values**.
+This doc defines how LLM tools (Codex, Claude Code, etc) interact with Opaque to use secrets **without ever receiving plaintext secret values**.
 
 ## 1. The Rule: LLMs Get Operations, Not Values
 
-AgentPass exposes a small set of **operations** (see `docs/operations.md`) that can *use* secrets internally.
+Opaque exposes a small set of **operations** (see `docs/operations.md`) that can *use* secrets internally.
 
 - LLM tools may request:
   - "set GitHub secret `JWT` from secret ref `vault://...`"
@@ -25,11 +25,11 @@ Inputs are limited to:
   - `vault://...` (Vault path/key)
   - `profile:<name>:<key>` (recommended for agent workflows)
 
-AgentPass should reject raw values for "secret write" operations.
+Opaque should reject raw values for "secret write" operations.
 
 ## 3. Profiles: Make Secret Selection LLM-Friendly
 
-To keep LLM interaction simple and safe, AgentPass should support a "profile" file that maps env var names to secret refs.
+To keep LLM interaction simple and safe, Opaque should support a "profile" file that maps env var names to secret refs.
 
 Example (conceptual):
 
@@ -55,7 +55,7 @@ Operations that use secrets can trigger approval automatically based on policy:
 The LLM does not need to orchestrate approvals explicitly. Preferred v1 UX:
 
 1. LLM requests operation.
-2. AgentPass triggers approval UI(s).
+2. Opaque triggers approval UI(s).
 3. Operation returns success/failure.
 
 If your LLM tool environment has short tool-call timeouts, add an async mode:
@@ -73,7 +73,7 @@ Instead, the LLM should:
 
 - change code/config to read from an env var:
   - `JWT` (or `AUTH_TOKEN`)
-- then request AgentPass to *deliver* that env var into the target:
+- then request Opaque to *deliver* that env var into the target:
   - GitHub Actions secret (repo or environment)
   - GitLab CI variable
   - Kubernetes secret
@@ -88,7 +88,7 @@ Use an agent-safe operation:
 
 - `http.request_with_auth(auth_ref=..., url=..., method=...)`
 
-AgentPass adds the auth header internally and can enforce:
+Opaque adds the auth header internally and can enforce:
 
 - domain allowlists
 - method allowlists
@@ -116,7 +116,7 @@ Add these constraints to your agent/system prompt:
 
 - Never ask the user to paste secrets into chat.
 - Never read `.env` files that contain real values.
-- Use AgentPass operations with secret refs/profiles.
+- Use Opaque operations with secret refs/profiles.
 - For any operation that uses secrets, summarize intent for the human:
   - repo/project/cluster
   - secret key names (not values)
@@ -126,11 +126,11 @@ Add these constraints to your agent/system prompt:
 
 ### 7.1 CLI Harness (works everywhere)
 
-- LLM calls `agentpass ...` commands that invoke operations.
+- LLM calls `opaque ...` commands that invoke operations.
 - Output is strict JSON without secret values.
 
 ### 7.2 MCP Server (best UX for Claude Code)
 
-- Expose AgentPass operations as MCP tools.
+- Expose Opaque operations as MCP tools.
 - The MCP server must never return secret values.
 

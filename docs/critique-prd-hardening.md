@@ -2,7 +2,7 @@
 
 ## 1. Executive Summary
 
-This PRD attempts to retrofit security-critical properties -- operation-bound approvals, client identity verification, error sanitization, and audit integrity -- onto a codebase that currently has none of these things. The existing implementation (`crates/agentpassd/src/main.rs`) is approximately 200 lines of code that can handle `ping`, `version`, a completely unauthenticated `approval.prompt`, and a stubbed `whoami`. There is no policy engine, no client identity verification beyond raw `PeerInfo` extraction, no audit log, no operation model, no provider connectors, and no error sanitization. The PRD reads as a reasonable wish list, but it conflates a ground-up security framework build with a "hardening" pass, underestimates the implementation surface area by an order of magnitude, and leaves critical design decisions as open questions that will block every user story. Several of the proposed features (LanceDB semantic search, Arrow/Parquet analytics exports) are premature optimization for a system that does not yet have a single working operation executor. The threat model has real gaps, particularly around same-UID attacks, daemon impersonation, and the fundamental tension between "broker performs operations" and actually supporting the breadth of provider integrations described in the architecture doc.
+This PRD attempts to retrofit security-critical properties -- operation-bound approvals, client identity verification, error sanitization, and audit integrity -- onto a codebase that currently has none of these things. The existing implementation (`crates/opaqued/src/main.rs`) is approximately 200 lines of code that can handle `ping`, `version`, a completely unauthenticated `approval.prompt`, and a stubbed `whoami`. There is no policy engine, no client identity verification beyond raw `PeerInfo` extraction, no audit log, no operation model, no provider connectors, and no error sanitization. The PRD reads as a reasonable wish list, but it conflates a ground-up security framework build with a "hardening" pass, underestimates the implementation surface area by an order of magnitude, and leaves critical design decisions as open questions that will block every user story. Several of the proposed features (LanceDB semantic search, Arrow/Parquet analytics exports) are premature optimization for a system that does not yet have a single working operation executor. The threat model has real gaps, particularly around same-UID attacks, daemon impersonation, and the fundamental tension between "broker performs operations" and actually supporting the breadth of provider integrations described in the architecture doc.
 
 ---
 
@@ -12,19 +12,19 @@ This PRD attempts to retrofit security-critical properties -- operation-bound ap
 
 The PRD (US-003, FR-2) relies on Unix socket peer credentials (`uid/gid/pid`) plus executable hash as the client identity foundation. The architecture doc (`docs/architecture.md`, Section 6) confirms this. But:
 
-- **Any process running as the same UID can connect to the socket.** The socket is at `~/.agentpass/run/agentpassd.sock` with mode `0600` (see `lock_down_socket_path` in `crates/agentpassd/src/main.rs`, line 96-104). This means every process the user runs -- including the LLM agent runtime, any malware the agent downloads, any npm postinstall script, any compromised VS Code extension -- can connect.
+- **Any process running as the same UID can connect to the socket.** The socket is at `~/.opaque/run/opaqued.sock` with mode `0600` (see `lock_down_socket_path` in `crates/opaqued/src/main.rs`, line 96-104). This means every process the user runs -- including the LLM agent runtime, any malware the agent downloads, any npm postinstall script, any compromised VS Code extension -- can connect.
 - **Executable hash is a speed bump, not a barrier.** The PRD says the daemon computes `exe_path + sha256`. But `/proc/<pid>/exe` on Linux is a symlink that a malicious process can manipulate via mount namespaces. On macOS, the executable path from `LOCAL_PEERPID` is more reliable but still trusts that the binary has not been replaced between hash computation and actual use (TOCTOU).
-- **PID reuse.** The current `PeerInfo` struct (`crates/agentpass-core/src/peer.rs`) captures PID. PIDs are recycled. On Linux, PID exhaustion/cycling attacks are well-documented. The PRD does not mention PID reuse as a threat. If a malicious process can cause the legitimate client to exit and then reuse its PID before the daemon notices, any PID-scoped lease or identity check is broken.
+- **PID reuse.** The current `PeerInfo` struct (`crates/opaque-core/src/peer.rs`) captures PID. PIDs are recycled. On Linux, PID exhaustion/cycling attacks are well-documented. The PRD does not mention PID reuse as a threat. If a malicious process can cause the legitimate client to exit and then reuse its PID before the daemon notices, any PID-scoped lease or identity check is broken.
 - **macOS code-sign identity is "when available" (PRD line 49).** This means all unsigned binaries get a degraded identity model. Most developer tools (Claude Code installed via npm, Codex via pip, custom scripts) are unsigned. The "stronger" identity path will almost never be exercised in practice.
 
 **What is missing:** The PRD does not address daemon impersonation -- a malicious process could race to bind the socket path before the legitimate daemon starts. The stale-socket check in `main.rs` (lines 40-53) tries a connect and removes the file if it fails, but this is itself racy. There is no file locking, no pidfile, and no mechanism for clients to verify they are talking to the real daemon.
 
 ### 2.2 The "Untrusted Agent Runtime" Model Breaks Down
 
-The architecture doc (Section 2) correctly identifies that if an LLM agent can run arbitrary commands, it can exfiltrate anything it can read. The PRD then proceeds to ignore this by defining an approval-based security model that assumes the agent will politely go through the AgentPass RPC interface.
+The architecture doc (Section 2) correctly identifies that if an LLM agent can run arbitrary commands, it can exfiltrate anything it can read. The PRD then proceeds to ignore this by defining an approval-based security model that assumes the agent will politely go through the Opaque RPC interface.
 
 In practice:
-- Claude Code and Codex run shell commands. They can `cat ~/.agentpass/run/agentpassd.sock` (not useful) but they can also read the policy TOML files, read the SQLite audit database, read the OS keychain metadata, and enumerate what secrets exist.
+- Claude Code and Codex run shell commands. They can `cat ~/.opaque/run/opaqued.sock` (not useful) but they can also read the policy TOML files, read the SQLite audit database, read the OS keychain metadata, and enumerate what secrets exist.
 - The agent can observe the timing and content of approval prompts (by watching for the approval dialog process on Linux, or by monitoring process lists) even if it cannot directly approve them.
 - The agent can attempt denial-of-service by flooding the daemon with requests, exhausting the single-permit approval semaphore, or crashing the daemon via malformed input.
 
@@ -49,7 +49,7 @@ The policy model (`docs/policy.md`) matches clients by `exe_path` and `exe_sha25
 
 ### 3.1 Single Points of Failure in the Approval Flow
 
-The approval flow is entirely synchronous and single-threaded at the approval gate level. From `crates/agentpassd/src/main.rs` (lines 181-183):
+The approval flow is entirely synchronous and single-threaded at the approval gate level. From `crates/opaqued/src/main.rs` (lines 181-183):
 
 ```rust
 let Ok(_permit) = state.approval_gate.acquire().await else {
@@ -84,16 +84,16 @@ Between steps 3 and 5, there is no cryptographic binding. The PRD says the appro
 
 Beyond the same-UID issues discussed in Section 2.1:
 
-- **`XDG_RUNTIME_DIR` vs `~/.agentpass/run`**: The socket path logic in `crates/agentpass-core/src/socket.rs` (lines 6-22) falls back from `XDG_RUNTIME_DIR` to `~/.agentpass/run`. On many Linux systems, `XDG_RUNTIME_DIR` is `/run/user/<uid>`, which is a tmpfs with correct ownership. But `~/.agentpass/run` is on the user's home filesystem, which may be NFS-mounted, shared, or have different permission semantics. The PRD does not acknowledge this.
+- **`XDG_RUNTIME_DIR` vs `~/.opaque/run`**: The socket path logic in `crates/opaque-core/src/socket.rs` (lines 6-22) falls back from `XDG_RUNTIME_DIR` to `~/.opaque/run`. On many Linux systems, `XDG_RUNTIME_DIR` is `/run/user/<uid>`, which is a tmpfs with correct ownership. But `~/.opaque/run` is on the user's home filesystem, which may be NFS-mounted, shared, or have different permission semantics. The PRD does not acknowledge this.
 - **No authentication of the daemon to the client.** The client connects to a socket path and trusts that the daemon is legitimate. There is no challenge-response, no shared secret, and no daemon identity verification. A malicious process that races to bind the socket can impersonate the daemon and intercept all requests.
-- **`AGENTPASS_SOCK` environment variable override**: Any process can set `AGENTPASS_SOCK` to redirect the client to a malicious socket. This is mentioned nowhere in the threat model.
+- **`OPAQUE_SOCK` environment variable override**: Any process can set `OPAQUE_SOCK` to redirect the client to a malicious socket. This is mentioned nowhere in the threat model.
 
 ### 3.4 Length-Delimited JSON over UDS
 
-The protocol uses `tokio_util::codec::LengthDelimitedCodec` with a 1MB max frame size (`crates/agentpass/src/main.rs` line 79, `crates/agentpassd/src/main.rs` line 136). Issues:
+The protocol uses `tokio_util::codec::LengthDelimitedCodec` with a 1MB max frame size (`crates/opaque/src/main.rs` line 79, `crates/opaqued/src/main.rs` line 136). Issues:
 
 - **1MB frame size is generous for what should be small JSON requests.** A malicious client can send 1MB of JSON and force the daemon to allocate and parse it. There is no request size validation beyond the frame limit.
-- **No protocol versioning.** The PRD (US-002) calls for versioned envelopes, but the current `Request` struct (`crates/agentpass-core/src/proto.rs`) has no version field. Adding one is a breaking change.
+- **No protocol versioning.** The PRD (US-002) calls for versioned envelopes, but the current `Request` struct (`crates/opaque-core/src/proto.rs`) has no version field. Adding one is a breaking change.
 - **No request timeout.** A client can open a connection, send a partial frame (enough bytes to start the length-delimited read but not enough to complete it), and hold the connection indefinitely. There is no per-connection or per-request timeout in the daemon.
 - **The protocol is synchronous request-response on a persistent connection** (the `while let Some(frame)` loop in `handle_conn`). This means a client that sends a request and then blocks before reading the response ties up a server task indefinitely. There is no mechanism to cancel or timeout stale connections.
 
@@ -133,7 +133,7 @@ This is not a secrets broker -- it is a full API gateway. The PRD does not addre
 ### US-003: Enforce client identity + allowlist policy on every request
 
 - **Scope:** This is the entire policy engine. "Enforce client identity + allowlist policy on every request" is a feature, not a story.
-- **Acceptance criteria:** "Default behavior is deny-all until policy permits." This is correct, but it means the system is unusable out of the box. First-run experience will be: install AgentPass, try to use it, get denied on everything, have to manually write TOML policy rules. There is no onboarding flow, no interactive policy setup, and no way to discover what clients need to be allowed.
+- **Acceptance criteria:** "Default behavior is deny-all until policy permits." This is correct, but it means the system is unusable out of the box. First-run experience will be: install Opaque, try to use it, get denied on everything, have to manually write TOML policy rules. There is no onboarding flow, no interactive policy setup, and no way to discover what clients need to be allowed.
 - **Dependency:** This story depends on US-002 (you need the `OperationRequest` to evaluate policy against). It also implicitly depends on having at least one operation implemented, or the policy engine has nothing to gate. These dependencies are not stated.
 - **Missing:** The `exe_sha256` computation requires reading the client binary at connection time. For large binaries (VS Code is hundreds of MB), this adds latency to every connection. The PRD does not discuss caching, lazy evaluation, or the performance impact.
 
@@ -154,12 +154,12 @@ This is not a secrets broker -- it is a full API gateway. The PRD does not addre
 
 - **Acceptance criteria:** "If the environment cannot display intent ... the operation is denied with `approval_unavailable`." How does the daemon detect this? The current implementation (`approval.rs` lines 97-136) calls `polkit.CheckAuthorization` and returns whatever polkit returns. There is no mechanism to detect whether the auth agent actually displayed the intent details. Polkit does not provide a "did the user see the details" callback. The auth agent may display them, or it may just show "Authentication required" with no details.
 - **Open question acknowledged but not resolved:** The PRD (Open Question 1) asks "Which desktop environments/auth agents are officially supported?" This is a blocking question. You cannot test this story without answering it. The story should be blocked on this decision, and the PRD should say so explicitly.
-- **Missing:** The polkit policy file (`assets/linux/polkit/com.agentpass.approve.policy`) defines a single action ID `com.agentpass.approve` with a static message. There is no mechanism to pass per-operation details through the policy action. You would need multiple action IDs (one per operation type) or a custom auth agent that reads the `details` HashMap, which most standard auth agents do not do in a user-visible way.
+- **Missing:** The polkit policy file (`assets/linux/polkit/com.opaque.approve.policy`) defines a single action ID `com.opaque.approve` with a static message. There is no mechanism to pass per-operation details through the policy action. You would need multiple action IDs (one per operation type) or a custom auth agent that reads the `details` HashMap, which most standard auth agents do not do in a user-visible way.
 
 ### US-007: macOS approvals must work when daemon is packaged/backgrounded
 
 - **Acceptance criteria:** "Define and validate the supported packaging model." This is a research task, not a user story with testable acceptance criteria. The answer depends on Apple's behavior with `LAContext` in background processes, which may change between macOS versions.
-- **Blocking dependency:** Open Question 2 asks whether agentpassd runs as a LaunchAgent or app bundle helper. This must be decided before any testing can begin. The story is not implementable until this is answered.
+- **Blocking dependency:** Open Question 2 asks whether opaqued runs as a LaunchAgent or app bundle helper. This must be decided before any testing can begin. The story is not implementable until this is answered.
 - **Missing:** The current `prompt_macos_blocking` implementation (`approval.rs` lines 48-94) calls `LAContext.evaluatePolicy` from a `spawn_blocking` task. If the daemon is a LaunchAgent without access to the login session's window server, this call may hang or fail silently. The 120-second timeout is the only safety net, and it means the daemon is unresponsive for two minutes before failing.
 
 ### US-008: Build append-only audit log with role-gated live feed
@@ -234,7 +234,7 @@ The PRD (US-006, Open Question 1) acknowledges that polkit auth agents may not s
 - **MATE, XFCE, others**: varies, generally does not display details.
 - **Headless/SSH**: no auth agent at all.
 
-This means that on virtually all Linux desktops, the user sees "Authentication is required to approve an AgentPass operation" (from the policy file, line 8 of `com.agentpass.approve.policy`) with no indication of which operation, target, or client is requesting approval. The user is literally approving blind.
+This means that on virtually all Linux desktops, the user sees "Authentication is required to approve an Opaque operation" (from the policy file, line 8 of `com.opaque.approve.policy`) with no indication of which operation, target, or client is requesting approval. The user is literally approving blind.
 
 The PRD's Design Consideration (line 125) suggests "ship a minimal local UI helper for approvals" as a fallback, but this is not in any user story and has no acceptance criteria. It is a hand-wave toward the correct solution.
 
@@ -248,13 +248,13 @@ The PRD's Design Consideration (line 125) suggests "ship a minimal local UI help
 
 2. **Socket cleanup and daemon locking.** The current stale-socket detection (`main.rs` lines 40-53) is racy. There should be a proper pidfile and advisory file lock mechanism.
 
-3. **Client timeout and retry specification.** The client (`crates/agentpass/src/main.rs`) has no timeout on the connection or response. If the daemon hangs, the client hangs forever.
+3. **Client timeout and retry specification.** The client (`crates/opaque/src/main.rs`) has no timeout on the connection or response. If the daemon hangs, the client hangs forever.
 
 4. **Graceful shutdown behavior.** What happens to in-flight requests when the daemon receives SIGTERM? The current code (line 77-79) just breaks out of the accept loop. In-flight tasks are dropped when the tokio runtime shuts down. Clients get connection resets.
 
 5. **Multi-connection behavior.** Can the same client open multiple connections? Can different clients have concurrent in-flight requests? The daemon spawns a task per connection but has a global approval gate. These interactions are unspecified.
 
-6. **Secret material memory safety.** The architecture doc says secrets should only exist in `agentpassd` memory, but there is no discussion of:
+6. **Secret material memory safety.** The architecture doc says secrets should only exist in `opaqued` memory, but there is no discussion of:
    - Zeroing secret memory after use (`zeroize` crate).
    - Preventing secrets from being paged to swap (`mlock`).
    - Preventing secrets from appearing in core dumps (setting `PR_SET_DUMPABLE` on Linux, `KERN_PROC_PROT` on macOS).
@@ -324,7 +324,7 @@ None of these apply to a single-user local daemon in v1. SQLite is more than suf
 
 The audit-analytics doc proposes three feed transport options: UDS stream, HTTP SSE, and Arrow Flight. For v1:
 - `tokio::broadcast` in-process is sufficient.
-- A simple `agentpass tail --follow` over UDS is a nice-to-have.
+- A simple `opaque tail --follow` over UDS is a nice-to-have.
 - HTTP SSE and Arrow Flight are enterprise features that add HTTP server dependencies to a local daemon.
 
 **Cut SSE and Arrow Flight from v1.** Implement in-process broadcast and a simple UDS tail.
@@ -352,7 +352,7 @@ This is a project in itself. The PRD correctly lists it as a non-goal for full i
 
 3. **Add rate limiting to approval requests.** Per-client, per-operation, with configurable limits. Include an exponential backoff on denied approvals.
 
-4. **Define the protocol version negotiation.** The first message on a new connection should include `api_version` (from `agentpass-core/src/lib.rs` line 5, which defines `API_VERSION: u32 = 1` but never uses it). Define forward/backward compatibility rules.
+4. **Define the protocol version negotiation.** The first message on a new connection should include `api_version` (from `opaque-core/src/lib.rs` line 5, which defines `API_VERSION: u32 = 1` but never uses it). Define forward/backward compatibility rules.
 
 5. **Add connection and request timeouts.** Both client-side and server-side. A request that has not received a response within N seconds should be cancelled. A connection that has been idle for M seconds should be closed.
 
@@ -372,7 +372,7 @@ This is a project in itself. The PRD correctly lists it as a non-goal for full i
 
 1. **Daemon health check and lifecycle management.** Pidfile, file locking, systemd/launchd integration, graceful shutdown with in-flight request draining.
 2. **Client retry and timeout specification.** Define what clients should do on connection failure, request timeout, and approval timeout.
-3. **Policy bootstrapping / first-run experience.** Interactive `agentpass init` that detects installed tools, generates a starter policy, and walks the user through a first approval.
+3. **Policy bootstrapping / first-run experience.** Interactive `opaque init` that detects installed tools, generates a starter policy, and walks the user through a first approval.
 4. **Approval rate limiting and anti-spam.** Per-client request throttling, approval prompt cooldown, maximum pending approvals.
 5. **Memory safety for secrets.** `zeroize`, `mlock`, disable core dumps.
 6. **Integration tests for the approval flow.** The current code has zero tests. At minimum: policy deny, policy allow with approval, approval timeout, malformed request handling, concurrent approval requests.
@@ -394,18 +394,18 @@ The following are specific issues in the current codebase that the PRD should ac
 
 | File | Line(s) | Issue |
 |------|---------|-------|
-| `crates/agentpassd/src/main.rs` | 144 | `e.to_string()` sent directly in error response -- exactly the leak pattern US-005 aims to fix. |
-| `crates/agentpassd/src/main.rs` | 63 | `Semaphore::new(1)` -- no recovery if the semaphore is closed after a panic. |
-| `crates/agentpassd/src/main.rs` | 40-53 | Stale socket detection is racy (no file lock). |
-| `crates/agentpassd/src/main.rs` | 122-168 | No connection timeout, no request timeout, no max concurrent connections. |
-| `crates/agentpassd/src/main.rs` | 174-189 | `approval.prompt` is callable by any same-UID client with any reason string -- the exact problem the PRD identifies. |
-| `crates/agentpassd/src/approval.rs` | 88 | 120-second timeout is hardcoded, not configurable. During this time the approval gate is locked. |
-| `crates/agentpassd/src/approval.rs` | 121 | `details` HashMap passed to polkit is not displayed by standard auth agents, making Linux approvals blind. |
-| `crates/agentpass-core/src/peer.rs` | 5-9 | `PeerInfo` has no `exe_path` or `exe_sha256` -- the PRD assumes these exist but they are not implemented. |
-| `crates/agentpass-core/src/proto.rs` | 4-9 | `Request` has no `version` field, no `request_id` (uses `id: u64`), and `params` is untyped `serde_json::Value`. |
-| `crates/agentpass-core/src/socket.rs` | 24-39 | `ensure_socket_parent_dir` uses `create_dir_all` which may create intermediate directories with wrong permissions before `set_permissions` is called. |
-| `crates/agentpass/src/main.rs` | 67-102 | Client has no connection timeout, no response timeout, and retries are not implemented. |
+| `crates/opaqued/src/main.rs` | 144 | `e.to_string()` sent directly in error response -- exactly the leak pattern US-005 aims to fix. |
+| `crates/opaqued/src/main.rs` | 63 | `Semaphore::new(1)` -- no recovery if the semaphore is closed after a panic. |
+| `crates/opaqued/src/main.rs` | 40-53 | Stale socket detection is racy (no file lock). |
+| `crates/opaqued/src/main.rs` | 122-168 | No connection timeout, no request timeout, no max concurrent connections. |
+| `crates/opaqued/src/main.rs` | 174-189 | `approval.prompt` is callable by any same-UID client with any reason string -- the exact problem the PRD identifies. |
+| `crates/opaqued/src/approval.rs` | 88 | 120-second timeout is hardcoded, not configurable. During this time the approval gate is locked. |
+| `crates/opaqued/src/approval.rs` | 121 | `details` HashMap passed to polkit is not displayed by standard auth agents, making Linux approvals blind. |
+| `crates/opaque-core/src/peer.rs` | 5-9 | `PeerInfo` has no `exe_path` or `exe_sha256` -- the PRD assumes these exist but they are not implemented. |
+| `crates/opaque-core/src/proto.rs` | 4-9 | `Request` has no `version` field, no `request_id` (uses `id: u64`), and `params` is untyped `serde_json::Value`. |
+| `crates/opaque-core/src/socket.rs` | 24-39 | `ensure_socket_parent_dir` uses `create_dir_all` which may create intermediate directories with wrong permissions before `set_permissions` is called. |
+| `crates/opaque/src/main.rs` | 67-102 | Client has no connection timeout, no response timeout, and retries are not implemented. |
 
 ---
 
-*This critique was written to be harsh and specific. The core idea of AgentPass -- a secrets broker that prevents LLM agents from seeing secrets -- is sound and worth building. But the PRD as written conflates too many concerns, defers too many blocking decisions, and includes features that distract from the security-critical foundation that does not yet exist. Build the foundation first: identity, policy, one working operation, hardened approvals on one platform, and audit. Everything else is premature.*
+*This critique was written to be harsh and specific. The core idea of Opaque -- a secrets broker that prevents LLM agents from seeing secrets -- is sound and worth building. But the PRD as written conflates too many concerns, defers too many blocking decisions, and includes features that distract from the security-critical foundation that does not yet exist. Build the foundation first: identity, policy, one working operation, hardened approvals on one platform, and audit. Everything else is premature.*

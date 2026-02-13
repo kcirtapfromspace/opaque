@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-  "crates/agentpass-core",
-  "crates/agentpassd",
-  "crates/agentpass",
+  "crates/opaque-core",
+  "crates/opaqued",
+  "crates/opaque",
 ]
 
 [workspace.dependencies]

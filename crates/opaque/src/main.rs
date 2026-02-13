@@ -1,11 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use agentpass_core::proto::{Request, Response};
-use agentpass_core::socket::{socket_path, verify_socket_safety};
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
+use opaque_core::proto::{Request, Response};
+use opaque_core::socket::{socket_path, verify_socket_safety};
 use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
@@ -13,9 +13,9 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 const DAEMON_TOKEN_FILENAME: &str = "daemon.token";
 
 #[derive(Debug, Parser)]
-#[command(name = "agentpass", version)]
+#[command(name = "opaque", version)]
 struct Cli {
-    /// Override the Unix socket path (otherwise uses AGENTPASS_SOCK / XDG_RUNTIME_DIR / ~/.agentpass/run).
+    /// Override the Unix socket path (otherwise uses OPAQUE_SOCK / XDG_RUNTIME_DIR / ~/.opaque/run).
     #[arg(long)]
     socket: Option<PathBuf>,
 
@@ -100,7 +100,7 @@ async fn main() {
             );
         }
         Err(e) => {
-            eprintln!("agentpass: {e}");
+            eprintln!("opaque: {e}");
             std::process::exit(1);
         }
     }
@@ -122,7 +122,7 @@ fn read_daemon_token(sock: &Path) -> std::io::Result<String> {
         std::io::Error::new(
             e.kind(),
             format!(
-                "failed to read daemon token at {}: {e} (is agentpassd running?)",
+                "failed to read daemon token at {}: {e} (is opaqued running?)",
                 token_path.display()
             ),
         )
@@ -204,14 +204,14 @@ async fn call(
             std::io::Error::new(
                 e.kind(),
                 format!(
-                    "{e} (is agentpassd running? expected socket at {})",
+                    "{e} (is opaqued running? expected socket at {})",
                     sock.display()
                 ),
             )
         })?;
 
     let codec = LengthDelimitedCodec::builder()
-        .max_frame_length(agentpass_core::MAX_FRAME_LENGTH)
+        .max_frame_length(opaque_core::MAX_FRAME_LENGTH)
         .new_codec();
     let mut framed = Framed::new(stream, codec);
 

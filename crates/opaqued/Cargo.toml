@@ -1,11 +1,11 @@
 [package]
-name = "agentpassd"
+name = "opaqued"
 version = "0.1.0"
 edition = "2024"
 publish = false
 
 [dependencies]
-agentpass-core = { path = "../agentpass-core" }
+opaque-core = { path = "../opaque-core" }
 bytes = { workspace = true }
 libc = { workspace = true }
 futures-util = { workspace = true }

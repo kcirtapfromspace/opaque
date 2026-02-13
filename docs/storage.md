@@ -1,6 +1,6 @@
 # Storage & Data Model (Broker-First)
 
-AgentPass is a **broker**, not a general purpose secret key/value store. The persistent data model should therefore store:
+Opaque is a **broker**, not a general purpose secret key/value store. The persistent data model should therefore store:
 
 - references, identities, policies, approvals, and audit history
 - provider connection metadata (non-secret)
@@ -16,7 +16,7 @@ and explicitly **must not** store plaintext secret values.
 - pending approval requests (nonces, request summaries)
 - short-lived approval leases/capabilities (optional to persist; safer to keep in-memory)
 
-If `agentpassd` restarts, it is acceptable (and safer) to require re-approval.
+If `opaqued` restarts, it is acceptable (and safer) to require re-approval.
 
 ### 1.2 OS Credential Store (Keychain / Secret Service)
 
@@ -24,7 +24,7 @@ Use the OS store for **credentials and private keys**:
 
 - GitHub/GitLab credentials (PATs) if you choose to store them locally
 - Vault tokens / 1Password service tokens (if stored)
-- AgentPass server identity private key (used for iOS pairing/transport)
+- Opaque server identity private key (used for iOS pairing/transport)
 - optional: a database encryption key (see below)
 
 macOS: Keychain

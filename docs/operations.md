@@ -1,6 +1,6 @@
 # Operations (Draft Contract)
 
-AgentPass exposes **operations**, not raw secret values.
+Opaque exposes **operations**, not raw secret values.
 
 Operations are invoked via:
 

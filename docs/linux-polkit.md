@@ -1,6 +1,6 @@
 # Linux Native Approvals (polkit)
 
-AgentPass uses a **two-step approval flow** on Linux:
+Opaque uses a **two-step approval flow** on Linux:
 
 1. **Intent dialog** (zenity/kdialog) — displays the operation details so the user knows what they are approving
 2. **Polkit authentication** — system password/biometric prompt via PolicyKit
@@ -12,7 +12,7 @@ This two-step design exists because most polkit auth agents do not display the o
 - A running graphical session (`$DISPLAY` or `$WAYLAND_DISPLAY` must be set)
 - `zenity` (GNOME/GTK desktops) or `kdialog` (KDE/Qt desktops) installed and in `$PATH`
 - A polkit authentication agent running in the desktop session
-- The AgentPass polkit policy file installed (see below)
+- The Opaque polkit policy file installed (see below)
 
 If any requirement is missing, the daemon will fail closed (refuse to approve operations, not skip approval).
 
@@ -21,8 +21,8 @@ If any requirement is missing, the daemon will fail closed (refuse to approve op
 Copy the policy file to the system polkit actions directory (requires root):
 
 ```bash
-sudo cp assets/linux/polkit/com.agentpass.approve.policy \
-  /usr/share/polkit-1/actions/com.agentpass.approve.policy
+sudo cp assets/linux/polkit/com.opaque.approve.policy \
+  /usr/share/polkit-1/actions/com.opaque.approve.policy
 ```
 
 ## Policy Details
@@ -52,14 +52,14 @@ See `docs/deployment.md` for the full tiered support matrix. Summary:
 
 ## Credential Caching
 
-Some polkit auth agents (notably GNOME's) cache credentials for a short period (typically 5 minutes). Within that window, the polkit step may auto-succeed without re-entering a password. This is acceptable because the intent dialog (step 1) still appears for every approval, so the user always sees and confirms what they are approving. The credential cache is a polkit agent feature outside AgentPass's control.
+Some polkit auth agents (notably GNOME's) cache credentials for a short period (typically 5 minutes). Within that window, the polkit step may auto-succeed without re-entering a password. This is acceptable because the intent dialog (step 1) still appears for every approval, so the user always sees and confirms what they are approving. The credential cache is a polkit agent feature outside Opaque's control.
 
 ## Daemon Lifecycle
 
 Use a systemd user service. See `docs/deployment.md` for the recommended unit file with hardening options.
 
 ```bash
-systemctl --user enable --now agentpassd.service
+systemctl --user enable --now opaqued.service
 ```
 
 ## Notes
