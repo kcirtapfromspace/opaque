@@ -31,6 +31,30 @@ enum Cmd {
     Version,
     /// Debug client identity (placeholder).
     Whoami,
+    /// Execute an operation through the enclave.
+    Execute {
+        /// Operation name (e.g. "test.noop", "github.set_actions_secret").
+        operation: String,
+
+        /// Target key=value pairs (repeatable). E.g. --target repo=org/myrepo
+        #[arg(long, short = 't', value_parser = parse_kv)]
+        target: Vec<(String, String)>,
+
+        /// Secret ref names (repeatable). E.g. --secret JWT --secret DB_PASSWORD
+        #[arg(long, short = 's')]
+        secret: Vec<String>,
+
+        /// Attach git workspace context from the current directory.
+        #[arg(long, default_value_t = false)]
+        workspace: bool,
+    },
+}
+
+fn parse_kv(s: &str) -> Result<(String, String), String> {
+    let (k, v) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected KEY=VALUE, got '{s}'"))?;
+    Ok((k.to_owned(), v.to_owned()))
 }
 
 #[tokio::main]
@@ -43,6 +67,29 @@ async fn main() {
         Cmd::Ping => ("ping", serde_json::Value::Null),
         Cmd::Version => ("version", serde_json::Value::Null),
         Cmd::Whoami => ("whoami", serde_json::Value::Null),
+        Cmd::Execute {
+            operation,
+            target,
+            secret,
+            workspace: attach_ws,
+        } => {
+            let target_map: serde_json::Map<String, serde_json::Value> = target
+                .into_iter()
+                .map(|(k, v)| (k, serde_json::Value::String(v)))
+                .collect();
+            let ws = if attach_ws {
+                resolve_workspace_context()
+            } else {
+                None
+            };
+            let params = serde_json::json!({
+                "operation": operation,
+                "target": target_map,
+                "secret_ref_names": secret,
+                "workspace": ws,
+            });
+            ("execute", params)
+        }
     };
 
     match call(&sock, method, params).await {
@@ -82,7 +129,6 @@ fn read_daemon_token(sock: &Path) -> std::io::Result<String> {
     })
 }
 
-#[allow(dead_code)] // Used when execute subcommand is wired up
 /// Resolve the git workspace context from the current working directory.
 ///
 /// Runs git commands to determine repo root, remote URL, branch, HEAD SHA,
