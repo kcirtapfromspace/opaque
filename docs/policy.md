@@ -1,114 +1,117 @@
-# Policy Model (Draft)
+# Policy (v1)
 
-Opaque policy answers two questions:
+Opaque uses a deny-by-default allowlist policy enforced by the daemon (`opaqued`) inside `Enclave::execute()`.
 
-1. **Who** is calling (client identity)?
-2. **What** are they allowed to do (operation + target + secret refs), and under what conditions (approval factors, TTL, sandbox)?
+Rules are evaluated in order; the **first matching rule wins**. If no rule matches, the request is denied.
 
-This doc proposes a simple allowlist policy that is enforceable on macOS + Linux.
+The policy lives in the daemon config file:
 
-## 1. Client Identity
+- `OPAQUE_CONFIG` (if set)
+- otherwise `~/.opaque/config.toml`
 
-Minimum viable (v1):
+## Client Type (Human vs Agent)
 
-- Unix domain socket peer credentials: `uid`, `gid`, `pid`
-- Executable path and content hash (`sha256`)
+`opaqued` classifies each connecting client as:
 
-Stronger (macOS):
+- `human`: matches an entry in `known_human_clients`
+- `agent`: everything else (default)
 
-- code signature verification (Team ID, signing identity), treat unsigned clients as higher risk
+This classification is derived from peer credentials + executable identity and is **never** accepted from client-provided params.
 
-Recommended client identifiers:
+## Daemon Config Schema
 
-- `client.name`: human-readable label (ex: `"Claude Code"`)
-- `client.fingerprint`: stable machine-verified identifier
-  - `uid:<uid>:sha256:<hash>`
-  - optionally `codesign_team_id:<TEAMID>`
+Top-level fields:
 
-## 2. Operation + Target
+- `known_human_clients` (optional): list of allowlisted human executables
+- `rules` (optional): policy rules (deny-all when empty)
+- `audit_retention_days` (optional): SQLite retention window (default: 90)
 
-Every request should be represented as:
+### `known_human_clients`
 
-- `operation`: a string like `github.set_actions_secret`
-- `target`: operation-specific structured fields (repo/project/cluster/namespace/etc)
-- `inputs`: may include `secret_ref`s (never raw values)
+Each entry matches when **all specified fields match**. Unspecified fields are treated as "any":
 
-Policies should match on:
+- `exe_path`: glob match on executable path
+- `exe_sha256`: exact SHA-256 hex digest
+- `codesign_team_id`: exact macOS Team ID
 
-- operation name
-- target patterns (repo glob, project id, cluster name, namespace allowlist)
-- secret references (by name/tag, not by value)
-
-## 3. Approval Requirements
-
-Approval is a first-class policy attribute.
-
-Suggested knobs:
-
-- `require_approval`: `always` | `first_use` | `never`
-- `factors`: any-of / all-of set (ex: `["fido2"]` or `["fido2","ios"]`)
-- `lease_ttl`: duration (ex: `10m`)
-- `one_time`: boolean
-
-Supported factors (v1+ roadmap):
-
-- `local_bio`: native OS prompt on the same machine (macOS LocalAuthentication, Linux polkit)
-- `ios_faceid`: second-device approval using paired iOS device (QR pairing + Face ID)
-- `fido2`: hardware security key/passkey (future / optional)
+Empty entries are rejected by the daemon (would match everything).
 
 Example:
 
-- GitHub secret writes: require FIDO2 every time, one-time.
-- Low-risk reads: allow for 10 minutes after approval.
-
-## 4. Sandbox Requirements (Exec Mode)
-
-Exec mode is only safe against a malicious agent if the executed process is constrained.
-
-Policy should support:
-
-- allowed command allowlist (path + sha256)
-- environment allowlist (which variable names may be injected)
-- network egress allowlist (domains/IPs/ports)
-- filesystem allowlist (read-only mounts, deny access to keychain dirs, etc)
-- stdout/stderr redaction (best-effort; not a primary control)
-
-Linux can enforce this in v1 using namespaces/seccomp.
-
-macOS likely needs a VM/container runner for strong per-command egress policy; treat as a roadmap item unless you commit to a specific mechanism (pf anchors, NEFilter, VM-based runner).
-
-## 5. Draft Policy Format (TOML)
-
-This is a strawman format to make rules concrete:
-
 ```toml
-version = 1
-
-[[clients]]
-name = "claude-code"
-match.uid = 501
-match.exe_path = "/Applications/Claude Code.app/Contents/MacOS/claude-code"
-match.exe_sha256 = "..."
-
-[[rules]]
-clients = ["claude-code"]
-operation = "github.set_actions_secret"
-targets.repo = "org/*"
-approval.require = "always"
-approval.factors = ["fido2"]
-approval.one_time = true
-
-[[rules]]
-clients = ["claude-code"]
-operation = "k8s.set_secret"
-targets.cluster = "prod-*"
-targets.namespace = ["apps", "infra"]
-approval.require = "always"
-approval.factors = ["fido2", "ios"] # step-up for prod clusters
-approval.one_time = true
+[[known_human_clients]]
+name = "Opaque CLI"
+exe_path = "*/target/release/opaque"
 ```
 
-## 6. Non-Goals
+## Rule Schema
 
-- Policy is not meant to be a full IAM language.
-- Deny rules and complex precedence can be added later; start with explicit allowlists.
+Each `[[rules]]` has:
+
+- `name`: label (used in audit)
+- `operation_pattern`: glob (ex: `"github.*"`, `"sandbox.exec"`)
+- `allow`: `true` to allow, `false` to explicitly deny
+- `client_types`: `["human"]`, `["agent"]`, or both (empty means "all")
+
+Nested tables:
+
+- `[rules.client]`: match on client identity (`uid`, `exe_path`, `exe_sha256`, `codesign_team_id`)
+- `[rules.target]`: match on operation target fields (glob patterns)
+- `[rules.workspace]`: match on git workspace context (`remote_url_pattern`, `branch_pattern`, `require_clean`)
+- `[rules.secret_names]`: constrain referenced secret *names* (not values) via glob patterns
+- `[rules.approval]`: operation-bound approval requirements
+
+### Approval Configuration
+
+`[rules.approval]` fields:
+
+- `require`: `always` | `first_use` | `never`
+- `factors`: approval factors (any-of). v1 supports `local_bio`
+- `lease_ttl`: seconds (optional; for `first_use`)
+- `one_time`: bool (optional; defaults to `false`)
+
+Deferred factors exist in types but are out of scope for v1:
+
+- `ios_faceid` (v3)
+- `fido2` (v3)
+
+## Example Policy File
+
+This is a minimal, working config that:
+
+1. Allows `github.set_actions_secret` for a repo prefix, with first-use approval + 5 minute lease
+2. Allows `sandbox.exec` with approval every time
+
+```toml
+audit_retention_days = 90
+
+[[rules]]
+name = "allow-agent-github-actions-secrets"
+operation_pattern = "github.set_actions_secret"
+allow = true
+client_types = ["agent"]
+
+[rules.client]
+
+[rules.target]
+fields = { repo = "myorg/*" }
+
+[rules.approval]
+require = "first_use"
+factors = ["local_bio"]
+lease_ttl = 300
+
+[[rules]]
+name = "allow-agent-sandbox-exec"
+operation_pattern = "sandbox.exec"
+allow = true
+client_types = ["agent"]
+
+[rules.client]
+
+[rules.approval]
+require = "always"
+factors = ["local_bio"]
+```
+
+For more examples, see `examples/policy.toml`.

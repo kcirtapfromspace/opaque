@@ -1,136 +1,86 @@
-# LLM Harness: Safe Secret Usage Without Disclosure
+# LLM Harness (v1): Use Secrets Without Disclosure
 
-This doc defines how LLM tools (Codex, Claude Code, etc) interact with Opaque to use secrets **without ever receiving plaintext secret values**.
+This doc defines how LLM tools (Codex, Claude Code, etc) should interact with Opaque so they can **use** secrets without ever receiving plaintext secret values.
 
-## 1. The Rule: LLMs Get Operations, Not Values
+## The Rule
 
-Opaque exposes a small set of **operations** (see `docs/operations.md`) that can *use* secrets internally.
+LLMs get **operations**, not values.
 
-- LLM tools may request:
-  - "set GitHub secret `JWT` from secret ref `vault://...`"
-  - "write Kubernetes secret `foo` from secret refs"
-  - "call HTTP endpoint with auth ref"
-- LLM tools must never request:
-  - "print the JWT"
-  - "show me the .env contents"
-  - any API that returns secret values
+- OK: "set GitHub Actions secret `JWT` for `org/repo` using ref `keychain:opaque/jwt`"
+- Not OK: "print the JWT" / "show me the `.env` file" / "return the secret value"
 
-## 2. What the LLM Can Provide
+## How The LLM Calls Opaque (v1)
 
-Inputs are limited to:
+v1 uses a CLI harness:
 
-- non-secret metadata: repo name, secret variable names, cluster/namespace names, etc
-- **secret references** (refs), not values:
-  - `op://...` (1Password item/field reference)
-  - `vault://...` (Vault path/key)
-  - `profile:<name>:<key>` (recommended for agent workflows)
+- the agent runs `opaque ...` commands
+- the daemon (`opaqued`) enforces policy, triggers approvals, executes the operation, sanitizes results, and emits audit events
 
-Opaque should reject raw values for "secret write" operations.
+MCP server exposure is deferred (v2).
 
-## 3. Profiles: Make Secret Selection LLM-Friendly
+## Secret Inputs: Refs, Not Values
 
-To keep LLM interaction simple and safe, Opaque should support a "profile" file that maps env var names to secret refs.
+Operations accept **secret references** (refs), not raw values.
 
-Example (conceptual):
+Examples:
+
+- `keychain:opaque/github-pat`
+- `env:MY_SECRET` (daemon reads from its own environment, not the agent's)
+- `profile:<name>:<key>` (profile indirection; recommended for agent workflows)
+
+Opaque should reject raw secret literals for operations that write secrets to providers.
+
+## Profiles: Make Agent Workflows Safer
+
+Instead of giving the agent a pile of refs each run, keep them in a profile:
 
 ```toml
 [secrets]
-JWT = "vault://kv/myapp/jwt"
-DATABASE_URL = "op://Prod DB/uri"
+GITHUB_TOKEN = "keychain:opaque/github-token"
 ```
 
-Then the LLM only needs to say:
+Then the agent can request:
 
-- "set `JWT` in GitHub Actions secrets for `org/repo` using profile `myapp`"
+- "run sandbox exec with profile `dev`"
 
-The broker resolves `JWT` -> ref and fetches the value internally.
+The CLI never sees the resolved secret values.
 
-## 4. Approvals: Proof-of-Life + Step-Up
+## Approvals
 
-Operations that use secrets can trigger approval automatically based on policy:
+Approvals are operation-bound and are triggered as part of execution.
 
-- `local_bio`: native OS popup on desktop (macOS LocalAuthentication, Linux polkit)
-- `ios_faceid`: paired iOS device approval (QR pairing + Face ID)
+v1 implemented factor:
 
-The LLM does not need to orchestrate approvals explicitly. Preferred v1 UX:
+- `local_bio`: native OS prompt (macOS LocalAuthentication, Linux polkit)
 
-1. LLM requests operation.
-2. Opaque triggers approval UI(s).
-3. Operation returns success/failure.
+Deferred (do not build in v1):
 
-If your LLM tool environment has short tool-call timeouts, add an async mode:
+- `ios_faceid` (v3)
+- `fido2` / WebAuthn (v3)
 
-- `op.start` returns `request_id`
-- `op.status` polls until approved/denied/completed
+## Handling Common Requests Safely
 
-## 5. Handling “Arbitrary” Requests Safely
+### "Sync my .env to GitHub"
 
-### 5.1 “Insert JWT Here”
+Do not have the agent open a plaintext `.env` containing real values.
 
-Do not insert a JWT literal into source code or config files the LLM can read.
+Prefer:
 
-Instead, the LLM should:
+- `.env.example` (names only)
+- a profile mapping (names -> refs)
+- provider-side fetch via refs
 
-- change code/config to read from an env var:
-  - `JWT` (or `AUTH_TOKEN`)
-- then request Opaque to *deliver* that env var into the target:
-  - GitHub Actions secret (repo or environment)
-  - GitLab CI variable
-  - Kubernetes secret
+Then call:
 
-This keeps the JWT value out of the LLM context and out of the repo.
+- `github.set_actions_secret(repo, secret_name, value_ref)`
 
-### 5.2 “Use JWT to Call an API”
+### "Run tests that need secrets"
 
-Do not run `curl -H "Authorization: Bearer <jwt>" ...` from an agent runtime.
+Do not paste secrets into prompts or run `printenv` to verify them.
 
-Use an agent-safe operation:
+Use:
 
-- `http.request_with_auth(auth_ref=..., url=..., method=...)`
+- `opaque exec --profile <name> -- <command...>`
 
-Opaque adds the auth header internally and can enforce:
-
-- domain allowlists
-- method allowlists
-- response scrubbing
-
-### 5.3 “Sync .env Vars to GitHub”
-
-Avoid having the LLM open a plaintext `.env` that contains real values.
-
-Safer patterns:
-
-- `.env.example` or `.env.manifest` (names only)
-- profile mapping (names -> secret refs)
-- provider-side fetch (1Password/Vault) using refs
-
-Then sync with operations like:
-
-- `github.set_actions_secret(repo, name, value_ref)`
-- `github.set_actions_secret(repo, environment, name, value_ref)`
-- `github.set_codespaces_secret(scope, name, value_ref)`
-
-## 6. LLM Prompting Guidance (What To Teach the Agent)
-
-Add these constraints to your agent/system prompt:
-
-- Never ask the user to paste secrets into chat.
-- Never read `.env` files that contain real values.
-- Use Opaque operations with secret refs/profiles.
-- For any operation that uses secrets, summarize intent for the human:
-  - repo/project/cluster
-  - secret key names (not values)
-  - why it’s needed
-
-## 7. Integration Options
-
-### 7.1 CLI Harness (works everywhere)
-
-- LLM calls `opaque ...` commands that invoke operations.
-- Output is strict JSON without secret values.
-
-### 7.2 MCP Server (best UX for Claude Code)
-
-- Expose Opaque operations as MCP tools.
-- The MCP server must never return secret values.
+Opaque can inject secrets into the sandboxed process environment without returning them in command output.
 
