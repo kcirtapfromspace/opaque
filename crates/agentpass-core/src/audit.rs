@@ -59,6 +59,9 @@ pub enum AuditEventKind {
 
     /// A request was rate-limited.
     RateLimited,
+
+    /// An approval lease was reused (FirstUse within TTL).
+    LeaseHit,
 }
 
 impl fmt::Display for AuditEventKind {
@@ -76,6 +79,7 @@ impl fmt::Display for AuditEventKind {
             Self::ProviderFetchStarted => "provider.fetch.started",
             Self::ProviderFetchFinished => "provider.fetch.finished",
             Self::RateLimited => "rate.limited",
+            Self::LeaseHit => "lease.hit",
         };
         write!(f, "{s}")
     }
@@ -611,6 +615,10 @@ mod tests {
             default_level_for_kind(AuditEventKind::OperationSucceeded),
             AuditLevel::Info
         );
+        assert_eq!(
+            default_level_for_kind(AuditEventKind::LeaseHit),
+            AuditLevel::Info
+        );
     }
 
     #[test]
@@ -683,6 +691,7 @@ mod tests {
                 "provider.fetch.finished",
             ),
             (AuditEventKind::RateLimited, "rate.limited"),
+            (AuditEventKind::LeaseHit, "lease.hit"),
         ];
         for (kind, expected) in kinds {
             assert_eq!(format!("{kind}"), expected);

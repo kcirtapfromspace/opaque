@@ -31,8 +31,19 @@ use agentpass_core::operation::{
 };
 use agentpass_core::policy::{PolicyDecision, PolicyEngine};
 use agentpass_core::sanitize::{Sanitized, SanitizedResponse, Sanitizer, Unsanitized};
+use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
+
+// ---------------------------------------------------------------------------
+// Approval lease constants
+// ---------------------------------------------------------------------------
+
+/// Default TTL for approval leases when the policy rule does not specify one.
+const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(600); // 10 minutes
+
+/// Maximum TTL cap for any approval lease.
+const MAX_LEASE_TTL: Duration = Duration::from_secs(3600); // 60 minutes
 
 // ---------------------------------------------------------------------------
 // Enclave error
@@ -153,6 +164,146 @@ impl fmt::Debug for ApprovalRateLimiter {
 }
 
 // ---------------------------------------------------------------------------
+// Approval lease cache
+// ---------------------------------------------------------------------------
+
+/// Key for the approval lease cache. Identifies a unique (client, operation,
+/// target, secrets) tuple. Deliberately excludes PID so the same binary can
+/// reuse a lease across reconnects.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct LeaseKey {
+    /// SHA-256 of stable client identity fields (uid, gid, exe_path,
+    /// exe_sha256, codesign_team_id). PID is excluded.
+    client_fingerprint: String,
+    operation: String,
+    /// Sorted "key1=val1\0key2=val2\0..."
+    target_canonical: String,
+    /// Sorted "NAME1\0NAME2\0..."
+    secret_refs_canonical: String,
+}
+
+impl LeaseKey {
+    /// Compute a lease key from an operation request.
+    fn from_request(request: &OperationRequest) -> Self {
+        // Client fingerprint: hash stable identity fields (no PID).
+        let mut hasher = Sha256::new();
+        hasher.update(request.client_identity.uid.to_le_bytes());
+        hasher.update(request.client_identity.gid.to_le_bytes());
+        if let Some(ref p) = request.client_identity.exe_path {
+            hasher.update(p.to_string_lossy().as_bytes());
+        }
+        hasher.update(b"\0");
+        if let Some(ref h) = request.client_identity.exe_sha256 {
+            hasher.update(h.as_bytes());
+        }
+        hasher.update(b"\0");
+        if let Some(ref t) = request.client_identity.codesign_team_id {
+            hasher.update(t.as_bytes());
+        }
+        let client_fingerprint = format!("{:x}", hasher.finalize());
+
+        // Sorted target entries.
+        let mut target_entries: Vec<_> = request.target.iter().collect();
+        target_entries.sort_by_key(|(k, _)| k.as_str());
+        let target_canonical = target_entries
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("\0");
+
+        // Sorted secret ref names.
+        let mut refs = request.secret_ref_names.clone();
+        refs.sort();
+        let secret_refs_canonical = refs.join("\0");
+
+        Self {
+            client_fingerprint,
+            operation: request.operation.clone(),
+            target_canonical,
+            secret_refs_canonical,
+        }
+    }
+}
+
+/// A single approval lease entry.
+struct LeaseEntry {
+    granted_at: tokio::time::Instant,
+    ttl: Duration,
+    one_time: bool,
+}
+
+/// In-memory cache of approval leases. Cleared on daemon restart (fail closed).
+struct LeaseCache {
+    leases: Mutex<HashMap<LeaseKey, LeaseEntry>>,
+    max_ttl: Duration,
+}
+
+impl LeaseCache {
+    /// Create an empty lease cache with the default max TTL.
+    fn new() -> Self {
+        Self {
+            leases: Mutex::new(HashMap::new()),
+            max_ttl: MAX_LEASE_TTL,
+        }
+    }
+
+    /// Check if a valid lease exists for the given key.
+    ///
+    /// Returns `true` if a valid (non-expired) lease exists. Lazily removes
+    /// expired entries. Consumes one-time leases on hit.
+    fn check(&self, key: &LeaseKey) -> bool {
+        let mut leases = self.leases.lock().expect("lease cache mutex poisoned");
+        let now = tokio::time::Instant::now();
+
+        if let Some(entry) = leases.get(key) {
+            if now.duration_since(entry.granted_at) < entry.ttl {
+                if entry.one_time {
+                    // Consume the one-time lease.
+                    leases.remove(key);
+                }
+                return true;
+            }
+            // Expired — remove lazily.
+            leases.remove(key);
+        }
+        false
+    }
+
+    /// Grant a new lease. TTL is capped at `max_ttl`.
+    fn grant(&self, key: LeaseKey, ttl: Duration, one_time: bool) {
+        let capped_ttl = ttl.min(self.max_ttl);
+        let mut leases = self.leases.lock().expect("lease cache mutex poisoned");
+        leases.insert(
+            key,
+            LeaseEntry {
+                granted_at: tokio::time::Instant::now(),
+                ttl: capped_ttl,
+                one_time,
+            },
+        );
+    }
+
+    /// Clear all leases.
+    #[cfg(test)]
+    fn clear(&self) {
+        self.leases
+            .lock()
+            .expect("lease cache mutex poisoned")
+            .clear();
+    }
+}
+
+impl fmt::Debug for LeaseCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let count = self.leases.lock().map(|m| m.len()).unwrap_or(0);
+        f.debug_struct("LeaseCache")
+            .field("entries", &count)
+            .field("max_ttl", &self.max_ttl)
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Operation handler trait
 // ---------------------------------------------------------------------------
 
@@ -235,6 +386,9 @@ pub struct Enclave {
 
     /// Rate limiter for approval requests.
     rate_limiter: ApprovalRateLimiter,
+
+    /// In-memory approval lease cache. Cleared on daemon restart.
+    lease_cache: LeaseCache,
 }
 
 impl fmt::Debug for Enclave {
@@ -323,6 +477,7 @@ impl EnclaveBuilder {
             sanitizer: self.sanitizer,
             approval_semaphore: Semaphore::new(1),
             rate_limiter: ApprovalRateLimiter::new(3, Duration::from_secs(60)),
+            lease_cache: LeaseCache::new(),
         }
     }
 }
@@ -591,9 +746,21 @@ impl Enclave {
         let needs_approval = match decision.approval_requirement {
             ApprovalRequirement::Always => true,
             ApprovalRequirement::FirstUse => {
-                // In a full implementation, check lease cache here.
-                // For now, always require approval (fail closed).
-                true
+                let lease_key = LeaseKey::from_request(request);
+                if self.lease_cache.check(&lease_key) {
+                    // Lease hit — emit audit event, skip approval.
+                    self.audit.emit(
+                        AuditEvent::new(AuditEventKind::LeaseHit)
+                            .with_request_id(request.request_id)
+                            .with_client(client_summary.clone())
+                            .with_operation(&request.operation)
+                            .with_target(target_summary.clone())
+                            .with_outcome("lease_used"),
+                    );
+                    false
+                } else {
+                    true
+                }
             }
             ApprovalRequirement::Never => false,
         };
@@ -698,6 +865,14 @@ impl Enclave {
                         .with_latency_ms(approval_latency.as_millis() as i64)
                         .with_request_hash(&content_hash),
                 );
+
+                // Grant a lease for FirstUse approvals.
+                if decision.approval_requirement == ApprovalRequirement::FirstUse {
+                    let ttl = decision.lease_ttl.unwrap_or(DEFAULT_LEASE_TTL);
+                    let lease_key = LeaseKey::from_request(request);
+                    self.lease_cache.grant(lease_key, ttl, decision.one_time);
+                }
+
                 Ok(())
             }
             Ok(false) => {
@@ -815,6 +990,40 @@ impl ApprovalGate for NativeApprovalGate {
 #[cfg(test)]
 mod test_support {
     use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// An approval gate that always approves and counts invocations.
+    /// Used to assert "approval was called exactly N times" for lease tests.
+    #[derive(Debug)]
+    pub struct CountingApproveGate {
+        pub count: Arc<AtomicU32>,
+    }
+
+    impl CountingApproveGate {
+        pub fn new() -> (Self, Arc<AtomicU32>) {
+            let count = Arc::new(AtomicU32::new(0));
+            (
+                Self {
+                    count: count.clone(),
+                },
+                count,
+            )
+        }
+    }
+
+    impl ApprovalGate for CountingApproveGate {
+        fn request_approval(
+            &self,
+            _approval_id: Uuid,
+            _request: &OperationRequest,
+            _factors: &[ApprovalFactor],
+            _description: &str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>>
+        {
+            self.count.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(true) })
+        }
+    }
 
     /// A no-op approval gate that always approves. For testing only.
     #[derive(Debug)]
@@ -1348,5 +1557,321 @@ mod tests {
 
         let rate_events = audit.events_of_kind(AuditEventKind::RateLimited);
         assert_eq!(rate_events.len(), 1);
+    }
+
+    // -- LeaseKey unit tests --
+
+    #[test]
+    fn lease_key_deterministic() {
+        // Same request fields but different PID → same key.
+        let mut req1 = test_request("github.set_actions_secret", ClientType::Agent);
+        req1.client_identity.pid = Some(100);
+        let mut req2 = req1.clone();
+        req2.client_identity.pid = Some(999);
+        req2.request_id = Uuid::new_v4(); // different request_id too
+
+        assert_eq!(LeaseKey::from_request(&req1), LeaseKey::from_request(&req2));
+    }
+
+    #[test]
+    fn lease_key_differs_on_target() {
+        let req1 = test_request("github.set_actions_secret", ClientType::Agent);
+        let mut req2 = req1.clone();
+        req2.target.insert("repo".into(), "other-org/repo".into());
+
+        assert_ne!(LeaseKey::from_request(&req1), LeaseKey::from_request(&req2));
+    }
+
+    #[test]
+    fn lease_key_differs_on_operation() {
+        let mut reg = test_registry();
+        // Register a second operation so both are valid.
+        reg.register(OperationDef {
+            name: "github.delete_actions_secret".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Delete a GitHub Actions secret".into(),
+            params_schema: None,
+            allowed_target_keys: vec![],
+        })
+        .unwrap();
+        let _ = reg; // just needed to prove it's valid
+
+        let req1 = test_request("github.set_actions_secret", ClientType::Agent);
+        let mut req2 = req1.clone();
+        req2.operation = "github.delete_actions_secret".into();
+
+        assert_ne!(LeaseKey::from_request(&req1), LeaseKey::from_request(&req2));
+    }
+
+    #[test]
+    fn lease_key_differs_on_client() {
+        let req1 = test_request("github.set_actions_secret", ClientType::Agent);
+        let mut req2 = req1.clone();
+        req2.client_identity.exe_sha256 = Some("different_hash".into());
+
+        assert_ne!(LeaseKey::from_request(&req1), LeaseKey::from_request(&req2));
+    }
+
+    // -- LeaseCache unit tests --
+
+    #[test]
+    fn lease_cache_grant_and_check() {
+        let cache = LeaseCache::new();
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let key = LeaseKey::from_request(&req);
+        cache.grant(key.clone(), Duration::from_secs(60), false);
+        assert!(cache.check(&key));
+    }
+
+    #[tokio::test]
+    async fn lease_cache_expired() {
+        let cache = LeaseCache::new();
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let key = LeaseKey::from_request(&req);
+        cache.grant(key.clone(), Duration::from_millis(1), false);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!cache.check(&key));
+    }
+
+    #[test]
+    fn lease_cache_one_time_consumed() {
+        let cache = LeaseCache::new();
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let key = LeaseKey::from_request(&req);
+        cache.grant(key.clone(), Duration::from_secs(60), true);
+        assert!(cache.check(&key)); // first check consumes
+        assert!(!cache.check(&key)); // second check → gone
+    }
+
+    #[test]
+    fn lease_cache_clear() {
+        let cache = LeaseCache::new();
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let key = LeaseKey::from_request(&req);
+        cache.grant(key.clone(), Duration::from_secs(60), false);
+        cache.clear();
+        assert!(!cache.check(&key));
+    }
+
+    #[test]
+    fn lease_cache_different_keys_independent() {
+        let cache = LeaseCache::new();
+        let req1 = test_request("github.set_actions_secret", ClientType::Agent);
+        let mut req2 = req1.clone();
+        req2.target.insert("repo".into(), "other/repo".into());
+        let key1 = LeaseKey::from_request(&req1);
+        let key2 = LeaseKey::from_request(&req2);
+        cache.grant(key1.clone(), Duration::from_secs(60), false);
+        assert!(cache.check(&key1));
+        assert!(!cache.check(&key2));
+    }
+
+    // -- Lease integration tests --
+
+    /// Build a policy with a FirstUse rule for github.set_actions_secret.
+    fn test_first_use_policy(lease_ttl: Option<Duration>, one_time: bool) -> PolicyEngine {
+        PolicyEngine::with_rules(vec![PolicyRule {
+            name: "allow-claude-github-first-use".into(),
+            client: ClientMatch {
+                uid: Some(501),
+                exe_path: Some("/usr/bin/claude*".into()),
+                ..Default::default()
+            },
+            operation_pattern: "github.*".into(),
+            target: TargetMatch {
+                fields: {
+                    let mut m = HashMap::new();
+                    m.insert("repo".into(), "org/*".into());
+                    m
+                },
+            },
+            workspace: WorkspaceMatch::default(),
+            secret_names: SecretNameMatch::default(),
+            allow: true,
+            client_types: vec![ClientType::Agent, ClientType::Human],
+            approval: ApprovalConfig {
+                require: ApprovalRequirement::FirstUse,
+                factors: vec![ApprovalFactor::LocalBio],
+                lease_ttl,
+                one_time,
+            },
+        }])
+    }
+
+    fn build_lease_enclave(
+        gate: Box<dyn ApprovalGate>,
+        audit: Arc<InMemoryAuditEmitter>,
+        policy: PolicyEngine,
+    ) -> Enclave {
+        Enclave::builder()
+            .registry(test_registry())
+            .policy(policy)
+            .handler(
+                "github.set_actions_secret",
+                Box::new(StubHandler {
+                    response: serde_json::json!({"status": "ok"}),
+                }),
+            )
+            .approval_gate(gate)
+            .audit(audit)
+            .build()
+    }
+
+    #[tokio::test]
+    async fn lease_skips_approval_within_ttl() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let (gate, count) = CountingApproveGate::new();
+        let policy = test_first_use_policy(Some(Duration::from_secs(300)), false);
+        let enclave = build_lease_enclave(Box::new(gate), audit.clone(), policy);
+
+        // First execution: approval required.
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let resp = enclave.execute(req).await;
+        assert!(resp.error_code().is_none());
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Second execution: lease hit, no approval.
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let resp = enclave.execute(req).await;
+        assert!(resp.error_code().is_none());
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn lease_expires_triggers_new_approval() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let (gate, count) = CountingApproveGate::new();
+        // 1ms TTL so it expires immediately.
+        let policy = test_first_use_policy(Some(Duration::from_millis(1)), false);
+        let enclave = build_lease_enclave(Box::new(gate), audit.clone(), policy);
+
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let _ = enclave.execute(req).await;
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Second execution after expiry: approval required again.
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let _ = enclave.execute(req).await;
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn lease_different_target_no_reuse() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let (gate, count) = CountingApproveGate::new();
+        let policy = test_first_use_policy(Some(Duration::from_secs(300)), false);
+
+        // Need a policy that also matches the second target.
+        let mut policy_engine = policy;
+        policy_engine.add_rule(PolicyRule {
+            name: "allow-claude-github-other".into(),
+            client: ClientMatch {
+                uid: Some(501),
+                exe_path: Some("/usr/bin/claude*".into()),
+                ..Default::default()
+            },
+            operation_pattern: "github.*".into(),
+            target: TargetMatch {
+                fields: {
+                    let mut m = HashMap::new();
+                    m.insert("repo".into(), "other/*".into());
+                    m
+                },
+            },
+            workspace: WorkspaceMatch::default(),
+            secret_names: SecretNameMatch::default(),
+            allow: true,
+            client_types: vec![ClientType::Agent, ClientType::Human],
+            approval: ApprovalConfig {
+                require: ApprovalRequirement::FirstUse,
+                factors: vec![ApprovalFactor::LocalBio],
+                lease_ttl: Some(Duration::from_secs(300)),
+                one_time: false,
+            },
+        });
+
+        let enclave = build_lease_enclave(Box::new(gate), audit.clone(), policy_engine);
+
+        // First target.
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let _ = enclave.execute(req).await;
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Different target → new approval needed.
+        let mut req = test_request("github.set_actions_secret", ClientType::Agent);
+        req.target.insert("repo".into(), "other/repo".into());
+        let _ = enclave.execute(req).await;
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn one_time_lease_consumed() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let (gate, count) = CountingApproveGate::new();
+        let policy = test_first_use_policy(Some(Duration::from_secs(300)), true);
+        let enclave = build_lease_enclave(Box::new(gate), audit.clone(), policy);
+
+        // 1st execution: approval.
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let _ = enclave.execute(req).await;
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // 2nd execution: lease hit (consumed).
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let _ = enclave.execute(req).await;
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // 3rd execution: lease gone, approval again.
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let _ = enclave.execute(req).await;
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn always_approval_never_grants_lease() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let (gate, count) = CountingApproveGate::new();
+        // Use the original Always policy.
+        let policy = test_policy();
+        let enclave = build_lease_enclave(Box::new(gate), audit.clone(), policy);
+
+        // Two executions, both should require approval.
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let _ = enclave.execute(req).await;
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let _ = enclave.execute(req).await;
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn lease_hit_emits_audit_event() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let (gate, _count) = CountingApproveGate::new();
+        let policy = test_first_use_policy(Some(Duration::from_secs(300)), false);
+        let enclave = build_lease_enclave(Box::new(gate), audit.clone(), policy);
+
+        // First: triggers approval, grants lease.
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let _ = enclave.execute(req).await;
+        assert!(audit.events_of_kind(AuditEventKind::LeaseHit).is_empty());
+
+        // Second: lease hit.
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let _ = enclave.execute(req).await;
+
+        let lease_hits = audit.events_of_kind(AuditEventKind::LeaseHit);
+        assert_eq!(lease_hits.len(), 1);
+        let hit = &lease_hits[0];
+        assert_eq!(hit.outcome.as_deref(), Some("lease_used"));
+        assert_eq!(hit.operation.as_deref(), Some("github.set_actions_secret"));
+        assert!(hit.request_id.is_some());
+        assert!(hit.client.is_some());
+        assert!(hit.target.is_some());
     }
 }
