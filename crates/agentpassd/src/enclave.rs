@@ -598,6 +598,7 @@ impl Enclave {
         }
 
         let approval_id = Uuid::new_v4();
+        let content_hash = request.content_hash();
 
         // Emit approval required event.
         self.audit.emit(
@@ -606,7 +607,8 @@ impl Enclave {
                 .with_approval_id(approval_id)
                 .with_client(client_summary.clone())
                 .with_operation(&request.operation)
-                .with_target(target_summary.clone()),
+                .with_target(target_summary.clone())
+                .with_request_hash(&content_hash),
         );
 
         // Build the approval description that the user will see.
@@ -625,6 +627,8 @@ impl Enclave {
                 ws.dirty,
             ));
         }
+        // Append truncated content hash for cryptographic binding.
+        description.push_str(&format!("\nRequest Hash: {}", &content_hash[..16]));
 
         // Serialize approval prompts to avoid races.
         let _permit = self
@@ -640,7 +644,8 @@ impl Enclave {
                 .with_approval_id(approval_id)
                 .with_client(client_summary.clone())
                 .with_operation(&request.operation)
-                .with_target(target_summary.clone()),
+                .with_target(target_summary.clone())
+                .with_request_hash(&content_hash),
         );
 
         let approval_start = Instant::now();
@@ -665,7 +670,8 @@ impl Enclave {
                         .with_operation(&request.operation)
                         .with_target(target_summary.clone())
                         .with_outcome("granted")
-                        .with_latency_ms(approval_latency.as_millis() as i64),
+                        .with_latency_ms(approval_latency.as_millis() as i64)
+                        .with_request_hash(&content_hash),
                 );
                 Ok(())
             }
@@ -678,7 +684,8 @@ impl Enclave {
                         .with_operation(&request.operation)
                         .with_target(target_summary.clone())
                         .with_outcome("denied")
-                        .with_latency_ms(approval_latency.as_millis() as i64),
+                        .with_latency_ms(approval_latency.as_millis() as i64)
+                        .with_request_hash(&content_hash),
                 );
                 Err(EnclaveError::ApprovalNotGranted(
                     "user denied the approval request".into(),
@@ -694,7 +701,8 @@ impl Enclave {
                         .with_target(target_summary.clone())
                         .with_outcome("error")
                         .with_level(AuditLevel::Error)
-                        .with_latency_ms(approval_latency.as_millis() as i64),
+                        .with_latency_ms(approval_latency.as_millis() as i64)
+                        .with_request_hash(&content_hash),
                 );
                 Err(EnclaveError::ApprovalUnavailable(e))
             }
@@ -1158,6 +1166,38 @@ mod tests {
         for event in &events {
             if let Some(eid) = event.request_id {
                 assert_eq!(eid, rid, "all events should share the same request_id");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_events_contain_request_hash() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let enclave = build_enclave(Box::new(AlwaysApproveGate), audit.clone());
+
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let _ = enclave.execute(req).await;
+
+        // All approval-related events should carry the request_hash.
+        let approval_kinds = [
+            AuditEventKind::ApprovalRequired,
+            AuditEventKind::ApprovalPresented,
+            AuditEventKind::ApprovalGranted,
+        ];
+        for kind in &approval_kinds {
+            let events = audit.events_of_kind(*kind);
+            assert!(!events.is_empty(), "expected at least one {kind:?} event");
+            for event in &events {
+                assert!(
+                    event.request_hash.is_some(),
+                    "{kind:?} event missing request_hash"
+                );
+                let hash = event.request_hash.as_ref().unwrap();
+                assert_eq!(hash.len(), 64, "request_hash should be 64 hex chars");
+                assert!(
+                    hash.chars().all(|c| c.is_ascii_hexdigit()),
+                    "request_hash should be hex"
+                );
             }
         }
     }

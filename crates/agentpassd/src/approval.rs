@@ -95,6 +95,83 @@ fn prompt_macos_blocking(reason: &str) -> Result<bool, ApprovalError> {
 
 #[cfg(target_os = "linux")]
 async fn prompt_linux(reason: &str) -> Result<bool, ApprovalError> {
+    // Step 1: Show intent dialog with operation details before authentication.
+    // This prevents blind polkit approvals where the user authenticates without
+    // knowing what operation they are approving.
+    let intent_confirmed = show_intent_dialog(reason).await?;
+    if !intent_confirmed {
+        return Ok(false);
+    }
+
+    // Step 2: Polkit authentication (unchanged).
+    polkit_authenticate(reason).await
+}
+
+/// Show an intent dialog displaying operation details before polkit authentication.
+///
+/// Tries GUI dialogs first (zenity, kdialog), falls back to terminal if available.
+/// If no UI is available, fails closed (returns error, not false).
+#[cfg(target_os = "linux")]
+async fn show_intent_dialog(reason: &str) -> Result<bool, ApprovalError> {
+    let reason = reason.to_string();
+    tokio::task::spawn_blocking(move || show_intent_dialog_blocking(&reason))
+        .await
+        .map_err(|e| ApprovalError::Failed(format!("intent dialog task failed: {e}")))?
+}
+
+/// Blocking implementation of the intent dialog.
+#[cfg(target_os = "linux")]
+fn show_intent_dialog_blocking(reason: &str) -> Result<bool, ApprovalError> {
+    use std::process::Command;
+
+    let dialog_text = format!("AgentPass Approval Request\n\n{reason}\n\nDo you want to proceed?");
+
+    // Try zenity (GNOME/GTK).
+    if let Ok(status) = Command::new("zenity")
+        .args([
+            "--question",
+            "--title=AgentPass Approval",
+            &format!("--text={dialog_text}"),
+            "--width=400",
+        ])
+        .status()
+    {
+        return Ok(status.success());
+    }
+
+    // Try kdialog (KDE).
+    if let Ok(status) = Command::new("kdialog")
+        .args(["--yesno", &dialog_text, "--title", "AgentPass Approval"])
+        .status()
+    {
+        return Ok(status.success());
+    }
+
+    // Try terminal fallback if stdin is a TTY.
+    if atty_is_tty() {
+        eprint!("{}\n\nApprove? [y/N] ", dialog_text);
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).is_ok() {
+            let answer = input.trim().to_lowercase();
+            return Ok(answer == "y" || answer == "yes");
+        }
+    }
+
+    // No UI available — fail closed.
+    Err(ApprovalError::Failed(
+        "no approval UI available (no zenity, kdialog, or TTY)".into(),
+    ))
+}
+
+/// Check if stdin is a terminal (TTY).
+#[cfg(target_os = "linux")]
+fn atty_is_tty() -> bool {
+    unsafe { libc::isatty(libc::STDIN_FILENO) != 0 }
+}
+
+/// Polkit authentication step.
+#[cfg(target_os = "linux")]
+async fn polkit_authenticate(reason: &str) -> Result<bool, ApprovalError> {
     use std::collections::HashMap;
 
     use zbus::Connection;
@@ -111,11 +188,8 @@ async fn prompt_linux(reason: &str) -> Result<bool, ApprovalError> {
     let subject = Subject::new_for_owner(pid, None, None)
         .map_err(|e| ApprovalError::Failed(format!("polkit subject failed: {e}")))?;
 
-    // This requires installing a matching polkit policy action on the system.
-    // In v1, we ship a sample policy file and installation instructions.
     let action_id = "com.agentpass.approve";
 
-    // Details can be shown in some auth agents.
     let mut details = HashMap::new();
     details.insert("reason".to_string(), reason.to_string());
 
@@ -131,4 +205,14 @@ async fn prompt_linux(reason: &str) -> Result<bool, ApprovalError> {
         .map_err(|e| ApprovalError::Failed(format!("polkit check failed: {e}")))?;
 
     Ok(result.is_authorized)
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn atty_is_tty_does_not_panic() {
+        // Just verify the function doesn't panic in any environment.
+        let _ = super::atty_is_tty();
+    }
 }
