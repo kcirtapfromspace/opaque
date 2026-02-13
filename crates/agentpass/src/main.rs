@@ -211,7 +211,7 @@ async fn call(
         })?;
 
     let codec = LengthDelimitedCodec::builder()
-        .max_frame_length(1024 * 1024)
+        .max_frame_length(agentpass_core::MAX_FRAME_LENGTH)
         .new_codec();
     let mut framed = Framed::new(stream, codec);
 

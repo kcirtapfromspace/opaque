@@ -116,7 +116,25 @@ fn load_config() -> DaemonConfig {
 
     match std::fs::read_to_string(&path) {
         Ok(contents) => match toml_edit::de::from_str::<DaemonConfig>(&contents) {
-            Ok(config) => {
+            Ok(mut config) => {
+                // Filter out empty human client entries that would match everything.
+                let before = config.known_human_clients.len();
+                config.known_human_clients.retain(|entry| {
+                    let has_criteria = entry.exe_path.is_some()
+                        || entry.exe_sha256.is_some()
+                        || entry.codesign_team_id.is_some();
+                    if !has_criteria {
+                        warn!(
+                            "ignoring known_human_clients entry '{}': no matching criteria specified",
+                            entry.name
+                        );
+                    }
+                    has_criteria
+                });
+                let filtered = before - config.known_human_clients.len();
+                if filtered > 0 {
+                    warn!("{filtered} empty human client entries removed from config");
+                }
                 info!(
                     "loaded config from {} ({} known human clients, {} policy rules)",
                     path.display(),
@@ -335,7 +353,14 @@ fn derive_client_type(identity: &ClientIdentity, config: &DaemonConfig) -> Clien
 
 /// Check if a client identity matches a human client allowlist entry.
 /// All specified fields must match; absent fields are treated as "any".
+/// An entry with NO fields specified matches nothing — this prevents a
+/// misconfigured empty entry from classifying every client as Human.
 fn entry_matches(identity: &ClientIdentity, entry: &HumanClientEntry) -> bool {
+    // Reject entries that specify no matching criteria at all.
+    if entry.exe_path.is_none() && entry.exe_sha256.is_none() && entry.codesign_team_id.is_none() {
+        return false;
+    }
+
     if let Some(ref pattern) = entry.exe_path {
         match &identity.exe_path {
             Some(exe) => {
@@ -370,8 +395,6 @@ fn entry_matches(identity: &ClientIdentity, entry: &HumanClientEntry) -> bool {
         }
     }
 
-    // An entry with no fields specified would match everything — but that's
-    // a config error. We still return true for backward-compat.
     true
 }
 
@@ -587,9 +610,13 @@ fn verify_workspace_blocking(
         if remote.status.success() {
             let actual_url = String::from_utf8_lossy(&remote.stdout).trim().to_string();
             if actual_url != *claimed_url {
+                // Sanitize URLs before embedding in error messages to strip
+                // embedded credentials (e.g. https://token@host/...).
+                let safe_claimed = InputValidator::sanitize_url(claimed_url);
+                let safe_actual = InputValidator::sanitize_url(&actual_url);
                 return Err(format!(
                     "claimed remote_url '{}' does not match actual '{}'",
-                    claimed_url, actual_url,
+                    safe_claimed, safe_actual,
                 ));
             }
         }
@@ -690,7 +717,7 @@ async fn handle_conn(state: Arc<DaemonState>, stream: UnixStream) -> std::io::Re
     }
 
     let codec = LengthDelimitedCodec::builder()
-        .max_frame_length(128 * 1024) // 128KB max frame
+        .max_frame_length(agentpass_core::MAX_FRAME_LENGTH)
         .new_codec();
     let mut framed = Framed::new(stream, codec);
 
@@ -1171,6 +1198,44 @@ mod tests {
         );
         // HOME=/nonexistent prevents reading ~/.gitconfig.
         assert_eq!(envs.get("HOME").map(|s| s.as_str()), Some("/nonexistent"));
+    }
+
+    #[test]
+    fn empty_entry_does_not_match() {
+        let entry = HumanClientEntry {
+            name: "empty".into(),
+            exe_path: None,
+            exe_sha256: None,
+            codesign_team_id: None,
+        };
+        let id = test_identity();
+        assert!(!entry_matches(&id, &entry));
+    }
+
+    #[test]
+    fn config_rejects_empty_human_client_entry() {
+        let toml_str = r#"
+[[known_human_clients]]
+name = "empty-entry"
+
+[[known_human_clients]]
+name = "valid-entry"
+exe_path = "/usr/bin/claude*"
+"#;
+        let mut config: DaemonConfig = toml_edit::de::from_str(toml_str).unwrap();
+        assert_eq!(config.known_human_clients.len(), 2);
+
+        // Simulate the filtering that load_config() performs.
+        config.known_human_clients.retain(|entry| {
+            entry.exe_path.is_some()
+                || entry.exe_sha256.is_some()
+                || entry.codesign_team_id.is_some()
+        });
+        assert_eq!(config.known_human_clients.len(), 1);
+        assert_eq!(
+            config.known_human_clients[0].exe_path.as_deref(),
+            Some("/usr/bin/claude*")
+        );
     }
 
     #[test]
