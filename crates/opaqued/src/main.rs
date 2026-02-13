@@ -314,6 +314,72 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         })
         .expect("failed to register github.set_actions_secret");
 
+    registry
+        .register(OperationDef {
+            name: "github.set_codespaces_secret".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Set a GitHub Codespaces secret (user or repo level)".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["secret_name", "value_ref"],
+                "properties": {
+                    "secret_name": {"type": "string"},
+                    "value_ref": {"type": "string"},
+                    "repo": {"type": "string"},
+                    "github_token_ref": {"type": "string"},
+                    "selected_repository_ids": {"type": "array", "items": {"type": "integer"}}
+                }
+            })),
+            allowed_target_keys: vec!["repo".into()],
+        })
+        .expect("failed to register github.set_codespaces_secret");
+
+    registry
+        .register(OperationDef {
+            name: "github.set_dependabot_secret".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Set a GitHub Dependabot repository secret".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["repo", "secret_name", "value_ref"],
+                "properties": {
+                    "repo": {"type": "string"},
+                    "secret_name": {"type": "string"},
+                    "value_ref": {"type": "string"},
+                    "github_token_ref": {"type": "string"}
+                }
+            })),
+            allowed_target_keys: vec!["repo".into()],
+        })
+        .expect("failed to register github.set_dependabot_secret");
+
+    registry
+        .register(OperationDef {
+            name: "github.set_org_secret".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Set a GitHub Actions organization secret".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["org", "secret_name", "value_ref"],
+                "properties": {
+                    "org": {"type": "string"},
+                    "secret_name": {"type": "string"},
+                    "value_ref": {"type": "string"},
+                    "github_token_ref": {"type": "string"},
+                    "visibility": {"type": "string", "enum": ["all", "private", "selected"]},
+                    "selected_repository_ids": {"type": "array", "items": {"type": "integer"}}
+                }
+            })),
+            allowed_target_keys: vec!["org".into()],
+        })
+        .expect("failed to register github.set_org_secret");
+
     let policy = PolicyEngine::with_rules(config.rules.clone());
     info!("policy engine loaded with {} rules", policy.rule_count());
 
@@ -334,14 +400,29 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
     let audit = Arc::new(MultiAuditSink::new(vec![tracing_sink, sqlite_sink]));
 
     let sandbox_executor = sandbox::SandboxExecutor::new(audit.clone());
-    let github_handler = github::GitHubHandler::new(audit.clone());
+    let github_actions_handler = github::GitHubHandler::new(audit.clone());
+    let github_codespaces_handler = github::GitHubHandler::new(audit.clone());
+    let github_dependabot_handler = github::GitHubHandler::new(audit.clone());
+    let github_org_handler = github::GitHubHandler::new(audit.clone());
 
     let enclave = Enclave::builder()
         .registry(registry)
         .policy(policy)
         .handler("test.noop", Box::new(NoopHandler))
         .handler("sandbox.exec", Box::new(sandbox_executor))
-        .handler("github.set_actions_secret", Box::new(github_handler))
+        .handler(
+            "github.set_actions_secret",
+            Box::new(github_actions_handler),
+        )
+        .handler(
+            "github.set_codespaces_secret",
+            Box::new(github_codespaces_handler),
+        )
+        .handler(
+            "github.set_dependabot_secret",
+            Box::new(github_dependabot_handler),
+        )
+        .handler("github.set_org_secret", Box::new(github_org_handler))
         .approval_gate(Box::new(NativeApprovalGate))
         .audit(audit)
         .build();
@@ -1212,26 +1293,12 @@ async fn handle_request(
         }
         "github" => {
             // The github method is a convenience wrapper that builds an "execute"
-            // request for "github.set_actions_secret" from github-specific params.
-            let repo = req
+            // request for the appropriate github.* operation based on the `scope` param.
+            let scope = req
                 .params
-                .get("repo")
+                .get("scope")
                 .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-
-            if repo.is_empty() {
-                return Response::err(Some(req.id), "bad_request", "missing 'repo' field");
-            }
-
-            // Validate repo format (owner/repo).
-            if !repo.contains('/') || repo.starts_with('/') || repo.ends_with('/') {
-                return Response::err(
-                    Some(req.id),
-                    "bad_request",
-                    "repo must be in 'owner/repo' format",
-                );
-            }
+                .unwrap_or("repo_actions");
 
             let secret_name = req
                 .params
@@ -1282,37 +1349,156 @@ async fn handle_request(
                 );
             }
 
-            let github_token_ref = req
-                .params
-                .get("github_token_ref")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_owned());
+            // Determine operation name and target based on scope.
+            let (operation, target, op_params) = match scope {
+                "repo_actions" | "env_actions" => {
+                    let repo = req
+                        .params
+                        .get("repo")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_owned();
+                    if repo.is_empty() {
+                        return Response::err(Some(req.id), "bad_request", "missing 'repo' field");
+                    }
+                    if !repo.contains('/') || repo.starts_with('/') || repo.ends_with('/') {
+                        return Response::err(
+                            Some(req.id),
+                            "bad_request",
+                            "repo must be in 'owner/repo' format",
+                        );
+                    }
 
-            let environment = req
-                .params
-                .get("environment")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_owned());
+                    let mut params = serde_json::json!({
+                        "repo": repo,
+                        "secret_name": secret_name,
+                        "value_ref": value_ref,
+                    });
+                    if let Some(tok) = req.params.get("github_token_ref").and_then(|v| v.as_str()) {
+                        params["github_token_ref"] = serde_json::Value::String(tok.into());
+                    }
+                    if let Some(env) = req.params.get("environment").and_then(|v| v.as_str()) {
+                        params["environment"] = serde_json::Value::String(env.into());
+                    }
+                    let target = HashMap::from([("repo".into(), repo)]);
+                    ("github.set_actions_secret", target, params)
+                }
+                "codespaces_user" => {
+                    let mut params = serde_json::json!({
+                        "secret_name": secret_name,
+                        "value_ref": value_ref,
+                    });
+                    if let Some(tok) = req.params.get("github_token_ref").and_then(|v| v.as_str()) {
+                        params["github_token_ref"] = serde_json::Value::String(tok.into());
+                    }
+                    if let Some(ids) = req.params.get("selected_repository_ids") {
+                        params["selected_repository_ids"] = ids.clone();
+                    }
+                    ("github.set_codespaces_secret", HashMap::new(), params)
+                }
+                "codespaces_repo" => {
+                    let repo = req
+                        .params
+                        .get("repo")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_owned();
+                    if repo.is_empty() {
+                        return Response::err(Some(req.id), "bad_request", "missing 'repo' field");
+                    }
+                    if !repo.contains('/') || repo.starts_with('/') || repo.ends_with('/') {
+                        return Response::err(
+                            Some(req.id),
+                            "bad_request",
+                            "repo must be in 'owner/repo' format",
+                        );
+                    }
 
-            let mut op_params = serde_json::json!({
-                "repo": repo,
-                "secret_name": secret_name,
-                "value_ref": value_ref,
-            });
+                    let mut params = serde_json::json!({
+                        "repo": repo,
+                        "secret_name": secret_name,
+                        "value_ref": value_ref,
+                    });
+                    if let Some(tok) = req.params.get("github_token_ref").and_then(|v| v.as_str()) {
+                        params["github_token_ref"] = serde_json::Value::String(tok.into());
+                    }
+                    let target = HashMap::from([("repo".into(), repo)]);
+                    ("github.set_codespaces_secret", target, params)
+                }
+                "dependabot" => {
+                    let repo = req
+                        .params
+                        .get("repo")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_owned();
+                    if repo.is_empty() {
+                        return Response::err(Some(req.id), "bad_request", "missing 'repo' field");
+                    }
+                    if !repo.contains('/') || repo.starts_with('/') || repo.ends_with('/') {
+                        return Response::err(
+                            Some(req.id),
+                            "bad_request",
+                            "repo must be in 'owner/repo' format",
+                        );
+                    }
 
-            if let Some(ref tok) = github_token_ref {
-                op_params["github_token_ref"] = serde_json::Value::String(tok.clone());
-            }
-            if let Some(ref env) = environment {
-                op_params["environment"] = serde_json::Value::String(env.clone());
-            }
+                    let mut params = serde_json::json!({
+                        "repo": repo,
+                        "secret_name": secret_name,
+                        "value_ref": value_ref,
+                    });
+                    if let Some(tok) = req.params.get("github_token_ref").and_then(|v| v.as_str()) {
+                        params["github_token_ref"] = serde_json::Value::String(tok.into());
+                    }
+                    let target = HashMap::from([("repo".into(), repo)]);
+                    ("github.set_dependabot_secret", target, params)
+                }
+                "org_actions" => {
+                    let org = req
+                        .params
+                        .get("org")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_owned();
+                    if org.is_empty() {
+                        return Response::err(Some(req.id), "bad_request", "missing 'org' field");
+                    }
+
+                    let mut params = serde_json::json!({
+                        "org": org,
+                        "secret_name": secret_name,
+                        "value_ref": value_ref,
+                    });
+                    if let Some(tok) = req.params.get("github_token_ref").and_then(|v| v.as_str()) {
+                        params["github_token_ref"] = serde_json::Value::String(tok.into());
+                    }
+                    if let Some(vis) = req.params.get("visibility").and_then(|v| v.as_str()) {
+                        params["visibility"] = serde_json::Value::String(vis.into());
+                    }
+                    if let Some(ids) = req.params.get("selected_repository_ids") {
+                        params["selected_repository_ids"] = ids.clone();
+                    }
+                    let target = HashMap::from([("org".into(), org)]);
+                    ("github.set_org_secret", target, params)
+                }
+                unknown => {
+                    return Response::err(
+                        Some(req.id),
+                        "bad_request",
+                        format!(
+                            "unknown scope '{unknown}' (expected: repo_actions, env_actions, codespaces_user, codespaces_repo, dependabot, org_actions)"
+                        ),
+                    );
+                }
+            };
 
             let op_req = OperationRequest {
                 request_id: Uuid::new_v4(),
                 client_identity: identity.clone(),
                 client_type,
-                operation: "github.set_actions_secret".into(),
-                target: HashMap::from([("repo".into(), repo)]),
+                operation: operation.into(),
+                target,
                 secret_ref_names: vec![],
                 created_at: SystemTime::now(),
                 expires_at: None,
