@@ -7,12 +7,13 @@ Local approval-gated secrets broker for AI coding tools (Codex, Claude Code, etc
 - Enclave enforcement funnel: policy -> approval -> execute -> sanitize -> audit
 - Client identity from Unix peer creds (`uid/gid/pid`) + executable identity (path/hash, optional macOS Team ID)
 - Deny-by-default policy engine with allowlist rules
+- Modern terminal UI for the CLI (spinners, structured output, audit tables)
 - Operation-bound native OS approvals:
   - macOS LocalAuthentication
   - Linux polkit (+ intent dialog)
 - Typestate-enforced response sanitization + secret-pattern scrubbing
 - Structured audit events (SQLite) with correlation IDs
-- First provider: GitHub Actions secret sync (`github.set_actions_secret`)
+- First provider: GitHub secrets sync (Actions repo/env, Codespaces user/repo, Dependabot, org)
 
 ## Deferred (Not In v1)
 
