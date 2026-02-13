@@ -5,9 +5,12 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use agentpass_core::audit::TracingAuditEmitter;
-use agentpass_core::operation::{ClientIdentity, ClientType, OperationRegistry, OperationRequest};
+use agentpass_core::operation::{
+    ApprovalFactor, ApprovalRequirement, ClientIdentity, ClientType, OperationDef,
+    OperationRegistry, OperationRequest, OperationSafety,
+};
 use agentpass_core::peer::peer_info_from_fd;
-use agentpass_core::policy::PolicyEngine;
+use agentpass_core::policy::{PolicyEngine, PolicyRule};
 use agentpass_core::proto::{Request, Response};
 use agentpass_core::socket::{
     ensure_socket_parent_dir, socket_path_for_client, validate_path_chain,
@@ -27,7 +30,10 @@ const DAEMON_TOKEN_FILENAME: &str = "daemon.token";
 mod approval;
 mod enclave;
 
-use enclave::{Enclave, NativeApprovalGate};
+use std::future::Future;
+use std::pin::Pin;
+
+use enclave::{Enclave, NativeApprovalGate, OperationHandler};
 
 // ---------------------------------------------------------------------------
 // Daemon configuration
@@ -40,6 +46,10 @@ struct DaemonConfig {
     /// entry, it is classified as `Human`; otherwise it defaults to `Agent`.
     #[serde(default)]
     known_human_clients: Vec<HumanClientEntry>,
+
+    /// Policy rules loaded from config. Deny-all default when empty.
+    #[serde(default)]
+    rules: Vec<PolicyRule>,
 }
 
 /// A single entry in the known human clients allowlist.
@@ -108,9 +118,10 @@ fn load_config() -> DaemonConfig {
         Ok(contents) => match toml_edit::de::from_str::<DaemonConfig>(&contents) {
             Ok(config) => {
                 info!(
-                    "loaded config from {} ({} known human clients)",
+                    "loaded config from {} ({} known human clients, {} policy rules)",
                     path.display(),
-                    config.known_human_clients.len()
+                    config.known_human_clients.len(),
+                    config.rules.len(),
                 );
                 config
             }
@@ -148,6 +159,19 @@ fn write_daemon_token(socket: &Path, token: &str) -> std::io::Result<PathBuf> {
     Ok(token_path)
 }
 
+/// Minimal no-op operation handler for end-to-end testing of the enclave pipeline.
+#[derive(Debug)]
+struct NoopHandler;
+
+impl OperationHandler for NoopHandler {
+    fn execute(
+        &self,
+        _request: &OperationRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send + '_>> {
+        Box::pin(async { Ok(serde_json::json!({"status": "ok"})) })
+    }
+}
+
 async fn run(socket: PathBuf) -> std::io::Result<()> {
     ensure_socket_parent_dir(&socket)?;
 
@@ -182,14 +206,29 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
 
     let config = load_config();
 
-    // Build enclave with deny-all defaults.
-    let registry = OperationRegistry::new();
-    let policy = PolicyEngine::new();
+    // Build enclave with registered operations and policy from config.
+    let mut registry = OperationRegistry::new();
+    registry
+        .register(OperationDef {
+            name: "test.noop".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::FirstUse,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "No-op test operation".into(),
+            params_schema: None,
+            allowed_target_keys: vec![],
+        })
+        .expect("failed to register test.noop");
+
+    let policy = PolicyEngine::with_rules(config.rules.clone());
+    info!("policy engine loaded with {} rules", policy.rule_count());
+
     let audit = Arc::new(TracingAuditEmitter::new());
 
     let enclave = Enclave::builder()
         .registry(registry)
         .policy(policy)
+        .handler("test.noop", Box::new(NoopHandler))
         .approval_gate(Box::new(NativeApprovalGate))
         .audit(audit)
         .build();
@@ -909,6 +948,7 @@ mod tests {
     fn derive_client_type_matches_by_path() {
         let config = DaemonConfig {
             known_human_clients: vec![entry_with_path("claude", "/usr/bin/claude*")],
+            ..Default::default()
         };
         let id = test_identity();
         assert_eq!(derive_client_type(&id, &config), ClientType::Human);
@@ -923,6 +963,7 @@ mod tests {
                 exe_sha256: Some("AABBCCDD".into()), // case-insensitive
                 codesign_team_id: None,
             }],
+            ..Default::default()
         };
         let id = test_identity();
         assert_eq!(derive_client_type(&id, &config), ClientType::Human);
@@ -932,6 +973,7 @@ mod tests {
     fn derive_client_type_defaults_to_agent() {
         let config = DaemonConfig {
             known_human_clients: vec![entry_with_path("vscode", "/usr/bin/code*")],
+            ..Default::default()
         };
         let id = test_identity();
         assert_eq!(derive_client_type(&id, &config), ClientType::Agent);
