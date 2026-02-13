@@ -4,6 +4,7 @@ members = [
   "crates/opaque-core",
   "crates/opaqued",
   "crates/opaque",
+  "crates/opaque-approve-helper",
 ]
 
 [workspace.dependencies]

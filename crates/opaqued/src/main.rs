@@ -873,6 +873,13 @@ async fn handle_conn(
         return Ok(());
     }
 
+    // Split into read/write halves so we can detect client disconnect during
+    // request processing. When the client disconnects, the in-flight request
+    // future is dropped, which releases any held resources (including the
+    // approval semaphore). This implements the US-009 requirement:
+    // "Approval semaphore is released when the requesting client disconnects."
+    let (mut sink, mut reader) = framed.split();
+
     // Per-connection rate limiter: burst of 10, sustained 2 req/s.
     let mut rate_limiter = ConnectionRateLimiter::new(10, 2.0);
 
@@ -885,7 +892,7 @@ async fn handle_conn(
 
         // Idle timeout: disconnect clients that send no frames for 30 seconds.
         let next_frame = tokio::select! {
-            frame = tokio::time::timeout(std::time::Duration::from_secs(30), framed.next()) => frame,
+            frame = tokio::time::timeout(std::time::Duration::from_secs(30), reader.next()) => frame,
             _ = shutdown_rx.changed() => {
                 info!("shutdown signaled, closing connection");
                 break;
@@ -901,7 +908,7 @@ async fn handle_conn(
                         let resp = Response::err(None, "bad_json", "invalid JSON request");
                         let bytes = serde_json::to_vec(&resp)
                             .unwrap_or_else(|_| b"{\"error\":\"encode\"}".to_vec());
-                        let _ = framed.send(Bytes::from(bytes)).await;
+                        let _ = sink.send(Bytes::from(bytes)).await;
                         continue;
                     }
                 };
@@ -911,34 +918,45 @@ async fn handle_conn(
                     warn!("rate limit exceeded for connection");
                     let resp = Response::err(Some(req.id), "rate_limited", "too many requests");
                     let out = serde_json::to_vec(&resp).map_err(std::io::Error::other)?;
-                    framed.send(Bytes::from(out)).await?;
+                    sink.send(Bytes::from(out)).await?;
                     continue;
                 }
 
                 // Never log params (may contain secrets due to client bugs).
                 // Request timeout: 120 seconds.
+                // Race against client disconnect so the approval semaphore is
+                // released immediately when the requesting client goes away.
                 let req_id = req.id;
-                let resp = match tokio::time::timeout(
-                    std::time::Duration::from_secs(120),
-                    handle_request(&state, req, &identity, client_type),
-                )
-                .await
-                {
-                    Ok(r) => r,
-                    Err(_) => {
-                        warn!("request timed out after 120s");
-                        Response::err(Some(req_id), "timeout", "request timed out")
+                let resp = tokio::select! {
+                    r = tokio::time::timeout(
+                        std::time::Duration::from_secs(120),
+                        handle_request(&state, req, &identity, client_type),
+                    ) => {
+                        match r {
+                            Ok(r) => r,
+                            Err(_) => {
+                                warn!("request timed out after 120s");
+                                Response::err(Some(req_id), "timeout", "request timed out")
+                            }
+                        }
+                    }
+                    _ = reader.next() => {
+                        // Client disconnected or sent data during request processing.
+                        // Dropping the handle_request future releases the approval
+                        // semaphore permit via RAII if one was held.
+                        info!("client disconnected during request processing");
+                        break;
                     }
                 };
                 let out = serde_json::to_vec(&resp).map_err(std::io::Error::other)?;
-                framed.send(Bytes::from(out)).await?;
+                sink.send(Bytes::from(out)).await?;
             }
             Ok(Some(Err(e))) => {
                 warn!("bad frame from client: {e}");
                 let resp = Response::err(None, "bad_frame", "malformed frame");
                 let bytes = serde_json::to_vec(&resp)
                     .unwrap_or_else(|_| b"{\"error\":\"encode\"}".to_vec());
-                let _ = framed.send(Bytes::from(bytes)).await;
+                let _ = sink.send(Bytes::from(bytes)).await;
                 return Err(e);
             }
             Ok(None) => break, // Client disconnected

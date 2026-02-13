@@ -31,6 +31,5 @@ objc2 = { version = "0.6.3", default-features = false, features = ["std"] }
 objc2-foundation = "0.3.2"
 objc2-local-authentication = { version = "0.3.2", default-features = false, features = ["std", "block2", "LAContext"] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-zbus = { version = "5.0.0", default-features = false, features = ["tokio"] }
-zbus_polkit = { version = "5.0.0", default-features = false, features = ["tokio"] }
+# Linux approval is handled by the opaque-approve-helper binary (subprocess),
+# so zbus/zbus_polkit are no longer needed in the daemon.

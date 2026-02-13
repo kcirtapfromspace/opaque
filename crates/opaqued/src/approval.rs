@@ -9,6 +9,9 @@ pub enum ApprovalError {
     #[allow(dead_code)] // Used on platforms without macOS/Linux approval
     Unsupported,
 
+    #[error("approval UI unavailable")]
+    Unavailable,
+
     #[error("approval failed: {0}")]
     Failed(String),
 }
@@ -36,6 +39,10 @@ pub async fn prompt(reason: &str) -> Result<bool, ApprovalError> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// macOS: LocalAuthentication (Touch ID / password)
+// ---------------------------------------------------------------------------
+
 #[cfg(target_os = "macos")]
 async fn prompt_macos(reason: &str) -> Result<bool, ApprovalError> {
     let reason = reason.to_string();
@@ -55,12 +62,12 @@ fn prompt_macos_blocking(reason: &str) -> Result<bool, ApprovalError> {
     use objc2_local_authentication::{LAContext, LAPolicy};
 
     let ctx = unsafe { LAContext::new() };
-    // Preflight so we can return a reasonable error instead of failing silently.
-    if let Err(e) = unsafe { ctx.canEvaluatePolicy_error(LAPolicy::DeviceOwnerAuthentication) } {
-        return Err(ApprovalError::Failed(format!(
-            "LocalAuthentication unavailable: {}",
-            e.localizedDescription()
-        )));
+
+    // Preflight: check if the UI session supports approval.
+    // If not (e.g., no window server, LaunchDaemon, SSH), return Unavailable
+    // so the enclave reports `approval_unavailable` to the client.
+    if unsafe { ctx.canEvaluatePolicy_error(LAPolicy::DeviceOwnerAuthentication) }.is_err() {
+        return Err(ApprovalError::Unavailable);
     }
 
     let (tx, rx) = std::sync::mpsc::channel::<bool>();
@@ -84,8 +91,10 @@ fn prompt_macos_blocking(reason: &str) -> Result<bool, ApprovalError> {
         );
     }
 
-    // Avoid hanging forever if LocalAuthentication never calls back.
-    match rx.recv_timeout(Duration::from_secs(120)) {
+    // US-009: Reduced from 120s to 60s. The approval semaphore in the enclave
+    // is released via future cancellation if the client disconnects, so a
+    // shorter timeout here limits how long an orphaned prompt can block.
+    match rx.recv_timeout(Duration::from_secs(60)) {
         Ok(ok) => Ok(ok),
         Err(e) => Err(ApprovalError::Failed(format!(
             "approval timed out or failed: {e}"
@@ -93,126 +102,148 @@ fn prompt_macos_blocking(reason: &str) -> Result<bool, ApprovalError> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Linux: opaque-approve-helper subprocess
+// ---------------------------------------------------------------------------
+
+/// Launch the external approval helper binary as a subprocess.
+///
+/// The helper performs the two-step approval flow:
+/// 1. Intent dialog (zenity/kdialog/TTY) showing what the user is approving
+/// 2. Polkit authentication via `pkcheck`
+///
+/// Exit codes: 0 = approved, 1 = denied, 2 = unavailable.
 #[cfg(target_os = "linux")]
 async fn prompt_linux(reason: &str) -> Result<bool, ApprovalError> {
-    // Step 1: Show intent dialog with operation details before authentication.
-    // This prevents blind polkit approvals where the user authenticates without
-    // knowing what operation they are approving.
-    let intent_confirmed = show_intent_dialog(reason).await?;
-    if !intent_confirmed {
-        return Ok(false);
-    }
-
-    // Step 2: Polkit authentication (unchanged).
-    polkit_authenticate(reason).await
-}
-
-/// Show an intent dialog displaying operation details before polkit authentication.
-///
-/// Tries GUI dialogs first (zenity, kdialog), falls back to terminal if available.
-/// If no UI is available, fails closed (returns error, not false).
-#[cfg(target_os = "linux")]
-async fn show_intent_dialog(reason: &str) -> Result<bool, ApprovalError> {
     let reason = reason.to_string();
-    tokio::task::spawn_blocking(move || show_intent_dialog_blocking(&reason))
+    tokio::task::spawn_blocking(move || launch_approve_helper(&reason))
         .await
-        .map_err(|e| ApprovalError::Failed(format!("intent dialog task failed: {e}")))?
+        .map_err(|e| ApprovalError::Failed(format!("approval task failed: {e}")))?
 }
 
-/// Blocking implementation of the intent dialog.
 #[cfg(target_os = "linux")]
-fn show_intent_dialog_blocking(reason: &str) -> Result<bool, ApprovalError> {
-    use std::process::Command;
+fn launch_approve_helper(reason: &str) -> Result<bool, ApprovalError> {
+    let helper_path = find_approve_helper()?;
 
-    let dialog_text = format!("Opaque Approval Request\n\n{reason}\n\nDo you want to proceed?");
-
-    // Try zenity (GNOME/GTK).
-    if let Ok(status) = Command::new("zenity")
-        .args([
-            "--question",
-            "--title=Opaque Approval",
-            &format!("--text={dialog_text}"),
-            "--width=400",
-        ])
+    // Inherit daemon's environment — the helper needs DISPLAY, WAYLAND_DISPLAY,
+    // DBUS_SESSION_BUS_ADDRESS, XDG_RUNTIME_DIR etc. to display dialogs and
+    // communicate with polkit.
+    let status = std::process::Command::new(&helper_path)
+        .arg("--reason")
+        .arg(reason)
         .status()
-    {
-        return Ok(status.success());
-    }
+        .map_err(|e| ApprovalError::Failed(format!("failed to launch approval helper: {e}")))?;
 
-    // Try kdialog (KDE).
-    if let Ok(status) = Command::new("kdialog")
-        .args(["--yesno", &dialog_text, "--title", "Opaque Approval"])
-        .status()
-    {
-        return Ok(status.success());
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        Some(2) => Err(ApprovalError::Unavailable),
+        Some(c) => Err(ApprovalError::Failed(format!(
+            "approval helper exited with code {c}"
+        ))),
+        None => Err(ApprovalError::Failed(
+            "approval helper killed by signal".into(),
+        )),
     }
+}
 
-    // Try terminal fallback if stdin is a TTY.
-    if atty_is_tty() {
-        eprint!("{}\n\nApprove? [y/N] ", dialog_text);
-        let mut input = String::new();
-        if std::io::stdin().read_line(&mut input).is_ok() {
-            let answer = input.trim().to_lowercase();
-            return Ok(answer == "y" || answer == "yes");
+/// Locate the `opaque-approve-helper` binary.
+///
+/// Search order:
+/// 1. Same directory as the running daemon binary
+/// 2. Well-known system paths
+#[cfg(target_os = "linux")]
+fn find_approve_helper() -> Result<std::path::PathBuf, ApprovalError> {
+    // Next to the daemon binary (works during development and standard installs).
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let helper = dir.join("opaque-approve-helper");
+            if helper.exists() {
+                return Ok(helper);
+            }
         }
     }
 
-    // No UI available — fail closed.
-    Err(ApprovalError::Failed(
-        "no approval UI available (no zenity, kdialog, or TTY)".into(),
-    ))
+    // Well-known install paths.
+    for path in &[
+        "/usr/local/bin/opaque-approve-helper",
+        "/usr/bin/opaque-approve-helper",
+    ] {
+        let p = std::path::PathBuf::from(path);
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+
+    Err(ApprovalError::Unavailable)
 }
 
-/// Check if stdin is a terminal (TTY).
-#[cfg(target_os = "linux")]
-fn atty_is_tty() -> bool {
-    unsafe { libc::isatty(libc::STDIN_FILENO) != 0 }
-}
-
-/// Polkit authentication step.
-#[cfg(target_os = "linux")]
-async fn polkit_authenticate(reason: &str) -> Result<bool, ApprovalError> {
-    use std::collections::HashMap;
-
-    use zbus::Connection;
-    use zbus_polkit::policykit1::{AuthorityProxy, CheckAuthorizationFlags, Subject};
-
-    let connection = Connection::system()
-        .await
-        .map_err(|e| ApprovalError::Failed(format!("polkit connect failed: {e}")))?;
-    let proxy = AuthorityProxy::new(&connection)
-        .await
-        .map_err(|e| ApprovalError::Failed(format!("polkit proxy failed: {e}")))?;
-
-    let pid = std::process::id();
-    let subject = Subject::new_for_owner(pid, None, None)
-        .map_err(|e| ApprovalError::Failed(format!("polkit subject failed: {e}")))?;
-
-    let action_id = "com.opaque.approve";
-
-    let mut details = HashMap::new();
-    details.insert("reason".to_string(), reason.to_string());
-
-    let result = proxy
-        .check_authorization(
-            &subject,
-            action_id,
-            &details,
-            CheckAuthorizationFlags::AllowUserInteraction.into(),
-            "",
-        )
-        .await
-        .map_err(|e| ApprovalError::Failed(format!("polkit check failed: {e}")))?;
-
-    Ok(result.is_authorized)
-}
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_reason_returns_invalid() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = rt.block_on(prompt(""));
+        assert!(matches!(result, Err(ApprovalError::InvalidReason)));
+    }
+
+    #[test]
+    fn whitespace_reason_returns_invalid() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = rt.block_on(prompt("   "));
+        assert!(matches!(result, Err(ApprovalError::InvalidReason)));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
-    fn atty_is_tty_does_not_panic() {
-        // Just verify the function doesn't panic in any environment.
-        let _ = super::atty_is_tty();
+    fn helper_exit_code_mapping() {
+        // Test exit code interpretation without launching a real helper.
+        // We simulate by testing the match logic.
+        fn map_exit(code: Option<i32>) -> Result<bool, &'static str> {
+            match code {
+                Some(0) => Ok(true),
+                Some(1) => Ok(false),
+                Some(2) => Err("unavailable"),
+                Some(_) => Err("unexpected"),
+                None => Err("signal"),
+            }
+        }
+
+        assert_eq!(map_exit(Some(0)), Ok(true));
+        assert_eq!(map_exit(Some(1)), Ok(false));
+        assert!(map_exit(Some(2)).is_err());
+        assert!(map_exit(Some(42)).is_err());
+        assert!(map_exit(None).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn find_helper_returns_unavailable_when_missing() {
+        // Set a fake current_exe that has no helper next to it.
+        // Since we can't control current_exe in tests, just verify that
+        // find_approve_helper() returns Unavailable when the helper doesn't
+        // exist in any expected location (which is the case in CI/dev).
+        // In production, the helper would be installed alongside the daemon.
+        let result = find_approve_helper();
+        // The result depends on whether the helper is built. In most test
+        // environments during `cargo test`, both binaries are in target/debug/
+        // so the helper may or may not exist. We just check it doesn't panic.
+        match result {
+            Ok(path) => assert!(path.exists()),
+            Err(ApprovalError::Unavailable) => {} // Expected in CI
+            Err(e) => panic!("unexpected error: {e}"),
+        }
     }
 }

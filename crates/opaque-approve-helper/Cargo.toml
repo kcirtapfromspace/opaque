@@ -1,0 +1,9 @@
+[package]
+name = "opaque-approve-helper"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Linux approval helper for Opaque — shows intent dialog + polkit auth"
+
+# No external dependencies — uses only std.
+# This keeps the binary small and avoids pulling in async runtimes.
