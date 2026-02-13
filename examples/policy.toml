@@ -1,0 +1,65 @@
+# Opaque example policy configuration
+#
+# Rules are evaluated in order; the first matching rule wins.
+# The default behavior (no matching rule) is deny-all.
+#
+# Each rule specifies:
+#   - name:              Human-readable label (for audit logs)
+#   - operation_pattern: Glob on operation name (e.g. "github.*")
+#   - allow:             true = permit, false = explicit deny
+#   - client_types:      Which client types the rule applies to ("human", "agent")
+#   - client:            Match on client identity (exe_path, uid, exe_sha256, codesign_team_id)
+#   - target:            Match on operation target fields (glob patterns)
+#   - workspace:         Match on git workspace context (remote_url_pattern, branch_pattern, require_clean)
+#   - secret_names:      Match on secret ref names (glob patterns)
+#   - approval:          Approval requirements (require, factors, lease_ttl, one_time)
+
+# ---------------------------------------------------------------------------
+# Rule 1: Allow Claude Code to sync GitHub Actions secrets for repos in "myorg".
+# Biometric approval is required on first use, then a 5-minute lease applies.
+# ---------------------------------------------------------------------------
+[[rules]]
+name = "allow-claude-github-secrets"
+operation_pattern = "github.set_actions_secret"
+allow = true
+client_types = ["agent", "human"]
+
+[rules.client]
+exe_path = "/usr/bin/claude*"
+
+[rules.target]
+fields = { repo = "myorg/*" }
+
+[rules.workspace]
+remote_url_pattern = "*github.com:myorg/*"
+branch_pattern = "main"
+
+[rules.secret_names]
+patterns = ["GH_*"]
+
+[rules.approval]
+require = "first_use"
+factors = ["local_bio"]
+lease_ttl = 300
+
+# ---------------------------------------------------------------------------
+# Rule 2: Allow any human to run safe test operations without approval.
+# ---------------------------------------------------------------------------
+[[rules]]
+name = "allow-human-test-ops"
+operation_pattern = "test.*"
+allow = true
+client_types = ["human"]
+
+[rules.client]
+
+[rules.target]
+fields = {}
+
+[rules.workspace]
+
+[rules.secret_names]
+
+[rules.approval]
+require = "never"
+factors = []
