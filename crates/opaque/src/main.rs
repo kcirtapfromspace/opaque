@@ -95,6 +95,11 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         force: bool,
     },
+    /// Manage GitHub Actions secrets.
+    Github {
+        #[command(subcommand)]
+        action: GithubAction,
+    },
     /// Execute a command in a sandboxed environment.
     Exec {
         /// Profile name (loads ~/.opaque/profiles/<name>.toml).
@@ -140,6 +145,32 @@ enum ProfileAction {
     Validate {
         /// Profile name.
         name: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum GithubAction {
+    /// Set a GitHub Actions repository secret.
+    SetSecret {
+        /// Repository in "owner/repo" format.
+        #[arg(long)]
+        repo: String,
+
+        /// Secret name (e.g. "AWS_ACCESS_KEY_ID").
+        #[arg(long)]
+        secret_name: String,
+
+        /// Secret ref (e.g. "keychain:opaque/aws-key" or "profile:prod:AWS_KEY").
+        #[arg(long)]
+        value_ref: String,
+
+        /// GitHub token ref (default: "keychain:opaque/github-pat").
+        #[arg(long)]
+        github_token_ref: Option<String>,
+
+        /// GitHub environment name (for environment secrets).
+        #[arg(long)]
+        environment: Option<String>,
     },
 }
 
@@ -287,6 +318,28 @@ async fn main() {
             });
             ("exec", params)
         }
+        Cmd::Github { action } => match action {
+            GithubAction::SetSecret {
+                repo,
+                secret_name,
+                value_ref,
+                github_token_ref,
+                environment,
+            } => {
+                let mut params = serde_json::json!({
+                    "repo": repo,
+                    "secret_name": secret_name,
+                    "value_ref": value_ref,
+                });
+                if let Some(ref tok) = github_token_ref {
+                    params["github_token_ref"] = serde_json::Value::String(tok.clone());
+                }
+                if let Some(ref env) = environment {
+                    params["environment"] = serde_json::Value::String(env.clone());
+                }
+                ("github", params)
+            }
+        },
         // Already handled above; unreachable.
         Cmd::Policy { .. } | Cmd::Init { .. } | Cmd::Audit { .. } | Cmd::Profile { .. } => {
             unreachable!()

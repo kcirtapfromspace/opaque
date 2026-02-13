@@ -28,7 +28,9 @@ const DAEMON_TOKEN_FILENAME: &str = "daemon.token";
 
 mod approval;
 mod enclave;
+mod github;
 mod sandbox;
+pub mod secret;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -194,7 +196,36 @@ impl OperationHandler for NoopHandler {
     }
 }
 
+/// Disable core dumps to prevent secret material from being written to disk.
+///
+/// Called early in daemon startup, before any secrets are loaded.
+fn init_memory_safety() {
+    #[cfg(target_os = "linux")]
+    {
+        let ret = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) };
+        if ret == 0 {
+            info!("core dumps disabled (PR_SET_DUMPABLE=0)");
+        } else {
+            warn!("failed to disable core dumps via PR_SET_DUMPABLE");
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let rlim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        let ret = unsafe { libc::setrlimit(libc::RLIMIT_CORE, &rlim) };
+        if ret == 0 {
+            info!("core dumps disabled (RLIMIT_CORE=0)");
+        } else {
+            warn!("failed to disable core dumps via RLIMIT_CORE");
+        }
+    }
+}
+
 async fn run(socket: PathBuf) -> std::io::Result<()> {
+    init_memory_safety();
     ensure_socket_parent_dir(&socket)?;
 
     // Acquire PID file lock before anything else.
@@ -261,6 +292,28 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         })
         .expect("failed to register sandbox.exec");
 
+    registry
+        .register(OperationDef {
+            name: "github.set_actions_secret".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Set a GitHub Actions repository secret".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["repo", "secret_name", "value_ref"],
+                "properties": {
+                    "repo": {"type": "string"},
+                    "secret_name": {"type": "string"},
+                    "value_ref": {"type": "string"},
+                    "github_token_ref": {"type": "string"},
+                    "environment": {"type": "string"}
+                }
+            })),
+            allowed_target_keys: vec!["repo".into()],
+        })
+        .expect("failed to register github.set_actions_secret");
+
     let policy = PolicyEngine::with_rules(config.rules.clone());
     info!("policy engine loaded with {} rules", policy.rule_count());
 
@@ -281,12 +334,14 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
     let audit = Arc::new(MultiAuditSink::new(vec![tracing_sink, sqlite_sink]));
 
     let sandbox_executor = sandbox::SandboxExecutor::new(audit.clone());
+    let github_handler = github::GitHubHandler::new(audit.clone());
 
     let enclave = Enclave::builder()
         .registry(registry)
         .policy(policy)
         .handler("test.noop", Box::new(NoopHandler))
         .handler("sandbox.exec", Box::new(sandbox_executor))
+        .handler("github.set_actions_secret", Box::new(github_handler))
         .approval_gate(Box::new(NativeApprovalGate))
         .audit(audit)
         .build();
@@ -1147,6 +1202,117 @@ async fn handle_request(
                 expires_at: None,
                 params: op_params,
                 workspace,
+            };
+
+            state
+                .enclave
+                .execute(op_req)
+                .await
+                .into_proto_response(req.id)
+        }
+        "github" => {
+            // The github method is a convenience wrapper that builds an "execute"
+            // request for "github.set_actions_secret" from github-specific params.
+            let repo = req
+                .params
+                .get("repo")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+
+            if repo.is_empty() {
+                return Response::err(Some(req.id), "bad_request", "missing 'repo' field");
+            }
+
+            // Validate repo format (owner/repo).
+            if !repo.contains('/') || repo.starts_with('/') || repo.ends_with('/') {
+                return Response::err(
+                    Some(req.id),
+                    "bad_request",
+                    "repo must be in 'owner/repo' format",
+                );
+            }
+
+            let secret_name = req
+                .params
+                .get("secret_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+
+            if secret_name.is_empty() {
+                return Response::err(Some(req.id), "bad_request", "missing 'secret_name' field");
+            }
+
+            // Validate secret_name (alphanumeric + underscores).
+            if !secret_name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                return Response::err(
+                    Some(req.id),
+                    "bad_request",
+                    "secret_name must be alphanumeric (with underscores)",
+                );
+            }
+
+            let value_ref = req
+                .params
+                .get("value_ref")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+
+            if value_ref.is_empty() {
+                return Response::err(Some(req.id), "bad_request", "missing 'value_ref' field");
+            }
+
+            // Validate value_ref starts with a known scheme.
+            const KNOWN_SCHEMES: &[&str] = &["env:", "keychain:", "profile:"];
+            if !KNOWN_SCHEMES.iter().any(|s| value_ref.starts_with(s)) {
+                return Response::err(
+                    Some(req.id),
+                    "bad_request",
+                    "value_ref must start with a known scheme (env:, keychain:, profile:)",
+                );
+            }
+
+            let github_token_ref = req
+                .params
+                .get("github_token_ref")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_owned());
+
+            let environment = req
+                .params
+                .get("environment")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_owned());
+
+            let mut op_params = serde_json::json!({
+                "repo": repo,
+                "secret_name": secret_name,
+                "value_ref": value_ref,
+            });
+
+            if let Some(ref tok) = github_token_ref {
+                op_params["github_token_ref"] = serde_json::Value::String(tok.clone());
+            }
+            if let Some(ref env) = environment {
+                op_params["environment"] = serde_json::Value::String(env.clone());
+            }
+
+            let op_req = OperationRequest {
+                request_id: Uuid::new_v4(),
+                client_identity: identity.clone(),
+                client_type,
+                operation: "github.set_actions_secret".into(),
+                target: HashMap::from([("repo".into(), repo)]),
+                secret_ref_names: vec![],
+                created_at: SystemTime::now(),
+                expires_at: None,
+                params: op_params,
+                workspace: None,
             };
 
             state
