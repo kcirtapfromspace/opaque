@@ -1,12 +1,12 @@
 # Deployment Guide
 
-Packaging model, supported platforms, and approval architecture requirements for real-world deployment of AgentPass.
+Packaging model, supported platforms, and approval architecture requirements for real-world deployment of Opaque.
 
 ---
 
 ## Fundamental Constraint
 
-The daemon (`agentpassd`) **must run inside an interactive GUI session**. Both approval backends — macOS `LocalAuthentication` and Linux polkit — require a display server and a user session to present authentication dialogs. Headless, SSH, CI, and container environments are unsupported and will fail closed.
+The daemon (`opaqued`) **must run inside an interactive GUI session**. Both approval backends — macOS `LocalAuthentication` and Linux polkit — require a display server and a user session to present authentication dialogs. Headless, SSH, CI, and container environments are unsupported and will fail closed.
 
 ---
 
@@ -19,9 +19,9 @@ The daemon (`agentpassd`) **must run inside an interactive GUI session**. Both a
 Ship a `.pkg` installer that places:
 
 ```
-/usr/local/bin/agentpassd          (code-signed, notarized)
-/usr/local/bin/agentpass           (code-signed, notarized)
-~/Library/LaunchAgents/com.agentpass.daemon.plist
+/usr/local/bin/opaqued          (code-signed, notarized)
+/usr/local/bin/opaque           (code-signed, notarized)
+~/Library/LaunchAgents/com.opaque.daemon.plist
 ```
 
 **v1.1+: Migrate to SMAppService app bundle**
@@ -37,10 +37,10 @@ Use `SMAppService.agent(plistName:)` (macOS 13+) to register the LaunchAgent fro
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.agentpass.daemon</string>
+  <string>com.opaque.daemon</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/local/bin/agentpassd</string>
+    <string>/usr/local/bin/opaqued</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
@@ -54,7 +54,7 @@ Use `SMAppService.agent(plistName:)` (macOS 13+) to register the LaunchAgent fro
   <key>ProcessType</key>
   <string>Interactive</string>
   <key>StandardErrorPath</key>
-  <string>/tmp/agentpassd.err</string>
+  <string>/tmp/opaqued.err</string>
 </dict>
 </plist>
 ```
@@ -65,7 +65,7 @@ Use `SMAppService.agent(plistName:)` (macOS 13+) to register the LaunchAgent fro
 |-------|-------|-----|
 | `LimitLoadToSessionType` | `Aqua` | Only loads in GUI login sessions. Prevents loading under SSH, cron, or background contexts where Touch ID is unavailable. |
 | `ProcessType` | `Interactive` | Tells macOS the process presents approval dialogs. Prevents aggressive process throttling. |
-| `KeepAlive.SuccessfulExit` | `false` | Restarts on crash. Does not restart on clean exit (allows `agentpass shutdown` to stick). |
+| `KeepAlive.SuccessfulExit` | `false` | Restarts on crash. Does not restart on clean exit (allows `opaque shutdown` to stick). |
 
 ### Why LaunchAgent, Never LaunchDaemon
 
@@ -74,7 +74,7 @@ Use `SMAppService.agent(plistName:)` (macOS 13+) to register the LaunchAgent fro
 - The user's Secure Enclave key (Touch ID) or fallback password dialog
 - The user's login keychain
 
-A LaunchDaemon runs as root with no GUI session. Touch ID is unreachable. `canEvaluatePolicy` would fail on every request. **LaunchDaemon is architecturally incompatible with AgentPass.**
+A LaunchDaemon runs as root with no GUI session. Touch ID is unreachable. `canEvaluatePolicy` would fail on every request. **LaunchDaemon is architecturally incompatible with Opaque.**
 
 ### Code Signing Requirements
 
@@ -83,8 +83,8 @@ The binary must be signed with Hardened Runtime:
 ```bash
 codesign --sign "Developer ID Application: ..." \
   --options runtime \
-  --entitlements agentpassd.entitlements \
-  /usr/local/bin/agentpassd
+  --entitlements opaqued.entitlements \
+  /usr/local/bin/opaqued
 ```
 
 Minimal entitlements (no special entitlements needed — `LocalAuthentication` does not require an entitlement when called from a user-session process):
@@ -112,7 +112,7 @@ Notarize via `notarytool` so Gatekeeper does not quarantine the binary on first 
 
 ### Session Detection (Daemon Startup)
 
-The daemon must verify it is running in a usable GUI session before binding the socket. On macOS, call `canEvaluatePolicy` at startup as a preflight. If it fails, log: `"agentpassd requires a macOS GUI session (LaunchAgent, not LaunchDaemon or SSH)"` and exit non-zero.
+The daemon must verify it is running in a usable GUI session before binding the socket. On macOS, call `canEvaluatePolicy` at startup as a preflight. If it fails, log: `"opaqued requires a macOS GUI session (LaunchAgent, not LaunchDaemon or SSH)"` and exit non-zero.
 
 ---
 
@@ -176,22 +176,22 @@ Some polkit auth agents (notably GNOME's) cache credentials for a short period (
 
 **This is acceptable** because:
 - The intent dialog (zenity/kdialog) still appears for every approval — the user always sees what they are approving
-- The credential cache is a polkit agent feature outside AgentPass's control
+- The credential cache is a polkit agent feature outside Opaque's control
 - Disabling it requires modifying system polkit configuration, which is out of scope
 - The user explicitly confirmed intent in step 1; the polkit step provides authentication, not intent
 
 ### systemd User Service
 
-Recommended unit file at `~/.config/systemd/user/agentpassd.service`:
+Recommended unit file at `~/.config/systemd/user/opaqued.service`:
 
 ```ini
 [Unit]
-Description=AgentPass Daemon
+Description=Opaque Daemon
 After=graphical-session.target
 Requires=graphical-session.target
 
 [Service]
-ExecStart=/usr/local/bin/agentpassd
+ExecStart=/usr/local/bin/opaqued
 Restart=on-failure
 RestartSec=5
 
@@ -200,7 +200,7 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=true
-ReadWritePaths=%h/.agentpass
+ReadWritePaths=%h/.opaque
 CapabilityBoundingSet=
 AmbientCapabilities=
 LimitCORE=0
@@ -215,13 +215,13 @@ WantedBy=graphical-session.target
 |-------|-------|-----|
 | `Requires=graphical-session.target` | — | Only starts when a graphical session is active. Prevents starting under SSH or headless boot. |
 | `NoNewPrivileges=true` | — | Prevents privilege escalation via setuid/setgid binaries |
-| `ProtectHome=read-only` | — | Daemon can only write to `ReadWritePaths` (`~/.agentpass`) |
+| `ProtectHome=read-only` | — | Daemon can only write to `ReadWritePaths` (`~/.opaque`) |
 | `LimitCORE=0` | — | Core dump prevention (secrets may be in process memory) |
 
 Enable and start:
 
 ```bash
-systemctl --user enable --now agentpassd.service
+systemctl --user enable --now opaqued.service
 ```
 
 ### Polkit Policy Installation
@@ -229,11 +229,11 @@ systemctl --user enable --now agentpassd.service
 Copy the policy file to the system polkit actions directory (requires root):
 
 ```bash
-sudo cp assets/linux/polkit/com.agentpass.approve.policy \
-  /usr/share/polkit-1/actions/com.agentpass.approve.policy
+sudo cp assets/linux/polkit/com.opaque.approve.policy \
+  /usr/share/polkit-1/actions/com.opaque.approve.policy
 ```
 
-The policy uses `auth_self` for active sessions (user must authenticate with their own password). See `assets/linux/polkit/com.agentpass.approve.policy` for the full XML.
+The policy uses `auth_self` for active sessions (user must authenticate with their own password). See `assets/linux/polkit/com.opaque.approve.policy` for the full XML.
 
 ### Session Detection (Daemon Startup)
 
@@ -279,21 +279,21 @@ The approval semaphore ensures only one approval dialog is active at a time. If 
 
 - [ ] Binary is code-signed with Developer ID and Hardened Runtime
 - [ ] Binary is notarized via `notarytool`
-- [ ] LaunchAgent plist installed at `~/Library/LaunchAgents/com.agentpass.daemon.plist`
+- [ ] LaunchAgent plist installed at `~/Library/LaunchAgents/com.opaque.daemon.plist`
 - [ ] Plist has `LimitLoadToSessionType: Aqua`
-- [ ] Socket directory `~/.agentpass/run/` has permissions `0700`
+- [ ] Socket directory `~/.opaque/run/` has permissions `0700`
 - [ ] Socket file has permissions `0600`
-- [ ] `~/.agentpass/` is excluded from Time Machine and Spotlight
+- [ ] `~/.opaque/` is excluded from Time Machine and Spotlight
 - [ ] `canEvaluatePolicy` succeeds at daemon startup
 
 ### Linux
 
-- [ ] Polkit policy installed at `/usr/share/polkit-1/actions/com.agentpass.approve.policy`
+- [ ] Polkit policy installed at `/usr/share/polkit-1/actions/com.opaque.approve.policy`
 - [ ] `zenity` or `kdialog` is installed and in `$PATH`
 - [ ] A polkit authentication agent is running in the desktop session
 - [ ] systemd user service installed with `Requires=graphical-session.target`
 - [ ] `$DISPLAY` or `$WAYLAND_DISPLAY` is set
-- [ ] Socket directory (`$XDG_RUNTIME_DIR/agentpass/` or `~/.agentpass/run/`) has permissions `0700`
+- [ ] Socket directory (`$XDG_RUNTIME_DIR/opaque/` or `~/.opaque/run/`) has permissions `0700`
 - [ ] Socket file has permissions `0600`
 - [ ] `$XDG_RUNTIME_DIR` is mounted as `tmpfs` (prevents socket persistence across reboots)
 - [ ] Core dumps disabled (`LimitCORE=0` in systemd unit)

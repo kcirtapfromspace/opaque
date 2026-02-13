@@ -6,7 +6,7 @@ You want three things simultaneously:
 2. **Live feed**: a real-time stream for UI/monitoring (pending approvals, durations, outcomes).
 3. **Analytics + semantic search**: fast queries and “find similar events” without leaking secret material.
 
-This doc describes a broker-first approach that keeps AgentPass a **secrets broker**, not a secret store.
+This doc describes a broker-first approach that keeps Opaque a **secrets broker**, not a secret store.
 
 ## 1. Storage Strategy (Layered)
 
@@ -155,7 +155,7 @@ Internally:
 
 Externally (pick one or more):
 
-- UDS stream for local UI/CLI tail (`agentpass tail --follow`)
+- UDS stream for local UI/CLI tail (`opaque tail --follow`)
 - HTTP `localhost` endpoint using SSE for a web/desktop UI
 - (later) Arrow Flight / FlightSQL stream for Arrow-native consumers
 

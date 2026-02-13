@@ -1,4 +1,4 @@
-# AgentPass (WIP)
+# Opaque (WIP)
 
 Approval-gated secrets broker for AI coding tools (Claude Code, Codex, etc).
 

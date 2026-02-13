@@ -124,13 +124,13 @@ async fn show_intent_dialog(reason: &str) -> Result<bool, ApprovalError> {
 fn show_intent_dialog_blocking(reason: &str) -> Result<bool, ApprovalError> {
     use std::process::Command;
 
-    let dialog_text = format!("AgentPass Approval Request\n\n{reason}\n\nDo you want to proceed?");
+    let dialog_text = format!("Opaque Approval Request\n\n{reason}\n\nDo you want to proceed?");
 
     // Try zenity (GNOME/GTK).
     if let Ok(status) = Command::new("zenity")
         .args([
             "--question",
-            "--title=AgentPass Approval",
+            "--title=Opaque Approval",
             &format!("--text={dialog_text}"),
             "--width=400",
         ])
@@ -141,7 +141,7 @@ fn show_intent_dialog_blocking(reason: &str) -> Result<bool, ApprovalError> {
 
     // Try kdialog (KDE).
     if let Ok(status) = Command::new("kdialog")
-        .args(["--yesno", &dialog_text, "--title", "AgentPass Approval"])
+        .args(["--yesno", &dialog_text, "--title", "Opaque Approval"])
         .status()
     {
         return Ok(status.success());
@@ -188,7 +188,7 @@ async fn polkit_authenticate(reason: &str) -> Result<bool, ApprovalError> {
     let subject = Subject::new_for_owner(pid, None, None)
         .map_err(|e| ApprovalError::Failed(format!("polkit subject failed: {e}")))?;
 
-    let action_id = "com.agentpass.approve";
+    let action_id = "com.opaque.approve";
 
     let mut details = HashMap::new();
     details.insert("reason".to_string(), reason.to_string());
