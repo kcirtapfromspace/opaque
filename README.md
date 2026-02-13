@@ -1,23 +1,69 @@
 # Opaque (WIP)
 
-Approval-gated secrets broker for AI coding tools (Claude Code, Codex, etc).
+Local approval-gated secrets broker for AI coding tools (Codex, Claude Code, etc) that must not disclose plaintext secrets to LLM context.
 
-## Problem
-AI coding agents often need API keys, tokens, and passwords to run tests, call SaaS APIs, or push CI/CD configuration. If you paste secrets into prompts or let the agent print them, you risk disclosure and long-lived credential leakage.
+## What v1 Includes
 
-## Goal
-Provide a local "secrets broker" that:
+- Enclave enforcement funnel: policy -> approval -> execute -> sanitize -> audit
+- Client identity from Unix peer creds (`uid/gid/pid`) + executable identity (path/hash, optional macOS Team ID)
+- Deny-by-default policy engine with allowlist rules
+- Operation-bound native OS approvals:
+  - macOS LocalAuthentication
+  - Linux polkit (+ intent dialog)
+- Typestate-enforced response sanitization + secret-pattern scrubbing
+- Structured audit events (SQLite) with correlation IDs
+- First provider: GitHub Actions secret sync (`github.set_actions_secret`)
 
-- Requires proof-of-life + explicit approval before a new secret is used (FIDO2/security key, local biometrics, or second-device FaceID/TouchID).
-- Integrates with secret sources (1Password, HashiCorp Vault, etc).
-- Brokers secrets into:
-  - local environments (process execution) and
-  - SaaS providers (GitHub/GitLab secret stores),
-  without exposing plaintext secrets to the LLM.
+## Deferred (Not In v1)
+
+See `docs/roadmap-deferred.md`. Notably:
+
+- MCP server exposure (v2)
+- 1Password / HashiCorp Vault connectors (v2)
+- iOS approvals / FaceID (v3)
+- FIDO2 / WebAuthn approvals (v3)
+
+## Quickstart (From Source)
+
+```bash
+cargo build --release
+
+./target/release/opaque init
+
+# Edit ~/.opaque/config.toml to add an allow rule (deny-all is the default).
+./target/release/opaque policy check
+
+./target/release/opaqued
+```
+
+In another terminal:
+
+```bash
+./target/release/opaque ping
+./target/release/opaque execute test.noop
+./target/release/opaque audit tail --limit 10
+```
+
+More details: `docs/getting-started.md`
+
+## Demos
+
+### Enclave Quickstart (Init, Policy, Daemon, Execute, Audit)
+
+![quickstart demo](assets/demos/quickstart.gif)
+
+### Sandboxed Exec (No stdout/stderr Returned)
+
+![sandbox exec demo](assets/demos/sandbox-exec.gif)
 
 ## Docs
-- Architecture: `docs/architecture.md`
+
+- Docs index: `docs/README.md`
+- Getting started: `docs/getting-started.md`
+- Demos: `docs/demos.md`
+- Policy: `docs/policy.md`
+- Operations: `docs/operations.md`
 - LLM harness: `docs/llm-harness.md`
-- Mobile approvals: `docs/mobile-approvals.md`
-- Storage model: `docs/storage.md`
-- Audit & analytics: `docs/audit-analytics.md`
+- Deployment: `docs/deployment.md`
+- Security assessment: `docs/security-assessment.md`
+- Deferred roadmap: `docs/roadmap-deferred.md`

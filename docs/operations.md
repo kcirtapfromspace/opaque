@@ -1,162 +1,81 @@
-# Operations (Draft Contract)
+# Operations (Contract)
 
 Opaque exposes **operations**, not raw secret values.
 
-Operations are invoked via:
+v1 transport is local only:
 
-- local CLI (human)
-- MCP server (LLM tools)
-- internal automation hooks (future)
+- `opaque` (CLI) -> Unix domain socket -> `opaqued` (daemon)
 
-Unless explicitly noted, operation results must be **sanitized** to avoid leaking secret values into LLM-visible channels.
+MCP server exposure is **deferred** (see `docs/roadmap-deferred.md`).
 
 ## Safety Classes
 
-- `SAFE`: uses secrets but cannot return them (ex: "set GitHub secret")
-- `SENSITIVE_OUTPUT`: could return token-like material; disabled for LLM clients by default
-- `REVEAL`: returns secret values; not exposed to MCP/LLM clients
+| Class | Meaning | Agent Access |
+|------:|---------|--------------|
+| `SAFE` | Uses secrets internally and must not return them | Allowed (with policy + approvals) |
+| `SENSITIVE_OUTPUT` | Output may contain credential-like data | Denied for agents unless explicitly allowlisted in policy |
+| `REVEAL` | Returns plaintext secrets | Never (hard-blocked in v1) |
 
-## GitHub
+## Implemented Operations (v1)
 
-### `github.set_actions_secret` (SAFE)
+### `test.noop` (`SAFE`)
 
-Inputs:
-
-- `repo`: `org/repo`
-- `name`: secret name (ex: `AWS_ACCESS_KEY_ID`)
-- `value_ref`: secret reference (1Password/Vault/etc)
-- optional: `environment` (when set, writes an Actions *environment* secret instead of a repo secret)
+No inputs.
 
 Result:
 
-- `status`: `ok` | `error`
-- `repo`, `name`
-- optional: `environment`
-- optional: `updated`: bool
+- `{ "status": "ok" }`
+
+### `sandbox.exec` (`SAFE`)
+
+Runs a command in a platform sandbox using an execution profile.
+
+Inputs (via `opaque exec --profile <name> -- <cmd...>`):
+
+- `profile`: profile name (loads `~/.opaque/profiles/<name>.toml`)
+- `command`: command argv array
+
+Result:
+
+- `exit_code`: i32
+- `duration_ms`: u64
+- `stdout_length`: u64
+- `stderr_length`: u64
 
 Notes:
 
-- Broker fetches repo public key and encrypts secret for GitHub API.
+- The daemon does **not** return stdout/stderr content (only lengths), to reduce the chance of secret leakage via command output.
+
+### `github.set_actions_secret` (`SAFE`)
+
+Sets a GitHub Actions repository secret using GitHub's public-key encryption.
+
+Inputs:
+
+- `repo`: `owner/repo`
+- `secret_name`: secret name (ex: `AWS_ACCESS_KEY_ID`)
+- `value_ref`: secret reference (ex: `keychain:opaque/my-token`)
+- optional: `github_token_ref`: GitHub PAT ref (default: `keychain:opaque/github-pat`)
+- optional: `environment`: when set, writes an Actions environment secret instead of a repo secret
+
+Result:
+
+- `status`: `created` | `updated`
+- `repo`
+- `secret_name`
+
+Notes:
+
 - Never return the secret value or its ciphertext.
 
-### `github.set_codespaces_secret` (SAFE)
+## Deferred Specs (Not Implemented In v1)
 
-Inputs:
+These are design placeholders and should not be treated as supported operations in v1:
 
-- scope: user or repo
-- `name`
-- `value_ref`
+- `github.set_codespaces_secret`
+- `gitlab.set_ci_variable`
+- `k8s.set_secret`
+- `k8s.apply_manifest`
+- `aws.call`
+- `http.request_with_auth`
 
-Result:
-
-- `status`, `scope`, `name`
-
-Notes:
-
-- Support both user-level Codespaces secrets and repo-level Codespaces secrets.
-
-## GitLab
-
-### `gitlab.set_ci_variable` (SAFE)
-
-Inputs:
-
-- `project`: id/path
-- `key`
-- `value_ref`
-- `protected`: bool
-- `masked`: bool
-- `environment_scope`: string
-
-Result:
-
-- `status`, `project`, `key`
-
-Notes:
-
-- Default to `masked=true` and `protected=true` where it makes sense.
-
-## Kubernetes
-
-### `k8s.set_secret` (SAFE)
-
-Inputs:
-
-- `cluster`: logical cluster name
-- `namespace`
-- `name`
-- `type`: secret type (ex: `kubernetes.io/dockerconfigjson`)
-- `data_from_refs`: map of `key -> value_ref`
-
-Result:
-
-- `status`, `cluster`, `namespace`, `name`
-
-Notes:
-
-- Disallow providing raw secret values in the request.
-- Prefer a broker identity that can `create/update/patch` secrets but not `get/list/watch` secrets.
-
-### `k8s.apply_manifest` (SAFE with policy)
-
-Inputs:
-
-- `cluster`
-- `manifest_yaml`
-
-Result:
-
-- `status`, `objects_applied`: list of `kind/name/namespace`
-
-Policy:
-
-- Reject if the manifest contains `kind: Secret`.
-- Optionally reject `ConfigMap` keys that look like secrets (heuristic).
-
-## AWS
-
-### `aws.call` (SAFE or SENSITIVE_OUTPUT depending)
-
-Inputs:
-
-- `account`/`role` context (logical)
-- `service`: `s3`, `eks`, `ecr`, `sts`, ...
-- `action`: operation name
-- `params`: structured JSON
-
-Result:
-
-- `status`
-- `output`: sanitized JSON
-
-Policy:
-
-- Start with an allowlist (service+action) and resource constraints.
-- Mark actions that can return credentials as `SENSITIVE_OUTPUT`.
-
-Examples:
-
-- `ecr:GetAuthorizationToken` is `SENSITIVE_OUTPUT` (token-like)
-- `sts:AssumeRole` output credentials are `SENSITIVE_OUTPUT`
-
-## HTTP Proxy
-
-### `http.request_with_auth` (SAFE with strong constraints)
-
-Inputs:
-
-- `method`, `url`
-- `headers` (no `Authorization`)
-- `body` (size-limited)
-- `auth_ref` (secret ref used to set Authorization/header/cookie)
-
-Result:
-
-- `status_code`
-- `headers` (filtered)
-- `body` (optional; disabled by default unless endpoint allowlisted)
-
-Policy:
-
-- Strict allowlist of domains and methods.
-- Body size limits and response scrubbing.
