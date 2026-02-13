@@ -116,6 +116,32 @@ pub struct OperationDef {
 
     /// Human-readable description shown in audit logs and approval prompts.
     pub description: String,
+
+    /// Optional JSON Schema for validating operation params.
+    /// If present, params are validated before execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params_schema: Option<serde_json::Value>,
+}
+
+/// Validate operation params against a JSON Schema.
+///
+/// Returns `Ok(())` if validation passes or no schema is provided.
+/// Returns `Err(errors)` with a list of validation error messages on failure.
+pub fn validate_params(
+    schema: &serde_json::Value,
+    params: &serde_json::Value,
+) -> Result<(), Vec<String>> {
+    let validator =
+        jsonschema::validator_for(schema).map_err(|e| vec![format!("invalid schema: {e}")])?;
+    let errors: Vec<String> = validator
+        .iter_errors(params)
+        .map(|e| e.to_string())
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 
 /// Error returned by [`OperationRegistry`] methods.
@@ -254,6 +280,32 @@ impl fmt::Display for ClientIdentity {
 }
 
 // ---------------------------------------------------------------------------
+// Workspace context
+// ---------------------------------------------------------------------------
+
+/// Git workspace context for scoped approvals.
+///
+/// Ties approvals and policy rules to a specific git repository, branch, and
+/// working state. Prevents cross-repo/cross-branch approval confusion attacks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceContext {
+    /// Absolute path to the git repository root.
+    pub repo_root: PathBuf,
+
+    /// Remote URL (typically `origin`), e.g. `"git@github.com:org/repo.git"`.
+    pub remote_url: Option<String>,
+
+    /// Current branch name (e.g. `"main"`, `"feature/foo"`).
+    pub branch: Option<String>,
+
+    /// HEAD commit SHA.
+    pub head_sha: Option<String>,
+
+    /// Whether the working tree has uncommitted changes.
+    pub dirty: bool,
+}
+
+// ---------------------------------------------------------------------------
 // Client type (derived from identity + policy)
 // ---------------------------------------------------------------------------
 
@@ -304,6 +356,10 @@ pub struct OperationRequest {
 
     /// Operation-specific parameters (non-secret).
     pub params: serde_json::Value,
+
+    /// Git workspace context for scoped approvals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceContext>,
 }
 
 // Custom Debug to avoid any accidental secret leakage.
@@ -320,6 +376,7 @@ impl fmt::Debug for OperationRequest {
             .field("expires_at", &self.expires_at)
             // Deliberately omit params to avoid logging secret-adjacent data.
             .field("params", &"<redacted>")
+            .field("workspace", &self.workspace)
             .finish()
     }
 }
@@ -337,6 +394,7 @@ mod tests {
             default_approval: ApprovalRequirement::Always,
             default_factors: vec![ApprovalFactor::LocalBio],
             description: "Set a GitHub Actions secret".into(),
+            params_schema: None,
         })
         .unwrap();
 
@@ -354,6 +412,7 @@ mod tests {
             default_approval: ApprovalRequirement::Never,
             default_factors: vec![],
             description: "test".into(),
+            params_schema: None,
         };
         reg.register(def.clone()).unwrap();
         assert!(reg.register(def).is_err());
@@ -413,6 +472,7 @@ mod tests {
             default_approval: ApprovalRequirement::Never,
             default_factors: vec![],
             description: "test".into(),
+            params_schema: None,
         })
         .unwrap();
         assert!(!reg.is_empty());
@@ -508,6 +568,7 @@ mod tests {
             default_approval: ApprovalRequirement::Always,
             default_factors: vec![ApprovalFactor::LocalBio, ApprovalFactor::Fido2],
             description: "Set a GitHub Actions secret".into(),
+            params_schema: None,
         };
         let json = serde_json::to_string(&def).unwrap();
         let roundtripped: OperationDef = serde_json::from_str(&json).unwrap();
@@ -535,11 +596,84 @@ mod tests {
             created_at: SystemTime::now(),
             expires_at: None,
             params: serde_json::json!({"key": "value"}),
+            workspace: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let roundtripped: OperationRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(roundtripped.operation, "test.op");
         assert_eq!(roundtripped.secret_ref_names, vec!["SECRET"]);
+    }
+
+    #[test]
+    fn validate_params_passes() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "repo": { "type": "string" }
+            },
+            "required": ["repo"]
+        });
+        let params = serde_json::json!({"repo": "org/myrepo"});
+        assert!(super::validate_params(&schema, &params).is_ok());
+    }
+
+    #[test]
+    fn validate_params_missing_required_fails() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "repo": { "type": "string" }
+            },
+            "required": ["repo"]
+        });
+        let params = serde_json::json!({});
+        let result = super::validate_params(&schema, &params);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(!errors.is_empty());
+    }
+
+    #[test]
+    fn validate_params_wrong_type_fails() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "count": { "type": "integer" }
+            },
+            "required": ["count"]
+        });
+        let params = serde_json::json!({"count": "not_a_number"});
+        let result = super::validate_params(&schema, &params);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn operation_def_with_schema_serde() {
+        let def = OperationDef {
+            name: "test.op".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Never,
+            default_factors: vec![],
+            description: "test".into(),
+            params_schema: Some(serde_json::json!({"type": "object"})),
+        };
+        let json = serde_json::to_string(&def).unwrap();
+        let rt: OperationDef = serde_json::from_str(&json).unwrap();
+        assert!(rt.params_schema.is_some());
+    }
+
+    #[test]
+    fn operation_def_no_schema_skips_serialization() {
+        let def = OperationDef {
+            name: "test.op".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Never,
+            default_factors: vec![],
+            description: "test".into(),
+            params_schema: None,
+        };
+        let json = serde_json::to_string(&def).unwrap();
+        assert!(!json.contains("params_schema"));
     }
 
     #[test]
@@ -561,9 +695,62 @@ mod tests {
             created_at: SystemTime::now(),
             expires_at: None,
             params: serde_json::json!({"secret": "super_secret_value"}),
+            workspace: None,
         };
         let dbg = format!("{req:?}");
         assert!(!dbg.contains("super_secret_value"));
         assert!(dbg.contains("<redacted>"));
+    }
+
+    #[test]
+    fn workspace_context_serde_roundtrip() {
+        let ws = WorkspaceContext {
+            repo_root: PathBuf::from("/home/user/project"),
+            remote_url: Some("git@github.com:org/repo.git".into()),
+            branch: Some("main".into()),
+            head_sha: Some("abc123".into()),
+            dirty: false,
+        };
+        let json = serde_json::to_string(&ws).unwrap();
+        let rt: WorkspaceContext = serde_json::from_str(&json).unwrap();
+        assert_eq!(rt.repo_root, PathBuf::from("/home/user/project"));
+        assert_eq!(
+            rt.remote_url.as_deref(),
+            Some("git@github.com:org/repo.git")
+        );
+        assert_eq!(rt.branch.as_deref(), Some("main"));
+        assert!(!rt.dirty);
+    }
+
+    #[test]
+    fn operation_request_with_workspace_debug() {
+        let req = OperationRequest {
+            request_id: Uuid::new_v4(),
+            client_identity: ClientIdentity {
+                uid: 501,
+                gid: 20,
+                pid: Some(1),
+                exe_path: None,
+                exe_sha256: None,
+                codesign_team_id: None,
+            },
+            client_type: ClientType::Agent,
+            operation: "test.op".into(),
+            target: HashMap::new(),
+            secret_ref_names: vec![],
+            created_at: SystemTime::now(),
+            expires_at: None,
+            params: serde_json::Value::Null,
+            workspace: Some(WorkspaceContext {
+                repo_root: PathBuf::from("/tmp/repo"),
+                remote_url: Some("https://github.com/org/repo".into()),
+                branch: Some("feature/x".into()),
+                head_sha: None,
+                dirty: true,
+            }),
+        };
+        let dbg = format!("{req:?}");
+        assert!(dbg.contains("workspace"));
+        assert!(dbg.contains("/tmp/repo"));
     }
 }
