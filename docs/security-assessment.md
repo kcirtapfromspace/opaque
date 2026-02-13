@@ -1,4 +1,4 @@
-# AgentPass Security Assessment
+# Opaque Security Assessment
 
 **Date:** 2026-02-12
 **Assessor:** Security Engineering Review
@@ -27,17 +27,17 @@
 | Actor | Description | Capability | Motivation |
 |-------|-------------|------------|------------|
 | **TA-1: Malicious LLM Agent** | An AI coding tool (Codex, Claude Code) that has been jailbroken, compromised, or is behaving adversarially. | Can invoke any RPC exposed over the UDS socket. Can send arbitrary JSON payloads. Can run arbitrary commands on the user's machine if the tool runtime permits. Can read any file the user can read. | Exfiltrate secrets, escalate privileges, perform unauthorized operations against SaaS targets. |
-| **TA-2: Compromised Dependency** | A crate in the supply chain (e.g., `zbus`, `objc2`, or a transitive dep) that has been backdoored via a supply chain attack. | Full code execution within `agentpassd` or `agentpass` process at build time (proc macros) or runtime. Access to all in-memory secrets, the UDS socket, and OS credentials. | Exfiltrate secrets, install persistent backdoors, pivot to cloud resources. |
-| **TA-3: Same-User Attacker** | A malicious process running under the same Unix UID as the AgentPass user. This could be malware, a compromised npm package, a hostile VS Code extension, etc. | Can connect to the UDS socket (same UID), read/write files in the user's home directory, attach debuggers (on some configurations), read `/proc/<pid>/mem` (Linux). | Trigger unauthorized approval prompts (approval spam/fatigue), invoke privileged operations, read audit data, denial of service. |
+| **TA-2: Compromised Dependency** | A crate in the supply chain (e.g., `zbus`, `objc2`, or a transitive dep) that has been backdoored via a supply chain attack. | Full code execution within `opaqued` or `opaque` process at build time (proc macros) or runtime. Access to all in-memory secrets, the UDS socket, and OS credentials. | Exfiltrate secrets, install persistent backdoors, pivot to cloud resources. |
+| **TA-3: Same-User Attacker** | A malicious process running under the same Unix UID as the Opaque user. This could be malware, a compromised npm package, a hostile VS Code extension, etc. | Can connect to the UDS socket (same UID), read/write files in the user's home directory, attach debuggers (on some configurations), read `/proc/<pid>/mem` (Linux). | Trigger unauthorized approval prompts (approval spam/fatigue), invoke privileged operations, read audit data, denial of service. |
 | **TA-4: Network-Adjacent Attacker** | An attacker on the same LAN, relevant when the iOS mobile pairing HTTPS server is active. | Network traffic interception, mDNS spoofing, ARP spoofing. | Intercept pairing QR data, man-in-the-middle the mobile approval channel, steal device pairing keys. |
-| **TA-5: Malicious MCP Server** | A rogue or compromised MCP server that relays requests from LLM tools to AgentPass. | Can craft arbitrary operation requests, replay requests, attempt to extract sensitive information from responses or error messages. | Exfiltrate secrets through error message side channels, abuse approval leases, trigger operations against unauthorized targets. |
-| **TA-6: Insider / Malicious Developer** | A developer with commit access to the AgentPass repository or access to the build pipeline. | Can introduce backdoors in code, weaken policy defaults, add exfiltration paths. | Long-term persistent access to secrets across all deployments. |
+| **TA-5: Malicious MCP Server** | A rogue or compromised MCP server that relays requests from LLM tools to Opaque. | Can craft arbitrary operation requests, replay requests, attempt to extract sensitive information from responses or error messages. | Exfiltrate secrets through error message side channels, abuse approval leases, trigger operations against unauthorized targets. |
+| **TA-6: Insider / Malicious Developer** | A developer with commit access to the Opaque repository or access to the build pipeline. | Can introduce backdoors in code, weaken policy defaults, add exfiltration paths. | Long-term persistent access to secrets across all deployments. |
 
 ### 1.2 Attack Surface Map
 
 | Surface | Components | Exposed To | Notes |
 |---------|-----------|------------|-------|
-| **UDS Socket** | `agentpassd` listener at `$XDG_RUNTIME_DIR/agentpass/agentpassd.sock` or `~/.agentpass/run/agentpassd.sock` | TA-1, TA-3, TA-5 | Primary attack surface. All operations flow through this socket. |
+| **UDS Socket** | `opaqued` listener at `$XDG_RUNTIME_DIR/opaque/opaqued.sock` or `~/.opaque/run/opaqued.sock` | TA-1, TA-3, TA-5 | Primary attack surface. All operations flow through this socket. |
 | **Approval UI (macOS)** | `LocalAuthentication` framework, Touch ID / password dialog | TA-1 (indirect via spam), TA-3 | User-facing. Social engineering vector. |
 | **Approval UI (Linux)** | polkit `CheckAuthorization`, system auth agent | TA-1 (indirect via spam), TA-3 | User-facing. Intent visibility depends on auth agent. |
 | **Provider Connectors** | 1Password CLI/API, HashiCorp Vault API, AWS SDK, GitHub/GitLab APIs | TA-2, TA-6 | Credentials for these are the crown jewels. |
@@ -67,15 +67,15 @@
 
 ### Finding 2.1: CRITICAL -- Generic `approval.prompt` RPC Exposed Without Authorization
 
-**File:** `/Users/thinkstudio/agent_pass/crates/agentpassd/src/main.rs`, lines 174-188
-**File:** `/Users/thinkstudio/agent_pass/crates/agentpass/src/main.rs`, lines 47-53
+**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/main.rs`, lines 174-188
+**File:** `/Users/thinkstudio/agent_pass/crates/opaque/src/main.rs`, lines 47-53
 
 **Description:**
 The `approval.prompt` method is directly callable by any process that can connect to the UDS socket. There is no client identity verification, no policy check, and no operation binding. The `reason` string is entirely client-controlled and displayed directly to the user in the OS authentication dialog.
 
 **Code:**
 ```rust
-// agentpassd/src/main.rs:174-188
+// opaqued/src/main.rs:174-188
 "approval.prompt" => {
     let reason = req
         .params
@@ -105,7 +105,7 @@ The `approval.prompt` method is directly callable by any process that can connec
 ```bash
 # From any process running as the same user:
 echo '{"id":1,"method":"approval.prompt","params":{"reason":"URGENT: Approve to prevent data loss"}}' | \
-  socat - UNIX-CONNECT:$HOME/.agentpass/run/agentpassd.sock
+  socat - UNIX-CONNECT:$HOME/.opaque/run/opaqued.sock
 ```
 
 **Impact:** Social engineering via approval prompt spoofing. Approval fatigue attack (repeated prompts until user blindly approves).
@@ -119,14 +119,14 @@ echo '{"id":1,"method":"approval.prompt","params":{"reason":"URGENT: Approve to 
 
 ### Finding 2.2: CRITICAL -- No Client Identity Verification or Authorization
 
-**File:** `/Users/thinkstudio/agent_pass/crates/agentpassd/src/main.rs`, lines 122-168
+**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/main.rs`, lines 122-168
 
 **Description:**
 The `handle_conn` function retrieves peer credentials (`uid`, `gid`, `pid`) but only logs them. No authorization decision is made. Every connected client has full access to all RPC methods.
 
 **Code:**
 ```rust
-// agentpassd/src/main.rs:122-134
+// opaqued/src/main.rs:122-134
 async fn handle_conn(state: Arc<AppState>, stream: UnixStream) -> std::io::Result<()> {
     let fd = stream.as_raw_fd();
     let peer = peer_info_from_fd(fd).ok();
@@ -154,7 +154,7 @@ A malicious npm postinstall script (TA-3) running under the same UID connects to
 
 ### Finding 2.3: HIGH -- Approval Error Leaks LocalAuthentication Details
 
-**File:** `/Users/thinkstudio/agent_pass/crates/agentpassd/src/approval.rs`, lines 59-63
+**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/approval.rs`, lines 59-63
 
 **Description:**
 When LocalAuthentication is unavailable, the error includes the full `localizedDescription()` from `NSError`, which may contain system-internal details about the authentication configuration.
@@ -188,8 +188,8 @@ An LLM agent probes the `approval.prompt` endpoint. If LocalAuthentication is no
 
 ### Finding 2.4: HIGH -- Client-Controlled Reason String Displayed in OS Auth Dialog
 
-**File:** `/Users/thinkstudio/agent_pass/crates/agentpassd/src/approval.rs`, lines 68-85
-**File:** `/Users/thinkstudio/agent_pass/crates/agentpassd/src/approval.rs`, lines 120-122
+**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/approval.rs`, lines 68-85
+**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/approval.rs`, lines 120-122
 
 **Description:**
 The `reason` parameter from the client is passed directly to:
@@ -207,13 +207,13 @@ An attacker sends a reason string designed to deceive the user:
 
 **Recommended Fix:**
 - In the target architecture, the reason string should be derived server-side from the `OperationRequest` (operation + target + client identity), never from client-supplied text.
-- As an interim fix: limit length to 200 characters, strip control characters and RTL overrides, prefix with `"AgentPass: "` to distinguish from system prompts.
+- As an interim fix: limit length to 200 characters, strip control characters and RTL overrides, prefix with `"Opaque: "` to distinguish from system prompts.
 
 ---
 
 ### Finding 2.5: HIGH -- Unsafe Code Review in `peer.rs`
 
-**File:** `/Users/thinkstudio/agent_pass/crates/agentpass-core/src/peer.rs`, lines 20-28 and 77-88
+**File:** `/Users/thinkstudio/agent_pass/crates/opaque-core/src/peer.rs`, lines 20-28 and 77-88
 
 **Description:**
 There are three `unsafe` blocks in `peer.rs`. All involve FFI calls to `libc` functions (`getsockopt`, `getpeereid`).
@@ -266,7 +266,7 @@ let rc = unsafe {
 
 ### Finding 2.6: HIGH -- Unsafe Code Review in `approval.rs`
 
-**File:** `/Users/thinkstudio/agent_pass/crates/agentpassd/src/approval.rs`, lines 57-85
+**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/approval.rs`, lines 57-85
 
 **Description:**
 There are three `unsafe` blocks in `approval.rs`, all related to Objective-C interop via the `objc2` crate.
@@ -300,7 +300,7 @@ unsafe {
 
 **Concern:** The `reply` closure captures `tx2` which is `Arc<Mutex<Option<Sender<bool>>>>`. If the block is called more than once (which LocalAuthentication should not do, but is not formally guaranteed by Apple's documentation), the second call would find `tx.take()` returns `None` and silently drop the result. This is safe but could mask bugs.
 
-**Concern:** If `agentpassd` is terminated while an approval is pending, the `reply` block may be called after the `rx` receiver has been dropped. The `tx.send()` will return `Err` and the result is silently dropped via `let _ = tx.send(ok)`. This is safe.
+**Concern:** If `opaqued` is terminated while an approval is pending, the `reply` block may be called after the `rx` receiver has been dropped. The `tx.send()` will return `Err` and the result is silently dropped via `let _ = tx.send(ok)`. This is safe.
 
 **Recommended Fix:**
 - No immediate memory safety fix needed. These `unsafe` blocks are sound.
@@ -311,7 +311,7 @@ unsafe {
 
 ### Finding 2.7: MEDIUM -- Denial of Service via Approval Semaphore Starvation
 
-**File:** `/Users/thinkstudio/agent_pass/crates/agentpassd/src/main.rs`, lines 63, 181-183
+**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/main.rs`, lines 63, 181-183
 
 **Description:**
 The `approval_gate` is a `Semaphore::new(1)`, which correctly ensures only one approval dialog is active at a time. However, the semaphore is held for the entire duration of the approval (up to 120 seconds on macOS). During this time, all other approval requests block.
@@ -341,7 +341,7 @@ Even without a malicious actor, a legitimate but slow approval (user steps away)
 
 ### Finding 2.8: MEDIUM -- Unbounded Connection Spawning
 
-**File:** `/Users/thinkstudio/agent_pass/crates/agentpassd/src/main.rs`, lines 81-89
+**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/main.rs`, lines 81-89
 
 **Description:**
 Every incoming connection spawns a new Tokio task with no limit on concurrent connections.
@@ -372,7 +372,7 @@ A malicious process opens thousands of connections to the UDS socket. Each conne
 
 ### Finding 2.9: MEDIUM -- Connection Error Leaks Frame Parsing Details
 
-**File:** `/Users/thinkstudio/agent_pass/crates/agentpassd/src/main.rs`, lines 141-158
+**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/main.rs`, lines 141-158
 
 **Description:**
 Frame parsing errors and JSON deserialization errors are sent back to the client with the full `e.to_string()` error message.
@@ -401,7 +401,7 @@ This information assists in fingerprinting the server implementation.
 
 ### Finding 2.10: MEDIUM -- Peer Credentials Not Verified Against UID
 
-**File:** `/Users/thinkstudio/agent_pass/crates/agentpassd/src/main.rs`, lines 122-134
+**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/main.rs`, lines 122-134
 
 **Description:**
 The daemon retrieves peer credentials but does not verify that the connecting process's UID matches the daemon's UID. While socket permissions (0600) should prevent cross-user connections, the daemon should defensively verify this.
@@ -423,7 +423,7 @@ If socket permissions are misconfigured (e.g., the directory is world-readable d
 
 ### Finding 2.11: LOW -- `whoami` Endpoint Not Implemented
 
-**File:** `/Users/thinkstudio/agent_pass/crates/agentpassd/src/main.rs`, lines 190-193
+**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/main.rs`, lines 190-193
 
 **Description:**
 The `whoami` endpoint returns `{"note": "not implemented"}`. When implemented, it should return the server-observed client identity. If the implementation returns too much detail, it could be used for fingerprinting.
@@ -443,7 +443,7 @@ The `whoami` endpoint returns `{"note": "not implemented"}`. When implemented, i
 
 ### Finding 2.12: LOW -- Request ID Type Is Not Cryptographically Random
 
-**File:** `/Users/thinkstudio/agent_pass/crates/agentpass-core/src/proto.rs`, line 5
+**File:** `/Users/thinkstudio/agent_pass/crates/opaque-core/src/proto.rs`, line 5
 
 **Description:**
 The `Request.id` field is a `u64`, and the client CLI hardcodes it to `1`. When operation requests are implemented, the `request_id` should be a cryptographically random UUID to prevent prediction and replay.
@@ -456,7 +456,7 @@ The `Request.id` field is a `u64`, and the client CLI hardcodes it to `1`. When 
 
 ### Finding 2.13: LOW -- No Rate Limiting on Any Endpoint
 
-**File:** `/Users/thinkstudio/agent_pass/crates/agentpassd/src/main.rs`, lines 170-196
+**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/main.rs`, lines 170-196
 
 **Description:**
 There is no rate limiting on RPC calls. A malicious client can send thousands of `ping` or `version` requests per second, or spam `approval.prompt` requests.
@@ -471,8 +471,8 @@ There is no rate limiting on RPC calls. A malicious client can send thousands of
 
 ### 3.1 JSON Deserialization
 
-**File:** `/Users/thinkstudio/agent_pass/crates/agentpassd/src/main.rs`, line 151
-**File:** `/Users/thinkstudio/agent_pass/crates/agentpass-core/src/proto.rs`, lines 1-9
+**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/main.rs`, line 151
+**File:** `/Users/thinkstudio/agent_pass/crates/opaque-core/src/proto.rs`, lines 1-9
 
 **Analysis:**
 The protocol uses `serde_json::from_slice` to deserialize incoming frames into the `Request` struct. The `params` field is `serde_json::Value`, which means arbitrary JSON is accepted.
@@ -492,8 +492,8 @@ The protocol uses `serde_json::from_slice` to deserialize incoming frames into t
 
 ### 3.2 Frame Smuggling via Length-Delimited Codec
 
-**File:** `/Users/thinkstudio/agent_pass/crates/agentpassd/src/main.rs`, lines 135-137
-**File:** `/Users/thinkstudio/agent_pass/crates/agentpass/src/main.rs`, lines 78-80
+**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/main.rs`, lines 135-137
+**File:** `/Users/thinkstudio/agent_pass/crates/opaque/src/main.rs`, lines 78-80
 
 **Analysis:**
 Both client and server use `LengthDelimitedCodec` with a 1MB max frame length. This codec prepends a 4-byte big-endian length header to each frame.
@@ -554,12 +554,12 @@ Requests are not signed or authenticated. The daemon relies entirely on socket-l
 
 #### 4.1.1 Prompt Spoofing
 
-**File:** `/Users/thinkstudio/agent_pass/crates/agentpassd/src/approval.rs`, lines 68-85
+**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/approval.rs`, lines 68-85
 
 **Analysis:**
-The `localizedReason` string is the only context the user sees in the Touch ID dialog. macOS displays this as: `"agentpassd" is trying to [reason]`. The application name comes from the process name, not the reason string.
+The `localizedReason` string is the only context the user sees in the Touch ID dialog. macOS displays this as: `"opaqued" is trying to [reason]`. The application name comes from the process name, not the reason string.
 
-**Risk:** A malicious client can set the reason to anything (see Finding 2.4). The user sees `"agentpassd" is trying to "Install critical security update"` and may approve without understanding what operation is actually being authorized.
+**Risk:** A malicious client can set the reason to anything (see Finding 2.4). The user sees `"opaqued" is trying to "Install critical security update"` and may approve without understanding what operation is actually being authorized.
 
 **Mitigation (current):** None. The reason is fully client-controlled.
 
@@ -568,7 +568,7 @@ The `localizedReason` string is the only context the user sees in the Touch ID d
 #### 4.1.2 Daemon Losing UI Session
 
 **Analysis:**
-If `agentpassd` is started as a LaunchDaemon (runs as root, no GUI session) instead of a LaunchAgent (runs in user session), `LocalAuthentication` will fail because there is no UI session to display the dialog.
+If `opaqued` is started as a LaunchDaemon (runs as root, no GUI session) instead of a LaunchAgent (runs in user session), `LocalAuthentication` will fail because there is no UI session to display the dialog.
 
 The code at line 59 calls `canEvaluatePolicy_error` which should detect this and return an error. However, there are edge cases:
 - If the daemon starts with a UI session but the user locks the screen, the behavior of `evaluatePolicy` is unclear (Apple documentation does not specify).
@@ -601,7 +601,7 @@ However, a malicious process *can*:
 
 #### 4.1.4 120-Second Timeout as DoS Vector
 
-**File:** `/Users/thinkstudio/agent_pass/crates/agentpassd/src/approval.rs`, line 88
+**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/approval.rs`, line 88
 
 **Analysis:**
 The 120-second timeout on `rx.recv_timeout(Duration::from_secs(120))` means the approval gate semaphore is held for up to 2 minutes per approval request.
@@ -610,14 +610,14 @@ The 120-second timeout on `rx.recv_timeout(Duration::from_secs(120))` means the 
 
 **Recommendation:**
 - Reduce the timeout to 60 seconds.
-- Add a mechanism for the user to cancel the approval from the daemon side (e.g., via the CLI: `agentpass cancel`).
+- Add a mechanism for the user to cancel the approval from the daemon side (e.g., via the CLI: `opaque cancel`).
 - Release the semaphore when the requesting connection is dropped.
 
 ### 4.2 Linux polkit
 
 #### 4.2.1 `auth_self` Policy Analysis
 
-**File:** `/Users/thinkstudio/agent_pass/assets/linux/polkit/com.agentpass.approve.policy`, lines 9-13
+**File:** `/Users/thinkstudio/agent_pass/assets/linux/polkit/com.opaque.approve.policy`, lines 9-13
 
 **Policy:**
 ```xml
@@ -639,25 +639,25 @@ The 120-second timeout on `rx.recv_timeout(Duration::from_secs(120))` means the 
 - GNOME's polkit agent shows the `message` field but not individual `details` entries.
 - KDE's polkit agent shows details in some versions.
 
-This means on many Linux setups, the user sees: `"Authentication is required to approve an AgentPass operation."` with no indication of which operation or target.
+This means on many Linux setups, the user sees: `"Authentication is required to approve an Opaque operation."` with no indication of which operation or target.
 
 **Recommendation:**
 - Test specific auth agents (gnome-shell, kde, mate, pkttyagent) and document which ones display intent.
 - As specified in the PRD (US-006/FR-6): if the environment cannot display intent, fail closed with `approval_unavailable`.
-- Consider implementing a dedicated AgentPass approval UI helper for Linux that shows full operation details, using polkit only for the authentication step.
+- Consider implementing a dedicated Opaque approval UI helper for Linux that shows full operation details, using polkit only for the authentication step.
 
 **Status (RESOLVED):** A two-step approval flow has been implemented in `approval.rs`. Step 1 shows an intent dialog via `zenity --question` or `kdialog --yesno` with full operation details. Step 2 performs the polkit authentication. This separates intent visibility (our code, always works) from authentication (polkit, always requires password). If no intent dialog UI is available (no zenity, no kdialog, no TTY), approval fails closed. Supported desktop tiers are documented in `docs/deployment.md`.
 
 #### 4.2.2 Action ID Hijacking
 
 **Analysis:**
-The polkit action ID `com.agentpass.approve` is a reverse-DNS identifier. A malicious actor would need root access to install a competing policy file at `/usr/share/polkit-1/actions/com.agentpass.approve.policy`. If they have root, they can bypass polkit entirely.
+The polkit action ID `com.opaque.approve` is a reverse-DNS identifier. A malicious actor would need root access to install a competing policy file at `/usr/share/polkit-1/actions/com.opaque.approve.policy`. If they have root, they can bypass polkit entirely.
 
 **Risk:** Low. Polkit action IDs cannot be hijacked without root access.
 
 **Recommendation:**
 - Verify the policy file integrity at daemon startup (hash check).
-- Consider namespacing operations into separate action IDs (e.g., `com.agentpass.approve.github`, `com.agentpass.approve.k8s`) for more granular policy in the future.
+- Consider namespacing operations into separate action IDs (e.g., `com.opaque.approve.github`, `com.opaque.approve.k8s`) for more granular policy in the future.
 
 ### 4.3 Mobile (iOS) Pairing
 
@@ -684,7 +684,7 @@ The documentation says "high-entropy" but does not specify the length or charact
 - Require a key confirmation step: after pairing, display a short verification code (derived from both public keys) on both devices for the user to compare (similar to Signal safety numbers).
 - Specify minimum pairing code entropy: at least 128 bits (e.g., 32 hex characters or 22 base64 characters).
 - Rate-limit pairing attempts to prevent brute-force (max 5 attempts per pairing session).
-- Add device listing: `agentpass devices list` should show paired devices with their last-seen timestamp.
+- Add device listing: `opaque devices list` should show paired devices with their last-seen timestamp.
 
 #### 4.3.2 MitM Prevention During Pairing
 
@@ -726,8 +726,8 @@ challenge = H(server_id || request_id || sha256(request_summary_json) || expires
 
 ### 5.1 Socket Path Permissions
 
-**File:** `/Users/thinkstudio/agent_pass/crates/agentpass-core/src/socket.rs`, lines 24-39
-**File:** `/Users/thinkstudio/agent_pass/crates/agentpassd/src/main.rs`, lines 96-104
+**File:** `/Users/thinkstudio/agent_pass/crates/opaque-core/src/socket.rs`, lines 24-39
+**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/main.rs`, lines 96-104
 
 **Analysis:**
 The socket creation follows these steps:
@@ -749,14 +749,14 @@ unsafe { libc::umask(old_umask) };
 
 ### 5.2 Directory Permission Race Conditions
 
-**File:** `/Users/thinkstudio/agent_pass/crates/agentpass-core/src/socket.rs`, lines 24-39
+**File:** `/Users/thinkstudio/agent_pass/crates/opaque-core/src/socket.rs`, lines 24-39
 
 **Analysis:**
 `create_dir_all` followed by `set_permissions` has a TOCTOU race: another process could create the directory (or a symlink) between the check and the permission set.
 
-**Risk:** If `$XDG_RUNTIME_DIR/agentpass/` does not exist, `create_dir_all` creates it. But `$XDG_RUNTIME_DIR` itself is typically user-owned (created by `pam_systemd` with correct permissions). The risk is low in practice.
+**Risk:** If `$XDG_RUNTIME_DIR/opaque/` does not exist, `create_dir_all` creates it. But `$XDG_RUNTIME_DIR` itself is typically user-owned (created by `pam_systemd` with correct permissions). The risk is low in practice.
 
-**Higher risk path:** `~/.agentpass/run/` under the HOME fallback. If `~/.agentpass/` already exists and is a symlink to an attacker-controlled location, `create_dir_all` will follow the symlink and create `run/` in the attacker's directory.
+**Higher risk path:** `~/.opaque/run/` under the HOME fallback. If `~/.opaque/` already exists and is a symlink to an attacker-controlled location, `create_dir_all` will follow the symlink and create `run/` in the attacker's directory.
 
 **Recommended Fix:**
 - After `create_dir_all`, verify that the resulting path is owned by the current user and is not a symlink:
@@ -772,7 +772,7 @@ if meta.uid() != current_uid {
 
 ### 5.3 Stale Socket File Handling (TOCTOU)
 
-**File:** `/Users/thinkstudio/agent_pass/crates/agentpassd/src/main.rs`, lines 40-53
+**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/main.rs`, lines 40-53
 
 **Code:**
 ```rust
@@ -793,7 +793,7 @@ if socket.exists() {
 ```
 
 **Analysis:**
-This has a TOCTOU race: between the `exists()` check (or the failed `connect()`) and the `remove_file()`, another instance of `agentpassd` could start, create its socket, and then this instance removes the other's socket.
+This has a TOCTOU race: between the `exists()` check (or the failed `connect()`) and the `remove_file()`, another instance of `opaqued` could start, create its socket, and then this instance removes the other's socket.
 
 Additionally, between `remove_file()` and `bind()`, another process could create a file (or symlink) at the socket path.
 
@@ -812,13 +812,13 @@ if flock(lock.as_raw_fd(), FlockArg::LockExclusiveNonblock).is_err() {
 
 ### 5.4 Symlink Attacks on Socket Path
 
-**File:** `/Users/thinkstudio/agent_pass/crates/agentpass-core/src/socket.rs`, lines 6-22
+**File:** `/Users/thinkstudio/agent_pass/crates/opaque-core/src/socket.rs`, lines 6-22
 
 **Analysis:**
-The `AGENTPASS_SOCK` environment variable allows the user to specify an arbitrary socket path. If the daemon runs as the user, and the path points to a symlink, `UnixListener::bind` will follow the symlink.
+The `OPAQUE_SOCK` environment variable allows the user to specify an arbitrary socket path. If the daemon runs as the user, and the path points to a symlink, `UnixListener::bind` will follow the symlink.
 
 **Attack Scenario (TA-3):**
-1. Attacker creates a symlink: `ln -s /tmp/shared_socket ~/.agentpass/run/agentpassd.sock`
+1. Attacker creates a symlink: `ln -s /tmp/shared_socket ~/.opaque/run/opaqued.sock`
 2. When the daemon starts, it binds to `/tmp/shared_socket` (which may be world-accessible).
 3. The attacker can now connect to the socket from any user.
 
@@ -918,17 +918,17 @@ If a runtime dependency is compromised:
 
 #### Filesystem
 
-- [ ] Socket directory (`$XDG_RUNTIME_DIR/agentpass/` or `~/.agentpass/run/`) has permissions `0700`, owned by the daemon user.
+- [ ] Socket directory (`$XDG_RUNTIME_DIR/opaque/` or `~/.opaque/run/`) has permissions `0700`, owned by the daemon user.
 - [ ] Socket file has permissions `0600`.
 - [ ] No symlinks exist in the socket path chain.
 - [ ] SQLite database directory (when implemented) has permissions `0700`.
 - [ ] TOML policy files have permissions `0600` and are owned by the daemon user.
 - [ ] Verify `$XDG_RUNTIME_DIR` is mounted as `tmpfs` (Linux) -- prevents socket persistence across reboots.
-- [ ] On macOS, verify `~/.agentpass/` is excluded from Time Machine and Spotlight indexing.
+- [ ] On macOS, verify `~/.opaque/` is excluded from Time Machine and Spotlight indexing.
 
 #### Process Isolation
 
-- [ ] `agentpassd` runs as a LaunchAgent (macOS) or systemd user service (Linux), never as root.
+- [ ] `opaqued` runs as a LaunchAgent (macOS) or systemd user service (Linux), never as root.
 - [ ] On Linux, create a systemd unit with:
   ```ini
   [Service]
@@ -936,7 +936,7 @@ If a runtime dependency is compromised:
   ProtectSystem=strict
   ProtectHome=read-only
   PrivateTmp=true
-  ReadWritePaths=%h/.agentpass
+  ReadWritePaths=%h/.opaque
   ```
 - [ ] On macOS, if using a signed app bundle, the binary should have hardened runtime enabled.
 - [ ] Disable core dumps for the daemon process (`ulimit -c 0` or `prctl(PR_SET_DUMPABLE, 0)` on Linux).
@@ -946,7 +946,7 @@ If a runtime dependency is compromised:
 
 - [ ] The daemon's UDS socket must never be exposed over TCP or any network transport.
 - [ ] When the mobile pairing HTTPS server is active (future), bind it to the LAN interface only, never `0.0.0.0`.
-- [ ] Use a firewall to restrict outbound connections from `agentpassd` to only the required provider endpoints (1Password, Vault, GitHub API, GitLab API, AWS endpoints).
+- [ ] Use a firewall to restrict outbound connections from `opaqued` to only the required provider endpoints (1Password, Vault, GitHub API, GitLab API, AWS endpoints).
 
 #### Secrets Management
 
@@ -980,26 +980,26 @@ If a runtime dependency is compromised:
 
 #### Resource Usage
 
-- Monitor file descriptor count for `agentpassd` (alert if > 100).
+- Monitor file descriptor count for `opaqued` (alert if > 100).
 - Monitor memory usage (alert if > 256MB -- indicates possible memory exhaustion attack or leak).
 - Monitor CPU usage (alert if sustained > 50% -- possible DoS).
 
 ### 7.3 Incident Response Procedures
 
-#### Suspected Compromise of AgentPass Daemon
+#### Suspected Compromise of Opaque Daemon
 
-1. **Contain:** Kill the `agentpassd` process immediately: `kill -9 $(pgrep agentpassd)`.
+1. **Contain:** Kill the `opaqued` process immediately: `kill -9 $(pgrep opaqued)`.
 2. **Preserve:** Copy the audit log (SQLite DB) and log files to a secure location before they are modified.
-3. **Revoke:** Revoke all provider credentials (PATs, Vault tokens, AWS keys) that were configured in AgentPass.
-4. **Rotate:** Rotate all secrets that were managed through AgentPass operations (GitHub secrets, GitLab CI variables, Kubernetes secrets).
+3. **Revoke:** Revoke all provider credentials (PATs, Vault tokens, AWS keys) that were configured in Opaque.
+4. **Rotate:** Rotate all secrets that were managed through Opaque operations (GitHub secrets, GitLab CI variables, Kubernetes secrets).
 5. **Investigate:** Review the audit log for unauthorized operations. Check for operations against unexpected targets or from unrecognized client identities.
-6. **Rebuild:** Reinstall AgentPass from a verified source. Do not reuse the old binary or configuration.
+6. **Rebuild:** Reinstall Opaque from a verified source. Do not reuse the old binary or configuration.
 7. **Re-pair:** If iOS device pairing was in use, revoke all paired devices and re-pair.
 
 #### Suspected Approval Prompt Spoofing / Social Engineering
 
 1. **Do not approve** any pending prompts.
-2. **Check** `agentpass devices list` (when implemented) for unauthorized paired devices.
+2. **Check** `opaque devices list` (when implemented) for unauthorized paired devices.
 3. **Review** the audit log for any operations that were approved during the suspicious time window.
 4. **Revoke** approval leases if any are active.
 5. **Investigate** which process triggered the suspicious approval (check daemon logs for client PID/exe).
@@ -1009,7 +1009,7 @@ If a runtime dependency is compromised:
 1. **Revoke** the leaked credential immediately at the provider (GitHub, GitLab, AWS, Vault, 1Password).
 2. **Audit** the provider's access logs for unauthorized usage during the exposure window.
 3. **Rotate** any downstream secrets that were accessible via the leaked credential.
-4. **Update** the AgentPass configuration with the new credential.
+4. **Update** the Opaque configuration with the new credential.
 
 ### 7.4 Backup and Recovery for Audit Data
 
@@ -1017,9 +1017,9 @@ If a runtime dependency is compromised:
 
 | Data | Location | Frequency | Retention |
 |------|----------|-----------|-----------|
-| SQLite audit DB | `~/.agentpass/data/audit.db` (planned) | Daily incremental | 1 year minimum |
-| Parquet exports | `~/.agentpass/data/parquet/` (planned) | On creation | 2+ years |
-| Policy files | `~/.agentpass/policy.toml` (planned) | On change | Indefinite (version control recommended) |
+| SQLite audit DB | `~/.opaque/data/audit.db` (planned) | Daily incremental | 1 year minimum |
+| Parquet exports | `~/.opaque/data/parquet/` (planned) | On creation | 2+ years |
+| Policy files | `~/.opaque/policy.toml` (planned) | On change | Indefinite (version control recommended) |
 | Paired device keys | In SQLite DB | With audit DB | Until device is revoked |
 
 #### Backup Procedures
@@ -1031,10 +1031,10 @@ If a runtime dependency is compromised:
 
 #### Recovery
 
-1. Stop `agentpassd`.
+1. Stop `opaqued`.
 2. Replace the SQLite DB with the backup copy.
 3. Verify integrity: `sqlite3 audit.db "PRAGMA integrity_check"`.
-4. Restart `agentpassd`.
+4. Restart `opaqued`.
 5. Note: Approval leases are intentionally not persisted (fail-closed). After recovery, users will need to re-approve operations.
 
 ---
@@ -1074,7 +1074,7 @@ If a runtime dependency is compromised:
 | M-1 | Section 4.3.1 | Implement key confirmation step for mobile pairing. | Medium |
 | M-2 | Section 4.3.3 | Use structured encoding (canonical JSON or length-prefixed) for challenge construction. | Small |
 | M-3 | Finding 2.12 | Use UUID v4/v7 for request identifiers. Generate canonical IDs server-side. | Small |
-| M-4 | Section 5.4 | Add symlink check before binding to socket path (especially when `AGENTPASS_SOCK` is set). | Small |
+| M-4 | Section 5.4 | Add symlink check before binding to socket path (especially when `OPAQUE_SOCK` is set). | Small |
 | M-5 | Section 3.5 | Implement per-session challenge-response to prevent PID reuse attacks. | Medium |
 | M-6 | -- | Implement audit log with redaction levels (human vs. agent feed). | Large |
 | M-7 | -- | Implement approval leases with scoped TTL (PRD US-004). | Medium |
@@ -1103,14 +1103,14 @@ If a runtime dependency is compromised:
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `/Users/thinkstudio/agent_pass/crates/agentpass-core/src/lib.rs` | 6 | Core library root, API version constant |
-| `/Users/thinkstudio/agent_pass/crates/agentpass-core/src/proto.rs` | 46 | JSON-RPC Request/Response types |
-| `/Users/thinkstudio/agent_pass/crates/agentpass-core/src/socket.rs` | 40 | Socket path resolution and directory setup |
-| `/Users/thinkstudio/agent_pass/crates/agentpass-core/src/peer.rs` | 91 | UDS peer credential extraction (unsafe FFI) |
-| `/Users/thinkstudio/agent_pass/crates/agentpass/src/main.rs` | 103 | CLI client |
-| `/Users/thinkstudio/agent_pass/crates/agentpassd/src/main.rs` | 200 | Daemon: listener, connection handler, request dispatch |
-| `/Users/thinkstudio/agent_pass/crates/agentpassd/src/approval.rs` | 137 | macOS LocalAuthentication and Linux polkit approval flows |
-| `/Users/thinkstudio/agent_pass/assets/linux/polkit/com.agentpass.approve.policy` | 16 | polkit policy XML |
+| `/Users/thinkstudio/agent_pass/crates/opaque-core/src/lib.rs` | 6 | Core library root, API version constant |
+| `/Users/thinkstudio/agent_pass/crates/opaque-core/src/proto.rs` | 46 | JSON-RPC Request/Response types |
+| `/Users/thinkstudio/agent_pass/crates/opaque-core/src/socket.rs` | 40 | Socket path resolution and directory setup |
+| `/Users/thinkstudio/agent_pass/crates/opaque-core/src/peer.rs` | 91 | UDS peer credential extraction (unsafe FFI) |
+| `/Users/thinkstudio/agent_pass/crates/opaque/src/main.rs` | 103 | CLI client |
+| `/Users/thinkstudio/agent_pass/crates/opaqued/src/main.rs` | 200 | Daemon: listener, connection handler, request dispatch |
+| `/Users/thinkstudio/agent_pass/crates/opaqued/src/approval.rs` | 137 | macOS LocalAuthentication and Linux polkit approval flows |
+| `/Users/thinkstudio/agent_pass/assets/linux/polkit/com.opaque.approve.policy` | 16 | polkit policy XML |
 | `/Users/thinkstudio/agent_pass/Cargo.toml` | 21 | Workspace configuration |
 | `/Users/thinkstudio/agent_pass/Cargo.lock` | 1489 | Full dependency tree |
 | `/Users/thinkstudio/agent_pass/docs/architecture.md` | 381 | System architecture |

@@ -4,20 +4,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use agentpass_core::audit::TracingAuditEmitter;
-use agentpass_core::operation::{
+use bytes::Bytes;
+use futures_util::{SinkExt, StreamExt};
+use opaque_core::audit::TracingAuditEmitter;
+use opaque_core::operation::{
     ApprovalFactor, ApprovalRequirement, ClientIdentity, ClientType, OperationDef,
     OperationRegistry, OperationRequest, OperationSafety,
 };
-use agentpass_core::peer::peer_info_from_fd;
-use agentpass_core::policy::{PolicyEngine, PolicyRule};
-use agentpass_core::proto::{Request, Response};
-use agentpass_core::socket::{
-    ensure_socket_parent_dir, socket_path_for_client, validate_path_chain,
-};
-use agentpass_core::validate::InputValidator;
-use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
+use opaque_core::peer::peer_info_from_fd;
+use opaque_core::policy::{PolicyEngine, PolicyRule};
+use opaque_core::proto::{Request, Response};
+use opaque_core::socket::{ensure_socket_parent_dir, socket_path_for_client, validate_path_chain};
+use opaque_core::validate::InputValidator;
 use serde::Deserialize;
 use tokio::net::{UnixListener, UnixStream};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
@@ -39,7 +37,7 @@ use enclave::{Enclave, NativeApprovalGate, OperationHandler};
 // Daemon configuration
 // ---------------------------------------------------------------------------
 
-/// Daemon configuration loaded from `~/.agentpass/config.toml`.
+/// Daemon configuration loaded from `~/.opaque/config.toml`.
 #[derive(Debug, Clone, Deserialize, Default)]
 struct DaemonConfig {
     /// Known human client executables. If a connecting client matches any
@@ -91,10 +89,10 @@ struct DaemonState {
 async fn main() {
     init_tracing();
 
-    // Daemon never trusts AGENTPASS_SOCK env var.
+    // Daemon never trusts OPAQUE_SOCK env var.
     let path = socket_path_for_client(false);
     if let Err(e) = run(path).await {
-        eprintln!("agentpassd: {e}");
+        eprintln!("opaqued: {e}");
         std::process::exit(1);
     }
 }
@@ -105,13 +103,13 @@ fn init_tracing() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
-/// Load daemon config from `~/.agentpass/config.toml` or `$AGENTPASS_CONFIG`.
+/// Load daemon config from `~/.opaque/config.toml` or `$OPAQUE_CONFIG`.
 fn load_config() -> DaemonConfig {
-    let path = std::env::var("AGENTPASS_CONFIG")
+    let path = std::env::var("OPAQUE_CONFIG")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            PathBuf::from(home).join(".agentpass").join("config.toml")
+            PathBuf::from(home).join(".opaque").join("config.toml")
         });
 
     match std::fs::read_to_string(&path) {
@@ -399,7 +397,7 @@ fn entry_matches(identity: &ClientIdentity, entry: &HumanClientEntry) -> bool {
 }
 
 /// Build a [`ClientIdentity`] from peer credentials obtained via the Unix socket.
-fn build_client_identity(peer: Option<&agentpass_core::peer::PeerInfo>) -> ClientIdentity {
+fn build_client_identity(peer: Option<&opaque_core::peer::PeerInfo>) -> ClientIdentity {
     match peer {
         Some(info) => {
             let exe_path = info.pid.and_then(exe_path_for_pid);
@@ -541,7 +539,7 @@ fn read_client_cwd_macos(pid: i32) -> Option<PathBuf> {
 /// - Claimed remote_url matches actual `git remote get-url origin`
 /// - Claimed branch matches actual `git rev-parse --abbrev-ref HEAD`
 fn verify_workspace_blocking(
-    claimed: &agentpass_core::operation::WorkspaceContext,
+    claimed: &opaque_core::operation::WorkspaceContext,
     client_pid: Option<i32>,
 ) -> Result<(), String> {
     // Verify client cwd is within claimed repo_root.
@@ -651,7 +649,7 @@ fn verify_workspace_blocking(
 /// Async wrapper around `verify_workspace_blocking` that offloads the
 /// blocking `Command::output()` calls to a Tokio blocking thread.
 async fn verify_workspace(
-    claimed: &agentpass_core::operation::WorkspaceContext,
+    claimed: &opaque_core::operation::WorkspaceContext,
     client_pid: Option<i32>,
 ) -> Result<(), String> {
     let claimed = claimed.clone();
@@ -668,7 +666,7 @@ async fn verify_workspace(
 ///
 /// Rejects connections from other users, which could be confused-deputy
 /// or privilege-escalation attempts in multi-user environments.
-fn verify_peer_uid(peer: &agentpass_core::peer::PeerInfo) -> bool {
+fn verify_peer_uid(peer: &opaque_core::peer::PeerInfo) -> bool {
     #[cfg(unix)]
     {
         let my_uid = unsafe { libc::getuid() };
@@ -717,7 +715,7 @@ async fn handle_conn(state: Arc<DaemonState>, stream: UnixStream) -> std::io::Re
     }
 
     let codec = LengthDelimitedCodec::builder()
-        .max_frame_length(agentpass_core::MAX_FRAME_LENGTH)
+        .max_frame_length(opaque_core::MAX_FRAME_LENGTH)
         .new_codec();
     let mut framed = Framed::new(stream, codec);
 
@@ -895,7 +893,7 @@ async fn handle_request(
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
 
-            let mut workspace: Option<agentpass_core::operation::WorkspaceContext> = req
+            let mut workspace: Option<opaque_core::operation::WorkspaceContext> = req
                 .params
                 .get("workspace")
                 .and_then(|v| serde_json::from_value(v.clone()).ok());
@@ -1098,9 +1096,9 @@ mod tests {
         let dir = std::env::temp_dir()
             .canonicalize()
             .unwrap_or_else(|_| std::env::temp_dir())
-            .join(format!("agentpass-test-{}", Uuid::new_v4()));
+            .join(format!("opaque-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let socket_path = dir.join("agentpassd.sock");
+        let socket_path = dir.join("opaqued.sock");
         let token = "test_token_hex";
         let token_path = write_daemon_token(&socket_path, token).unwrap();
         assert_eq!(token_path, dir.join(DAEMON_TOKEN_FILENAME));
@@ -1121,7 +1119,7 @@ mod tests {
     #[test]
     fn verify_peer_uid_same_uid() {
         let my_uid = unsafe { libc::getuid() };
-        let peer = agentpass_core::peer::PeerInfo {
+        let peer = opaque_core::peer::PeerInfo {
             uid: my_uid,
             gid: 20,
             pid: Some(1234),
@@ -1133,7 +1131,7 @@ mod tests {
     fn verify_peer_uid_different_uid() {
         let my_uid = unsafe { libc::getuid() };
         let other_uid = if my_uid == 0 { 1000 } else { my_uid + 1 };
-        let peer = agentpass_core::peer::PeerInfo {
+        let peer = opaque_core::peer::PeerInfo {
             uid: other_uid,
             gid: 20,
             pid: Some(1234),

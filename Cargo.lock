@@ -3,64 +3,6 @@
 version = 4
 
 [[package]]
-name = "agentpass"
-version = "0.1.0"
-dependencies = [
- "agentpass-core",
- "bytes",
- "clap",
- "futures-util",
- "serde_json",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "agentpass-core"
-version = "0.1.0"
-dependencies = [
- "glob-match",
- "jsonschema",
- "libc",
- "regex",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "agentpassd"
-version = "0.1.0"
-dependencies = [
- "agentpass-core",
- "block2",
- "bytes",
- "futures-util",
- "getrandom 0.3.4",
- "glob-match",
- "libc",
- "objc2",
- "objc2-foundation",
- "objc2-local-authentication",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "tokio",
- "tokio-util",
- "toml_edit 0.22.27",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "zbus",
- "zbus_polkit",
-]
-
-[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1126,6 +1068,64 @@ name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
+
+[[package]]
+name = "opaque"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "clap",
+ "futures-util",
+ "opaque-core",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "opaque-core"
+version = "0.1.0"
+dependencies = [
+ "glob-match",
+ "jsonschema",
+ "libc",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "opaqued"
+version = "0.1.0"
+dependencies = [
+ "block2",
+ "bytes",
+ "futures-util",
+ "getrandom 0.3.4",
+ "glob-match",
+ "libc",
+ "objc2",
+ "objc2-foundation",
+ "objc2-local-authentication",
+ "opaque-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "toml_edit 0.22.27",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "zbus",
+ "zbus_polkit",
+]
 
 [[package]]
 name = "ordered-stream"

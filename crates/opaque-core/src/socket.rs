@@ -1,15 +1,15 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-pub const DEFAULT_SOCKET_FILENAME: &str = "agentpassd.sock";
+pub const DEFAULT_SOCKET_FILENAME: &str = "opaqued.sock";
 
-/// Resolve the socket path, optionally allowing the `AGENTPASS_SOCK` env override.
+/// Resolve the socket path, optionally allowing the `OPAQUE_SOCK` env override.
 ///
 /// The daemon should call `socket_path_for_client(false)` to ignore the env
 /// var (prevents an attacker from redirecting via environment). The CLI uses
 /// `socket_path()` which delegates to `socket_path_for_client(true)`.
 pub fn socket_path_for_client(allow_env_override: bool) -> PathBuf {
-    if allow_env_override && let Ok(p) = std::env::var("AGENTPASS_SOCK") {
+    if allow_env_override && let Ok(p) = std::env::var("OPAQUE_SOCK") {
         return PathBuf::from(p);
     }
 
@@ -21,13 +21,13 @@ pub fn socket_path_for_client(allow_env_override: bool) -> PathBuf {
                 .components()
                 .any(|c| c == std::path::Component::ParentDir)
         {
-            return dir_path.join("agentpass").join(DEFAULT_SOCKET_FILENAME);
+            return dir_path.join("opaque").join(DEFAULT_SOCKET_FILENAME);
         }
     }
 
     let home = std::env::var_os("HOME").unwrap_or_else(|| OsString::from("."));
     PathBuf::from(home)
-        .join(".agentpass")
+        .join(".opaque")
         .join("run")
         .join(DEFAULT_SOCKET_FILENAME)
 }
@@ -175,23 +175,23 @@ mod tests {
     // Env var tests are combined into one function to avoid parallel test races.
     #[test]
     fn socket_path_env_overrides() {
-        // When allow_env_override is false, AGENTPASS_SOCK should be ignored.
+        // When allow_env_override is false, OPAQUE_SOCK should be ignored.
         {
-            let _guard = EnvGuard::set("AGENTPASS_SOCK", "/tmp/evil.sock");
+            let _guard = EnvGuard::set("OPAQUE_SOCK", "/tmp/evil.sock");
             let path = socket_path_for_client(false);
             assert_ne!(path, PathBuf::from("/tmp/evil.sock"));
         }
 
-        // When allow_env_override is true, AGENTPASS_SOCK should be used.
+        // When allow_env_override is true, OPAQUE_SOCK should be used.
         {
-            let _guard = EnvGuard::set("AGENTPASS_SOCK", "/tmp/test.sock");
+            let _guard = EnvGuard::set("OPAQUE_SOCK", "/tmp/test.sock");
             let path = socket_path_for_client(true);
             assert_eq!(path, PathBuf::from("/tmp/test.sock"));
         }
 
         // Relative XDG_RUNTIME_DIR should be rejected.
         {
-            let _sock_guard = EnvGuard::remove("AGENTPASS_SOCK");
+            let _sock_guard = EnvGuard::remove("OPAQUE_SOCK");
             let _xdg_guard = EnvGuard::set("XDG_RUNTIME_DIR", "relative/path");
             let path = socket_path_for_client(false);
             assert!(!path.starts_with("relative"));
@@ -199,7 +199,7 @@ mod tests {
 
         // XDG_RUNTIME_DIR with parent traversal should be rejected.
         {
-            let _sock_guard = EnvGuard::remove("AGENTPASS_SOCK");
+            let _sock_guard = EnvGuard::remove("OPAQUE_SOCK");
             let _xdg_guard = EnvGuard::set("XDG_RUNTIME_DIR", "/run/../etc");
             let path = socket_path_for_client(false);
             assert!(!path.starts_with("/run/../etc"));
@@ -280,7 +280,7 @@ mod tests {
         std::fs::create_dir(&real_dir).unwrap();
         let link_dir = dir.join("link");
         fs::symlink(&real_dir, &link_dir).unwrap();
-        let sock_path = link_dir.join("agentpassd.sock");
+        let sock_path = link_dir.join("opaqued.sock");
         let result = validate_path_chain(&sock_path);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("symlink"));
@@ -342,7 +342,7 @@ mod tests {
         let base = std::env::temp_dir()
             .canonicalize()
             .unwrap_or_else(|_| std::env::temp_dir());
-        let dir = base.join(format!("agentpass-test-{}", uuid::Uuid::new_v4()));
+        let dir = base.join(format!("opaque-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         #[cfg(unix)]
         {

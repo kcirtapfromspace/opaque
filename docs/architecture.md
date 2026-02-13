@@ -1,4 +1,4 @@
-# AgentPass Architecture
+# Opaque Architecture
 
 This document proposes an architecture for an approval-gated secrets broker that can be used alongside AI coding tools without disclosing plaintext secrets to the model.
 
@@ -46,11 +46,11 @@ Therefore, "never disclose secrets to the LLM" requires **one** of:
    - output redaction
    - explicit policy allowlists for which binaries can receive which secrets
 
-AgentPass is designed around (1) by default, and supports (2) as an opt-in compatibility mode.
+Opaque is designed around (1) by default, and supports (2) as an opt-in compatibility mode.
 
 ### 2.1 What "Hard Guarantee" Can Mean Here
 
-With careful API design, AgentPass can offer a strong guarantee that:
+With careful API design, Opaque can offer a strong guarantee that:
 
 - plaintext secrets are never returned to the client (CLI/MCP) and therefore never enter the LLM context
 - plaintext secrets never enter the agent-controlled process space (in agent-safe operation mode)
@@ -66,7 +66,7 @@ In practice, “hard guarantee” becomes:
 
 ### Components
 
-- `agentpassd` (local daemon)
+- `opaqued` (local daemon)
   - policy engine (who/what can request which secret use)
   - provider connectors (1Password, Vault, etc)
   - approval orchestration (proof-of-life, step-up auth)
@@ -77,7 +77,7 @@ In practice, “hard guarantee” becomes:
     - Kubernetes secret/manifest operations
     - AWS operations (signed proxy / SDK calls)
     - HTTP proxy operations (strict allowlist)
-- `agentpass` (CLI)
+- `opaque` (CLI)
   - user-facing configuration, setup, debugging
   - “exec mode” wrapper (optional) to run a command with environment injected
   - starts/stops the daemon
@@ -98,10 +98,10 @@ In practice, “hard guarantee” becomes:
 
 ```mermaid
 flowchart LR
-  Agent["LLM Tool (Codex / Claude Code)"] -->|requests operation| MCP["AgentPass MCP (optional)"]
+  Agent["LLM Tool (Codex / Claude Code)"] -->|requests operation| MCP["Opaque MCP (optional)"]
   User["User"] -->|approve| Factor["Approval Factor(s)"]
-  MCP --> D["agentpassd (daemon)"]
-  CLI["agentpass (CLI)"] --> D
+  MCP --> D["opaqued (daemon)"]
+  CLI["opaque (CLI)"] --> D
   Factor --> D
 
   D --> P["Provider Connectors<br/>1Password / Vault / ..."]
@@ -111,7 +111,7 @@ flowchart LR
 
 ## 4. Core Idea: "Secrets as Capabilities"
 
-AgentPass avoids returning plaintext values. Instead it grants **capabilities**:
+Opaque avoids returning plaintext values. Instead it grants **capabilities**:
 
 - A capability is scoped to:
   - a specific operation (ex: "set GitHub Actions secret")
@@ -126,7 +126,7 @@ This resembles how `ssh-agent` avoids handing out private keys: clients ask the 
 ## 5. Trust Boundaries
 
 - **Trusted**:
-  - `agentpassd` process (local daemon)
+  - `opaqued` process (local daemon)
   - the approval factor(s) and pairing keys
   - configured provider connectors and their credentials (stored in OS keychain)
 - **Untrusted / semi-trusted**:
@@ -153,7 +153,7 @@ Policy rules should be expressible as:
 Examples:
 
 - Allow the MCP server process to call `github.set_actions_secret` only for repos under `org/acme-*`.
-- Allow `agentpass exec -- npm` to receive `NPM_TOKEN` but only when egress is limited to `registry.npmjs.org`.
+- Allow `opaque exec -- npm` to receive `NPM_TOKEN` but only when egress is limited to `registry.npmjs.org`.
 
 ## 7. Approval (Proof of Life)
 
@@ -174,7 +174,7 @@ Keep it explicit and non-technical:
 
 ### Native OS Popup Approvals (v1)
 
-AgentPass v1 uses **native OS authentication prompts** (not terminal prompts) to ensure proof-of-life:
+Opaque v1 uses **native OS authentication prompts** (not terminal prompts) to ensure proof-of-life:
 
 - macOS:
   - `LocalAuthentication` prompt using `LAPolicyDeviceOwnerAuthentication`
@@ -196,7 +196,7 @@ If the daemon is running without access to an interactive user session (headless
 ```mermaid
 sequenceDiagram
   participant C as Client (CLI/MCP)
-  participant D as agentpassd
+  participant D as opaqued
   participant A as Approval Factor (FIDO2 / iOS)
 
   C->>D: RequestOperation(op, target, secret_refs)
@@ -227,7 +227,7 @@ Connectors are responsible for:
 - authentication to provider
 - reading secrets by reference
 - caching with TTL/lease semantics when supported (Vault)
-- returning secret material only inside `agentpassd` memory
+- returning secret material only inside `opaqued` memory
 
 Recommended patterns:
 
@@ -255,7 +255,7 @@ In this mode the secret never enters the agent’s process.
 
 ### 9.2 Exec mode (compatibility)
 
-`agentpass exec --profile myproj -- <command>`
+`opaque exec --profile myproj -- <command>`
 
 - broker injects env vars into a subprocess
 - optionally runs it inside a sandbox:
@@ -281,7 +281,7 @@ Goal: allow the agent to cause Kubernetes changes that require secret material (
 
 Recommended model:
 
-- AgentPass stores cluster access (kubeconfig / exec auth) and performs Kubernetes API calls itself.
+- Opaque stores cluster access (kubeconfig / exec auth) and performs Kubernetes API calls itself.
 - For secret writes, use a Kubernetes identity (service account / user) that can `create/patch/update` secrets but is not granted `get/list/watch` secrets, so the value cannot be read back via the same identity.
 
 Operations:
@@ -341,13 +341,13 @@ Store locally (SQLite) with optional export to JSON for enterprise setups.
 ### MVP 0 (days)
 
 - CLI only (no daemon):
-  - `agentpass exec` pulls secrets from 1Password/Vault and runs a command
+  - `opaque exec` pulls secrets from 1Password/Vault and runs a command
   - manual approval prompt in terminal
   - never prints secret values
 
 ### MVP 1 (1-2 weeks) - v1 Targets
 
-- `agentpassd` daemon + policy + audit log
+- `opaqued` daemon + policy + audit log
 - approval factor: FIDO2 security key (local)
 - GitHub Actions secret sync module
 - GitLab CI variable sync module
