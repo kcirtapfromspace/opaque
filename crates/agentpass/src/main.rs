@@ -29,12 +29,6 @@ enum Cmd {
     Ping,
     /// Read daemon version.
     Version,
-    /// Request a native OS approval prompt (debug).
-    Approve {
-        /// Text shown in the OS authentication prompt.
-        #[arg(long)]
-        reason: String,
-    },
     /// Debug client identity (placeholder).
     Whoami,
 }
@@ -48,12 +42,6 @@ async fn main() {
     let (method, params) = match cmd {
         Cmd::Ping => ("ping", serde_json::Value::Null),
         Cmd::Version => ("version", serde_json::Value::Null),
-        Cmd::Approve { reason } => (
-            "approval.prompt",
-            serde_json::json!({
-                "reason": reason,
-            }),
-        ),
         Cmd::Whoami => ("whoami", serde_json::Value::Null),
     };
 

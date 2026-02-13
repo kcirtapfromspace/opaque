@@ -556,9 +556,44 @@ fn verify_workspace(
 // Connection handler
 // ---------------------------------------------------------------------------
 
+/// Verify that the peer UID matches the daemon's own UID.
+///
+/// Rejects connections from other users, which could be confused-deputy
+/// or privilege-escalation attempts in multi-user environments.
+fn verify_peer_uid(peer: &agentpass_core::peer::PeerInfo) -> bool {
+    #[cfg(unix)]
+    {
+        let my_uid = unsafe { libc::getuid() };
+        peer.uid == my_uid
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = peer;
+        true
+    }
+}
+
 async fn handle_conn(state: Arc<DaemonState>, stream: UnixStream) -> std::io::Result<()> {
     let fd = stream.as_raw_fd();
     let peer = peer_info_from_fd(fd).ok();
+
+    // Verify peer UID matches daemon UID. Reject if unavailable or mismatched.
+    match &peer {
+        None => {
+            warn!("peer credentials unavailable, rejecting connection");
+            return Ok(());
+        }
+        Some(info) => {
+            if !verify_peer_uid(info) {
+                warn!(
+                    "peer UID {} does not match daemon UID, rejecting connection",
+                    info.uid
+                );
+                return Ok(());
+            }
+        }
+    }
+
     let identity = build_client_identity(peer.as_ref());
 
     // Derive client type once per connection — never from request params.
@@ -594,7 +629,8 @@ async fn handle_conn(state: Arc<DaemonState>, stream: UnixStream) -> std::io::Re
         let frame = match frame {
             Ok(b) => b,
             Err(e) => {
-                let resp = Response::err(None, "bad_frame", e.to_string());
+                warn!("bad frame from client: {e}");
+                let resp = Response::err(None, "bad_frame", "malformed frame");
                 let bytes = serde_json::to_vec(&resp)
                     .unwrap_or_else(|_| b"{\"error\":\"encode\"}".to_vec());
                 let _ = framed.send(Bytes::from(bytes)).await;
@@ -605,7 +641,8 @@ async fn handle_conn(state: Arc<DaemonState>, stream: UnixStream) -> std::io::Re
         let req: Request = match serde_json::from_slice(&frame) {
             Ok(r) => r,
             Err(e) => {
-                let resp = Response::err(None, "bad_json", e.to_string());
+                warn!("bad JSON from client: {e}");
+                let resp = Response::err(None, "bad_json", "invalid JSON request");
                 let bytes = serde_json::to_vec(&resp)
                     .unwrap_or_else(|_| b"{\"error\":\"encode\"}".to_vec());
                 let _ = framed.send(Bytes::from(bytes)).await;
@@ -666,16 +703,24 @@ async fn handle_request(
     match req.method.as_str() {
         "ping" => Response::ok(req.id, serde_json::json!({ "ok": true })),
         "version" => Response::ok(req.id, serde_json::json!({ "version": state.version })),
-        "whoami" => Response::ok(
-            req.id,
-            serde_json::json!({
-                "uid": identity.uid,
-                "gid": identity.gid,
-                "pid": identity.pid,
-                "exe_path": identity.exe_path.as_ref().map(|p| p.display().to_string()),
-                "client_type": client_type,
-            }),
-        ),
+        "whoami" => {
+            // Agent clients get minimal info to prevent reconnaissance.
+            // Human clients get the full dump.
+            let payload = match client_type {
+                ClientType::Human => serde_json::json!({
+                    "uid": identity.uid,
+                    "gid": identity.gid,
+                    "pid": identity.pid,
+                    "exe_path": identity.exe_path.as_ref().map(|p| p.display().to_string()),
+                    "client_type": client_type,
+                }),
+                ClientType::Agent => serde_json::json!({
+                    "uid": identity.uid,
+                    "client_type": client_type,
+                }),
+            };
+            Response::ok(req.id, payload)
+        }
         "execute" => {
             let operation = req
                 .params
@@ -722,7 +767,7 @@ async fn handle_request(
                 return Response::err(
                     Some(req.id),
                     "workspace_verification_failed",
-                    format!("workspace verification failed: {e}"),
+                    "workspace verification failed",
                 );
             }
 
@@ -919,6 +964,29 @@ mod tests {
 
         // Cleanup.
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_peer_uid_same_uid() {
+        let my_uid = unsafe { libc::getuid() };
+        let peer = agentpass_core::peer::PeerInfo {
+            uid: my_uid,
+            gid: 20,
+            pid: Some(1234),
+        };
+        assert!(verify_peer_uid(&peer));
+    }
+
+    #[test]
+    fn verify_peer_uid_different_uid() {
+        let my_uid = unsafe { libc::getuid() };
+        let other_uid = if my_uid == 0 { 1000 } else { my_uid + 1 };
+        let peer = agentpass_core::peer::PeerInfo {
+            uid: other_uid,
+            gid: 20,
+            pid: Some(1234),
+        };
+        assert!(!verify_peer_uid(&peer));
     }
 
     #[test]
