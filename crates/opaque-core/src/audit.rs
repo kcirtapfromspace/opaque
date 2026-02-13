@@ -63,6 +63,15 @@ pub enum AuditEventKind {
 
     /// An approval lease was reused (FirstUse within TTL).
     LeaseHit,
+
+    /// A sandbox environment was created for command execution.
+    SandboxCreated,
+
+    /// A sandboxed command execution completed.
+    SandboxCompleted,
+
+    /// A secret reference was resolved (value never logged).
+    SecretResolved,
 }
 
 impl fmt::Display for AuditEventKind {
@@ -81,6 +90,9 @@ impl fmt::Display for AuditEventKind {
             Self::ProviderFetchFinished => "provider.fetch.finished",
             Self::RateLimited => "rate.limited",
             Self::LeaseHit => "lease.hit",
+            Self::SandboxCreated => "sandbox.created",
+            Self::SandboxCompleted => "sandbox.completed",
+            Self::SecretResolved => "secret.resolved",
         };
         write!(f, "{s}")
     }
@@ -104,6 +116,9 @@ impl std::str::FromStr for AuditEventKind {
             "provider.fetch.finished" => Ok(Self::ProviderFetchFinished),
             "rate.limited" => Ok(Self::RateLimited),
             "lease.hit" => Ok(Self::LeaseHit),
+            "sandbox.created" => Ok(Self::SandboxCreated),
+            "sandbox.completed" => Ok(Self::SandboxCompleted),
+            "secret.resolved" => Ok(Self::SecretResolved),
             _ => Err(format!("unknown audit event kind: {s}")),
         }
     }
@@ -1157,6 +1172,9 @@ mod tests {
             ),
             (AuditEventKind::RateLimited, "rate.limited"),
             (AuditEventKind::LeaseHit, "lease.hit"),
+            (AuditEventKind::SandboxCreated, "sandbox.created"),
+            (AuditEventKind::SandboxCompleted, "sandbox.completed"),
+            (AuditEventKind::SecretResolved, "secret.resolved"),
         ];
         for (kind, expected) in kinds {
             assert_eq!(format!("{kind}"), expected);
@@ -1438,6 +1456,9 @@ mod tests {
             AuditEventKind::ProviderFetchFinished,
             AuditEventKind::RateLimited,
             AuditEventKind::LeaseHit,
+            AuditEventKind::SandboxCreated,
+            AuditEventKind::SandboxCompleted,
+            AuditEventKind::SecretResolved,
         ];
         for kind in kinds {
             let s = format!("{kind}");

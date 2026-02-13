@@ -28,6 +28,7 @@ const DAEMON_TOKEN_FILENAME: &str = "daemon.token";
 
 mod approval;
 mod enclave;
+mod sandbox;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -248,6 +249,18 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         })
         .expect("failed to register test.noop");
 
+    registry
+        .register(OperationDef {
+            name: "sandbox.exec".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Execute a command in a sandboxed environment".into(),
+            params_schema: None,
+            allowed_target_keys: vec!["profile".into(), "command".into()],
+        })
+        .expect("failed to register sandbox.exec");
+
     let policy = PolicyEngine::with_rules(config.rules.clone());
     info!("policy engine loaded with {} rules", policy.rule_count());
 
@@ -267,10 +280,13 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
     );
     let audit = Arc::new(MultiAuditSink::new(vec![tracing_sink, sqlite_sink]));
 
+    let sandbox_executor = sandbox::SandboxExecutor::new(audit.clone());
+
     let enclave = Enclave::builder()
         .registry(registry)
         .policy(policy)
         .handler("test.noop", Box::new(NoopHandler))
+        .handler("sandbox.exec", Box::new(sandbox_executor))
         .approval_gate(Box::new(NativeApprovalGate))
         .audit(audit)
         .build();
@@ -1131,6 +1147,64 @@ async fn handle_request(
                 expires_at: None,
                 params: op_params,
                 workspace,
+            };
+
+            state
+                .enclave
+                .execute(op_req)
+                .await
+                .into_proto_response(req.id)
+        }
+        "exec" => {
+            // The exec method is a convenience wrapper that builds an "execute"
+            // request for "sandbox.exec" from exec-specific params.
+            let profile = req
+                .params
+                .get("profile")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+
+            if profile.is_empty() {
+                return Response::err(Some(req.id), "bad_request", "missing 'profile' field");
+            }
+
+            let command: Vec<String> = req
+                .params
+                .get("command")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+
+            if command.is_empty() {
+                return Response::err(Some(req.id), "bad_request", "missing 'command' field");
+            }
+
+            // Validate profile name (alphanumeric + hyphens + underscores).
+            if !profile
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                return Response::err(
+                    Some(req.id),
+                    "bad_request",
+                    "profile name must be alphanumeric (with hyphens/underscores)",
+                );
+            }
+
+            let op_req = OperationRequest {
+                request_id: Uuid::new_v4(),
+                client_identity: identity.clone(),
+                client_type,
+                operation: "sandbox.exec".into(),
+                target: HashMap::from([("profile".into(), profile.clone())]),
+                secret_ref_names: vec![],
+                created_at: SystemTime::now(),
+                expires_at: None,
+                params: serde_json::json!({
+                    "profile": profile,
+                    "command": command,
+                }),
+                workspace: None,
             };
 
             state

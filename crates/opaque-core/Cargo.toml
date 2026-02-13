@@ -15,5 +15,6 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+toml_edit = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
