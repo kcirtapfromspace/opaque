@@ -131,6 +131,23 @@ pub struct TargetSummary {
     pub fields: std::collections::HashMap<String, String>,
 }
 
+impl TargetSummary {
+    /// Create a sanitized target summary by scrubbing URLs and redacting
+    /// secret patterns in all values.
+    pub fn sanitized(target: &std::collections::HashMap<String, String>) -> Self {
+        let patterns = crate::sanitize::SecretPatterns::compile();
+        let fields = target
+            .iter()
+            .map(|(k, v)| {
+                let scrubbed = crate::sanitize::scrub_urls(v);
+                let redacted = patterns.redact(&scrubbed);
+                (k.clone(), redacted)
+            })
+            .collect();
+        Self { fields }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Workspace summary (safe for audit)
 // ---------------------------------------------------------------------------
@@ -144,6 +161,21 @@ pub struct WorkspaceSummary {
     pub branch: Option<String>,
     /// Whether the working tree is dirty.
     pub dirty: bool,
+}
+
+impl WorkspaceSummary {
+    /// Create a sanitized workspace summary, stripping userinfo from the
+    /// remote URL.
+    pub fn sanitized(ws: &crate::operation::WorkspaceContext) -> Self {
+        Self {
+            remote_url: ws
+                .remote_url
+                .as_deref()
+                .map(crate::validate::InputValidator::sanitize_url),
+            branch: ws.branch.clone(),
+            dirty: ws.dirty,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -866,5 +898,51 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             2
         );
+    }
+
+    // -- Sanitized constructor tests --
+
+    #[test]
+    fn target_summary_redacts_jwt_in_value() {
+        let mut target = std::collections::HashMap::new();
+        target.insert("repo".into(), "org/myrepo".into());
+        target.insert(
+            "header".into(),
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U".into(),
+        );
+        let summary = TargetSummary::sanitized(&target);
+        assert_eq!(summary.fields["repo"], "org/myrepo");
+        assert!(!summary.fields["header"].contains("eyJ"));
+        assert!(summary.fields["header"].contains("[REDACTED:"));
+    }
+
+    #[test]
+    fn target_summary_redacts_credential_url() {
+        let mut target = std::collections::HashMap::new();
+        target.insert(
+            "endpoint".into(),
+            "https://admin:secret@db.example.com/mydb".into(),
+        );
+        let summary = TargetSummary::sanitized(&target);
+        assert!(!summary.fields["endpoint"].contains("admin:secret"));
+        assert!(summary.fields["endpoint"].contains("[URL:REDACTED]"));
+    }
+
+    #[test]
+    fn workspace_summary_strips_userinfo() {
+        use crate::operation::WorkspaceContext;
+        use std::path::PathBuf;
+        let ws = WorkspaceContext {
+            repo_root: PathBuf::from("/tmp/repo"),
+            remote_url: Some("https://user:pass@github.com/org/repo.git".into()),
+            branch: Some("main".into()),
+            head_sha: None,
+            dirty: false,
+        };
+        let summary = WorkspaceSummary::sanitized(&ws);
+        let url = summary.remote_url.unwrap();
+        assert!(!url.contains("user:pass"));
+        assert_eq!(url, "https://github.com/org/repo.git");
+        assert_eq!(summary.branch.as_deref(), Some("main"));
     }
 }

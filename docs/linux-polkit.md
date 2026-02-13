@@ -1,22 +1,69 @@
 # Linux Native Approvals (polkit)
 
-AgentPass uses PolicyKit (polkit) on Linux to trigger a native OS authentication prompt for approvals.
+AgentPass uses a **two-step approval flow** on Linux:
 
-## What This Enables
+1. **Intent dialog** (zenity/kdialog) — displays the operation details so the user knows what they are approving
+2. **Polkit authentication** — system password/biometric prompt via PolicyKit
 
-- When `agentpassd` requests approval, polkit can show a system authentication dialog (password and/or fingerprint depending on the desktop setup).
-- The daemon receives only an allow/deny decision, not credentials.
+This two-step design exists because most polkit auth agents do not display the operation `details` HashMap, which would otherwise result in blind approvals where the user authenticates without seeing what operation they are authorizing.
 
-## Installation (system)
+## Requirements
 
-Install the policy file:
+- A running graphical session (`$DISPLAY` or `$WAYLAND_DISPLAY` must be set)
+- `zenity` (GNOME/GTK desktops) or `kdialog` (KDE/Qt desktops) installed and in `$PATH`
+- A polkit authentication agent running in the desktop session
+- The AgentPass polkit policy file installed (see below)
 
-- copy `assets/linux/polkit/com.agentpass.approve.policy` to `/usr/share/polkit-1/actions/com.agentpass.approve.policy`
+If any requirement is missing, the daemon will fail closed (refuse to approve operations, not skip approval).
 
-Then ensure a polkit authentication agent is running in your desktop session (GNOME, KDE, etc typically include one).
+## Policy Installation
+
+Copy the policy file to the system polkit actions directory (requires root):
+
+```bash
+sudo cp assets/linux/polkit/com.agentpass.approve.policy \
+  /usr/share/polkit-1/actions/com.agentpass.approve.policy
+```
+
+## Policy Details
+
+The policy uses `auth_self` for active sessions:
+
+```xml
+<defaults>
+  <allow_any>no</allow_any>
+  <allow_inactive>no</allow_inactive>
+  <allow_active>auth_self</allow_active>
+</defaults>
+```
+
+- `allow_any=no` — Denies requests from non-local sessions
+- `allow_inactive=no` — Denies requests from inactive sessions (SSH, screen locked on some setups)
+- `allow_active=auth_self` — Requires the user to authenticate with their own password
+
+## Supported Desktops
+
+See `docs/deployment.md` for the full tiered support matrix. Summary:
+
+- **Tier 1 (full support):** GNOME 42+, KDE Plasma 5.20+
+- **Tier 2 (supported, minor setup):** MATE, XFCE, Cinnamon, Budgie, LXQt
+- **Tier 3 (manual setup):** Sway, Hyprland, i3, dwm (user must manually start a polkit agent)
+- **Tier 4 (unsupported, fail closed):** Headless, WSL, SSH, containers
+
+## Credential Caching
+
+Some polkit auth agents (notably GNOME's) cache credentials for a short period (typically 5 minutes). Within that window, the polkit step may auto-succeed without re-entering a password. This is acceptable because the intent dialog (step 1) still appears for every approval, so the user always sees and confirms what they are approving. The credential cache is a polkit agent feature outside AgentPass's control.
+
+## Daemon Lifecycle
+
+Use a systemd user service. See `docs/deployment.md` for the recommended unit file with hardening options.
+
+```bash
+systemctl --user enable --now agentpassd.service
+```
 
 ## Notes
 
-- The policy defaults to `auth_self` for active sessions (prompt each time).
-- If you want “approve for N minutes”, that should be implemented as an AgentPass lease in the daemon, not by weakening polkit policy.
-
+- Approval leases ("approve for N minutes") are implemented as daemon-side TTL grants, not by weakening the polkit policy to `auth_self_keep`.
+- If you need to test without a graphical session, you cannot — this is by design. The daemon requires a display server and a polkit agent.
+- Tiling WM users (Sway, i3, etc.) must ensure a polkit agent is running. Common choices: `polkit-gnome-authentication-agent-1` or `lxpolkit`.

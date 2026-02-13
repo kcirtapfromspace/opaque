@@ -89,16 +89,11 @@ pub fn verify_socket_safety(path: &Path) -> std::io::Result<()> {
     }
 
     let mode = meta.mode() & 0o777;
-    if mode != 0o600 && mode != 0o755 && mode != 0o700 {
-        // Allow common socket modes: 0600 is preferred, also accept 0755/0700
-        // since some systems set different modes on socket files.
-        // Be strict: only accept 0600.
-        if mode != 0o600 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!("socket has mode {:o}, expected 0600", mode),
-            ));
-        }
+    if mode != 0o600 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("socket has mode {:o}, expected 0600", mode),
+        ));
     }
 
     // Check parent directory.
@@ -236,6 +231,44 @@ mod tests {
         let result = verify_socket_safety(&sock);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("mode"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_socket_safety_rejects_0755() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir();
+        let sock = dir.join("test755.sock");
+        std::fs::write(&sock, b"").unwrap();
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let result = verify_socket_safety(&sock);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("mode"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_socket_safety_rejects_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir();
+        let sock = dir.join("test700.sock");
+        std::fs::write(&sock, b"").unwrap();
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let result = verify_socket_safety(&sock);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("mode"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_socket_safety_accepts_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir();
+        let sock = dir.join("test600.sock");
+        std::fs::write(&sock, b"").unwrap();
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let result = verify_socket_safety(&sock);
+        assert!(result.is_ok());
     }
 
     #[cfg(unix)]
