@@ -72,7 +72,10 @@ Prefer:
 
 Then call:
 
-- `github.set_actions_secret(repo, secret_name, value_ref)`
+- `github.set_actions_secret(repo, secret_name, value_ref)` (repo or env Actions secrets)
+- `github.set_codespaces_secret(secret_name, value_ref, ...)`
+- `github.set_dependabot_secret(repo, secret_name, value_ref)`
+- `github.set_org_secret(org, secret_name, value_ref, ...)`
 
 ### "Run tests that need secrets"
 
@@ -83,4 +86,3 @@ Use:
 - `opaque exec --profile <name> -- <command...>`
 
 Opaque can inject secrets into the sandboxed process environment without returning them in command output.
-

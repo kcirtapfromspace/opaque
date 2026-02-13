@@ -91,7 +91,9 @@ In another terminal:
 
 `sandbox.exec` intentionally does **not** return stdout/stderr contents (only lengths + exit code) to avoid leaking secrets via command output.
 
-### `github.set_actions_secret`
+### GitHub Secrets
+
+The CLI exposes multiple GitHub secret scopes via `opaque github ...`.
 
 ```bash
 ./target/release/opaque github set-secret \
@@ -100,7 +102,52 @@ In another terminal:
   --value-ref keychain:opaque/my-token
 ```
 
-This operation is `SAFE`: it never returns the secret value or ciphertext.
+Environment-level Actions secret:
+
+```bash
+./target/release/opaque github set-secret \
+  --repo owner/repo \
+  --environment production \
+  --secret-name MY_TOKEN \
+  --value-ref keychain:opaque/my-token
+```
+
+Codespaces (user-level):
+
+```bash
+./target/release/opaque github set-codespaces-secret \
+  --secret-name DOTFILES_TOKEN \
+  --value-ref keychain:opaque/dotfiles-token
+```
+
+Codespaces (repo-level):
+
+```bash
+./target/release/opaque github set-codespaces-secret \
+  --repo owner/repo \
+  --secret-name DOTFILES_TOKEN \
+  --value-ref keychain:opaque/dotfiles-token
+```
+
+Dependabot (repo-level):
+
+```bash
+./target/release/opaque github set-dependabot-secret \
+  --repo owner/repo \
+  --secret-name NPM_TOKEN \
+  --value-ref keychain:opaque/npm-token
+```
+
+Org-level Actions secret:
+
+```bash
+./target/release/opaque github set-org-secret \
+  --org myorg \
+  --secret-name ORG_DEPLOY_KEY \
+  --value-ref keychain:opaque/org-deploy-key
+```
+
+These operations are `SAFE`: they never return the secret value or ciphertext.
 
 ## Audit
 
@@ -115,9 +162,9 @@ The daemon writes a local SQLite audit DB at `~/.opaque/audit.db`.
 - `OPAQUE_CONFIG`: override daemon/CLI config path (default: `~/.opaque/config.toml`)
 - `OPAQUE_SOCK`: override socket path for the CLI only (daemon ignores it)
 - `OPAQUE_GITHUB_TOKEN_REF`: override default GitHub PAT secret ref used by `github.set_actions_secret`
+- `OPAQUE_GITHUB_API_URL`: override GitHub API base URL (GitHub Enterprise Server or local testing)
 
 ## Next
 
 - Demo recordings: `docs/demos.md`
 - Deployment & OS approval backends: `docs/deployment.md`
-

@@ -10,11 +10,13 @@ if [[ ! -x "$BIN_DIR/opaque" || ! -x "$BIN_DIR/opaqued" ]]; then
 fi
 
 export PATH="$BIN_DIR:$PATH"
+export TERM="${TERM:-xterm-256color}"
 
 run() {
   echo "\$ $*"
   "$@"
   echo
+  sleep 0.6
 }
 
 DEMO_DIR="$(mktemp -d /private/tmp/opaque-demo-quickstart.XXXXXX)"
@@ -56,6 +58,7 @@ run opaque policy check
 echo "\$ opaqued  # (started in background)"
 RUST_LOG=info opaqued >"$DEMO_DIR/logs/opaqued.log" 2>&1 &
 OPAQUED_PID="$!"
+sleep 0.4
 
 SOCK="$XDG_RUNTIME_DIR/opaque/opaqued.sock"
 TOKEN="$XDG_RUNTIME_DIR/opaque/daemon.token"
@@ -65,10 +68,6 @@ for _ in $(seq 1 200); do
   fi
   sleep 0.05
 done
-
-echo "\$ tail -n 8 opaqued.log"
-tail -n 8 "$DEMO_DIR/logs/opaqued.log" || true
-echo
 
 run opaque ping
 run opaque version

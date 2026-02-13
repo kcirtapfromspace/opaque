@@ -10,11 +10,13 @@ if [[ ! -x "$BIN_DIR/opaque" || ! -x "$BIN_DIR/opaqued" ]]; then
 fi
 
 export PATH="$BIN_DIR:$PATH"
+export TERM="${TERM:-xterm-256color}"
 
 run() {
   echo "\$ $*"
   "$@"
   echo
+  sleep 0.6
 }
 
 DEMO_DIR="$(mktemp -d /private/tmp/opaque-demo-sandbox-exec.XXXXXX)"
@@ -76,6 +78,7 @@ TOML
 echo "\$ opaqued  # (started in background)"
 RUST_LOG=info opaqued >"$DEMO_DIR/logs/opaqued.log" 2>&1 &
 OPAQUED_PID="$!"
+sleep 0.4
 
 SOCK="$XDG_RUNTIME_DIR/opaque/opaqued.sock"
 TOKEN="$XDG_RUNTIME_DIR/opaque/daemon.token"
@@ -89,3 +92,4 @@ done
 echo "\$ opaque exec --profile demo -- sh -lc 'echo \"hello from sandbox\"; echo \"stderr line\" 1>&2'"
 opaque exec --profile demo -- sh -lc 'echo "hello from sandbox"; echo "stderr line" 1>&2'
 echo
+sleep 0.6

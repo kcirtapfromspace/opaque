@@ -115,3 +115,5 @@ factors = ["local_bio"]
 ```
 
 For more examples, see `examples/policy.toml`.
+
+Tip: to allow all GitHub secret-setting operations, use an `operation_pattern` like `github.set_*_secret` (or `github.*`) and constrain targets (`repo`, `org`) as needed.
