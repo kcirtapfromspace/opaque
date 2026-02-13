@@ -12,6 +12,7 @@ use agentpass_core::proto::{Request, Response};
 use agentpass_core::socket::{
     ensure_socket_parent_dir, socket_path_for_client, validate_path_chain,
 };
+use agentpass_core::validate::InputValidator;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -68,6 +69,8 @@ struct DaemonState {
     version: &'static str,
     /// Hex-encoded 32-byte CSPRNG token for handshake authentication.
     daemon_token: String,
+    /// Semaphore to limit maximum concurrent connections.
+    connection_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +199,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         config,
         version: env!("CARGO_PKG_VERSION"),
         daemon_token,
+        connection_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
     });
 
     let shutdown = tokio::signal::ctrl_c();
@@ -215,8 +219,18 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             }
             res = listener.accept() => {
                 let (stream, _addr) = res?;
+                let permit = match state.connection_semaphore.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        warn!("max connections reached (64), rejecting");
+                        drop(stream);
+                        continue;
+                    }
+                };
                 let state = state.clone();
                 tokio::spawn(async move {
+                    // Hold the permit for the connection lifetime.
+                    let _permit = permit;
                     if let Err(e) = handle_conn(state, stream).await {
                         warn!("connection error: {e}");
                     }
@@ -399,6 +413,22 @@ fn exe_path_macos(pid: i32) -> Option<PathBuf> {
 // Workspace verification
 // ---------------------------------------------------------------------------
 
+/// Create a `Command` with a minimal, hardened environment.
+///
+/// Clears all inherited env vars and sets only a restricted PATH to prevent
+/// binary injection. Also prevents git from reading system/user config or
+/// prompting for credentials.
+fn safe_command(bin: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(bin);
+    cmd.env_clear();
+    cmd.env("PATH", "/usr/bin:/usr/local/bin:/bin");
+    cmd.env("LC_ALL", "C");
+    cmd.env("GIT_CONFIG_NOSYSTEM", "1");
+    cmd.env("HOME", "/nonexistent"); // Prevent reading ~/.gitconfig
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    cmd
+}
+
 /// Read the current working directory of a process by PID.
 fn read_client_cwd(pid: i32) -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
@@ -421,7 +451,7 @@ fn read_client_cwd(pid: i32) -> Option<PathBuf> {
 #[cfg(target_os = "macos")]
 fn read_client_cwd_macos(pid: i32) -> Option<PathBuf> {
     // Use lsof to get the cwd of a process on macOS.
-    let output = std::process::Command::new("lsof")
+    let output = safe_command("lsof")
         .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
         .output()
         .ok()?;
@@ -438,20 +468,20 @@ fn read_client_cwd_macos(pid: i32) -> Option<PathBuf> {
     None
 }
 
-/// Verify that the claimed workspace context is consistent with the client's
-/// actual process state.
+/// Blocking workspace verification logic.
+///
+/// Verifies that the claimed workspace context is consistent with the client's
+/// actual process state. Runs external `git` commands.
 ///
 /// Checks:
 /// - Client's cwd is within the claimed repo_root
 /// - `git rev-parse --show-toplevel` in repo_root matches
 /// - Claimed remote_url matches actual `git remote get-url origin`
 /// - Claimed branch matches actual `git rev-parse --abbrev-ref HEAD`
-fn verify_workspace(
+fn verify_workspace_blocking(
     claimed: &agentpass_core::operation::WorkspaceContext,
     client_pid: Option<i32>,
 ) -> Result<(), String> {
-    use std::process::Command;
-
     // Verify client cwd is within claimed repo_root.
     if let Some(pid) = client_pid
         && let Some(cwd) = read_client_cwd(pid)
@@ -472,7 +502,7 @@ fn verify_workspace(
     // If we can't read the cwd, we don't fail — best-effort.
 
     // Verify git toplevel matches.
-    let toplevel = Command::new("git")
+    let toplevel = safe_command("git")
         .args([
             "-C",
             &claimed.repo_root.to_string_lossy(),
@@ -505,7 +535,7 @@ fn verify_workspace(
 
     // Verify remote URL if claimed.
     if let Some(ref claimed_url) = claimed.remote_url {
-        let remote = Command::new("git")
+        let remote = safe_command("git")
             .args([
                 "-C",
                 &claimed.repo_root.to_string_lossy(),
@@ -528,7 +558,7 @@ fn verify_workspace(
 
     // Verify branch if claimed.
     if let Some(ref claimed_branch) = claimed.branch {
-        let branch = Command::new("git")
+        let branch = safe_command("git")
             .args([
                 "-C",
                 &claimed.repo_root.to_string_lossy(),
@@ -550,6 +580,18 @@ fn verify_workspace(
     }
 
     Ok(())
+}
+
+/// Async wrapper around `verify_workspace_blocking` that offloads the
+/// blocking `Command::output()` calls to a Tokio blocking thread.
+async fn verify_workspace(
+    claimed: &agentpass_core::operation::WorkspaceContext,
+    client_pid: Option<i32>,
+) -> Result<(), String> {
+    let claimed = claimed.clone();
+    tokio::task::spawn_blocking(move || verify_workspace_blocking(&claimed, client_pid))
+        .await
+        .map_err(|e| format!("workspace verification task failed: {e}"))?
 }
 
 // ---------------------------------------------------------------------------
@@ -625,10 +667,31 @@ async fn handle_conn(state: Arc<DaemonState>, stream: UnixStream) -> std::io::Re
         return Ok(());
     }
 
-    while let Some(frame) = framed.next().await {
-        let frame = match frame {
-            Ok(b) => b,
-            Err(e) => {
+    loop {
+        // Idle timeout: disconnect clients that send no frames for 30 seconds.
+        let next_frame =
+            tokio::time::timeout(std::time::Duration::from_secs(30), framed.next()).await;
+
+        match next_frame {
+            Ok(Some(Ok(frame))) => {
+                let req: Request = match serde_json::from_slice(&frame) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!("bad JSON from client: {e}");
+                        let resp = Response::err(None, "bad_json", "invalid JSON request");
+                        let bytes = serde_json::to_vec(&resp)
+                            .unwrap_or_else(|_| b"{\"error\":\"encode\"}".to_vec());
+                        let _ = framed.send(Bytes::from(bytes)).await;
+                        continue;
+                    }
+                };
+
+                // Never log params (may contain secrets due to client bugs).
+                let resp = handle_request(&state, req, &identity, client_type).await;
+                let out = serde_json::to_vec(&resp).map_err(std::io::Error::other)?;
+                framed.send(Bytes::from(out)).await?;
+            }
+            Ok(Some(Err(e))) => {
                 warn!("bad frame from client: {e}");
                 let resp = Response::err(None, "bad_frame", "malformed frame");
                 let bytes = serde_json::to_vec(&resp)
@@ -636,24 +699,12 @@ async fn handle_conn(state: Arc<DaemonState>, stream: UnixStream) -> std::io::Re
                 let _ = framed.send(Bytes::from(bytes)).await;
                 return Err(e);
             }
-        };
-
-        let req: Request = match serde_json::from_slice(&frame) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("bad JSON from client: {e}");
-                let resp = Response::err(None, "bad_json", "invalid JSON request");
-                let bytes = serde_json::to_vec(&resp)
-                    .unwrap_or_else(|_| b"{\"error\":\"encode\"}".to_vec());
-                let _ = framed.send(Bytes::from(bytes)).await;
-                continue;
+            Ok(None) => break, // Client disconnected
+            Err(_) => {
+                info!("idle timeout, closing connection");
+                break;
             }
-        };
-
-        // Never log params (may contain secrets due to client bugs).
-        let resp = handle_request(&state, req, &identity, client_type).await;
-        let out = serde_json::to_vec(&resp).map_err(std::io::Error::other)?;
-        framed.send(Bytes::from(out)).await?;
+        }
     }
 
     Ok(())
@@ -745,6 +796,30 @@ async fn handle_request(
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
                 .unwrap_or_default();
 
+            // --- Input validation (P0): sanitize client-controlled strings ---
+            let target = match InputValidator::validate_target(&target) {
+                Ok(t) => t,
+                Err(e) => {
+                    return Response::err(
+                        Some(req.id),
+                        "bad_request",
+                        format!("invalid target: {e}"),
+                    );
+                }
+            };
+
+            let secret_ref_names =
+                match InputValidator::validate_secret_ref_names(&secret_ref_names) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        return Response::err(
+                            Some(req.id),
+                            "bad_request",
+                            format!("invalid secret_ref_names: {e}"),
+                        );
+                    }
+                };
+
             // Client type is derived from verified identity — NEVER from params.
             // Any `client_type` field in params is silently ignored.
 
@@ -754,14 +829,22 @@ async fn handle_request(
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
 
-            let workspace: Option<agentpass_core::operation::WorkspaceContext> = req
+            let mut workspace: Option<agentpass_core::operation::WorkspaceContext> = req
                 .params
                 .get("workspace")
                 .and_then(|v| serde_json::from_value(v.clone()).ok());
 
+            // Sanitize workspace remote_url to strip embedded credentials.
+            if let Some(ref mut ws) = workspace
+                && let Some(ref url) = ws.remote_url
+            {
+                ws.remote_url = Some(InputValidator::sanitize_url(url));
+            }
+
             // Verify claimed workspace against actual process state.
+            // verify_workspace is async (offloads blocking git commands to spawn_blocking).
             if let Some(ref ws) = workspace
-                && let Err(e) = verify_workspace(ws, identity.pid)
+                && let Err(e) = verify_workspace(ws, identity.pid).await
             {
                 warn!("workspace verification failed: {e}");
                 return Response::err(
@@ -994,6 +1077,58 @@ mod tests {
         assert!(constant_time_eq(b"hello", b"hello"));
         assert!(!constant_time_eq(b"hello", b"world"));
         assert!(!constant_time_eq(b"hi", b"hello"));
+    }
+
+    #[test]
+    fn safe_command_has_minimal_env() {
+        let cmd = safe_command("echo");
+        let envs: HashMap<String, String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        assert_eq!(
+            envs.get("PATH").map(|s| s.as_str()),
+            Some("/usr/bin:/usr/local/bin:/bin")
+        );
+        assert_eq!(envs.get("LC_ALL").map(|s| s.as_str()), Some("C"));
+        assert_eq!(
+            envs.get("GIT_TERMINAL_PROMPT").map(|s| s.as_str()),
+            Some("0")
+        );
+        assert_eq!(
+            envs.get("GIT_CONFIG_NOSYSTEM").map(|s| s.as_str()),
+            Some("1")
+        );
+        assert_eq!(envs.get("HOME").map(|s| s.as_str()), Some("/nonexistent"));
+        // Should not contain common env vars that would be inherited.
+        assert!(!envs.contains_key("USER"));
+        assert!(!envs.contains_key("SHELL"));
+    }
+
+    #[test]
+    fn safe_command_blocks_git_config() {
+        let cmd = safe_command("git");
+        let envs: HashMap<String, String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        // GIT_CONFIG_NOSYSTEM prevents reading /etc/gitconfig.
+        assert_eq!(
+            envs.get("GIT_CONFIG_NOSYSTEM").map(|s| s.as_str()),
+            Some("1")
+        );
+        // HOME=/nonexistent prevents reading ~/.gitconfig.
+        assert_eq!(envs.get("HOME").map(|s| s.as_str()), Some("/nonexistent"));
     }
 
     #[test]

@@ -91,8 +91,8 @@ In practice, “hard guarantee” becomes:
 
 ### Supported platforms (v1)
 
-- macOS
-- Linux
+- macOS (LaunchAgent in GUI session — see `docs/deployment.md`)
+- Linux (systemd user service in graphical session — see `docs/deployment.md`)
 
 ### Component diagram
 
@@ -178,15 +178,18 @@ AgentPass v1 uses **native OS authentication prompts** (not terminal prompts) to
 
 - macOS:
   - `LocalAuthentication` prompt using `LAPolicyDeviceOwnerAuthentication`
-  - shows a system-owned Touch ID / password dialog
-- Linux:
-  - PolicyKit (polkit) `CheckAuthorization` with `AllowUserInteraction`
-  - shows the system’s polkit authentication dialog (password and/or fingerprint depending on setup)
-  - requires a polkit action policy (see `docs/linux-polkit.md`)
-- iOS (second device):
+  - Shows a system-owned Touch ID / password dialog
+  - Requires a GUI (Aqua) session — daemon must run as a LaunchAgent, never a LaunchDaemon
+- Linux (two-step flow):
+  - **Step 1: Intent dialog** — `zenity --question` or `kdialog --yesno` shows operation details before authentication
+  - **Step 2: Polkit authentication** — `CheckAuthorization` with `AllowUserInteraction` for system auth
+  - This separation ensures the user always sees what they are approving, regardless of whether the polkit agent displays operation details
+  - Requires a graphical session, a polkit auth agent, and `zenity` or `kdialog`
+  - Supported desktops: GNOME, KDE Plasma, MATE, XFCE, Cinnamon, Budgie, LXQt (see `docs/deployment.md` for full tier list)
+- iOS (second device, deferred to v3):
   - QR pairing + Face ID gated approvals via a companion app (see `docs/mobile-approvals.md`)
 
-If the daemon is running without access to an interactive user session (headless / no auth agent), approvals should **fail closed**.
+If the daemon is running without access to an interactive user session (headless / no auth agent / no display server), approvals **fail closed**. The daemon refuses to start. See `docs/deployment.md` for session detection requirements.
 
 ### Approval sequence
 

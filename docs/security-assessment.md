@@ -581,6 +581,8 @@ The code at line 59 calls `canEvaluatePolicy_error` which should detect this and
 - Test behavior when the screen is locked.
 - Consider detecting `IOServiceGetMatchingService(kIOMainPortDefault, ...)` for display sleep state.
 
+**Status (PARTIALLY RESOLVED):** The deployment model (LaunchAgent only, `LimitLoadToSessionType: Aqua`) is now documented in `docs/deployment.md`. The LaunchAgent plist prevents loading in non-GUI sessions. Session detection at daemon startup (calling `canEvaluatePolicy` as a preflight and refusing to start on failure) is specified but not yet implemented. Screen-lock behavior and Fast User Switching remain to be tested.
+
 #### 4.1.3 Process Interaction with Prompt
 
 **Analysis:**
@@ -643,6 +645,8 @@ This means on many Linux setups, the user sees: `"Authentication is required to 
 - Test specific auth agents (gnome-shell, kde, mate, pkttyagent) and document which ones display intent.
 - As specified in the PRD (US-006/FR-6): if the environment cannot display intent, fail closed with `approval_unavailable`.
 - Consider implementing a dedicated AgentPass approval UI helper for Linux that shows full operation details, using polkit only for the authentication step.
+
+**Status (RESOLVED):** A two-step approval flow has been implemented in `approval.rs`. Step 1 shows an intent dialog via `zenity --question` or `kdialog --yesno` with full operation details. Step 2 performs the polkit authentication. This separates intent visibility (our code, always works) from authentication (polkit, always requires password). If no intent dialog UI is available (no zenity, no kdialog, no TTY), approval fails closed. Supported desktop tiers are documented in `docs/deployment.md`.
 
 #### 4.2.2 Action ID Hijacking
 
@@ -1041,11 +1045,11 @@ If a runtime dependency is compromised:
 
 | ID | Finding | Action | Effort |
 |----|---------|--------|--------|
-| C-1 | Finding 2.1 | Remove `approval.prompt` as a client-callable RPC. Approvals must only be triggered internally during operation execution. | Small |
-| C-2 | Finding 2.2 | Implement client identity verification (peer creds + exe path + hash). Reject connections from unrecognized clients. | Medium |
-| C-3 | Finding 2.4 | Never pass client-supplied strings to OS approval dialogs. Construct the reason string server-side from the verified operation request. | Small |
-| C-4 | Finding 2.3 | Sanitize all error messages returned to clients. Return stable error codes, log details server-side only. | Small |
-| C-5 | Finding 2.10 | Verify peer UID matches daemon UID. Reject connections from different UIDs. Reject connections where peer creds are unavailable. | Small |
+| C-1 | Finding 2.1 | ~~Remove `approval.prompt` as a client-callable RPC.~~ **DONE:** Removed in hardening pass. Approvals are triggered internally by `Enclave::handle_approval()` only. | Small |
+| C-2 | Finding 2.2 | ~~Implement client identity verification (peer creds + exe path + hash).~~ **DONE:** `ClientIdentity` with uid/gid/pid/exe_path/exe_sha256 implemented. Policy engine evaluates against client identity. | Medium |
+| C-3 | Finding 2.4 | ~~Never pass client-supplied strings to OS approval dialogs.~~ **DONE:** Approval description is constructed by the enclave from verified `OperationRequest` fields, never from client-supplied reason text. | Small |
+| C-4 | Finding 2.3 | ~~Sanitize all error messages returned to clients.~~ **DONE:** Error messages scrubbed in hardening pass. `bad_frame` -> `"malformed frame"`, `bad_json` -> `"invalid JSON request"`, workspace errors -> generic message. Details logged server-side only. | Small |
+| C-5 | Finding 2.10 | ~~Verify peer UID matches daemon UID.~~ **DONE:** `verify_peer_uid()` implemented. Connections from different UIDs or with unavailable peer creds are silently rejected. | Small |
 | C-6 | Section 5.1 | Set umask to `0o077` before `bind()` to eliminate the socket permission race window. | Small |
 
 ### 8.2 High Priority -- Do Before v1 Release
@@ -1058,8 +1062,8 @@ If a runtime dependency is compromised:
 | H-4 | Finding 2.13 | Implement per-connection rate limiting (token bucket). | Medium |
 | H-5 | Section 5.2 | Add symlink and ownership checks on socket directory. | Small |
 | H-6 | Section 5.3 | Add PID file with advisory locking for single-instance protection. | Small |
-| H-7 | Section 4.2.1 | Implement polkit intent visibility detection. Fail closed when the auth agent cannot show operation details. | Medium |
-| H-8 | Section 4.1.2 | Document and test supported macOS deployment models (LaunchAgent only). Detect and fail closed when UI session is unavailable. | Medium |
+| H-7 | Section 4.2.1 | ~~Implement polkit intent visibility detection. Fail closed when the auth agent cannot show operation details.~~ **DONE:** Two-step approval flow (intent dialog + polkit auth) implemented. Supported desktops documented in `docs/deployment.md`. | Medium |
+| H-8 | Section 4.1.2 | ~~Document supported macOS deployment models (LaunchAgent only).~~ **PARTIALLY DONE:** Documented in `docs/deployment.md`. Session detection at daemon startup not yet implemented. | Medium |
 | H-9 | Section 6.3 | Add `cargo audit` to CI pipeline. Pin all dependency versions. | Small |
 | H-10 | -- | Implement the `OperationRequest` envelope (PRD US-002) with versioning, binding approvals to specific operations. | Large |
 

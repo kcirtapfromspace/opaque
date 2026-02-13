@@ -5,5 +5,6 @@ pub mod policy;
 pub mod proto;
 pub mod sanitize;
 pub mod socket;
+pub mod validate;
 
 pub const API_VERSION: u32 = 1;

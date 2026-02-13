@@ -121,6 +121,11 @@ pub struct OperationDef {
     /// If present, params are validated before execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params_schema: Option<serde_json::Value>,
+
+    /// Allowed target field keys. If non-empty, keys not in this set are
+    /// rejected at the enclave boundary. Empty = accept any keys.
+    #[serde(default)]
+    pub allowed_target_keys: Vec<String>,
 }
 
 /// Validate operation params against a JSON Schema.
@@ -457,6 +462,7 @@ mod tests {
             default_factors: vec![ApprovalFactor::LocalBio],
             description: "Set a GitHub Actions secret".into(),
             params_schema: None,
+            allowed_target_keys: vec![],
         })
         .unwrap();
 
@@ -475,6 +481,7 @@ mod tests {
             default_factors: vec![],
             description: "test".into(),
             params_schema: None,
+            allowed_target_keys: vec![],
         };
         reg.register(def.clone()).unwrap();
         assert!(reg.register(def).is_err());
@@ -535,6 +542,7 @@ mod tests {
             default_factors: vec![],
             description: "test".into(),
             params_schema: None,
+            allowed_target_keys: vec![],
         })
         .unwrap();
         assert!(!reg.is_empty());
@@ -631,6 +639,7 @@ mod tests {
             default_factors: vec![ApprovalFactor::LocalBio, ApprovalFactor::Fido2],
             description: "Set a GitHub Actions secret".into(),
             params_schema: None,
+            allowed_target_keys: vec![],
         };
         let json = serde_json::to_string(&def).unwrap();
         let roundtripped: OperationDef = serde_json::from_str(&json).unwrap();
@@ -718,6 +727,7 @@ mod tests {
             default_factors: vec![],
             description: "test".into(),
             params_schema: Some(serde_json::json!({"type": "object"})),
+            allowed_target_keys: vec![],
         };
         let json = serde_json::to_string(&def).unwrap();
         let rt: OperationDef = serde_json::from_str(&json).unwrap();
@@ -733,6 +743,7 @@ mod tests {
             default_factors: vec![],
             description: "test".into(),
             params_schema: None,
+            allowed_target_keys: vec![],
         };
         let json = serde_json::to_string(&def).unwrap();
         assert!(!json.contains("params_schema"));
