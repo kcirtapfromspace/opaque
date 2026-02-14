@@ -13,6 +13,7 @@ use opaque_core::socket::{socket_path, verify_socket_safety};
 use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
+mod setup;
 mod ui;
 
 /// Name of the daemon token file expected next to the socket.
@@ -128,6 +129,18 @@ enum Cmd {
     Audit {
         #[command(subcommand)]
         action: AuditAction,
+    },
+    /// Interactive setup wizard — configure and seal your security policy.
+    Setup {
+        /// Seal the current config.toml without running the wizard.
+        #[arg(long)]
+        seal: bool,
+        /// Remove the config seal (allows reconfiguration).
+        #[arg(long)]
+        reset: bool,
+        /// Check seal status without starting daemon.
+        #[arg(long)]
+        verify: bool,
     },
 }
 
@@ -361,6 +374,20 @@ async fn main() {
             }
             return;
         }
+        Cmd::Setup {
+            seal,
+            reset,
+            verify,
+        } => {
+            match run_setup(*seal, *reset, *verify) {
+                Ok(()) => {}
+                Err(e) => {
+                    ui::error(&e);
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
         _ => {}
     }
 
@@ -510,7 +537,11 @@ async fn main() {
             }
         },
         // Already handled above; unreachable.
-        Cmd::Policy { .. } | Cmd::Init { .. } | Cmd::Audit { .. } | Cmd::Profile { .. } => {
+        Cmd::Policy { .. }
+        | Cmd::Init { .. }
+        | Cmd::Audit { .. }
+        | Cmd::Profile { .. }
+        | Cmd::Setup { .. } => {
             unreachable!()
         }
     };
@@ -918,7 +949,7 @@ fn run_init(force: bool) -> Result<(), String> {
         style(base.join("config.toml").display()).cyan()
     ));
     println!();
-    ui::info("Edit ~/.opaque/config.toml to configure policy rules.");
+    ui::info("Run 'opaque setup' to configure your security policy and seal it.");
     Ok(())
 }
 
@@ -945,6 +976,277 @@ fn run_init_at(base: &Path, force: bool) -> Result<(), String> {
     // Write config file.
     std::fs::write(&config_path, SAMPLE_CONFIG)
         .map_err(|e| format!("failed to write {}: {e}", config_path.display()))?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// setup
+// ---------------------------------------------------------------------------
+
+/// Run the setup command (wizard, --seal, --reset, --verify).
+fn run_setup(seal_only: bool, reset: bool, verify: bool) -> Result<(), String> {
+    use opaque_core::seal::{self, SealStatus};
+
+    let base = default_opaque_dir();
+    let config_path = resolve_config_path(None);
+    let seal_file = base.join("config.seal");
+
+    if verify {
+        if !config_path.exists() {
+            return Err(format!(
+                "config not found at {} (run 'opaque init' first)",
+                config_path.display()
+            ));
+        }
+        let config_bytes = std::fs::read(&config_path)
+            .map_err(|e| format!("failed to read {}: {e}", config_path.display()))?;
+        let status = seal::verify_seal(&config_bytes, &seal_file)
+            .map_err(|e| format!("seal check failed: {e}"))?;
+        match status {
+            SealStatus::Verified => {
+                ui::success("Config seal verified — integrity OK");
+            }
+            SealStatus::Tampered { expected, actual } => {
+                ui::error("Config seal BROKEN — config.toml was modified after sealing");
+                ui::kv("expected", &expected);
+                ui::kv("actual", &actual);
+                ui::info("Run 'opaque setup --reset' to unseal, then reconfigure.");
+            }
+            SealStatus::Unsealed => {
+                ui::warn("Config is unsealed — run 'opaque setup --seal' to protect it.");
+            }
+        }
+        return Ok(());
+    }
+
+    if reset {
+        seal::remove_seal(&seal_file).map_err(|e| format!("failed to remove seal: {e}"))?;
+        ui::success("Config seal removed. You can now edit config.toml.");
+        ui::info("Run 'opaque setup' to reconfigure and re-seal.");
+        return Ok(());
+    }
+
+    if seal_only {
+        if !config_path.exists() {
+            return Err(format!(
+                "config not found at {} (run 'opaque init' first)",
+                config_path.display()
+            ));
+        }
+        let config_bytes = std::fs::read(&config_path)
+            .map_err(|e| format!("failed to read {}: {e}", config_path.display()))?;
+        let hash = seal::compute_seal(&config_bytes);
+        seal::store_seal(&hash, &seal_file).map_err(|e| format!("failed to store seal: {e}"))?;
+        ui::success(&format!(
+            "Config sealed (SHA-256: {}...)",
+            &hash[..16]
+        ));
+        return Ok(());
+    }
+
+    // Interactive wizard.
+    run_setup_wizard(&base, &config_path, &seal_file)
+}
+
+/// Interactive onboarding wizard.
+fn run_setup_wizard(
+    base: &Path,
+    config_path: &Path,
+    seal_file: &Path,
+) -> Result<(), String> {
+    use dialoguer::{Confirm, Input, MultiSelect};
+    use opaque_core::seal;
+
+    println!();
+    println!("  {}", style("Opaque Setup").bold());
+    println!("  {}", style("════════════").dim());
+    println!();
+    println!(
+        "  This wizard configures your security policy and seals it."
+    );
+    println!(
+        "  Once sealed, config cannot be modified without '{}'.",
+        style("opaque setup --reset").cyan()
+    );
+    println!();
+
+    // Ensure base directory exists.
+    create_dir_0700(base)?;
+
+    // Step 1: Human Clients
+    println!("  {}", style("Step 1: Human Clients").bold().underlined());
+
+    let current_exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    let mut clients: Vec<setup::HumanClientConfig> = Vec::new();
+
+    if !current_exe.is_empty() {
+        println!("  Detected: {}", style(&current_exe).cyan());
+        let register = Confirm::new()
+            .with_prompt("  Register this binary as a trusted human client?")
+            .default(true)
+            .interact()
+            .map_err(|e| format!("input error: {e}"))?;
+
+        if register {
+            clients.push(setup::HumanClientConfig {
+                name: "opaque-cli".into(),
+                exe_path: current_exe,
+            });
+        }
+    }
+
+    loop {
+        let add_more = Confirm::new()
+            .with_prompt("  Add another client binary path?")
+            .default(false)
+            .interact()
+            .map_err(|e| format!("input error: {e}"))?;
+
+        if !add_more {
+            break;
+        }
+
+        let path: String = Input::new()
+            .with_prompt("  Client binary path")
+            .interact_text()
+            .map_err(|e| format!("input error: {e}"))?;
+
+        let name: String = Input::new()
+            .with_prompt("  Client name")
+            .default("custom-client".into())
+            .interact_text()
+            .map_err(|e| format!("input error: {e}"))?;
+
+        clients.push(setup::HumanClientConfig {
+            name,
+            exe_path: path,
+        });
+    }
+
+    println!();
+
+    // Step 2: Operations
+    println!("  {}", style("Step 2: Operations").bold().underlined());
+
+    let op_labels: Vec<&str> = setup::EnabledOperation::ALL
+        .iter()
+        .map(|op| op.label())
+        .collect();
+
+    let defaults: Vec<bool> = vec![true; op_labels.len()];
+
+    let selected_indices = MultiSelect::new()
+        .with_prompt("  Which operations should human clients access?")
+        .items(&op_labels)
+        .defaults(&defaults)
+        .interact()
+        .map_err(|e| format!("input error: {e}"))?;
+
+    let enabled_ops: Vec<setup::EnabledOperation> = selected_indices
+        .iter()
+        .map(|&i| setup::EnabledOperation::ALL[i])
+        .collect();
+
+    println!();
+
+    // Step 3: Approval Policy
+    println!(
+        "  {}",
+        style("Step 3: Approval Policy").bold().underlined()
+    );
+
+    let require_bio = Confirm::new()
+        .with_prompt("  Require biometric approval for sensitive operations?")
+        .default(true)
+        .interact()
+        .map_err(|e| format!("input error: {e}"))?;
+
+    let lease_ttl: u64 = if require_bio {
+        Input::new()
+            .with_prompt("  Approval lease duration in seconds")
+            .default(300)
+            .interact_text()
+            .map_err(|e| format!("input error: {e}"))?
+    } else {
+        0
+    };
+
+    println!();
+
+    // Generate config
+    let answers = setup::SetupAnswers {
+        human_clients: clients,
+        enabled_operations: enabled_ops,
+        require_biometric: require_bio,
+        lease_ttl,
+    };
+
+    let config_content = setup::generate_config(&answers);
+
+    // Step 4: Review & Confirm
+    println!(
+        "  {}",
+        style("Step 4: Review & Confirm").bold().underlined()
+    );
+    println!();
+    println!(
+        "  {} {}",
+        style("┌─").dim(),
+        style(config_path.display()).cyan()
+    );
+    for line in config_content.lines() {
+        println!("  {} {}", style("│").dim(), line);
+    }
+    println!("  {}", style("└─").dim());
+    println!();
+
+    let confirm = Confirm::new()
+        .with_prompt("  Write config and seal?")
+        .default(true)
+        .interact()
+        .map_err(|e| format!("input error: {e}"))?;
+
+    if !confirm {
+        ui::warn("Setup cancelled.");
+        return Ok(());
+    }
+
+    // Write config
+    std::fs::write(config_path, &config_content)
+        .map_err(|e| format!("failed to write {}: {e}", config_path.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(config_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| {
+                format!(
+                    "failed to set permissions on {}: {e}",
+                    config_path.display()
+                )
+            })?;
+    }
+
+    ui::init_step(&format!(
+        "Config written to {}",
+        style(config_path.display()).cyan()
+    ));
+
+    // Seal
+    let hash = seal::compute_seal(config_content.as_bytes());
+    seal::store_seal(&hash, seal_file).map_err(|e| format!("failed to store seal: {e}"))?;
+
+    ui::init_step(&format!(
+        "Config sealed (SHA-256: {}...)",
+        &hash[..16]
+    ));
+
+    println!();
+    ui::success("Setup complete!");
 
     Ok(())
 }
