@@ -862,6 +862,8 @@ pub struct AuditFilter {
     pub limit: usize,
     /// Filter by request correlation ID.
     pub request_id: Option<Uuid>,
+    /// Filter by outcome value (e.g. "allowed", "denied", "error").
+    pub outcome: Option<String>,
 }
 
 impl Default for AuditFilter {
@@ -872,6 +874,7 @@ impl Default for AuditFilter {
             since_ms: None,
             limit: 50,
             request_id: None,
+            outcome: None,
         }
     }
 }
@@ -904,6 +907,10 @@ pub fn query_audit_db(db_path: &Path, filter: &AuditFilter) -> Result<Vec<AuditE
     if let Some(ref rid) = filter.request_id {
         sql.push_str(" AND request_id = ?");
         param_values.push(Box::new(rid.to_string()));
+    }
+    if let Some(ref outcome) = filter.outcome {
+        sql.push_str(" AND outcome = ?");
+        param_values.push(Box::new(outcome.clone()));
     }
 
     sql.push_str(" ORDER BY ts_utc_ms DESC LIMIT ?");
