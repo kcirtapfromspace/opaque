@@ -33,5 +33,6 @@ base64 = "0.22"
 crypto_box = { version = "0.9", features = ["seal"] }
 zeroize = { version = "1.8", features = ["derive"] }
 console = "0.15"
+dialoguer = "0.11"
 indicatif = "0.17"
 wiremock = "0.6"
