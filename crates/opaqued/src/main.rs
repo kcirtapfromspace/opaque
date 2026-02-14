@@ -63,7 +63,6 @@ struct DaemonConfig {
 #[derive(Debug, Clone, Deserialize)]
 struct HumanClientEntry {
     /// Human-readable label (for logging).
-    #[allow(dead_code)]
     name: String,
 
     /// Glob pattern matched against the exe path.
