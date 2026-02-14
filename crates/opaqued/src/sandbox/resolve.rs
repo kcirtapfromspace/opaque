@@ -335,7 +335,8 @@ impl SecretResolver for CompositeResolver {
 
 /// Resolve all secret refs in a profile to their values.
 ///
-/// Returns a map of `ENV_NAME -> SecretValue`.
+/// Returns a map of `ENV_NAME -> SecretValue`. Each resolved value is
+/// `mlock`'d to prevent it from being swapped to disk while in use.
 pub fn resolve_all(
     secrets: &HashMap<String, String>,
     resolver: &dyn SecretResolver,
@@ -343,6 +344,7 @@ pub fn resolve_all(
     let mut resolved = HashMap::with_capacity(secrets.len());
     for (env_name, ref_str) in secrets {
         let value = resolver.resolve(ref_str)?;
+        value.mlock();
         resolved.insert(env_name.clone(), value);
     }
     Ok(resolved)
