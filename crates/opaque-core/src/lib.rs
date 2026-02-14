@@ -5,6 +5,7 @@ pub mod policy;
 pub mod profile;
 pub mod proto;
 pub mod sanitize;
+pub mod seal;
 pub mod socket;
 pub mod validate;
 
