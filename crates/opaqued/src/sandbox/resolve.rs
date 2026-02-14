@@ -291,6 +291,17 @@ impl CompositeResolver {
             onepassword,
         }
     }
+
+    /// Create a resolver without 1Password backend (for testing).
+    #[cfg(test)]
+    fn without_onepassword() -> Self {
+        Self {
+            env: EnvResolver,
+            keychain: KeychainResolver,
+            profile: ProfileResolver,
+            onepassword: None,
+        }
+    }
 }
 
 impl Default for CompositeResolver {
@@ -483,18 +494,15 @@ mod tests {
         assert!(format!("{err}").contains("1Password resolution failed"));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn composite_resolver_onepassword_dispatch() {
-        let resolver = CompositeResolver::new();
-        // Without OPAQUE_1PASSWORD_CONNECT_URL, the resolver either:
-        // - Uses `op` CLI if available (will fail with a CLI error on bogus ref)
-        // - Returns "not configured" if no backend is available
+    #[test]
+    fn composite_resolver_onepassword_dispatch() {
+        // Use without_onepassword() to avoid hitting the real `op` CLI.
+        let resolver = CompositeResolver::without_onepassword();
         let result = resolver.resolve("onepassword:nonexistent-vault-xyz/item");
         assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            ResolveError::OnePasswordError(..)
-        ));
+        let err = result.unwrap_err();
+        assert!(matches!(err, ResolveError::OnePasswordError(..)));
+        assert!(format!("{err}").contains("not configured"));
     }
 
     // -- ProfileResolver tests --
