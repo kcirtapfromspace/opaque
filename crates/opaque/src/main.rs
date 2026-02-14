@@ -13,6 +13,7 @@ use opaque_core::socket::{socket_path, verify_socket_safety};
 use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
+mod service;
 mod setup;
 mod ui;
 
@@ -142,6 +143,29 @@ enum Cmd {
         #[arg(long)]
         verify: bool,
     },
+    /// Manage the opaqued daemon service (install, start, stop, status).
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+    /// Diagnose your Opaque installation and report issues.
+    Doctor,
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceAction {
+    /// Install and start the daemon as a system service.
+    Install,
+    /// Stop and remove the daemon service.
+    Uninstall,
+    /// Check if the daemon service is installed and running.
+    Status,
+    /// Start the daemon service.
+    Start,
+    /// Stop the daemon service.
+    Stop,
+    /// Show recent daemon logs.
+    Logs,
 }
 
 #[derive(Debug, Subcommand)]
@@ -388,6 +412,47 @@ async fn main() {
             }
             return;
         }
+        Cmd::Doctor => {
+            run_doctor().await;
+            return;
+        }
+        Cmd::Service { action } => {
+            let op = match action {
+                ServiceAction::Install => service::ServiceOp::Install,
+                ServiceAction::Uninstall => service::ServiceOp::Uninstall,
+                ServiceAction::Status => service::ServiceOp::Status,
+                ServiceAction::Start => service::ServiceOp::Start,
+                ServiceAction::Stop => service::ServiceOp::Stop,
+                ServiceAction::Logs => service::ServiceOp::Logs,
+            };
+            match service::run(op) {
+                Ok(()) => {
+                    // Print success for mutating operations.
+                    match op {
+                        service::ServiceOp::Install => {
+                            ui::success("Daemon service installed and started");
+                        }
+                        service::ServiceOp::Uninstall => {
+                            ui::success("Daemon service stopped and removed");
+                        }
+                        service::ServiceOp::Start => {
+                            ui::success("Daemon service started");
+                        }
+                        service::ServiceOp::Stop => {
+                            ui::success("Daemon service stopped");
+                        }
+                        service::ServiceOp::Status | service::ServiceOp::Logs => {
+                            // Status and logs handle their own output.
+                        }
+                    }
+                }
+                Err(e) => {
+                    ui::error(&e);
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
         _ => {}
     }
 
@@ -541,7 +606,9 @@ async fn main() {
         | Cmd::Init { .. }
         | Cmd::Audit { .. }
         | Cmd::Profile { .. }
-        | Cmd::Setup { .. } => {
+        | Cmd::Setup { .. }
+        | Cmd::Service { .. }
+        | Cmd::Doctor => {
             unreachable!()
         }
     };
@@ -1247,8 +1314,390 @@ fn run_setup_wizard(
 
     println!();
     ui::success("Setup complete!");
+    ui::info("Run 'opaque service install' to start the daemon automatically on login.");
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// doctor
+// ---------------------------------------------------------------------------
+
+/// Run the `opaque doctor` diagnostic command.
+///
+/// Checks each component of the Opaque installation and reports its status.
+/// Uses a pass/warn/fail pattern similar to `brew doctor` or `npm doctor`.
+async fn run_doctor() {
+    println!();
+    println!("  {}", style("Opaque Doctor").bold());
+    println!("  {}", style("═════════════").dim());
+    println!();
+
+    let mut pass_count = 0u32;
+    let mut warn_count = 0u32;
+    let mut fail_count = 0u32;
+
+    let base = default_opaque_dir();
+
+    // 1. Config directory
+    if base.exists() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&base) {
+                let mode = meta.permissions().mode() & 0o777;
+                if mode == 0o700 {
+                    doctor_pass(&format!(
+                        "Config directory exists ({})",
+                        base.display()
+                    ));
+                    pass_count += 1;
+                } else {
+                    doctor_warn(&format!(
+                        "Config directory permissions are {mode:04o} (expected 0700)"
+                    ));
+                    warn_count += 1;
+                }
+            } else {
+                doctor_pass(&format!(
+                    "Config directory exists ({})",
+                    base.display()
+                ));
+                pass_count += 1;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            doctor_pass(&format!(
+                "Config directory exists ({})",
+                base.display()
+            ));
+            pass_count += 1;
+        }
+    } else {
+        doctor_fail("Config directory not found — run 'opaque init'");
+        fail_count += 1;
+    }
+
+    // 2. Config file
+    let config_path = base.join("config.toml");
+    if config_path.exists() {
+        match std::fs::read_to_string(&config_path) {
+            Ok(contents) => {
+                match toml_edit::de::from_str::<PolicyConfig>(&contents) {
+                    Ok(config) => {
+                        doctor_pass(&format!(
+                            "Config file valid ({} rules)",
+                            config.rules.len()
+                        ));
+                        pass_count += 1;
+                    }
+                    Err(e) => {
+                        doctor_fail(&format!("Config file has parse errors: {e}"));
+                        fail_count += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                doctor_fail(&format!("Cannot read config file: {e}"));
+                fail_count += 1;
+            }
+        }
+    } else {
+        doctor_warn("Config file not found — run 'opaque init' or 'opaque setup'");
+        warn_count += 1;
+    }
+
+    // 3. Config seal
+    {
+        use opaque_core::seal::{self, SealStatus};
+        let seal_file = base.join("config.seal");
+        if config_path.exists() {
+            match std::fs::read(&config_path) {
+                Ok(config_bytes) => {
+                    match seal::verify_seal(&config_bytes, &seal_file) {
+                        Ok(SealStatus::Verified) => {
+                            doctor_pass("Config seal verified");
+                            pass_count += 1;
+                        }
+                        Ok(SealStatus::Unsealed) => {
+                            doctor_warn("Config is unsealed — run 'opaque setup --seal'");
+                            warn_count += 1;
+                        }
+                        Ok(SealStatus::Tampered { .. }) => {
+                            doctor_fail(
+                                "Config seal BROKEN — run 'opaque setup --reset' then reconfigure",
+                            );
+                            fail_count += 1;
+                        }
+                        Err(e) => {
+                            doctor_warn(&format!("Seal check error: {e}"));
+                            warn_count += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    doctor_warn(&format!("Cannot read config for seal check: {e}"));
+                    warn_count += 1;
+                }
+            }
+        } else {
+            doctor_skip("Config seal (no config file)");
+        }
+    }
+
+    // 4. Socket
+    let sock = socket_path();
+    if sock.exists() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&sock) {
+                let mode = meta.permissions().mode() & 0o777;
+                if mode <= 0o600 {
+                    doctor_pass(&format!(
+                        "Socket exists with secure permissions ({mode:04o})"
+                    ));
+                    pass_count += 1;
+                } else {
+                    doctor_warn(&format!(
+                        "Socket permissions are {mode:04o} (expected 0600 or stricter)"
+                    ));
+                    warn_count += 1;
+                }
+            } else {
+                doctor_pass("Socket file exists");
+                pass_count += 1;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            doctor_pass("Socket file exists");
+            pass_count += 1;
+        }
+    } else {
+        doctor_warn(&format!(
+            "Socket not found at {} — is the daemon running?",
+            sock.display()
+        ));
+        warn_count += 1;
+    }
+
+    // 5. Daemon connectivity
+    if sock.exists() {
+        match tokio::time::timeout(Duration::from_secs(5), try_ping(&sock)).await {
+            Ok(Ok(())) => {
+                doctor_pass("Daemon is reachable (ping OK)");
+                pass_count += 1;
+            }
+            Ok(Err(e)) => {
+                doctor_fail(&format!("Daemon ping failed: {e}"));
+                fail_count += 1;
+            }
+            Err(_) => {
+                doctor_fail("Daemon ping timed out (5s)");
+                fail_count += 1;
+            }
+        }
+    } else {
+        doctor_skip("Daemon connectivity (no socket)");
+    }
+
+    // 6. Service status
+    {
+        let status = service::query_status();
+        if status.installed {
+            if status.running {
+                let pid_info = status
+                    .pid
+                    .map(|p| format!(" (PID {p})"))
+                    .unwrap_or_default();
+                doctor_pass(&format!("Service installed and running{pid_info}"));
+                pass_count += 1;
+            } else {
+                doctor_warn("Service installed but not running — run 'opaque service start'");
+                warn_count += 1;
+            }
+        } else {
+            doctor_warn("Service not installed — run 'opaque service install'");
+            warn_count += 1;
+        }
+    }
+
+    // 7. 1Password op CLI
+    match std::process::Command::new("which")
+        .arg("op")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            doctor_pass(&format!("1Password CLI found ({path})"));
+            pass_count += 1;
+        }
+        _ => {
+            doctor_info("1Password CLI (op) not found — 1Password features unavailable");
+        }
+    }
+
+    // 8. Profiles directory
+    let profiles_dir = base.join("profiles");
+    if profiles_dir.exists() {
+        let count = std::fs::read_dir(&profiles_dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().is_some_and(|ext| ext == "toml"))
+                    .count()
+            })
+            .unwrap_or(0);
+        doctor_pass(&format!("Profiles directory exists ({count} profiles)"));
+        pass_count += 1;
+    } else {
+        doctor_info("No profiles directory (sandbox features unavailable)");
+    }
+
+    // 9. Audit database
+    let audit_db = base.join("audit.db");
+    if audit_db.exists() {
+        if let Ok(meta) = std::fs::metadata(&audit_db) {
+            let size_kb = meta.len() / 1024;
+            doctor_pass(&format!("Audit database exists ({size_kb} KB)"));
+            pass_count += 1;
+        } else {
+            doctor_pass("Audit database exists");
+            pass_count += 1;
+        }
+    } else {
+        doctor_info("No audit database (created on first daemon run)");
+    }
+
+    // Summary
+    println!();
+    println!("  {}", style("────────────────────────────────").dim());
+    let summary = format!("{pass_count} passed, {warn_count} warnings, {fail_count} errors");
+    if fail_count > 0 {
+        println!(
+            "  {} {}",
+            style(ui::CROSS).red(),
+            style(summary).red().bold()
+        );
+    } else if warn_count > 0 {
+        println!(
+            "  {} {}",
+            style(ui::WARN_ICON).yellow(),
+            style(summary).yellow().bold()
+        );
+    } else {
+        println!(
+            "  {} {}",
+            style(ui::CHECK).green(),
+            style(summary).green().bold()
+        );
+    }
+    println!();
+
+    if fail_count > 0 {
+        std::process::exit(1);
+    }
+}
+
+/// Attempt a lightweight ping to the daemon. Returns Ok(()) on success.
+async fn try_ping(sock: &Path) -> Result<(), String> {
+    // Verify socket safety first.
+    verify_socket_safety(sock).map_err(|e| format!("{e}"))?;
+
+    // Read daemon token.
+    let daemon_token = read_daemon_token(sock).map_err(|e| format!("{e}"))?;
+
+    // Connect.
+    let stream = UnixStream::connect(sock)
+        .await
+        .map_err(|e| format!("connect failed: {e}"))?;
+
+    let codec = LengthDelimitedCodec::builder()
+        .max_frame_length(opaque_core::MAX_FRAME_LENGTH)
+        .new_codec();
+    let mut framed = Framed::new(stream, codec);
+
+    // Handshake.
+    let handshake = serde_json::json!({
+        "handshake": "v1",
+        "daemon_token": daemon_token,
+    });
+    let hs_bytes = serde_json::to_vec(&handshake).map_err(|e| format!("serialize: {e}"))?;
+    framed
+        .send(Bytes::from(hs_bytes))
+        .await
+        .map_err(|e| format!("send handshake: {e}"))?;
+
+    // Send ping.
+    let req = Request {
+        id: 1,
+        method: "ping".to_string(),
+        params: serde_json::Value::Null,
+    };
+    let out = serde_json::to_vec(&req).map_err(|e| format!("serialize: {e}"))?;
+    framed
+        .send(Bytes::from(out))
+        .await
+        .map_err(|e| format!("send ping: {e}"))?;
+
+    // Read response.
+    let frame = framed
+        .next()
+        .await
+        .ok_or_else(|| "no response".to_string())?
+        .map_err(|e| format!("read: {e}"))?;
+
+    let resp: Response =
+        serde_json::from_slice(&frame).map_err(|e| format!("parse response: {e}"))?;
+
+    if resp.error.is_some() {
+        return Err("daemon returned an error".to_string());
+    }
+    Ok(())
+}
+
+fn doctor_pass(msg: &str) {
+    println!(
+        "  {} {}",
+        style(ui::CHECK).green(),
+        msg
+    );
+}
+
+fn doctor_fail(msg: &str) {
+    println!(
+        "  {} {}",
+        style(ui::CROSS).red(),
+        style(msg).red()
+    );
+}
+
+fn doctor_warn(msg: &str) {
+    println!(
+        "  {} {}",
+        style(ui::WARN_ICON).yellow(),
+        style(msg).yellow()
+    );
+}
+
+fn doctor_info(msg: &str) {
+    println!(
+        "  {} {}",
+        style(ui::INFO_ICON).dim(),
+        style(msg).dim()
+    );
+}
+
+fn doctor_skip(msg: &str) {
+    println!(
+        "  {} {}",
+        style("—").dim(),
+        style(msg).dim()
+    );
 }
 
 /// Create a directory with mode 0700 if it does not already exist.
