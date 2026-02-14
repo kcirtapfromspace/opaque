@@ -29,6 +29,7 @@ const DAEMON_TOKEN_FILENAME: &str = "daemon.token";
 mod approval;
 mod enclave;
 mod github;
+mod onepassword;
 mod sandbox;
 pub mod secret;
 
@@ -380,6 +381,34 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         })
         .expect("failed to register github.set_org_secret");
 
+    registry
+        .register(OperationDef {
+            name: "onepassword.list_vaults".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::FirstUse,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "List available 1Password vaults".into(),
+            params_schema: None,
+            allowed_target_keys: vec![],
+        })
+        .expect("failed to register onepassword.list_vaults");
+
+    registry
+        .register(OperationDef {
+            name: "onepassword.list_items".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::FirstUse,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "List items in a 1Password vault".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["vault"],
+                "properties": { "vault": {"type": "string"} }
+            })),
+            allowed_target_keys: vec!["vault".into()],
+        })
+        .expect("failed to register onepassword.list_items");
+
     let policy = PolicyEngine::with_rules(config.rules.clone());
     info!("policy engine loaded with {} rules", policy.rule_count());
 
@@ -405,7 +434,11 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
     let github_dependabot_handler = github::GitHubHandler::new(audit.clone());
     let github_org_handler = github::GitHubHandler::new(audit.clone());
 
-    let enclave = Enclave::builder()
+    // 1Password Connect handler: only created if the Connect URL is configured.
+    let onepassword_connect_url =
+        std::env::var(onepassword::client::CONNECT_URL_ENV).unwrap_or_default();
+
+    let mut enclave_builder = Enclave::builder()
         .registry(registry)
         .policy(policy)
         .handler("test.noop", Box::new(NoopHandler))
@@ -422,7 +455,25 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             "github.set_dependabot_secret",
             Box::new(github_dependabot_handler),
         )
-        .handler("github.set_org_secret", Box::new(github_org_handler))
+        .handler("github.set_org_secret", Box::new(github_org_handler));
+
+    if !onepassword_connect_url.is_empty() {
+        let op_list_vaults_handler =
+            onepassword::OnePasswordHandler::new(audit.clone(), &onepassword_connect_url);
+        let op_list_items_handler =
+            onepassword::OnePasswordHandler::new(audit.clone(), &onepassword_connect_url);
+        enclave_builder = enclave_builder
+            .handler("onepassword.list_vaults", Box::new(op_list_vaults_handler))
+            .handler("onepassword.list_items", Box::new(op_list_items_handler));
+        info!(
+            "1Password Connect handler enabled ({})",
+            onepassword_connect_url
+        );
+    } else {
+        info!("1Password Connect handler disabled (OPAQUE_1PASSWORD_CONNECT_URL not set)");
+    }
+
+    let enclave = enclave_builder
         .approval_gate(Box::new(NativeApprovalGate))
         .audit(audit)
         .build();
@@ -1489,6 +1540,73 @@ async fn handle_request(
                         format!(
                             "unknown scope '{unknown}' (expected: repo_actions, env_actions, codespaces_user, codespaces_repo, dependabot, org_actions)"
                         ),
+                    );
+                }
+            };
+
+            let op_req = OperationRequest {
+                request_id: Uuid::new_v4(),
+                client_identity: identity.clone(),
+                client_type,
+                operation: operation.into(),
+                target,
+                secret_ref_names: vec![],
+                created_at: SystemTime::now(),
+                expires_at: None,
+                params: op_params,
+                workspace: None,
+            };
+
+            state
+                .enclave
+                .execute(op_req)
+                .await
+                .into_proto_response(req.id)
+        }
+        "onepassword" => {
+            // The onepassword method is a convenience wrapper that builds an
+            // "execute" request for the appropriate onepassword.* operation.
+            let action = req
+                .params
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+
+            if action.is_empty() {
+                return Response::err(Some(req.id), "bad_request", "missing 'action' field");
+            }
+
+            let (operation, target, op_params) = match action.as_str() {
+                "list_vaults" => (
+                    "onepassword.list_vaults",
+                    HashMap::new(),
+                    serde_json::json!({}),
+                ),
+                "list_items" => {
+                    let vault = req
+                        .params
+                        .get("vault")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_owned();
+
+                    if vault.is_empty() {
+                        return Response::err(Some(req.id), "bad_request", "missing 'vault' field");
+                    }
+
+                    let target = HashMap::from([("vault".into(), vault.clone())]);
+                    (
+                        "onepassword.list_items",
+                        target,
+                        serde_json::json!({ "vault": vault }),
+                    )
+                }
+                unknown => {
+                    return Response::err(
+                        Some(req.id),
+                        "bad_request",
+                        format!("unknown action '{unknown}' (expected: list_vaults, list_items)"),
                     );
                 }
             };
