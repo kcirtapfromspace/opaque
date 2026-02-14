@@ -42,8 +42,8 @@ impl EnabledOperation {
     /// Display label for the wizard multi-select.
     pub fn label(self) -> &'static str {
         match self {
-            EnabledOperation::OnePassword => "1Password (list vaults, list items)",
-            EnabledOperation::GitHub => "GitHub Actions (set secrets)",
+            EnabledOperation::OnePassword => "1Password (list vaults, list items, read fields)",
+            EnabledOperation::GitHub => "GitHub (set, list, delete secrets)",
             EnabledOperation::Sandbox => "Sandbox execution (run profiles)",
             EnabledOperation::TestNoop => "Test no-op (development)",
         }
@@ -103,6 +103,14 @@ pub fn generate_config(answers: &SetupAnswers) -> String {
                     factors,
                     answers.lease_ttl,
                 );
+                write_rule(
+                    &mut out,
+                    "allow-onepassword-read-field",
+                    "onepassword.read_field",
+                    approval_require,
+                    factors,
+                    answers.lease_ttl,
+                );
             }
             EnabledOperation::GitHub => {
                 write_rule(
@@ -133,6 +141,22 @@ pub fn generate_config(answers: &SetupAnswers) -> String {
                     &mut out,
                     "allow-github-set-org-secret",
                     "github.set_org_secret",
+                    approval_require,
+                    factors,
+                    answers.lease_ttl,
+                );
+                write_rule(
+                    &mut out,
+                    "allow-github-list-secrets",
+                    "github.list_secrets",
+                    approval_require,
+                    factors,
+                    answers.lease_ttl,
+                );
+                write_rule(
+                    &mut out,
+                    "allow-github-delete-secret",
+                    "github.delete_secret",
                     approval_require,
                     factors,
                     answers.lease_ttl,
@@ -217,6 +241,7 @@ mod tests {
         assert!(config.contains("exe_path = \"/usr/bin/opaque\""));
         assert!(config.contains("allow-onepassword-list-vaults"));
         assert!(config.contains("allow-onepassword-list-items"));
+        assert!(config.contains("allow-onepassword-read-field"));
         assert!(config.contains("require = \"first_use\""));
         assert!(config.contains("[\"local_bio\"]"));
         assert!(config.contains("lease_ttl = 300"));
@@ -251,6 +276,8 @@ mod tests {
         assert!(config.contains("allow-github-set-codespaces-secret"));
         assert!(config.contains("allow-github-set-dependabot-secret"));
         assert!(config.contains("allow-github-set-org-secret"));
+        assert!(config.contains("allow-github-list-secrets"));
+        assert!(config.contains("allow-github-delete-secret"));
     }
 
     #[test]
