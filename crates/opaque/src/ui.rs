@@ -140,6 +140,9 @@ pub fn format_response(method: &str, result: &serde_json::Value) {
         "github" | "execute" | "exec" => {
             format_operation_result(result);
         }
+        "onepassword" => {
+            format_onepassword_result(result);
+        }
         _ => {
             print_json(result);
         }
@@ -245,6 +248,62 @@ fn build_operation_description(obj: &serde_json::Map<String, serde_json::Value>)
     }
 
     format!("Operation completed: {secret}")
+}
+
+/// Format a 1Password response (list_vaults or list_items).
+fn format_onepassword_result(result: &serde_json::Value) {
+    if let Some(vaults) = result.get("vaults").and_then(|v| v.as_array()) {
+        header(&format!("{} vault(s)", vaults.len()));
+        for vault in vaults {
+            let name = vault
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(unknown)");
+            let desc = vault
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if desc.is_empty() {
+                println!("  {} {}", style(FOLDER).dim(), style(name).cyan().bold());
+            } else {
+                println!(
+                    "  {} {}  {}",
+                    style(FOLDER).dim(),
+                    style(name).cyan().bold(),
+                    style(desc).dim()
+                );
+            }
+        }
+    } else if let Some(items) = result.get("items").and_then(|v| v.as_array()) {
+        let vault_name = result
+            .get("vault")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(unknown)");
+        header(&format!(
+            "{} item(s) in vault '{}'",
+            items.len(),
+            vault_name
+        ));
+        for item in items {
+            let title = item
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(unknown)");
+            let category = item.get("category").and_then(|v| v.as_str()).unwrap_or("");
+            if category.is_empty() {
+                println!("  {} {}", style(KEY).dim(), style(title).yellow().bold());
+            } else {
+                println!(
+                    "  {} {}  {}",
+                    style(KEY).dim(),
+                    style(title).yellow().bold(),
+                    style(format!("[{category}]")).dim()
+                );
+            }
+        }
+    } else {
+        print_json(result);
+    }
 }
 
 /// Format a daemon error response.
