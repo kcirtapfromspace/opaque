@@ -57,7 +57,6 @@ const MAX_LEASE_TTL: Duration = Duration::from_secs(3600); // 60 minutes
 #[derive(Debug, thiserror::Error)]
 pub enum EnclaveError {
     #[error("client identity verification failed: {0}")]
-    #[allow(dead_code)] // Will be used when identity verification is implemented
     IdentityVerification(String),
 
     #[error("unknown operation: {0}")]
@@ -537,14 +536,15 @@ impl Enclave {
     /// response has been sanitized.
     ///
     /// Pipeline:
-    /// 1. Verify client identity
-    /// 2. Look up operation in registry
-    /// 3. Check safety-class constraints
-    /// 4. Evaluate policy
-    /// 5. Trigger approval if required
-    /// 6. Execute operation handler
-    /// 7. Sanitize response
-    /// 8. Emit audit events
+    /// 1. Verify client identity (defense-in-depth)
+    /// 2. Emit request-received audit event
+    /// 3. Look up operation in registry, validate target keys and params
+    /// 4. Check safety-class constraints
+    /// 5. Evaluate policy
+    /// 6. Trigger approval if required
+    /// 7. Execute operation handler
+    /// 8. Sanitize response
+    /// 9. Emit outcome audit event
     pub async fn execute(&self, request: OperationRequest) -> SanitizedResponse<Sanitized> {
         let start = Instant::now();
         let request_id = request.request_id;
@@ -553,7 +553,17 @@ impl Enclave {
 
         let workspace_summary = request.workspace.as_ref().map(WorkspaceSummary::sanitized);
 
-        // --- Step 1: Emit request received ---
+        // --- Step 1: Verify client identity ---
+        // Defense-in-depth: reject requests with the fallback identity
+        // (uid == u32::MAX means peer credentials were unavailable).
+        if request.client_identity.uid == u32::MAX {
+            let err = EnclaveError::IdentityVerification(
+                "peer credentials unavailable (uid unresolved)".into(),
+            );
+            return self.error_to_sanitized(&err);
+        }
+
+        // --- Step 2: Emit request received ---
         let mut event = AuditEvent::new(AuditEventKind::RequestReceived)
             .with_request_id(request_id)
             .with_client(client_summary.clone())
@@ -565,7 +575,7 @@ impl Enclave {
         }
         self.audit.emit(event);
 
-        // --- Step 2: Look up operation in registry ---
+        // --- Step 3: Look up operation in registry ---
         let op_def = match self.registry.get(&request.operation) {
             Ok(def) => def.clone(),
             Err(_) => {
@@ -582,7 +592,7 @@ impl Enclave {
             }
         };
 
-        // --- Step 2b: Validate target keys against allowed set ---
+        // --- Step 3b: Validate target keys against allowed set ---
         if !op_def.allowed_target_keys.is_empty() {
             for key in request.target.keys() {
                 if !op_def.allowed_target_keys.iter().any(|k| k == key) {
@@ -600,7 +610,7 @@ impl Enclave {
             }
         }
 
-        // --- Step 2c: Validate params against schema ---
+        // --- Step 3c: Validate params against schema ---
         if let Some(ref schema) = op_def.params_schema
             && let Err(errors) = validate_params(schema, &request.params)
         {
@@ -616,7 +626,7 @@ impl Enclave {
             );
         }
 
-        // --- Step 3: Safety-class / client-type constraints ---
+        // --- Step 4: Safety-class / client-type constraints ---
         if let Err(err) = self.check_safety_constraints(&request, &op_def) {
             return self.emit_and_sanitize_error(
                 request_id,
@@ -629,7 +639,7 @@ impl Enclave {
             );
         }
 
-        // --- Step 4: Evaluate policy ---
+        // --- Step 5: Evaluate policy ---
         let decision = self.policy.evaluate(&request, op_def.safety);
 
         if !decision.allowed {
@@ -653,7 +663,7 @@ impl Enclave {
             return self.error_to_sanitized(&err);
         }
 
-        // --- Step 5: Approval gate ---
+        // --- Step 6: Approval gate ---
         if let Err(err) = self
             .handle_approval(
                 &request,
@@ -675,7 +685,7 @@ impl Enclave {
             );
         }
 
-        // --- Step 6: Execute operation handler ---
+        // --- Step 7: Execute operation handler ---
         self.audit.emit(
             AuditEvent::new(AuditEventKind::OperationStarted)
                 .with_request_id(request_id)
@@ -712,11 +722,11 @@ impl Enclave {
 
         match result {
             Ok(payload) => {
-                // --- Step 7: Sanitize response ---
+                // --- Step 8: Sanitize response ---
                 let raw = SanitizedResponse::<Unsanitized>::from_payload(payload);
                 let sanitized = self.sanitizer.sanitize_response(raw);
 
-                // --- Step 8: Emit success ---
+                // --- Step 9: Emit success ---
                 self.audit.emit(
                     AuditEvent::new(AuditEventKind::OperationSucceeded)
                         .with_request_id(request_id)
@@ -2958,5 +2968,18 @@ mod tests {
         assert_eq!(leases[0].operation, "github.set_actions_secret");
         assert!(leases[0].ttl_remaining_secs > 0);
         assert!(!leases[0].one_time);
+    }
+
+    #[tokio::test]
+    async fn unresolved_identity_rejected() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let enclave = build_enclave(Box::new(AlwaysApproveGate), audit.clone());
+
+        // Build a request with the fallback identity (uid == u32::MAX).
+        let mut req = test_request("github.set_actions_secret", ClientType::Agent);
+        req.client_identity.uid = u32::MAX;
+
+        let resp = enclave.execute(req).await;
+        assert_eq!(resp.error_code(), Some("identity_verification_failed"));
     }
 }

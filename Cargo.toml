@@ -27,7 +27,6 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 uuid = { version = "1.11", features = ["v4", "serde"] }
-nix = { version = "0.29", features = ["sched", "mount", "signal", "process", "user"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 base64 = "0.22"
 crypto_box = { version = "0.9", features = ["seal"] }

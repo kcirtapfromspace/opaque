@@ -75,7 +75,7 @@ enum Cmd {
     Ping,
     /// Read daemon version.
     Version,
-    /// Debug client identity (placeholder).
+    /// Show how the daemon identifies this client (uid, gid, exe path, pid).
     Whoami,
     /// Execute an operation through the enclave.
     Execute {
