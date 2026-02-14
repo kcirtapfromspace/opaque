@@ -709,6 +709,11 @@ fn resolve_workspace_context() -> Option<serde_json::Value> {
     }))
 }
 
+/// Maximum number of connection retry attempts.
+const MAX_RETRIES: u32 = 3;
+/// Initial retry delay (doubles each attempt).
+const INITIAL_RETRY_MS: u64 = 200;
+
 async fn call(
     sock: &PathBuf,
     method: &str,
@@ -720,6 +725,46 @@ async fn call(
     // Read daemon token before connecting.
     let daemon_token = read_daemon_token(sock)?;
 
+    // Retry connection with exponential backoff (200ms → 400ms → 800ms).
+    let mut last_err = None;
+    for attempt in 0..=MAX_RETRIES {
+        if attempt > 0 {
+            let delay = INITIAL_RETRY_MS * 2u64.pow(attempt - 1);
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+
+        match call_once(sock, method, &params, &daemon_token).await {
+            Ok(resp) => return Ok(resp),
+            Err(e) => {
+                // Only retry on connection-related errors, not protocol errors.
+                let retryable = matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::BrokenPipe
+                );
+                if !retryable || attempt == MAX_RETRIES {
+                    return Err(e);
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::other("connection failed after retries")
+    }))
+}
+
+/// Single connection attempt — no retries.
+async fn call_once(
+    sock: &PathBuf,
+    method: &str,
+    params: &serde_json::Value,
+    daemon_token: &str,
+) -> std::io::Result<Response> {
     let stream = tokio::time::timeout(Duration::from_secs(30), UnixStream::connect(sock))
         .await
         .map_err(|_| {
@@ -754,7 +799,7 @@ async fn call(
     let req = Request {
         id: 1,
         method: method.to_string(),
-        params,
+        params: params.clone(),
     };
     let out = serde_json::to_vec(&req).map_err(std::io::Error::other)?;
     framed.send(Bytes::from(out)).await?;

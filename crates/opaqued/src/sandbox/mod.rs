@@ -157,10 +157,16 @@ impl OperationHandler for SandboxExecutor {
             // and deadlock output tasks that are awaiting `send()`.
             let (tx, mut rx) = mpsc::channel::<ExecFrame>(64);
 
+            /// Maximum bytes of stdout/stderr to capture in the response.
+            /// Output beyond this is counted but not returned.
+            const MAX_CAPTURE_BYTES: usize = 64 * 1024; // 64 KB
+
             #[derive(Debug, Default)]
             struct FrameSummary {
                 stdout_len: u64,
                 stderr_len: u64,
+                stdout: String,
+                stderr: String,
                 duration_ms: u64,
             }
 
@@ -174,11 +180,23 @@ impl OperationHandler for SandboxExecutor {
                         ExecFrame::Output {
                             stream: opaque_core::proto::ExecStream::Stdout,
                             data,
-                        } => s.stdout_len = s.stdout_len.saturating_add(data.len() as u64),
+                        } => {
+                            s.stdout_len = s.stdout_len.saturating_add(data.len() as u64);
+                            if s.stdout.len() < MAX_CAPTURE_BYTES {
+                                let remaining = MAX_CAPTURE_BYTES - s.stdout.len();
+                                s.stdout.push_str(&data[..data.len().min(remaining)]);
+                            }
+                        }
                         ExecFrame::Output {
                             stream: opaque_core::proto::ExecStream::Stderr,
                             data,
-                        } => s.stderr_len = s.stderr_len.saturating_add(data.len() as u64),
+                        } => {
+                            s.stderr_len = s.stderr_len.saturating_add(data.len() as u64);
+                            if s.stderr.len() < MAX_CAPTURE_BYTES {
+                                let remaining = MAX_CAPTURE_BYTES - s.stderr.len();
+                                s.stderr.push_str(&data[..data.len().min(remaining)]);
+                            }
+                        }
                         ExecFrame::ExecCompleted { duration_ms: d, .. } => s.duration_ms = d,
                         _ => {}
                     }
@@ -202,12 +220,17 @@ impl OperationHandler for SandboxExecutor {
 
             let s = summary.lock().await;
 
-            // Return a summary result (the streaming handler sends frames directly).
+            let truncated =
+                s.stdout.len() < s.stdout_len as usize || s.stderr.len() < s.stderr_len as usize;
+
             Ok(serde_json::json!({
                 "exit_code": exit_code,
                 "duration_ms": s.duration_ms,
                 "stdout_length": s.stdout_len,
                 "stderr_length": s.stderr_len,
+                "stdout": s.stdout,
+                "stderr": s.stderr,
+                "truncated": truncated,
             }))
         })
     }
