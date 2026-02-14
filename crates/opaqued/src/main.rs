@@ -437,6 +437,50 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
 
     registry
         .register(OperationDef {
+            name: "github.list_secrets".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::FirstUse,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "List GitHub secret names for a repository, environment, or org".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "scope": {"type": "string", "enum": ["actions", "codespaces", "dependabot", "org"]},
+                    "repo": {"type": "string"},
+                    "org": {"type": "string"},
+                    "environment": {"type": "string"},
+                    "github_token_ref": {"type": "string"}
+                }
+            })),
+            allowed_target_keys: vec!["repo".into(), "org".into()],
+        })
+        .expect("failed to register github.list_secrets");
+
+    registry
+        .register(OperationDef {
+            name: "github.delete_secret".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Delete a GitHub secret from a repository, environment, or org".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["secret_name"],
+                "properties": {
+                    "scope": {"type": "string", "enum": ["actions", "codespaces", "dependabot", "org"]},
+                    "secret_name": {"type": "string"},
+                    "repo": {"type": "string"},
+                    "org": {"type": "string"},
+                    "environment": {"type": "string"},
+                    "github_token_ref": {"type": "string"}
+                }
+            })),
+            allowed_target_keys: vec!["repo".into(), "org".into()],
+        })
+        .expect("failed to register github.delete_secret");
+
+    registry
+        .register(OperationDef {
             name: "onepassword.list_vaults".into(),
             safety: OperationSafety::Safe,
             default_approval: ApprovalRequirement::FirstUse,
@@ -446,6 +490,26 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec![],
         })
         .expect("failed to register onepassword.list_vaults");
+
+    registry
+        .register(OperationDef {
+            name: "onepassword.read_field".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Read a single field value from a 1Password item".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["vault", "item", "field"],
+                "properties": {
+                    "vault": {"type": "string"},
+                    "item": {"type": "string"},
+                    "field": {"type": "string"}
+                }
+            })),
+            allowed_target_keys: vec!["vault".into(), "item".into()],
+        })
+        .expect("failed to register onepassword.read_field");
 
     registry
         .register(OperationDef {
@@ -487,6 +551,8 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
     let github_codespaces_handler = github::GitHubHandler::new(audit.clone());
     let github_dependabot_handler = github::GitHubHandler::new(audit.clone());
     let github_org_handler = github::GitHubHandler::new(audit.clone());
+    let github_list_handler = github::GitHubHandler::new(audit.clone());
+    let github_delete_handler = github::GitHubHandler::new(audit.clone());
 
     // 1Password handler: prefer Connect Server URL, fall back to `op` CLI.
     let onepassword_connect_url =
@@ -509,7 +575,9 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             "github.set_dependabot_secret",
             Box::new(github_dependabot_handler),
         )
-        .handler("github.set_org_secret", Box::new(github_org_handler));
+        .handler("github.set_org_secret", Box::new(github_org_handler))
+        .handler("github.list_secrets", Box::new(github_list_handler))
+        .handler("github.delete_secret", Box::new(github_delete_handler));
 
     if !onepassword_connect_url.is_empty() {
         // Connect Server backend (self-hosted REST API).
@@ -517,9 +585,12 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             onepassword::OnePasswordHandler::new(audit.clone(), &onepassword_connect_url);
         let op_list_items_handler =
             onepassword::OnePasswordHandler::new(audit.clone(), &onepassword_connect_url);
+        let op_read_field_handler =
+            onepassword::OnePasswordHandler::new(audit.clone(), &onepassword_connect_url);
         enclave_builder = enclave_builder
             .handler("onepassword.list_vaults", Box::new(op_list_vaults_handler))
-            .handler("onepassword.list_items", Box::new(op_list_items_handler));
+            .handler("onepassword.list_items", Box::new(op_list_items_handler))
+            .handler("onepassword.read_field", Box::new(op_read_field_handler));
         info!(
             "1Password handler enabled via Connect Server ({})",
             onepassword_connect_url
@@ -528,10 +599,14 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         // `op` CLI backend (desktop app + biometric auth).
         let op_list_vaults_handler =
             onepassword::OnePasswordHandler::from_cli(audit.clone(), cli.clone());
-        let op_list_items_handler = onepassword::OnePasswordHandler::from_cli(audit.clone(), cli);
+        let op_list_items_handler =
+            onepassword::OnePasswordHandler::from_cli(audit.clone(), cli.clone());
+        let op_read_field_handler =
+            onepassword::OnePasswordHandler::from_cli(audit.clone(), cli);
         enclave_builder = enclave_builder
             .handler("onepassword.list_vaults", Box::new(op_list_vaults_handler))
-            .handler("onepassword.list_items", Box::new(op_list_items_handler));
+            .handler("onepassword.list_items", Box::new(op_list_items_handler))
+            .handler("onepassword.read_field", Box::new(op_read_field_handler));
         info!("1Password handler enabled via op CLI");
     } else {
         info!("1Password handler disabled (no Connect URL or op CLI found)");
