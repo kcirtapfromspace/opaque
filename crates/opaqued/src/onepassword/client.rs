@@ -98,12 +98,6 @@ impl OnePasswordClient {
         }
     }
 
-    /// Create a client pointing at a custom base URL (for testing).
-    #[cfg(test)]
-    pub fn with_base_url(base_url: String) -> Self {
-        Self::new(&base_url)
-    }
-
     /// List all vaults accessible with the given token.
     pub async fn list_vaults(&self, token: &str) -> Result<Vec<Vault>, ConnectApiError> {
         let url = format!("{}/v1/vaults", self.base_url);
@@ -336,5 +330,366 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].title, "Token");
         assert_eq!(items[1].category, "API_CREDENTIAL");
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration tests using wiremock
+    // -----------------------------------------------------------------------
+
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn list_vaults_success() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/vaults"))
+            .and(header("Authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": "v1", "name": "Personal", "description": "My vault"},
+                {"id": "v2", "name": "Shared"}
+            ])))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = OnePasswordClient::new(&mock_server.uri());
+        let vaults = client.list_vaults("test-token").await.unwrap();
+
+        assert_eq!(vaults.len(), 2);
+        assert_eq!(vaults[0].id, "v1");
+        assert_eq!(vaults[0].name, "Personal");
+        assert_eq!(vaults[0].description.as_deref(), Some("My vault"));
+        assert_eq!(vaults[1].id, "v2");
+        assert_eq!(vaults[1].name, "Shared");
+        assert!(vaults[1].description.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_vaults_unauthorized() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/vaults"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = OnePasswordClient::new(&mock_server.uri());
+        let result = client.list_vaults("bad-token").await;
+
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), ConnectApiError::Unauthorized));
+    }
+
+    #[tokio::test]
+    async fn list_vaults_server_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/vaults"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = OnePasswordClient::new(&mock_server.uri());
+        let result = client.list_vaults("token").await;
+
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), ConnectApiError::ServerError));
+    }
+
+    #[tokio::test]
+    async fn list_items_success() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/vaults/v1/items"))
+            .and(header("Authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": "i1", "title": "GitHub Token", "category": "LOGIN"},
+                {"id": "i2", "title": "API Key", "category": "API_CREDENTIAL"}
+            ])))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = OnePasswordClient::new(&mock_server.uri());
+        let items = client.list_items("test-token", "v1").await.unwrap();
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].title, "GitHub Token");
+        assert_eq!(items[1].title, "API Key");
+        assert_eq!(items[1].category, "API_CREDENTIAL");
+    }
+
+    #[tokio::test]
+    async fn list_items_vault_not_found() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/vaults/nonexistent/items"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = OnePasswordClient::new(&mock_server.uri());
+        let result = client.list_items("token", "nonexistent").await;
+
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), ConnectApiError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn get_item_success() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/vaults/v1/items/i1"))
+            .and(header("Authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "i1",
+                "title": "GitHub Token",
+                "fields": [
+                    {"id": "f1", "label": "username", "value": "user@example.com"},
+                    {"id": "f2", "label": "password", "value": "ghp_secret123"}
+                ]
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = OnePasswordClient::new(&mock_server.uri());
+        let item = client.get_item("test-token", "v1", "i1").await.unwrap();
+
+        assert_eq!(item.id, "i1");
+        assert_eq!(item.title, "GitHub Token");
+        assert_eq!(item.fields.len(), 2);
+        assert_eq!(item.fields[0].label.as_deref(), Some("username"));
+        assert_eq!(item.fields[0].value.as_deref(), Some("user@example.com"));
+        assert_eq!(item.fields[1].label.as_deref(), Some("password"));
+        assert_eq!(item.fields[1].value.as_deref(), Some("ghp_secret123"));
+    }
+
+    #[tokio::test]
+    async fn get_item_not_found() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/vaults/v1/items/missing"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = OnePasswordClient::new(&mock_server.uri());
+        let result = client.get_item("token", "v1", "missing").await;
+
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), ConnectApiError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn find_vault_by_name_success() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/vaults"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": "v1", "name": "Personal"},
+                {"id": "v2", "name": "Work"}
+            ])))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = OnePasswordClient::new(&mock_server.uri());
+        let vault_id = client.find_vault_by_name("token", "Work").await.unwrap();
+        assert_eq!(vault_id, "v2");
+    }
+
+    #[tokio::test]
+    async fn find_vault_by_name_not_found() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/vaults"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": "v1", "name": "Personal"}
+            ])))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = OnePasswordClient::new(&mock_server.uri());
+        let result = client.find_vault_by_name("token", "Nonexistent").await;
+
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), ConnectApiError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn find_item_by_title_success() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/vaults/v1/items"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": "i1", "title": "GitHub Token", "category": "LOGIN"},
+                {"id": "i2", "title": "API Key", "category": "API_CREDENTIAL"}
+            ])))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = OnePasswordClient::new(&mock_server.uri());
+        let item_id = client
+            .find_item_by_title("token", "v1", "API Key")
+            .await
+            .unwrap();
+        assert_eq!(item_id, "i2");
+    }
+
+    /// Full end-to-end resolution chain:
+    /// find_vault_by_name → find_item_by_title → get_item → extract field
+    #[tokio::test]
+    async fn full_resolution_chain() {
+        let mock_server = MockServer::start().await;
+
+        // Step 1: list vaults → find "Personal" → vault_id="v1"
+        Mock::given(method("GET"))
+            .and(path("/v1/vaults"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": "v1", "name": "Personal", "description": "My personal vault"}
+            ])))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // Step 2: list items in v1 → find "GitHub Token" → item_id="i1"
+        Mock::given(method("GET"))
+            .and(path("/v1/vaults/v1/items"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": "i1", "title": "GitHub Token", "category": "LOGIN"}
+            ])))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // Step 3: get item i1 with fields → extract "password" field
+        Mock::given(method("GET"))
+            .and(path("/v1/vaults/v1/items/i1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "i1",
+                "title": "GitHub Token",
+                "fields": [
+                    {"id": "f1", "label": "username", "value": "user@example.com"},
+                    {"id": "f2", "label": "password", "value": "ghp_realtoken123"}
+                ]
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = OnePasswordClient::new(&mock_server.uri());
+        let token = "test-connect-token";
+
+        // Simulate the full resolution chain that OnePasswordResolver does:
+        let vault_id = client.find_vault_by_name(token, "Personal").await.unwrap();
+        assert_eq!(vault_id, "v1");
+
+        let item_id = client
+            .find_item_by_title(token, &vault_id, "GitHub Token")
+            .await
+            .unwrap();
+        assert_eq!(item_id, "i1");
+
+        let item = client.get_item(token, &vault_id, &item_id).await.unwrap();
+        let password = item
+            .fields
+            .iter()
+            .find(|f| f.label.as_deref() == Some("password"))
+            .and_then(|f| f.value.as_deref())
+            .unwrap();
+        assert_eq!(password, "ghp_realtoken123");
+    }
+
+    /// Verify bearer token is sent correctly in the Authorization header.
+    #[tokio::test]
+    async fn bearer_auth_header_sent() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/vaults"))
+            .and(header("Authorization", "Bearer my-secret-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = OnePasswordClient::new(&mock_server.uri());
+        let vaults = client.list_vaults("my-secret-token").await.unwrap();
+        assert!(vaults.is_empty());
+    }
+
+    /// Verify the user-agent header is sent.
+    #[tokio::test]
+    async fn user_agent_header_sent() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/vaults"))
+            .and(header(
+                "user-agent",
+                &format!("opaqued/{}", env!("CARGO_PKG_VERSION")),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = OnePasswordClient::new(&mock_server.uri());
+        client.list_vaults("token").await.unwrap();
+    }
+
+    /// Verify unexpected status codes are handled.
+    #[tokio::test]
+    async fn unexpected_status_code() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/vaults"))
+            .respond_with(ResponseTemplate::new(418)) // I'm a teapot
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = OnePasswordClient::new(&mock_server.uri());
+        let result = client.list_vaults("token").await;
+        assert!(matches!(
+            result.unwrap_err(),
+            ConnectApiError::UnexpectedStatus(418)
+        ));
+    }
+
+    /// Verify 403 is treated as unauthorized (same as 401).
+    #[tokio::test]
+    async fn forbidden_treated_as_unauthorized() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/vaults"))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = OnePasswordClient::new(&mock_server.uri());
+        let result = client.list_vaults("token").await;
+        assert!(matches!(result.unwrap_err(), ConnectApiError::Unauthorized));
     }
 }
