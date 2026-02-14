@@ -159,6 +159,36 @@ fn format_operation_result(result: &serde_json::Value) {
         }
     };
 
+    // github.list_secrets returns total_count + secrets array.
+    if let Some(secrets) = obj.get("secrets").and_then(|v| v.as_array()) {
+        let total = obj
+            .get("total_count")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(secrets.len() as i64);
+        header(&format!("{total} secret(s)"));
+        for secret in secrets {
+            let name = secret
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(unknown)");
+            let updated = secret
+                .get("updated_at")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if updated.is_empty() {
+                println!("  {} {}", style(KEY).dim(), style(name).yellow().bold());
+            } else {
+                println!(
+                    "  {} {}  {}",
+                    style(KEY).dim(),
+                    style(name).yellow().bold(),
+                    style(format!("(updated {updated})")).dim()
+                );
+            }
+        }
+        return;
+    }
+
     // sandbox.exec returns stdout/stderr + exit code.
     if let Some(exit_code) = obj.get("exit_code").and_then(|v| v.as_i64()) {
         // Print captured stdout directly (not styled — preserve command output).
@@ -312,6 +342,14 @@ fn format_onepassword_result(result: &serde_json::Value) {
                 );
             }
         }
+    } else if result.get("field").is_some() {
+        // read_field response: vault, item, field, value.
+        let vault = result.get("vault").and_then(|v| v.as_str()).unwrap_or("?");
+        let item = result.get("item").and_then(|v| v.as_str()).unwrap_or("?");
+        let field = result.get("field").and_then(|v| v.as_str()).unwrap_or("?");
+        let value = result.get("value").and_then(|v| v.as_str()).unwrap_or("");
+        header(&format!("{vault}/{item}/{field}"));
+        println!("  {}", value);
     } else if let Some(items) = result.get("items").and_then(|v| v.as_array()) {
         let vault_name = result
             .get("vault")
