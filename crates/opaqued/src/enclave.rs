@@ -291,6 +291,38 @@ impl LeaseCache {
             .expect("lease cache mutex poisoned")
             .clear();
     }
+
+    /// Return a snapshot of active (non-expired) leases for introspection.
+    fn active_leases(&self) -> Vec<LeaseInfo> {
+        let leases = self.leases.lock().expect("lease cache mutex poisoned");
+        let now = tokio::time::Instant::now();
+        leases
+            .iter()
+            .filter_map(|(key, entry)| {
+                let elapsed = now.duration_since(entry.granted_at);
+                if elapsed >= entry.ttl {
+                    return None; // expired
+                }
+                Some(LeaseInfo {
+                    operation: key.operation.clone(),
+                    target: key.target_canonical.clone(),
+                    client_fingerprint: key.client_fingerprint[..12].to_string(),
+                    ttl_remaining_secs: (entry.ttl - elapsed).as_secs(),
+                    one_time: entry.one_time,
+                })
+            })
+            .collect()
+    }
+}
+
+/// Serializable snapshot of a single active lease.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LeaseInfo {
+    pub operation: String,
+    pub target: String,
+    pub client_fingerprint: String,
+    pub ttl_remaining_secs: u64,
+    pub one_time: bool,
 }
 
 impl fmt::Debug for LeaseCache {
@@ -491,6 +523,11 @@ impl Enclave {
     /// Create a builder for constructing an enclave.
     pub fn builder() -> EnclaveBuilder {
         EnclaveBuilder::new()
+    }
+
+    /// Return a snapshot of active (non-expired) approval leases.
+    pub fn active_leases(&self) -> Vec<LeaseInfo> {
+        self.lease_cache.active_leases()
     }
 
     /// Execute an operation request through the full enforcement funnel.
@@ -2896,5 +2933,30 @@ mod tests {
         let req = test_request("ecr.get_auth_token", ClientType::Human);
         let resp = enclave.execute(req).await;
         assert!(resp.error_code().is_none());
+    }
+
+    // -- Active leases introspection --
+
+    #[tokio::test]
+    async fn active_leases_returns_non_expired_entries() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let (gate, _count) = CountingApproveGate::new();
+        let policy = test_first_use_policy(Some(Duration::from_secs(300)), false);
+        let enclave = build_lease_enclave(Box::new(gate), audit.clone(), policy);
+
+        // Before any requests, no leases.
+        assert!(enclave.active_leases().is_empty());
+
+        // Execute a request → should create a lease.
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let resp = enclave.execute(req).await;
+        assert!(resp.error_code().is_none());
+
+        // Now should have one active lease.
+        let leases = enclave.active_leases();
+        assert_eq!(leases.len(), 1, "expected 1 active lease, got {}", leases.len());
+        assert_eq!(leases[0].operation, "github.set_actions_secret");
+        assert!(leases[0].ttl_remaining_secs > 0);
+        assert!(!leases[0].one_time);
     }
 }

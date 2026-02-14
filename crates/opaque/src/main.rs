@@ -151,6 +151,8 @@ enum Cmd {
     },
     /// Diagnose your Opaque installation and report issues.
     Doctor,
+    /// List active approval leases in the daemon.
+    Leases,
 }
 
 #[derive(Debug, Subcommand)]
@@ -407,6 +409,10 @@ enum AuditAction {
         /// Filter by request correlation ID.
         #[arg(long)]
         request_id: Option<String>,
+
+        /// Filter by outcome (e.g. "allowed", "denied", "error").
+        #[arg(long)]
+        outcome: Option<String>,
     },
 }
 
@@ -497,6 +503,7 @@ async fn main() {
                     operation,
                     since,
                     request_id,
+                    outcome,
                 } => {
                     match run_audit_tail(
                         *limit,
@@ -504,6 +511,7 @@ async fn main() {
                         operation.as_deref(),
                         since.as_deref(),
                         request_id.as_deref(),
+                        outcome.as_deref(),
                     ) {
                         Ok(()) => {}
                         Err(e) => {
@@ -579,6 +587,7 @@ async fn main() {
         Cmd::Ping => ("ping", serde_json::Value::Null),
         Cmd::Version => ("version", serde_json::Value::Null),
         Cmd::Whoami => ("whoami", serde_json::Value::Null),
+        Cmd::Leases => ("leases", serde_json::Value::Null),
         Cmd::Execute {
             operation,
             target,
@@ -1010,6 +1019,7 @@ fn run_audit_tail(
     operation: Option<&str>,
     since: Option<&str>,
     request_id: Option<&str>,
+    outcome: Option<&str>,
 ) -> Result<(), String> {
     let db_path = default_opaque_dir().join("audit.db");
     if !db_path.exists() {
@@ -1052,6 +1062,7 @@ fn run_audit_tail(
         since_ms,
         limit,
         request_id,
+        outcome: outcome.map(|s| s.to_owned()),
     };
 
     let events = query_audit_db(&db_path, &filter).map_err(|e| format!("query failed: {e}"))?;
