@@ -1108,7 +1108,7 @@ mod tests {
 
     use opaque_core::operation::{
         ApprovalFactor, ApprovalRequirement, ClientIdentity, ClientType, OperationDef,
-        OperationRequest, OperationSafety,
+        OperationRequest, OperationSafety, WorkspaceContext,
     };
     use opaque_core::policy::*;
 
@@ -1872,5 +1872,1029 @@ mod tests {
         assert!(hit.request_id.is_some());
         assert!(hit.client.is_some());
         assert!(hit.target.is_some());
+    }
+
+    // ======================================================================
+    // Approval flow integration tests
+    // ======================================================================
+
+    /// An approval gate that returns Err (simulating unavailable approval UI).
+    #[derive(Debug)]
+    struct ErrorGate {
+        message: String,
+    }
+
+    impl ApprovalGate for ErrorGate {
+        fn request_approval(
+            &self,
+            _approval_id: Uuid,
+            _request: &OperationRequest,
+            _factors: &[ApprovalFactor],
+            _description: &str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>>
+        {
+            let msg = self.message.clone();
+            Box::pin(async move { Err(msg) })
+        }
+    }
+
+    /// An approval gate that sleeps for a configurable duration before approving.
+    /// Tracks how many concurrent approvals are in-flight.
+    #[derive(Debug)]
+    struct SlowApproveGate {
+        delay: Duration,
+        max_concurrent: Arc<std::sync::atomic::AtomicU32>,
+        current: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl SlowApproveGate {
+        fn new(delay: Duration) -> (Self, Arc<std::sync::atomic::AtomicU32>) {
+            let max_concurrent = Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let current = Arc::new(std::sync::atomic::AtomicU32::new(0));
+            (
+                Self {
+                    delay,
+                    max_concurrent: max_concurrent.clone(),
+                    current,
+                },
+                max_concurrent,
+            )
+        }
+    }
+
+    impl ApprovalGate for SlowApproveGate {
+        fn request_approval(
+            &self,
+            _approval_id: Uuid,
+            _request: &OperationRequest,
+            _factors: &[ApprovalFactor],
+            _description: &str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>>
+        {
+            let delay = self.delay;
+            let max_conc = self.max_concurrent.clone();
+            let current = self.current.clone();
+            Box::pin(async move {
+                let prev = current.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let in_flight = prev + 1;
+                // Update high water mark.
+                max_conc.fetch_max(in_flight, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(delay).await;
+                current.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(true)
+            })
+        }
+    }
+
+    /// An approval gate that captures the description string for assertion.
+    #[derive(Debug)]
+    struct CapturingGate {
+        descriptions: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl CapturingGate {
+        fn new() -> (Self, Arc<Mutex<Vec<String>>>) {
+            let descriptions = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    descriptions: descriptions.clone(),
+                },
+                descriptions,
+            )
+        }
+    }
+
+    impl ApprovalGate for CapturingGate {
+        fn request_approval(
+            &self,
+            _approval_id: Uuid,
+            _request: &OperationRequest,
+            _factors: &[ApprovalFactor],
+            description: &str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>>
+        {
+            self.descriptions
+                .lock()
+                .expect("capturing gate mutex")
+                .push(description.to_owned());
+            Box::pin(async { Ok(true) })
+        }
+    }
+
+    // -- Approval gate error path --
+
+    #[tokio::test]
+    async fn approval_gate_error_returns_unavailable() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let gate = ErrorGate {
+            message: "Touch ID not available in SSH session".into(),
+        };
+        let enclave = build_enclave(Box::new(gate), audit.clone());
+
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let resp = enclave.execute(req).await;
+
+        assert_eq!(resp.error_code(), Some("approval_unavailable"));
+
+        // Audit should record the approval denial with "error" outcome.
+        let denied = audit.events_of_kind(AuditEventKind::ApprovalDenied);
+        assert!(!denied.is_empty());
+        assert_eq!(denied[0].outcome.as_deref(), Some("error"));
+    }
+
+    // -- Never approval skips gate --
+
+    #[tokio::test]
+    async fn never_approval_skips_gate_entirely() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let (gate, count) = CountingApproveGate::new();
+
+        let policy = PolicyEngine::with_rules(vec![PolicyRule {
+            name: "allow-no-approval".into(),
+            client: ClientMatch {
+                uid: Some(501),
+                exe_path: Some("/usr/bin/claude*".into()),
+                ..Default::default()
+            },
+            operation_pattern: "github.*".into(),
+            target: TargetMatch {
+                fields: {
+                    let mut m = HashMap::new();
+                    m.insert("repo".into(), "org/*".into());
+                    m
+                },
+            },
+            workspace: WorkspaceMatch::default(),
+            secret_names: SecretNameMatch::default(),
+            allow: true,
+            client_types: vec![ClientType::Agent, ClientType::Human],
+            approval: ApprovalConfig {
+                require: ApprovalRequirement::Never,
+                factors: vec![],
+                lease_ttl: None,
+                one_time: false,
+            },
+        }]);
+
+        let enclave = Enclave::builder()
+            .registry(test_registry())
+            .policy(policy)
+            .handler(
+                "github.set_actions_secret",
+                Box::new(StubHandler {
+                    response: serde_json::json!({"status": "ok"}),
+                }),
+            )
+            .approval_gate(Box::new(gate))
+            .audit(audit.clone())
+            .build();
+
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let resp = enclave.execute(req).await;
+
+        assert!(resp.error_code().is_none());
+        // Gate should never have been called.
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // No approval events should be emitted.
+        assert!(audit
+            .events_of_kind(AuditEventKind::ApprovalRequired)
+            .is_empty());
+        assert!(audit
+            .events_of_kind(AuditEventKind::ApprovalPresented)
+            .is_empty());
+        assert!(audit
+            .events_of_kind(AuditEventKind::ApprovalGranted)
+            .is_empty());
+    }
+
+    // -- Concurrent approval serialization --
+
+    #[tokio::test]
+    async fn approval_serialized_by_semaphore() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let (gate, max_concurrent) = SlowApproveGate::new(Duration::from_millis(50));
+
+        // Use a FirstUse policy so leases don't interfere between requests
+        // (different targets → no lease reuse).
+        let mut policy = test_first_use_policy(Some(Duration::from_secs(300)), false);
+        // Add a second target rule.
+        policy.add_rule(PolicyRule {
+            name: "allow-other".into(),
+            client: ClientMatch {
+                uid: Some(501),
+                exe_path: Some("/usr/bin/claude*".into()),
+                ..Default::default()
+            },
+            operation_pattern: "github.*".into(),
+            target: TargetMatch {
+                fields: {
+                    let mut m = HashMap::new();
+                    m.insert("repo".into(), "other/*".into());
+                    m
+                },
+            },
+            workspace: WorkspaceMatch::default(),
+            secret_names: SecretNameMatch::default(),
+            allow: true,
+            client_types: vec![ClientType::Agent, ClientType::Human],
+            approval: ApprovalConfig {
+                require: ApprovalRequirement::Always,
+                factors: vec![ApprovalFactor::LocalBio],
+                lease_ttl: None,
+                one_time: false,
+            },
+        });
+
+        let enclave = Arc::new(
+            Enclave::builder()
+                .registry(test_registry())
+                .policy(policy)
+                .handler(
+                    "github.set_actions_secret",
+                    Box::new(StubHandler {
+                        response: serde_json::json!({"status": "ok"}),
+                    }),
+                )
+                .approval_gate(Box::new(gate))
+                .audit(audit.clone())
+                .build(),
+        );
+
+        // Fire 3 concurrent requests with different targets (so no lease hits).
+        let targets = ["org/repo1", "org/repo2", "other/repo3"];
+        let mut handles = vec![];
+        for target in targets {
+            let enc = enclave.clone();
+            let t = target.to_string();
+            handles.push(tokio::spawn(async move {
+                let mut req = test_request("github.set_actions_secret", ClientType::Agent);
+                req.target.insert("repo".into(), t);
+                enc.execute(req).await
+            }));
+        }
+
+        for h in handles {
+            let resp = h.await.unwrap();
+            assert!(resp.error_code().is_none());
+        }
+
+        // The semaphore should ensure max 1 concurrent approval prompt.
+        assert_eq!(
+            max_concurrent.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "semaphore should serialize approval prompts to max 1 concurrent"
+        );
+    }
+
+    // -- Target key validation --
+
+    #[tokio::test]
+    async fn unexpected_target_key_rejected() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+
+        let mut registry = OperationRegistry::new();
+        registry
+            .register(OperationDef {
+                name: "restricted.op".into(),
+                safety: OperationSafety::Safe,
+                default_approval: ApprovalRequirement::Never,
+                default_factors: vec![],
+                description: "Op with restricted target keys".into(),
+                params_schema: None,
+                allowed_target_keys: vec!["repo".into(), "environment".into()],
+            })
+            .unwrap();
+
+        let policy = PolicyEngine::with_rules(vec![PolicyRule {
+            name: "allow-restricted".into(),
+            client: ClientMatch::default(),
+            operation_pattern: "restricted.*".into(),
+            target: TargetMatch::default(),
+            workspace: WorkspaceMatch::default(),
+            secret_names: SecretNameMatch::default(),
+            allow: true,
+            client_types: vec![],
+            approval: ApprovalConfig {
+                require: ApprovalRequirement::Never,
+                factors: vec![],
+                lease_ttl: None,
+                one_time: false,
+            },
+        }]);
+
+        let enclave = Enclave::builder()
+            .registry(registry)
+            .policy(policy)
+            .handler(
+                "restricted.op",
+                Box::new(StubHandler {
+                    response: serde_json::json!({"status": "ok"}),
+                }),
+            )
+            .approval_gate(Box::new(AlwaysApproveGate))
+            .audit(audit.clone())
+            .build();
+
+        // Request with allowed keys → success.
+        let mut req = test_request("restricted.op", ClientType::Human);
+        req.target.clear();
+        req.target.insert("repo".into(), "org/repo".into());
+        let resp = enclave.execute(req).await;
+        assert!(resp.error_code().is_none());
+
+        // Request with unexpected key → rejected.
+        let mut req = test_request("restricted.op", ClientType::Human);
+        req.target.clear();
+        req.target
+            .insert("repo".into(), "org/repo".into());
+        req.target
+            .insert("injected_field".into(), "malicious".into());
+        let resp = enclave.execute(req).await;
+        assert_eq!(resp.error_code(), Some("bad_request"));
+    }
+
+    // -- Params schema validation at enclave level --
+
+    #[tokio::test]
+    async fn params_schema_validation_at_enclave() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+
+        let mut registry = OperationRegistry::new();
+        registry
+            .register(OperationDef {
+                name: "schema.op".into(),
+                safety: OperationSafety::Safe,
+                default_approval: ApprovalRequirement::Never,
+                default_factors: vec![],
+                description: "Op with param schema".into(),
+                params_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "count": { "type": "integer" }
+                    },
+                    "required": ["count"]
+                })),
+                allowed_target_keys: vec![],
+            })
+            .unwrap();
+
+        let policy = PolicyEngine::with_rules(vec![PolicyRule {
+            name: "allow-schema".into(),
+            client: ClientMatch::default(),
+            operation_pattern: "schema.*".into(),
+            target: TargetMatch::default(),
+            workspace: WorkspaceMatch::default(),
+            secret_names: SecretNameMatch::default(),
+            allow: true,
+            client_types: vec![],
+            approval: ApprovalConfig {
+                require: ApprovalRequirement::Never,
+                factors: vec![],
+                lease_ttl: None,
+                one_time: false,
+            },
+        }]);
+
+        let enclave = Enclave::builder()
+            .registry(registry)
+            .policy(policy)
+            .handler(
+                "schema.op",
+                Box::new(StubHandler {
+                    response: serde_json::json!({"status": "ok"}),
+                }),
+            )
+            .approval_gate(Box::new(AlwaysApproveGate))
+            .audit(audit.clone())
+            .build();
+
+        // Valid params → success.
+        let mut req = test_request("schema.op", ClientType::Human);
+        req.params = serde_json::json!({"count": 42});
+        let resp = enclave.execute(req).await;
+        assert!(resp.error_code().is_none());
+
+        // Missing required param → rejected.
+        let mut req = test_request("schema.op", ClientType::Human);
+        req.params = serde_json::json!({});
+        let resp = enclave.execute(req).await;
+        assert_eq!(resp.error_code(), Some("invalid_params"));
+
+        // Wrong type → rejected.
+        let mut req = test_request("schema.op", ClientType::Human);
+        req.params = serde_json::json!({"count": "not_a_number"});
+        let resp = enclave.execute(req).await;
+        assert_eq!(resp.error_code(), Some("invalid_params"));
+    }
+
+    // -- Workspace-scoped policy through enclave --
+
+    #[tokio::test]
+    async fn workspace_constraint_enforced_through_enclave() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+
+        let policy = PolicyEngine::with_rules(vec![PolicyRule {
+            name: "allow-main-only".into(),
+            client: ClientMatch {
+                uid: Some(501),
+                exe_path: Some("/usr/bin/claude*".into()),
+                ..Default::default()
+            },
+            operation_pattern: "github.*".into(),
+            target: TargetMatch {
+                fields: {
+                    let mut m = HashMap::new();
+                    m.insert("repo".into(), "org/*".into());
+                    m
+                },
+            },
+            workspace: WorkspaceMatch {
+                remote_url_pattern: Some("*github.com:org/*".into()),
+                branch_pattern: Some("main".into()),
+                require_clean: false,
+            },
+            secret_names: SecretNameMatch::default(),
+            allow: true,
+            client_types: vec![ClientType::Agent, ClientType::Human],
+            approval: ApprovalConfig {
+                require: ApprovalRequirement::Always,
+                factors: vec![ApprovalFactor::LocalBio],
+                lease_ttl: None,
+                one_time: false,
+            },
+        }]);
+
+        let enclave = Enclave::builder()
+            .registry(test_registry())
+            .policy(policy)
+            .handler(
+                "github.set_actions_secret",
+                Box::new(StubHandler {
+                    response: serde_json::json!({"status": "ok"}),
+                }),
+            )
+            .approval_gate(Box::new(AlwaysApproveGate))
+            .audit(audit.clone())
+            .build();
+
+        // Request without workspace → denied (rule requires workspace).
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let resp = enclave.execute(req).await;
+        assert_eq!(resp.error_code(), Some("policy_denied"));
+
+        // Request with wrong branch → denied.
+        let mut req = test_request("github.set_actions_secret", ClientType::Agent);
+        req.workspace = Some(WorkspaceContext {
+            repo_root: "/tmp/repo".into(),
+            remote_url: Some("git@github.com:org/repo.git".into()),
+            branch: Some("feature/x".into()),
+            head_sha: None,
+            dirty: false,
+        });
+        let resp = enclave.execute(req).await;
+        assert_eq!(resp.error_code(), Some("policy_denied"));
+
+        // Request with correct workspace → allowed.
+        let mut req = test_request("github.set_actions_secret", ClientType::Agent);
+        req.workspace = Some(WorkspaceContext {
+            repo_root: "/tmp/repo".into(),
+            remote_url: Some("git@github.com:org/repo.git".into()),
+            branch: Some("main".into()),
+            head_sha: None,
+            dirty: false,
+        });
+        let resp = enclave.execute(req).await;
+        assert!(resp.error_code().is_none());
+    }
+
+    // -- Secret name constraint through enclave --
+
+    #[tokio::test]
+    async fn secret_name_constraint_enforced_through_enclave() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+
+        let policy = PolicyEngine::with_rules(vec![PolicyRule {
+            name: "allow-jwt-only".into(),
+            client: ClientMatch {
+                uid: Some(501),
+                exe_path: Some("/usr/bin/claude*".into()),
+                ..Default::default()
+            },
+            operation_pattern: "github.*".into(),
+            target: TargetMatch {
+                fields: {
+                    let mut m = HashMap::new();
+                    m.insert("repo".into(), "org/*".into());
+                    m
+                },
+            },
+            workspace: WorkspaceMatch::default(),
+            secret_names: SecretNameMatch {
+                patterns: vec!["JWT".into(), "GH_*".into()],
+            },
+            allow: true,
+            client_types: vec![ClientType::Agent],
+            approval: ApprovalConfig {
+                require: ApprovalRequirement::Always,
+                factors: vec![ApprovalFactor::LocalBio],
+                lease_ttl: None,
+                one_time: false,
+            },
+        }]);
+
+        let enclave = Enclave::builder()
+            .registry(test_registry())
+            .policy(policy)
+            .handler(
+                "github.set_actions_secret",
+                Box::new(StubHandler {
+                    response: serde_json::json!({"status": "ok"}),
+                }),
+            )
+            .approval_gate(Box::new(AlwaysApproveGate))
+            .audit(audit.clone())
+            .build();
+
+        // Request with allowed secret name → success.
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        // req.secret_ref_names is ["JWT"] from test_request
+        let resp = enclave.execute(req).await;
+        assert!(resp.error_code().is_none());
+
+        // Request with disallowed secret name → denied.
+        let mut req = test_request("github.set_actions_secret", ClientType::Agent);
+        req.secret_ref_names = vec!["AWS_SECRET_KEY".into()];
+        let resp = enclave.execute(req).await;
+        assert_eq!(resp.error_code(), Some("policy_denied"));
+    }
+
+    // -- Approval description content binding --
+
+    #[tokio::test]
+    async fn approval_description_contains_operation_details() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let (gate, descriptions) = CapturingGate::new();
+        let enclave = build_enclave(Box::new(gate), audit.clone());
+
+        let mut req = test_request("github.set_actions_secret", ClientType::Agent);
+        req.target.insert("repo".into(), "org/myrepo".into());
+        req.secret_ref_names = vec!["JWT".into(), "API_KEY".into()];
+        let _ = enclave.execute(req).await;
+
+        let descs = descriptions.lock().expect("desc lock");
+        assert_eq!(descs.len(), 1);
+        let desc = &descs[0];
+
+        // Should contain the operation description.
+        assert!(
+            desc.contains("Set a GitHub Actions repository secret"),
+            "description should contain op description"
+        );
+        // Should contain target fields.
+        assert!(
+            desc.contains("repo: org/myrepo"),
+            "description should contain target repo"
+        );
+        // Should contain secret ref names.
+        assert!(desc.contains("JWT"), "description should list secret refs");
+        assert!(
+            desc.contains("API_KEY"),
+            "description should list secret refs"
+        );
+        // Should contain a request hash (16 hex chars prefix).
+        assert!(
+            desc.contains("Request Hash:"),
+            "description should contain request hash"
+        );
+        // Should contain client identity info.
+        assert!(
+            desc.contains("uid=501"),
+            "description should contain client identity"
+        );
+    }
+
+    // -- Handler execution receives correct request --
+
+    /// A handler that records the request it received.
+    #[derive(Debug)]
+    struct RecordingHandler {
+        received: Arc<Mutex<Vec<OperationRequest>>>,
+    }
+
+    impl OperationHandler for RecordingHandler {
+        fn execute(
+            &self,
+            request: &OperationRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + '_>,
+        > {
+            self.received
+                .lock()
+                .expect("recording handler mutex")
+                .push(request.clone());
+            Box::pin(async { Ok(serde_json::json!({"status": "ok"})) })
+        }
+    }
+
+    #[tokio::test]
+    async fn handler_receives_original_request() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let received = Arc::new(Mutex::new(Vec::new()));
+
+        let enclave = Enclave::builder()
+            .registry(test_registry())
+            .policy(test_policy())
+            .handler(
+                "github.set_actions_secret",
+                Box::new(RecordingHandler {
+                    received: received.clone(),
+                }),
+            )
+            .approval_gate(Box::new(AlwaysApproveGate))
+            .audit(audit.clone())
+            .build();
+
+        let mut req = test_request("github.set_actions_secret", ClientType::Agent);
+        let request_id = req.request_id;
+        req.target.insert("repo".into(), "org/myrepo".into());
+        req.secret_ref_names = vec!["DEPLOY_KEY".into()];
+        let resp = enclave.execute(req).await;
+
+        assert!(resp.error_code().is_none());
+
+        let recorded = received.lock().expect("recorded lock");
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].request_id, request_id);
+        assert_eq!(recorded[0].operation, "github.set_actions_secret");
+        assert_eq!(recorded[0].target["repo"], "org/myrepo");
+        assert_eq!(recorded[0].secret_ref_names, vec!["DEPLOY_KEY"]);
+    }
+
+    // -- Multiple operations with different approval requirements --
+
+    #[tokio::test]
+    async fn mixed_approval_requirements() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let (gate, count) = CountingApproveGate::new();
+
+        let mut registry = test_registry();
+        registry
+            .register(OperationDef {
+                name: "github.list_secrets".into(),
+                safety: OperationSafety::Safe,
+                default_approval: ApprovalRequirement::Never,
+                default_factors: vec![],
+                description: "List secrets (read-only)".into(),
+                params_schema: None,
+                allowed_target_keys: vec![],
+            })
+            .unwrap();
+
+        let policy = PolicyEngine::with_rules(vec![
+            // list_secrets: no approval needed.
+            PolicyRule {
+                name: "allow-list".into(),
+                client: ClientMatch {
+                    uid: Some(501),
+                    exe_path: Some("/usr/bin/claude*".into()),
+                    ..Default::default()
+                },
+                operation_pattern: "github.list_secrets".into(),
+                target: TargetMatch {
+                    fields: {
+                        let mut m = HashMap::new();
+                        m.insert("repo".into(), "org/*".into());
+                        m
+                    },
+                },
+                workspace: WorkspaceMatch::default(),
+                secret_names: SecretNameMatch::default(),
+                allow: true,
+                client_types: vec![ClientType::Agent],
+                approval: ApprovalConfig {
+                    require: ApprovalRequirement::Never,
+                    factors: vec![],
+                    lease_ttl: None,
+                    one_time: false,
+                },
+            },
+            // set_actions_secret: Always approval.
+            PolicyRule {
+                name: "allow-set".into(),
+                client: ClientMatch {
+                    uid: Some(501),
+                    exe_path: Some("/usr/bin/claude*".into()),
+                    ..Default::default()
+                },
+                operation_pattern: "github.set_actions_secret".into(),
+                target: TargetMatch {
+                    fields: {
+                        let mut m = HashMap::new();
+                        m.insert("repo".into(), "org/*".into());
+                        m
+                    },
+                },
+                workspace: WorkspaceMatch::default(),
+                secret_names: SecretNameMatch::default(),
+                allow: true,
+                client_types: vec![ClientType::Agent],
+                approval: ApprovalConfig {
+                    require: ApprovalRequirement::Always,
+                    factors: vec![ApprovalFactor::LocalBio],
+                    lease_ttl: None,
+                    one_time: false,
+                },
+            },
+        ]);
+
+        let enclave = Enclave::builder()
+            .registry(registry)
+            .policy(policy)
+            .handler(
+                "github.list_secrets",
+                Box::new(StubHandler {
+                    response: serde_json::json!({"total_count": 0, "secrets": []}),
+                }),
+            )
+            .handler(
+                "github.set_actions_secret",
+                Box::new(StubHandler {
+                    response: serde_json::json!({"status": "ok"}),
+                }),
+            )
+            .approval_gate(Box::new(gate))
+            .audit(audit.clone())
+            .build();
+
+        // list_secrets: no approval.
+        let req = test_request("github.list_secrets", ClientType::Agent);
+        let resp = enclave.execute(req).await;
+        assert!(resp.error_code().is_none());
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // set_actions_secret: requires approval.
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let resp = enclave.execute(req).await;
+        assert!(resp.error_code().is_none());
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // -- Denied policy then allowed on different target --
+
+    #[tokio::test]
+    async fn policy_deny_does_not_block_subsequent_allowed_requests() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let enclave = build_enclave(Box::new(AlwaysApproveGate), audit.clone());
+
+        // First: denied (wrong target).
+        let mut req = test_request("github.set_actions_secret", ClientType::Agent);
+        req.target.insert("repo".into(), "evil-org/repo".into());
+        let resp = enclave.execute(req).await;
+        assert_eq!(resp.error_code(), Some("policy_denied"));
+
+        // Second: allowed (correct target).
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let resp = enclave.execute(req).await;
+        assert!(resp.error_code().is_none());
+    }
+
+    // -- Handler failure does not poison enclave --
+
+    #[tokio::test]
+    async fn handler_failure_does_not_poison_enclave() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+
+        // Register a second operation alongside the failing one.
+        let mut registry = test_registry();
+        registry
+            .register(OperationDef {
+                name: "github.list_secrets".into(),
+                safety: OperationSafety::Safe,
+                default_approval: ApprovalRequirement::Always,
+                default_factors: vec![ApprovalFactor::LocalBio],
+                description: "List secrets".into(),
+                params_schema: None,
+                allowed_target_keys: vec![],
+            })
+            .unwrap();
+
+        let enclave = Enclave::builder()
+            .registry(registry)
+            .policy(test_policy())
+            .handler(
+                "github.set_actions_secret",
+                Box::new(FailingHandler {
+                    error_message: "connection refused".into(),
+                }),
+            )
+            .handler(
+                "github.list_secrets",
+                Box::new(StubHandler {
+                    response: serde_json::json!({"total_count": 0, "secrets": []}),
+                }),
+            )
+            .approval_gate(Box::new(AlwaysApproveGate))
+            .audit(audit.clone())
+            .build();
+
+        // First: fails.
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let resp = enclave.execute(req).await;
+        assert_eq!(resp.error_code(), Some("operation_failed"));
+
+        // Second: succeeds on a different operation.
+        let req = test_request("github.list_secrets", ClientType::Agent);
+        let resp = enclave.execute(req).await;
+        assert!(resp.error_code().is_none());
+    }
+
+    // -- Lease key excludes workspace context --
+
+    #[tokio::test]
+    async fn lease_key_excludes_workspace() {
+        // Workspace context is intentionally NOT part of the lease key.
+        // The lease is scoped to (client, operation, target, secret_refs).
+        // Workspace scoping is handled by policy rules, not lease keys.
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let (gate, count) = CountingApproveGate::new();
+        let policy = test_first_use_policy(Some(Duration::from_secs(300)), false);
+        let enclave = build_lease_enclave(Box::new(gate), audit.clone(), policy);
+
+        // First request with workspace A → triggers approval.
+        let mut req = test_request("github.set_actions_secret", ClientType::Agent);
+        req.workspace = Some(WorkspaceContext {
+            repo_root: "/tmp/repoA".into(),
+            remote_url: Some("https://github.com/org/repoA".into()),
+            branch: Some("main".into()),
+            head_sha: None,
+            dirty: false,
+        });
+        let _ = enclave.execute(req).await;
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Same canonical fields but different workspace → lease still hits
+        // because workspace is NOT in the lease key.
+        let mut req = test_request("github.set_actions_secret", ClientType::Agent);
+        req.workspace = Some(WorkspaceContext {
+            repo_root: "/tmp/repoB".into(),
+            remote_url: Some("https://github.com/org/repoB".into()),
+            branch: Some("develop".into()),
+            head_sha: None,
+            dirty: true,
+        });
+        let _ = enclave.execute(req).await;
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "lease key excludes workspace — should reuse lease"
+        );
+
+        // Request without workspace → also reuses same lease.
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let _ = enclave.execute(req).await;
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no workspace also reuses same lease"
+        );
+    }
+
+    // -- Lease differs by secret_ref_names --
+
+    #[tokio::test]
+    async fn lease_differs_by_secret_refs() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let (gate, count) = CountingApproveGate::new();
+        let policy = test_first_use_policy(Some(Duration::from_secs(300)), false);
+        let enclave = build_lease_enclave(Box::new(gate), audit.clone(), policy);
+
+        // First request with secret_ref "JWT" → triggers approval.
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let _ = enclave.execute(req).await;
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Same secret_ref → lease hit.
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let _ = enclave.execute(req).await;
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Different secret_ref → new approval.
+        let mut req = test_request("github.set_actions_secret", ClientType::Agent);
+        req.secret_ref_names = vec!["DEPLOY_TOKEN".into()];
+        let _ = enclave.execute(req).await;
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "different secret_ref_names should require new approval"
+        );
+    }
+
+    // -- Audit event ordering --
+
+    #[tokio::test]
+    async fn audit_events_in_correct_order() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let enclave = build_enclave(Box::new(AlwaysApproveGate), audit.clone());
+
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let _ = enclave.execute(req).await;
+
+        let events = audit.events();
+        let kinds: Vec<_> = events.iter().map(|e| e.kind).collect();
+
+        // Verify strict ordering.
+        let expected_order = [
+            AuditEventKind::RequestReceived,
+            AuditEventKind::ApprovalRequired,
+            AuditEventKind::ApprovalPresented,
+            AuditEventKind::ApprovalGranted,
+            AuditEventKind::OperationStarted,
+            AuditEventKind::OperationSucceeded,
+        ];
+
+        let mut last_idx = 0;
+        for expected in &expected_order {
+            let idx = kinds
+                .iter()
+                .position(|k| k == expected)
+                .unwrap_or_else(|| panic!("missing event: {expected:?}"));
+            assert!(
+                idx >= last_idx,
+                "{expected:?} at index {idx} should come after index {last_idx}"
+            );
+            last_idx = idx;
+        }
+    }
+
+    // -- SensitiveOutput safety enforcement through enclave --
+
+    #[tokio::test]
+    async fn sensitive_output_blocked_for_agent_without_explicit_allowance() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+
+        let mut registry = OperationRegistry::new();
+        registry
+            .register(OperationDef {
+                name: "ecr.get_auth_token".into(),
+                safety: OperationSafety::SensitiveOutput,
+                default_approval: ApprovalRequirement::Always,
+                default_factors: vec![ApprovalFactor::LocalBio],
+                description: "Get ECR auth token".into(),
+                params_schema: None,
+                allowed_target_keys: vec![],
+            })
+            .unwrap();
+
+        // Rule does NOT explicitly include Agent in client_types.
+        let policy = PolicyEngine::with_rules(vec![PolicyRule {
+            name: "allow-ecr".into(),
+            client: ClientMatch {
+                uid: Some(501),
+                exe_path: Some("/usr/bin/claude*".into()),
+                ..Default::default()
+            },
+            operation_pattern: "ecr.*".into(),
+            target: TargetMatch {
+                fields: {
+                    let mut m = HashMap::new();
+                    m.insert("repo".into(), "org/*".into());
+                    m
+                },
+            },
+            workspace: WorkspaceMatch::default(),
+            secret_names: SecretNameMatch::default(),
+            allow: true,
+            client_types: vec![], // Empty = matches all for matching, but NOT for SENSITIVE_OUTPUT
+            approval: ApprovalConfig {
+                require: ApprovalRequirement::Always,
+                factors: vec![ApprovalFactor::LocalBio],
+                lease_ttl: None,
+                one_time: false,
+            },
+        }]);
+
+        let enclave = Enclave::builder()
+            .registry(registry)
+            .policy(policy)
+            .handler(
+                "ecr.get_auth_token",
+                Box::new(StubHandler {
+                    response: serde_json::json!({"token": "secret_token"}),
+                }),
+            )
+            .approval_gate(Box::new(AlwaysApproveGate))
+            .audit(audit.clone())
+            .build();
+
+        // Agent client → policy denied due to SENSITIVE_OUTPUT without explicit allowance.
+        let req = test_request("ecr.get_auth_token", ClientType::Agent);
+        let resp = enclave.execute(req).await;
+        assert_eq!(resp.error_code(), Some("policy_denied"));
+
+        // Human client → allowed.
+        let req = test_request("ecr.get_auth_token", ClientType::Human);
+        let resp = enclave.execute(req).await;
+        assert!(resp.error_code().is_none());
     }
 }
