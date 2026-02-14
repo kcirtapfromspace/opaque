@@ -61,6 +61,10 @@ struct Cli {
     #[arg(long)]
     socket: Option<PathBuf>,
 
+    /// Output raw JSON instead of styled text (useful for scripting).
+    #[arg(long, global = true)]
+    json: bool,
+
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -428,6 +432,7 @@ async fn main() {
     let cli = Cli::parse();
 
     let cmd = cli.cmd.unwrap_or(Cmd::Ping);
+    let json_output = cli.json;
 
     // Handle commands that don't need a daemon connection.
     match &cmd {
@@ -512,6 +517,7 @@ async fn main() {
                         since.as_deref(),
                         request_id.as_deref(),
                         outcome.as_deref(),
+                        json_output,
                     ) {
                         Ok(()) => {}
                         Err(e) => {
@@ -804,22 +810,47 @@ async fn main() {
         }
     };
 
-    let sp = ui::spinner(&format!("Calling {method}..."));
+    let sp = if json_output {
+        None
+    } else {
+        Some(ui::spinner(&format!("Calling {method}...")))
+    };
+
     match call(&sock, method, params).await {
         Ok(resp) => {
-            sp.finish_and_clear();
-            if let Some(err) = &resp.error {
-                ui::format_error(err);
-                std::process::exit(1);
+            if let Some(ref sp) = sp {
+                sp.finish_and_clear();
             }
-            if let Some(result) = &resp.result {
-                ui::format_response(method, result);
+
+            if json_output {
+                // Raw JSON: output the full response as-is.
+                let output = serde_json::to_string_pretty(&resp)
+                    .unwrap_or_else(|_| "{}".to_string());
+                println!("{output}");
+                if resp.error.is_some() {
+                    std::process::exit(1);
+                }
             } else {
-                ui::success("Done (no result payload)");
+                if let Some(err) = &resp.error {
+                    ui::format_error(err);
+                    std::process::exit(1);
+                }
+                if let Some(result) = &resp.result {
+                    ui::format_response(method, result);
+                } else {
+                    ui::success("Done (no result payload)");
+                }
             }
         }
         Err(e) => {
-            ui::spinner_error(&sp, &format!("Connection failed: {e}"));
+            if json_output {
+                let err = serde_json::json!({"error": e.to_string()});
+                println!("{}", serde_json::to_string_pretty(&err).unwrap_or_default());
+            } else if let Some(ref sp) = sp {
+                ui::spinner_error(sp, &format!("Connection failed: {e}"));
+            } else {
+                ui::error(&format!("Connection failed: {e}"));
+            }
             std::process::exit(1);
         }
     }
@@ -1020,6 +1051,7 @@ fn run_audit_tail(
     since: Option<&str>,
     request_id: Option<&str>,
     outcome: Option<&str>,
+    json_output: bool,
 ) -> Result<(), String> {
     let db_path = default_opaque_dir().join("audit.db");
     if !db_path.exists() {
@@ -1066,6 +1098,28 @@ fn run_audit_tail(
     };
 
     let events = query_audit_db(&db_path, &filter).map_err(|e| format!("query failed: {e}"))?;
+
+    if json_output {
+        let json_events: Vec<serde_json::Value> = events
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "event_id": e.event_id.to_string(),
+                    "ts_utc_ms": e.ts_utc_ms,
+                    "kind": e.kind.to_string(),
+                    "operation": e.operation,
+                    "outcome": e.outcome,
+                    "request_id": e.request_id.map(|u| u.to_string()),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json_events)
+                .unwrap_or_else(|_| "[]".to_string())
+        );
+        return Ok(());
+    }
 
     if events.is_empty() {
         ui::info("No audit events found.");
