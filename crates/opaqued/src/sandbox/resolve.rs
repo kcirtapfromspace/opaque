@@ -23,7 +23,7 @@ pub trait SecretResolver: Send + Sync {
 /// Errors from secret resolution.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ResolveError {
-    #[error("unknown ref scheme in '{0}' (expected env:, keychain:, or profile:)")]
+    #[error("unknown ref scheme in '{0}' (expected env:, keychain:, profile:, or onepassword:)")]
     UnknownScheme(String),
 
     #[error("environment variable '{0}' not found")]
@@ -37,6 +37,9 @@ pub enum ResolveError {
 
     #[error("profile resolution failed for '{0}': {1}")]
     ProfileError(String, String),
+
+    #[error("1Password resolution failed for '{0}': {1}")]
+    OnePasswordError(String, String),
 }
 
 // ---------------------------------------------------------------------------
@@ -214,20 +217,26 @@ impl SecretResolver for ProfileResolver {
 
         // Resolve the underlying ref through base resolvers only (no ProfileResolver)
         // to prevent cycles.
-        let base = BaseResolver {
-            env: EnvResolver,
-            keychain: KeychainResolver,
-        };
+        let base = BaseResolver::new();
         base.resolve(underlying_ref)
     }
 }
 
-/// Internal base resolver that dispatches to env: and keychain: only.
-/// Used by ProfileResolver to prevent resolution cycles.
+/// Base resolver that dispatches to env: and keychain: only.
+/// Used by ProfileResolver and OnePasswordResolver to prevent resolution cycles.
 #[derive(Debug)]
-struct BaseResolver {
+pub struct BaseResolver {
     env: EnvResolver,
     keychain: KeychainResolver,
+}
+
+impl BaseResolver {
+    pub fn new() -> Self {
+        Self {
+            env: EnvResolver,
+            keychain: KeychainResolver,
+        }
+    }
 }
 
 impl SecretResolver for BaseResolver {
@@ -247,20 +256,28 @@ impl SecretResolver for BaseResolver {
 // ---------------------------------------------------------------------------
 
 /// A composite resolver that dispatches to the correct resolver based on
-/// the ref scheme prefix (`env:`, `keychain:`, `profile:`).
+/// the ref scheme prefix (`env:`, `keychain:`, `profile:`, `onepassword:`).
 #[derive(Debug)]
 pub struct CompositeResolver {
     env: EnvResolver,
     keychain: KeychainResolver,
     profile: ProfileResolver,
+    onepassword: Option<crate::onepassword::resolve::OnePasswordResolver>,
 }
 
 impl CompositeResolver {
     pub fn new() -> Self {
+        let onepassword = std::env::var(crate::onepassword::client::CONNECT_URL_ENV)
+            .ok()
+            .map(|url| {
+                let client = crate::onepassword::client::OnePasswordClient::new(&url);
+                crate::onepassword::resolve::OnePasswordResolver::new(client)
+            });
         Self {
             env: EnvResolver,
             keychain: KeychainResolver,
             profile: ProfileResolver,
+            onepassword,
         }
     }
 }
@@ -279,6 +296,14 @@ impl SecretResolver for CompositeResolver {
             self.keychain.resolve(ref_str)
         } else if ref_str.starts_with("profile:") {
             self.profile.resolve(ref_str)
+        } else if ref_str.starts_with("onepassword:") {
+            match &self.onepassword {
+                Some(r) => r.resolve(ref_str),
+                None => Err(ResolveError::OnePasswordError(
+                    ref_str.to_owned(),
+                    "1Password Connect not configured (set OPAQUE_1PASSWORD_CONNECT_URL)".into(),
+                )),
+            }
         } else {
             Err(ResolveError::UnknownScheme(ref_str.to_owned()))
         }
@@ -441,6 +466,22 @@ mod tests {
 
         let err = ResolveError::ProfileError("profile:x:y".into(), "not found".into());
         assert!(format!("{err}").contains("profile resolution failed"));
+
+        let err = ResolveError::OnePasswordError("onepassword:v/i".into(), "not configured".into());
+        assert!(format!("{err}").contains("1Password resolution failed"));
+    }
+
+    #[test]
+    fn composite_resolver_onepassword_unconfigured() {
+        let resolver = CompositeResolver::new();
+        // Without OPAQUE_1PASSWORD_CONNECT_URL set, onepassword: refs should
+        // return a clear "not configured" error.
+        let result = resolver.resolve("onepassword:vault/item");
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ResolveError::OnePasswordError(..)
+        ));
     }
 
     // -- ProfileResolver tests --

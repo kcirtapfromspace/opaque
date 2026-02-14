@@ -103,6 +103,12 @@ enum Cmd {
         #[command(subcommand)]
         action: GithubAction,
     },
+    /// Browse 1Password vaults and items.
+    #[command(name = "onepassword", alias = "1p")]
+    OnePassword {
+        #[command(subcommand)]
+        action: OnePasswordAction,
+    },
     /// Execute a command in a sandboxed environment.
     Exec {
         /// Profile name (loads ~/.opaque/profiles/<name>.toml).
@@ -241,6 +247,18 @@ enum GithubAction {
         /// Selected repository IDs (comma-separated, when visibility is "selected").
         #[arg(long, value_delimiter = ',')]
         selected_repository_ids: Option<Vec<i64>>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum OnePasswordAction {
+    /// List accessible vaults.
+    ListVaults,
+    /// List items in a vault.
+    ListItems {
+        /// Vault name.
+        #[arg(long)]
+        vault: String,
     },
 }
 
@@ -476,6 +494,19 @@ async fn main() {
                     params["selected_repository_ids"] = serde_json::json!(ids);
                 }
                 ("github", params)
+            }
+        },
+        Cmd::OnePassword { action } => match action {
+            OnePasswordAction::ListVaults => {
+                let params = serde_json::json!({ "action": "list_vaults" });
+                ("onepassword", params)
+            }
+            OnePasswordAction::ListItems { vault } => {
+                let params = serde_json::json!({
+                    "action": "list_items",
+                    "vault": vault,
+                });
+                ("onepassword", params)
             }
         },
         // Already handled above; unreachable.
