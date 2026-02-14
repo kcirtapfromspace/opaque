@@ -162,6 +162,57 @@ fn load_config() -> DaemonConfig {
     }
 }
 
+/// Verify the config seal on daemon startup.
+///
+/// - **Verified**: config matches seal — proceed normally.
+/// - **Unsealed**: no seal found — warn and continue (backward compatible).
+/// - **Tampered**: seal exists but doesn't match — hard stop.
+fn verify_config_seal() -> std::io::Result<()> {
+    use opaque_core::seal::{self, SealStatus};
+
+    let config_path = std::env::var("OPAQUE_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            PathBuf::from(home).join(".opaque").join("config.toml")
+        });
+
+    let config_dir = config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    let seal_file = config_dir.join("config.seal");
+
+    // If config doesn't exist, nothing to verify (load_config handles defaults).
+    if !config_path.exists() {
+        return Ok(());
+    }
+
+    let config_bytes = std::fs::read(&config_path)?;
+
+    match seal::verify_seal(&config_bytes, &seal_file) {
+        Ok(SealStatus::Verified) => {
+            info!("config seal verified");
+        }
+        Ok(SealStatus::Unsealed) => {
+            warn!("config is unsealed — run 'opaque setup --seal' to protect it");
+        }
+        Ok(SealStatus::Tampered { .. }) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "config seal broken — config.toml was modified after sealing. \
+                 Run 'opaque setup --reset' to unseal, then reconfigure.",
+            ));
+        }
+        Err(e) => {
+            return Err(std::io::Error::other(
+                format!("config seal check failed: {e}"),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Generate a 32-byte CSPRNG hex token for daemon authentication.
 fn generate_daemon_token() -> String {
     let mut buf = [0u8; 32];
@@ -266,6 +317,9 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
     info!("listening on {}", socket.display());
 
     let config = load_config();
+
+    // Verify config seal before proceeding.
+    verify_config_seal()?;
 
     // Build enclave with registered operations and policy from config.
     let mut registry = OperationRegistry::new();
