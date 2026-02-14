@@ -2115,8 +2115,8 @@ async fn run_doctor() {
         }
     }
 
-    // 7. 1Password op CLI
-    match std::process::Command::new("which")
+    // 7. 1Password backends
+    let op_cli_found = match std::process::Command::new("which")
         .arg("op")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -2126,10 +2126,17 @@ async fn run_doctor() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
             doctor_pass(&format!("1Password CLI found ({path})"));
             pass_count += 1;
+            true
         }
-        _ => {
-            doctor_info("1Password CLI (op) not found — 1Password features unavailable");
-        }
+        _ => false,
+    };
+    let connect_url = std::env::var("OPAQUE_1PASSWORD_URL").ok();
+    if let Some(ref url) = connect_url {
+        doctor_pass(&format!("1Password Connect Server configured ({url})"));
+        pass_count += 1;
+    }
+    if !op_cli_found && connect_url.is_none() {
+        doctor_info("No 1Password backend — install op CLI or set OPAQUE_1PASSWORD_URL");
     }
 
     // 8. Profiles directory
