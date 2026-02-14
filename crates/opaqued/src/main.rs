@@ -1363,13 +1363,14 @@ async fn handle_request(
         ),
         "whoami" => {
             // Agent clients get minimal info to prevent reconnaissance.
-            // Human clients get the full dump.
+            // Human clients get the full dump for debugging identity matching.
             let payload = match client_type {
                 ClientType::Human => serde_json::json!({
                     "uid": identity.uid,
                     "gid": identity.gid,
                     "pid": identity.pid,
                     "exe_path": identity.exe_path.as_ref().map(|p| p.display().to_string()),
+                    "exe_sha256": identity.exe_sha256,
                     "client_type": client_type,
                 }),
                 ClientType::Agent => serde_json::json!({
@@ -2096,6 +2097,19 @@ mod tests {
     }
 
     #[test]
+    fn compute_exe_hash_valid_file() {
+        // Hash the current test binary — always exists during test execution.
+        let exe = std::env::current_exe().expect("current_exe should succeed in tests");
+        let hash = compute_exe_hash(&exe);
+        assert!(hash.is_some(), "hashing current binary should succeed");
+        let h = hash.unwrap();
+        // SHA-256 hex digest is always 64 characters.
+        assert_eq!(h.len(), 64, "expected 64-char hex digest, got {}", h.len());
+        // Should be lowercase hex.
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    #[test]
     fn config_empty_all_agents() {
         let config = DaemonConfig::default();
         let id = test_identity();
@@ -2118,6 +2132,64 @@ mod tests {
         assert!(!entry_matches(&id, &entry));
 
         id.codesign_team_id = None;
+        assert!(!entry_matches(&id, &entry));
+    }
+
+    #[test]
+    fn entry_matches_multi_criteria_all_must_match() {
+        // When both exe_path and exe_sha256 are specified, both must match.
+        let entry = HumanClientEntry {
+            name: "strict".into(),
+            exe_path: Some("/usr/bin/claude*".into()),
+            exe_sha256: Some("aabbccdd".into()),
+            codesign_team_id: None,
+        };
+
+        // Both match → ok.
+        let id = test_identity();
+        assert!(entry_matches(&id, &entry));
+
+        // Path matches, hash doesn't → reject.
+        let mut id2 = test_identity();
+        id2.exe_sha256 = Some("different".into());
+        assert!(!entry_matches(&id2, &entry));
+
+        // Hash matches, path doesn't → reject.
+        let mut id3 = test_identity();
+        id3.exe_path = Some("/opt/bin/other".into());
+        assert!(!entry_matches(&id3, &entry));
+    }
+
+    #[test]
+    fn entry_matches_empty_entry_rejects_all() {
+        let empty = HumanClientEntry {
+            name: "empty".into(),
+            exe_path: None,
+            exe_sha256: None,
+            codesign_team_id: None,
+        };
+        let id = test_identity();
+        assert!(!entry_matches(&id, &empty));
+    }
+
+    #[test]
+    fn entry_matches_identity_missing_exe_path() {
+        let entry = entry_with_path("cli", "/usr/bin/claude*");
+        let mut id = test_identity();
+        id.exe_path = None;
+        assert!(!entry_matches(&id, &entry));
+    }
+
+    #[test]
+    fn entry_matches_identity_missing_hash() {
+        let entry = HumanClientEntry {
+            name: "hash-only".into(),
+            exe_path: None,
+            exe_sha256: Some("aabbccdd".into()),
+            codesign_team_id: None,
+        };
+        let mut id = test_identity();
+        id.exe_sha256 = None;
         assert!(!entry_matches(&id, &entry));
     }
 
