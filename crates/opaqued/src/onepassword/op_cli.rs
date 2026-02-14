@@ -332,4 +332,69 @@ mod tests {
         let err = OpCliError::ParseError("invalid json".into());
         assert!(format!("{err}").contains("invalid json"));
     }
+
+    // -----------------------------------------------------------------------
+    // Live integration tests (require `op` CLI + authenticated desktop app)
+    // Run with: cargo test -p opaqued -- op_cli::tests::live --ignored --nocapture
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    #[ignore = "requires authenticated 1Password desktop app"]
+    async fn live_list_vaults() {
+        let cli = OpCliClient::new().expect("op CLI not found");
+        let vaults = cli.list_vaults().await.expect("failed to list vaults");
+        assert!(!vaults.is_empty(), "expected at least one vault");
+        for v in &vaults {
+            println!("  vault: {} (id={})", v.name, v.id);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires authenticated 1Password desktop app"]
+    async fn live_list_items() {
+        let cli = OpCliClient::new().expect("op CLI not found");
+        let vaults = cli.list_vaults().await.expect("failed to list vaults");
+        let first_vault = &vaults[0];
+        println!("  listing items in vault: {}", first_vault.name);
+
+        let items = cli
+            .list_items(&first_vault.name)
+            .await
+            .expect("failed to list items");
+        println!("  found {} items", items.len());
+        for item in items.iter().take(5) {
+            println!("    - {} ({})", item.title, item.category);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires authenticated 1Password desktop app"]
+    async fn live_read_field() {
+        let cli = OpCliClient::new().expect("op CLI not found");
+        // List vaults, pick first, list items, pick first LOGIN item, read username
+        let vaults = cli.list_vaults().await.expect("failed to list vaults");
+        let vault_name = &vaults[0].name;
+        let items = cli
+            .list_items(vault_name)
+            .await
+            .expect("failed to list items");
+
+        // Find a LOGIN item that likely has a username field.
+        let login_item = items.iter().find(|i| i.category == "LOGIN");
+        if let Some(item) = login_item {
+            println!("  reading 'username' from {}/{}", vault_name, item.title);
+            match cli.read_field(vault_name, &item.title, "username").await {
+                Ok(value) => {
+                    // Don't print the actual value — just confirm it's non-empty.
+                    assert!(!value.is_empty(), "expected non-empty username");
+                    println!("  SUCCESS: got {} chars", value.len());
+                }
+                Err(e) => {
+                    println!("  field read returned error (may not have username): {e}");
+                }
+            }
+        } else {
+            println!("  no LOGIN items found in vault '{vault_name}', skipping");
+        }
+    }
 }
