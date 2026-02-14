@@ -6,7 +6,8 @@ use clap::{Parser, Subcommand};
 use console::style;
 use futures_util::{SinkExt, StreamExt};
 use opaque_core::audit::{AuditEventKind, AuditFilter, query_audit_db};
-use opaque_core::policy::PolicyRule;
+use opaque_core::operation::{ClientIdentity, ClientType, OperationRequest, OperationSafety};
+use opaque_core::policy::{PolicyEngine, PolicyRule};
 use opaque_core::profile;
 use opaque_core::proto::{Request, Response};
 use opaque_core::socket::{socket_path, verify_socket_safety};
@@ -173,6 +174,30 @@ enum PolicyAction {
     /// Validate policy configuration file.
     Check {
         /// Path to config file (default: ~/.opaque/config.toml or $OPAQUE_CONFIG).
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    /// Display loaded policy rules in a human-readable format.
+    Show {
+        /// Path to config file (default: ~/.opaque/config.toml or $OPAQUE_CONFIG).
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    /// Dry-run a request against the policy to see what would happen.
+    Simulate {
+        /// Operation name (e.g. "github.set_actions_secret").
+        #[arg(long)]
+        operation: String,
+        /// Client type: "human" or "agent".
+        #[arg(long, default_value = "human")]
+        client_type: String,
+        /// Target fields as KEY=VALUE pairs (e.g. --target repo=org/repo).
+        #[arg(long = "target", value_parser = parse_kv)]
+        targets: Vec<(String, String)>,
+        /// Secret ref names referenced by the request.
+        #[arg(long = "secret-ref")]
+        secret_refs: Vec<String>,
+        /// Path to config file.
         #[arg(long)]
         file: Option<PathBuf>,
     },
@@ -404,6 +429,38 @@ async fn main() {
             PolicyAction::Check { file } => {
                 match policy_check_path(file.as_deref()) {
                     Ok(msg) => ui::success(&msg),
+                    Err(e) => {
+                        ui::error(&e);
+                        std::process::exit(1);
+                    }
+                }
+                return;
+            }
+            PolicyAction::Show { file } => {
+                match policy_show(file.as_deref()) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        ui::error(&e);
+                        std::process::exit(1);
+                    }
+                }
+                return;
+            }
+            PolicyAction::Simulate {
+                operation,
+                client_type,
+                targets,
+                secret_refs,
+                file,
+            } => {
+                match policy_simulate(
+                    file.as_deref(),
+                    operation,
+                    client_type,
+                    targets,
+                    secret_refs,
+                ) {
+                    Ok(()) => {}
                     Err(e) => {
                         ui::error(&e);
                         std::process::exit(1);
@@ -1148,6 +1205,305 @@ fn policy_check_path(file: Option<&Path>) -> Result<String, String> {
     }
 
     Ok(format!("policy OK: {} rules loaded", config.rules.len()))
+}
+
+// ---------------------------------------------------------------------------
+// policy show
+// ---------------------------------------------------------------------------
+
+/// Load and display policy rules in a human-readable format.
+fn policy_show(file: Option<&Path>) -> Result<(), String> {
+    let path = resolve_config_path(file);
+    let contents = std::fs::read_to_string(&path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+
+    let config: PolicyConfig = toml_edit::de::from_str(&contents)
+        .map_err(|e| format!("TOML parse error in {}: {e}", path.display()))?;
+
+    if config.rules.is_empty() {
+        ui::warn("no rules loaded — default deny-all policy is in effect");
+        return Ok(());
+    }
+
+    ui::header(&format!(
+        "{} rule(s) from {}",
+        config.rules.len(),
+        path.display()
+    ));
+
+    for (i, rule) in config.rules.iter().enumerate() {
+        println!();
+        let allow_str = if rule.allow {
+            style("ALLOW").green().bold().to_string()
+        } else {
+            style("DENY").red().bold().to_string()
+        };
+        println!(
+            "  {}  {}  {}",
+            style(format!("[{i}]")).dim(),
+            allow_str,
+            style(&rule.name).cyan().bold()
+        );
+
+        // Operation pattern.
+        println!(
+            "      {} {}",
+            style("operation:").dim(),
+            style(&rule.operation_pattern).yellow()
+        );
+
+        // Client types.
+        if !rule.client_types.is_empty() {
+            let types: Vec<&str> = rule
+                .client_types
+                .iter()
+                .map(|ct| match ct {
+                    ClientType::Human => "human",
+                    ClientType::Agent => "agent",
+                })
+                .collect();
+            println!(
+                "      {} {}",
+                style("clients:").dim(),
+                types.join(", ")
+            );
+        }
+
+        // Client match constraints.
+        if rule.client.exe_path.is_some()
+            || rule.client.exe_sha256.is_some()
+            || rule.client.codesign_team_id.is_some()
+            || rule.client.uid.is_some()
+        {
+            let mut parts = Vec::new();
+            if let Some(ref p) = rule.client.exe_path {
+                parts.push(format!("exe={p}"));
+            }
+            if let Some(ref h) = rule.client.exe_sha256 {
+                parts.push(format!("sha256={}", &h[..8.min(h.len())]));
+            }
+            if let Some(ref t) = rule.client.codesign_team_id {
+                parts.push(format!("team={t}"));
+            }
+            if let Some(uid) = rule.client.uid {
+                parts.push(format!("uid={uid}"));
+            }
+            println!(
+                "      {} {}",
+                style("client:").dim(),
+                parts.join(", ")
+            );
+        }
+
+        // Target constraints.
+        if !rule.target.fields.is_empty() {
+            let fields: Vec<String> = rule
+                .target
+                .fields
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect();
+            println!(
+                "      {} {}",
+                style("target:").dim(),
+                fields.join(", ")
+            );
+        }
+
+        // Workspace constraints.
+        if rule.workspace.remote_url_pattern.is_some()
+            || rule.workspace.branch_pattern.is_some()
+            || rule.workspace.require_clean
+        {
+            let mut parts = Vec::new();
+            if let Some(ref p) = rule.workspace.remote_url_pattern {
+                parts.push(format!("remote={p}"));
+            }
+            if let Some(ref p) = rule.workspace.branch_pattern {
+                parts.push(format!("branch={p}"));
+            }
+            if rule.workspace.require_clean {
+                parts.push("clean-only".into());
+            }
+            println!(
+                "      {} {}",
+                style("workspace:").dim(),
+                parts.join(", ")
+            );
+        }
+
+        // Secret name constraints.
+        if !rule.secret_names.patterns.is_empty() {
+            println!(
+                "      {} {}",
+                style("secrets:").dim(),
+                rule.secret_names.patterns.join(", ")
+            );
+        }
+
+        // Approval.
+        let req_str = format!("{:?}", rule.approval.require);
+        let factors: Vec<String> = rule
+            .approval
+            .factors
+            .iter()
+            .map(|f| format!("{f:?}"))
+            .collect();
+        let mut approval_parts = vec![req_str.to_lowercase()];
+        if !factors.is_empty() {
+            approval_parts.push(format!("factors=[{}]", factors.join(",")));
+        }
+        if let Some(ttl) = rule.approval.lease_ttl {
+            approval_parts.push(format!("lease={}s", ttl.as_secs()));
+        }
+        if rule.approval.one_time {
+            approval_parts.push("one-time".into());
+        }
+        println!(
+            "      {} {}",
+            style("approval:").dim(),
+            approval_parts.join(", ")
+        );
+    }
+
+    println!();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// policy simulate
+// ---------------------------------------------------------------------------
+
+/// Dry-run a request against the policy engine to show what would happen.
+fn policy_simulate(
+    file: Option<&Path>,
+    operation: &str,
+    client_type_str: &str,
+    targets: &[(String, String)],
+    secret_refs: &[String],
+) -> Result<(), String> {
+    let path = resolve_config_path(file);
+    let contents = std::fs::read_to_string(&path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+
+    let config: PolicyConfig = toml_edit::de::from_str(&contents)
+        .map_err(|e| format!("TOML parse error in {}: {e}", path.display()))?;
+
+    let client_type = match client_type_str {
+        "human" => ClientType::Human,
+        "agent" => ClientType::Agent,
+        other => return Err(format!("unknown client type: {other} (expected 'human' or 'agent')")),
+    };
+
+    let target: std::collections::HashMap<String, String> =
+        targets.iter().cloned().collect();
+
+    let request = OperationRequest {
+        request_id: uuid::Uuid::nil(),
+        client_identity: ClientIdentity {
+            uid: 501,
+            gid: 20,
+            pid: None,
+            exe_path: std::env::current_exe().ok(),
+            exe_sha256: None,
+            codesign_team_id: None,
+        },
+        client_type,
+        operation: operation.into(),
+        target,
+        params: serde_json::Value::Object(serde_json::Map::new()),
+        secret_ref_names: secret_refs.to_vec(),
+        workspace: None,
+        created_at: std::time::SystemTime::now(),
+        expires_at: None,
+    };
+
+    let engine = PolicyEngine::with_rules(config.rules);
+
+    // Use Safe as default — we can't know the actual safety class without
+    // the operation registry, but this gives a correct policy evaluation
+    // for the common case.
+    let decision = engine.evaluate(&request, OperationSafety::Safe);
+
+    ui::header("Policy Simulation");
+
+    // Show the request summary.
+    println!(
+        "  {} {}",
+        style("operation:").dim(),
+        style(operation).yellow().bold()
+    );
+    println!(
+        "  {} {}",
+        style("client:").dim(),
+        client_type_str
+    );
+    if !targets.is_empty() {
+        let fields: Vec<String> = targets.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        println!(
+            "  {} {}",
+            style("target:").dim(),
+            fields.join(", ")
+        );
+    }
+    if !secret_refs.is_empty() {
+        println!(
+            "  {} {}",
+            style("secrets:").dim(),
+            secret_refs.join(", ")
+        );
+    }
+    println!();
+
+    // Show the decision.
+    if decision.allowed {
+        ui::success(&format!("ALLOW (rule: {})", decision.matched_rule.as_deref().unwrap_or("?")));
+        let req_str = format!("{:?}", decision.approval_requirement).to_lowercase();
+        println!(
+            "  {} {}",
+            style("approval:").dim(),
+            req_str,
+        );
+        if !decision.required_factors.is_empty() {
+            let factors: Vec<String> = decision
+                .required_factors
+                .iter()
+                .map(|f| format!("{f:?}"))
+                .collect();
+            println!(
+                "  {} {}",
+                style("factors:").dim(),
+                factors.join(", ")
+            );
+        }
+        if let Some(ttl) = decision.lease_ttl {
+            println!(
+                "  {} {}s",
+                style("lease:").dim(),
+                ttl.as_secs(),
+            );
+        }
+        if decision.one_time {
+            println!(
+                "  {} yes",
+                style("one-time:").dim(),
+            );
+        }
+    } else {
+        ui::error(&format!(
+            "DENY: {}",
+            decision.denial_reason.as_deref().unwrap_or("no matching rule")
+        ));
+        if let Some(ref rule) = decision.matched_rule {
+            println!(
+                "  {} {}",
+                style("matched rule:").dim(),
+                rule,
+            );
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2262,5 +2618,130 @@ factors = []
         let config: PolicyConfig = toml_edit::de::from_str(SAMPLE_CONFIG).unwrap();
         // All example rules are commented out, so 0 rules.
         assert_eq!(config.rules.len(), 0);
+    }
+
+    /// Write a TOML config, return the temp path for use in policy_show / policy_simulate.
+    fn write_config(content: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, content).unwrap();
+        (dir, path)
+    }
+
+    fn sample_rule_toml() -> &'static str {
+        r#"
+[[rules]]
+name = "allow-github-actions"
+operation_pattern = "github.set_actions_secret"
+allow = true
+client_types = ["human"]
+
+[rules.client]
+
+[rules.target]
+fields = { repo = "myorg/*" }
+
+[rules.workspace]
+
+[rules.secret_names]
+patterns = ["GH_*"]
+
+[rules.approval]
+require = "first_use"
+factors = ["local_bio"]
+lease_ttl = 300
+"#
+    }
+
+    #[test]
+    fn policy_show_empty_rules() {
+        let (_dir, path) = write_config("");
+        // Should not error, just warn about empty rules.
+        let result = policy_show(Some(path.as_path()));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn policy_show_with_rules() {
+        let (_dir, path) = write_config(sample_rule_toml());
+        let result = policy_show(Some(path.as_path()));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn policy_show_missing_file() {
+        let result = policy_show(Some(Path::new("/nonexistent/config.toml")));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("cannot read"));
+    }
+
+    #[test]
+    fn policy_simulate_allow() {
+        let (_dir, path) = write_config(sample_rule_toml());
+        let result = policy_simulate(
+            Some(path.as_path()),
+            "github.set_actions_secret",
+            "human",
+            &[("repo".into(), "myorg/myrepo".into())],
+            &["GH_TOKEN".into()],
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn policy_simulate_deny_no_matching_rule() {
+        let (_dir, path) = write_config(sample_rule_toml());
+        // Use an operation not covered by any rule.
+        let result = policy_simulate(
+            Some(path.as_path()),
+            "sandbox.exec",
+            "human",
+            &[],
+            &[],
+        );
+        // Should succeed (prints the deny decision).
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn policy_simulate_deny_target_mismatch() {
+        let (_dir, path) = write_config(sample_rule_toml());
+        // Rule requires repo=myorg/*, but we pass a different org.
+        let result = policy_simulate(
+            Some(path.as_path()),
+            "github.set_actions_secret",
+            "human",
+            &[("repo".into(), "otherorg/repo".into())],
+            &["GH_TOKEN".into()],
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn policy_simulate_invalid_client_type() {
+        let (_dir, path) = write_config(sample_rule_toml());
+        let result = policy_simulate(
+            Some(path.as_path()),
+            "github.set_actions_secret",
+            "unknown",
+            &[],
+            &[],
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown client type"));
+    }
+
+    #[test]
+    fn policy_simulate_agent_client_type() {
+        let (_dir, path) = write_config(sample_rule_toml());
+        // Rule only allows "human", so agent should be denied.
+        let result = policy_simulate(
+            Some(path.as_path()),
+            "github.set_actions_secret",
+            "agent",
+            &[("repo".into(), "myorg/myrepo".into())],
+            &["GH_TOKEN".into()],
+        );
+        assert!(result.is_ok());
     }
 }
