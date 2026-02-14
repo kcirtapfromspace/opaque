@@ -159,13 +159,51 @@ fn format_operation_result(result: &serde_json::Value) {
         }
     };
 
-    // sandbox.exec returns a summary without a status field.
+    // sandbox.exec returns stdout/stderr + exit code.
     if let Some(exit_code) = obj.get("exit_code").and_then(|v| v.as_i64()) {
-        if exit_code == 0 {
-            success("Sandbox exec succeeded");
-        } else {
-            warn(&format!("Sandbox exec failed (exit_code={exit_code})"));
+        // Print captured stdout directly (not styled — preserve command output).
+        if let Some(stdout) = obj.get("stdout").and_then(|v| v.as_str())
+            && !stdout.is_empty()
+        {
+            print!("{stdout}");
+            if !stdout.ends_with('\n') {
+                println!();
+            }
         }
+        // Print captured stderr to stderr.
+        if let Some(stderr) = obj.get("stderr").and_then(|v| v.as_str())
+            && !stderr.is_empty()
+        {
+            eprint!("{stderr}");
+            if !stderr.ends_with('\n') {
+                eprintln!();
+            }
+        }
+
+        // Show truncation warning if output was capped.
+        if obj
+            .get("truncated")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            let stdout_len = obj.get("stdout_length").and_then(|v| v.as_u64()).unwrap_or(0);
+            let stderr_len = obj.get("stderr_length").and_then(|v| v.as_u64()).unwrap_or(0);
+            warn(&format!(
+                "Output truncated (stdout: {} bytes, stderr: {} bytes)",
+                stdout_len, stderr_len
+            ));
+        }
+
+        // Summary line.
+        let duration = obj.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+        if exit_code == 0 {
+            success(&format!("Sandbox exec succeeded ({duration}ms)"));
+        } else {
+            warn(&format!(
+                "Sandbox exec failed (exit_code={exit_code}, {duration}ms)"
+            ));
+        }
+        return;
     } else {
         // Check status first
         let status = obj
