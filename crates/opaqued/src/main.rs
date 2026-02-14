@@ -1484,6 +1484,25 @@ async fn handle_request(
         "github" => {
             // The github method is a convenience wrapper that builds an "execute"
             // request for the appropriate github.* operation based on the `scope` param.
+            //
+            // The `action` field determines the operation type:
+            // - "list_secrets" → github.list_secrets
+            // - "delete_secret" → github.delete_secret
+            // - (default) → github.set_* (set secret)
+            let action = req
+                .params
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("set_secret");
+
+            // Route list_secrets and delete_secret to their own dispatch paths.
+            if action == "list_secrets" {
+                return handle_github_list_secrets(&req, state, identity, client_type).await;
+            }
+            if action == "delete_secret" {
+                return handle_github_delete_secret(&req, state, identity, client_type).await;
+            }
+
             let scope = req
                 .params
                 .get("scope")
@@ -1741,11 +1760,51 @@ async fn handle_request(
                         serde_json::json!({ "vault": vault }),
                     )
                 }
+                "read_field" => {
+                    let vault = req
+                        .params
+                        .get("vault")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_owned();
+                    let item = req
+                        .params
+                        .get("item")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_owned();
+                    let field = req
+                        .params
+                        .get("field")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_owned();
+
+                    if vault.is_empty() {
+                        return Response::err(Some(req.id), "bad_request", "missing 'vault' field");
+                    }
+                    if item.is_empty() {
+                        return Response::err(Some(req.id), "bad_request", "missing 'item' field");
+                    }
+                    if field.is_empty() {
+                        return Response::err(Some(req.id), "bad_request", "missing 'field' field");
+                    }
+
+                    let target = HashMap::from([
+                        ("vault".into(), vault.clone()),
+                        ("item".into(), item.clone()),
+                    ]);
+                    (
+                        "onepassword.read_field",
+                        target,
+                        serde_json::json!({ "vault": vault, "item": item, "field": field }),
+                    )
+                }
                 unknown => {
                     return Response::err(
                         Some(req.id),
                         "bad_request",
-                        format!("unknown action '{unknown}' (expected: list_vaults, list_items)"),
+                        format!("unknown action '{unknown}' (expected: list_vaults, list_items, read_field)"),
                     );
                 }
             };
@@ -1829,6 +1888,126 @@ async fn handle_request(
         }
         _ => Response::err(Some(req.id), "unknown_method", "unknown method"),
     }
+}
+
+/// Handle `github` method with `action: "list_secrets"`.
+///
+/// Routes to `github.list_secrets` operation in the enclave.
+async fn handle_github_list_secrets(
+    req: &opaque_core::proto::Request,
+    state: &DaemonState,
+    identity: &ClientIdentity,
+    client_type: ClientType,
+) -> opaque_core::proto::Response {
+    let scope = req
+        .params
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .unwrap_or("actions");
+
+    let mut op_params = serde_json::json!({ "scope": scope });
+    let mut target = HashMap::new();
+
+    if let Some(repo) = req.params.get("repo").and_then(|v| v.as_str()) {
+        op_params["repo"] = serde_json::Value::String(repo.into());
+        target.insert("repo".into(), repo.to_owned());
+    }
+    if let Some(org) = req.params.get("org").and_then(|v| v.as_str()) {
+        op_params["org"] = serde_json::Value::String(org.into());
+        target.insert("org".into(), org.to_owned());
+    }
+    if let Some(env) = req.params.get("environment").and_then(|v| v.as_str()) {
+        op_params["environment"] = serde_json::Value::String(env.into());
+    }
+    if let Some(tok) = req.params.get("github_token_ref").and_then(|v| v.as_str()) {
+        op_params["github_token_ref"] = serde_json::Value::String(tok.into());
+    }
+
+    let op_req = OperationRequest {
+        request_id: Uuid::new_v4(),
+        client_identity: identity.clone(),
+        client_type,
+        operation: "github.list_secrets".into(),
+        target,
+        secret_ref_names: vec![],
+        created_at: SystemTime::now(),
+        expires_at: None,
+        params: op_params,
+        workspace: None,
+    };
+
+    state
+        .enclave
+        .execute(op_req)
+        .await
+        .into_proto_response(req.id)
+}
+
+/// Handle `github` method with `action: "delete_secret"`.
+///
+/// Routes to `github.delete_secret` operation in the enclave.
+async fn handle_github_delete_secret(
+    req: &opaque_core::proto::Request,
+    state: &DaemonState,
+    identity: &ClientIdentity,
+    client_type: ClientType,
+) -> opaque_core::proto::Response {
+    let scope = req
+        .params
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .unwrap_or("actions");
+
+    let secret_name = req
+        .params
+        .get("secret_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+
+    if secret_name.is_empty() {
+        return Response::err(Some(req.id), "bad_request", "missing 'secret_name' field");
+    }
+
+    let mut op_params = serde_json::json!({
+        "scope": scope,
+        "secret_name": secret_name,
+    });
+    let mut target = HashMap::new();
+
+    if let Some(repo) = req.params.get("repo").and_then(|v| v.as_str()) {
+        op_params["repo"] = serde_json::Value::String(repo.into());
+        target.insert("repo".into(), repo.to_owned());
+    }
+    if let Some(org) = req.params.get("org").and_then(|v| v.as_str()) {
+        op_params["org"] = serde_json::Value::String(org.into());
+        target.insert("org".into(), org.to_owned());
+    }
+    if let Some(env) = req.params.get("environment").and_then(|v| v.as_str()) {
+        op_params["environment"] = serde_json::Value::String(env.into());
+    }
+    if let Some(tok) = req.params.get("github_token_ref").and_then(|v| v.as_str()) {
+        op_params["github_token_ref"] = serde_json::Value::String(tok.into());
+    }
+
+    let op_req = OperationRequest {
+        request_id: Uuid::new_v4(),
+        client_identity: identity.clone(),
+        client_type,
+        operation: "github.delete_secret".into(),
+        target,
+        secret_ref_names: vec![],
+        created_at: SystemTime::now(),
+        expires_at: None,
+        params: op_params,
+        workspace: None,
+    };
+
+    state
+        .enclave
+        .execute(op_req)
+        .await
+        .into_proto_response(req.id)
 }
 
 // ---------------------------------------------------------------------------
