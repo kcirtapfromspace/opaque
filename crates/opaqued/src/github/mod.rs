@@ -177,6 +177,7 @@ async fn set_secret_flow(
     let secret_value = resolver
         .resolve(value_ref)
         .map_err(|e| format!("failed to resolve value_ref: {e}"))?;
+    secret_value.mlock();
 
     audit.emit(
         AuditEvent::new(AuditEventKind::SecretResolved)
@@ -192,6 +193,7 @@ async fn set_secret_flow(
     let github_token = resolver
         .resolve(github_token_ref)
         .map_err(|e| format!("failed to resolve github_token_ref: {e}"))?;
+    github_token.mlock();
 
     let github_token_str = github_token
         .as_str()
@@ -563,6 +565,7 @@ impl GitHubHandler {
         let github_token = resolver
             .resolve(&github_token_ref)
             .map_err(|e| format!("failed to resolve github_token_ref: {e}"))?;
+        github_token.mlock();
         let github_token_str = github_token
             .as_str()
             .ok_or_else(|| "github token is not valid UTF-8".to_string())?;
@@ -632,6 +635,7 @@ impl GitHubHandler {
         let github_token = resolver
             .resolve(&github_token_ref)
             .map_err(|e| format!("failed to resolve github_token_ref: {e}"))?;
+        github_token.mlock();
         let github_token_str = github_token
             .as_str()
             .ok_or_else(|| "github token is not valid UTF-8".to_string())?;
