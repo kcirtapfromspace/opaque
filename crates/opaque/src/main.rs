@@ -285,6 +285,54 @@ enum GithubAction {
         #[arg(long, value_delimiter = ',')]
         selected_repository_ids: Option<Vec<i64>>,
     },
+    /// List secrets for a repository, environment, or organization.
+    ListSecrets {
+        /// Repository in "owner/repo" format (for repo/env/codespaces/dependabot scopes).
+        #[arg(long)]
+        repo: Option<String>,
+
+        /// Organization name (for org scope).
+        #[arg(long)]
+        org: Option<String>,
+
+        /// Secret scope: "actions", "codespaces", "dependabot", or "org".
+        #[arg(long, default_value = "actions")]
+        scope: String,
+
+        /// GitHub environment name (for environment-scoped listing).
+        #[arg(long)]
+        environment: Option<String>,
+
+        /// GitHub token ref (default: "keychain:opaque/github-pat").
+        #[arg(long)]
+        github_token_ref: Option<String>,
+    },
+    /// Delete a secret from a repository, environment, or organization.
+    DeleteSecret {
+        /// Repository in "owner/repo" format (for repo/env/codespaces/dependabot scopes).
+        #[arg(long)]
+        repo: Option<String>,
+
+        /// Organization name (for org scope).
+        #[arg(long)]
+        org: Option<String>,
+
+        /// Secret name to delete.
+        #[arg(long)]
+        secret_name: String,
+
+        /// Secret scope: "actions", "codespaces", "dependabot", or "org".
+        #[arg(long, default_value = "actions")]
+        scope: String,
+
+        /// GitHub environment name (for environment-scoped deletion).
+        #[arg(long)]
+        environment: Option<String>,
+
+        /// GitHub token ref (default: "keychain:opaque/github-pat").
+        #[arg(long)]
+        github_token_ref: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -296,6 +344,18 @@ enum OnePasswordAction {
         /// Vault name.
         #[arg(long)]
         vault: String,
+    },
+    /// Read a specific field from a 1Password item.
+    ReadField {
+        /// Vault name.
+        #[arg(long)]
+        vault: String,
+        /// Item title.
+        #[arg(long)]
+        item: String,
+        /// Field label.
+        #[arg(long)]
+        field: String,
     },
 }
 
@@ -587,6 +647,58 @@ async fn main() {
                 }
                 ("github", params)
             }
+            GithubAction::ListSecrets {
+                repo,
+                org,
+                scope,
+                environment,
+                github_token_ref,
+            } => {
+                let mut params = serde_json::json!({
+                    "action": "list_secrets",
+                    "scope": scope,
+                });
+                if let Some(ref r) = repo {
+                    params["repo"] = serde_json::Value::String(r.clone());
+                }
+                if let Some(ref o) = org {
+                    params["org"] = serde_json::Value::String(o.clone());
+                }
+                if let Some(ref env) = environment {
+                    params["environment"] = serde_json::Value::String(env.clone());
+                }
+                if let Some(ref tok) = github_token_ref {
+                    params["github_token_ref"] = serde_json::Value::String(tok.clone());
+                }
+                ("github", params)
+            }
+            GithubAction::DeleteSecret {
+                repo,
+                org,
+                secret_name,
+                scope,
+                environment,
+                github_token_ref,
+            } => {
+                let mut params = serde_json::json!({
+                    "action": "delete_secret",
+                    "scope": scope,
+                    "secret_name": secret_name,
+                });
+                if let Some(ref r) = repo {
+                    params["repo"] = serde_json::Value::String(r.clone());
+                }
+                if let Some(ref o) = org {
+                    params["org"] = serde_json::Value::String(o.clone());
+                }
+                if let Some(ref env) = environment {
+                    params["environment"] = serde_json::Value::String(env.clone());
+                }
+                if let Some(ref tok) = github_token_ref {
+                    params["github_token_ref"] = serde_json::Value::String(tok.clone());
+                }
+                ("github", params)
+            }
         },
         Cmd::OnePassword { action } => match action {
             OnePasswordAction::ListVaults => {
@@ -597,6 +709,19 @@ async fn main() {
                 let params = serde_json::json!({
                     "action": "list_items",
                     "vault": vault,
+                });
+                ("onepassword", params)
+            }
+            OnePasswordAction::ReadField {
+                vault,
+                item,
+                field,
+            } => {
+                let params = serde_json::json!({
+                    "action": "read_field",
+                    "vault": vault,
+                    "item": item,
+                    "field": field,
                 });
                 ("onepassword", params)
             }
