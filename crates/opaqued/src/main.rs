@@ -1380,6 +1380,24 @@ async fn handle_request(
             };
             Response::ok(req.id, payload)
         }
+        "leases" => {
+            // Only human clients can inspect active leases.
+            if client_type != ClientType::Human {
+                return Response::err(
+                    Some(req.id),
+                    "permission_denied",
+                    "only human clients can list active leases",
+                );
+            }
+            let leases = state.enclave.active_leases();
+            Response::ok(
+                req.id,
+                serde_json::json!({
+                    "count": leases.len(),
+                    "leases": leases,
+                }),
+            )
+        }
         "execute" => {
             let operation = req
                 .params

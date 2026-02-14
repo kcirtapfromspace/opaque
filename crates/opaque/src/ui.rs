@@ -143,6 +143,9 @@ pub fn format_response(method: &str, result: &serde_json::Value) {
         "onepassword" => {
             format_onepassword_result(result);
         }
+        "leases" => {
+            format_leases_result(result);
+        }
         _ => {
             print_json(result);
         }
@@ -376,6 +379,78 @@ fn format_onepassword_result(result: &serde_json::Value) {
                     style(format!("[{category}]")).dim()
                 );
             }
+        }
+    } else {
+        print_json(result);
+    }
+}
+
+/// Format active leases response.
+fn format_leases_result(result: &serde_json::Value) {
+    let count = result
+        .get("count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let leases = result.get("leases").and_then(|v| v.as_array());
+
+    if count == 0 {
+        info("No active approval leases");
+        return;
+    }
+
+    header(&format!("{count} active lease(s)"));
+
+    if let Some(leases) = leases {
+        for lease in leases {
+            let operation = lease
+                .get("operation")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let target = lease
+                .get("target")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let ttl = lease
+                .get("ttl_remaining_secs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let fingerprint = lease
+                .get("client_fingerprint")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let one_time = lease
+                .get("one_time")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            let ttl_str = if ttl >= 60 {
+                format!("{}m {}s", ttl / 60, ttl % 60)
+            } else {
+                format!("{ttl}s")
+            };
+
+            println!(
+                "  {} {}  {}",
+                style(KEY).dim(),
+                style(operation).yellow().bold(),
+                style(format!("({ttl_str} remaining)")).dim()
+            );
+            if !target.is_empty() {
+                println!(
+                    "      {} {}",
+                    style("target:").dim(),
+                    target.replace('\0', ", ")
+                );
+            }
+            let mut meta = vec![format!("client:{fingerprint}")];
+            if one_time {
+                meta.push("one-time".into());
+            }
+            println!(
+                "      {} {}",
+                style("meta:").dim(),
+                style(meta.join(", ")).dim()
+            );
         }
     } else {
         print_json(result);
