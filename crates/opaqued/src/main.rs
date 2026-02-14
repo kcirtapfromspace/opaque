@@ -434,7 +434,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
     let github_dependabot_handler = github::GitHubHandler::new(audit.clone());
     let github_org_handler = github::GitHubHandler::new(audit.clone());
 
-    // 1Password Connect handler: only created if the Connect URL is configured.
+    // 1Password handler: prefer Connect Server URL, fall back to `op` CLI.
     let onepassword_connect_url =
         std::env::var(onepassword::client::CONNECT_URL_ENV).unwrap_or_default();
 
@@ -458,6 +458,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         .handler("github.set_org_secret", Box::new(github_org_handler));
 
     if !onepassword_connect_url.is_empty() {
+        // Connect Server backend (self-hosted REST API).
         let op_list_vaults_handler =
             onepassword::OnePasswordHandler::new(audit.clone(), &onepassword_connect_url);
         let op_list_items_handler =
@@ -466,11 +467,20 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             .handler("onepassword.list_vaults", Box::new(op_list_vaults_handler))
             .handler("onepassword.list_items", Box::new(op_list_items_handler));
         info!(
-            "1Password Connect handler enabled ({})",
+            "1Password handler enabled via Connect Server ({})",
             onepassword_connect_url
         );
+    } else if let Ok(cli) = onepassword::op_cli::OpCliClient::new() {
+        // `op` CLI backend (desktop app + biometric auth).
+        let op_list_vaults_handler =
+            onepassword::OnePasswordHandler::from_cli(audit.clone(), cli.clone());
+        let op_list_items_handler = onepassword::OnePasswordHandler::from_cli(audit.clone(), cli);
+        enclave_builder = enclave_builder
+            .handler("onepassword.list_vaults", Box::new(op_list_vaults_handler))
+            .handler("onepassword.list_items", Box::new(op_list_items_handler));
+        info!("1Password handler enabled via op CLI");
     } else {
-        info!("1Password Connect handler disabled (OPAQUE_1PASSWORD_CONNECT_URL not set)");
+        info!("1Password handler disabled (no Connect URL or op CLI found)");
     }
 
     let enclave = enclave_builder

@@ -34,3 +34,4 @@ crypto_box = { version = "0.9", features = ["seal"] }
 zeroize = { version = "1.8", features = ["derive"] }
 console = "0.15"
 indicatif = "0.17"
+wiremock = "0.6"

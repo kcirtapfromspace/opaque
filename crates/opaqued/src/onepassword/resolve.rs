@@ -1,16 +1,19 @@
 //! 1Password secret resolver.
 //!
-//! Resolves `onepassword:<vault>/<item>[/<field>]` references by calling
-//! the 1Password Connect Server API. The field defaults to `"password"`
-//! if not specified.
+//! Resolves `onepassword:<vault>/<item>[/<field>]` references using either:
+//! - **Connect Server API** — via `OnePasswordClient` (self-hosted, bearer token)
+//! - **`op` CLI** — via `OpCliClient` (desktop app, biometric auth)
 //!
-//! The Connect bearer token is itself resolved via the base resolver
-//! (env + keychain only) to prevent resolution cycles.
+//! The field defaults to `"password"` if not specified.
+//!
+//! For the Connect Server backend, the bearer token is itself resolved via the
+//! base resolver (env + keychain only) to prevent resolution cycles.
 
 use crate::sandbox::resolve::{BaseResolver, ResolveError, SecretResolver};
 use crate::secret::SecretValue;
 
 use super::client::OnePasswordClient;
+use super::op_cli::OpCliClient;
 
 /// Default keychain ref for the 1Password Connect token.
 const DEFAULT_CONNECT_TOKEN_REF: &str = "keychain:opaque/1password-connect-token";
@@ -21,31 +24,61 @@ const CONNECT_TOKEN_REF_ENV: &str = "OPAQUE_1PASSWORD_TOKEN_REF";
 /// Default field name when not specified in the ref.
 const DEFAULT_FIELD: &str = "password";
 
+/// Which backend the resolver uses.
+pub enum ResolverBackend {
+    /// Connect Server: needs a client and a token ref.
+    ConnectServer {
+        client: OnePasswordClient,
+        connect_token_ref: String,
+    },
+    /// `op` CLI: no token needed, auth via desktop app.
+    Cli(OpCliClient),
+}
+
+impl std::fmt::Debug for ResolverBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConnectServer {
+                connect_token_ref, ..
+            } => f
+                .debug_struct("ConnectServer")
+                .field("connect_token_ref", connect_token_ref)
+                .finish(),
+            Self::Cli(_) => write!(f, "OpCli"),
+        }
+    }
+}
+
 /// Resolves `onepassword:<vault>/<item>[/<field>]` secret references.
 pub struct OnePasswordResolver {
-    client: OnePasswordClient,
-    connect_token_ref: String,
+    backend: ResolverBackend,
 }
 
 impl std::fmt::Debug for OnePasswordResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OnePasswordResolver")
-            .field("connect_token_ref", &self.connect_token_ref)
+            .field("backend", &self.backend)
             .finish()
     }
 }
 
 impl OnePasswordResolver {
-    /// Create a new resolver with the given client.
-    ///
-    /// The Connect token ref is read from `OPAQUE_1PASSWORD_TOKEN_REF` env var,
-    /// defaulting to `keychain:opaque/1password-connect-token`.
+    /// Create a resolver backed by the Connect Server.
     pub fn new(client: OnePasswordClient) -> Self {
         let connect_token_ref = std::env::var(CONNECT_TOKEN_REF_ENV)
             .unwrap_or_else(|_| DEFAULT_CONNECT_TOKEN_REF.to_owned());
         Self {
-            client,
-            connect_token_ref,
+            backend: ResolverBackend::ConnectServer {
+                client,
+                connect_token_ref,
+            },
+        }
+    }
+
+    /// Create a resolver backed by the `op` CLI.
+    pub fn from_cli(cli: OpCliClient) -> Self {
+        Self {
+            backend: ResolverBackend::Cli(cli),
         }
     }
 
@@ -96,16 +129,21 @@ impl OnePasswordResolver {
             )),
         }
     }
-}
 
-impl SecretResolver for OnePasswordResolver {
-    fn resolve(&self, ref_str: &str) -> Result<SecretValue, ResolveError> {
-        let (vault_name, item_title, field_label) = Self::parse_ref(ref_str)?;
-
+    /// Resolve via the Connect Server API (async, bridged to sync).
+    fn resolve_connect_server(
+        &self,
+        ref_str: &str,
+        client: &OnePasswordClient,
+        connect_token_ref: &str,
+        vault_name: &str,
+        item_title: &str,
+        field_label: &str,
+    ) -> Result<SecretValue, ResolveError> {
         // Resolve the Connect token via base resolvers only (env + keychain)
         // to prevent cycles.
         let base = BaseResolver::new();
-        let token_value = base.resolve(&self.connect_token_ref).map_err(|e| {
+        let token_value = base.resolve(connect_token_ref).map_err(|e| {
             ResolveError::OnePasswordError(
                 ref_str.to_owned(),
                 format!("failed to resolve connect token: {e}"),
@@ -122,28 +160,21 @@ impl SecretResolver for OnePasswordResolver {
         let handle = tokio::runtime::Handle::current();
         let result = tokio::task::block_in_place(|| {
             handle.block_on(async {
-                // Step 1: Find vault by name.
-                let vault_id = self
-                    .client
+                let vault_id = client
                     .find_vault_by_name(token, vault_name)
                     .await
                     .map_err(|e| format!("vault lookup failed: {e}"))?;
 
-                // Step 2: Find item by title within vault.
-                let item_id = self
-                    .client
+                let item_id = client
                     .find_item_by_title(token, &vault_id, item_title)
                     .await
                     .map_err(|e| format!("item lookup failed: {e}"))?;
 
-                // Step 3: Get item with field values.
-                let item = self
-                    .client
+                let item = client
                     .get_item(token, &vault_id, &item_id)
                     .await
                     .map_err(|e| format!("item fetch failed: {e}"))?;
 
-                // Step 4: Extract the named field.
                 let field_value = item
                     .fields
                     .iter()
@@ -163,6 +194,53 @@ impl SecretResolver for OnePasswordResolver {
         match result {
             Ok(value) => Ok(SecretValue::from_string(value)),
             Err(msg) => Err(ResolveError::OnePasswordError(ref_str.to_owned(), msg)),
+        }
+    }
+
+    /// Resolve via the `op` CLI using `op read`.
+    fn resolve_cli(
+        &self,
+        ref_str: &str,
+        cli: &OpCliClient,
+        vault_name: &str,
+        item_title: &str,
+        field_label: &str,
+    ) -> Result<SecretValue, ResolveError> {
+        let handle = tokio::runtime::Handle::current();
+        let result = tokio::task::block_in_place(|| {
+            handle.block_on(async {
+                cli.read_field(vault_name, item_title, field_label)
+                    .await
+                    .map_err(|e| format!("{e}"))
+            })
+        });
+
+        match result {
+            Ok(value) => Ok(SecretValue::from_string(value)),
+            Err(msg) => Err(ResolveError::OnePasswordError(ref_str.to_owned(), msg)),
+        }
+    }
+}
+
+impl SecretResolver for OnePasswordResolver {
+    fn resolve(&self, ref_str: &str) -> Result<SecretValue, ResolveError> {
+        let (vault_name, item_title, field_label) = Self::parse_ref(ref_str)?;
+
+        match &self.backend {
+            ResolverBackend::ConnectServer {
+                client,
+                connect_token_ref,
+            } => self.resolve_connect_server(
+                ref_str,
+                client,
+                connect_token_ref,
+                vault_name,
+                item_title,
+                field_label,
+            ),
+            ResolverBackend::Cli(cli) => {
+                self.resolve_cli(ref_str, cli, vault_name, item_title, field_label)
+            }
         }
     }
 }
@@ -243,11 +321,21 @@ mod tests {
     }
 
     #[test]
-    fn resolver_debug_does_not_leak_token() {
+    fn resolver_debug_connect_server() {
         let client = OnePasswordClient::new("http://localhost:8080");
         let resolver = OnePasswordResolver::new(client);
         let debug = format!("{resolver:?}");
         assert!(debug.contains("OnePasswordResolver"));
-        assert!(!debug.contains("secret"));
+        assert!(debug.contains("ConnectServer"));
+    }
+
+    #[test]
+    fn resolver_debug_cli() {
+        if let Ok(cli) = OpCliClient::new() {
+            let resolver = OnePasswordResolver::from_cli(cli);
+            let debug = format!("{resolver:?}");
+            assert!(debug.contains("OnePasswordResolver"));
+            assert!(debug.contains("OpCli"));
+        }
     }
 }
