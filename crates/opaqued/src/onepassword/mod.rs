@@ -174,6 +174,77 @@ impl OperationHandler for OnePasswordHandler {
 
                     Ok(serde_json::json!({ "vaults": sanitized }))
                 }
+                "onepassword.read_field" => {
+                    let vault_name = params
+                        .get("vault")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| "missing 'vault' parameter".to_string())?;
+                    let item_name = params
+                        .get("item")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| "missing 'item' parameter".to_string())?;
+                    let field_name = params
+                        .get("field")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| "missing 'field' parameter".to_string())?;
+
+                    audit.emit(
+                        AuditEvent::new(AuditEventKind::ProviderFetchStarted)
+                            .with_request_id(request_id)
+                            .with_operation(&operation)
+                            .with_detail(format!(
+                                "endpoint=read_field vault={vault_name} item={item_name} field={field_name}"
+                            )),
+                    );
+
+                    let value = match &self.backend {
+                        OnePasswordBackend::ConnectServer { client, .. } => {
+                            let token = self.resolve_connect_token()?;
+                            let vault_id = client
+                                .find_vault_by_name(&token, vault_name)
+                                .await
+                                .map_err(|e| format!("vault lookup failed: {e}"))?;
+                            let item_id = client
+                                .find_item_by_title(&token, &vault_id, item_name)
+                                .await
+                                .map_err(|e| format!("item lookup failed: {e}"))?;
+                            let item = client
+                                .get_item(&token, &vault_id, &item_id)
+                                .await
+                                .map_err(|e| format!("failed to get item: {e}"))?;
+
+                            item.fields
+                                .iter()
+                                .find(|f| f.label.as_deref() == Some(field_name))
+                                .and_then(|f| f.value.clone())
+                                .ok_or_else(|| {
+                                    format!("field '{field_name}' not found in item '{item_name}'")
+                                })?
+                        }
+                        OnePasswordBackend::Cli(cli) => cli
+                            .read_field(vault_name, item_name, field_name)
+                            .await
+                            .map_err(|e| format!("failed to read field: {e}"))?,
+                    };
+
+                    audit.emit(
+                        AuditEvent::new(AuditEventKind::ProviderFetchFinished)
+                            .with_request_id(request_id)
+                            .with_operation(&operation)
+                            .with_outcome("ok")
+                            .with_detail(format!(
+                                "vault={vault_name} item={item_name} field={field_name} value_len={}",
+                                value.len()
+                            )),
+                    );
+
+                    Ok(serde_json::json!({
+                        "vault": vault_name,
+                        "item": item_name,
+                        "field": field_name,
+                        "value": value,
+                    }))
+                }
                 "onepassword.list_items" => {
                     let vault_name = params
                         .get("vault")
@@ -434,6 +505,142 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("authentication failed"));
+
+        cleanup_env();
+    }
+
+    #[tokio::test]
+    async fn read_field_via_handler() {
+        let (handler, mock_server, audit) = setup_handler_with_mock().await;
+
+        // Step 1: find vault by name
+        Mock::given(method("GET"))
+            .and(path("/v1/vaults"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": "v1", "name": "Personal"}
+            ])))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // Step 2: find item by title
+        Mock::given(method("GET"))
+            .and(path("/v1/vaults/v1/items"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": "i1", "title": "GitHub Token", "category": "LOGIN"}
+            ])))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // Step 3: get item with fields
+        Mock::given(method("GET"))
+            .and(path("/v1/vaults/v1/items/i1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "i1",
+                "title": "GitHub Token",
+                "fields": [
+                    {"id": "f1", "label": "username", "value": "user@example.com"},
+                    {"id": "f2", "label": "password", "value": "ghp_secret123"}
+                ]
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let request = make_request(
+            "onepassword.read_field",
+            serde_json::json!({"vault": "Personal", "item": "GitHub Token", "field": "password"}),
+        );
+        let result = handler.execute(&request).await.unwrap();
+
+        assert_eq!(result["vault"], "Personal");
+        assert_eq!(result["item"], "GitHub Token");
+        assert_eq!(result["field"], "password");
+        assert_eq!(result["value"], "ghp_secret123");
+
+        let events = audit.events();
+        assert!(events.len() >= 2);
+
+        cleanup_env();
+    }
+
+    #[tokio::test]
+    async fn read_field_missing_params_rejected() {
+        let (handler, _mock_server, _audit) = setup_handler_with_mock().await;
+
+        // Missing vault
+        let request = make_request(
+            "onepassword.read_field",
+            serde_json::json!({"item": "Token", "field": "password"}),
+        );
+        let result = handler.execute(&request).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("missing 'vault'"));
+
+        // Missing item
+        let request = make_request(
+            "onepassword.read_field",
+            serde_json::json!({"vault": "Personal", "field": "password"}),
+        );
+        let result = handler.execute(&request).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("missing 'item'"));
+
+        // Missing field
+        let request = make_request(
+            "onepassword.read_field",
+            serde_json::json!({"vault": "Personal", "item": "Token"}),
+        );
+        let result = handler.execute(&request).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("missing 'field'"));
+
+        cleanup_env();
+    }
+
+    #[tokio::test]
+    async fn read_field_field_not_found() {
+        let (handler, mock_server, _audit) = setup_handler_with_mock().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/vaults"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": "v1", "name": "Personal"}
+            ])))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/vaults/v1/items"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": "i1", "title": "Token", "category": "LOGIN"}
+            ])))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/vaults/v1/items/i1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "i1",
+                "title": "Token",
+                "fields": [
+                    {"id": "f1", "label": "username", "value": "user@test.com"}
+                ]
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let request = make_request(
+            "onepassword.read_field",
+            serde_json::json!({"vault": "Personal", "item": "Token", "field": "nonexistent"}),
+        );
+        let result = handler.execute(&request).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("field 'nonexistent' not found"));
 
         cleanup_env();
     }

@@ -108,6 +108,32 @@ impl<'a> SecretScope<'a> {
         }
     }
 
+    /// Returns the API path segment for listing secrets.
+    pub fn list_secrets_path(&self) -> String {
+        match self {
+            SecretScope::RepoActions { owner, repo } => {
+                format!("/repos/{owner}/{repo}/actions/secrets")
+            }
+            SecretScope::EnvActions {
+                owner,
+                repo,
+                environment,
+            } => {
+                format!("/repos/{owner}/{repo}/environments/{environment}/secrets")
+            }
+            SecretScope::CodespacesUser => "/user/codespaces/secrets".into(),
+            SecretScope::CodespacesRepo { owner, repo } => {
+                format!("/repos/{owner}/{repo}/codespaces/secrets")
+            }
+            SecretScope::Dependabot { owner, repo } => {
+                format!("/repos/{owner}/{repo}/dependabot/secrets")
+            }
+            SecretScope::OrgActions { org } => {
+                format!("/orgs/{org}/actions/secrets")
+            }
+        }
+    }
+
     /// Returns the API path segment for setting (PUT) a secret.
     pub fn set_secret_path(&self, name: &str) -> String {
         match self {
@@ -177,6 +203,21 @@ pub struct PublicKeyResponse {
     pub key_id: String,
     /// Base64-encoded Curve25519 public key.
     pub key: String,
+}
+
+/// Response from `GET .../secrets` (list secrets).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListSecretsResponse {
+    pub total_count: i64,
+    pub secrets: Vec<SecretEntry>,
+}
+
+/// A single secret entry (name + timestamps, never the value).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SecretEntry {
+    pub name: String,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 /// Response variants from `PUT .../secrets/{name}`.
@@ -318,6 +359,66 @@ impl GitHubClient {
             401 | 403 => Err(GitHubApiError::Unauthorized),
             404 => Err(GitHubApiError::NotFound(scope.not_found_context())),
             422 => Err(GitHubApiError::UnexpectedStatus(422)),
+            429 => Err(GitHubApiError::RateLimited),
+            500..=599 => Err(GitHubApiError::ServerError),
+            other => Err(GitHubApiError::UnexpectedStatus(other)),
+        }
+    }
+
+    /// List secrets for a given scope (names and timestamps only, never values).
+    pub async fn list_secrets_scoped(
+        &self,
+        token: &str,
+        scope: &SecretScope<'_>,
+    ) -> Result<ListSecretsResponse, GitHubApiError> {
+        let url = format!("{}{}", self.base_url, scope.list_secrets_path());
+
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(token)
+            .header("Accept", GITHUB_ACCEPT)
+            .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
+            .send()
+            .await
+            .map_err(GitHubApiError::Network)?;
+
+        match resp.status().as_u16() {
+            200 => resp
+                .json::<ListSecretsResponse>()
+                .await
+                .map_err(GitHubApiError::Network),
+            401 | 403 => Err(GitHubApiError::Unauthorized),
+            404 => Err(GitHubApiError::NotFound(scope.not_found_context())),
+            429 => Err(GitHubApiError::RateLimited),
+            500..=599 => Err(GitHubApiError::ServerError),
+            other => Err(GitHubApiError::UnexpectedStatus(other)),
+        }
+    }
+
+    /// Delete a secret for a given scope.
+    pub async fn delete_secret_scoped(
+        &self,
+        token: &str,
+        scope: &SecretScope<'_>,
+        name: &str,
+    ) -> Result<(), GitHubApiError> {
+        let url = format!("{}{}", self.base_url, scope.set_secret_path(name));
+
+        let resp = self
+            .http
+            .delete(&url)
+            .bearer_auth(token)
+            .header("Accept", GITHUB_ACCEPT)
+            .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
+            .send()
+            .await
+            .map_err(GitHubApiError::Network)?;
+
+        match resp.status().as_u16() {
+            204 => Ok(()),
+            401 | 403 => Err(GitHubApiError::Unauthorized),
+            404 => Err(GitHubApiError::NotFound(scope.not_found_context())),
             429 => Err(GitHubApiError::RateLimited),
             500..=599 => Err(GitHubApiError::ServerError),
             other => Err(GitHubApiError::UnexpectedStatus(other)),
@@ -595,6 +696,187 @@ mod tests {
             SecretScope::OrgActions { org: "myorg" }.display_target(),
             "org=myorg"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // list_secrets_path tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scope_repo_actions_list_path() {
+        let scope = SecretScope::RepoActions {
+            owner: "myorg",
+            repo: "myrepo",
+        };
+        assert_eq!(
+            scope.list_secrets_path(),
+            "/repos/myorg/myrepo/actions/secrets"
+        );
+    }
+
+    #[test]
+    fn scope_env_actions_list_path() {
+        let scope = SecretScope::EnvActions {
+            owner: "myorg",
+            repo: "myrepo",
+            environment: "prod",
+        };
+        assert_eq!(
+            scope.list_secrets_path(),
+            "/repos/myorg/myrepo/environments/prod/secrets"
+        );
+    }
+
+    #[test]
+    fn scope_codespaces_user_list_path() {
+        assert_eq!(
+            SecretScope::CodespacesUser.list_secrets_path(),
+            "/user/codespaces/secrets"
+        );
+    }
+
+    #[test]
+    fn scope_org_actions_list_path() {
+        let scope = SecretScope::OrgActions { org: "myorg" };
+        assert_eq!(
+            scope.list_secrets_path(),
+            "/orgs/myorg/actions/secrets"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Response type tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn list_secrets_response_deserialize() {
+        let json = r#"{
+            "total_count": 2,
+            "secrets": [
+                {"name": "MY_SECRET", "created_at": "2024-01-01T00:00:00Z", "updated_at": "2024-06-01T00:00:00Z"},
+                {"name": "DEPLOY_KEY", "created_at": "2024-02-01T00:00:00Z", "updated_at": "2024-07-01T00:00:00Z"}
+            ]
+        }"#;
+        let resp: ListSecretsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.total_count, 2);
+        assert_eq!(resp.secrets.len(), 2);
+        assert_eq!(resp.secrets[0].name, "MY_SECRET");
+        assert_eq!(resp.secrets[1].name, "DEPLOY_KEY");
+    }
+
+    #[test]
+    fn secret_entry_deserialize() {
+        let json = r#"{"name": "TOKEN", "created_at": "2024-01-01T00:00:00Z", "updated_at": "2024-06-01T00:00:00Z"}"#;
+        let entry: SecretEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.name, "TOKEN");
+        assert!(!entry.created_at.is_empty());
+        assert!(!entry.updated_at.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration tests for list/delete (wiremock)
+    // -----------------------------------------------------------------------
+
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn list_secrets_scoped_success() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/myorg/myrepo/actions/secrets"))
+            .and(header("Authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "total_count": 2,
+                "secrets": [
+                    {"name": "DB_PASSWORD", "created_at": "2024-01-01T00:00:00Z", "updated_at": "2024-06-01T00:00:00Z"},
+                    {"name": "API_KEY", "created_at": "2024-02-01T00:00:00Z", "updated_at": "2024-07-01T00:00:00Z"}
+                ]
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = GitHubClient::with_base_url(mock_server.uri());
+        let scope = SecretScope::RepoActions {
+            owner: "myorg",
+            repo: "myrepo",
+        };
+        let resp = client
+            .list_secrets_scoped("test-token", &scope)
+            .await
+            .unwrap();
+
+        assert_eq!(resp.total_count, 2);
+        assert_eq!(resp.secrets.len(), 2);
+        assert_eq!(resp.secrets[0].name, "DB_PASSWORD");
+        assert_eq!(resp.secrets[1].name, "API_KEY");
+    }
+
+    #[tokio::test]
+    async fn list_secrets_scoped_unauthorized() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/myorg/myrepo/actions/secrets"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = GitHubClient::with_base_url(mock_server.uri());
+        let scope = SecretScope::RepoActions {
+            owner: "myorg",
+            repo: "myrepo",
+        };
+        let result = client.list_secrets_scoped("bad-token", &scope).await;
+        assert!(matches!(result.unwrap_err(), GitHubApiError::Unauthorized));
+    }
+
+    #[tokio::test]
+    async fn delete_secret_scoped_success() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/repos/myorg/myrepo/actions/secrets/MY_SECRET"))
+            .and(header("Authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = GitHubClient::with_base_url(mock_server.uri());
+        let scope = SecretScope::RepoActions {
+            owner: "myorg",
+            repo: "myrepo",
+        };
+        client
+            .delete_secret_scoped("test-token", &scope, "MY_SECRET")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_secret_scoped_not_found() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/repos/myorg/myrepo/actions/secrets/NOPE"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = GitHubClient::with_base_url(mock_server.uri());
+        let scope = SecretScope::RepoActions {
+            owner: "myorg",
+            repo: "myrepo",
+        };
+        let result = client
+            .delete_secret_scoped("test-token", &scope, "NOPE")
+            .await;
+        assert!(matches!(result.unwrap_err(), GitHubApiError::NotFound(_)));
     }
 
     #[test]

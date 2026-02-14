@@ -320,6 +320,12 @@ impl OperationHandler for GitHubHandler {
                 "github.set_org_secret" => {
                     self.handle_org_secret(request_id, &params, &audit).await
                 }
+                "github.list_secrets" => {
+                    self.handle_list_secrets(request_id, &params, &audit).await
+                }
+                "github.delete_secret" => {
+                    self.handle_delete_secret(request_id, &params, &audit).await
+                }
                 other => Err(format!("unknown GitHub operation: {other}")),
             }
         })
@@ -539,6 +545,220 @@ impl GitHubHandler {
             Some(&extra),
         )
         .await
+    }
+
+    /// Handle `github.list_secrets`: list secret names for any scope.
+    async fn handle_list_secrets(
+        &self,
+        request_id: uuid::Uuid,
+        params: &serde_json::Value,
+        audit: &Arc<dyn AuditSink>,
+    ) -> Result<serde_json::Value, String> {
+        let github_token_ref = resolve_github_token_ref(params);
+        validate_value_ref(&github_token_ref)?;
+
+        let scope = parse_scope(params)?;
+
+        let resolver = CompositeResolver::new();
+        let github_token = resolver
+            .resolve(&github_token_ref)
+            .map_err(|e| format!("failed to resolve github_token_ref: {e}"))?;
+        let github_token_str = github_token
+            .as_str()
+            .ok_or_else(|| "github token is not valid UTF-8".to_string())?;
+
+        audit.emit(
+            AuditEvent::new(AuditEventKind::ProviderFetchStarted)
+                .with_request_id(request_id)
+                .with_operation("github.list_secrets")
+                .with_detail(format!("endpoint=list_secrets {}", scope.display_target())),
+        );
+
+        let list_resp = self
+            .client
+            .list_secrets_scoped(github_token_str, &scope)
+            .await
+            .map_err(|e| format!("failed to list secrets: {e}"))?;
+
+        audit.emit(
+            AuditEvent::new(AuditEventKind::ProviderFetchFinished)
+                .with_request_id(request_id)
+                .with_operation("github.list_secrets")
+                .with_outcome("ok")
+                .with_detail(format!(
+                    "{} total_count={}",
+                    scope.display_target(),
+                    list_resp.total_count
+                )),
+        );
+
+        let secrets: Vec<serde_json::Value> = list_resp
+            .secrets
+            .into_iter()
+            .map(|s| {
+                serde_json::json!({
+                    "name": s.name,
+                    "created_at": s.created_at,
+                    "updated_at": s.updated_at,
+                })
+            })
+            .collect();
+
+        Ok(serde_json::json!({
+            "total_count": list_resp.total_count,
+            "secrets": secrets,
+        }))
+    }
+
+    /// Handle `github.delete_secret`: delete a secret from any scope.
+    async fn handle_delete_secret(
+        &self,
+        request_id: uuid::Uuid,
+        params: &serde_json::Value,
+        audit: &Arc<dyn AuditSink>,
+    ) -> Result<serde_json::Value, String> {
+        let secret_name = params
+            .get("secret_name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "missing 'secret_name' parameter".to_string())?;
+        let github_token_ref = resolve_github_token_ref(params);
+
+        validate_secret_name(secret_name)?;
+        validate_value_ref(&github_token_ref)?;
+
+        let scope = parse_scope(params)?;
+
+        let resolver = CompositeResolver::new();
+        let github_token = resolver
+            .resolve(&github_token_ref)
+            .map_err(|e| format!("failed to resolve github_token_ref: {e}"))?;
+        let github_token_str = github_token
+            .as_str()
+            .ok_or_else(|| "github token is not valid UTF-8".to_string())?;
+
+        audit.emit(
+            AuditEvent::new(AuditEventKind::ProviderFetchStarted)
+                .with_request_id(request_id)
+                .with_operation("github.delete_secret")
+                .with_detail(format!(
+                    "endpoint=delete_secret {} secret_name={secret_name}",
+                    scope.display_target()
+                )),
+        );
+
+        self.client
+            .delete_secret_scoped(github_token_str, &scope, secret_name)
+            .await
+            .map_err(|e| format!("failed to delete secret: {e}"))?;
+
+        audit.emit(
+            AuditEvent::new(AuditEventKind::ProviderFetchFinished)
+                .with_request_id(request_id)
+                .with_operation("github.delete_secret")
+                .with_outcome("deleted")
+                .with_detail(format!(
+                    "{} secret_name={secret_name}",
+                    scope.display_target()
+                )),
+        );
+
+        let mut resp = serde_json::json!({
+            "status": "deleted",
+            "secret_name": secret_name,
+        });
+
+        match &scope {
+            SecretScope::RepoActions { owner, repo }
+            | SecretScope::CodespacesRepo { owner, repo }
+            | SecretScope::Dependabot { owner, repo } => {
+                resp["repo"] = serde_json::Value::String(format!("{owner}/{repo}"));
+            }
+            SecretScope::EnvActions {
+                owner,
+                repo,
+                environment,
+            } => {
+                resp["repo"] = serde_json::Value::String(format!("{owner}/{repo}"));
+                resp["environment"] = serde_json::Value::String(environment.to_string());
+            }
+            SecretScope::CodespacesUser => {
+                resp["scope"] = serde_json::Value::String("user".into());
+            }
+            SecretScope::OrgActions { org } => {
+                resp["org"] = serde_json::Value::String(org.to_string());
+            }
+        }
+
+        Ok(resp)
+    }
+}
+
+/// Parse a `SecretScope` from operation params.
+///
+/// The `scope` parameter determines the secret type: `"actions"` (default),
+/// `"codespaces"`, `"dependabot"`, or `"org"`. Combined with `repo`, `org`,
+/// and `environment` parameters to build the full scope.
+fn parse_scope(params: &serde_json::Value) -> Result<SecretScope<'_>, String> {
+    let scope_type = params
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .unwrap_or("actions");
+
+    match scope_type {
+        "actions" => {
+            let repo = params
+                .get("repo")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "missing 'repo' parameter".to_string())?;
+            let (owner, repo_name) = validate_repo(repo)?;
+
+            if let Some(env_name) = params.get("environment").and_then(|v| v.as_str()) {
+                validate_environment_name(env_name)?;
+                Ok(SecretScope::EnvActions {
+                    owner,
+                    repo: repo_name,
+                    environment: env_name,
+                })
+            } else {
+                Ok(SecretScope::RepoActions {
+                    owner,
+                    repo: repo_name,
+                })
+            }
+        }
+        "codespaces" => {
+            if let Some(repo) = params.get("repo").and_then(|v| v.as_str()) {
+                let (owner, repo_name) = validate_repo(repo)?;
+                Ok(SecretScope::CodespacesRepo {
+                    owner,
+                    repo: repo_name,
+                })
+            } else {
+                Ok(SecretScope::CodespacesUser)
+            }
+        }
+        "dependabot" => {
+            let repo = params
+                .get("repo")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "missing 'repo' parameter for dependabot scope".to_string())?;
+            let (owner, repo_name) = validate_repo(repo)?;
+            Ok(SecretScope::Dependabot {
+                owner,
+                repo: repo_name,
+            })
+        }
+        "org" => {
+            let org = params
+                .get("org")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "missing 'org' parameter for org scope".to_string())?;
+            validate_org_name(org)?;
+            Ok(SecretScope::OrgActions { org })
+        }
+        other => Err(format!(
+            "unknown scope '{other}': expected 'actions', 'codespaces', 'dependabot', or 'org'"
+        )),
     }
 }
 
@@ -916,5 +1136,149 @@ mod tests {
         let result = handler.execute(&request).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("unknown GitHub operation"));
+    }
+
+    // --- parse_scope tests ---
+
+    #[test]
+    fn parse_scope_default_actions() {
+        let params = serde_json::json!({"repo": "owner/repo"});
+        let scope = parse_scope(&params).unwrap();
+        assert_eq!(
+            scope,
+            SecretScope::RepoActions {
+                owner: "owner",
+                repo: "repo"
+            }
+        );
+    }
+
+    #[test]
+    fn parse_scope_actions_with_environment() {
+        let params = serde_json::json!({"repo": "owner/repo", "environment": "production"});
+        let scope = parse_scope(&params).unwrap();
+        assert_eq!(
+            scope,
+            SecretScope::EnvActions {
+                owner: "owner",
+                repo: "repo",
+                environment: "production"
+            }
+        );
+    }
+
+    #[test]
+    fn parse_scope_codespaces_user() {
+        let params = serde_json::json!({"scope": "codespaces"});
+        let scope = parse_scope(&params).unwrap();
+        assert_eq!(scope, SecretScope::CodespacesUser);
+    }
+
+    #[test]
+    fn parse_scope_codespaces_repo() {
+        let params = serde_json::json!({"scope": "codespaces", "repo": "owner/repo"});
+        let scope = parse_scope(&params).unwrap();
+        assert_eq!(
+            scope,
+            SecretScope::CodespacesRepo {
+                owner: "owner",
+                repo: "repo"
+            }
+        );
+    }
+
+    #[test]
+    fn parse_scope_dependabot() {
+        let params = serde_json::json!({"scope": "dependabot", "repo": "owner/repo"});
+        let scope = parse_scope(&params).unwrap();
+        assert_eq!(
+            scope,
+            SecretScope::Dependabot {
+                owner: "owner",
+                repo: "repo"
+            }
+        );
+    }
+
+    #[test]
+    fn parse_scope_dependabot_missing_repo() {
+        let params = serde_json::json!({"scope": "dependabot"});
+        assert!(parse_scope(&params).is_err());
+    }
+
+    #[test]
+    fn parse_scope_org() {
+        let params = serde_json::json!({"scope": "org", "org": "myorg"});
+        let scope = parse_scope(&params).unwrap();
+        assert_eq!(scope, SecretScope::OrgActions { org: "myorg" });
+    }
+
+    #[test]
+    fn parse_scope_org_missing_org() {
+        let params = serde_json::json!({"scope": "org"});
+        assert!(parse_scope(&params).is_err());
+    }
+
+    #[test]
+    fn parse_scope_unknown() {
+        let params = serde_json::json!({"scope": "invalid"});
+        assert!(parse_scope(&params).is_err());
+    }
+
+    // --- list_secrets handler tests ---
+
+    #[tokio::test]
+    async fn list_secrets_missing_repo_rejected() {
+        use opaque_core::audit::InMemoryAuditEmitter;
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let handler = GitHubHandler::new(audit);
+        let request = make_request("github.list_secrets", serde_json::json!({}));
+        let result = handler.execute(&request).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("missing 'repo'"));
+    }
+
+    #[tokio::test]
+    async fn list_secrets_invalid_scope_rejected() {
+        use opaque_core::audit::InMemoryAuditEmitter;
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let handler = GitHubHandler::new(audit);
+        let request = make_request(
+            "github.list_secrets",
+            serde_json::json!({"scope": "invalid"}),
+        );
+        let result = handler.execute(&request).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown scope"));
+    }
+
+    // --- delete_secret handler tests ---
+
+    #[tokio::test]
+    async fn delete_secret_missing_name_rejected() {
+        use opaque_core::audit::InMemoryAuditEmitter;
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let handler = GitHubHandler::new(audit);
+        let request = make_request(
+            "github.delete_secret",
+            serde_json::json!({"repo": "owner/repo"}),
+        );
+        let result = handler.execute(&request).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("missing 'secret_name'"));
+    }
+
+    #[tokio::test]
+    async fn delete_secret_invalid_name_rejected() {
+        use opaque_core::audit::InMemoryAuditEmitter;
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let handler = GitHubHandler::new(audit);
+        let request = make_request(
+            "github.delete_secret",
+            serde_json::json!({"repo": "owner/repo", "secret_name": "GITHUB_TOKEN"}),
+        );
+        let result = handler.execute(&request).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("GITHUB_"));
     }
 }
