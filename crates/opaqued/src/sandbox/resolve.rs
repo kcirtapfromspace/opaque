@@ -267,12 +267,23 @@ pub struct CompositeResolver {
 
 impl CompositeResolver {
     pub fn new() -> Self {
-        let onepassword = std::env::var(crate::onepassword::client::CONNECT_URL_ENV)
-            .ok()
-            .map(|url| {
+        // Backend selection priority:
+        // 1. Connect Server URL configured → use Connect Server
+        // 2. `op` CLI found in PATH → use `op` CLI
+        // 3. Neither → onepassword disabled
+        let onepassword =
+            if let Ok(url) = std::env::var(crate::onepassword::client::CONNECT_URL_ENV) {
                 let client = crate::onepassword::client::OnePasswordClient::new(&url);
-                crate::onepassword::resolve::OnePasswordResolver::new(client)
-            });
+                Some(crate::onepassword::resolve::OnePasswordResolver::new(
+                    client,
+                ))
+            } else if let Ok(cli) = crate::onepassword::op_cli::OpCliClient::new() {
+                Some(crate::onepassword::resolve::OnePasswordResolver::from_cli(
+                    cli,
+                ))
+            } else {
+                None
+            };
         Self {
             env: EnvResolver,
             keychain: KeychainResolver,
@@ -301,7 +312,8 @@ impl SecretResolver for CompositeResolver {
                 Some(r) => r.resolve(ref_str),
                 None => Err(ResolveError::OnePasswordError(
                     ref_str.to_owned(),
-                    "1Password Connect not configured (set OPAQUE_1PASSWORD_CONNECT_URL)".into(),
+                    "1Password not configured (set OPAQUE_1PASSWORD_CONNECT_URL or install op CLI)"
+                        .into(),
                 )),
             }
         } else {
@@ -471,12 +483,13 @@ mod tests {
         assert!(format!("{err}").contains("1Password resolution failed"));
     }
 
-    #[test]
-    fn composite_resolver_onepassword_unconfigured() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn composite_resolver_onepassword_dispatch() {
         let resolver = CompositeResolver::new();
-        // Without OPAQUE_1PASSWORD_CONNECT_URL set, onepassword: refs should
-        // return a clear "not configured" error.
-        let result = resolver.resolve("onepassword:vault/item");
+        // Without OPAQUE_1PASSWORD_CONNECT_URL, the resolver either:
+        // - Uses `op` CLI if available (will fail with a CLI error on bogus ref)
+        // - Returns "not configured" if no backend is available
+        let result = resolver.resolve("onepassword:nonexistent-vault-xyz/item");
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
