@@ -27,6 +27,7 @@ use uuid::Uuid;
 const DAEMON_TOKEN_FILENAME: &str = "daemon.token";
 
 mod approval;
+mod bitwarden;
 mod enclave;
 mod github;
 mod onepassword;
@@ -78,6 +79,11 @@ struct HumanClientEntry {
 // ---------------------------------------------------------------------------
 // Daemon state
 // ---------------------------------------------------------------------------
+
+/// Build a version string that includes the git SHA: `0.1.0+abc1234`.
+const fn version_string() -> &'static str {
+    concat!(env!("CARGO_PKG_VERSION"), "+", env!("OPAQUE_GIT_SHA"))
+}
 
 struct DaemonState {
     enclave: Arc<Enclave>,
@@ -526,6 +532,49 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         })
         .expect("failed to register onepassword.list_items");
 
+    registry
+        .register(OperationDef {
+            name: "bitwarden.list_projects".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::FirstUse,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "List available Bitwarden Secrets Manager projects".into(),
+            params_schema: None,
+            allowed_target_keys: vec![],
+        })
+        .expect("failed to register bitwarden.list_projects");
+
+    registry
+        .register(OperationDef {
+            name: "bitwarden.list_secrets".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::FirstUse,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "List secrets in a Bitwarden Secrets Manager project".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": { "project": {"type": "string"} }
+            })),
+            allowed_target_keys: vec!["project".into()],
+        })
+        .expect("failed to register bitwarden.list_secrets");
+
+    registry
+        .register(OperationDef {
+            name: "bitwarden.read_secret".into(),
+            safety: OperationSafety::Reveal,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Read a secret value from Bitwarden Secrets Manager".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["secret_id"],
+                "properties": { "secret_id": {"type": "string"} }
+            })),
+            allowed_target_keys: vec!["secret_id".into()],
+        })
+        .expect("failed to register bitwarden.read_secret");
+
     let policy = PolicyEngine::with_rules(config.rules.clone());
     info!("policy engine loaded with {} rules", policy.rule_count());
 
@@ -611,6 +660,32 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         info!("1Password handler disabled (no Connect URL or op CLI found)");
     }
 
+    // Bitwarden handler: use configured URL or default.
+    let bitwarden_url = std::env::var(bitwarden::client::BITWARDEN_URL_ENV)
+        .unwrap_or_else(|_| bitwarden::client::DEFAULT_BASE_URL.to_owned());
+    {
+        let bw_list_projects_handler =
+            bitwarden::BitwardenHandler::new(audit.clone(), &bitwarden_url);
+        let bw_list_secrets_handler =
+            bitwarden::BitwardenHandler::new(audit.clone(), &bitwarden_url);
+        let bw_read_secret_handler =
+            bitwarden::BitwardenHandler::new(audit.clone(), &bitwarden_url);
+        enclave_builder = enclave_builder
+            .handler(
+                "bitwarden.list_projects",
+                Box::new(bw_list_projects_handler),
+            )
+            .handler(
+                "bitwarden.list_secrets",
+                Box::new(bw_list_secrets_handler),
+            )
+            .handler(
+                "bitwarden.read_secret",
+                Box::new(bw_read_secret_handler),
+            );
+        info!("Bitwarden handler enabled ({})", bitwarden_url);
+    }
+
     let enclave = enclave_builder
         .approval_gate(Box::new(NativeApprovalGate))
         .audit(audit)
@@ -619,7 +694,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
     let state = Arc::new(DaemonState {
         enclave: Arc::new(enclave),
         config,
-        version: env!("CARGO_PKG_VERSION"),
+        version: version_string(),
         daemon_token,
         connection_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
     });
@@ -1576,6 +1651,20 @@ async fn handle_request(
                 );
             }
 
+            // Validate value_ref and github_token_ref for control chars / secret patterns.
+            // This prevents prompt injection in the approval UI via crafted ref strings.
+            let mut refs_to_validate = vec![value_ref.clone()];
+            if let Some(tok) = req.params.get("github_token_ref").and_then(|v| v.as_str()) {
+                refs_to_validate.push(tok.to_owned());
+            }
+            if let Err(e) = InputValidator::validate_secret_ref_names(&refs_to_validate) {
+                return Response::err(
+                    Some(req.id),
+                    "bad_request",
+                    format!("invalid secret ref: {e}"),
+                );
+            }
+
             // Determine operation name and target based on scope.
             let (operation, target, op_params) = match scope {
                 "repo_actions" | "env_actions" => {
@@ -1607,7 +1696,13 @@ async fn handle_request(
                     if let Some(env) = req.params.get("environment").and_then(|v| v.as_str()) {
                         params["environment"] = serde_json::Value::String(env.into());
                     }
-                    let target = HashMap::from([("repo".into(), repo)]);
+                    let mut target = HashMap::from([
+                        ("repo".into(), repo),
+                        ("secret_name".into(), secret_name.clone()),
+                    ]);
+                    if let Some(env) = params.get("environment").and_then(|v| v.as_str()) {
+                        target.insert("environment".into(), env.to_owned());
+                    }
                     ("github.set_actions_secret", target, params)
                 }
                 "codespaces_user" => {
@@ -1621,7 +1716,10 @@ async fn handle_request(
                     if let Some(ids) = req.params.get("selected_repository_ids") {
                         params["selected_repository_ids"] = ids.clone();
                     }
-                    ("github.set_codespaces_secret", HashMap::new(), params)
+                    let target = HashMap::from([
+                        ("secret_name".into(), secret_name.clone()),
+                    ]);
+                    ("github.set_codespaces_secret", target, params)
                 }
                 "codespaces_repo" => {
                     let repo = req
@@ -1649,7 +1747,10 @@ async fn handle_request(
                     if let Some(tok) = req.params.get("github_token_ref").and_then(|v| v.as_str()) {
                         params["github_token_ref"] = serde_json::Value::String(tok.into());
                     }
-                    let target = HashMap::from([("repo".into(), repo)]);
+                    let target = HashMap::from([
+                        ("repo".into(), repo),
+                        ("secret_name".into(), secret_name.clone()),
+                    ]);
                     ("github.set_codespaces_secret", target, params)
                 }
                 "dependabot" => {
@@ -1678,7 +1779,10 @@ async fn handle_request(
                     if let Some(tok) = req.params.get("github_token_ref").and_then(|v| v.as_str()) {
                         params["github_token_ref"] = serde_json::Value::String(tok.into());
                     }
-                    let target = HashMap::from([("repo".into(), repo)]);
+                    let target = HashMap::from([
+                        ("repo".into(), repo),
+                        ("secret_name".into(), secret_name.clone()),
+                    ]);
                     ("github.set_dependabot_secret", target, params)
                 }
                 "org_actions" => {
@@ -1706,7 +1810,10 @@ async fn handle_request(
                     if let Some(ids) = req.params.get("selected_repository_ids") {
                         params["selected_repository_ids"] = ids.clone();
                     }
-                    let target = HashMap::from([("org".into(), org)]);
+                    let target = HashMap::from([
+                        ("org".into(), org),
+                        ("secret_name".into(), secret_name.clone()),
+                    ]);
                     ("github.set_org_secret", target, params)
                 }
                 unknown => {
@@ -1716,6 +1823,18 @@ async fn handle_request(
                         format!(
                             "unknown scope '{unknown}' (expected: repo_actions, env_actions, codespaces_user, codespaces_repo, dependabot, org_actions)"
                         ),
+                    );
+                }
+            };
+
+            // Validate target before building OperationRequest.
+            let target = match InputValidator::validate_target(&target) {
+                Ok(t) => t,
+                Err(e) => {
+                    return Response::err(
+                        Some(req.id),
+                        "bad_request",
+                        format!("invalid target: {e}"),
                     );
                 }
             };
@@ -1832,12 +1951,154 @@ async fn handle_request(
                 }
             };
 
+            // Validate target before building OperationRequest.
+            let target = match InputValidator::validate_target(&target) {
+                Ok(t) => t,
+                Err(e) => {
+                    return Response::err(
+                        Some(req.id),
+                        "bad_request",
+                        format!("invalid target: {e}"),
+                    );
+                }
+            };
+
             // Build secret_ref_names from the vault/item/field path for read_field.
             let secret_ref_names = if action == "read_field" {
                 let v = op_params.get("vault").and_then(|v| v.as_str()).unwrap_or("");
                 let i = op_params.get("item").and_then(|v| v.as_str()).unwrap_or("");
                 let f = op_params.get("field").and_then(|v| v.as_str()).unwrap_or("");
-                vec![format!("onepassword:{v}/{i}/{f}")]
+                let refs = vec![format!("onepassword:{v}/{i}/{f}")];
+                if let Err(e) = InputValidator::validate_secret_ref_names(&refs) {
+                    return Response::err(
+                        Some(req.id),
+                        "bad_request",
+                        format!("invalid secret ref: {e}"),
+                    );
+                }
+                refs
+            } else {
+                vec![]
+            };
+
+            let op_req = OperationRequest {
+                request_id: Uuid::new_v4(),
+                client_identity: identity.clone(),
+                client_type,
+                operation: operation.into(),
+                target,
+                secret_ref_names,
+                created_at: SystemTime::now(),
+                expires_at: None,
+                params: op_params,
+                workspace: None,
+            };
+
+            state
+                .enclave
+                .execute(op_req)
+                .await
+                .into_proto_response(req.id)
+        }
+        "bitwarden" => {
+            // The bitwarden method is a convenience wrapper that builds an
+            // "execute" request for the appropriate bitwarden.* operation.
+            let action = req
+                .params
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+
+            if action.is_empty() {
+                return Response::err(Some(req.id), "bad_request", "missing 'action' field");
+            }
+
+            let (operation, target, op_params) = match action.as_str() {
+                "list_projects" => (
+                    "bitwarden.list_projects",
+                    HashMap::new(),
+                    serde_json::json!({}),
+                ),
+                "list_secrets" => {
+                    let project = req
+                        .params
+                        .get("project")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_owned());
+
+                    let target = if let Some(ref p) = project {
+                        HashMap::from([("project".into(), p.clone())])
+                    } else {
+                        HashMap::new()
+                    };
+                    let params = if let Some(ref p) = project {
+                        serde_json::json!({ "project": p })
+                    } else {
+                        serde_json::json!({})
+                    };
+                    ("bitwarden.list_secrets", target, params)
+                }
+                "read_secret" => {
+                    let secret_id = req
+                        .params
+                        .get("secret_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_owned();
+
+                    if secret_id.is_empty() {
+                        return Response::err(
+                            Some(req.id),
+                            "bad_request",
+                            "missing 'secret_id' field",
+                        );
+                    }
+
+                    let target =
+                        HashMap::from([("secret_id".into(), secret_id.clone())]);
+                    (
+                        "bitwarden.read_secret",
+                        target,
+                        serde_json::json!({ "secret_id": secret_id }),
+                    )
+                }
+                unknown => {
+                    return Response::err(
+                        Some(req.id),
+                        "bad_request",
+                        format!("unknown action '{unknown}' (expected: list_projects, list_secrets, read_secret)"),
+                    );
+                }
+            };
+
+            // Validate target before building OperationRequest.
+            let target = match InputValidator::validate_target(&target) {
+                Ok(t) => t,
+                Err(e) => {
+                    return Response::err(
+                        Some(req.id),
+                        "bad_request",
+                        format!("invalid target: {e}"),
+                    );
+                }
+            };
+
+            // Build secret_ref_names for read_secret.
+            let secret_ref_names = if action == "read_secret" {
+                let sid = op_params
+                    .get("secret_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let refs = vec![format!("bitwarden:{sid}")];
+                if let Err(e) = InputValidator::validate_secret_ref_names(&refs) {
+                    return Response::err(
+                        Some(req.id),
+                        "bad_request",
+                        format!("invalid secret ref: {e}"),
+                    );
+                }
+                refs
             } else {
                 vec![]
             };
@@ -1962,6 +2223,18 @@ async fn handle_github_list_secrets(
         op_params["github_token_ref"] = serde_json::Value::String(tok.into());
     }
 
+    // Validate target before building OperationRequest.
+    let target = match InputValidator::validate_target(&target) {
+        Ok(t) => t,
+        Err(e) => {
+            return Response::err(
+                Some(req.id),
+                "bad_request",
+                format!("invalid target: {e}"),
+            );
+        }
+    };
+
     let op_req = OperationRequest {
         request_id: Uuid::new_v4(),
         client_identity: identity.clone(),
@@ -2012,7 +2285,9 @@ async fn handle_github_delete_secret(
         "scope": scope,
         "secret_name": secret_name,
     });
-    let mut target = HashMap::new();
+    let mut target = HashMap::from([
+        ("secret_name".into(), secret_name.clone()),
+    ]);
 
     if let Some(repo) = req.params.get("repo").and_then(|v| v.as_str()) {
         op_params["repo"] = serde_json::Value::String(repo.into());
@@ -2028,6 +2303,18 @@ async fn handle_github_delete_secret(
     if let Some(tok) = req.params.get("github_token_ref").and_then(|v| v.as_str()) {
         op_params["github_token_ref"] = serde_json::Value::String(tok.into());
     }
+
+    // Validate target before building OperationRequest.
+    let target = match InputValidator::validate_target(&target) {
+        Ok(t) => t,
+        Err(e) => {
+            return Response::err(
+                Some(req.id),
+                "bad_request",
+                format!("invalid target: {e}"),
+            );
+        }
+    };
 
     let op_req = OperationRequest {
         request_id: Uuid::new_v4(),
@@ -2638,7 +2925,7 @@ exe_sha256 = "deadbeef"
         DaemonState {
             enclave: Arc::new(enclave),
             config: DaemonConfig::default(),
-            version: env!("CARGO_PKG_VERSION"),
+            version: version_string(),
             daemon_token: "test_token".into(),
             connection_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
         }

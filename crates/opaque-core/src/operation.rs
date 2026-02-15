@@ -77,7 +77,7 @@ impl fmt::Display for ApprovalFactor {
 }
 
 /// When approval is required for an operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalRequirement {
     /// Approval is required every time.
@@ -88,6 +88,7 @@ pub enum ApprovalRequirement {
     FirstUse,
 
     /// No approval is required (safe introspection operations).
+    #[default]
     Never,
 }
 

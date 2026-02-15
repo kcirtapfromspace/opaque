@@ -167,8 +167,12 @@ impl fmt::Debug for ApprovalRateLimiter {
 // ---------------------------------------------------------------------------
 
 /// Key for the approval lease cache. Identifies a unique (client, operation,
-/// target, secrets) tuple. Deliberately excludes PID so the same binary can
-/// reuse a lease across reconnects.
+/// target, secrets, params) tuple. Deliberately excludes PID so the same
+/// binary can reuse a lease across reconnects.
+///
+/// SECURITY: `params_hash` ensures that different operation parameters
+/// (e.g. different `secret_name` or `environment`) produce distinct lease
+/// keys, preventing param-swapping under an existing first-use lease.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct LeaseKey {
     /// SHA-256 of stable client identity fields (uid, gid, exe_path,
@@ -179,6 +183,8 @@ struct LeaseKey {
     target_canonical: String,
     /// Sorted "NAME1\0NAME2\0..."
     secret_refs_canonical: String,
+    /// SHA-256 of canonical JSON-serialized params.
+    params_hash: String,
 }
 
 impl LeaseKey {
@@ -215,11 +221,18 @@ impl LeaseKey {
         refs.sort();
         let secret_refs_canonical = refs.join("\0");
 
+        // Hash of canonical params to prevent param-swapping under a lease.
+        let mut params_hasher = Sha256::new();
+        let params_canonical = serde_json::to_string(&request.params).unwrap_or_default();
+        params_hasher.update(params_canonical.as_bytes());
+        let params_hash = format!("{:x}", params_hasher.finalize());
+
         Self {
             client_fingerprint,
             operation: request.operation.clone(),
             target_canonical,
             secret_refs_canonical,
+            params_hash,
         }
     }
 }
@@ -842,19 +855,20 @@ impl Enclave {
         );
 
         // Build the approval description that the user will see.
-        // SECURITY: Never use {:?} on raw client-controlled maps — it could
-        // embed secrets or control characters in the approval UI.
+        // SECURITY: Defensively sanitize all client-controlled strings before
+        // rendering into the approval prompt. This is defense-in-depth: even
+        // if upstream validation is bypassed, the prompt cannot be spoofed.
         let mut description = format!("Operation: {}", op_def.description);
         for (k, v) in &request.target {
-            let v_display = if v.len() > 128 { &v[..128] } else { v };
-            description.push_str(&format!("\n  {k}: {v_display}"));
+            let v_safe = sanitize_for_display(v, 128);
+            description.push_str(&format!("\n  {k}: {v_safe}"));
         }
         description.push_str(&format!("\nClient: {}", request.client_identity));
-        let ref_display: Vec<&str> = request
+        let ref_display: Vec<String> = request
             .secret_ref_names
             .iter()
             .take(8)
-            .map(|s| s.as_str())
+            .map(|s| sanitize_for_display(s, 128))
             .collect();
         description.push_str(&format!("\nSecrets: [{}]", ref_display.join(", ")));
         if let Some(ref ws) = request.workspace {
@@ -1027,6 +1041,40 @@ impl ApprovalGate for NativeApprovalGate {
                 .map_err(|e| e.to_string())
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Approval display sanitization
+// ---------------------------------------------------------------------------
+
+/// Sanitize a string for display in the approval prompt.
+///
+/// Strips control characters (0x00-0x1F), RTL overrides (U+202A-U+202E),
+/// and bidi isolates (U+2066-U+2069). Truncates to `max_len` chars.
+/// This is defense-in-depth: even if upstream validation is bypassed,
+/// the approval UI cannot be spoofed with control characters.
+fn sanitize_for_display(s: &str, max_len: usize) -> String {
+    let cleaned: String = s
+        .chars()
+        .filter(|&ch| {
+            let cp = ch as u32;
+            // Reject control characters (0x00-0x1F).
+            if cp <= 0x1F {
+                return false;
+            }
+            // Reject RTL override characters (U+202A-U+202E).
+            if (0x202A..=0x202E).contains(&cp) {
+                return false;
+            }
+            // Reject bidi isolate characters (U+2066-U+2069).
+            if (0x2066..=0x2069).contains(&cp) {
+                return false;
+            }
+            true
+        })
+        .take(max_len)
+        .collect();
+    cleaned
 }
 
 // ---------------------------------------------------------------------------
