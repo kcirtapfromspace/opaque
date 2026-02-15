@@ -371,9 +371,9 @@ impl OperationRequest {
     /// Compute a SHA-256 content hash over the canonical fields of this request.
     ///
     /// The hash covers: operation name, sorted target entries, sorted secret_ref_names,
-    /// client identity (uid, gid, pid), and workspace (remote_url, branch).
+    /// params, client identity (uid, gid, pid), and workspace (remote_url, branch).
     ///
-    /// Excludes: `params` (ephemeral), `request_id`, timestamps.
+    /// Excludes: `request_id`, timestamps.
     ///
     /// Null-byte delimiters between fields prevent prefix collisions.
     pub fn content_hash(&self) -> String {
@@ -402,6 +402,11 @@ impl OperationRequest {
             hasher.update(r.as_bytes());
             hasher.update(b"\0");
         }
+
+        // Params — include canonical JSON serialization to bind approval to parameters.
+        let params_str = serde_json::to_string(&self.params).unwrap_or_default();
+        hasher.update(params_str.as_bytes());
+        hasher.update(b"\0");
 
         // Client identity: uid, gid, pid as little-endian bytes
         hasher.update(self.client_identity.uid.to_le_bytes());
@@ -821,15 +826,23 @@ mod tests {
             workspace: None,
         };
 
-        // Same canonical fields, different request_id and params.
+        // Same canonical fields (including params), different request_id and timestamps.
         let req2 = OperationRequest {
-            request_id: Uuid::new_v4(),                   // Different
-            params: serde_json::json!({"other": "data"}), // Different
-            created_at: SystemTime::now(),                // Different
+            request_id: Uuid::new_v4(),    // Different — excluded from hash
+            created_at: SystemTime::now(), // Different — excluded from hash
             ..req1.clone()
         };
 
         assert_eq!(req1.content_hash(), req2.content_hash());
+
+        // Different params must produce a different hash.
+        let req3 = OperationRequest {
+            request_id: Uuid::new_v4(),
+            params: serde_json::json!({"other": "data"}),
+            ..req1.clone()
+        };
+
+        assert_ne!(req1.content_hash(), req3.content_hash());
     }
 
     #[test]
