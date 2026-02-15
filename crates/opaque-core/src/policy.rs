@@ -227,12 +227,17 @@ impl SecretNameMatch {
 // ---------------------------------------------------------------------------
 
 /// Approval configuration attached to a policy rule.
+///
+/// Defaults to `require: Never, factors: []` — suitable for deny rules
+/// where approval is irrelevant.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalConfig {
     /// When approval is required.
+    #[serde(default)]
     pub require: ApprovalRequirement,
 
     /// Acceptable approval factors (any-of).
+    #[serde(default)]
     pub factors: Vec<ApprovalFactor>,
 
     /// Lease duration after approval (for `FirstUse`).
@@ -246,6 +251,17 @@ pub struct ApprovalConfig {
     /// If true, the approval is consumed after a single use.
     #[serde(default)]
     pub one_time: bool,
+}
+
+impl Default for ApprovalConfig {
+    fn default() -> Self {
+        Self {
+            require: ApprovalRequirement::Never,
+            factors: vec![],
+            lease_ttl: None,
+            one_time: false,
+        }
+    }
 }
 
 mod optional_duration_secs {
@@ -283,7 +299,8 @@ pub struct PolicyRule {
     /// Human-readable rule name (for audit/logging).
     pub name: String,
 
-    /// Client match pattern.
+    /// Client match pattern. Defaults to "match any" when omitted.
+    #[serde(default)]
     pub client: ClientMatch,
 
     /// Glob pattern on operation name (e.g. `"github.*"`).
@@ -311,6 +328,8 @@ pub struct PolicyRule {
     pub client_types: Vec<ClientType>,
 
     /// Approval configuration (required factors, lease, one-time).
+    /// Defaults to no approval required (suitable for deny rules).
+    #[serde(default)]
     pub approval: ApprovalConfig,
 }
 
