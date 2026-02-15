@@ -337,7 +337,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
     registry
         .register(OperationDef {
             name: "sandbox.exec".into(),
-            safety: OperationSafety::Safe,
+            safety: OperationSafety::SensitiveOutput,
             default_approval: ApprovalRequirement::Always,
             default_factors: vec![ApprovalFactor::LocalBio],
             description: "Execute a command in a sandboxed environment".into(),
@@ -493,7 +493,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
     registry
         .register(OperationDef {
             name: "onepassword.read_field".into(),
-            safety: OperationSafety::Safe,
+            safety: OperationSafety::Reveal,
             default_approval: ApprovalRequirement::Always,
             default_factors: vec![ApprovalFactor::LocalBio],
             description: "Read a single field value from a 1Password item".into(),
@@ -1720,13 +1720,18 @@ async fn handle_request(
                 }
             };
 
+            let mut secret_refs = vec![value_ref.clone()];
+            if let Some(tok) = op_params.get("github_token_ref").and_then(|v| v.as_str()) {
+                secret_refs.push(tok.to_owned());
+            }
+
             let op_req = OperationRequest {
                 request_id: Uuid::new_v4(),
                 client_identity: identity.clone(),
                 client_type,
                 operation: operation.into(),
                 target,
-                secret_ref_names: vec![],
+                secret_ref_names: secret_refs,
                 created_at: SystemTime::now(),
                 expires_at: None,
                 params: op_params,
@@ -1827,13 +1832,23 @@ async fn handle_request(
                 }
             };
 
+            // Build secret_ref_names from the vault/item/field path for read_field.
+            let secret_ref_names = if action == "read_field" {
+                let v = op_params.get("vault").and_then(|v| v.as_str()).unwrap_or("");
+                let i = op_params.get("item").and_then(|v| v.as_str()).unwrap_or("");
+                let f = op_params.get("field").and_then(|v| v.as_str()).unwrap_or("");
+                vec![format!("onepassword:{v}/{i}/{f}")]
+            } else {
+                vec![]
+            };
+
             let op_req = OperationRequest {
                 request_id: Uuid::new_v4(),
                 client_identity: identity.clone(),
                 client_type,
                 operation: operation.into(),
                 target,
-                secret_ref_names: vec![],
+                secret_ref_names,
                 created_at: SystemTime::now(),
                 expires_at: None,
                 params: op_params,
@@ -1882,13 +1897,19 @@ async fn handle_request(
                 );
             }
 
+            // Derive secret_ref_names from the profile's secret declarations.
+            let secret_ref_names =
+                opaque_core::profile::load_named_profile(&profile)
+                    .map(|p| p.secrets.keys().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+
             let op_req = OperationRequest {
                 request_id: Uuid::new_v4(),
                 client_identity: identity.clone(),
                 client_type,
                 operation: "sandbox.exec".into(),
                 target: HashMap::from([("profile".into(), profile.clone())]),
-                secret_ref_names: vec![],
+                secret_ref_names,
                 created_at: SystemTime::now(),
                 expires_at: None,
                 params: serde_json::json!({

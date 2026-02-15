@@ -240,6 +240,30 @@ struct SetSecretPayload {
     selected_repository_ids: Option<Vec<i64>>,
 }
 
+/// Validate that a URL uses `https://`, allowing `http://` only for localhost.
+fn validate_url_scheme(url: &str) {
+    if url.starts_with("https://") {
+        return;
+    }
+    if url.starts_with("http://") {
+        if let Some(host_part) = url.strip_prefix("http://") {
+            let host = host_part.split('/').next().unwrap_or("");
+            let host_no_port = host.split(':').next().unwrap_or("");
+            if host_no_port == "localhost" || host_no_port == "127.0.0.1" {
+                return;
+            }
+        }
+        panic!(
+            "insecure HTTP URL rejected: {url}. \
+             Only https:// URLs are allowed (http:// is permitted for localhost/127.0.0.1 only)"
+        );
+    }
+    panic!(
+        "unsupported URL scheme: {url}. \
+         Only https:// URLs are allowed (http:// is permitted for localhost/127.0.0.1 only)"
+    );
+}
+
 /// GitHub REST API client for secrets.
 #[derive(Debug, Clone)]
 pub struct GitHubClient {
@@ -255,9 +279,13 @@ impl GitHubClient {
 
     /// Create a new client. Uses `OPAQUE_GITHUB_API_URL` env var if set,
     /// otherwise defaults to `https://api.github.com`.
+    ///
+    /// Panics if the base URL uses `http://` for a non-localhost host.
     pub fn new() -> Self {
         let base_url =
             std::env::var(GITHUB_API_URL_ENV).unwrap_or_else(|_| DEFAULT_GITHUB_API_URL.to_owned());
+
+        validate_url_scheme(&base_url);
 
         let http = reqwest::Client::builder()
             .user_agent(Self::user_agent())
@@ -897,5 +925,28 @@ mod tests {
             SecretScope::OrgActions { org: "myorg" }.not_found_context(),
             "org/myorg"
         );
+    }
+
+    #[test]
+    fn validate_url_scheme_accepts_https() {
+        validate_url_scheme("https://api.github.com");
+    }
+
+    #[test]
+    fn validate_url_scheme_accepts_localhost_http() {
+        validate_url_scheme("http://localhost:8080");
+        validate_url_scheme("http://127.0.0.1:9000/v1");
+    }
+
+    #[test]
+    #[should_panic(expected = "insecure HTTP URL rejected")]
+    fn validate_url_scheme_rejects_remote_http() {
+        validate_url_scheme("http://api.github.com");
+    }
+
+    #[test]
+    #[should_panic(expected = "unsupported URL scheme")]
+    fn validate_url_scheme_rejects_ftp() {
+        validate_url_scheme("ftp://example.com/file");
     }
 }
