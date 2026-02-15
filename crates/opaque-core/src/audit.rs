@@ -657,6 +657,7 @@ pub struct SqliteAuditSink {
     sender: std::sync::mpsc::SyncSender<AuditEvent>,
     next_sequence: AtomicU64,
     writer_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    sanitizer: crate::sanitize::Sanitizer,
 }
 
 impl fmt::Debug for SqliteAuditSink {
@@ -709,6 +710,7 @@ impl SqliteAuditSink {
             sender,
             next_sequence: AtomicU64::new(0),
             writer_handle: std::sync::Mutex::new(Some(writer_handle)),
+            sanitizer: crate::sanitize::Sanitizer::new(),
         })
     }
 
@@ -825,6 +827,13 @@ impl SqliteAuditSink {
 impl AuditSink for SqliteAuditSink {
     fn emit(&self, mut event: AuditEvent) {
         event.sequence_number = self.next_sequence.fetch_add(1, Ordering::Relaxed);
+        // Sanitize the detail field to prevent secret leakage into the audit DB.
+        if let Some(ref detail) = event.detail {
+            event.detail = Some(self.sanitizer.redact_audit_text(
+                detail,
+                crate::sanitize::RedactionLevel::Human,
+            ));
+        }
         // Non-blocking send. If the channel is full, drop the event.
         let _ = self.sender.try_send(event);
     }
@@ -1814,5 +1823,40 @@ mod tests {
             "not found",
         ));
         assert!(format!("{io_err}").contains("not found"));
+    }
+
+    #[test]
+    fn sqlite_sink_sanitizes_detail() {
+        // P0-4: The SqliteAuditSink must sanitize the detail field
+        // before persisting to prevent secret leakage in the audit DB.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("sanitize_test.db");
+        let sink = SqliteAuditSink::new(db_path.clone(), 90).unwrap();
+
+        let secret_detail =
+            "command=[\"/bin/sh\", \"-c\", \"echo ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij\"]";
+        let event = AuditEvent::new(AuditEventKind::OperationSucceeded)
+            .with_detail(secret_detail.to_owned());
+        sink.emit(event);
+        drop(sink);
+
+        // Query the DB directly to verify the detail was sanitized.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let detail: String = conn
+            .query_row(
+                "SELECT detail FROM audit_events WHERE detail IS NOT NULL LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(
+            !detail.contains("ghp_ABCDEF"),
+            "audit detail should not contain the raw GitHub PAT"
+        );
+        assert!(
+            detail.contains("[REDACTED:github_token]"),
+            "audit detail should contain redaction marker"
+        );
     }
 }

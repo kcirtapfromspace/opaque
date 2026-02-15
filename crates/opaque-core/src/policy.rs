@@ -205,9 +205,14 @@ pub struct SecretNameMatch {
 impl SecretNameMatch {
     /// Returns `true` if all secret ref names match at least one pattern.
     /// An empty pattern list matches any set of names (backward compat).
+    /// A non-empty pattern list requires at least one secret ref name —
+    /// empty `secret_ref_names` fails closed when patterns are specified.
     pub fn matches(&self, secret_ref_names: &[String]) -> bool {
         if self.patterns.is_empty() {
             return true;
+        }
+        if secret_ref_names.is_empty() {
+            return false;
         }
         secret_ref_names.iter().all(|name| {
             self.patterns
@@ -1078,5 +1083,50 @@ mod tests {
                 .unwrap()
                 .contains("default deny")
         );
+    }
+
+    #[test]
+    fn secret_name_match_empty_refs_fails_closed() {
+        // P0-3: When patterns are specified but secret_ref_names is empty,
+        // matches() must return false (fail-closed).
+        let matcher = SecretNameMatch {
+            patterns: vec!["CI_*".into()],
+        };
+        assert!(!matcher.matches(&[]));
+    }
+
+    #[test]
+    fn secret_name_match_empty_patterns_matches_anything() {
+        // Empty patterns means "no constraint" — should match any refs.
+        let matcher = SecretNameMatch {
+            patterns: vec![],
+        };
+        assert!(matcher.matches(&[]));
+        assert!(matcher.matches(&["FOO".into()]));
+    }
+
+    #[test]
+    fn secret_name_match_populated_refs_still_works() {
+        let matcher = SecretNameMatch {
+            patterns: vec!["CI_*".into()],
+        };
+        assert!(matcher.matches(&["CI_TOKEN".into()]));
+        assert!(!matcher.matches(&["DB_PASSWORD".into()]));
+    }
+
+    #[test]
+    fn policy_denies_empty_secret_refs_when_rule_has_patterns() {
+        // P0-3: A policy rule with secret_names patterns should reject
+        // requests that don't declare any secret refs.
+        let mut rule = allow_rule();
+        rule.secret_names = SecretNameMatch {
+            patterns: vec!["CI_*".into()],
+        };
+        let engine = PolicyEngine::with_rules(vec![rule]);
+
+        let mut req = test_request("github.set_actions_secret", ClientType::Agent);
+        req.secret_ref_names = vec![]; // Empty — should fail closed.
+        let decision = engine.evaluate(&req, OperationSafety::Safe);
+        assert!(!decision.allowed);
     }
 }
