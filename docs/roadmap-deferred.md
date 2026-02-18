@@ -12,14 +12,15 @@ Do not start a phase until the prior phase is shipped, tested with real users, a
 
 **Prerequisites:** v1 shipped. At least one real user has completed the GitHub Actions secret workflow end-to-end. Audit log has real data. Policy engine has been exercised by multiple client identities.
 
-| Feature | Description | Justification for Deferral | Effort |
-|---------|-------------|---------------------------|--------|
-| **GitLab CI variable sync** | `gitlab.set_ci_variable` operation | Same pattern as GitHub. Blocked on proving the architecture with one provider first. | Medium |
-| **GitHub Codespaces secrets** | `github.set_codespaces_secret` operation (user + repo scope) | Minor variant of GitHub Actions secrets. | Small |
-| **MCP server** | Expose Opaque operations as MCP tools for Claude Code and other MCP-aware tools | Requires a stable operation interface to expose. Designing the MCP contract before the CLI contract is proven risks building the wrong abstraction. | Large |
-| **1Password provider connector** | Fetch secrets from 1Password vaults via Connect API or service accounts | v1 uses mock/env-backed secret refs. Real provider connectors need the operation + sanitization pipeline to be solid. | Medium |
-| **HashiCorp Vault provider connector** | Fetch secrets from Vault KV, dynamic secrets (DB, AWS) | Same reasoning as 1Password. Vault adds lease management complexity. | Large |
-| **SQLite FTS5 audit search** | Full-text search over sanitized audit event text | Defer until there's enough audit data to justify search. `opaque audit tail --follow` with grep is sufficient for v1. | Small |
+| Feature | Description | Status | Effort |
+|---------|-------------|--------|--------|
+| **MCP server** | Expose Opaque operations as MCP tools for Claude Code | **Shipped** — see `docs/mcp-integration.md` | Large |
+| **Bitwarden Secrets Manager** | `bitwarden:` ref scheme, browsing operations, service account auth | **Shipped** — see `docs/bitwarden.md` | Medium |
+| **GitLab CI variable sync** | `gitlab.set_ci_variable` operation | Deferred — same pattern as GitHub, blocked on proving architecture with multiple providers first. | Medium |
+| **GitHub Codespaces secrets (shipped)** | `github.set_codespaces_secret` operation (user + repo scope) | **Shipped** in v1. | Small |
+| **1Password provider connector (hardening)** | Fetch secrets from 1Password vaults via Connect API or service accounts | Core plumbing exists, needs hardening: correct safety classification (`REVEAL` vs `SAFE`), strict output sanitization, and policy binding so plaintext secrets cannot reach agent-visible channels. | Medium |
+| **HashiCorp Vault provider connector** | Fetch secrets from Vault KV, dynamic secrets (DB, AWS) | Deferred — Vault adds lease management complexity. | Large |
+| **SQLite FTS5 audit search** | Full-text search over sanitized audit event text | Deferred — `opaque audit tail` with grep is sufficient for now. | Small |
 
 ---
 
