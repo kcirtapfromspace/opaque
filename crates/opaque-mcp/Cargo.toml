@@ -1,0 +1,16 @@
+[package]
+name = "opaque-mcp"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+opaque-core = { path = "../opaque-core" }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["io-std"] }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
