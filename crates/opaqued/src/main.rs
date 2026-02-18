@@ -337,6 +337,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             description: "No-op test operation".into(),
             params_schema: None,
             allowed_target_keys: vec![],
+            secret_ref_param_keys: vec![],
         })
         .expect("failed to register test.noop");
 
@@ -349,6 +350,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             description: "Execute a command in a sandboxed environment".into(),
             params_schema: None,
             allowed_target_keys: vec!["profile".into(), "command".into()],
+            secret_ref_param_keys: vec!["profile".into()],
         })
         .expect("failed to register sandbox.exec");
 
@@ -371,6 +373,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
                 }
             })),
             allowed_target_keys: vec!["repo".into()],
+            secret_ref_param_keys: vec!["value_ref".into(), "github_token_ref".into()],
         })
         .expect("failed to register github.set_actions_secret");
 
@@ -393,6 +396,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
                 }
             })),
             allowed_target_keys: vec!["repo".into()],
+            secret_ref_param_keys: vec!["value_ref".into(), "github_token_ref".into()],
         })
         .expect("failed to register github.set_codespaces_secret");
 
@@ -414,6 +418,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
                 }
             })),
             allowed_target_keys: vec!["repo".into()],
+            secret_ref_param_keys: vec!["value_ref".into(), "github_token_ref".into()],
         })
         .expect("failed to register github.set_dependabot_secret");
 
@@ -437,6 +442,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
                 }
             })),
             allowed_target_keys: vec!["org".into()],
+            secret_ref_param_keys: vec!["value_ref".into(), "github_token_ref".into()],
         })
         .expect("failed to register github.set_org_secret");
 
@@ -458,6 +464,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
                 }
             })),
             allowed_target_keys: vec!["repo".into(), "org".into()],
+            secret_ref_param_keys: vec!["github_token_ref".into()],
         })
         .expect("failed to register github.list_secrets");
 
@@ -481,6 +488,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
                 }
             })),
             allowed_target_keys: vec!["repo".into(), "org".into()],
+            secret_ref_param_keys: vec!["github_token_ref".into()],
         })
         .expect("failed to register github.delete_secret");
 
@@ -493,6 +501,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             description: "List available 1Password vaults".into(),
             params_schema: None,
             allowed_target_keys: vec![],
+            secret_ref_param_keys: vec![],
         })
         .expect("failed to register onepassword.list_vaults");
 
@@ -513,6 +522,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
                 }
             })),
             allowed_target_keys: vec!["vault".into(), "item".into()],
+            secret_ref_param_keys: vec!["vault".into(), "item".into(), "field".into()],
         })
         .expect("failed to register onepassword.read_field");
 
@@ -529,6 +539,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
                 "properties": { "vault": {"type": "string"} }
             })),
             allowed_target_keys: vec!["vault".into()],
+            secret_ref_param_keys: vec![],
         })
         .expect("failed to register onepassword.list_items");
 
@@ -541,6 +552,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             description: "List available Bitwarden Secrets Manager projects".into(),
             params_schema: None,
             allowed_target_keys: vec![],
+            secret_ref_param_keys: vec![],
         })
         .expect("failed to register bitwarden.list_projects");
 
@@ -556,6 +568,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
                 "properties": { "project": {"type": "string"} }
             })),
             allowed_target_keys: vec!["project".into()],
+            secret_ref_param_keys: vec![],
         })
         .expect("failed to register bitwarden.list_secrets");
 
@@ -572,6 +585,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
                 "properties": { "secret_id": {"type": "string"} }
             })),
             allowed_target_keys: vec!["secret_id".into()],
+            secret_ref_param_keys: vec!["secret_id".into()],
         })
         .expect("failed to register bitwarden.read_secret");
 

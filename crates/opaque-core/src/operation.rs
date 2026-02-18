@@ -127,6 +127,17 @@ pub struct OperationDef {
     /// rejected at the enclave boundary. Empty = accept any keys.
     #[serde(default)]
     pub allowed_target_keys: Vec<String>,
+
+    /// Param keys that contain secret references (e.g. `"value_ref"`,
+    /// `"github_token_ref"`). Used by the enclave to derive
+    /// `secret_ref_names` server-side instead of trusting client input.
+    ///
+    /// If non-empty, the enclave extracts the string values of these keys
+    /// from `params` and uses them as the authoritative `secret_ref_names`.
+    /// If empty, the operation does not reference secrets through params
+    /// (e.g. browse/list operations).
+    #[serde(default)]
+    pub secret_ref_param_keys: Vec<String>,
 }
 
 /// Validate operation params against a JSON Schema.
@@ -469,6 +480,7 @@ mod tests {
             description: "Set a GitHub Actions secret".into(),
             params_schema: None,
             allowed_target_keys: vec![],
+            secret_ref_param_keys: vec![],
         })
         .unwrap();
 
@@ -488,6 +500,7 @@ mod tests {
             description: "test".into(),
             params_schema: None,
             allowed_target_keys: vec![],
+            secret_ref_param_keys: vec![],
         };
         reg.register(def.clone()).unwrap();
         assert!(reg.register(def).is_err());
@@ -549,6 +562,7 @@ mod tests {
             description: "test".into(),
             params_schema: None,
             allowed_target_keys: vec![],
+            secret_ref_param_keys: vec![],
         })
         .unwrap();
         assert!(!reg.is_empty());
@@ -646,6 +660,7 @@ mod tests {
             description: "Set a GitHub Actions secret".into(),
             params_schema: None,
             allowed_target_keys: vec![],
+            secret_ref_param_keys: vec![],
         };
         let json = serde_json::to_string(&def).unwrap();
         let roundtripped: OperationDef = serde_json::from_str(&json).unwrap();
@@ -734,6 +749,7 @@ mod tests {
             description: "test".into(),
             params_schema: Some(serde_json::json!({"type": "object"})),
             allowed_target_keys: vec![],
+            secret_ref_param_keys: vec![],
         };
         let json = serde_json::to_string(&def).unwrap();
         let rt: OperationDef = serde_json::from_str(&json).unwrap();
@@ -750,6 +766,7 @@ mod tests {
             description: "test".into(),
             params_schema: None,
             allowed_target_keys: vec![],
+            secret_ref_param_keys: vec![],
         };
         let json = serde_json::to_string(&def).unwrap();
         assert!(!json.contains("params_schema"));
