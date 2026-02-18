@@ -26,8 +26,8 @@ use opaque_core::audit::{
     WorkspaceSummary,
 };
 use opaque_core::operation::{
-    ApprovalFactor, ApprovalRequirement, OperationDef, OperationRegistry, OperationRequest,
-    OperationSafety, validate_params,
+    ApprovalFactor, ApprovalRequirement, ClientType, OperationDef, OperationRegistry,
+    OperationRequest, OperationSafety, validate_params,
 };
 use opaque_core::policy::{PolicyDecision, PolicyEngine};
 use opaque_core::sanitize::{Sanitized, SanitizedResponse, Sanitizer, Unsanitized};
@@ -55,10 +55,10 @@ fn derive_secret_ref_names(param_keys: &[String], params: &serde_json::Value) ->
     let mut refs = Vec::new();
     if let serde_json::Value::Object(map) = params {
         for key in param_keys {
-            if let Some(serde_json::Value::String(val)) = map.get(key.as_str()) {
-                if !val.is_empty() {
-                    refs.push(val.clone());
-                }
+            if let Some(serde_json::Value::String(val)) = map.get(key.as_str())
+                && !val.is_empty()
+            {
+                refs.push(val.clone());
             }
         }
     }
@@ -822,7 +822,7 @@ impl Enclave {
     /// Check safety-class constraints before policy evaluation.
     fn check_safety_constraints(
         &self,
-        _request: &OperationRequest,
+        request: &OperationRequest,
         op_def: &OperationDef,
     ) -> Result<(), EnclaveError> {
         // REVEAL operations are hard-blocked for ALL clients in v1.
@@ -831,6 +831,16 @@ impl Enclave {
         if op_def.safety == OperationSafety::Reveal {
             return Err(EnclaveError::SafetyViolation(
                 "REVEAL operations are not permitted in v1".into(),
+            ));
+        }
+        // SENSITIVE_OUTPUT operations are hard-blocked for agent clients.
+        // Policy already enforces this, but defense-in-depth at the enclave
+        // layer ensures no policy misconfiguration can leak sensitive output.
+        if op_def.safety == OperationSafety::SensitiveOutput
+            && request.client_type == ClientType::Agent
+        {
+            return Err(EnclaveError::SafetyViolation(
+                "SENSITIVE_OUTPUT operations are not permitted for agent clients".into(),
             ));
         }
         Ok(())
@@ -3033,10 +3043,10 @@ mod tests {
             .audit(audit.clone())
             .build();
 
-        // Agent client → policy denied due to SENSITIVE_OUTPUT without explicit allowance.
+        // Agent client → blocked by enclave safety check (defense-in-depth).
         let req = test_request("ecr.get_auth_token", ClientType::Agent);
         let resp = enclave.execute(req).await;
-        assert_eq!(resp.error_code(), Some("policy_denied"));
+        assert_eq!(resp.error_code(), Some("safety_violation"));
 
         // Human client → allowed.
         let req = test_request("ecr.get_auth_token", ClientType::Human);

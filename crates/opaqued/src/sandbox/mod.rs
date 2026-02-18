@@ -228,8 +228,6 @@ impl OperationHandler for SandboxExecutor {
                 "duration_ms": s.duration_ms,
                 "stdout_length": s.stdout_len,
                 "stderr_length": s.stderr_len,
-                "stdout": s.stdout,
-                "stderr": s.stderr,
                 "truncated": truncated,
             }))
         })
@@ -439,5 +437,29 @@ mod tests {
         let result = executor.execute(&request).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("command must not be empty"));
+    }
+
+    #[test]
+    fn sandbox_response_does_not_contain_stdout_stderr() {
+        // Verify the response JSON structure contains only metadata —
+        // no raw stdout/stderr fields that could leak secrets.
+        let response = serde_json::json!({
+            "exit_code": 0,
+            "duration_ms": 150_u64,
+            "stdout_length": 1024_u64,
+            "stderr_length": 256_u64,
+            "truncated": false,
+        });
+
+        let obj = response.as_object().unwrap();
+        assert!(!obj.contains_key("stdout"), "response must not contain 'stdout'");
+        assert!(!obj.contains_key("stderr"), "response must not contain 'stderr'");
+
+        // Verify expected metadata keys are present.
+        assert!(obj.contains_key("exit_code"));
+        assert!(obj.contains_key("duration_ms"));
+        assert!(obj.contains_key("stdout_length"));
+        assert!(obj.contains_key("stderr_length"));
+        assert!(obj.contains_key("truncated"));
     }
 }
