@@ -36,6 +36,38 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
+// Server-side secret ref name derivation
+// ---------------------------------------------------------------------------
+
+/// Extract secret reference names from operation params server-side.
+///
+/// This replaces client-supplied `secret_ref_names` with values derived
+/// from the actual operation params using the operation definition's
+/// `secret_ref_param_keys`. This prevents policy bypass where a malicious
+/// client sends empty or incorrect `secret_ref_names` to sidestep
+/// `[rules.secret_names]` constraints.
+///
+/// For each key in `param_keys`, if the params contain a string value at
+/// that key, it is included in the returned set. Non-string or missing
+/// keys are silently skipped (the params schema validation has already
+/// run by this point).
+fn derive_secret_ref_names(param_keys: &[String], params: &serde_json::Value) -> Vec<String> {
+    let mut refs = Vec::new();
+    if let serde_json::Value::Object(map) = params {
+        for key in param_keys {
+            if let Some(serde_json::Value::String(val)) = map.get(key.as_str()) {
+                if !val.is_empty() {
+                    refs.push(val.clone());
+                }
+            }
+        }
+    }
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+// ---------------------------------------------------------------------------
 // Approval lease constants
 // ---------------------------------------------------------------------------
 
@@ -558,7 +590,7 @@ impl Enclave {
     /// 7. Execute operation handler
     /// 8. Sanitize response
     /// 9. Emit outcome audit event
-    pub async fn execute(&self, request: OperationRequest) -> SanitizedResponse<Sanitized> {
+    pub async fn execute(&self, mut request: OperationRequest) -> SanitizedResponse<Sanitized> {
         let start = Instant::now();
         let request_id = request.request_id;
         let client_summary = ClientSummary::from((&request.client_identity, request.client_type));
@@ -637,6 +669,17 @@ impl Enclave {
                 &err,
                 start,
             );
+        }
+
+        // --- Step 3d: Derive secret_ref_names server-side ---
+        // SECURITY: Never trust client-supplied secret_ref_names. Extract
+        // them from the operation params using the operation definition's
+        // `secret_ref_param_keys`. This prevents policy bypass where a
+        // client sends empty secret_ref_names to sidestep secret name
+        // constraints.
+        if !op_def.secret_ref_param_keys.is_empty() {
+            let derived = derive_secret_ref_names(&op_def.secret_ref_param_keys, &request.params);
+            request.secret_ref_names = derived;
         }
 
         // --- Step 4: Safety-class / client-type constraints ---
@@ -1247,6 +1290,7 @@ mod tests {
             description: "Set a GitHub Actions repository secret".into(),
             params_schema: None,
             allowed_target_keys: vec![],
+            secret_ref_param_keys: vec![],
         })
         .unwrap();
         reg.register(OperationDef {
@@ -1257,6 +1301,7 @@ mod tests {
             description: "Reveal a secret value (human only)".into(),
             params_schema: None,
             allowed_target_keys: vec![],
+            secret_ref_param_keys: vec![],
         })
         .unwrap();
         reg
@@ -1688,6 +1733,7 @@ mod tests {
             description: "Delete a GitHub Actions secret".into(),
             params_schema: None,
             allowed_target_keys: vec![],
+            secret_ref_param_keys: vec![],
         })
         .unwrap();
         let _ = reg; // just needed to prove it's valid
@@ -2258,6 +2304,7 @@ mod tests {
                 description: "Op with restricted target keys".into(),
                 params_schema: None,
                 allowed_target_keys: vec!["repo".into(), "environment".into()],
+                secret_ref_param_keys: vec![],
             })
             .unwrap();
 
@@ -2331,6 +2378,7 @@ mod tests {
                     "required": ["count"]
                 })),
                 allowed_target_keys: vec![],
+                secret_ref_param_keys: vec![],
             })
             .unwrap();
 
@@ -2643,6 +2691,7 @@ mod tests {
                 description: "List secrets (read-only)".into(),
                 params_schema: None,
                 allowed_target_keys: vec![],
+                secret_ref_param_keys: vec![],
             })
             .unwrap();
 
@@ -2771,6 +2820,7 @@ mod tests {
                 description: "List secrets".into(),
                 params_schema: None,
                 allowed_target_keys: vec![],
+                secret_ref_param_keys: vec![],
             })
             .unwrap();
 
@@ -2938,6 +2988,7 @@ mod tests {
                 description: "Get ECR auth token".into(),
                 params_schema: None,
                 allowed_target_keys: vec![],
+                secret_ref_param_keys: vec![],
             })
             .unwrap();
 
@@ -3029,5 +3080,142 @@ mod tests {
 
         let resp = enclave.execute(req).await;
         assert_eq!(resp.error_code(), Some("identity_verification_failed"));
+    }
+
+    #[tokio::test]
+    async fn secret_ref_names_derived_server_side() {
+        // Verifies P0 fix: client-supplied secret_ref_names are overridden
+        // when the operation has secret_ref_param_keys configured.
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+
+        let mut registry = OperationRegistry::new();
+        registry
+            .register(OperationDef {
+                name: "github.set_actions_secret".into(),
+                safety: OperationSafety::Safe,
+                default_approval: ApprovalRequirement::Always,
+                default_factors: vec![ApprovalFactor::LocalBio],
+                description: "Set a GitHub Actions secret".into(),
+                params_schema: None,
+                allowed_target_keys: vec![],
+                secret_ref_param_keys: vec!["value_ref".into(), "github_token_ref".into()],
+            })
+            .unwrap();
+
+        // Policy that restricts to specific secret names.
+        let policy = PolicyEngine::with_rules(vec![PolicyRule {
+            name: "allow-only-specific-secrets".into(),
+            client: ClientMatch {
+                uid: Some(501),
+                exe_path: Some("/usr/bin/claude*".into()),
+                ..Default::default()
+            },
+            operation_pattern: "github.*".into(),
+            target: TargetMatch {
+                fields: {
+                    let mut m = HashMap::new();
+                    m.insert("repo".into(), "org/*".into());
+                    m
+                },
+            },
+            workspace: WorkspaceMatch::default(),
+            secret_names: SecretNameMatch { patterns: vec!["env:MY_TOKEN".into()] },
+            allow: true,
+            client_types: vec![ClientType::Agent, ClientType::Human],
+            approval: ApprovalConfig {
+                require: ApprovalRequirement::Always,
+                factors: vec![ApprovalFactor::LocalBio],
+                lease_ttl: None,
+                one_time: true,
+            },
+        }]);
+
+        // A handler that captures the request to verify secret_ref_names.
+        let handler_response = serde_json::json!({"status": "ok"});
+
+        let enclave = Enclave::builder()
+            .registry(registry)
+            .policy(policy)
+            .handler(
+                "github.set_actions_secret",
+                Box::new(StubHandler {
+                    response: handler_response,
+                }),
+            )
+            .approval_gate(Box::new(AlwaysApproveGate))
+            .audit(audit.clone())
+            .build();
+
+        // Client tries to LIE about secret_ref_names — claims "ADMIN_KEY"
+        // but params actually reference "env:MY_TOKEN".
+        let mut req = test_request("github.set_actions_secret", ClientType::Agent);
+        req.secret_ref_names = vec!["ADMIN_KEY".into()]; // attacker-supplied
+        req.params = serde_json::json!({
+            "value_ref": "env:MY_TOKEN",
+            "github_token_ref": "env:MY_TOKEN",
+            "secret_name": "MY_SECRET",
+            "repo": "org/myrepo"
+        });
+
+        let resp = enclave.execute(req).await;
+        // Should succeed because server-side derivation extracts "env:MY_TOKEN"
+        // which IS allowed by the policy.
+        assert!(resp.error_code().is_none(), "expected success, got: {:?}", resp.error_code());
+
+        // Now test the DENY case: params reference a secret NOT in the policy.
+        let mut req2 = test_request("github.set_actions_secret", ClientType::Agent);
+        req2.secret_ref_names = vec!["env:MY_TOKEN".into()]; // attacker claims allowed name
+        req2.params = serde_json::json!({
+            "value_ref": "env:ADMIN_KEY",
+            "github_token_ref": "env:SUPER_SECRET"
+        });
+
+        let resp2 = enclave.execute(req2).await;
+        // Should be DENIED because server-side derivation extracts
+        // ["env:ADMIN_KEY", "env:SUPER_SECRET"] which are NOT in the policy.
+        assert_eq!(resp2.error_code(), Some("policy_denied"),
+            "expected policy_denied for unauthorized secret refs, got: {:?}", resp2.error_code());
+    }
+
+    #[test]
+    fn derive_secret_ref_names_extracts_from_params() {
+        let keys = vec!["value_ref".into(), "github_token_ref".into()];
+        let params = serde_json::json!({
+            "value_ref": "env:DB_PASSWORD",
+            "github_token_ref": "keychain:github-token",
+            "secret_name": "MY_SECRET"
+        });
+        let result = super::derive_secret_ref_names(&keys, &params);
+        assert_eq!(result, vec!["env:DB_PASSWORD", "keychain:github-token"]);
+    }
+
+    #[test]
+    fn derive_secret_ref_names_ignores_missing_and_empty() {
+        let keys = vec!["value_ref".into(), "missing_key".into(), "empty_key".into()];
+        let params = serde_json::json!({
+            "value_ref": "env:TOKEN",
+            "empty_key": ""
+        });
+        let result = super::derive_secret_ref_names(&keys, &params);
+        assert_eq!(result, vec!["env:TOKEN"]);
+    }
+
+    #[test]
+    fn derive_secret_ref_names_deduplicates() {
+        let keys = vec!["value_ref".into(), "github_token_ref".into()];
+        let params = serde_json::json!({
+            "value_ref": "env:SAME_TOKEN",
+            "github_token_ref": "env:SAME_TOKEN"
+        });
+        let result = super::derive_secret_ref_names(&keys, &params);
+        assert_eq!(result, vec!["env:SAME_TOKEN"]);
+    }
+
+    #[test]
+    fn derive_secret_ref_names_empty_keys() {
+        let keys: Vec<String> = vec![];
+        let params = serde_json::json!({"value_ref": "env:TOKEN"});
+        let result = super::derive_secret_ref_names(&keys, &params);
+        assert!(result.is_empty());
     }
 }
