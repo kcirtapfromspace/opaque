@@ -9,14 +9,22 @@ LLMs get **operations**, not values.
 - OK: "set GitHub Actions secret `JWT` for `org/repo` using ref `keychain:opaque/jwt`"
 - Not OK: "print the JWT" / "show me the `.env` file" / "return the secret value"
 
-## How The LLM Calls Opaque (v1)
+## How The LLM Calls Opaque
 
-v1 uses a CLI harness:
+### MCP (Preferred for Claude Code)
+
+The recommended path for MCP-aware tools like Claude Code is the `opaque-mcp` server. It exposes Safe operations as MCP tools over stdio, so the LLM calls Opaque tools natively without shell access.
+
+See `docs/mcp-integration.md` for setup.
+
+### CLI Harness (Fallback)
+
+For tools without MCP support (e.g., Codex), the agent runs `opaque ...` CLI commands directly:
 
 - the agent runs `opaque ...` commands
 - the daemon (`opaqued`) enforces policy, triggers approvals, executes the operation, sanitizes results, and emits audit events
 
-MCP server exposure is deferred (v2).
+Both paths go through the same daemon and policy engine. The MCP server is a thin adapter over the same Unix socket IPC.
 
 ## Secret Inputs: Refs, Not Values
 
@@ -27,6 +35,7 @@ Examples:
 - `keychain:opaque/github-pat`
 - `env:MY_SECRET` (daemon reads from its own environment, not the agent's)
 - `profile:<name>:<key>` (profile indirection; recommended for agent workflows)
+- `bitwarden:<secret-id>` or `bitwarden:<project>/<key>` (Bitwarden Secrets Manager)
 
 Opaque should reject raw secret literals for operations that write secrets to providers.
 
@@ -43,7 +52,7 @@ Then the agent can request:
 
 - "run sandbox exec with profile `dev`"
 
-The CLI never sees the resolved secret values.
+The CLI never sees the resolved secret values *directly*, but secrets can still leak if a sandboxed command prints them (see note under sandbox exec below).
 
 ## Approvals
 
@@ -85,4 +94,4 @@ Use:
 
 - `opaque exec --profile <name> -- <command...>`
 
-Opaque can inject secrets into the sandboxed process environment without returning them in command output.
+Opaque can inject secrets into the sandboxed process environment. **However**, `sandbox.exec` currently captures and returns stdout/stderr (and the CLI prints it), so an agent can receive any secret that is printed. Treat sandbox output as `SENSITIVE_OUTPUT` and avoid commands that echo secret material.
