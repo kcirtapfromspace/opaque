@@ -23,7 +23,7 @@ pub trait SecretResolver: Send + Sync {
 /// Errors from secret resolution.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ResolveError {
-    #[error("unknown ref scheme in '{0}' (expected env:, keychain:, profile:, or onepassword:)")]
+    #[error("unknown ref scheme in '{0}' (expected env:, keychain:, profile:, onepassword:, or bitwarden:)")]
     UnknownScheme(String),
 
     #[error("environment variable '{0}' not found")]
@@ -40,6 +40,9 @@ pub enum ResolveError {
 
     #[error("1Password resolution failed for '{0}': {1}")]
     OnePasswordError(String, String),
+
+    #[error("Bitwarden resolution failed for '{0}': {1}")]
+    BitwardenError(String, String),
 }
 
 // ---------------------------------------------------------------------------
@@ -256,18 +259,19 @@ impl SecretResolver for BaseResolver {
 // ---------------------------------------------------------------------------
 
 /// A composite resolver that dispatches to the correct resolver based on
-/// the ref scheme prefix (`env:`, `keychain:`, `profile:`, `onepassword:`).
+/// the ref scheme prefix (`env:`, `keychain:`, `profile:`, `onepassword:`, `bitwarden:`).
 #[derive(Debug)]
 pub struct CompositeResolver {
     env: EnvResolver,
     keychain: KeychainResolver,
     profile: ProfileResolver,
     onepassword: Option<crate::onepassword::resolve::OnePasswordResolver>,
+    bitwarden: Option<crate::bitwarden::resolve::BitwardenResolver>,
 }
 
 impl CompositeResolver {
     pub fn new() -> Self {
-        // Backend selection priority:
+        // 1Password backend selection:
         // 1. Connect Server URL configured → use Connect Server
         // 2. `op` CLI found in PATH → use `op` CLI
         // 3. Neither → onepassword disabled
@@ -284,15 +288,24 @@ impl CompositeResolver {
             } else {
                 None
             };
+
+        // Bitwarden backend: always available (uses default or configured URL).
+        let bitwarden_url = std::env::var(crate::bitwarden::client::BITWARDEN_URL_ENV)
+            .unwrap_or_else(|_| crate::bitwarden::client::DEFAULT_BASE_URL.to_owned());
+        let bitwarden = Some(crate::bitwarden::resolve::BitwardenResolver::new(
+            crate::bitwarden::client::BitwardenClient::new(&bitwarden_url),
+        ));
+
         Self {
             env: EnvResolver,
             keychain: KeychainResolver,
             profile: ProfileResolver,
             onepassword,
+            bitwarden,
         }
     }
 
-    /// Create a resolver without 1Password backend (for testing).
+    /// Create a resolver without 1Password or Bitwarden backends (for testing).
     #[cfg(test)]
     fn without_onepassword() -> Self {
         Self {
@@ -300,6 +313,7 @@ impl CompositeResolver {
             keychain: KeychainResolver,
             profile: ProfileResolver,
             onepassword: None,
+            bitwarden: None,
         }
     }
 }
@@ -325,6 +339,14 @@ impl SecretResolver for CompositeResolver {
                     ref_str.to_owned(),
                     "1Password not configured (set OPAQUE_1PASSWORD_CONNECT_URL or install op CLI)"
                         .into(),
+                )),
+            }
+        } else if ref_str.starts_with("bitwarden:") {
+            match &self.bitwarden {
+                Some(r) => r.resolve(ref_str),
+                None => Err(ResolveError::BitwardenError(
+                    ref_str.to_owned(),
+                    "Bitwarden not configured".into(),
                 )),
             }
         } else {
@@ -494,6 +516,10 @@ mod tests {
 
         let err = ResolveError::OnePasswordError("onepassword:v/i".into(), "not configured".into());
         assert!(format!("{err}").contains("1Password resolution failed"));
+
+        let err =
+            ResolveError::BitwardenError("bitwarden:proj/key".into(), "not configured".into());
+        assert!(format!("{err}").contains("Bitwarden resolution failed"));
     }
 
     #[test]
@@ -504,6 +530,17 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, ResolveError::OnePasswordError(..)));
+        assert!(format!("{err}").contains("not configured"));
+    }
+
+    #[test]
+    fn composite_resolver_bitwarden_dispatch() {
+        // Use without_onepassword() which also has bitwarden=None.
+        let resolver = CompositeResolver::without_onepassword();
+        let result = resolver.resolve("bitwarden:nonexistent-id");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ResolveError::BitwardenError(..)));
         assert!(format!("{err}").contains("not configured"));
     }
 
