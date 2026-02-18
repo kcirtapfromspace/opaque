@@ -1,0 +1,53 @@
+# Opaque preset: sandbox-human
+#
+# Allows sandbox.exec for human clients only. Agent clients (Claude, Codex)
+# are explicitly denied sandbox access. This is the recommended starting
+# policy for teams that want sandboxed execution without exposing it to
+# AI coding assistants.
+#
+# Risk: Medium. sandbox.exec runs arbitrary commands with secret environment
+# variables. Human-only gating ensures a person reviews each execution.
+# Output is classified SensitiveOutput and scrubbed of secret patterns.
+#
+# Usage:
+#   opaque policy preset apply sandbox-human
+
+# ---- Known human clients ----
+# Customize these to match your local setup.
+
+[[known_human_clients]]
+name = "opaque-cli"
+exe_path = "*/opaque"
+
+# ---- Sandbox rules ----
+
+# Allow human clients to run sandboxed commands.
+[[rules]]
+name = "allow-sandbox-human"
+operation_pattern = "sandbox.exec"
+allow = true
+client_types = ["human"]
+
+[rules.approval]
+require = "always"
+factors = ["local_bio"]
+
+# Explicitly deny agent clients sandbox access.
+[[rules]]
+name = "deny-sandbox-agent"
+operation_pattern = "sandbox.exec"
+allow = false
+client_types = ["agent"]
+
+# ---- Test operation (for onboarding) ----
+
+[[rules]]
+name = "allow-test-noop"
+operation_pattern = "test.noop"
+allow = true
+client_types = ["agent", "human"]
+
+[rules.approval]
+require = "first_use"
+factors = ["local_bio"]
+lease_ttl = 300

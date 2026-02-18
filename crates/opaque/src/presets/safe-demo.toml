@@ -1,0 +1,20 @@
+# Opaque preset: safe-demo
+#
+# Minimal safe policy for testing Opaque. Only allows the no-op test
+# operation (test.noop). All other operations are denied by default.
+#
+# Risk: None. test.noop does no real work and touches no secrets.
+#
+# Usage:
+#   opaque policy preset apply safe-demo
+
+[[rules]]
+name = "allow-test-noop"
+operation_pattern = "test.noop"
+allow = true
+client_types = ["agent", "human"]
+
+[rules.approval]
+require = "first_use"
+factors = ["local_bio"]
+lease_ttl = 300

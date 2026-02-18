@@ -18,6 +18,11 @@ mod service;
 mod setup;
 mod ui;
 
+/// Build a version string that includes the git SHA: `0.1.0+abc1234`.
+const fn version_string() -> &'static str {
+    concat!(env!("CARGO_PKG_VERSION"), "+", env!("OPAQUE_GIT_SHA"))
+}
+
 /// Name of the daemon token file expected next to the socket.
 const DAEMON_TOKEN_FILENAME: &str = "daemon.token";
 
@@ -55,7 +60,7 @@ const SAMPLE_CONFIG: &str = r#"# Opaque configuration file
 "#;
 
 #[derive(Debug, Parser)]
-#[command(name = "opaque", version)]
+#[command(name = "opaque", version = version_string())]
 struct Cli {
     /// Override the Unix socket path (otherwise uses OPAQUE_SOCK / XDG_RUNTIME_DIR / ~/.opaque/run).
     #[arg(long)]
@@ -104,6 +109,9 @@ enum Cmd {
         /// Overwrite existing config file.
         #[arg(long, default_value_t = false)]
         force: bool,
+        /// Apply a policy preset (e.g. "safe-demo", "github-secrets", "sandbox-human").
+        #[arg(long)]
+        preset: Option<String>,
     },
     /// Manage GitHub Actions secrets.
     Github {
@@ -188,6 +196,13 @@ enum PolicyAction {
         /// Path to config file (default: ~/.opaque/config.toml or $OPAQUE_CONFIG).
         #[arg(long)]
         file: Option<PathBuf>,
+    },
+    /// List available policy presets.
+    Presets,
+    /// Apply a policy preset to your configuration.
+    Preset {
+        /// Preset name (e.g. "safe-demo", "github-secrets", "sandbox-human").
+        name: String,
     },
     /// Dry-run a request against the policy to see what would happen.
     Simulate {
@@ -457,6 +472,20 @@ async fn main() {
                 }
                 return;
             }
+            PolicyAction::Presets => {
+                policy_list_presets();
+                return;
+            }
+            PolicyAction::Preset { name } => {
+                match policy_apply_preset(&name) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        ui::error(&e);
+                        std::process::exit(1);
+                    }
+                }
+                return;
+            }
             PolicyAction::Simulate {
                 operation,
                 client_type,
@@ -480,8 +509,8 @@ async fn main() {
                 return;
             }
         },
-        Cmd::Init { force } => {
-            match run_init(*force) {
+        Cmd::Init { force, preset } => {
+            match run_init(*force, preset.as_deref()) {
                 Ok(()) => {}
                 Err(e) => {
                     ui::error(&e);
@@ -1587,10 +1616,109 @@ fn dirs_or_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+// ---------------------------------------------------------------------------
+// Policy presets
+// ---------------------------------------------------------------------------
+
+/// Embedded policy preset files.
+const PRESET_SAFE_DEMO: &str = include_str!("presets/safe-demo.toml");
+const PRESET_GITHUB_SECRETS: &str = include_str!("presets/github-secrets.toml");
+const PRESET_SANDBOX_HUMAN: &str = include_str!("presets/sandbox-human.toml");
+
+/// Available presets: (name, description, content).
+fn available_presets() -> Vec<(&'static str, &'static str, &'static str)> {
+    vec![
+        (
+            "safe-demo",
+            "Minimal safe policy (test.noop only)",
+            PRESET_SAFE_DEMO,
+        ),
+        (
+            "github-secrets",
+            "Allow agents to sync GitHub secrets (Actions, Codespaces, Dependabot, org)",
+            PRESET_GITHUB_SECRETS,
+        ),
+        (
+            "sandbox-human",
+            "Allow human-only sandbox execution, deny agents",
+            PRESET_SANDBOX_HUMAN,
+        ),
+    ]
+}
+
+/// Get preset content by name.
+fn get_preset(name: &str) -> Option<&'static str> {
+    available_presets()
+        .into_iter()
+        .find(|(n, _, _)| *n == name)
+        .map(|(_, _, content)| content)
+}
+
+/// List available policy presets.
+fn policy_list_presets() {
+    ui::header("Available policy presets");
+    println!();
+    for (name, description, _) in available_presets() {
+        println!(
+            "  {}  {}",
+            style(name).cyan().bold(),
+            style(description).dim()
+        );
+    }
+    println!();
+    ui::info("Apply a preset: opaque policy preset <name>");
+    ui::info("Or during init: opaque init --preset <name>");
+}
+
+/// Apply a policy preset to ~/.opaque/config.toml.
+fn policy_apply_preset(name: &str) -> Result<(), String> {
+    let content = get_preset(name).ok_or_else(|| {
+        format!(
+            "unknown preset '{name}'. Available: {}",
+            available_presets()
+                .iter()
+                .map(|(n, _, _)| *n)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+
+    let config_path = default_opaque_dir().join("config.toml");
+    if !config_path.exists() {
+        return Err(format!(
+            "no config file found at {}. Run 'opaque init' first.",
+            config_path.display()
+        ));
+    }
+
+    std::fs::write(&config_path, content)
+        .map_err(|e| format!("failed to write {}: {e}", config_path.display()))?;
+
+    ui::success(&format!("Applied preset '{name}' to {}", config_path.display()));
+    ui::info("Run 'opaque setup --seal' to seal your config.");
+    Ok(())
+}
+
 /// Run the init command with styled output.
-fn run_init(force: bool) -> Result<(), String> {
+fn run_init(force: bool, preset: Option<&str>) -> Result<(), String> {
     let base = default_opaque_dir();
-    run_init_at(&base, force)?;
+
+    // Determine config content.
+    let config_content = match preset {
+        Some(name) => get_preset(name).ok_or_else(|| {
+            format!(
+                "unknown preset '{name}'. Available: {}",
+                available_presets()
+                    .iter()
+                    .map(|(n, _, _)| *n)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?,
+        None => SAMPLE_CONFIG,
+    };
+
+    run_init_at(&base, force, config_content)?;
 
     ui::header("Initialized opaque");
     ui::init_step(&format!("Created {}", style(base.display()).cyan()));
@@ -1602,17 +1730,25 @@ fn run_init(force: bool) -> Result<(), String> {
         "Created {}",
         style(base.join("profiles").display()).cyan()
     ));
-    ui::init_step(&format!(
-        "Wrote   {}",
-        style(base.join("config.toml").display()).cyan()
-    ));
+    if let Some(name) = preset {
+        ui::init_step(&format!(
+            "Wrote   {} (preset: {})",
+            style(base.join("config.toml").display()).cyan(),
+            style(name).bold()
+        ));
+    } else {
+        ui::init_step(&format!(
+            "Wrote   {}",
+            style(base.join("config.toml").display()).cyan()
+        ));
+    }
     println!();
     ui::info("Run 'opaque setup' to configure your security policy and seal it.");
     Ok(())
 }
 
 /// Initialize the opaque config directory at the given base path.
-fn run_init_at(base: &Path, force: bool) -> Result<(), String> {
+fn run_init_at(base: &Path, force: bool, config_content: &str) -> Result<(), String> {
     let config_path = base.join("config.toml");
     let run_dir = base.join("run");
 
@@ -1632,7 +1768,7 @@ fn run_init_at(base: &Path, force: bool) -> Result<(), String> {
     create_dir_0700(&profiles_dir)?;
 
     // Write config file.
-    std::fs::write(&config_path, SAMPLE_CONFIG)
+    std::fs::write(&config_path, config_content)
         .map_err(|e| format!("failed to write {}: {e}", config_path.display()))?;
 
     Ok(())
@@ -2566,7 +2702,7 @@ lease_ttl = 0
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join(".opaque");
 
-        let result = run_init_at(&base, false);
+        let result = run_init_at(&base, false, SAMPLE_CONFIG);
         assert!(result.is_ok(), "expected Ok, got: {result:?}");
 
         assert!(base.exists());
@@ -2584,7 +2720,7 @@ lease_ttl = 0
         fs::create_dir_all(&base).unwrap();
         fs::write(base.join("config.toml"), "existing").unwrap();
 
-        let result = run_init_at(&base, false);
+        let result = run_init_at(&base, false, SAMPLE_CONFIG);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already exists"));
     }
@@ -2596,13 +2732,44 @@ lease_ttl = 0
         fs::create_dir_all(&base).unwrap();
         fs::write(base.join("config.toml"), "old content").unwrap();
 
-        let result = run_init_at(&base, true);
+        let result = run_init_at(&base, true, SAMPLE_CONFIG);
         assert!(result.is_ok(), "expected Ok, got: {result:?}");
 
         let content = fs::read_to_string(base.join("config.toml")).unwrap();
         assert!(content.contains("Opaque configuration file"));
         // Old content should be replaced
         assert!(!content.contains("old content"));
+    }
+
+    #[test]
+    fn init_with_preset() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join(".opaque");
+
+        let result = run_init_at(&base, false, PRESET_SAFE_DEMO);
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+
+        let content = fs::read_to_string(base.join("config.toml")).unwrap();
+        assert!(content.contains("safe-demo"));
+        assert!(content.contains("test.noop"));
+    }
+
+    #[test]
+    fn preset_lookup() {
+        assert!(get_preset("safe-demo").is_some());
+        assert!(get_preset("github-secrets").is_some());
+        assert!(get_preset("sandbox-human").is_some());
+        assert!(get_preset("nonexistent").is_none());
+    }
+
+    #[test]
+    fn presets_are_valid_toml() {
+        for (name, _, content) in available_presets() {
+            let result: Result<PolicyConfig, _> = toml_edit::de::from_str(content);
+            assert!(result.is_ok(), "preset '{name}' is not valid TOML: {result:?}");
+            let config = result.unwrap();
+            assert!(!config.rules.is_empty(), "preset '{name}' should have at least one rule");
+        }
     }
 
     #[test]
@@ -2671,7 +2838,7 @@ factors = []
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join(".opaque");
 
-        run_init_at(&base, false).unwrap();
+        run_init_at(&base, false, SAMPLE_CONFIG).unwrap();
 
         #[cfg(unix)]
         {
