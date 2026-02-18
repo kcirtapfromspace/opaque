@@ -61,6 +61,8 @@ Nested tables:
 - `[rules.secret_names]`: constrain referenced secret *names* (not values) via glob patterns
 - `[rules.approval]`: operation-bound approval requirements
 
+Note: `secret_names` enforcement currently depends on `secret_ref_names` being populated on the request. Some convenience wrappers (e.g., `exec`, `github`, `onepassword`) do not currently provide reliable `secret_ref_names`, so `secret_names` should be treated as best-effort until that is fixed (see the latest security review in `docs/`).
+
 ### Approval Configuration
 
 `[rules.approval]` fields:

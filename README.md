@@ -1,51 +1,118 @@
-# Opaque (WIP)
+# Opaque
+
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
 Local approval-gated secrets broker for AI coding tools (Codex, Claude Code, etc) that must not disclose plaintext secrets to LLM context.
 
-## What v1 Includes
+## What It Does
 
-- Enclave enforcement funnel: policy -> approval -> execute -> sanitize -> audit
-- Client identity from Unix peer creds (`uid/gid/pid`) + executable identity (path/hash, optional macOS Team ID)
+Opaque sits between your AI coding assistant and your secrets. LLMs get **operations** (e.g., "set this GitHub secret"), never plaintext values. Every operation passes through:
+
+**Policy → Approval → Execute → Sanitize → Audit**
+
+## Features
+
 - Deny-by-default policy engine with allowlist rules
-- Modern terminal UI for the CLI (spinners, structured output, audit tables)
-- Operation-bound native OS approvals:
-  - macOS LocalAuthentication
-  - Linux polkit (+ intent dialog)
+- Client identity from Unix peer creds + executable identity (path/hash, optional macOS Team ID)
+- Operation-bound native OS approvals (macOS Touch ID, Linux polkit)
 - Typestate-enforced response sanitization + secret-pattern scrubbing
 - Structured audit events (SQLite) with correlation IDs
-- First provider: GitHub secrets sync (Actions repo/env, Codespaces user/repo, Dependabot, org)
+- MCP server for Claude Code integration
+- Providers: GitHub secrets, 1Password, Bitwarden Secrets Manager
+- Policy presets for common workflows
 
-## Deferred (Not In v1)
-
-See `docs/roadmap-deferred.md`. Notably:
-
-- MCP server exposure (v2)
-- 1Password / HashiCorp Vault connectors (v2)
-- iOS approvals / FaceID (v3)
-- FIDO2 / WebAuthn approvals (v3)
-
-## Quickstart (From Source)
+## Install (From Source)
 
 ```bash
 cargo build --release
-
-./target/release/opaque init
-
-# Edit ~/.opaque/config.toml to add an allow rule (deny-all is the default).
-./target/release/opaque policy check
-
-./target/release/opaqued
 ```
 
-In another terminal:
+Binaries:
+
+| Binary | Role |
+|--------|------|
+| `opaqued` | Trusted daemon (enclave, policy, approvals, audit) |
+| `opaque` | CLI client |
+| `opaque-mcp` | MCP server for Claude Code |
+
+## Quickstart: Claude Code (MCP)
+
+1. Initialize with a preset:
+   ```bash
+   opaque init --preset github-secrets
+   ```
+
+2. Start the daemon:
+   ```bash
+   opaqued
+   # Or install as a service: opaque service install
+   ```
+
+3. Add to your Claude Code MCP config:
+   ```json
+   {
+     "mcpServers": {
+       "opaque": {
+         "command": "/path/to/opaque-mcp"
+       }
+     }
+   }
+   ```
+
+4. Ask Claude Code to sync a secret:
+   > "Set the GitHub Actions secret API_KEY for myorg/myrepo using my keychain"
+
+Full MCP docs: `docs/mcp-integration.md`
+
+## Quickstart: Codex / CLI
+
+1. Initialize with a preset:
+   ```bash
+   opaque init --preset github-secrets
+   ```
+
+2. Start the daemon:
+   ```bash
+   opaqued
+   ```
+
+3. Test connectivity:
+   ```bash
+   opaque ping
+   opaque execute test.noop
+   ```
+
+4. Sync a GitHub secret:
+   ```bash
+   opaque github set-secret \
+     --repo myorg/myrepo \
+     --secret-name API_KEY \
+     --value-ref keychain:opaque/api-key
+   ```
+
+5. Review the audit log:
+   ```bash
+   opaque audit tail --limit 10
+   ```
+
+Full CLI docs: `docs/getting-started.md`
+
+## Policy Presets
+
+Get started quickly with built-in presets:
 
 ```bash
-./target/release/opaque ping
-./target/release/opaque execute test.noop
-./target/release/opaque audit tail --limit 10
+opaque policy presets                        # list available presets
+opaque init --preset safe-demo               # test.noop only (safe to experiment)
+opaque init --preset github-secrets          # GitHub secret sync for agents
+opaque init --preset sandbox-human           # sandbox exec for humans only
 ```
 
-More details: `docs/getting-started.md`
+Or apply a preset to an existing config:
+
+```bash
+opaque policy preset github-secrets
+```
 
 ## Demos
 
@@ -53,7 +120,7 @@ More details: `docs/getting-started.md`
 
 ![quickstart demo](assets/demos/quickstart.gif)
 
-### Sandboxed Exec (No stdout/stderr Returned)
+### Sandboxed Exec (Captured stdout/stderr)
 
 ![sandbox exec demo](assets/demos/sandbox-exec.gif)
 
@@ -61,10 +128,25 @@ More details: `docs/getting-started.md`
 
 - Docs index: `docs/README.md`
 - Getting started: `docs/getting-started.md`
-- Demos: `docs/demos.md`
+- MCP integration: `docs/mcp-integration.md`
+- Bitwarden setup: `docs/bitwarden.md`
 - Policy: `docs/policy.md`
 - Operations: `docs/operations.md`
 - LLM harness: `docs/llm-harness.md`
+- Demos: `docs/demos.md`
 - Deployment: `docs/deployment.md`
 - Security assessment: `docs/security-assessment.md`
 - Deferred roadmap: `docs/roadmap-deferred.md`
+
+## Deferred
+
+See `docs/roadmap-deferred.md`. Notably:
+
+- HashiCorp Vault connector
+- GitLab CI variable sync
+- iOS approvals / FaceID (v3)
+- FIDO2 / WebAuthn approvals (v3)
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).

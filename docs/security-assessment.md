@@ -1,5 +1,7 @@
 # Opaque Security Assessment
 
+> NOTE: This document is historical and may not match the current code. For the latest adversarial review and demos, see `docs/adversarial-security-review-2026-02-14.md`.
+
 **Date:** 2026-02-12
 **Assessor:** Security Engineering Review
 **Scope:** Full source tree (`crates/`), documentation (`docs/`), PRD, configuration, and dependency analysis

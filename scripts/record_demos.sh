@@ -37,5 +37,8 @@ record() {
 
 record "quickstart" "scripts/demo_quickstart.sh" 132 28
 record "sandbox-exec" "scripts/demo_sandbox_exec.sh" 100 28
+record "security-audit-detail-leak" "scripts/demo_security_audit_detail_leak.sh" 120 28
+record "security-sandbox-secret-leak" "scripts/demo_security_sandbox_secret_leak.sh" 110 28
+record "security-onepassword-read-field" "scripts/demo_security_onepassword_read_field.sh" 110 28
 
 echo "==> Done"
