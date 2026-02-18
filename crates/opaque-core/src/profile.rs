@@ -178,7 +178,7 @@ pub enum ProfileError {
 /// This is the single canonical list of supported secret ref schemes.
 /// All validation code (profile loader, GitHub handler, daemon method handlers)
 /// must reference this constant instead of defining local copies.
-pub const ALLOWED_REF_SCHEMES: &[&str] = &["env:", "keychain:", "profile:", "onepassword:"];
+pub const ALLOWED_REF_SCHEMES: &[&str] = &["env:", "keychain:", "profile:", "onepassword:", "bitwarden:"];
 
 /// Load and validate an `ExecProfile` from a TOML string.
 ///
@@ -516,6 +516,40 @@ TOKEN = "keychain:opaque/my-token"
 "#;
         let profile = load_profile(toml, None).unwrap();
         assert_eq!(profile.secrets["TOKEN"], "keychain:opaque/my-token");
+    }
+
+    #[test]
+    fn valid_bitwarden_ref() {
+        let toml = r#"
+[profile]
+name = "bw-test"
+project_dir = "/tmp"
+
+[secrets]
+DB_PASSWORD = "bitwarden:Production/DB_PASSWORD"
+"#;
+        let profile = load_profile(toml, None).unwrap();
+        assert_eq!(
+            profile.secrets["DB_PASSWORD"],
+            "bitwarden:Production/DB_PASSWORD"
+        );
+    }
+
+    #[test]
+    fn valid_bitwarden_uuid_ref() {
+        let toml = r#"
+[profile]
+name = "bw-uuid"
+project_dir = "/tmp"
+
+[secrets]
+TOKEN = "bitwarden:550e8400-e29b-41d4-a716-446655440000"
+"#;
+        let profile = load_profile(toml, None).unwrap();
+        assert_eq!(
+            profile.secrets["TOKEN"],
+            "bitwarden:550e8400-e29b-41d4-a716-446655440000"
+        );
     }
 
     #[test]
