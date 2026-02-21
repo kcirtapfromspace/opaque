@@ -163,6 +163,7 @@ Inspect and revoke active wrapper sessions:
 ```bash
 ./target/release/opaque agent list
 ./target/release/opaque agent end <session-id>
+./target/release/opaque agent end --all
 ```
 
 With stricter daemon enforcement, enable session gating in `~/.opaque/config.toml`:

@@ -1643,7 +1643,37 @@ async fn handle_request(
             )
         }
         "agent_session_end" => {
-            let Some(session_id) = req.params.get("session_id").and_then(|v| v.as_str()) else {
+            let end_all = req
+                .params
+                .get("all")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let session_id_param = req.params.get("session_id").and_then(|v| v.as_str());
+
+            if end_all && session_id_param.is_some() {
+                return Response::err(
+                    Some(req.id),
+                    "bad_request",
+                    "cannot combine 'all' with 'session_id'",
+                );
+            }
+
+            if end_all {
+                let mut sessions = state.agent_sessions.write().await;
+                let before = sessions.len();
+                sessions.retain(|_, s| s.created_by_uid != identity.uid);
+                let ended_count = before.saturating_sub(sessions.len());
+                return Response::ok(
+                    req.id,
+                    serde_json::json!({
+                        "status": "ended",
+                        "all": true,
+                        "ended_count": ended_count,
+                    }),
+                );
+            }
+
+            let Some(session_id) = session_id_param else {
                 return Response::err(Some(req.id), "bad_request", "missing 'session_id' field");
             };
 
@@ -3417,6 +3447,77 @@ exe_sha256 = "deadbeef"
                 .get("s-own-expired")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn agent_session_end_all_revokes_only_calling_uid_sessions() {
+        let state = make_test_state();
+        let now = SystemTime::now();
+
+        state.agent_sessions.write().await.insert(
+            "s-own-1".into(),
+            AgentSession {
+                session_id: "s-own-1".into(),
+                token: "tok-own-1".into(),
+                created_by_uid: 501,
+                expires_at: now + std::time::Duration::from_secs(300),
+                label: Some("own-1".into()),
+            },
+        );
+        state.agent_sessions.write().await.insert(
+            "s-own-2".into(),
+            AgentSession {
+                session_id: "s-own-2".into(),
+                token: "tok-own-2".into(),
+                created_by_uid: 501,
+                expires_at: now + std::time::Duration::from_secs(300),
+                label: Some("own-2".into()),
+            },
+        );
+        state.agent_sessions.write().await.insert(
+            "s-other".into(),
+            AgentSession {
+                session_id: "s-other".into(),
+                token: "tok-other".into(),
+                created_by_uid: 777,
+                expires_at: now + std::time::Duration::from_secs(300),
+                label: Some("other".into()),
+            },
+        );
+
+        let req = Request {
+            id: 8,
+            method: "agent_session_end".into(),
+            params: serde_json::json!({ "all": true }),
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+        let result = resp.result.expect("result expected");
+        assert_eq!(result.get("status").and_then(|v| v.as_str()), Some("ended"));
+        assert_eq!(result.get("all").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(result.get("ended_count").and_then(|v| v.as_u64()), Some(2));
+
+        let sessions = state.agent_sessions.read().await;
+        assert!(!sessions.contains_key("s-own-1"));
+        assert!(!sessions.contains_key("s-own-2"));
+        assert!(sessions.contains_key("s-other"));
+    }
+
+    #[tokio::test]
+    async fn agent_session_end_all_rejects_mixed_mode_with_session_id() {
+        let state = make_test_state();
+        let req = Request {
+            id: 9,
+            method: "agent_session_end".into(),
+            params: serde_json::json!({
+                "all": true,
+                "session_id": "s1",
+            }),
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        let err = resp.error.expect("expected bad_request");
+        assert_eq!(err.code, "bad_request");
+        assert!(err.message.contains("cannot combine 'all'"));
     }
 
     #[tokio::test]
