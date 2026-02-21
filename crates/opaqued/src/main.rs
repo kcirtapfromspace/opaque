@@ -7,7 +7,10 @@ use std::time::SystemTime;
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use opaque_core::audit::{MultiAuditSink, SqliteAuditSink, TracingAuditEmitter};
+use opaque_core::audit::{
+    AuditEvent, AuditEventKind, AuditSink, ClientSummary, MultiAuditSink, SqliteAuditSink,
+    TracingAuditEmitter,
+};
 use opaque_core::operation::{
     ApprovalFactor, ApprovalRequirement, ClientIdentity, ClientType, OperationDef,
     OperationRegistry, OperationRequest, OperationSafety,
@@ -98,6 +101,7 @@ const fn version_string() -> &'static str {
 
 struct DaemonState {
     enclave: Arc<Enclave>,
+    audit: Arc<dyn AuditSink>,
     config: DaemonConfig,
     version: &'static str,
     /// Hex-encoded 32-byte CSPRNG token for handshake authentication.
@@ -639,12 +643,12 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
     let policy = PolicyEngine::with_rules(config.rules.clone());
     info!("policy engine loaded with {} rules", policy.rule_count());
 
-    let tracing_sink = Arc::new(TracingAuditEmitter::new());
+    let tracing_sink: Arc<dyn AuditSink> = Arc::new(TracingAuditEmitter::new());
     let audit_db_path = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
         .join(".opaque")
         .join("audit.db");
     let retention_days = config.audit_retention_days.unwrap_or(90);
-    let sqlite_sink = Arc::new(
+    let sqlite_sink: Arc<dyn AuditSink> = Arc::new(
         SqliteAuditSink::new(audit_db_path.clone(), retention_days)
             .expect("failed to open audit database"),
     );
@@ -653,7 +657,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         audit_db_path.display(),
         retention_days
     );
-    let audit = Arc::new(MultiAuditSink::new(vec![tracing_sink, sqlite_sink]));
+    let audit: Arc<dyn AuditSink> = Arc::new(MultiAuditSink::new(vec![tracing_sink, sqlite_sink]));
 
     let sandbox_executor = sandbox::SandboxExecutor::new(audit.clone());
     let github_actions_handler = github::GitHubHandler::new(audit.clone());
@@ -744,11 +748,12 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
 
     let enclave = enclave_builder
         .approval_gate(Box::new(NativeApprovalGate))
-        .audit(audit)
+        .audit(audit.clone())
         .build();
 
     let state = Arc::new(DaemonState {
         enclave: Arc::new(enclave),
+        audit: audit.clone(),
         config,
         version: version_string(),
         daemon_token,
@@ -1533,6 +1538,25 @@ fn system_time_to_unix_ms(ts: SystemTime) -> i64 {
         .unwrap_or(0)
 }
 
+fn emit_daemon_method_audit(
+    state: &DaemonState,
+    kind: AuditEventKind,
+    method: &str,
+    identity: &ClientIdentity,
+    client_type: ClientType,
+    outcome: &str,
+    detail: Option<String>,
+) {
+    let mut event = AuditEvent::new(kind)
+        .with_operation(method)
+        .with_client(ClientSummary::from((identity, client_type)))
+        .with_outcome(outcome);
+    if let Some(detail) = detail {
+        event = event.with_detail(detail);
+    }
+    state.audit.emit(event);
+}
+
 async fn validate_agent_session_token(
     state: &DaemonState,
     token: &str,
@@ -1593,6 +1617,15 @@ async fn handle_request(
         }
         "agent_session_start" => {
             if state.config.enforce_agent_sessions && client_type != ClientType::Human {
+                emit_daemon_method_audit(
+                    state,
+                    AuditEventKind::OperationFailed,
+                    "agent_session_start",
+                    identity,
+                    client_type,
+                    "permission_denied",
+                    Some("enforce_agent_sessions requires human client".into()),
+                );
                 return Response::err(
                     Some(req.id),
                     "permission_denied",
@@ -1612,6 +1645,7 @@ async fn handle_request(
                 .get("label")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_owned());
+            let label_for_audit = label.clone();
 
             let session_id = Uuid::new_v4().to_string();
             let session_token = generate_daemon_token();
@@ -1632,6 +1666,21 @@ async fn handle_request(
                 .await
                 .insert(session_id.clone(), session);
 
+            emit_daemon_method_audit(
+                state,
+                AuditEventKind::OperationSucceeded,
+                "agent_session_start",
+                identity,
+                client_type,
+                "started",
+                Some(format!(
+                    "session_id={} ttl_secs={} label={}",
+                    session_id,
+                    ttl_secs,
+                    label_for_audit.as_deref().unwrap_or("")
+                )),
+            );
+
             Response::ok(
                 req.id,
                 serde_json::json!({
@@ -1651,6 +1700,15 @@ async fn handle_request(
             let session_id_param = req.params.get("session_id").and_then(|v| v.as_str());
 
             if end_all && session_id_param.is_some() {
+                emit_daemon_method_audit(
+                    state,
+                    AuditEventKind::OperationFailed,
+                    "agent_session_end",
+                    identity,
+                    client_type,
+                    "bad_request",
+                    Some("cannot combine all=true with session_id".into()),
+                );
                 return Response::err(
                     Some(req.id),
                     "bad_request",
@@ -1663,6 +1721,15 @@ async fn handle_request(
                 let before = sessions.len();
                 sessions.retain(|_, s| s.created_by_uid != identity.uid);
                 let ended_count = before.saturating_sub(sessions.len());
+                emit_daemon_method_audit(
+                    state,
+                    AuditEventKind::OperationSucceeded,
+                    "agent_session_end",
+                    identity,
+                    client_type,
+                    "ended_all",
+                    Some(format!("ended_count={ended_count}")),
+                );
                 return Response::ok(
                     req.id,
                     serde_json::json!({
@@ -1674,6 +1741,15 @@ async fn handle_request(
             }
 
             let Some(session_id) = session_id_param else {
+                emit_daemon_method_audit(
+                    state,
+                    AuditEventKind::OperationFailed,
+                    "agent_session_end",
+                    identity,
+                    client_type,
+                    "bad_request",
+                    Some("missing session_id".into()),
+                );
                 return Response::err(Some(req.id), "bad_request", "missing 'session_id' field");
             };
 
@@ -1684,6 +1760,15 @@ async fn handle_request(
                 true
             };
             if !can_delete {
+                emit_daemon_method_audit(
+                    state,
+                    AuditEventKind::OperationFailed,
+                    "agent_session_end",
+                    identity,
+                    client_type,
+                    "permission_denied",
+                    Some(format!("session_id={session_id}")),
+                );
                 return Response::err(
                     Some(req.id),
                     "permission_denied",
@@ -1693,11 +1778,25 @@ async fn handle_request(
 
             let removed = sessions.remove(session_id);
             let label = removed.as_ref().and_then(|s| s.label.clone());
+            let status = if removed.is_some() {
+                "ended"
+            } else {
+                "not_found"
+            };
+            emit_daemon_method_audit(
+                state,
+                AuditEventKind::OperationSucceeded,
+                "agent_session_end",
+                identity,
+                client_type,
+                status,
+                Some(format!("session_id={session_id}")),
+            );
 
             Response::ok(
                 req.id,
                 serde_json::json!({
-                    "status": if removed.is_some() { "ended" } else { "not_found" },
+                    "status": status,
                     "session_id": session_id,
                     "label": label,
                 }),
@@ -1705,6 +1804,15 @@ async fn handle_request(
         }
         "agent_session_list" => {
             if client_type != ClientType::Human {
+                emit_daemon_method_audit(
+                    state,
+                    AuditEventKind::OperationFailed,
+                    "agent_session_list",
+                    identity,
+                    client_type,
+                    "permission_denied",
+                    Some("only human clients can list sessions".into()),
+                );
                 return Response::err(
                     Some(req.id),
                     "permission_denied",
@@ -1740,6 +1848,16 @@ async fn handle_request(
                 let b_id = b.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
                 a_id.cmp(b_id)
             });
+
+            emit_daemon_method_audit(
+                state,
+                AuditEventKind::OperationSucceeded,
+                "agent_session_list",
+                identity,
+                client_type,
+                "listed",
+                Some(format!("count={}", visible_sessions.len())),
+            );
 
             Response::ok(
                 req.id,
@@ -3521,6 +3639,58 @@ exe_sha256 = "deadbeef"
     }
 
     #[tokio::test]
+    async fn agent_session_start_emits_audit_event() {
+        let audit = Arc::new(opaque_core::audit::InMemoryAuditEmitter::new());
+        let state = make_test_state_with_audit(audit.clone());
+        let req = Request {
+            id: 10,
+            method: "agent_session_start".into(),
+            params: serde_json::json!({
+                "label": "codex",
+                "ttl_secs": 120,
+            }),
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+
+        let events = audit.events_of_kind(AuditEventKind::OperationSucceeded);
+        assert!(events.iter().any(|e| {
+            e.operation.as_deref() == Some("agent_session_start")
+                && e.outcome.as_deref() == Some("started")
+        }));
+    }
+
+    #[tokio::test]
+    async fn agent_session_end_all_emits_audit_event() {
+        let audit = Arc::new(opaque_core::audit::InMemoryAuditEmitter::new());
+        let state = make_test_state_with_audit(audit.clone());
+        state.agent_sessions.write().await.insert(
+            "s-own-1".into(),
+            AgentSession {
+                session_id: "s-own-1".into(),
+                token: "tok-own-1".into(),
+                created_by_uid: 501,
+                expires_at: SystemTime::now() + std::time::Duration::from_secs(300),
+                label: Some("own-1".into()),
+            },
+        );
+
+        let req = Request {
+            id: 11,
+            method: "agent_session_end".into(),
+            params: serde_json::json!({ "all": true }),
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+
+        let events = audit.events_of_kind(AuditEventKind::OperationSucceeded);
+        assert!(events.iter().any(|e| {
+            e.operation.as_deref() == Some("agent_session_end")
+                && e.outcome.as_deref() == Some("ended_all")
+        }));
+    }
+
+    #[tokio::test]
     async fn validate_agent_session_token_uid_scoped() {
         let state = make_test_state();
         let session = AgentSession {
@@ -3686,23 +3856,28 @@ exe_sha256 = "deadbeef"
     // Test helpers
     // -----------------------------------------------------------------------
 
-    fn make_test_state() -> DaemonState {
+    fn make_test_state_with_audit(audit: Arc<dyn AuditSink>) -> DaemonState {
         let registry = OperationRegistry::new();
         let policy = PolicyEngine::with_rules(vec![]);
-        let audit = Arc::new(TracingAuditEmitter::new());
         let enclave = Enclave::builder()
             .registry(registry)
             .policy(policy)
             .approval_gate(Box::new(NativeApprovalGate))
-            .audit(audit)
+            .audit(audit.clone())
             .build();
         DaemonState {
             enclave: Arc::new(enclave),
+            audit,
             config: DaemonConfig::default(),
             version: version_string(),
             daemon_token: "test_token".into(),
             agent_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             connection_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
         }
+    }
+
+    fn make_test_state() -> DaemonState {
+        let audit: Arc<dyn AuditSink> = Arc::new(TracingAuditEmitter::new());
+        make_test_state_with_audit(audit)
     }
 }
