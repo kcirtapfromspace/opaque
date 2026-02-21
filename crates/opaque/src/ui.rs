@@ -521,6 +521,19 @@ fn format_agent_session_end_result(result: &serde_json::Value) {
         .get("status")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
+    let end_all = result.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    if end_all {
+        let ended_count = result
+            .get("ended_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        success(&format!(
+            "Ended {ended_count} wrapped-agent session(s) for current user"
+        ));
+        return;
+    }
+
     let session_id = result
         .get("session_id")
         .and_then(|v| v.as_str())
