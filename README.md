@@ -162,6 +162,7 @@ opaque policy preset github-secrets
 - Getting started: `docs/getting-started.md`
 - MCP integration: `docs/mcp-integration.md`
 - Bitwarden setup: `docs/bitwarden.md`
+- Vault setup: `docs/vault.md`
 - Policy: `docs/policy.md`
 - Operations: `docs/operations.md`
 - LLM harness: `docs/llm-harness.md`
@@ -174,8 +175,7 @@ opaque policy preset github-secrets
 
 See `docs/roadmap-deferred.md`. Notably:
 
-- HashiCorp Vault connector
-- GitLab CI variable sync
+- Vault dynamic secrets + lease lifecycle
 - iOS approvals / FaceID (v3)
 - FIDO2 / WebAuthn approvals (v3)
 

@@ -16,6 +16,17 @@ For MCP-aware tools (Claude Code), `opaque-mcp` provides a stdio-based MCP serve
 | `SENSITIVE_OUTPUT` | Output may contain credential-like data | Denied for agents unless explicitly allowlisted in policy |
 | `REVEAL` | Returns plaintext secrets | Never (hard-blocked in v1) |
 
+## Secret Ref Schemes
+
+Operations that accept `value_ref` or `*_token_ref` support:
+
+- `env:NAME`
+- `keychain:service/account`
+- `profile:<name>:<key>`
+- `onepassword:<vault>/<item>/<field>`
+- `bitwarden:<project>/<key>` or `bitwarden:<secret-id>`
+- `vault:<path>#<field>`
+
 ## Implemented Operations
 
 ### `test.noop` (`SAFE`)

@@ -19,7 +19,7 @@ Do not start a phase until the prior phase is shipped, tested with real users, a
 | **GitLab CI variable sync** | `gitlab.set_ci_variable` operation | **Shipped** — daemon/CLI/MCP wiring with write-only provider flow and policy-bound secret refs. | Medium |
 | **GitHub Codespaces secrets (shipped)** | `github.set_codespaces_secret` operation (user + repo scope) | **Shipped** in v1. | Small |
 | **1Password provider connector (hardening)** | Fetch secrets from 1Password vaults via Connect API or service accounts | **Shipped** — `onepassword.read_field` is `REVEAL`, agent-visible channels remain blocked, and canonical secret ref derivation is enforced server-side for policy binding. | Medium |
-| **HashiCorp Vault provider connector** | Fetch secrets from Vault KV, dynamic secrets (DB, AWS) | Deferred — Vault adds lease management complexity. | Large |
+| **HashiCorp Vault provider connector** | Fetch secrets from Vault KV, dynamic secrets (DB, AWS) | **Partially shipped** — `vault:` refs now resolve KV fields for existing write-only operations. Dynamic engines and lease lifecycle remain deferred. | Large |
 | **SQLite FTS5 audit search** | Full-text search over sanitized audit event text | **Shipped** — local SQLite FTS5 index with `opaque audit tail --query`. | Small |
 
 ---
