@@ -22,6 +22,7 @@ const TOKEN_REF_ENV: &str = "OPAQUE_VAULT_TOKEN_REF";
 struct LeaseCacheEntry {
     value: String,
     expires_at: Instant,
+    lease_id: Option<String>,
 }
 
 static LEASE_CACHE: LazyLock<Mutex<HashMap<String, LeaseCacheEntry>>> =
@@ -134,19 +135,47 @@ impl VaultResolver {
 
     fn get_cached_value(key: &str) -> Option<String> {
         let now = Instant::now();
-        let mut cache = Self::lock_cache();
-        cache.retain(|_, entry| entry.expires_at > now);
-        cache.get(key).map(|entry| entry.value.clone())
+        let cache = Self::lock_cache();
+        if let Some(entry) = cache.get(key) {
+            if entry.expires_at > now {
+                return Some(entry.value.clone());
+            }
+        }
+        None
     }
 
-    fn store_cached_value(key: String, value: String, lease_duration_secs: u64) {
+    fn take_expired_lease_for_key(key: &str) -> Option<String> {
+        let now = Instant::now();
+        let mut cache = Self::lock_cache();
+        let entry = cache.get(key)?;
+        if entry.expires_at > now {
+            return None;
+        }
+        let lease_id = entry.lease_id.clone();
+        cache.remove(key);
+        lease_id
+    }
+
+    fn store_cached_value(
+        key: String,
+        value: String,
+        lease_duration_secs: u64,
+        lease_id: Option<String>,
+    ) {
         if lease_duration_secs == 0 {
             return;
         }
         let ttl = lease_duration_secs.max(1);
         let expires_at = Instant::now() + Duration::from_secs(ttl);
         let mut cache = Self::lock_cache();
-        cache.insert(key, LeaseCacheEntry { value, expires_at });
+        cache.insert(
+            key,
+            LeaseCacheEntry {
+                value,
+                expires_at,
+                lease_id,
+            },
+        );
     }
 
     #[cfg(test)]
@@ -172,13 +201,25 @@ impl SecretResolver for VaultResolver {
         let token = token_value.as_str().ok_or_else(|| {
             ResolveError::VaultError(ref_str.to_owned(), "access token is not valid UTF-8".into())
         })?;
+        let handle = tokio::runtime::Handle::current();
         let cache_key = self.lease_cache_key(token, parsed.path, parsed.field);
         if let Some(value) = Self::get_cached_value(&cache_key) {
             return Ok(SecretValue::from_string(value));
         }
+        if let Some(expired_lease_id) = Self::take_expired_lease_for_key(&cache_key) {
+            let revoke_result = tokio::task::block_in_place(|| {
+                handle.block_on(async { self.client.revoke_lease(token, &expired_lease_id).await })
+            });
+            if let Err(err) = revoke_result {
+                tracing::warn!(
+                    "best-effort Vault lease revoke failed for {}: {}",
+                    parsed.path,
+                    err
+                );
+            }
+        }
 
         // Use block_in_place + block_on to call async HTTP from sync trait.
-        let handle = tokio::runtime::Handle::current();
         let result = tokio::task::block_in_place(|| {
             handle.block_on(async {
                 self.client
@@ -195,6 +236,7 @@ impl SecretResolver for VaultResolver {
                         cache_key,
                         read.value.clone(),
                         lease.lease_duration_secs,
+                        Some(lease.lease_id),
                     );
                 }
                 Ok(SecretValue::from_string(read.value))
@@ -208,7 +250,7 @@ impl SecretResolver for VaultResolver {
 mod tests {
     use super::*;
     use tokio::time::sleep;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
@@ -411,5 +453,72 @@ mod tests {
         assert_eq!(second.as_str(), Some("second-password"));
 
         unsafe { std::env::remove_var("OPAQUE_TEST_VAULT_TOKEN_REFRESH") };
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_revokes_expired_lease_before_refresh() {
+        VaultResolver::clear_cache_for_tests();
+        let server = MockServer::start().await;
+        let client = VaultClient::with_base_url(server.uri());
+
+        Mock::given(method("GET"))
+            .and(path("/v1/database/creds/readonly"))
+            .and(header("x-vault-token", "vault-token-123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "lease_id": "database/creds/readonly/a1",
+                "lease_duration": 1,
+                "renewable": true,
+                "data": {
+                    "password": "first-password"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        unsafe { std::env::set_var("OPAQUE_TEST_VAULT_TOKEN_REVOKE", "vault-token-123") };
+        let resolver = VaultResolver::with_token_ref(
+            client.clone(),
+            "env:OPAQUE_TEST_VAULT_TOKEN_REVOKE".into(),
+        );
+        let first = resolver
+            .resolve("vault:database/creds/readonly#password")
+            .unwrap();
+        assert_eq!(first.as_str(), Some("first-password"));
+
+        sleep(Duration::from_secs(2)).await;
+
+        server.reset().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/sys/leases/revoke"))
+            .and(header("x-vault-token", "vault-token-123"))
+            .and(body_json(serde_json::json!({
+                "lease_id": "database/creds/readonly/a1"
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/database/creds/readonly"))
+            .and(header("x-vault-token", "vault-token-123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "lease_id": "database/creds/readonly/b2",
+                "lease_duration": 30,
+                "renewable": true,
+                "data": {
+                    "password": "second-password"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let second = resolver
+            .resolve("vault:database/creds/readonly#password")
+            .unwrap();
+        assert_eq!(second.as_str(), Some("second-password"));
+
+        unsafe { std::env::remove_var("OPAQUE_TEST_VAULT_TOKEN_REVOKE") };
     }
 }
