@@ -118,6 +118,52 @@ fn extract_field_value(body: &serde_json::Value, field: &str) -> Option<String> 
     None
 }
 
+/// Lease metadata returned by Vault for dynamic secret engines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultLease {
+    pub lease_id: String,
+    pub lease_duration_secs: u64,
+    pub renewable: bool,
+}
+
+/// Secret read result with optional lease metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultSecretField {
+    pub value: String,
+    pub lease: Option<VaultLease>,
+}
+
+fn extract_lease(body: &serde_json::Value) -> Option<VaultLease> {
+    let lease_id = body
+        .get("lease_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    if lease_id.is_empty() {
+        return None;
+    }
+
+    let lease_duration_secs = body
+        .get("lease_duration")
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_i64().and_then(|n| u64::try_from(n).ok()))
+        })
+        .unwrap_or(0);
+    if lease_duration_secs == 0 {
+        return None;
+    }
+
+    Some(VaultLease {
+        lease_id: lease_id.to_owned(),
+        lease_duration_secs,
+        renewable: body
+            .get("renewable")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    })
+}
+
 /// Vault REST API client.
 #[derive(Debug, Clone)]
 pub struct VaultClient {
@@ -158,6 +204,11 @@ impl VaultClient {
         Self { http, base_url }
     }
 
+    /// Return the client base URL (without trailing slash).
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     /// Read a single secret field from Vault at the given path.
     pub async fn read_secret_field(
         &self,
@@ -165,6 +216,18 @@ impl VaultClient {
         path: &str,
         field: &str,
     ) -> Result<String, VaultApiError> {
+        self.read_secret_field_with_lease(token, path, field)
+            .await
+            .map(|result| result.value)
+    }
+
+    /// Read a single secret field and include lease metadata when present.
+    pub async fn read_secret_field_with_lease(
+        &self,
+        token: &str,
+        path: &str,
+        field: &str,
+    ) -> Result<VaultSecretField, VaultApiError> {
         let path_trimmed = path.trim_matches('/');
         if path_trimmed.is_empty() {
             return Err(VaultApiError::NotFound("empty secret path".into()));
@@ -190,8 +253,12 @@ impl VaultClient {
                     .json::<serde_json::Value>()
                     .await
                     .map_err(VaultApiError::Network)?;
-                extract_field_value(&body, field).ok_or_else(|| {
+                let value = extract_field_value(&body, field).ok_or_else(|| {
                     VaultApiError::NotFound(format!("field '{field}' at path '{path_trimmed}'"))
+                })?;
+                Ok(VaultSecretField {
+                    value,
+                    lease: extract_lease(&body),
                 })
             }
             401 | 403 => Err(VaultApiError::Unauthorized),
@@ -273,6 +340,19 @@ mod tests {
         assert_eq!(extract_field_value(&body, "API_KEY"), Some("abc123".into()));
     }
 
+    #[test]
+    fn extract_lease_supports_dynamic_secret_metadata() {
+        let body = serde_json::json!({
+            "lease_id": "database/creds/readonly/abc123",
+            "lease_duration": 1800,
+            "renewable": true
+        });
+        let lease = extract_lease(&body).expect("lease should parse");
+        assert_eq!(lease.lease_id, "database/creds/readonly/abc123");
+        assert_eq!(lease.lease_duration_secs, 1800);
+        assert!(lease.renewable);
+    }
+
     #[tokio::test]
     async fn read_secret_field_kv_v2_ok() {
         let server = MockServer::start().await;
@@ -294,6 +374,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(value, "postgres://example");
+    }
+
+    #[tokio::test]
+    async fn read_secret_field_with_lease_returns_metadata() {
+        let server = MockServer::start().await;
+        let client = VaultClient::with_base_url(server.uri());
+
+        Mock::given(method("GET"))
+            .and(path("/v1/database/creds/readonly"))
+            .and(header("x-vault-token", "vault-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "lease_id": "database/creds/readonly/abcd",
+                "lease_duration": 60,
+                "renewable": true,
+                "data": {
+                    "username": "v-root",
+                    "password": "v-pass"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let result = client
+            .read_secret_field_with_lease("vault-token", "database/creds/readonly", "password")
+            .await
+            .unwrap();
+        assert_eq!(result.value, "v-pass");
+        let lease = result.lease.expect("lease metadata should be present");
+        assert_eq!(lease.lease_id, "database/creds/readonly/abcd");
+        assert_eq!(lease.lease_duration_secs, 60);
+        assert!(lease.renewable);
     }
 
     #[tokio::test]
