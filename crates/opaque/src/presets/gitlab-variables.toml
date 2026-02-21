@@ -1,0 +1,33 @@
+# Opaque preset: gitlab-variables
+#
+# Allows agents and humans to set GitLab CI/CD project variables through Opaque.
+# Secret values are resolved server-side from refs and never returned to callers.
+#
+# Usage:
+#   opaque policy preset gitlab-variables
+
+[[known_human_clients]]
+name = "opaque-cli"
+exe_path = "*/opaque"
+
+[[rules]]
+name = "allow-gitlab-set-ci-variable"
+operation_pattern = "gitlab.set_ci_variable"
+allow = true
+client_types = ["agent", "human"]
+
+[rules.approval]
+require = "always"
+factors = ["local_bio"]
+lease_ttl = 300
+
+[[rules]]
+name = "allow-test-noop"
+operation_pattern = "test.noop"
+allow = true
+client_types = ["agent", "human"]
+
+[rules.approval]
+require = "first_use"
+factors = ["local_bio"]
+lease_ttl = 300
