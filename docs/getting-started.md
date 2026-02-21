@@ -260,6 +260,7 @@ The daemon writes a local SQLite audit DB at `~/.opaque/audit.db`.
 
 ```bash
 ./target/release/opaque audit tail --limit 50
+./target/release/opaque audit tail --query github --limit 20
 ```
 
 ## Environment Variables

@@ -647,6 +647,25 @@ CREATE INDEX IF NOT EXISTS idx_ts ON audit_events(ts_utc_ms);
 CREATE INDEX IF NOT EXISTS idx_kind ON audit_events(kind);
 CREATE INDEX IF NOT EXISTS idx_operation ON audit_events(operation);
 CREATE INDEX IF NOT EXISTS idx_request_id ON audit_events(request_id);
+CREATE VIRTUAL TABLE IF NOT EXISTS audit_events_fts USING fts5(search_text);
+CREATE TRIGGER IF NOT EXISTS audit_events_ai AFTER INSERT ON audit_events BEGIN
+    INSERT INTO audit_events_fts(rowid, search_text)
+    VALUES(
+        new.rowid,
+        trim(
+            coalesce(new.kind, '') || ' ' ||
+            coalesce(new.operation, '') || ' ' ||
+            coalesce(new.outcome, '') || ' ' ||
+            coalesce(new.detail, '') || ' ' ||
+            coalesce(new.target_json, '') || ' ' ||
+            coalesce(new.secret_names, '') || ' ' ||
+            coalesce(new.request_id, '')
+        )
+    );
+END;
+CREATE TRIGGER IF NOT EXISTS audit_events_ad AFTER DELETE ON audit_events BEGIN
+    DELETE FROM audit_events_fts WHERE rowid = old.rowid;
+END;
 ";
 
 /// A persistent audit sink backed by SQLite.
@@ -693,6 +712,22 @@ impl SqliteAuditSink {
         conn.execute(
             "DELETE FROM audit_events WHERE ts_utc_ms < ?1",
             rusqlite::params![cutoff_ms],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO audit_events_fts(rowid, search_text)
+             SELECT
+                rowid,
+                trim(
+                    coalesce(kind, '') || ' ' ||
+                    coalesce(operation, '') || ' ' ||
+                    coalesce(outcome, '') || ' ' ||
+                    coalesce(detail, '') || ' ' ||
+                    coalesce(target_json, '') || ' ' ||
+                    coalesce(secret_names, '') || ' ' ||
+                    coalesce(request_id, '')
+                )
+             FROM audit_events",
+            [],
         )?;
         drop(conn);
 
@@ -873,6 +908,8 @@ pub struct AuditFilter {
     pub request_id: Option<Uuid>,
     /// Filter by outcome value (e.g. "allowed", "denied", "error").
     pub outcome: Option<String>,
+    /// Full-text search over sanitized event text (kind/operation/outcome/detail/targets).
+    pub text_query: Option<String>,
 }
 
 impl Default for AuditFilter {
@@ -884,6 +921,7 @@ impl Default for AuditFilter {
             limit: 50,
             request_id: None,
             outcome: None,
+            text_query: None,
         }
     }
 }
@@ -898,7 +936,11 @@ pub fn query_audit_db(db_path: &Path, filter: &AuditFilter) -> Result<Vec<AuditE
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
 
-    let mut sql = String::from("SELECT * FROM audit_events WHERE 1=1");
+    let mut sql = String::from("SELECT audit_events.* FROM audit_events");
+    if filter.text_query.is_some() {
+        sql.push_str(" JOIN audit_events_fts ON audit_events_fts.rowid = audit_events.rowid");
+    }
+    sql.push_str(" WHERE 1=1");
     let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
     if let Some(ref kind) = filter.kind {
@@ -921,8 +963,12 @@ pub fn query_audit_db(db_path: &Path, filter: &AuditFilter) -> Result<Vec<AuditE
         sql.push_str(" AND outcome = ?");
         param_values.push(Box::new(outcome.clone()));
     }
+    if let Some(ref text_query) = filter.text_query {
+        sql.push_str(" AND audit_events_fts MATCH ?");
+        param_values.push(Box::new(text_query.clone()));
+    }
 
-    sql.push_str(" ORDER BY ts_utc_ms DESC LIMIT ?");
+    sql.push_str(" ORDER BY audit_events.ts_utc_ms DESC LIMIT ?");
     param_values.push(Box::new(filter.limit as i64));
 
     let params: Vec<&dyn rusqlite::types::ToSql> =
@@ -1602,6 +1648,39 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_query_filter_by_text_query() {
+        let db_path = temp_db_path();
+        let sink = SqliteAuditSink::new(db_path.clone(), 90).unwrap();
+
+        sink.emit(
+            AuditEvent::new(AuditEventKind::OperationSucceeded)
+                .with_operation("github.set_actions_secret")
+                .with_outcome("ok")
+                .with_detail("repo=acme/api secret=DATABASE_URL"),
+        );
+        sink.emit(
+            AuditEvent::new(AuditEventKind::OperationSucceeded)
+                .with_operation("sandbox.exec")
+                .with_outcome("ok")
+                .with_detail("command=ls"),
+        );
+        drop(sink);
+
+        let filter = AuditFilter {
+            text_query: Some("acme".into()),
+            ..Default::default()
+        };
+        let events = query_audit_db(&db_path, &filter).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].operation.as_deref(),
+            Some("github.set_actions_secret")
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
     fn sqlite_query_filter_by_request_id() {
         let db_path = temp_db_path();
         let sink = SqliteAuditSink::new(db_path.clone(), 90).unwrap();
@@ -1773,6 +1852,7 @@ mod tests {
         assert!(filter.since_ms.is_none());
         assert_eq!(filter.limit, 50);
         assert!(filter.request_id.is_none());
+        assert!(filter.text_query.is_none());
     }
 
     // -- MultiAuditSink tests --

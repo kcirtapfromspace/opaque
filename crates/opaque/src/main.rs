@@ -553,6 +553,10 @@ enum AuditAction {
         /// Filter by outcome (e.g. "allowed", "denied", "error").
         #[arg(long)]
         outcome: Option<String>,
+
+        /// Full-text search query over audit event text.
+        #[arg(long = "query")]
+        query: Option<String>,
     },
 }
 
@@ -1436,6 +1440,7 @@ async fn main() {
                     since,
                     request_id,
                     outcome,
+                    query,
                 } => {
                     match run_audit_tail(
                         *limit,
@@ -1444,6 +1449,7 @@ async fn main() {
                         since.as_deref(),
                         request_id.as_deref(),
                         outcome.as_deref(),
+                        query.as_deref(),
                         json_output,
                     ) {
                         Ok(()) => {}
@@ -2075,6 +2081,7 @@ fn run_audit_tail(
     since: Option<&str>,
     request_id: Option<&str>,
     outcome: Option<&str>,
+    text_query: Option<&str>,
     json_output: bool,
 ) -> Result<(), String> {
     let db_path = default_opaque_dir().join("audit.db");
@@ -2119,6 +2126,7 @@ fn run_audit_tail(
         limit,
         request_id,
         outcome: outcome.map(|s| s.to_owned()),
+        text_query: text_query.map(|s| s.to_owned()),
     };
 
     let events = query_audit_db(&db_path, &filter).map_err(|e| format!("query failed: {e}"))?;
