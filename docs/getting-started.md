@@ -37,6 +37,7 @@ Or initialize with a policy preset:
 ```bash
 ./target/release/opaque init --preset safe-demo       # test.noop only
 ./target/release/opaque init --preset github-secrets   # GitHub secret sync
+./target/release/opaque init --preset gitlab-variables # GitLab CI variable sync
 ./target/release/opaque init --preset sandbox-human    # sandbox for humans only
 ./target/release/opaque init --preset agent-wrapper-github # wrapped-agent GitHub sync + session tokens
 ```
@@ -219,6 +220,31 @@ Org-level Actions secret:
 
 These operations are `SAFE`: they never return the secret value or ciphertext.
 
+### GitLab CI Variables
+
+Set a project CI/CD variable:
+
+```bash
+./target/release/opaque gitlab set-ci-variable \
+  --project group/project \
+  --key DATABASE_URL \
+  --value-ref keychain:opaque/db-url
+```
+
+Optionally set scope/attributes:
+
+```bash
+./target/release/opaque gitlab set-ci-variable \
+  --project group/project \
+  --key DATABASE_URL \
+  --value-ref bitwarden:production/DATABASE_URL \
+  --environment-scope production \
+  --protected \
+  --masked
+```
+
+This operation is `SAFE`: it writes through to GitLab and never returns the variable value.
+
 Build a refs-only manifest from `.env.example` (names only):
 
 ```bash
@@ -269,6 +295,8 @@ The daemon writes a local SQLite audit DB at `~/.opaque/audit.db`.
 - `OPAQUE_SOCK`: override socket path for the CLI only (daemon ignores it)
 - `OPAQUE_GITHUB_TOKEN_REF`: override default GitHub PAT secret ref used by `github.set_actions_secret`
 - `OPAQUE_GITHUB_API_URL`: override GitHub API base URL (GitHub Enterprise Server or local testing)
+- `OPAQUE_GITLAB_TOKEN_REF`: override default GitLab token ref used by `gitlab.set_ci_variable`
+- `OPAQUE_GITLAB_API_URL`: override GitLab API base URL (GitLab.com / self-managed / local testing)
 - `OPAQUE_BITWARDEN_URL`: override Bitwarden API base URL (default: `https://api.bitwarden.com`)
 
 ## Next

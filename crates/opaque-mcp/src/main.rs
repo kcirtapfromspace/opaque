@@ -355,13 +355,14 @@ mod tests {
         let resp = handle_tools_list(Some(json!(1)));
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 11);
 
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
 
         // Verify Safe operations are present.
         assert!(tool_names.contains(&"opaque_github_set_actions_secret"));
         assert!(tool_names.contains(&"opaque_github_list_secrets"));
+        assert!(tool_names.contains(&"opaque_gitlab_set_ci_variable"));
         assert!(tool_names.contains(&"opaque_onepassword_list_vaults"));
         assert!(tool_names.contains(&"opaque_bitwarden_list_projects"));
 
