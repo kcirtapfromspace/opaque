@@ -67,7 +67,8 @@ Shipped in this phase:
 - Vault KV field resolution through `vault:` refs
 - Dynamic secret engine field resolution (for example `database/creds/...`)
 - Lease-aware caching for dynamic refs using Vault `lease_duration`
+- Best-effort revocation of expired cached leases on refresh
 
 Still deferred:
 
-- Lease renewal and explicit lease revocation flows
+- Lease renewal for long-running sessions
