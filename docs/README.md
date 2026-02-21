@@ -5,6 +5,7 @@
 - Operations contract: `docs/operations.md`
 - MCP integration (Claude Code): `docs/mcp-integration.md`
 - Bitwarden Secrets Manager: `docs/bitwarden.md`
+- HashiCorp Vault: `docs/vault.md`
 - LLM harness: `docs/llm-harness.md`
 - Demo recordings: `docs/demos.md`
 - Deployment guide (macOS LaunchAgent, Linux systemd user service + polkit): `docs/deployment.md`

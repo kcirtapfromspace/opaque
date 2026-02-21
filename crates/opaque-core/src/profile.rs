@@ -151,7 +151,9 @@ pub enum ProfileError {
     #[error("path traversal detected in {field}: {path}")]
     PathTraversal { field: String, path: String },
 
-    #[error("invalid secret ref scheme in '{name}': {ref_str} (expected env: or keychain:)")]
+    #[error(
+        "invalid secret ref scheme in '{name}': {ref_str} (expected env:, keychain:, profile:, onepassword:, bitwarden:, or vault:)"
+    )]
     InvalidSecretRef { name: String, ref_str: String },
 
     #[error("empty profile name")]
@@ -184,6 +186,7 @@ pub const ALLOWED_REF_SCHEMES: &[&str] = &[
     "profile:",
     "onepassword:",
     "bitwarden:",
+    "vault:",
 ];
 
 /// Load and validate an `ExecProfile` from a TOML string.
@@ -485,7 +488,7 @@ name = "bad"
 project_dir = "/tmp"
 
 [secrets]
-TOKEN = "vault:secret/data/myapp"
+TOKEN = "unknown:secret/data/myapp"
 "#;
         let result = load_profile(toml, None);
         assert!(result.is_err());
@@ -555,6 +558,23 @@ TOKEN = "bitwarden:550e8400-e29b-41d4-a716-446655440000"
         assert_eq!(
             profile.secrets["TOKEN"],
             "bitwarden:550e8400-e29b-41d4-a716-446655440000"
+        );
+    }
+
+    #[test]
+    fn valid_vault_ref() {
+        let toml = r#"
+[profile]
+name = "vault-test"
+project_dir = "/tmp"
+
+[secrets]
+DATABASE_URL = "vault:secret/data/myapp#DATABASE_URL"
+"#;
+        let profile = load_profile(toml, None).unwrap();
+        assert_eq!(
+            profile.secrets["DATABASE_URL"],
+            "vault:secret/data/myapp#DATABASE_URL"
         );
     }
 

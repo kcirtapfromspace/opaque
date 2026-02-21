@@ -89,6 +89,30 @@ Opaque can resolve secrets from Bitwarden Secrets Manager using the `bitwarden:`
 
 See `docs/bitwarden.md` for full setup.
 
+## HashiCorp Vault
+
+Opaque can resolve secrets from Vault using the `vault:` ref scheme:
+
+```text
+vault:<path>#<field>
+```
+
+Example:
+
+```bash
+opaque github set-secret \
+  --repo myorg/myrepo \
+  --secret-name DATABASE_URL \
+  --value-ref vault:secret/data/myapp#DATABASE_URL
+```
+
+Defaults:
+
+- Vault URL: `http://127.0.0.1:8200` (override with `OPAQUE_VAULT_URL`)
+- Vault token ref: `keychain:opaque/vault-token` (override with `OPAQUE_VAULT_TOKEN_REF`)
+
+See `docs/vault.md` for details.
+
 ## MCP Quickstart (Claude Code)
 
 For Claude Code, the MCP server is the recommended integration path:

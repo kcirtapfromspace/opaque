@@ -24,7 +24,7 @@ pub trait SecretResolver: Send + Sync {
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ResolveError {
     #[error(
-        "unknown ref scheme in '{0}' (expected env:, keychain:, profile:, onepassword:, or bitwarden:)"
+        "unknown ref scheme in '{0}' (expected env:, keychain:, profile:, onepassword:, bitwarden:, or vault:)"
     )]
     UnknownScheme(String),
 
@@ -45,6 +45,9 @@ pub enum ResolveError {
 
     #[error("Bitwarden resolution failed for '{0}': {1}")]
     BitwardenError(String, String),
+
+    #[error("Vault resolution failed for '{0}': {1}")]
+    VaultError(String, String),
 }
 
 // ---------------------------------------------------------------------------
@@ -261,7 +264,7 @@ impl SecretResolver for BaseResolver {
 // ---------------------------------------------------------------------------
 
 /// A composite resolver that dispatches to the correct resolver based on
-/// the ref scheme prefix (`env:`, `keychain:`, `profile:`, `onepassword:`, `bitwarden:`).
+/// the ref scheme prefix (`env:`, `keychain:`, `profile:`, `onepassword:`, `bitwarden:`, `vault:`).
 #[derive(Debug)]
 pub struct CompositeResolver {
     env: EnvResolver,
@@ -269,6 +272,7 @@ pub struct CompositeResolver {
     profile: ProfileResolver,
     onepassword: Option<crate::onepassword::resolve::OnePasswordResolver>,
     bitwarden: Option<crate::bitwarden::resolve::BitwardenResolver>,
+    vault: Option<crate::vault::resolve::VaultResolver>,
 }
 
 impl CompositeResolver {
@@ -298,12 +302,18 @@ impl CompositeResolver {
             crate::bitwarden::client::BitwardenClient::new(&bitwarden_url),
         ));
 
+        // Vault backend: always available (uses default or configured URL).
+        let vault = Some(crate::vault::resolve::VaultResolver::new(
+            crate::vault::client::VaultClient::new(),
+        ));
+
         Self {
             env: EnvResolver,
             keychain: KeychainResolver,
             profile: ProfileResolver,
             onepassword,
             bitwarden,
+            vault,
         }
     }
 
@@ -316,6 +326,7 @@ impl CompositeResolver {
             profile: ProfileResolver,
             onepassword: None,
             bitwarden: None,
+            vault: None,
         }
     }
 }
@@ -349,6 +360,14 @@ impl SecretResolver for CompositeResolver {
                 None => Err(ResolveError::BitwardenError(
                     ref_str.to_owned(),
                     "Bitwarden not configured".into(),
+                )),
+            }
+        } else if ref_str.starts_with("vault:") {
+            match &self.vault {
+                Some(r) => r.resolve(ref_str),
+                None => Err(ResolveError::VaultError(
+                    ref_str.to_owned(),
+                    "Vault not configured".into(),
                 )),
             }
         } else {
@@ -522,6 +541,9 @@ mod tests {
         let err =
             ResolveError::BitwardenError("bitwarden:proj/key".into(), "not configured".into());
         assert!(format!("{err}").contains("Bitwarden resolution failed"));
+
+        let err = ResolveError::VaultError("vault:secret/data/app#TOKEN".into(), "failed".into());
+        assert!(format!("{err}").contains("Vault resolution failed"));
     }
 
     #[test]
@@ -543,6 +565,17 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, ResolveError::BitwardenError(..)));
+        assert!(format!("{err}").contains("not configured"));
+    }
+
+    #[test]
+    fn composite_resolver_vault_dispatch() {
+        // Use without_onepassword() which also has vault=None.
+        let resolver = CompositeResolver::without_onepassword();
+        let result = resolver.resolve("vault:secret/data/app#TOKEN");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ResolveError::VaultError(..)));
         assert!(format!("{err}").contains("not configured"));
     }
 
