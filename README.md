@@ -114,6 +114,7 @@ opaque agent run -- codex
 6. Review the audit log:
    ```bash
    opaque audit tail --limit 10
+   opaque audit tail --query github --limit 10
    ```
 
 Full CLI docs: `docs/getting-started.md`

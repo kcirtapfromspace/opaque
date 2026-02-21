@@ -540,7 +540,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
                 }
             })),
             allowed_target_keys: vec!["vault".into(), "item".into()],
-            secret_ref_param_keys: vec!["vault".into(), "item".into(), "field".into()],
+            secret_ref_param_keys: vec!["onepassword:{vault}/{item}/{field}".into()],
         })
         .expect("failed to register onepassword.read_field");
 

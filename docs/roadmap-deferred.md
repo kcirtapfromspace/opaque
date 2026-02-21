@@ -18,9 +18,9 @@ Do not start a phase until the prior phase is shipped, tested with real users, a
 | **Bitwarden Secrets Manager** | `bitwarden:` ref scheme, browsing operations, service account auth | **Shipped** — see `docs/bitwarden.md` | Medium |
 | **GitLab CI variable sync** | `gitlab.set_ci_variable` operation | Deferred — same pattern as GitHub, blocked on proving architecture with multiple providers first. | Medium |
 | **GitHub Codespaces secrets (shipped)** | `github.set_codespaces_secret` operation (user + repo scope) | **Shipped** in v1. | Small |
-| **1Password provider connector (hardening)** | Fetch secrets from 1Password vaults via Connect API or service accounts | Core plumbing exists, needs hardening: correct safety classification (`REVEAL` vs `SAFE`), strict output sanitization, and policy binding so plaintext secrets cannot reach agent-visible channels. | Medium |
+| **1Password provider connector (hardening)** | Fetch secrets from 1Password vaults via Connect API or service accounts | **Shipped** — `onepassword.read_field` is `REVEAL`, agent-visible channels remain blocked, and canonical secret ref derivation is enforced server-side for policy binding. | Medium |
 | **HashiCorp Vault provider connector** | Fetch secrets from Vault KV, dynamic secrets (DB, AWS) | Deferred — Vault adds lease management complexity. | Large |
-| **SQLite FTS5 audit search** | Full-text search over sanitized audit event text | Deferred — `opaque audit tail` with grep is sufficient for now. | Small |
+| **SQLite FTS5 audit search** | Full-text search over sanitized audit event text | **Shipped** — local SQLite FTS5 index with `opaque audit tail --query`. | Small |
 
 ---
 

@@ -47,14 +47,59 @@ use uuid::Uuid;
 /// client sends empty or incorrect `secret_ref_names` to sidestep
 /// `[rules.secret_names]` constraints.
 ///
-/// For each key in `param_keys`, if the params contain a string value at
-/// that key, it is included in the returned set. Non-string or missing
-/// keys are silently skipped (the params schema validation has already
-/// run by this point).
+/// For each entry in `param_keys`:
+/// - direct key mode: `"value_ref"` extracts params[`value_ref`]
+/// - template mode: `"onepassword:{vault}/{item}/{field}"` renders from params
+///
+/// Non-string, empty, or missing values are skipped (params schema validation
+/// has already run by this point).
+fn render_secret_ref_template(
+    template: &str,
+    params: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    let mut out = String::new();
+    let mut idx = 0usize;
+
+    while idx < template.len() {
+        if template.as_bytes()[idx] == b'{' {
+            let close = template[idx + 1..].find('}')?;
+            let end = idx + 1 + close;
+            let key = &template[idx + 1..end];
+            if key.is_empty() {
+                return None;
+            }
+            let value = params.get(key)?.as_str()?;
+            if value.is_empty() {
+                return None;
+            }
+            out.push_str(value);
+            idx = end + 1;
+        } else {
+            let next = template[idx..]
+                .find('{')
+                .map(|off| idx + off)
+                .unwrap_or(template.len());
+            out.push_str(&template[idx..next]);
+            idx = next;
+        }
+    }
+
+    Some(out)
+}
+
 fn derive_secret_ref_names(param_keys: &[String], params: &serde_json::Value) -> Vec<String> {
     let mut refs = Vec::new();
     if let serde_json::Value::Object(map) = params {
         for key in param_keys {
+            if key.contains('{') {
+                if let Some(rendered) = render_secret_ref_template(key, map)
+                    && !rendered.is_empty()
+                {
+                    refs.push(rendered);
+                }
+                continue;
+            }
+
             if let Some(serde_json::Value::String(val)) = map.get(key.as_str())
                 && !val.is_empty()
             {
@@ -3245,6 +3290,29 @@ mod tests {
     fn derive_secret_ref_names_empty_keys() {
         let keys: Vec<String> = vec![];
         let params = serde_json::json!({"value_ref": "env:TOKEN"});
+        let result = super::derive_secret_ref_names(&keys, &params);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn derive_secret_ref_names_supports_templates() {
+        let keys = vec!["onepassword:{vault}/{item}/{field}".into()];
+        let params = serde_json::json!({
+            "vault": "Personal",
+            "item": "GitHub Token",
+            "field": "password"
+        });
+        let result = super::derive_secret_ref_names(&keys, &params);
+        assert_eq!(result, vec!["onepassword:Personal/GitHub Token/password"]);
+    }
+
+    #[test]
+    fn derive_secret_ref_names_template_skips_when_placeholder_missing() {
+        let keys = vec!["onepassword:{vault}/{item}/{field}".into()];
+        let params = serde_json::json!({
+            "vault": "Personal",
+            "item": "GitHub Token"
+        });
         let result = super::derive_secret_ref_names(&keys, &params);
         assert!(result.is_empty());
     }
