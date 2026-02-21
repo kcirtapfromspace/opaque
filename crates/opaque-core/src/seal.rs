@@ -109,7 +109,9 @@ pub fn verify_seal(config_bytes: &[u8], seal_file: &Path) -> Result<SealStatus, 
     if seal_file.exists() {
         let expected = std::fs::read_to_string(seal_file)
             .map(|s| s.trim().to_string())
-            .map_err(|e| SealError::IoError(format!("failed to read {}: {e}", seal_file.display())))?;
+            .map_err(|e| {
+                SealError::IoError(format!("failed to read {}: {e}", seal_file.display()))
+            })?;
 
         return if expected == actual {
             Ok(SealStatus::Verified)
@@ -128,8 +130,9 @@ pub fn remove_seal(seal_file: &Path) -> Result<(), SealError> {
 
     // Remove file if it exists.
     if seal_file.exists() {
-        std::fs::remove_file(seal_file)
-            .map_err(|e| SealError::IoError(format!("failed to remove {}: {e}", seal_file.display())))?;
+        std::fs::remove_file(seal_file).map_err(|e| {
+            SealError::IoError(format!("failed to remove {}: {e}", seal_file.display()))
+        })?;
     }
 
     Ok(())
@@ -146,8 +149,12 @@ fn write_seal_file(seal: &str, path: &Path) -> Result<(), SealError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o400))
-            .map_err(|e| SealError::IoError(format!("failed to set permissions on {}: {e}", path.display())))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o400)).map_err(|e| {
+            SealError::IoError(format!(
+                "failed to set permissions on {}: {e}",
+                path.display()
+            ))
+        })?;
     }
 
     Ok(())
@@ -166,9 +173,12 @@ fn keychain_write(seal: &str) -> Result<(), SealError> {
         let output = std::process::Command::new("security")
             .args([
                 "add-generic-password",
-                "-s", KEYCHAIN_SERVICE,
-                "-a", KEYCHAIN_ACCOUNT,
-                "-w", seal,
+                "-s",
+                KEYCHAIN_SERVICE,
+                "-a",
+                KEYCHAIN_ACCOUNT,
+                "-w",
+                seal,
                 "-U",
             ])
             .env_clear()
@@ -191,9 +201,12 @@ fn keychain_write(seal: &str) -> Result<(), SealError> {
         let output = std::process::Command::new("secret-tool")
             .args([
                 "store",
-                "--label", "Opaque Config Seal",
-                "service", KEYCHAIN_SERVICE,
-                "account", KEYCHAIN_ACCOUNT,
+                "--label",
+                "Opaque Config Seal",
+                "service",
+                KEYCHAIN_SERVICE,
+                "account",
+                KEYCHAIN_ACCOUNT,
             ])
             .env_clear()
             .env("PATH", "/usr/bin:/usr/local/bin:/bin")
@@ -234,8 +247,10 @@ fn keychain_read() -> Result<Option<String>, SealError> {
         let output = std::process::Command::new("security")
             .args([
                 "find-generic-password",
-                "-s", KEYCHAIN_SERVICE,
-                "-a", KEYCHAIN_ACCOUNT,
+                "-s",
+                KEYCHAIN_SERVICE,
+                "-a",
+                KEYCHAIN_ACCOUNT,
                 "-w",
             ])
             .env_clear()
@@ -260,8 +275,10 @@ fn keychain_read() -> Result<Option<String>, SealError> {
         let output = std::process::Command::new("secret-tool")
             .args([
                 "lookup",
-                "service", KEYCHAIN_SERVICE,
-                "account", KEYCHAIN_ACCOUNT,
+                "service",
+                KEYCHAIN_SERVICE,
+                "account",
+                KEYCHAIN_ACCOUNT,
             ])
             .env_clear()
             .env("PATH", "/usr/bin:/usr/local/bin:/bin")
@@ -295,8 +312,10 @@ fn keychain_delete() -> Result<(), SealError> {
         let output = std::process::Command::new("security")
             .args([
                 "delete-generic-password",
-                "-s", KEYCHAIN_SERVICE,
-                "-a", KEYCHAIN_ACCOUNT,
+                "-s",
+                KEYCHAIN_SERVICE,
+                "-a",
+                KEYCHAIN_ACCOUNT,
             ])
             .env_clear()
             .env("PATH", "/usr/bin")
@@ -315,8 +334,10 @@ fn keychain_delete() -> Result<(), SealError> {
         let output = std::process::Command::new("secret-tool")
             .args([
                 "clear",
-                "service", KEYCHAIN_SERVICE,
-                "account", KEYCHAIN_ACCOUNT,
+                "service",
+                KEYCHAIN_SERVICE,
+                "account",
+                KEYCHAIN_ACCOUNT,
             ])
             .env_clear()
             .env("PATH", "/usr/bin:/usr/local/bin:/bin")

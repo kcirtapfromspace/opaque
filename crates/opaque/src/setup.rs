@@ -321,7 +321,9 @@ mod tests {
 
         let config = generate_config(&answers);
         // Should parse without errors.
-        let parsed: toml_edit::DocumentMut = config.parse().expect("generated config should be valid TOML");
+        let parsed: toml_edit::DocumentMut = config
+            .parse()
+            .expect("generated config should be valid TOML");
         assert!(!parsed.is_empty());
     }
 

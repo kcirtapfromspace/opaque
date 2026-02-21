@@ -23,7 +23,9 @@ pub trait SecretResolver: Send + Sync {
 /// Errors from secret resolution.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ResolveError {
-    #[error("unknown ref scheme in '{0}' (expected env:, keychain:, profile:, onepassword:, or bitwarden:)")]
+    #[error(
+        "unknown ref scheme in '{0}' (expected env:, keychain:, profile:, onepassword:, or bitwarden:)"
+    )]
     UnknownScheme(String),
 
     #[error("environment variable '{0}' not found")]

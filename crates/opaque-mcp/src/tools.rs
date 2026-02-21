@@ -96,7 +96,12 @@ pub fn safe_tools() -> Vec<ToolDef> {
                 let mut params = args.clone();
                 // Daemon distinguishes codespaces_user vs codespaces_repo by
                 // whether a `repo` field is present.
-                if args.get("repo").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+                if args
+                    .get("repo")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .is_empty()
+                {
                     params["scope"] = json!("codespaces_user");
                 } else {
                     params["scope"] = json!("codespaces_repo");
@@ -265,9 +270,7 @@ pub fn safe_tools() -> Vec<ToolDef> {
                 "properties": {}
             }),
 
-            build_params: |_args| {
-                json!({"action": "list_vaults"})
-            },
+            build_params: |_args| json!({"action": "list_vaults"}),
         },
         ToolDef {
             name: "opaque_onepassword_list_items",
@@ -298,9 +301,7 @@ pub fn safe_tools() -> Vec<ToolDef> {
                 "properties": {}
             }),
 
-            build_params: |_args| {
-                json!({"action": "list_projects"})
-            },
+            build_params: |_args| json!({"action": "list_projects"}),
         },
         ToolDef {
             name: "opaque_bitwarden_list_secrets",
@@ -344,9 +345,11 @@ pub fn tool_to_daemon_method(tool_name: &str) -> Option<&'static str> {
         ("opaque_bitwarden_list_projects", "bitwarden"),
         ("opaque_bitwarden_list_secrets", "bitwarden"),
     ];
-    MAPPING.iter().find(|(k, _)| *k == tool_name).map(|(_, v)| *v)
+    MAPPING
+        .iter()
+        .find(|(k, _)| *k == tool_name)
+        .map(|(_, v)| *v)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -368,10 +371,26 @@ mod tests {
             );
 
             // Tool names must never reference Reveal or SensitiveOutput operations.
-            assert!(!tool.name.contains("read_field"), "Reveal tool leaked: {}", tool.name);
-            assert!(!tool.name.contains("read_secret"), "Reveal tool leaked: {}", tool.name);
-            assert!(!tool.name.contains("sandbox"), "SensitiveOutput tool leaked: {}", tool.name);
-            assert!(!tool.name.contains("noop"), "test tool leaked: {}", tool.name);
+            assert!(
+                !tool.name.contains("read_field"),
+                "Reveal tool leaked: {}",
+                tool.name
+            );
+            assert!(
+                !tool.name.contains("read_secret"),
+                "Reveal tool leaked: {}",
+                tool.name
+            );
+            assert!(
+                !tool.name.contains("sandbox"),
+                "SensitiveOutput tool leaked: {}",
+                tool.name
+            );
+            assert!(
+                !tool.name.contains("noop"),
+                "test tool leaked: {}",
+                tool.name
+            );
         }
     }
 
@@ -411,7 +430,11 @@ mod tests {
         for tool in &tools {
             let args = serde_json::json!({"test_key": "test_value"});
             let params = (tool.build_params)(&args);
-            assert!(params.is_object(), "build_params for {} didn't return an object", tool.name);
+            assert!(
+                params.is_object(),
+                "build_params for {} didn't return an object",
+                tool.name
+            );
         }
     }
 
@@ -419,8 +442,16 @@ mod tests {
     fn no_reveal_tools_in_safe_list() {
         let tools = safe_tools();
         for tool in &tools {
-            assert!(!tool.name.contains("read_field"), "Reveal tool leaked: {}", tool.name);
-            assert!(!tool.name.contains("read_secret"), "Reveal tool leaked: {}", tool.name);
+            assert!(
+                !tool.name.contains("read_field"),
+                "Reveal tool leaked: {}",
+                tool.name
+            );
+            assert!(
+                !tool.name.contains("read_secret"),
+                "Reveal tool leaked: {}",
+                tool.name
+            );
         }
     }
 
@@ -428,14 +459,21 @@ mod tests {
     fn no_sensitive_output_tools_in_safe_list() {
         let tools = safe_tools();
         for tool in &tools {
-            assert!(!tool.name.contains("sandbox"), "SensitiveOutput tool leaked: {}", tool.name);
+            assert!(
+                !tool.name.contains("sandbox"),
+                "SensitiveOutput tool leaked: {}",
+                tool.name
+            );
         }
     }
 
     #[test]
     fn github_set_tools_include_scope() {
         let tools = safe_tools();
-        let set_tools: Vec<_> = tools.iter().filter(|t| t.name.starts_with("opaque_github_set_")).collect();
+        let set_tools: Vec<_> = tools
+            .iter()
+            .filter(|t| t.name.starts_with("opaque_github_set_"))
+            .collect();
         assert!(!set_tools.is_empty());
         for tool in set_tools {
             let args = serde_json::json!({"repo": "org/repo", "secret_name": "S", "value_ref": "keychain:x"});

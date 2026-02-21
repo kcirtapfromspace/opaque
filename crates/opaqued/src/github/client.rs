@@ -766,10 +766,7 @@ mod tests {
     #[test]
     fn scope_org_actions_list_path() {
         let scope = SecretScope::OrgActions { org: "myorg" };
-        assert_eq!(
-            scope.list_secrets_path(),
-            "/orgs/myorg/actions/secrets"
-        );
+        assert_eq!(scope.list_secrets_path(), "/orgs/myorg/actions/secrets");
     }
 
     // -----------------------------------------------------------------------

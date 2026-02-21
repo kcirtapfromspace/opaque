@@ -269,9 +269,7 @@ pub fn query_status() -> ServiceStatus {
     let mut pid = None;
 
     if installed
-        && let Ok(output) = Command::new("launchctl")
-            .args(["list", LABEL])
-            .output()
+        && let Ok(output) = Command::new("launchctl").args(["list", LABEL]).output()
         && output.status.success()
     {
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -355,10 +353,7 @@ fn service_file_path() -> PathBuf {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
             PathBuf::from(home).join(".config")
         });
-    config_dir
-        .join("systemd")
-        .join("user")
-        .join(UNIT_NAME)
+    config_dir.join("systemd").join("user").join(UNIT_NAME)
 }
 
 #[cfg(target_os = "linux")]
@@ -465,7 +460,12 @@ pub fn query_status() -> ServiceStatus {
 
     if installed {
         if let Ok(output) = Command::new("systemctl")
-            .args(["--user", "show", UNIT_NAME, "--property=ActiveState,MainPID"])
+            .args([
+                "--user",
+                "show",
+                UNIT_NAME,
+                "--property=ActiveState,MainPID",
+            ])
             .output()
         {
             if output.status.success() {
@@ -579,9 +579,7 @@ fn find_opaqued() -> Result<PathBuf, String> {
     }
 
     // Fall back to PATH lookup.
-    if let Ok(output) = Command::new("which")
-        .arg("opaqued")
-        .output()
+    if let Ok(output) = Command::new("which").arg("opaqued").output()
         && output.status.success()
     {
         let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
