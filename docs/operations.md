@@ -16,7 +16,7 @@ For MCP-aware tools (Claude Code), `opaque-mcp` provides a stdio-based MCP serve
 | `SENSITIVE_OUTPUT` | Output may contain credential-like data | Denied for agents unless explicitly allowlisted in policy |
 | `REVEAL` | Returns plaintext secrets | Never (hard-blocked in v1) |
 
-## Implemented Operations (v1)
+## Implemented Operations
 
 ### `test.noop` (`SAFE`)
 
@@ -150,6 +150,38 @@ Notes:
 
 - Never return the secret value or its ciphertext.
 
+### `gitlab.set_ci_variable` (`SAFE`)
+
+Sets a GitLab CI/CD variable for a project.
+
+Inputs:
+
+- `project`: project path or ID (ex: `group/project`)
+- `key`: variable key (ex: `DATABASE_URL`)
+- `value_ref`: secret reference (ex: `keychain:opaque/db-url`)
+- optional: `gitlab_token_ref`: GitLab token ref (default: `keychain:opaque/gitlab-pat`)
+- optional: `environment_scope`
+- optional: `protected`: boolean
+- optional: `masked`: boolean
+- optional: `raw`: boolean
+- optional: `variable_type`: `"env_var" | "file"` (default: `"env_var"`)
+
+Result:
+
+- `status`: `created` | `updated`
+- `project`
+- `key`
+- optional: `environment_scope`
+- optional: `protected`
+- optional: `masked`
+- optional: `raw`
+- optional: `variable_type`
+
+Notes:
+
+- Never returns variable values.
+- Supports GitLab self-managed or alternate API hosts via `OPAQUE_GITLAB_API_URL`.
+
 ### `onepassword.list_vaults` (`SAFE`)
 
 Lists accessible 1Password vaults (names + descriptions only).
@@ -252,7 +284,6 @@ Notes:
 
 These are design placeholders and should not be treated as supported operations in v1:
 
-- `gitlab.set_ci_variable`
 - `k8s.set_secret`
 - `k8s.apply_manifest`
 - `aws.call`

@@ -16,7 +16,7 @@ Do not start a phase until the prior phase is shipped, tested with real users, a
 |---------|-------------|--------|--------|
 | **MCP server** | Expose Opaque operations as MCP tools for Claude Code | **Shipped** — see `docs/mcp-integration.md` | Large |
 | **Bitwarden Secrets Manager** | `bitwarden:` ref scheme, browsing operations, service account auth | **Shipped** — see `docs/bitwarden.md` | Medium |
-| **GitLab CI variable sync** | `gitlab.set_ci_variable` operation | Deferred — same pattern as GitHub, blocked on proving architecture with multiple providers first. | Medium |
+| **GitLab CI variable sync** | `gitlab.set_ci_variable` operation | **Shipped** — daemon/CLI/MCP wiring with write-only provider flow and policy-bound secret refs. | Medium |
 | **GitHub Codespaces secrets (shipped)** | `github.set_codespaces_secret` operation (user + repo scope) | **Shipped** in v1. | Small |
 | **1Password provider connector (hardening)** | Fetch secrets from 1Password vaults via Connect API or service accounts | **Shipped** — `onepassword.read_field` is `REVEAL`, agent-visible channels remain blocked, and canonical secret ref derivation is enforced server-side for policy binding. | Medium |
 | **HashiCorp Vault provider connector** | Fetch secrets from Vault KV, dynamic secrets (DB, AWS) | Deferred — Vault adds lease management complexity. | Large |

@@ -30,6 +30,7 @@ mod approval;
 mod bitwarden;
 mod enclave;
 mod github;
+mod gitlab;
 mod onepassword;
 mod sandbox;
 pub mod secret;
@@ -512,6 +513,33 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
 
     registry
         .register(OperationDef {
+            name: "gitlab.set_ci_variable".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Set a GitLab CI/CD variable for a project".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["project", "key", "value_ref"],
+                "properties": {
+                    "project": {"type": "string"},
+                    "key": {"type": "string"},
+                    "value_ref": {"type": "string"},
+                    "gitlab_token_ref": {"type": "string"},
+                    "environment_scope": {"type": "string"},
+                    "protected": {"type": "boolean"},
+                    "masked": {"type": "boolean"},
+                    "raw": {"type": "boolean"},
+                    "variable_type": {"type": "string", "enum": ["env_var", "file"]}
+                }
+            })),
+            allowed_target_keys: vec!["project".into(), "key".into()],
+            secret_ref_param_keys: vec!["value_ref".into(), "gitlab_token_ref".into()],
+        })
+        .expect("failed to register gitlab.set_ci_variable");
+
+    registry
+        .register(OperationDef {
             name: "onepassword.list_vaults".into(),
             safety: OperationSafety::Safe,
             default_approval: ApprovalRequirement::FirstUse,
@@ -633,6 +661,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
     let github_org_handler = github::GitHubHandler::new(audit.clone());
     let github_list_handler = github::GitHubHandler::new(audit.clone());
     let github_delete_handler = github::GitHubHandler::new(audit.clone());
+    let gitlab_handler = gitlab::GitLabHandler::new(audit.clone());
 
     // 1Password handler: prefer Connect Server URL, fall back to `op` CLI.
     let onepassword_connect_url =
@@ -657,7 +686,8 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         )
         .handler("github.set_org_secret", Box::new(github_org_handler))
         .handler("github.list_secrets", Box::new(github_list_handler))
-        .handler("github.delete_secret", Box::new(github_delete_handler));
+        .handler("github.delete_secret", Box::new(github_delete_handler))
+        .handler("gitlab.set_ci_variable", Box::new(gitlab_handler));
 
     if !onepassword_connect_url.is_empty() {
         // Connect Server backend (self-hosted REST API).
@@ -2036,6 +2066,143 @@ async fn handle_request(
                 operation: operation.into(),
                 target,
                 secret_ref_names: secret_refs,
+                created_at: SystemTime::now(),
+                expires_at: None,
+                params: op_params,
+                workspace: None,
+            };
+
+            state
+                .enclave
+                .execute(op_req)
+                .await
+                .into_proto_response(req.id)
+        }
+        "gitlab" => {
+            // Convenience wrapper for gitlab.set_ci_variable.
+            let action = req
+                .params
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("set_ci_variable")
+                .to_owned();
+
+            if action != "set_ci_variable" {
+                return Response::err(
+                    Some(req.id),
+                    "bad_request",
+                    format!("unknown action '{action}' (expected: set_ci_variable)"),
+                );
+            }
+
+            let project = req
+                .params
+                .get("project")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            if project.is_empty() {
+                return Response::err(Some(req.id), "bad_request", "missing 'project' field");
+            }
+
+            let key = req
+                .params
+                .get("key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            if key.is_empty() {
+                return Response::err(Some(req.id), "bad_request", "missing 'key' field");
+            }
+            if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                return Response::err(
+                    Some(req.id),
+                    "bad_request",
+                    "key must be alphanumeric (with underscores)",
+                );
+            }
+
+            let value_ref = req
+                .params
+                .get("value_ref")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            if value_ref.is_empty() {
+                return Response::err(Some(req.id), "bad_request", "missing 'value_ref' field");
+            }
+            if !opaque_core::profile::ALLOWED_REF_SCHEMES
+                .iter()
+                .any(|s| value_ref.starts_with(s))
+            {
+                return Response::err(
+                    Some(req.id),
+                    "bad_request",
+                    format!(
+                        "value_ref must start with a known scheme ({:?})",
+                        opaque_core::profile::ALLOWED_REF_SCHEMES
+                    ),
+                );
+            }
+
+            let mut refs_to_validate = vec![value_ref.clone()];
+            if let Some(tok) = req.params.get("gitlab_token_ref").and_then(|v| v.as_str()) {
+                refs_to_validate.push(tok.to_owned());
+            }
+            if let Err(e) = InputValidator::validate_secret_ref_names(&refs_to_validate) {
+                return Response::err(
+                    Some(req.id),
+                    "bad_request",
+                    format!("invalid secret ref: {e}"),
+                );
+            }
+
+            let target = HashMap::from([
+                ("project".into(), project.clone()),
+                ("key".into(), key.clone()),
+            ]);
+            let target = match InputValidator::validate_target(&target) {
+                Ok(t) => t,
+                Err(e) => {
+                    return Response::err(
+                        Some(req.id),
+                        "bad_request",
+                        format!("invalid target: {e}"),
+                    );
+                }
+            };
+
+            let mut op_params = serde_json::json!({
+                "project": project,
+                "key": key,
+                "value_ref": value_ref,
+            });
+            if let Some(tok) = req.params.get("gitlab_token_ref").and_then(|v| v.as_str()) {
+                op_params["gitlab_token_ref"] = serde_json::Value::String(tok.to_owned());
+            }
+            if let Some(scope) = req.params.get("environment_scope").and_then(|v| v.as_str()) {
+                op_params["environment_scope"] = serde_json::Value::String(scope.to_owned());
+            }
+            if req.params.get("protected").is_some() {
+                op_params["protected"] = req.params["protected"].clone();
+            }
+            if req.params.get("masked").is_some() {
+                op_params["masked"] = req.params["masked"].clone();
+            }
+            if req.params.get("raw").is_some() {
+                op_params["raw"] = req.params["raw"].clone();
+            }
+            if let Some(variable_type) = req.params.get("variable_type").and_then(|v| v.as_str()) {
+                op_params["variable_type"] = serde_json::Value::String(variable_type.to_owned());
+            }
+
+            let op_req = OperationRequest {
+                request_id: Uuid::new_v4(),
+                client_identity: identity.clone(),
+                client_type,
+                operation: "gitlab.set_ci_variable".into(),
+                target,
+                secret_ref_names: vec![],
                 created_at: SystemTime::now(),
                 expires_at: None,
                 params: op_params,

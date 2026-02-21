@@ -123,6 +123,11 @@ enum Cmd {
         #[command(subcommand)]
         action: GithubAction,
     },
+    /// Manage GitLab CI/CD variables.
+    Gitlab {
+        #[command(subcommand)]
+        action: GitlabAction,
+    },
     /// Browse 1Password vaults and items.
     #[command(name = "onepassword", alias = "1p")]
     OnePassword {
@@ -499,6 +504,48 @@ enum GithubAction {
         /// Continue publishing after individual secret failures.
         #[arg(long, default_value_t = false)]
         continue_on_error: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum GitlabAction {
+    /// Set a GitLab CI/CD variable for a project.
+    SetCiVariable {
+        /// Project path or ID (e.g. "group/project").
+        #[arg(long)]
+        project: String,
+
+        /// Variable key (e.g. "DATABASE_URL").
+        #[arg(long)]
+        key: String,
+
+        /// Secret ref (e.g. "keychain:opaque/db-url" or "bitwarden:prod/DATABASE_URL").
+        #[arg(long)]
+        value_ref: String,
+
+        /// GitLab token ref (default: "keychain:opaque/gitlab-pat").
+        #[arg(long)]
+        gitlab_token_ref: Option<String>,
+
+        /// Variable environment scope (default is provider-side default, usually "*").
+        #[arg(long)]
+        environment_scope: Option<String>,
+
+        /// Mark variable as protected.
+        #[arg(long, default_value_t = false)]
+        protected: bool,
+
+        /// Mark variable as masked.
+        #[arg(long, default_value_t = false)]
+        masked: bool,
+
+        /// Keep variable raw (no expansion).
+        #[arg(long, default_value_t = false)]
+        raw: bool,
+
+        /// Variable type: "env_var" or "file".
+        #[arg(long, default_value = "env_var")]
+        variable_type: String,
     },
 }
 
@@ -1804,6 +1851,37 @@ async fn main() {
             | GithubAction::BuildManifest { .. }
             | GithubAction::PublishManifest { .. } => unreachable!(),
         },
+        Cmd::Gitlab { action } => match action {
+            GitlabAction::SetCiVariable {
+                project,
+                key,
+                value_ref,
+                gitlab_token_ref,
+                environment_scope,
+                protected,
+                masked,
+                raw,
+                variable_type,
+            } => {
+                let mut params = serde_json::json!({
+                    "action": "set_ci_variable",
+                    "project": project,
+                    "key": key,
+                    "value_ref": value_ref,
+                    "protected": protected,
+                    "masked": masked,
+                    "raw": raw,
+                    "variable_type": variable_type,
+                });
+                if let Some(ref tok) = gitlab_token_ref {
+                    params["gitlab_token_ref"] = serde_json::Value::String(tok.clone());
+                }
+                if let Some(ref scope) = environment_scope {
+                    params["environment_scope"] = serde_json::Value::String(scope.clone());
+                }
+                ("gitlab", params)
+            }
+        },
         Cmd::OnePassword { action } => match action {
             OnePasswordAction::ListVaults => {
                 let params = serde_json::json!({ "action": "list_vaults" });
@@ -2587,6 +2665,7 @@ fn dirs_or_home() -> PathBuf {
 /// Embedded policy preset files.
 const PRESET_SAFE_DEMO: &str = include_str!("presets/safe-demo.toml");
 const PRESET_GITHUB_SECRETS: &str = include_str!("presets/github-secrets.toml");
+const PRESET_GITLAB_VARIABLES: &str = include_str!("presets/gitlab-variables.toml");
 const PRESET_SANDBOX_HUMAN: &str = include_str!("presets/sandbox-human.toml");
 const PRESET_AGENT_WRAPPER_GITHUB: &str = include_str!("presets/agent-wrapper-github.toml");
 
@@ -2602,6 +2681,11 @@ fn available_presets() -> Vec<(&'static str, &'static str, &'static str)> {
             "github-secrets",
             "Allow agents to sync GitHub secrets (Actions, Codespaces, Dependabot, org)",
             PRESET_GITHUB_SECRETS,
+        ),
+        (
+            "gitlab-variables",
+            "Allow agents to set GitLab CI/CD variables",
+            PRESET_GITLAB_VARIABLES,
         ),
         (
             "sandbox-human",
@@ -3834,6 +3918,7 @@ lease_ttl = 0
     fn preset_lookup() {
         assert!(get_preset("safe-demo").is_some());
         assert!(get_preset("github-secrets").is_some());
+        assert!(get_preset("gitlab-variables").is_some());
         assert!(get_preset("sandbox-human").is_some());
         assert!(get_preset("agent-wrapper-github").is_some());
         assert!(get_preset("nonexistent").is_none());

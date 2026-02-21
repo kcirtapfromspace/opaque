@@ -96,6 +96,14 @@ opaque agent run -- codex
      --value-ref keychain:opaque/api-key
    ```
 
+   Sync a GitLab CI variable:
+   ```bash
+   opaque gitlab set-ci-variable \
+     --project mygroup/myproject \
+     --key API_KEY \
+     --value-ref keychain:opaque/api-key
+   ```
+
 5. Build a refs-only manifest from `.env.example` and publish through Opaque:
    ```bash
    opaque github build-manifest \
@@ -127,6 +135,7 @@ Get started quickly with built-in presets:
 opaque policy presets                        # list available presets
 opaque init --preset safe-demo               # test.noop only (safe to experiment)
 opaque init --preset github-secrets          # GitHub secret sync for agents
+opaque init --preset gitlab-variables        # GitLab CI variable sync for agents
 opaque init --preset sandbox-human           # sandbox exec for humans only
 opaque init --preset agent-wrapper-github    # wrapped-agent GitHub sync with session enforcement
 ```

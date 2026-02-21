@@ -261,6 +261,61 @@ pub fn safe_tools() -> Vec<ToolDef> {
                 params
             },
         },
+        // --- GitLab operations ---
+        ToolDef {
+            name: "opaque_gitlab_set_ci_variable",
+            description: "Set a GitLab CI/CD project variable via Opaque's approval-gated enclave. \
+                           The value is resolved from a secure ref and never returned to the caller.",
+            input_schema: json!({
+                "type": "object",
+                "required": ["project", "key", "value_ref"],
+                "properties": {
+                    "project": {
+                        "type": "string",
+                        "description": "Project path or ID (e.g. group/project)"
+                    },
+                    "key": {
+                        "type": "string",
+                        "description": "Variable key"
+                    },
+                    "value_ref": {
+                        "type": "string",
+                        "description": "Secret ref (e.g. keychain:opaque/db-url)"
+                    },
+                    "gitlab_token_ref": {
+                        "type": "string",
+                        "description": "GitLab token ref (default: keychain:opaque/gitlab-pat)"
+                    },
+                    "environment_scope": {
+                        "type": "string",
+                        "description": "Environment scope (default: *)"
+                    },
+                    "protected": {
+                        "type": "boolean",
+                        "description": "Mark variable as protected"
+                    },
+                    "masked": {
+                        "type": "boolean",
+                        "description": "Mark variable as masked"
+                    },
+                    "raw": {
+                        "type": "boolean",
+                        "description": "Keep variable raw (no expansion)"
+                    },
+                    "variable_type": {
+                        "type": "string",
+                        "enum": ["env_var", "file"],
+                        "description": "Variable type (default: env_var)"
+                    }
+                }
+            }),
+
+            build_params: |args| {
+                let mut params = args.clone();
+                params["action"] = json!("set_ci_variable");
+                params
+            },
+        },
         // --- 1Password operations (Safe only — read_field is Reveal, excluded) ---
         ToolDef {
             name: "opaque_onepassword_list_vaults",
@@ -340,6 +395,7 @@ pub fn tool_to_daemon_method(tool_name: &str) -> Option<&'static str> {
         ("opaque_github_set_org_secret", "github"),
         ("opaque_github_list_secrets", "github"),
         ("opaque_github_delete_secret", "github"),
+        ("opaque_gitlab_set_ci_variable", "gitlab"),
         ("opaque_onepassword_list_vaults", "onepassword"),
         ("opaque_onepassword_list_items", "onepassword"),
         ("opaque_bitwarden_list_projects", "bitwarden"),
@@ -359,7 +415,7 @@ mod tests {
     fn all_tools_are_safe() {
         // Verify no Reveal or SensitiveOutput tool names leak into the tool list.
         let tools = safe_tools();
-        let allowed_methods = ["github", "onepassword", "bitwarden"];
+        let allowed_methods = ["github", "gitlab", "onepassword", "bitwarden"];
         for tool in &tools {
             let method = tool_to_daemon_method(tool.name)
                 .unwrap_or_else(|| panic!("no daemon method mapping for {}", tool.name));
@@ -409,7 +465,7 @@ mod tests {
     #[test]
     fn tool_count() {
         let tools = safe_tools();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 11);
     }
 
     #[test]
