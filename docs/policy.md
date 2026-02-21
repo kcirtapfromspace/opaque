@@ -25,6 +25,8 @@ Top-level fields:
 - `known_human_clients` (optional): list of allowlisted human executables
 - `rules` (optional): policy rules (deny-all when empty)
 - `audit_retention_days` (optional): SQLite retention window (default: 90)
+- `enforce_agent_sessions` (optional): require session token for `agent` clients (default: `false`)
+- `agent_session_ttl_secs` (optional): default agent session TTL in seconds (default: 3600)
 
 ### `known_human_clients`
 
