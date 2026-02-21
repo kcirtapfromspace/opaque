@@ -271,6 +271,13 @@ enum AgentAction {
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
+    /// List active wrapped-agent sessions for this user.
+    List,
+    /// End (revoke) a wrapped-agent session by ID.
+    End {
+        /// Session ID returned by `opaque agent run` or `opaque agent list`.
+        session_id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1904,11 +1911,18 @@ async fn main() {
                 ("onepassword", params)
             }
         },
+        Cmd::Agent { action } => match action {
+            AgentAction::Run { .. } => unreachable!(),
+            AgentAction::List => ("agent_session_list", serde_json::Value::Null),
+            AgentAction::End { session_id } => (
+                "agent_session_end",
+                serde_json::json!({ "session_id": session_id }),
+            ),
+        },
         // Already handled above; unreachable.
         Cmd::Policy { .. }
         | Cmd::Init { .. }
         | Cmd::Audit { .. }
-        | Cmd::Agent { .. }
         | Cmd::Profile { .. }
         | Cmd::Setup { .. }
         | Cmd::Service { .. }

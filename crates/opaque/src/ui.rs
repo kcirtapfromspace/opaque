@@ -146,6 +146,12 @@ pub fn format_response(method: &str, result: &serde_json::Value) {
         "leases" => {
             format_leases_result(result);
         }
+        "agent_session_list" => {
+            format_agent_session_list_result(result);
+        }
+        "agent_session_end" => {
+            format_agent_session_end_result(result);
+        }
         _ => {
             print_json(result);
         }
@@ -454,6 +460,76 @@ fn format_leases_result(result: &serde_json::Value) {
         }
     } else {
         print_json(result);
+    }
+}
+
+/// Format active wrapped-agent sessions response.
+fn format_agent_session_list_result(result: &serde_json::Value) {
+    let count = result.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+    let sessions = result.get("sessions").and_then(|v| v.as_array());
+
+    if count == 0 {
+        info("No active agent sessions");
+        return;
+    }
+
+    header(&format!("{count} active agent session(s)"));
+
+    if let Some(sessions) = sessions {
+        for session in sessions {
+            let session_id = session
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let label = session.get("label").and_then(|v| v.as_str()).unwrap_or("");
+            let ttl = session
+                .get("ttl_remaining_secs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+
+            let ttl_str = if ttl >= 60 {
+                format!("{}m {}s", ttl / 60, ttl % 60)
+            } else {
+                format!("{ttl}s")
+            };
+
+            if label.is_empty() {
+                println!(
+                    "  {} {}  {}",
+                    style(KEY).dim(),
+                    style(session_id).yellow().bold(),
+                    style(format!("({ttl_str} remaining)")).dim()
+                );
+            } else {
+                println!(
+                    "  {} {}  {}  {}",
+                    style(KEY).dim(),
+                    style(session_id).yellow().bold(),
+                    style(format!("({ttl_str} remaining)")).dim(),
+                    style(format!("[{label}]")).dim()
+                );
+            }
+        }
+    } else {
+        print_json(result);
+    }
+}
+
+/// Format agent session end/revoke response.
+fn format_agent_session_end_result(result: &serde_json::Value) {
+    let status = result
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let session_id = result
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+
+    match status {
+        "ended" => success(&format!("Ended agent session {session_id}")),
+        "not_found" => warn(&format!("Agent session not found: {session_id}")),
+        _ => print_json(result),
     }
 }
 

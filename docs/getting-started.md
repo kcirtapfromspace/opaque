@@ -158,6 +158,13 @@ Run an agent with a session-scoped token managed by Opaque:
 ./target/release/opaque agent run -- codex
 ```
 
+Inspect and revoke active wrapper sessions:
+
+```bash
+./target/release/opaque agent list
+./target/release/opaque agent end <session-id>
+```
+
 With stricter daemon enforcement, enable session gating in `~/.opaque/config.toml`:
 
 ```toml

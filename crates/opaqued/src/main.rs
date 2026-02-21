@@ -1673,6 +1673,52 @@ async fn handle_request(
                 }),
             )
         }
+        "agent_session_list" => {
+            if client_type != ClientType::Human {
+                return Response::err(
+                    Some(req.id),
+                    "permission_denied",
+                    "only human clients can list agent sessions",
+                );
+            }
+
+            let now = SystemTime::now();
+            let mut sessions = state.agent_sessions.write().await;
+            // Expire old sessions opportunistically.
+            sessions.retain(|_, s| s.expires_at > now);
+
+            let mut visible_sessions: Vec<serde_json::Value> = sessions
+                .values()
+                .filter(|s| s.created_by_uid == identity.uid)
+                .map(|s| {
+                    let ttl_remaining_secs = s
+                        .expires_at
+                        .duration_since(now)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    serde_json::json!({
+                        "session_id": s.session_id,
+                        "label": s.label,
+                        "expires_at_utc_ms": system_time_to_unix_ms(s.expires_at),
+                        "ttl_remaining_secs": ttl_remaining_secs,
+                    })
+                })
+                .collect();
+
+            visible_sessions.sort_by(|a, b| {
+                let a_id = a.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+                let b_id = b.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+                a_id.cmp(b_id)
+            });
+
+            Response::ok(
+                req.id,
+                serde_json::json!({
+                    "count": visible_sessions.len(),
+                    "sessions": visible_sessions,
+                }),
+            )
+        }
         "leases" => {
             // Only human clients can inspect active leases.
             if client_type != ClientType::Human {
@@ -3287,6 +3333,90 @@ exe_sha256 = "deadbeef"
         let resp = handle_request(&state, req, &test_identity(), ClientType::Agent, None).await;
         let err = resp.error.expect("expected permission denial");
         assert_eq!(err.code, "permission_denied");
+    }
+
+    #[tokio::test]
+    async fn agent_session_list_denied_for_agents() {
+        let state = make_test_state();
+        let req = Request {
+            id: 6,
+            method: "agent_session_list".into(),
+            params: serde_json::Value::Null,
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Agent, None).await;
+        let err = resp.error.expect("expected permission denial");
+        assert_eq!(err.code, "permission_denied");
+    }
+
+    #[tokio::test]
+    async fn agent_session_list_filters_to_calling_uid_and_hides_token() {
+        let state = make_test_state();
+        let now = SystemTime::now();
+
+        state.agent_sessions.write().await.insert(
+            "s-own-active".into(),
+            AgentSession {
+                session_id: "s-own-active".into(),
+                token: "tok-own-active".into(),
+                created_by_uid: 501,
+                expires_at: now + std::time::Duration::from_secs(600),
+                label: Some("own-active".into()),
+            },
+        );
+        state.agent_sessions.write().await.insert(
+            "s-own-expired".into(),
+            AgentSession {
+                session_id: "s-own-expired".into(),
+                token: "tok-own-expired".into(),
+                created_by_uid: 501,
+                expires_at: now - std::time::Duration::from_secs(1),
+                label: Some("own-expired".into()),
+            },
+        );
+        state.agent_sessions.write().await.insert(
+            "s-other-active".into(),
+            AgentSession {
+                session_id: "s-other-active".into(),
+                token: "tok-other-active".into(),
+                created_by_uid: 777,
+                expires_at: now + std::time::Duration::from_secs(600),
+                label: Some("other-active".into()),
+            },
+        );
+
+        let req = Request {
+            id: 7,
+            method: "agent_session_list".into(),
+            params: serde_json::Value::Null,
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+        let result = resp.result.expect("result expected");
+        assert_eq!(result.get("count").and_then(|v| v.as_u64()), Some(1));
+
+        let sessions = result
+            .get("sessions")
+            .and_then(|v| v.as_array())
+            .expect("sessions array expected");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].get("session_id").and_then(|v| v.as_str()),
+            Some("s-own-active")
+        );
+        assert!(
+            sessions[0].get("session_token").is_none(),
+            "session token must never be returned"
+        );
+
+        // Expired entry should be removed during list.
+        assert!(
+            state
+                .agent_sessions
+                .read()
+                .await
+                .get("s-own-expired")
+                .is_none()
+        );
     }
 
     #[tokio::test]
