@@ -178,7 +178,13 @@ pub enum ProfileError {
 /// This is the single canonical list of supported secret ref schemes.
 /// All validation code (profile loader, GitHub handler, daemon method handlers)
 /// must reference this constant instead of defining local copies.
-pub const ALLOWED_REF_SCHEMES: &[&str] = &["env:", "keychain:", "profile:", "onepassword:", "bitwarden:"];
+pub const ALLOWED_REF_SCHEMES: &[&str] = &[
+    "env:",
+    "keychain:",
+    "profile:",
+    "onepassword:",
+    "bitwarden:",
+];
 
 /// Load and validate an `ExecProfile` from a TOML string.
 ///

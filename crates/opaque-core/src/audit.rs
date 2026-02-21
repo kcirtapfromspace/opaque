@@ -829,10 +829,10 @@ impl AuditSink for SqliteAuditSink {
         event.sequence_number = self.next_sequence.fetch_add(1, Ordering::Relaxed);
         // Sanitize the detail field to prevent secret leakage into the audit DB.
         if let Some(ref detail) = event.detail {
-            event.detail = Some(self.sanitizer.redact_audit_text(
-                detail,
-                crate::sanitize::RedactionLevel::Human,
-            ));
+            event.detail = Some(
+                self.sanitizer
+                    .redact_audit_text(detail, crate::sanitize::RedactionLevel::Human),
+            );
         }
         // Non-blocking send. If the channel is full, drop the event.
         let _ = self.sender.try_send(event);
