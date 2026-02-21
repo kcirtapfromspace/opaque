@@ -2208,15 +2208,21 @@ mod tests {
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
 
         // No approval events should be emitted.
-        assert!(audit
-            .events_of_kind(AuditEventKind::ApprovalRequired)
-            .is_empty());
-        assert!(audit
-            .events_of_kind(AuditEventKind::ApprovalPresented)
-            .is_empty());
-        assert!(audit
-            .events_of_kind(AuditEventKind::ApprovalGranted)
-            .is_empty());
+        assert!(
+            audit
+                .events_of_kind(AuditEventKind::ApprovalRequired)
+                .is_empty()
+        );
+        assert!(
+            audit
+                .events_of_kind(AuditEventKind::ApprovalPresented)
+                .is_empty()
+        );
+        assert!(
+            audit
+                .events_of_kind(AuditEventKind::ApprovalGranted)
+                .is_empty()
+        );
     }
 
     // -- Concurrent approval serialization --
@@ -2358,8 +2364,7 @@ mod tests {
         // Request with unexpected key → rejected.
         let mut req = test_request("restricted.op", ClientType::Human);
         req.target.clear();
-        req.target
-            .insert("repo".into(), "org/repo".into());
+        req.target.insert("repo".into(), "org/repo".into());
         req.target
             .insert("injected_field".into(), "malicious".into());
         let resp = enclave.execute(req).await;
@@ -3073,7 +3078,12 @@ mod tests {
 
         // Now should have one active lease.
         let leases = enclave.active_leases();
-        assert_eq!(leases.len(), 1, "expected 1 active lease, got {}", leases.len());
+        assert_eq!(
+            leases.len(),
+            1,
+            "expected 1 active lease, got {}",
+            leases.len()
+        );
         assert_eq!(leases[0].operation, "github.set_actions_secret");
         assert!(leases[0].ttl_remaining_secs > 0);
         assert!(!leases[0].one_time);
@@ -3129,7 +3139,9 @@ mod tests {
                 },
             },
             workspace: WorkspaceMatch::default(),
-            secret_names: SecretNameMatch { patterns: vec!["env:MY_TOKEN".into()] },
+            secret_names: SecretNameMatch {
+                patterns: vec!["env:MY_TOKEN".into()],
+            },
             allow: true,
             client_types: vec![ClientType::Agent, ClientType::Human],
             approval: ApprovalConfig {
@@ -3170,7 +3182,11 @@ mod tests {
         let resp = enclave.execute(req).await;
         // Should succeed because server-side derivation extracts "env:MY_TOKEN"
         // which IS allowed by the policy.
-        assert!(resp.error_code().is_none(), "expected success, got: {:?}", resp.error_code());
+        assert!(
+            resp.error_code().is_none(),
+            "expected success, got: {:?}",
+            resp.error_code()
+        );
 
         // Now test the DENY case: params reference a secret NOT in the policy.
         let mut req2 = test_request("github.set_actions_secret", ClientType::Agent);
@@ -3183,8 +3199,12 @@ mod tests {
         let resp2 = enclave.execute(req2).await;
         // Should be DENIED because server-side derivation extracts
         // ["env:ADMIN_KEY", "env:SUPER_SECRET"] which are NOT in the policy.
-        assert_eq!(resp2.error_code(), Some("policy_denied"),
-            "expected policy_denied for unauthorized secret refs, got: {:?}", resp2.error_code());
+        assert_eq!(
+            resp2.error_code(),
+            Some("policy_denied"),
+            "expected policy_denied for unauthorized secret refs, got: {:?}",
+            resp2.error_code()
+        );
     }
 
     #[test]

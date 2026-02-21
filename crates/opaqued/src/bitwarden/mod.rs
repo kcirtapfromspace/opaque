@@ -55,8 +55,8 @@ impl fmt::Debug for BitwardenHandler {
 impl BitwardenHandler {
     /// Create a handler for the Bitwarden Secrets Manager API.
     pub fn new(audit: Arc<dyn AuditSink>, base_url: &str) -> Self {
-        let token_ref = std::env::var(TOKEN_REF_ENV)
-            .unwrap_or_else(|_| DEFAULT_TOKEN_REF.to_owned());
+        let token_ref =
+            std::env::var(TOKEN_REF_ENV).unwrap_or_else(|_| DEFAULT_TOKEN_REF.to_owned());
         Self {
             audit,
             client: BitwardenClient::new(base_url),
@@ -125,9 +125,7 @@ impl OperationHandler for BitwardenHandler {
                     Ok(serde_json::json!({ "projects": sanitized }))
                 }
                 "bitwarden.list_secrets" => {
-                    let project_name = params
-                        .get("project")
-                        .and_then(|v| v.as_str());
+                    let project_name = params.get("project").and_then(|v| v.as_str());
 
                     audit.emit(
                         AuditEvent::new(AuditEventKind::ProviderFetchStarted)
