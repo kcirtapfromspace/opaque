@@ -452,8 +452,14 @@ mod tests {
         });
 
         let obj = response.as_object().unwrap();
-        assert!(!obj.contains_key("stdout"), "response must not contain 'stdout'");
-        assert!(!obj.contains_key("stderr"), "response must not contain 'stderr'");
+        assert!(
+            !obj.contains_key("stdout"),
+            "response must not contain 'stdout'"
+        );
+        assert!(
+            !obj.contains_key("stderr"),
+            "response must not contain 'stderr'"
+        );
 
         // Verify expected metadata keys are present.
         assert!(obj.contains_key("exit_code"));

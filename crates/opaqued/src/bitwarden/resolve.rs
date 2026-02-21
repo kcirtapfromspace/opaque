@@ -47,8 +47,8 @@ enum BitwardenRef<'a> {
 impl BitwardenResolver {
     /// Create a new resolver with the given Bitwarden client.
     pub fn new(client: BitwardenClient) -> Self {
-        let token_ref = std::env::var(TOKEN_REF_ENV)
-            .unwrap_or_else(|_| DEFAULT_TOKEN_REF.to_owned());
+        let token_ref =
+            std::env::var(TOKEN_REF_ENV).unwrap_or_else(|_| DEFAULT_TOKEN_REF.to_owned());
         Self { client, token_ref }
     }
 
@@ -117,9 +117,9 @@ impl SecretResolver for BitwardenResolver {
                             .await
                             .map_err(|e| format!("secret fetch failed: {e}"))?;
 
-                        secret.value.ok_or_else(|| {
-                            format!("secret '{secret_id}' has no value")
-                        })
+                        secret
+                            .value
+                            .ok_or_else(|| format!("secret '{secret_id}' has no value"))
                     }
                     BitwardenRef::ProjectKey { project, key } => {
                         let project_id = self
@@ -141,9 +141,7 @@ impl SecretResolver for BitwardenResolver {
                             .map_err(|e| format!("secret fetch failed: {e}"))?;
 
                         secret.value.ok_or_else(|| {
-                            format!(
-                                "secret '{key}' in project '{project}' has no value"
-                            )
+                            format!("secret '{key}' in project '{project}' has no value")
                         })
                     }
                 }
@@ -168,8 +166,7 @@ mod tests {
     #[test]
     fn parse_ref_secret_id() {
         let result =
-            BitwardenResolver::parse_ref("bitwarden:550e8400-e29b-41d4-a716-446655440000")
-                .unwrap();
+            BitwardenResolver::parse_ref("bitwarden:550e8400-e29b-41d4-a716-446655440000").unwrap();
         assert_eq!(
             result,
             BitwardenRef::SecretId("550e8400-e29b-41d4-a716-446655440000")
@@ -178,8 +175,7 @@ mod tests {
 
     #[test]
     fn parse_ref_project_key() {
-        let result =
-            BitwardenResolver::parse_ref("bitwarden:Production/DB_PASSWORD").unwrap();
+        let result = BitwardenResolver::parse_ref("bitwarden:Production/DB_PASSWORD").unwrap();
         assert_eq!(
             result,
             BitwardenRef::ProjectKey {
@@ -219,8 +215,7 @@ mod tests {
 
     #[test]
     fn parse_ref_project_with_spaces() {
-        let result =
-            BitwardenResolver::parse_ref("bitwarden:My Project/My Secret").unwrap();
+        let result = BitwardenResolver::parse_ref("bitwarden:My Project/My Secret").unwrap();
         assert_eq!(
             result,
             BitwardenRef::ProjectKey {

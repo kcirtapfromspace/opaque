@@ -1117,9 +1117,7 @@ mod tests {
     #[test]
     fn secret_name_match_empty_patterns_matches_anything() {
         // Empty patterns means "no constraint" — should match any refs.
-        let matcher = SecretNameMatch {
-            patterns: vec![],
-        };
+        let matcher = SecretNameMatch { patterns: vec![] };
         assert!(matcher.matches(&[]));
         assert!(matcher.matches(&["FOO".into()]));
     }

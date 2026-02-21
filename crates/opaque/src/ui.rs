@@ -219,8 +219,14 @@ fn format_operation_result(result: &serde_json::Value) {
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
         {
-            let stdout_len = obj.get("stdout_length").and_then(|v| v.as_u64()).unwrap_or(0);
-            let stderr_len = obj.get("stderr_length").and_then(|v| v.as_u64()).unwrap_or(0);
+            let stdout_len = obj
+                .get("stdout_length")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let stderr_len = obj
+                .get("stderr_length")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             warn(&format!(
                 "Output truncated (stdout: {} bytes, stderr: {} bytes)",
                 stdout_len, stderr_len
@@ -387,10 +393,7 @@ fn format_onepassword_result(result: &serde_json::Value) {
 
 /// Format active leases response.
 fn format_leases_result(result: &serde_json::Value) {
-    let count = result
-        .get("count")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let count = result.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
     let leases = result.get("leases").and_then(|v| v.as_array());
 
     if count == 0 {
@@ -406,10 +409,7 @@ fn format_leases_result(result: &serde_json::Value) {
                 .get("operation")
                 .and_then(|v| v.as_str())
                 .unwrap_or("?");
-            let target = lease
-                .get("target")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let target = lease.get("target").and_then(|v| v.as_str()).unwrap_or("");
             let ttl = lease
                 .get("ttl_remaining_secs")
                 .and_then(|v| v.as_u64())
