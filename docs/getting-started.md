@@ -38,6 +38,7 @@ Or initialize with a policy preset:
 ./target/release/opaque init --preset safe-demo       # test.noop only
 ./target/release/opaque init --preset github-secrets   # GitHub secret sync
 ./target/release/opaque init --preset sandbox-human    # sandbox for humans only
+./target/release/opaque init --preset agent-wrapper-github # wrapped-agent GitHub sync + session tokens
 ```
 
 List available presets: `opaque policy presets`
@@ -124,6 +125,23 @@ In another terminal:
 ./target/release/opaque whoami
 ```
 
+## Agent Wrapper Mode
+
+Run an agent with a session-scoped token managed by Opaque:
+
+```bash
+./target/release/opaque agent run -- codex
+```
+
+With stricter daemon enforcement, enable session gating in `~/.opaque/config.toml`:
+
+```toml
+enforce_agent_sessions = true
+agent_session_ttl_secs = 3600
+```
+
+Then wrapped agent clients must present `OPAQUE_SESSION_TOKEN` in the daemon handshake (the wrapper does this automatically).
+
 ## Execute Operations
 
 ### `test.noop`
@@ -200,6 +218,41 @@ Org-level Actions secret:
 ```
 
 These operations are `SAFE`: they never return the secret value or ciphertext.
+
+Build a refs-only manifest from `.env.example` (names only):
+
+```bash
+./target/release/opaque github build-manifest \
+  --env-file .env.example \
+  --value-ref-template 'bitwarden:production/{name}' \
+  --out .opaque/env-manifest.json
+```
+
+Manually review/update refs in `.opaque/env-manifest.json`, then publish:
+
+```bash
+./target/release/opaque github publish-manifest \
+  --repo owner/repo \
+  --manifest-file .opaque/env-manifest.json
+```
+
+Preview publish only (no API calls):
+
+```bash
+./target/release/opaque github publish-manifest \
+  --repo owner/repo \
+  --manifest-file .opaque/env-manifest.json \
+  --dry-run
+```
+
+Legacy one-step flow (still supported):
+
+```bash
+./target/release/opaque github publish-env \
+  --repo owner/repo \
+  --env-file .env.example \
+  --value-ref-template 'bitwarden:production/{name}'
+```
 
 ## Audit
 
