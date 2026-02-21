@@ -275,8 +275,14 @@ enum AgentAction {
     List,
     /// End (revoke) a wrapped-agent session by ID.
     End {
+        /// Revoke all wrapped-agent sessions created by the current UID.
+        #[arg(long, default_value_t = false)]
+        all: bool,
+
         /// Session ID returned by `opaque agent run` or `opaque agent list`.
-        session_id: String,
+        /// Required unless `--all` is set.
+        #[arg(required_unless_present = "all")]
+        session_id: Option<String>,
     },
 }
 
@@ -1914,10 +1920,19 @@ async fn main() {
         Cmd::Agent { action } => match action {
             AgentAction::Run { .. } => unreachable!(),
             AgentAction::List => ("agent_session_list", serde_json::Value::Null),
-            AgentAction::End { session_id } => (
-                "agent_session_end",
-                serde_json::json!({ "session_id": session_id }),
-            ),
+            AgentAction::End { all, session_id } => {
+                if all {
+                    ("agent_session_end", serde_json::json!({ "all": true }))
+                } else {
+                    let session_id = session_id
+                        .as_deref()
+                        .expect("clap guarantees session_id when --all is not set");
+                    (
+                        "agent_session_end",
+                        serde_json::json!({ "session_id": session_id }),
+                    )
+                }
+            }
         },
         // Already handled above; unreachable.
         Cmd::Policy { .. }
