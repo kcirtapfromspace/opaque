@@ -34,6 +34,7 @@ mod gitlab;
 mod onepassword;
 mod sandbox;
 pub mod secret;
+mod vault;
 
 use std::future::Future;
 use std::pin::Pin;
