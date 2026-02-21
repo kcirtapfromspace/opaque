@@ -137,7 +137,7 @@ pub fn format_response(method: &str, result: &serde_json::Value) {
                 print_json(result);
             }
         }
-        "github" | "execute" | "exec" => {
+        "github" | "gitlab" | "execute" | "exec" => {
             format_operation_result(result);
         }
         "onepassword" => {

@@ -27,6 +27,7 @@ pub struct HumanClientConfig {
 pub enum EnabledOperation {
     OnePassword,
     GitHub,
+    GitLab,
     Sandbox,
     TestNoop,
 }
@@ -36,6 +37,7 @@ impl EnabledOperation {
     pub const ALL: &'static [EnabledOperation] = &[
         EnabledOperation::OnePassword,
         EnabledOperation::GitHub,
+        EnabledOperation::GitLab,
         EnabledOperation::Sandbox,
     ];
 
@@ -44,6 +46,7 @@ impl EnabledOperation {
         match self {
             EnabledOperation::OnePassword => "1Password (list vaults, list items, read fields)",
             EnabledOperation::GitHub => "GitHub (set, list, delete secrets)",
+            EnabledOperation::GitLab => "GitLab (set CI/CD variables)",
             EnabledOperation::Sandbox => "Sandbox execution (run profiles)",
             EnabledOperation::TestNoop => "Test no-op (development)",
         }
@@ -157,6 +160,16 @@ pub fn generate_config(answers: &SetupAnswers) -> String {
                     &mut out,
                     "allow-github-delete-secret",
                     "github.delete_secret",
+                    approval_require,
+                    factors,
+                    answers.lease_ttl,
+                );
+            }
+            EnabledOperation::GitLab => {
+                write_rule(
+                    &mut out,
+                    "allow-gitlab-set-ci-variable",
+                    "gitlab.set_ci_variable",
                     approval_require,
                     factors,
                     answers.lease_ttl,
@@ -278,6 +291,20 @@ mod tests {
         assert!(config.contains("allow-github-set-org-secret"));
         assert!(config.contains("allow-github-list-secrets"));
         assert!(config.contains("allow-github-delete-secret"));
+    }
+
+    #[test]
+    fn generate_config_gitlab_creates_rule() {
+        let answers = SetupAnswers {
+            human_clients: vec![],
+            enabled_operations: vec![EnabledOperation::GitLab],
+            require_biometric: true,
+            lease_ttl: 600,
+        };
+
+        let config = generate_config(&answers);
+        assert!(config.contains("allow-gitlab-set-ci-variable"));
+        assert!(config.contains("gitlab.set_ci_variable"));
     }
 
     #[test]
