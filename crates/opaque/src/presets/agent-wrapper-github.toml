@@ -1,0 +1,93 @@
+# Opaque preset: agent-wrapper-github
+#
+# Hardened preset for wrapped LLM workflows:
+# - requires session token handshakes for agent-classified clients
+# - allows GitHub secret sync operations for agent + human clients
+# - keeps deny-by-default for everything else
+#
+# Usage:
+#   opaque init --preset agent-wrapper-github
+
+enforce_agent_sessions = true
+agent_session_ttl_secs = 3600
+
+[[known_human_clients]]
+name = "opaque-cli"
+exe_path = "*/opaque"
+
+[[rules]]
+name = "allow-github-actions-secret"
+operation_pattern = "github.set_actions_secret"
+allow = true
+client_types = ["agent", "human"]
+
+[rules.approval]
+require = "always"
+factors = ["local_bio"]
+lease_ttl = 300
+
+[[rules]]
+name = "allow-github-codespaces-secret"
+operation_pattern = "github.set_codespaces_secret"
+allow = true
+client_types = ["agent", "human"]
+
+[rules.approval]
+require = "always"
+factors = ["local_bio"]
+lease_ttl = 300
+
+[[rules]]
+name = "allow-github-dependabot-secret"
+operation_pattern = "github.set_dependabot_secret"
+allow = true
+client_types = ["agent", "human"]
+
+[rules.approval]
+require = "always"
+factors = ["local_bio"]
+lease_ttl = 300
+
+[[rules]]
+name = "allow-github-org-secret"
+operation_pattern = "github.set_org_secret"
+allow = true
+client_types = ["agent", "human"]
+
+[rules.approval]
+require = "always"
+factors = ["local_bio"]
+lease_ttl = 300
+
+[[rules]]
+name = "allow-github-list-secrets"
+operation_pattern = "github.list_secrets"
+allow = true
+client_types = ["agent", "human"]
+
+[rules.approval]
+require = "first_use"
+factors = ["local_bio"]
+lease_ttl = 300
+
+[[rules]]
+name = "allow-github-delete-secret"
+operation_pattern = "github.delete_secret"
+allow = true
+client_types = ["agent", "human"]
+
+[rules.approval]
+require = "always"
+factors = ["local_bio"]
+lease_ttl = 300
+
+[[rules]]
+name = "allow-test-noop"
+operation_pattern = "test.noop"
+allow = true
+client_types = ["agent", "human"]
+
+[rules.approval]
+require = "first_use"
+factors = ["local_bio"]
+lease_ttl = 300

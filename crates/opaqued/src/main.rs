@@ -58,6 +58,15 @@ struct DaemonConfig {
     /// Audit log retention in days. Defaults to 90 if not specified.
     #[serde(default)]
     audit_retention_days: Option<u64>,
+
+    /// When true, clients classified as `Agent` must present a valid
+    /// per-session token in the handshake.
+    #[serde(default)]
+    enforce_agent_sessions: bool,
+
+    /// Default TTL for agent sessions in seconds.
+    #[serde(default)]
+    agent_session_ttl_secs: Option<u64>,
 }
 
 /// A single entry in the known human clients allowlist.
@@ -91,8 +100,19 @@ struct DaemonState {
     version: &'static str,
     /// Hex-encoded 32-byte CSPRNG token for handshake authentication.
     daemon_token: String,
+    /// Active wrapper sessions keyed by session id.
+    agent_sessions: Arc<tokio::sync::RwLock<HashMap<String, AgentSession>>>,
     /// Semaphore to limit maximum concurrent connections.
     connection_semaphore: Arc<tokio::sync::Semaphore>,
+}
+
+#[derive(Debug, Clone)]
+struct AgentSession {
+    session_id: String,
+    token: String,
+    created_by_uid: u32,
+    expires_at: SystemTime,
+    label: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -182,9 +202,7 @@ fn verify_config_seal() -> std::io::Result<()> {
             PathBuf::from(home).join(".opaque").join("config.toml")
         });
 
-    let config_dir = config_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
+    let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
     let seal_file = config_dir.join("config.seal");
 
     // If config doesn't exist, nothing to verify (load_config handles defaults).
@@ -209,9 +227,9 @@ fn verify_config_seal() -> std::io::Result<()> {
             ));
         }
         Err(e) => {
-            return Err(std::io::Error::other(
-                format!("config seal check failed: {e}"),
-            ));
+            return Err(std::io::Error::other(format!(
+                "config seal check failed: {e}"
+            )));
         }
     }
 
@@ -663,8 +681,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             onepassword::OnePasswordHandler::from_cli(audit.clone(), cli.clone());
         let op_list_items_handler =
             onepassword::OnePasswordHandler::from_cli(audit.clone(), cli.clone());
-        let op_read_field_handler =
-            onepassword::OnePasswordHandler::from_cli(audit.clone(), cli);
+        let op_read_field_handler = onepassword::OnePasswordHandler::from_cli(audit.clone(), cli);
         enclave_builder = enclave_builder
             .handler("onepassword.list_vaults", Box::new(op_list_vaults_handler))
             .handler("onepassword.list_items", Box::new(op_list_items_handler))
@@ -689,14 +706,8 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
                 "bitwarden.list_projects",
                 Box::new(bw_list_projects_handler),
             )
-            .handler(
-                "bitwarden.list_secrets",
-                Box::new(bw_list_secrets_handler),
-            )
-            .handler(
-                "bitwarden.read_secret",
-                Box::new(bw_read_secret_handler),
-            );
+            .handler("bitwarden.list_secrets", Box::new(bw_list_secrets_handler))
+            .handler("bitwarden.read_secret", Box::new(bw_read_secret_handler));
         info!("Bitwarden handler enabled ({})", bitwarden_url);
     }
 
@@ -710,6 +721,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         config,
         version: version_string(),
         daemon_token,
+        agent_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         connection_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
     });
 
@@ -1292,16 +1304,36 @@ async fn handle_conn(
     let mut framed = Framed::new(stream, codec);
 
     // --- Handshake: first frame must be a valid daemon token ---
-    let handshake_ok = match framed.next().await {
+    let handshake = match framed.next().await {
         Some(Ok(frame)) => validate_handshake(&frame, &state.daemon_token),
-        _ => false,
+        _ => None,
     };
 
-    if !handshake_ok {
+    let Some(handshake) = handshake else {
         // Close silently — no error detail to prevent oracle attacks.
         warn!("handshake failed, closing connection");
         return Ok(());
-    }
+    };
+
+    let session_id = if state.config.enforce_agent_sessions && client_type == ClientType::Agent {
+        match handshake.session_token.as_deref() {
+            Some(token) => {
+                match validate_agent_session_token(state.as_ref(), token, identity.uid).await {
+                    Some(id) => Some(id),
+                    None => {
+                        warn!("agent session token invalid or expired, closing connection");
+                        return Ok(());
+                    }
+                }
+            }
+            None => {
+                warn!("missing agent session token, closing connection");
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
 
     // Split into read/write halves so we can detect client disconnect during
     // request processing. When the client disconnects, the in-flight request
@@ -1352,6 +1384,22 @@ async fn handle_conn(
                     continue;
                 }
 
+                // Session TTL enforcement for wrapped agents.
+                if state.config.enforce_agent_sessions && client_type == ClientType::Agent {
+                    let active = if let Some(ref sid) = session_id {
+                        let sessions = state.agent_sessions.read().await;
+                        sessions.get(sid).is_some_and(|s| {
+                            s.created_by_uid == identity.uid && s.expires_at > SystemTime::now()
+                        })
+                    } else {
+                        false
+                    };
+                    if !active {
+                        warn!("agent session expired or revoked, closing connection");
+                        break;
+                    }
+                }
+
                 // Never log params (may contain secrets due to client bugs).
                 // Request timeout: 120 seconds.
                 // Race against client disconnect so the approval semaphore is
@@ -1360,7 +1408,7 @@ async fn handle_conn(
                 let resp = tokio::select! {
                     r = tokio::time::timeout(
                         std::time::Duration::from_secs(120),
-                        handle_request(&state, req, &identity, client_type),
+                        handle_request(&state, req, &identity, client_type, session_id.as_deref()),
                     ) => {
                         match r {
                             Ok(r) => r,
@@ -1403,24 +1451,37 @@ async fn handle_conn(
 /// Validate the handshake frame from a client.
 ///
 /// Expected format: `{"handshake":"v1","daemon_token":"<hex>"}`
-fn validate_handshake(frame: &[u8], expected_token: &str) -> bool {
+#[derive(Debug, Clone)]
+struct HandshakePayload {
+    session_token: Option<String>,
+}
+
+fn validate_handshake(frame: &[u8], expected_token: &str) -> Option<HandshakePayload> {
     #[derive(Deserialize)]
     struct Handshake {
         handshake: String,
         daemon_token: String,
+        #[serde(default)]
+        session_token: Option<String>,
     }
 
     let hs: Handshake = match serde_json::from_slice(frame) {
         Ok(h) => h,
-        Err(_) => return false,
+        Err(_) => return None,
     };
 
     if hs.handshake != "v1" {
-        return false;
+        return None;
     }
 
     // Constant-time comparison to prevent timing attacks.
-    constant_time_eq(hs.daemon_token.as_bytes(), expected_token.as_bytes())
+    if !constant_time_eq(hs.daemon_token.as_bytes(), expected_token.as_bytes()) {
+        return None;
+    }
+
+    Some(HandshakePayload {
+        session_token: hs.session_token.filter(|s| !s.trim().is_empty()),
+    })
 }
 
 /// Constant-time byte comparison (prevents timing side channels).
@@ -1435,11 +1496,39 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+fn system_time_to_unix_ms(ts: SystemTime) -> i64 {
+    ts.duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+async fn validate_agent_session_token(
+    state: &DaemonState,
+    token: &str,
+    uid: u32,
+) -> Option<String> {
+    let now = SystemTime::now();
+    let mut sessions = state.agent_sessions.write().await;
+    // Expire old sessions opportunistically.
+    sessions.retain(|_, s| s.expires_at > now);
+
+    sessions.values().find_map(|session| {
+        if session.created_by_uid == uid
+            && constant_time_eq(session.token.as_bytes(), token.as_bytes())
+        {
+            Some(session.session_id.clone())
+        } else {
+            None
+        }
+    })
+}
+
 async fn handle_request(
     state: &DaemonState,
     req: Request,
     identity: &ClientIdentity,
     client_type: ClientType,
+    session_id: Option<&str>,
 ) -> Response {
     match req.method.as_str() {
         "ping" => Response::ok(
@@ -1461,13 +1550,97 @@ async fn handle_request(
                     "exe_path": identity.exe_path.as_ref().map(|p| p.display().to_string()),
                     "exe_sha256": identity.exe_sha256,
                     "client_type": client_type,
+                    "agent_session_id": session_id,
                 }),
                 ClientType::Agent => serde_json::json!({
                     "uid": identity.uid,
                     "client_type": client_type,
+                    "agent_session_id": session_id,
                 }),
             };
             Response::ok(req.id, payload)
+        }
+        "agent_session_start" => {
+            if state.config.enforce_agent_sessions && client_type != ClientType::Human {
+                return Response::err(
+                    Some(req.id),
+                    "permission_denied",
+                    "only human clients can start agent sessions when enforce_agent_sessions is enabled",
+                );
+            }
+
+            let default_ttl = state.config.agent_session_ttl_secs.unwrap_or(3600);
+            let ttl_secs = req
+                .params
+                .get("ttl_secs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(default_ttl)
+                .clamp(60, 86_400);
+            let label = req
+                .params
+                .get("label")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_owned());
+
+            let session_id = Uuid::new_v4().to_string();
+            let session_token = generate_daemon_token();
+            let expires_at = SystemTime::now()
+                .checked_add(std::time::Duration::from_secs(ttl_secs))
+                .unwrap_or(SystemTime::now());
+
+            let session = AgentSession {
+                session_id: session_id.clone(),
+                token: session_token.clone(),
+                created_by_uid: identity.uid,
+                expires_at,
+                label,
+            };
+            state
+                .agent_sessions
+                .write()
+                .await
+                .insert(session_id.clone(), session);
+
+            Response::ok(
+                req.id,
+                serde_json::json!({
+                    "session_id": session_id,
+                    "session_token": session_token,
+                    "expires_at_utc_ms": system_time_to_unix_ms(expires_at),
+                    "ttl_secs": ttl_secs,
+                }),
+            )
+        }
+        "agent_session_end" => {
+            let Some(session_id) = req.params.get("session_id").and_then(|v| v.as_str()) else {
+                return Response::err(Some(req.id), "bad_request", "missing 'session_id' field");
+            };
+
+            let mut sessions = state.agent_sessions.write().await;
+            let can_delete = if let Some(existing) = sessions.get(session_id) {
+                client_type == ClientType::Human || existing.created_by_uid == identity.uid
+            } else {
+                true
+            };
+            if !can_delete {
+                return Response::err(
+                    Some(req.id),
+                    "permission_denied",
+                    "session belongs to a different uid",
+                );
+            }
+
+            let removed = sessions.remove(session_id);
+            let label = removed.as_ref().and_then(|s| s.label.clone());
+
+            Response::ok(
+                req.id,
+                serde_json::json!({
+                    "status": if removed.is_some() { "ended" } else { "not_found" },
+                    "session_id": session_id,
+                    "label": label,
+                }),
+            )
         }
         "leases" => {
             // Only human clients can inspect active leases.
@@ -1730,9 +1903,7 @@ async fn handle_request(
                     if let Some(ids) = req.params.get("selected_repository_ids") {
                         params["selected_repository_ids"] = ids.clone();
                     }
-                    let target = HashMap::from([
-                        ("secret_name".into(), secret_name.clone()),
-                    ]);
+                    let target = HashMap::from([("secret_name".into(), secret_name.clone())]);
                     ("github.set_codespaces_secret", target, params)
                 }
                 "codespaces_repo" => {
@@ -1960,7 +2131,9 @@ async fn handle_request(
                     return Response::err(
                         Some(req.id),
                         "bad_request",
-                        format!("unknown action '{unknown}' (expected: list_vaults, list_items, read_field)"),
+                        format!(
+                            "unknown action '{unknown}' (expected: list_vaults, list_items, read_field)"
+                        ),
                     );
                 }
             };
@@ -1979,9 +2152,15 @@ async fn handle_request(
 
             // Build secret_ref_names from the vault/item/field path for read_field.
             let secret_ref_names = if action == "read_field" {
-                let v = op_params.get("vault").and_then(|v| v.as_str()).unwrap_or("");
+                let v = op_params
+                    .get("vault")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 let i = op_params.get("item").and_then(|v| v.as_str()).unwrap_or("");
-                let f = op_params.get("field").and_then(|v| v.as_str()).unwrap_or("");
+                let f = op_params
+                    .get("field")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 let refs = vec![format!("onepassword:{v}/{i}/{f}")];
                 if let Err(e) = InputValidator::validate_secret_ref_names(&refs) {
                     return Response::err(
@@ -2069,8 +2248,7 @@ async fn handle_request(
                         );
                     }
 
-                    let target =
-                        HashMap::from([("secret_id".into(), secret_id.clone())]);
+                    let target = HashMap::from([("secret_id".into(), secret_id.clone())]);
                     (
                         "bitwarden.read_secret",
                         target,
@@ -2081,7 +2259,9 @@ async fn handle_request(
                     return Response::err(
                         Some(req.id),
                         "bad_request",
-                        format!("unknown action '{unknown}' (expected: list_projects, list_secrets, read_secret)"),
+                        format!(
+                            "unknown action '{unknown}' (expected: list_projects, list_secrets, read_secret)"
+                        ),
                     );
                 }
             };
@@ -2173,10 +2353,9 @@ async fn handle_request(
             }
 
             // Derive secret_ref_names from the profile's secret declarations.
-            let secret_ref_names =
-                opaque_core::profile::load_named_profile(&profile)
-                    .map(|p| p.secrets.keys().cloned().collect::<Vec<_>>())
-                    .unwrap_or_default();
+            let secret_ref_names = opaque_core::profile::load_named_profile(&profile)
+                .map(|p| p.secrets.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
 
             let op_req = OperationRequest {
                 request_id: Uuid::new_v4(),
@@ -2241,11 +2420,7 @@ async fn handle_github_list_secrets(
     let target = match InputValidator::validate_target(&target) {
         Ok(t) => t,
         Err(e) => {
-            return Response::err(
-                Some(req.id),
-                "bad_request",
-                format!("invalid target: {e}"),
-            );
+            return Response::err(Some(req.id), "bad_request", format!("invalid target: {e}"));
         }
     };
 
@@ -2299,9 +2474,7 @@ async fn handle_github_delete_secret(
         "scope": scope,
         "secret_name": secret_name,
     });
-    let mut target = HashMap::from([
-        ("secret_name".into(), secret_name.clone()),
-    ]);
+    let mut target = HashMap::from([("secret_name".into(), secret_name.clone())]);
 
     if let Some(repo) = req.params.get("repo").and_then(|v| v.as_str()) {
         op_params["repo"] = serde_json::Value::String(repo.into());
@@ -2322,11 +2495,7 @@ async fn handle_github_delete_secret(
     let target = match InputValidator::validate_target(&target) {
         Ok(t) => t,
         Err(e) => {
-            return Response::err(
-                Some(req.id),
-                "bad_request",
-                format!("invalid target: {e}"),
-            );
+            return Response::err(Some(req.id), "bad_request", format!("invalid target: {e}"));
         }
     };
 
@@ -2357,6 +2526,9 @@ async fn handle_github_delete_secret(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
     fn test_identity() -> ClientIdentity {
         ClientIdentity {
@@ -2428,7 +2600,10 @@ mod tests {
         // SHA-256 hex digest is always 64 characters.
         assert_eq!(h.len(), 64, "expected 64-char hex digest, got {}", h.len());
         // Should be lowercase hex.
-        assert!(h.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            h.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
     }
 
     #[test]
@@ -2523,7 +2698,7 @@ mod tests {
             "daemon_token": token,
         }))
         .unwrap();
-        assert!(validate_handshake(&frame, token));
+        assert!(validate_handshake(&frame, token).is_some());
     }
 
     #[test]
@@ -2533,13 +2708,13 @@ mod tests {
             "daemon_token": "wrong_token",
         }))
         .unwrap();
-        assert!(!validate_handshake(&frame, "correct_token"));
+        assert!(validate_handshake(&frame, "correct_token").is_none());
     }
 
     #[test]
     fn handshake_missing_fields_rejected() {
         let frame = serde_json::to_vec(&serde_json::json!({"handshake": "v1"})).unwrap();
-        assert!(!validate_handshake(&frame, "token"));
+        assert!(validate_handshake(&frame, "token").is_none());
     }
 
     #[test]
@@ -2549,12 +2724,25 @@ mod tests {
             "daemon_token": "token",
         }))
         .unwrap();
-        assert!(!validate_handshake(&frame, "token"));
+        assert!(validate_handshake(&frame, "token").is_none());
     }
 
     #[test]
     fn handshake_garbage_rejected() {
-        assert!(!validate_handshake(b"not json at all", "token"));
+        assert!(validate_handshake(b"not json at all", "token").is_none());
+    }
+
+    #[test]
+    fn handshake_with_session_token_roundtrip() {
+        let token = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let frame = serde_json::to_vec(&serde_json::json!({
+            "handshake": "v1",
+            "daemon_token": token,
+            "session_token": "session_123",
+        }))
+        .unwrap();
+        let hs = validate_handshake(&frame, token).expect("handshake should parse");
+        assert_eq!(hs.session_token.as_deref(), Some("session_123"));
     }
 
     #[test]
@@ -2866,7 +3054,7 @@ exe_sha256 = "deadbeef"
             method: "ping".into(),
             params: serde_json::Value::Null,
         };
-        let resp = handle_request(&state, req, &test_identity(), ClientType::Human).await;
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
         let result = resp.result.unwrap();
         assert_eq!(result["ok"], true);
         assert_eq!(result["api_version"], opaque_core::API_VERSION);
@@ -2880,7 +3068,7 @@ exe_sha256 = "deadbeef"
             method: "version".into(),
             params: serde_json::Value::Null,
         };
-        let resp = handle_request(&state, req, &test_identity(), ClientType::Human).await;
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
         let result = resp.result.unwrap();
         assert!(result["version"].is_string());
         assert_eq!(result["api_version"], opaque_core::API_VERSION);
@@ -2894,9 +3082,182 @@ exe_sha256 = "deadbeef"
             method: "nonexistent".into(),
             params: serde_json::Value::Null,
         };
-        let resp = handle_request(&state, req, &test_identity(), ClientType::Human).await;
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, "unknown_method");
+    }
+
+    #[tokio::test]
+    async fn agent_session_start_allowed_for_agent_when_not_enforced() {
+        let state = make_test_state();
+        let req = Request {
+            id: 4,
+            method: "agent_session_start".into(),
+            params: serde_json::json!({}),
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Agent, None).await;
+        assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+        let result = resp.result.expect("result expected");
+        assert!(result.get("session_id").and_then(|v| v.as_str()).is_some());
+        assert!(
+            result
+                .get("session_token")
+                .and_then(|v| v.as_str())
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_session_start_denied_for_agent_when_enforced() {
+        let mut state = make_test_state();
+        state.config.enforce_agent_sessions = true;
+        let req = Request {
+            id: 5,
+            method: "agent_session_start".into(),
+            params: serde_json::json!({}),
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Agent, None).await;
+        let err = resp.error.expect("expected permission denial");
+        assert_eq!(err.code, "permission_denied");
+    }
+
+    #[tokio::test]
+    async fn validate_agent_session_token_uid_scoped() {
+        let state = make_test_state();
+        let session = AgentSession {
+            session_id: "s1".into(),
+            token: "tok1".into(),
+            created_by_uid: 501,
+            expires_at: SystemTime::now() + std::time::Duration::from_secs(300),
+            label: Some("test".into()),
+        };
+        state
+            .agent_sessions
+            .write()
+            .await
+            .insert(session.session_id.clone(), session);
+
+        let ok = validate_agent_session_token(&state, "tok1", 501).await;
+        assert_eq!(ok.as_deref(), Some("s1"));
+
+        let wrong_uid = validate_agent_session_token(&state, "tok1", 502).await;
+        assert!(wrong_uid.is_none());
+    }
+
+    #[tokio::test]
+    async fn enforce_agent_sessions_rejects_unwrapped_and_allows_session_token() {
+        let mut state = make_test_state();
+        state.config.enforce_agent_sessions = true;
+
+        let uid = unsafe { libc::getuid() } as u32;
+        state.agent_sessions.write().await.insert(
+            "session-1".into(),
+            AgentSession {
+                session_id: "session-1".into(),
+                token: "token-1".into(),
+                created_by_uid: uid,
+                expires_at: SystemTime::now() + std::time::Duration::from_secs(60),
+                label: Some("test".into()),
+            },
+        );
+
+        let state = Arc::new(state);
+        let codec = || {
+            LengthDelimitedCodec::builder()
+                .max_frame_length(opaque_core::MAX_FRAME_LENGTH)
+                .new_codec()
+        };
+
+        // Unwrapped agent-style request: handshake has daemon token only.
+        let (client_stream, server_stream) = UnixStream::pair().expect("unix pair");
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let server_task = tokio::spawn(handle_conn(state.clone(), server_stream, shutdown_rx));
+        let mut client = Framed::new(client_stream, codec());
+
+        let direct_hs = serde_json::json!({
+            "handshake": "v1",
+            "daemon_token": "test_token",
+        });
+        client
+            .send(Bytes::from(
+                serde_json::to_vec(&direct_hs).expect("serialize handshake"),
+            ))
+            .await
+            .expect("send handshake");
+
+        let ping = Request {
+            id: 1,
+            method: "ping".into(),
+            params: serde_json::Value::Null,
+        };
+        let _ = client
+            .send(Bytes::from(
+                serde_json::to_vec(&ping).expect("serialize ping"),
+            ))
+            .await;
+
+        match tokio::time::timeout(std::time::Duration::from_secs(1), client.next()).await {
+            Ok(None) | Ok(Some(Err(_))) => {}
+            Ok(Some(Ok(frame))) => panic!("unexpected frame on rejected connection: {frame:?}"),
+            Err(_) => panic!("timed out waiting for rejected connection to close"),
+        }
+
+        drop(client);
+        let direct_result = tokio::time::timeout(std::time::Duration::from_secs(1), server_task)
+            .await
+            .expect("server task timeout")
+            .expect("server task join");
+        assert!(direct_result.is_ok(), "server error: {direct_result:?}");
+
+        // Wrapped agent-style request: includes valid session token.
+        let (client_stream, server_stream) = UnixStream::pair().expect("unix pair");
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let server_task = tokio::spawn(handle_conn(state.clone(), server_stream, shutdown_rx));
+        let mut client = Framed::new(client_stream, codec());
+
+        let wrapped_hs = serde_json::json!({
+            "handshake": "v1",
+            "daemon_token": "test_token",
+            "session_token": "token-1",
+        });
+        client
+            .send(Bytes::from(
+                serde_json::to_vec(&wrapped_hs).expect("serialize handshake"),
+            ))
+            .await
+            .expect("send handshake");
+        client
+            .send(Bytes::from(
+                serde_json::to_vec(&ping).expect("serialize ping"),
+            ))
+            .await
+            .expect("send ping");
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), client.next())
+            .await
+            .expect("timed out waiting for ping response")
+            .expect("connection closed unexpectedly")
+            .expect("frame read failed");
+        let resp: Response = serde_json::from_slice(&frame).expect("response decode");
+        assert!(
+            resp.error.is_none(),
+            "unexpected daemon error: {:?}",
+            resp.error
+        );
+        assert_eq!(
+            resp.result
+                .as_ref()
+                .and_then(|r| r.get("ok"))
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+
+        drop(client);
+        let wrapped_result = tokio::time::timeout(std::time::Duration::from_secs(1), server_task)
+            .await
+            .expect("server task timeout")
+            .expect("server task join");
+        assert!(wrapped_result.is_ok(), "server error: {wrapped_result:?}");
     }
 
     // -----------------------------------------------------------------------
@@ -2941,6 +3302,7 @@ exe_sha256 = "deadbeef"
             config: DaemonConfig::default(),
             version: version_string(),
             daemon_token: "test_token".into(),
+            agent_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             connection_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
         }
     }

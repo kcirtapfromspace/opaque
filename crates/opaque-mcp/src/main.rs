@@ -76,6 +76,31 @@ const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const INTERNAL_ERROR: i64 = -32603;
 
+fn maybe_handle_cli_flag() -> bool {
+    let mut args = std::env::args().skip(1);
+    let Some(arg) = args.next() else {
+        return false;
+    };
+
+    match arg.as_str() {
+        "-V" | "--version" => {
+            println!("opaque-mcp {}", version_string());
+            true
+        }
+        "-h" | "--help" => {
+            println!("opaque-mcp {}", version_string());
+            println!("Usage: opaque-mcp [--version]");
+            println!("Runs as an MCP server over stdio.");
+            true
+        }
+        _ => {
+            eprintln!("unknown argument: {arg}");
+            eprintln!("Usage: opaque-mcp [--version]");
+            std::process::exit(2);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // MCP protocol handling
 // ---------------------------------------------------------------------------
@@ -160,7 +185,10 @@ async fn handle_tools_call(
     // Build daemon IPC params.
     let daemon_params = (tool_def.build_params)(&arguments);
 
-    debug!(tool = tool_name, daemon_method, "forwarding tool call to daemon");
+    debug!(
+        tool = tool_name,
+        daemon_method, "forwarding tool call to daemon"
+    );
 
     // Call the daemon wrapper method with tool-specific params.
     match client.call(daemon_method, daemon_params).await {
@@ -214,6 +242,10 @@ async fn handle_tools_call(
 
 #[tokio::main]
 async fn main() {
+    if maybe_handle_cli_flag() {
+        return;
+    }
+
     // Tracing goes to stderr only — stdout is the MCP transport.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
@@ -243,11 +275,7 @@ async fn main() {
             Ok(r) => r,
             Err(e) => {
                 warn!("invalid JSON-RPC: {e}");
-                let resp = JsonRpcResponse::error(
-                    None,
-                    -32700,
-                    format!("parse error: {e}"),
-                );
+                let resp = JsonRpcResponse::error(None, -32700, format!("parse error: {e}"));
                 let out = serde_json::to_string(&resp).expect("response serialization");
                 let _ = stdout.write_all(out.as_bytes()).await;
                 let _ = stdout.write_all(b"\n").await;
@@ -329,10 +357,7 @@ mod tests {
         let tools = result["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 10);
 
-        let tool_names: Vec<&str> = tools
-            .iter()
-            .map(|t| t["name"].as_str().unwrap())
-            .collect();
+        let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
 
         // Verify Safe operations are present.
         assert!(tool_names.contains(&"opaque_github_set_actions_secret"));
@@ -344,7 +369,10 @@ mod tests {
         for name in &tool_names {
             assert!(!name.contains("read_field"), "Reveal tool leaked: {name}");
             assert!(!name.contains("read_secret"), "Reveal tool leaked: {name}");
-            assert!(!name.contains("sandbox"), "SensitiveOutput tool leaked: {name}");
+            assert!(
+                !name.contains("sandbox"),
+                "SensitiveOutput tool leaked: {name}"
+            );
             assert!(!name.contains("noop"), "test tool leaked: {name}");
         }
     }

@@ -51,24 +51,26 @@ impl DaemonClient {
         verify_socket_safety(&self.socket_path)?;
         let daemon_token = read_daemon_token(&self.socket_path)?;
 
-        let stream =
-            tokio::time::timeout(Duration::from_secs(30), UnixStream::connect(&self.socket_path))
-                .await
-                .map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!("connection timed out: {}", self.socket_path.display()),
-                    )
-                })?
-                .map_err(|e| {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!(
-                            "{e} (is opaqued running? expected socket at {})",
-                            self.socket_path.display()
-                        ),
-                    )
-                })?;
+        let stream = tokio::time::timeout(
+            Duration::from_secs(30),
+            UnixStream::connect(&self.socket_path),
+        )
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("connection timed out: {}", self.socket_path.display()),
+            )
+        })?
+        .map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "{e} (is opaqued running? expected socket at {})",
+                    self.socket_path.display()
+                ),
+            )
+        })?;
 
         let codec = LengthDelimitedCodec::builder()
             .max_frame_length(opaque_core::MAX_FRAME_LENGTH)
@@ -76,10 +78,15 @@ impl DaemonClient {
         let mut framed = Framed::new(stream, codec);
 
         // Send handshake as the first frame.
-        let handshake = serde_json::json!({
+        let mut handshake = serde_json::json!({
             "handshake": "v1",
             "daemon_token": daemon_token.trim(),
         });
+        if let Ok(session_token) = std::env::var("OPAQUE_SESSION_TOKEN")
+            && !session_token.trim().is_empty()
+        {
+            handshake["session_token"] = serde_json::Value::String(session_token);
+        }
         let hs_bytes = serde_json::to_vec(&handshake).map_err(std::io::Error::other)?;
         framed.send(Bytes::from(hs_bytes)).await?;
 

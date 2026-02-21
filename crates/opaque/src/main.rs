@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -57,6 +58,10 @@ const SAMPLE_CONFIG: &str = r#"# Opaque configuration file
 # require = "first_use"
 # factors = ["local_bio"]
 # lease_ttl = 300
+#
+# Optional: require session tokens for agent-classified clients.
+# enforce_agent_sessions = true
+# agent_session_ttl_secs = 3600
 "#;
 
 #[derive(Debug, Parser)]
@@ -138,6 +143,11 @@ enum Cmd {
     Profile {
         #[command(subcommand)]
         action: ProfileAction,
+    },
+    /// Run and manage wrapped agent sessions.
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
     },
     /// Query the audit log.
     Audit {
@@ -237,6 +247,24 @@ enum ProfileAction {
     Validate {
         /// Profile name.
         name: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AgentAction {
+    /// Run an agent command in a session scoped by an Opaque-issued token.
+    Run {
+        /// Optional session TTL in seconds (default comes from daemon).
+        #[arg(long)]
+        ttl_secs: Option<u64>,
+
+        /// Start the child with a reduced baseline environment.
+        #[arg(long, default_value_t = false)]
+        clean_env: bool,
+
+        /// Agent command and args to run.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
     },
 }
 
@@ -379,6 +407,99 @@ enum GithubAction {
         #[arg(long)]
         github_token_ref: Option<String>,
     },
+    /// Publish all keys from a .env-style template through Opaque.
+    ///
+    /// Reads key names from `.env.example` (or `--env-file`), builds a secret
+    /// ref for each key using `--value-ref-template` (must include `{name}`),
+    /// then calls GitHub set-secret via Opaque for each key.
+    ///
+    /// Example:
+    ///   opaque github publish-env \
+    ///     --repo myorg/myrepo \
+    ///     --env-file .env.example \
+    ///     --value-ref-template 'bitwarden:production/{name}'
+    PublishEnv {
+        /// Repository in "owner/repo" format.
+        #[arg(long)]
+        repo: String,
+
+        /// Path to a .env-style file containing KEY=... entries (names are used, values ignored).
+        #[arg(long, default_value = ".env.example")]
+        env_file: PathBuf,
+
+        /// Template used to build value refs (must include "{name}"), e.g. "bitwarden:production/{name}".
+        #[arg(long)]
+        value_ref_template: String,
+
+        /// GitHub token ref (default: "keychain:opaque/github-pat").
+        #[arg(long)]
+        github_token_ref: Option<String>,
+
+        /// GitHub environment name (for environment-scoped Actions secrets).
+        #[arg(long)]
+        environment: Option<String>,
+
+        /// Preview the publish plan without calling the daemon.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+
+        /// Continue publishing after individual secret failures.
+        #[arg(long, default_value_t = false)]
+        continue_on_error: bool,
+    },
+    /// Build a refs-only manifest from a .env-style template for manual vault updates.
+    ///
+    /// This never reads secret values; it only captures key names and value refs.
+    BuildManifest {
+        /// Path to a .env-style file containing KEY=... entries (names are used, values ignored).
+        #[arg(long, default_value = ".env.example")]
+        env_file: PathBuf,
+
+        /// Template used to build value refs (must include "{name}"), e.g. "bitwarden:production/{name}".
+        #[arg(long, default_value = "bitwarden:CHANGEME/{name}")]
+        value_ref_template: String,
+
+        /// Output manifest JSON path.
+        #[arg(long, default_value = ".opaque/env-manifest.json")]
+        out: PathBuf,
+
+        /// Optional default repository to store in the manifest.
+        #[arg(long)]
+        repo: Option<String>,
+
+        /// Optional default environment to store in the manifest.
+        #[arg(long)]
+        environment: Option<String>,
+    },
+    /// Publish secrets using a refs-only manifest.
+    ///
+    /// The manifest should be created via `build-manifest` and manually updated
+    /// with vault-backed refs as needed.
+    PublishManifest {
+        /// Manifest JSON path.
+        #[arg(long, default_value = ".opaque/env-manifest.json")]
+        manifest_file: PathBuf,
+
+        /// Repository in "owner/repo" format (overrides manifest.repo when set).
+        #[arg(long)]
+        repo: Option<String>,
+
+        /// GitHub token ref (default: "keychain:opaque/github-pat").
+        #[arg(long)]
+        github_token_ref: Option<String>,
+
+        /// GitHub environment name (overrides manifest.environment when set).
+        #[arg(long)]
+        environment: Option<String>,
+
+        /// Preview the publish plan without calling the daemon.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+
+        /// Continue publishing after individual secret failures.
+        #[arg(long, default_value_t = false)]
+        continue_on_error: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -440,6 +561,783 @@ fn parse_kv(s: &str) -> Result<(String, String), String> {
         .split_once('=')
         .ok_or_else(|| format!("expected KEY=VALUE, got '{s}'"))?;
     Ok((k.to_owned(), v.to_owned()))
+}
+
+fn is_valid_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn parse_env_names(contents: &str) -> Result<Vec<String>, String> {
+    let mut names = Vec::new();
+    let mut seen = HashSet::new();
+
+    for (line_no, raw_line) in contents.lines().enumerate() {
+        let mut line = raw_line.trim();
+        if line_no == 0 {
+            line = line.trim_start_matches('\u{feff}');
+        }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix("export ") {
+            line = rest.trim_start();
+        }
+
+        let (name_part, _) = line
+            .split_once('=')
+            .ok_or_else(|| format!("line {}: expected KEY=VALUE", line_no + 1))?;
+        let name = name_part.trim();
+
+        if !is_valid_env_name(name) {
+            return Err(format!(
+                "line {}: invalid env name '{name}' (expected [A-Za-z_][A-Za-z0-9_]*)",
+                line_no + 1
+            ));
+        }
+
+        if !seen.insert(name.to_owned()) {
+            return Err(format!("line {}: duplicate env name '{name}'", line_no + 1));
+        }
+
+        names.push(name.to_owned());
+    }
+
+    Ok(names)
+}
+
+fn parse_env_names_from_file(path: &Path) -> Result<Vec<String>, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    parse_env_names(&content)
+}
+
+fn render_value_ref(value_ref_template: &str, name: &str) -> Result<String, String> {
+    if !value_ref_template.contains("{name}") {
+        return Err(
+            "value_ref_template must include '{name}', e.g. 'bitwarden:production/{name}'".into(),
+        );
+    }
+    let value_ref = value_ref_template.replace("{name}", name);
+    if !is_allowed_value_ref(&value_ref) {
+        return Err(format!(
+            "value ref '{value_ref}' does not start with a known scheme ({:?})",
+            opaque_core::profile::ALLOWED_REF_SCHEMES
+        ));
+    }
+    Ok(value_ref)
+}
+
+fn is_allowed_value_ref(value_ref: &str) -> bool {
+    opaque_core::profile::ALLOWED_REF_SCHEMES
+        .iter()
+        .any(|s| value_ref.starts_with(s))
+}
+
+const ENV_MANIFEST_FORMAT_V1: &str = "opaque.env-manifest/v1";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct EnvManifestEntry {
+    secret_name: String,
+    value_ref: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct EnvManifest {
+    #[serde(default = "manifest_format_v1")]
+    format: String,
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default)]
+    environment: Option<String>,
+    entries: Vec<EnvManifestEntry>,
+}
+
+fn manifest_format_v1() -> String {
+    ENV_MANIFEST_FORMAT_V1.to_string()
+}
+
+fn validate_env_manifest(manifest: &EnvManifest) -> Result<(), String> {
+    if manifest.format != ENV_MANIFEST_FORMAT_V1 {
+        return Err(format!(
+            "unsupported manifest format '{}'; expected '{}'",
+            manifest.format, ENV_MANIFEST_FORMAT_V1
+        ));
+    }
+    if manifest.entries.is_empty() {
+        return Err("manifest has no entries".into());
+    }
+
+    let mut seen = HashSet::new();
+    for (idx, entry) in manifest.entries.iter().enumerate() {
+        if !is_valid_env_name(&entry.secret_name) {
+            return Err(format!(
+                "entry {} has invalid secret_name '{}'",
+                idx + 1,
+                entry.secret_name
+            ));
+        }
+        if !seen.insert(entry.secret_name.clone()) {
+            return Err(format!(
+                "manifest has duplicate secret_name '{}'",
+                entry.secret_name
+            ));
+        }
+        if !is_allowed_value_ref(&entry.value_ref) {
+            return Err(format!(
+                "entry {} has invalid value_ref '{}' (expected one of {:?})",
+                idx + 1,
+                entry.value_ref,
+                opaque_core::profile::ALLOWED_REF_SCHEMES
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, serde::Serialize)]
+struct PublishEnvItem {
+    secret_name: String,
+    value_ref: String,
+    status: String,
+    error: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct PublishEnvSummary {
+    repo: String,
+    environment: Option<String>,
+    env_file: String,
+    value_ref_template: String,
+    dry_run: bool,
+    total_discovered: usize,
+    attempted: usize,
+    published: usize,
+    failed: usize,
+    items: Vec<PublishEnvItem>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct BuildManifestSummary {
+    manifest_file: String,
+    env_file: String,
+    repo: Option<String>,
+    environment: Option<String>,
+    value_ref_template: String,
+    entries: usize,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct PublishManifestSummary {
+    repo: String,
+    environment: Option<String>,
+    manifest_file: String,
+    dry_run: bool,
+    total_entries: usize,
+    attempted: usize,
+    published: usize,
+    failed: usize,
+    items: Vec<PublishEnvItem>,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_github_publish_env(
+    sock: &PathBuf,
+    repo: &str,
+    env_file: &Path,
+    value_ref_template: &str,
+    github_token_ref: Option<&str>,
+    environment: Option<&str>,
+    dry_run: bool,
+    continue_on_error: bool,
+    json_output: bool,
+) -> Result<(), String> {
+    let env_names = parse_env_names_from_file(env_file)?;
+    if env_names.is_empty() {
+        return Err(format!(
+            "no env keys found in {} (expected KEY=VALUE lines)",
+            env_file.display()
+        ));
+    }
+
+    let mut items = Vec::with_capacity(env_names.len());
+    let mut attempted = 0usize;
+    let mut published = 0usize;
+    let mut failed = 0usize;
+
+    for name in env_names {
+        let value_ref = match render_value_ref(value_ref_template, &name) {
+            Ok(v) => v,
+            Err(e) => {
+                failed += 1;
+                items.push(PublishEnvItem {
+                    secret_name: name.clone(),
+                    value_ref: value_ref_template.replace("{name}", &name),
+                    status: "failed".into(),
+                    error: Some(e),
+                });
+                if !continue_on_error {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        if dry_run {
+            items.push(PublishEnvItem {
+                secret_name: name,
+                value_ref,
+                status: "planned".into(),
+                error: None,
+            });
+            continue;
+        }
+
+        attempted += 1;
+        let scope = if environment.is_some() {
+            "env_actions"
+        } else {
+            "repo_actions"
+        };
+        let mut params = serde_json::json!({
+            "scope": scope,
+            "repo": repo,
+            "secret_name": name,
+            "value_ref": value_ref,
+        });
+        if let Some(tok) = github_token_ref {
+            params["github_token_ref"] = serde_json::Value::String(tok.to_owned());
+        }
+        if let Some(env) = environment {
+            params["environment"] = serde_json::Value::String(env.to_owned());
+        }
+
+        match call(sock, "github", params).await {
+            Ok(resp) => {
+                if let Some(err) = resp.error {
+                    failed += 1;
+                    let error_msg = if err.code.is_empty() {
+                        err.message
+                    } else {
+                        format!("{}: {}", err.code, err.message)
+                    };
+                    items.push(PublishEnvItem {
+                        secret_name: name,
+                        value_ref,
+                        status: "failed".into(),
+                        error: Some(error_msg),
+                    });
+                    if !continue_on_error {
+                        break;
+                    }
+                } else {
+                    published += 1;
+                    let status = resp
+                        .result
+                        .as_ref()
+                        .and_then(|r| r.get("status"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("ok");
+                    items.push(PublishEnvItem {
+                        secret_name: name,
+                        value_ref,
+                        status: status.to_owned(),
+                        error: None,
+                    });
+                }
+            }
+            Err(e) => {
+                failed += 1;
+                items.push(PublishEnvItem {
+                    secret_name: name,
+                    value_ref,
+                    status: "failed".into(),
+                    error: Some(e.to_string()),
+                });
+                if !continue_on_error {
+                    break;
+                }
+            }
+        }
+    }
+
+    let summary = PublishEnvSummary {
+        repo: repo.to_owned(),
+        environment: environment.map(|s| s.to_owned()),
+        env_file: env_file.display().to_string(),
+        value_ref_template: value_ref_template.to_owned(),
+        dry_run,
+        total_discovered: items.len(),
+        attempted,
+        published,
+        failed,
+        items,
+    };
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&summary).map_err(|e| format!("json error: {e}"))?
+        );
+    } else {
+        ui::header("Publish Env Secrets");
+        ui::kv("repo", &summary.repo);
+        if let Some(ref env) = summary.environment {
+            ui::kv("environment", env);
+        }
+        ui::kv("env_file", &summary.env_file);
+        ui::kv("value_ref_template", &summary.value_ref_template);
+        if summary.dry_run {
+            ui::kv("mode", "dry-run");
+        }
+
+        for item in &summary.items {
+            if let Some(ref err) = item.error {
+                println!(
+                    "  {} {}",
+                    style(ui::CROSS).red(),
+                    style(&item.secret_name).red().bold()
+                );
+                println!(
+                    "      {} {}",
+                    style("ref:").dim(),
+                    style(&item.value_ref).dim()
+                );
+                println!("      {} {}", style("error:").dim(), style(err).red());
+            } else {
+                println!(
+                    "  {} {}",
+                    style(ui::CHECK).green(),
+                    style(&item.secret_name).yellow().bold()
+                );
+                println!(
+                    "      {} {}",
+                    style("ref:").dim(),
+                    style(&item.value_ref).dim()
+                );
+            }
+        }
+
+        if summary.dry_run {
+            ui::success(&format!(
+                "Dry run complete: {} secret(s) planned",
+                summary.items.len()
+            ));
+        } else if summary.failed == 0 {
+            ui::success(&format!("Published {} secret(s)", summary.published));
+        } else {
+            ui::warn(&format!(
+                "Published {} secret(s), {} failed",
+                summary.published, summary.failed
+            ));
+        }
+    }
+
+    if !dry_run && failed > 0 {
+        return Err(format!(
+            "publish failed: {} succeeded, {} failed",
+            published, failed
+        ));
+    }
+    Ok(())
+}
+
+fn run_github_build_manifest(
+    env_file: &Path,
+    value_ref_template: &str,
+    out: &Path,
+    repo: Option<&str>,
+    environment: Option<&str>,
+    json_output: bool,
+) -> Result<(), String> {
+    let env_names = parse_env_names_from_file(env_file)?;
+    if env_names.is_empty() {
+        return Err(format!(
+            "no env keys found in {} (expected KEY=VALUE lines)",
+            env_file.display()
+        ));
+    }
+
+    let entries = env_names
+        .into_iter()
+        .map(|name| {
+            let value_ref = render_value_ref(value_ref_template, &name)?;
+            Ok(EnvManifestEntry {
+                secret_name: name,
+                value_ref,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    let manifest = EnvManifest {
+        format: manifest_format_v1(),
+        repo: repo.map(|s| s.to_owned()),
+        environment: environment.map(|s| s.to_owned()),
+        entries,
+    };
+    validate_env_manifest(&manifest)?;
+
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+
+    let payload = serde_json::to_string_pretty(&manifest)
+        .map_err(|e| format!("failed to serialize manifest: {e}"))?;
+    std::fs::write(out, payload)
+        .map_err(|e| format!("failed to write manifest {}: {e}", out.display()))?;
+
+    let summary = BuildManifestSummary {
+        manifest_file: out.display().to_string(),
+        env_file: env_file.display().to_string(),
+        repo: manifest.repo,
+        environment: manifest.environment,
+        value_ref_template: value_ref_template.to_owned(),
+        entries: manifest.entries.len(),
+    };
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&summary).map_err(|e| format!("json error: {e}"))?
+        );
+    } else {
+        ui::header("Built Env Manifest");
+        ui::kv("manifest_file", &summary.manifest_file);
+        ui::kv("env_file", &summary.env_file);
+        ui::kv("value_ref_template", &summary.value_ref_template);
+        if let Some(ref repo) = summary.repo {
+            ui::kv("repo", repo);
+        }
+        if let Some(ref env) = summary.environment {
+            ui::kv("environment", env);
+        }
+        ui::kv("entries", &summary.entries.to_string());
+        ui::success("Manifest created. Update refs manually if needed, then run publish-manifest.");
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_github_publish_manifest(
+    sock: &PathBuf,
+    manifest_file: &Path,
+    repo_override: Option<&str>,
+    github_token_ref: Option<&str>,
+    environment_override: Option<&str>,
+    dry_run: bool,
+    continue_on_error: bool,
+    json_output: bool,
+) -> Result<(), String> {
+    let raw = std::fs::read_to_string(manifest_file)
+        .map_err(|e| format!("failed to read {}: {e}", manifest_file.display()))?;
+    let manifest: EnvManifest = serde_json::from_str(&raw)
+        .map_err(|e| format!("invalid manifest {}: {e}", manifest_file.display()))?;
+    validate_env_manifest(&manifest)?;
+
+    let repo = repo_override
+        .map(|s| s.to_owned())
+        .or(manifest.repo.clone())
+        .ok_or_else(|| {
+            "missing repo: pass --repo or set manifest.repo in build-manifest".to_string()
+        })?;
+    let environment = environment_override
+        .map(|s| s.to_owned())
+        .or(manifest.environment.clone());
+    let total_entries = manifest.entries.len();
+
+    let mut items = Vec::with_capacity(manifest.entries.len());
+    let mut attempted = 0usize;
+    let mut published = 0usize;
+    let mut failed = 0usize;
+
+    for entry in manifest.entries {
+        if dry_run {
+            items.push(PublishEnvItem {
+                secret_name: entry.secret_name,
+                value_ref: entry.value_ref,
+                status: "planned".into(),
+                error: None,
+            });
+            continue;
+        }
+
+        attempted += 1;
+        let scope = if environment.is_some() {
+            "env_actions"
+        } else {
+            "repo_actions"
+        };
+        let mut params = serde_json::json!({
+            "scope": scope,
+            "repo": repo,
+            "secret_name": entry.secret_name,
+            "value_ref": entry.value_ref,
+        });
+        if let Some(tok) = github_token_ref {
+            params["github_token_ref"] = serde_json::Value::String(tok.to_owned());
+        }
+        if let Some(ref env) = environment {
+            params["environment"] = serde_json::Value::String(env.to_owned());
+        }
+
+        match call(sock, "github", params).await {
+            Ok(resp) => {
+                if let Some(err) = resp.error {
+                    failed += 1;
+                    let error_msg = if err.code.is_empty() {
+                        err.message
+                    } else {
+                        format!("{}: {}", err.code, err.message)
+                    };
+                    items.push(PublishEnvItem {
+                        secret_name: entry.secret_name,
+                        value_ref: entry.value_ref,
+                        status: "failed".into(),
+                        error: Some(error_msg),
+                    });
+                    if !continue_on_error {
+                        break;
+                    }
+                } else {
+                    published += 1;
+                    let status = resp
+                        .result
+                        .as_ref()
+                        .and_then(|r| r.get("status"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("ok");
+                    items.push(PublishEnvItem {
+                        secret_name: entry.secret_name,
+                        value_ref: entry.value_ref,
+                        status: status.to_owned(),
+                        error: None,
+                    });
+                }
+            }
+            Err(e) => {
+                failed += 1;
+                items.push(PublishEnvItem {
+                    secret_name: entry.secret_name,
+                    value_ref: entry.value_ref,
+                    status: "failed".into(),
+                    error: Some(e.to_string()),
+                });
+                if !continue_on_error {
+                    break;
+                }
+            }
+        }
+    }
+
+    let summary = PublishManifestSummary {
+        repo,
+        environment,
+        manifest_file: manifest_file.display().to_string(),
+        dry_run,
+        total_entries,
+        attempted,
+        published,
+        failed,
+        items,
+    };
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&summary).map_err(|e| format!("json error: {e}"))?
+        );
+    } else {
+        ui::header("Publish Manifest Secrets");
+        ui::kv("repo", &summary.repo);
+        if let Some(ref env) = summary.environment {
+            ui::kv("environment", env);
+        }
+        ui::kv("manifest_file", &summary.manifest_file);
+        if summary.dry_run {
+            ui::kv("mode", "dry-run");
+        }
+
+        for item in &summary.items {
+            if let Some(ref err) = item.error {
+                println!(
+                    "  {} {}",
+                    style(ui::CROSS).red(),
+                    style(&item.secret_name).red().bold()
+                );
+                println!(
+                    "      {} {}",
+                    style("ref:").dim(),
+                    style(&item.value_ref).dim()
+                );
+                println!("      {} {}", style("error:").dim(), style(err).red());
+            } else {
+                println!(
+                    "  {} {}",
+                    style(ui::CHECK).green(),
+                    style(&item.secret_name).yellow().bold()
+                );
+                println!(
+                    "      {} {}",
+                    style("ref:").dim(),
+                    style(&item.value_ref).dim()
+                );
+            }
+        }
+
+        if summary.dry_run {
+            ui::success(&format!(
+                "Dry run complete: {} secret(s) planned",
+                summary.items.len()
+            ));
+        } else if summary.failed == 0 {
+            ui::success(&format!("Published {} secret(s)", summary.published));
+        } else {
+            ui::warn(&format!(
+                "Published {} secret(s), {} failed",
+                summary.published, summary.failed
+            ));
+        }
+    }
+
+    if !dry_run && summary.failed > 0 {
+        return Err(format!(
+            "publish failed: {} succeeded, {} failed",
+            summary.published, summary.failed
+        ));
+    }
+    Ok(())
+}
+
+fn session_token_from_env() -> Option<String> {
+    std::env::var("OPAQUE_SESSION_TOKEN")
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_agent_wrapped(
+    sock: &PathBuf,
+    command: &[String],
+    ttl_secs: Option<u64>,
+    clean_env: bool,
+    json_output: bool,
+) -> Result<i32, String> {
+    if command.is_empty() {
+        return Err("agent command must not be empty".into());
+    }
+
+    maybe_warn_opaque_mcp_skew(command, json_output);
+
+    let mut start_params = serde_json::json!({
+        "label": command[0],
+    });
+    if let Some(ttl) = ttl_secs {
+        start_params["ttl_secs"] = serde_json::json!(ttl);
+    }
+
+    let session_start = call(sock, "agent_session_start", start_params)
+        .await
+        .map_err(|e| format!("failed to start agent session: {e}"))?;
+    if let Some(err) = session_start.error {
+        return Err(format!("{}: {}", err.code, err.message));
+    }
+
+    let result = session_start
+        .result
+        .ok_or_else(|| "agent_session_start returned no result".to_string())?;
+    let session_id = result
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "agent_session_start missing session_id".to_string())?
+        .to_owned();
+    let session_token = result
+        .get("session_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "agent_session_start missing session_token".to_string())?
+        .to_owned();
+
+    if !json_output {
+        ui::header("Agent Wrapper Session");
+        ui::kv("session_id", &session_id);
+        if let Some(expires) = result.get("expires_at_utc_ms").and_then(|v| v.as_i64()) {
+            ui::kv("expires_at_utc_ms", &expires.to_string());
+        }
+    }
+
+    let mut child = tokio::process::Command::new(&command[0]);
+    if command.len() > 1 {
+        child.args(&command[1..]);
+    }
+
+    if clean_env {
+        child.env_clear();
+        for key in ["PATH", "HOME", "USER", "SHELL", "TERM", "LANG", "LC_ALL"] {
+            if let Ok(val) = std::env::var(key) {
+                child.env(key, val);
+            }
+        }
+    }
+
+    child.env("OPAQUE_SESSION_TOKEN", &session_token);
+    child.env("OPAQUE_AGENT_SESSION_ID", &session_id);
+    child.env("OPAQUE_AGENT_WRAPPED", "1");
+    child.env("OPAQUE_SOCK", sock.display().to_string());
+    child.stdin(std::process::Stdio::inherit());
+    child.stdout(std::process::Stdio::inherit());
+    child.stderr(std::process::Stdio::inherit());
+
+    let status = child
+        .spawn()
+        .map_err(|e| format!("failed to spawn agent command: {e}"))?
+        .wait()
+        .await
+        .map_err(|e| format!("agent command failed to run: {e}"))?;
+
+    // Best-effort cleanup.
+    let _ = call(
+        sock,
+        "agent_session_end",
+        serde_json::json!({ "session_id": session_id }),
+    )
+    .await;
+
+    Ok(status.code().unwrap_or(1))
+}
+
+fn maybe_warn_opaque_mcp_skew(command: &[String], json_output: bool) {
+    let Some(cmd0) = command.first() else {
+        return;
+    };
+    let cmd_name = Path::new(cmd0)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(cmd0);
+    if cmd_name != "opaque-mcp" {
+        return;
+    }
+
+    let path = if cmd0.contains('/') {
+        PathBuf::from(cmd0)
+    } else {
+        resolve_on_path(cmd0).unwrap_or_else(|| PathBuf::from(cmd0))
+    };
+
+    if let Ok(mcp_version) = read_binary_version(&path, "opaque-mcp") {
+        let cli_version = version_string();
+        if mcp_version != cli_version && !json_output {
+            ui::warn(&format!(
+                "opaque-mcp ({mcp_version}) differs from opaque ({cli_version}); rebuild to avoid handshake skew"
+            ));
+        }
+    }
 }
 
 #[tokio::main]
@@ -617,6 +1515,102 @@ async fn main() {
     }
 
     let sock = cli.socket.unwrap_or_else(socket_path);
+
+    if let Cmd::Agent {
+        action:
+            AgentAction::Run {
+                ttl_secs,
+                clean_env,
+                command,
+            },
+    } = &cmd
+    {
+        match run_agent_wrapped(&sock, command, *ttl_secs, *clean_env, json_output).await {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                ui::error(&e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if let Cmd::Github { action } = &cmd {
+        let result = match action {
+            GithubAction::BuildManifest {
+                env_file,
+                value_ref_template,
+                out,
+                repo,
+                environment,
+            } => run_github_build_manifest(
+                env_file,
+                value_ref_template,
+                out,
+                repo.as_deref(),
+                environment.as_deref(),
+                json_output,
+            ),
+            GithubAction::PublishEnv {
+                repo,
+                env_file,
+                value_ref_template,
+                github_token_ref,
+                environment,
+                dry_run,
+                continue_on_error,
+            } => {
+                run_github_publish_env(
+                    &sock,
+                    repo,
+                    env_file,
+                    value_ref_template,
+                    github_token_ref.as_deref(),
+                    environment.as_deref(),
+                    *dry_run,
+                    *continue_on_error,
+                    json_output,
+                )
+                .await
+            }
+            GithubAction::PublishManifest {
+                manifest_file,
+                repo,
+                github_token_ref,
+                environment,
+                dry_run,
+                continue_on_error,
+            } => {
+                run_github_publish_manifest(
+                    &sock,
+                    manifest_file,
+                    repo.as_deref(),
+                    github_token_ref.as_deref(),
+                    environment.as_deref(),
+                    *dry_run,
+                    *continue_on_error,
+                    json_output,
+                )
+                .await
+            }
+            _ => Ok(()),
+        };
+
+        if matches!(
+            action,
+            GithubAction::BuildManifest { .. }
+                | GithubAction::PublishEnv { .. }
+                | GithubAction::PublishManifest { .. }
+        ) {
+            match result {
+                Ok(()) => {}
+                Err(e) => {
+                    ui::error(&e);
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+    }
 
     let (method, params) = match cmd {
         Cmd::Ping => ("ping", serde_json::Value::Null),
@@ -800,6 +1794,9 @@ async fn main() {
                 }
                 ("github", params)
             }
+            GithubAction::PublishEnv { .. }
+            | GithubAction::BuildManifest { .. }
+            | GithubAction::PublishManifest { .. } => unreachable!(),
         },
         Cmd::OnePassword { action } => match action {
             OnePasswordAction::ListVaults => {
@@ -813,11 +1810,7 @@ async fn main() {
                 });
                 ("onepassword", params)
             }
-            OnePasswordAction::ReadField {
-                vault,
-                item,
-                field,
-            } => {
+            OnePasswordAction::ReadField { vault, item, field } => {
                 let params = serde_json::json!({
                     "action": "read_field",
                     "vault": vault,
@@ -831,6 +1824,7 @@ async fn main() {
         Cmd::Policy { .. }
         | Cmd::Init { .. }
         | Cmd::Audit { .. }
+        | Cmd::Agent { .. }
         | Cmd::Profile { .. }
         | Cmd::Setup { .. }
         | Cmd::Service { .. }
@@ -853,8 +1847,8 @@ async fn main() {
 
             if json_output {
                 // Raw JSON: output the full response as-is.
-                let output = serde_json::to_string_pretty(&resp)
-                    .unwrap_or_else(|_| "{}".to_string());
+                let output =
+                    serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_string());
                 println!("{output}");
                 if resp.error.is_some() {
                     std::process::exit(1);
@@ -1004,9 +1998,7 @@ async fn call(
         }
     }
 
-    Err(last_err.unwrap_or_else(|| {
-        std::io::Error::other("connection failed after retries")
-    }))
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("connection failed after retries")))
 }
 
 /// Single connection attempt — no retries.
@@ -1040,10 +2032,13 @@ async fn call_once(
     let mut framed = Framed::new(stream, codec);
 
     // Send handshake as the first frame.
-    let handshake = serde_json::json!({
+    let mut handshake = serde_json::json!({
         "handshake": "v1",
         "daemon_token": daemon_token,
     });
+    if let Some(session_token) = session_token_from_env() {
+        handshake["session_token"] = serde_json::Value::String(session_token);
+    }
     let hs_bytes = serde_json::to_vec(&handshake).map_err(std::io::Error::other)?;
     framed.send(Bytes::from(hs_bytes)).await?;
 
@@ -1144,8 +2139,7 @@ fn run_audit_tail(
             .collect();
         println!(
             "{}",
-            serde_json::to_string_pretty(&json_events)
-                .unwrap_or_else(|_| "[]".to_string())
+            serde_json::to_string_pretty(&json_events).unwrap_or_else(|_| "[]".to_string())
         );
         return Ok(());
     }
@@ -1356,11 +2350,7 @@ fn policy_show(file: Option<&Path>) -> Result<(), String> {
                     ClientType::Agent => "agent",
                 })
                 .collect();
-            println!(
-                "      {} {}",
-                style("clients:").dim(),
-                types.join(", ")
-            );
+            println!("      {} {}", style("clients:").dim(), types.join(", "));
         }
 
         // Client match constraints.
@@ -1382,11 +2372,7 @@ fn policy_show(file: Option<&Path>) -> Result<(), String> {
             if let Some(uid) = rule.client.uid {
                 parts.push(format!("uid={uid}"));
             }
-            println!(
-                "      {} {}",
-                style("client:").dim(),
-                parts.join(", ")
-            );
+            println!("      {} {}", style("client:").dim(), parts.join(", "));
         }
 
         // Target constraints.
@@ -1397,11 +2383,7 @@ fn policy_show(file: Option<&Path>) -> Result<(), String> {
                 .iter()
                 .map(|(k, v)| format!("{k}={v}"))
                 .collect();
-            println!(
-                "      {} {}",
-                style("target:").dim(),
-                fields.join(", ")
-            );
+            println!("      {} {}", style("target:").dim(), fields.join(", "));
         }
 
         // Workspace constraints.
@@ -1419,11 +2401,7 @@ fn policy_show(file: Option<&Path>) -> Result<(), String> {
             if rule.workspace.require_clean {
                 parts.push("clean-only".into());
             }
-            println!(
-                "      {} {}",
-                style("workspace:").dim(),
-                parts.join(", ")
-            );
+            println!("      {} {}", style("workspace:").dim(), parts.join(", "));
         }
 
         // Secret name constraints.
@@ -1486,11 +2464,14 @@ fn policy_simulate(
     let client_type = match client_type_str {
         "human" => ClientType::Human,
         "agent" => ClientType::Agent,
-        other => return Err(format!("unknown client type: {other} (expected 'human' or 'agent')")),
+        other => {
+            return Err(format!(
+                "unknown client type: {other} (expected 'human' or 'agent')"
+            ));
+        }
     };
 
-    let target: std::collections::HashMap<String, String> =
-        targets.iter().cloned().collect();
+    let target: std::collections::HashMap<String, String> = targets.iter().cloned().collect();
 
     let request = OperationRequest {
         request_id: uuid::Uuid::nil(),
@@ -1527,73 +2508,48 @@ fn policy_simulate(
         style("operation:").dim(),
         style(operation).yellow().bold()
     );
-    println!(
-        "  {} {}",
-        style("client:").dim(),
-        client_type_str
-    );
+    println!("  {} {}", style("client:").dim(), client_type_str);
     if !targets.is_empty() {
         let fields: Vec<String> = targets.iter().map(|(k, v)| format!("{k}={v}")).collect();
-        println!(
-            "  {} {}",
-            style("target:").dim(),
-            fields.join(", ")
-        );
+        println!("  {} {}", style("target:").dim(), fields.join(", "));
     }
     if !secret_refs.is_empty() {
-        println!(
-            "  {} {}",
-            style("secrets:").dim(),
-            secret_refs.join(", ")
-        );
+        println!("  {} {}", style("secrets:").dim(), secret_refs.join(", "));
     }
     println!();
 
     // Show the decision.
     if decision.allowed {
-        ui::success(&format!("ALLOW (rule: {})", decision.matched_rule.as_deref().unwrap_or("?")));
+        ui::success(&format!(
+            "ALLOW (rule: {})",
+            decision.matched_rule.as_deref().unwrap_or("?")
+        ));
         let req_str = format!("{:?}", decision.approval_requirement).to_lowercase();
-        println!(
-            "  {} {}",
-            style("approval:").dim(),
-            req_str,
-        );
+        println!("  {} {}", style("approval:").dim(), req_str,);
         if !decision.required_factors.is_empty() {
             let factors: Vec<String> = decision
                 .required_factors
                 .iter()
                 .map(|f| format!("{f:?}"))
                 .collect();
-            println!(
-                "  {} {}",
-                style("factors:").dim(),
-                factors.join(", ")
-            );
+            println!("  {} {}", style("factors:").dim(), factors.join(", "));
         }
         if let Some(ttl) = decision.lease_ttl {
-            println!(
-                "  {} {}s",
-                style("lease:").dim(),
-                ttl.as_secs(),
-            );
+            println!("  {} {}s", style("lease:").dim(), ttl.as_secs(),);
         }
         if decision.one_time {
-            println!(
-                "  {} yes",
-                style("one-time:").dim(),
-            );
+            println!("  {} yes", style("one-time:").dim(),);
         }
     } else {
         ui::error(&format!(
             "DENY: {}",
-            decision.denial_reason.as_deref().unwrap_or("no matching rule")
+            decision
+                .denial_reason
+                .as_deref()
+                .unwrap_or("no matching rule")
         ));
         if let Some(ref rule) = decision.matched_rule {
-            println!(
-                "  {} {}",
-                style("matched rule:").dim(),
-                rule,
-            );
+            println!("  {} {}", style("matched rule:").dim(), rule,);
         }
     }
 
@@ -1624,6 +2580,7 @@ fn dirs_or_home() -> PathBuf {
 const PRESET_SAFE_DEMO: &str = include_str!("presets/safe-demo.toml");
 const PRESET_GITHUB_SECRETS: &str = include_str!("presets/github-secrets.toml");
 const PRESET_SANDBOX_HUMAN: &str = include_str!("presets/sandbox-human.toml");
+const PRESET_AGENT_WRAPPER_GITHUB: &str = include_str!("presets/agent-wrapper-github.toml");
 
 /// Available presets: (name, description, content).
 fn available_presets() -> Vec<(&'static str, &'static str, &'static str)> {
@@ -1642,6 +2599,11 @@ fn available_presets() -> Vec<(&'static str, &'static str, &'static str)> {
             "sandbox-human",
             "Allow human-only sandbox execution, deny agents",
             PRESET_SANDBOX_HUMAN,
+        ),
+        (
+            "agent-wrapper-github",
+            "GitHub secret sync preset with enforce_agent_sessions enabled",
+            PRESET_AGENT_WRAPPER_GITHUB,
         ),
     ]
 }
@@ -1694,7 +2656,10 @@ fn policy_apply_preset(name: &str) -> Result<(), String> {
     std::fs::write(&config_path, content)
         .map_err(|e| format!("failed to write {}: {e}", config_path.display()))?;
 
-    ui::success(&format!("Applied preset '{name}' to {}", config_path.display()));
+    ui::success(&format!(
+        "Applied preset '{name}' to {}",
+        config_path.display()
+    ));
     ui::info("Run 'opaque setup --seal' to seal your config.");
     Ok(())
 }
@@ -1832,10 +2797,7 @@ fn run_setup(seal_only: bool, reset: bool, verify: bool) -> Result<(), String> {
             .map_err(|e| format!("failed to read {}: {e}", config_path.display()))?;
         let hash = seal::compute_seal(&config_bytes);
         seal::store_seal(&hash, &seal_file).map_err(|e| format!("failed to store seal: {e}"))?;
-        ui::success(&format!(
-            "Config sealed (SHA-256: {}...)",
-            &hash[..16]
-        ));
+        ui::success(&format!("Config sealed (SHA-256: {}...)", &hash[..16]));
         return Ok(());
     }
 
@@ -1844,11 +2806,7 @@ fn run_setup(seal_only: bool, reset: bool, verify: bool) -> Result<(), String> {
 }
 
 /// Interactive onboarding wizard.
-fn run_setup_wizard(
-    base: &Path,
-    config_path: &Path,
-    seal_file: &Path,
-) -> Result<(), String> {
+fn run_setup_wizard(base: &Path, config_path: &Path, seal_file: &Path) -> Result<(), String> {
     use dialoguer::{Confirm, Input, MultiSelect};
     use opaque_core::seal;
 
@@ -1856,9 +2814,7 @@ fn run_setup_wizard(
     println!("  {}", style("Opaque Setup").bold());
     println!("  {}", style("════════════").dim());
     println!();
-    println!(
-        "  This wizard configures your security policy and seals it."
-    );
+    println!("  This wizard configures your security policy and seals it.");
     println!(
         "  Once sealed, config cannot be modified without '{}'.",
         style("opaque setup --reset").cyan()
@@ -1948,10 +2904,7 @@ fn run_setup_wizard(
     println!();
 
     // Step 3: Approval Policy
-    println!(
-        "  {}",
-        style("Step 3: Approval Policy").bold().underlined()
-    );
+    println!("  {}", style("Step 3: Approval Policy").bold().underlined());
 
     let require_bio = Confirm::new()
         .with_prompt("  Require biometric approval for sensitive operations?")
@@ -2016,13 +2969,14 @@ fn run_setup_wizard(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(config_path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| {
+        std::fs::set_permissions(config_path, std::fs::Permissions::from_mode(0o600)).map_err(
+            |e| {
                 format!(
                     "failed to set permissions on {}: {e}",
                     config_path.display()
                 )
-            })?;
+            },
+        )?;
     }
 
     ui::init_step(&format!(
@@ -2034,10 +2988,7 @@ fn run_setup_wizard(
     let hash = seal::compute_seal(config_content.as_bytes());
     seal::store_seal(&hash, seal_file).map_err(|e| format!("failed to store seal: {e}"))?;
 
-    ui::init_step(&format!(
-        "Config sealed (SHA-256: {}...)",
-        &hash[..16]
-    ));
+    ui::init_step(&format!("Config sealed (SHA-256: {}...)", &hash[..16]));
 
     println!();
     ui::success("Setup complete!");
@@ -2074,10 +3025,7 @@ async fn run_doctor() {
             if let Ok(meta) = std::fs::metadata(&base) {
                 let mode = meta.permissions().mode() & 0o777;
                 if mode == 0o700 {
-                    doctor_pass(&format!(
-                        "Config directory exists ({})",
-                        base.display()
-                    ));
+                    doctor_pass(&format!("Config directory exists ({})", base.display()));
                     pass_count += 1;
                 } else {
                     doctor_warn(&format!(
@@ -2086,19 +3034,13 @@ async fn run_doctor() {
                     warn_count += 1;
                 }
             } else {
-                doctor_pass(&format!(
-                    "Config directory exists ({})",
-                    base.display()
-                ));
+                doctor_pass(&format!("Config directory exists ({})", base.display()));
                 pass_count += 1;
             }
         }
         #[cfg(not(unix))]
         {
-            doctor_pass(&format!(
-                "Config directory exists ({})",
-                base.display()
-            ));
+            doctor_pass(&format!("Config directory exists ({})", base.display()));
             pass_count += 1;
         }
     } else {
@@ -2110,21 +3052,16 @@ async fn run_doctor() {
     let config_path = base.join("config.toml");
     if config_path.exists() {
         match std::fs::read_to_string(&config_path) {
-            Ok(contents) => {
-                match toml_edit::de::from_str::<PolicyConfig>(&contents) {
-                    Ok(config) => {
-                        doctor_pass(&format!(
-                            "Config file valid ({} rules)",
-                            config.rules.len()
-                        ));
-                        pass_count += 1;
-                    }
-                    Err(e) => {
-                        doctor_fail(&format!("Config file has parse errors: {e}"));
-                        fail_count += 1;
-                    }
+            Ok(contents) => match toml_edit::de::from_str::<PolicyConfig>(&contents) {
+                Ok(config) => {
+                    doctor_pass(&format!("Config file valid ({} rules)", config.rules.len()));
+                    pass_count += 1;
                 }
-            }
+                Err(e) => {
+                    doctor_fail(&format!("Config file has parse errors: {e}"));
+                    fail_count += 1;
+                }
+            },
             Err(e) => {
                 doctor_fail(&format!("Cannot read config file: {e}"));
                 fail_count += 1;
@@ -2141,28 +3078,26 @@ async fn run_doctor() {
         let seal_file = base.join("config.seal");
         if config_path.exists() {
             match std::fs::read(&config_path) {
-                Ok(config_bytes) => {
-                    match seal::verify_seal(&config_bytes, &seal_file) {
-                        Ok(SealStatus::Verified) => {
-                            doctor_pass("Config seal verified");
-                            pass_count += 1;
-                        }
-                        Ok(SealStatus::Unsealed) => {
-                            doctor_warn("Config is unsealed — run 'opaque setup --seal'");
-                            warn_count += 1;
-                        }
-                        Ok(SealStatus::Tampered { .. }) => {
-                            doctor_fail(
-                                "Config seal BROKEN — run 'opaque setup --reset' then reconfigure",
-                            );
-                            fail_count += 1;
-                        }
-                        Err(e) => {
-                            doctor_warn(&format!("Seal check error: {e}"));
-                            warn_count += 1;
-                        }
+                Ok(config_bytes) => match seal::verify_seal(&config_bytes, &seal_file) {
+                    Ok(SealStatus::Verified) => {
+                        doctor_pass("Config seal verified");
+                        pass_count += 1;
                     }
-                }
+                    Ok(SealStatus::Unsealed) => {
+                        doctor_warn("Config is unsealed — run 'opaque setup --seal'");
+                        warn_count += 1;
+                    }
+                    Ok(SealStatus::Tampered { .. }) => {
+                        doctor_fail(
+                            "Config seal BROKEN — run 'opaque setup --reset' then reconfigure",
+                        );
+                        fail_count += 1;
+                    }
+                    Err(e) => {
+                        doctor_warn(&format!("Seal check error: {e}"));
+                        warn_count += 1;
+                    }
+                },
                 Err(e) => {
                     doctor_warn(&format!("Cannot read config for seal check: {e}"));
                     warn_count += 1;
@@ -2230,7 +3165,35 @@ async fn run_doctor() {
         doctor_skip("Daemon connectivity (no socket)");
     }
 
-    // 6. Service status
+    // 6. Daemon/CLI version skew
+    if sock.exists() {
+        match tokio::time::timeout(Duration::from_secs(5), try_daemon_version(&sock)).await {
+            Ok(Ok(daemon_version)) => {
+                let cli_version = version_string();
+                if daemon_version == cli_version {
+                    doctor_pass(&format!("Daemon version matches CLI ({cli_version})"));
+                    pass_count += 1;
+                } else {
+                    doctor_warn(&format!(
+                        "Daemon version ({daemon_version}) differs from CLI ({cli_version}) — restart/rebuild to avoid protocol skew"
+                    ));
+                    warn_count += 1;
+                }
+            }
+            Ok(Err(e)) => {
+                doctor_warn(&format!("Cannot read daemon version: {e}"));
+                warn_count += 1;
+            }
+            Err(_) => {
+                doctor_warn("Daemon version check timed out (5s)");
+                warn_count += 1;
+            }
+        }
+    } else {
+        doctor_skip("Daemon version skew (no socket)");
+    }
+
+    // 7. Service status
     {
         let status = service::query_status();
         if status.installed {
@@ -2251,7 +3214,44 @@ async fn run_doctor() {
         }
     }
 
-    // 7. 1Password backends
+    // 8. opaque-mcp skew
+    let mcp_paths = discover_opaque_mcp_binaries();
+    if mcp_paths.is_empty() {
+        doctor_info("opaque-mcp binary not found (skipping MCP skew check)");
+    } else {
+        let cli_version = version_string().to_string();
+        for path in mcp_paths {
+            match read_binary_version(&path, "opaque-mcp") {
+                Ok(mcp_version) => {
+                    if mcp_version == cli_version {
+                        doctor_pass(&format!(
+                            "opaque-mcp matches CLI version ({}) at {}",
+                            mcp_version,
+                            path.display()
+                        ));
+                        pass_count += 1;
+                    } else {
+                        doctor_warn(&format!(
+                            "opaque-mcp version ({}) at {} differs from CLI ({})",
+                            mcp_version,
+                            path.display(),
+                            cli_version
+                        ));
+                        warn_count += 1;
+                    }
+                }
+                Err(e) => {
+                    doctor_warn(&format!(
+                        "Could not determine opaque-mcp version at {}: {e}",
+                        path.display()
+                    ));
+                    warn_count += 1;
+                }
+            }
+        }
+    }
+
+    // 9. 1Password backends
     let op_cli_found = match std::process::Command::new("which")
         .arg("op")
         .stdout(std::process::Stdio::piped())
@@ -2275,7 +3275,7 @@ async fn run_doctor() {
         doctor_info("No 1Password backend — install op CLI or set OPAQUE_1PASSWORD_URL");
     }
 
-    // 8. Profiles directory
+    // 10. Profiles directory
     let profiles_dir = base.join("profiles");
     if profiles_dir.exists() {
         let count = std::fs::read_dir(&profiles_dir)
@@ -2292,7 +3292,7 @@ async fn run_doctor() {
         doctor_info("No profiles directory (sandbox features unavailable)");
     }
 
-    // 9. Audit database
+    // 11. Audit database
     let audit_db = base.join("audit.db");
     if audit_db.exists() {
         if let Ok(meta) = std::fs::metadata(&audit_db) {
@@ -2356,10 +3356,13 @@ async fn try_ping(sock: &Path) -> Result<(), String> {
     let mut framed = Framed::new(stream, codec);
 
     // Handshake.
-    let handshake = serde_json::json!({
+    let mut handshake = serde_json::json!({
         "handshake": "v1",
         "daemon_token": daemon_token,
     });
+    if let Some(session_token) = session_token_from_env() {
+        handshake["session_token"] = serde_json::Value::String(session_token);
+    }
     let hs_bytes = serde_json::to_vec(&handshake).map_err(|e| format!("serialize: {e}"))?;
     framed
         .send(Bytes::from(hs_bytes))
@@ -2394,20 +3397,93 @@ async fn try_ping(sock: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Query daemon version over IPC.
+async fn try_daemon_version(sock: &Path) -> Result<String, String> {
+    let resp = call(&sock.to_path_buf(), "version", serde_json::Value::Null)
+        .await
+        .map_err(|e| format!("{e}"))?;
+    if let Some(err) = resp.error {
+        return Err(format!("{}: {}", err.code, err.message));
+    }
+    resp.result
+        .and_then(|v| v.get("version").and_then(|s| s.as_str()).map(str::to_owned))
+        .ok_or_else(|| "missing version in daemon response".to_string())
+}
+
+fn discover_opaque_mcp_binaries() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Ok(current) = std::env::current_exe() {
+        let sibling = current.with_file_name("opaque-mcp");
+        if sibling.exists() && seen.insert(sibling.clone()) {
+            out.push(sibling);
+        }
+    }
+
+    if let Some(on_path) = resolve_on_path("opaque-mcp")
+        && seen.insert(on_path.clone())
+    {
+        out.push(on_path);
+    }
+
+    out
+}
+
+fn resolve_on_path(binary: &str) -> Option<PathBuf> {
+    let path_var = std::env::var("PATH").ok()?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(binary);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn read_binary_version(path: &Path, binary_name: &str) -> Result<String, String> {
+    let output = std::process::Command::new(path)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| format!("spawn failed: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}\n{stderr}");
+    parse_version_from_output(&combined, binary_name).ok_or_else(|| {
+        format!(
+            "unable to parse version output (exit={})",
+            output.status.code().unwrap_or(-1)
+        )
+    })
+}
+
+fn parse_version_from_output(output: &str, binary_name: &str) -> Option<String> {
+    for line in output.lines() {
+        if let Some(idx) = line.find(binary_name) {
+            let tail = &line[idx + binary_name.len()..];
+            for token in tail.split_whitespace() {
+                let cleaned = token.trim_matches(|c: char| {
+                    !c.is_ascii_alphanumeric() && c != '.' && c != '+' && c != '-'
+                });
+                if cleaned.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                    return Some(cleaned.to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
 fn doctor_pass(msg: &str) {
-    println!(
-        "  {} {}",
-        style(ui::CHECK).green(),
-        msg
-    );
+    println!("  {} {}", style(ui::CHECK).green(), msg);
 }
 
 fn doctor_fail(msg: &str) {
-    println!(
-        "  {} {}",
-        style(ui::CROSS).red(),
-        style(msg).red()
-    );
+    println!("  {} {}", style(ui::CROSS).red(), style(msg).red());
 }
 
 fn doctor_warn(msg: &str) {
@@ -2419,19 +3495,11 @@ fn doctor_warn(msg: &str) {
 }
 
 fn doctor_info(msg: &str) {
-    println!(
-        "  {} {}",
-        style(ui::INFO_ICON).dim(),
-        style(msg).dim()
-    );
+    println!("  {} {}", style(ui::INFO_ICON).dim(), style(msg).dim());
 }
 
 fn doctor_skip(msg: &str) {
-    println!(
-        "  {} {}",
-        style("—").dim(),
-        style(msg).dim()
-    );
+    println!("  {} {}", style("—").dim(), style(msg).dim());
 }
 
 /// Create a directory with mode 0700 if it does not already exist.
@@ -2759,6 +3827,7 @@ lease_ttl = 0
         assert!(get_preset("safe-demo").is_some());
         assert!(get_preset("github-secrets").is_some());
         assert!(get_preset("sandbox-human").is_some());
+        assert!(get_preset("agent-wrapper-github").is_some());
         assert!(get_preset("nonexistent").is_none());
     }
 
@@ -2766,9 +3835,15 @@ lease_ttl = 0
     fn presets_are_valid_toml() {
         for (name, _, content) in available_presets() {
             let result: Result<PolicyConfig, _> = toml_edit::de::from_str(content);
-            assert!(result.is_ok(), "preset '{name}' is not valid TOML: {result:?}");
+            assert!(
+                result.is_ok(),
+                "preset '{name}' is not valid TOML: {result:?}"
+            );
             let config = result.unwrap();
-            assert!(!config.rules.is_empty(), "preset '{name}' should have at least one rule");
+            assert!(
+                !config.rules.is_empty(),
+                "preset '{name}' should have at least one rule"
+            );
         }
     }
 
@@ -2931,13 +4006,7 @@ lease_ttl = 300
     fn policy_simulate_deny_no_matching_rule() {
         let (_dir, path) = write_config(sample_rule_toml());
         // Use an operation not covered by any rule.
-        let result = policy_simulate(
-            Some(path.as_path()),
-            "sandbox.exec",
-            "human",
-            &[],
-            &[],
-        );
+        let result = policy_simulate(Some(path.as_path()), "sandbox.exec", "human", &[], &[]);
         // Should succeed (prints the deny decision).
         assert!(result.is_ok());
     }
@@ -2982,5 +4051,100 @@ lease_ttl = 300
             &["GH_TOKEN".into()],
         );
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn parse_env_names_accepts_comments_and_export() {
+        let env = r#"
+# comment
+FOO=bar
+export BAR=baz
+BAZ=
+"#;
+        let names = parse_env_names(env).unwrap();
+        assert_eq!(names, vec!["FOO", "BAR", "BAZ"]);
+    }
+
+    #[test]
+    fn parse_env_names_rejects_duplicate_names() {
+        let env = "FOO=1\nFOO=2\n";
+        let err = parse_env_names(env).unwrap_err();
+        assert!(err.contains("duplicate env name"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_env_names_rejects_invalid_name() {
+        let env = "BAD-NAME=value\n";
+        let err = parse_env_names(env).unwrap_err();
+        assert!(err.contains("invalid env name"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_env_names_rejects_missing_equals() {
+        let env = "FOO\n";
+        let err = parse_env_names(env).unwrap_err();
+        assert!(err.contains("expected KEY=VALUE"), "got: {err}");
+    }
+
+    #[test]
+    fn render_value_ref_replaces_name_placeholder() {
+        let value_ref = render_value_ref("bitwarden:production/{name}", "DATABASE_URL").unwrap();
+        assert_eq!(value_ref, "bitwarden:production/DATABASE_URL");
+    }
+
+    #[test]
+    fn render_value_ref_requires_placeholder() {
+        let err = render_value_ref("bitwarden:production", "DATABASE_URL").unwrap_err();
+        assert!(err.contains("must include '{name}'"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_env_manifest_rejects_duplicate_secret_name() {
+        let manifest = EnvManifest {
+            format: manifest_format_v1(),
+            repo: Some("acme/repo".into()),
+            environment: None,
+            entries: vec![
+                EnvManifestEntry {
+                    secret_name: "DATABASE_URL".into(),
+                    value_ref: "bitwarden:prod/DATABASE_URL".into(),
+                },
+                EnvManifestEntry {
+                    secret_name: "DATABASE_URL".into(),
+                    value_ref: "bitwarden:prod/DATABASE_URL_ALT".into(),
+                },
+            ],
+        };
+        let err = validate_env_manifest(&manifest).unwrap_err();
+        assert!(err.contains("duplicate secret_name"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_env_manifest_rejects_invalid_value_ref() {
+        let manifest = EnvManifest {
+            format: manifest_format_v1(),
+            repo: Some("acme/repo".into()),
+            environment: None,
+            entries: vec![EnvManifestEntry {
+                secret_name: "DATABASE_URL".into(),
+                value_ref: "plaintext://not-allowed".into(),
+            }],
+        };
+        let err = validate_env_manifest(&manifest).unwrap_err();
+        assert!(err.contains("invalid value_ref"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_version_from_output_extracts_plain_version() {
+        let output = "opaque-mcp 0.1.0+abc1234";
+        let version = parse_version_from_output(output, "opaque-mcp");
+        assert_eq!(version.as_deref(), Some("0.1.0+abc1234"));
+    }
+
+    #[test]
+    fn parse_version_from_output_extracts_from_tracing_line() {
+        let output = "2026-02-21T06:38:23Z INFO opaque_mcp: opaque-mcp 0.1.0+fd008f0 starting";
+        let version = parse_version_from_output(output, "opaque-mcp");
+        assert_eq!(version.as_deref(), Some("0.1.0+fd008f0"));
     }
 }

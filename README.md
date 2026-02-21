@@ -82,6 +82,12 @@ Full MCP docs: `docs/mcp-integration.md`
    opaque execute test.noop
    ```
 
+Optional: run your agent through Opaque wrapper mode (session-scoped):
+
+```bash
+opaque agent run -- codex
+```
+
 4. Sync a GitHub secret:
    ```bash
    opaque github set-secret \
@@ -90,7 +96,22 @@ Full MCP docs: `docs/mcp-integration.md`
      --value-ref keychain:opaque/api-key
    ```
 
-5. Review the audit log:
+5. Build a refs-only manifest from `.env.example` and publish through Opaque:
+   ```bash
+   opaque github build-manifest \
+     --env-file .env.example \
+     --value-ref-template 'bitwarden:production/{name}' \
+     --out .opaque/env-manifest.json
+   ```
+
+   Manually edit `.opaque/env-manifest.json` if any refs need adjustment, then publish:
+   ```bash
+   opaque github publish-manifest \
+     --repo myorg/myrepo \
+     --manifest-file .opaque/env-manifest.json
+   ```
+
+6. Review the audit log:
    ```bash
    opaque audit tail --limit 10
    ```
@@ -106,6 +127,7 @@ opaque policy presets                        # list available presets
 opaque init --preset safe-demo               # test.noop only (safe to experiment)
 opaque init --preset github-secrets          # GitHub secret sync for agents
 opaque init --preset sandbox-human           # sandbox exec for humans only
+opaque init --preset agent-wrapper-github    # wrapped-agent GitHub sync with session enforcement
 ```
 
 Or apply a preset to an existing config:

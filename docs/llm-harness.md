@@ -26,6 +26,12 @@ For tools without MCP support (e.g., Codex), the agent runs `opaque ...` CLI com
 
 Both paths go through the same daemon and policy engine. The MCP server is a thin adapter over the same Unix socket IPC.
 
+For stronger local isolation, launch the agent via wrapper mode:
+
+- `opaque agent run -- <agent-command ...>`
+
+This injects a session token used by Opaque handshakes. If `enforce_agent_sessions = true` is enabled in daemon config, non-session agent calls are rejected.
+
 ## Secret Inputs: Refs, Not Values
 
 Operations accept **secret references** (refs), not raw values.
@@ -85,6 +91,13 @@ Then call:
 - `github.set_codespaces_secret(secret_name, value_ref, ...)`
 - `github.set_dependabot_secret(repo, secret_name, value_ref)`
 - `github.set_org_secret(org, secret_name, value_ref, ...)`
+
+CLI batching workflow (still routes through Opaque per secret):
+
+- `opaque github build-manifest --env-file .env.example --value-ref-template 'bitwarden:production/{name}' --out .opaque/env-manifest.json`
+- Review/update `.opaque/env-manifest.json` manually (refs only; no plaintext secrets).
+- `opaque github publish-manifest --repo <owner/repo> --manifest-file .opaque/env-manifest.json`
+- Use `--dry-run` on `publish-manifest` to preview without publishing.
 
 ### "Run tests that need secrets"
 
