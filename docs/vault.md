@@ -65,7 +65,9 @@ opaque github set-secret \
 Shipped in this phase:
 
 - Vault KV field resolution through `vault:` refs
+- Dynamic secret engine field resolution (for example `database/creds/...`)
+- Lease-aware caching for dynamic refs using Vault `lease_duration`
 
 Still deferred:
 
-- Dynamic secret engines and lease lifecycle management
+- Lease renewal and explicit lease revocation flows
