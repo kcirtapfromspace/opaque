@@ -7,6 +7,7 @@
 - Bitwarden Secrets Manager: `docs/bitwarden.md`
 - HashiCorp Vault: `docs/vault.md`
 - LLM harness: `docs/llm-harness.md`
+- Web dashboard: `docs/web-dashboard.md`
 - Demo recordings: `docs/demos.md`
 - Deployment guide (macOS LaunchAgent, Linux systemd user service + polkit): `docs/deployment.md`
 - Architecture (broader design notes, includes deferred items): `docs/architecture.md`

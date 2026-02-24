@@ -1,0 +1,1738 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Opaque Dashboard</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0d1117;--panel:#161b22;--border:#21262d;--border-hi:#30363d;
+  --text:#e6edf3;--dim:#7d8590;--muted:#484f58;
+  --green:#3fb950;--green-dim:#238636;--red:#f85149;--red-dim:#da3633;
+  --amber:#d29922;--blue:#58a6ff;--cyan:#39d353;--purple:#bc8cff;
+  --mono:'SF Mono','Cascadia Code','Fira Code','JetBrains Mono',Consolas,monospace;
+}
+html,body{
+  height:100%;
+  background:var(--bg);
+  color:var(--text);
+  font-family:var(--mono);
+  font-size:13px;
+  overflow:hidden;
+}
+body{
+  display:flex;
+  flex-direction:column;
+}
+
+/* ===== Scrollbar ===== */
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border-hi);border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:var(--muted)}
+
+/* ===== CRT Scanline overlay ===== */
+body::before{
+  content:'';
+  position:fixed;
+  top:0;left:0;right:0;bottom:0;
+  background:repeating-linear-gradient(
+    0deg,transparent,transparent 2px,rgba(0,0,0,.03) 2px,rgba(0,0,0,.03) 4px
+  );
+  pointer-events:none;
+  z-index:9999;
+}
+
+/* ===== Header ===== */
+header{
+  height:48px;
+  min-height:48px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  padding:0 20px;
+  background:var(--panel);
+  border-bottom:1px solid var(--border);
+  gap:16px;
+  flex-shrink:0;
+}
+.logo{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  font-size:15px;
+  font-weight:700;
+  letter-spacing:0.5px;
+}
+.logo-icon{
+  width:28px;height:28px;
+  border-radius:6px;
+  background:linear-gradient(135deg,var(--green-dim),var(--green));
+  display:flex;align-items:center;justify-content:center;
+  font-size:14px;font-weight:900;color:var(--bg);
+}
+.header-right{
+  display:flex;
+  align-items:center;
+  gap:16px;
+  font-size:11px;
+  color:var(--dim);
+}
+.mode-indicator{
+  display:flex;
+  align-items:center;
+  gap:6px;
+  padding:4px 10px;
+  border-radius:4px;
+  background:var(--bg);
+  border:1px solid var(--border);
+  font-size:11px;
+  font-weight:600;
+  letter-spacing:0.5px;
+}
+.mode-dot{
+  width:8px;height:8px;
+  border-radius:50%;
+  display:inline-block;
+}
+.mode-dot.live{
+  background:var(--green);
+  box-shadow:0 0 6px var(--green);
+}
+.mode-dot.demo{
+  background:var(--amber);
+  box-shadow:0 0 6px var(--amber);
+}
+.version-text{
+  font-size:10px;
+  color:var(--muted);
+  letter-spacing:0.3px;
+}
+
+/* ===== Tab Bar ===== */
+.tab-bar{
+  display:flex;
+  align-items:center;
+  gap:0;
+  background:var(--panel);
+  border-bottom:1px solid var(--border);
+  padding:0 20px;
+  flex-shrink:0;
+}
+.tab-btn{
+  padding:10px 18px;
+  border:none;
+  background:transparent;
+  color:var(--dim);
+  font-family:var(--mono);
+  font-size:12px;
+  font-weight:600;
+  cursor:pointer;
+  border-bottom:2px solid transparent;
+  transition:all .15s;
+  letter-spacing:0.3px;
+}
+.tab-btn:hover{
+  color:var(--text);
+  background:rgba(255,255,255,.03);
+}
+.tab-btn.active{
+  color:var(--green);
+  border-bottom-color:var(--green);
+}
+
+/* ===== Content Area ===== */
+.content{
+  flex:1;
+  overflow-y:auto;
+  padding:16px 20px;
+}
+.tab-panel{
+  display:none;
+}
+.tab-panel.active{
+  display:block;
+}
+
+/* ===== Audit Tab ===== */
+.audit-toolbar{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  margin-bottom:12px;
+  flex-wrap:wrap;
+}
+.audit-toolbar select,
+.audit-toolbar input[type="text"]{
+  background:var(--bg);
+  border:1px solid var(--border);
+  color:var(--text);
+  font-family:var(--mono);
+  font-size:11px;
+  padding:6px 10px;
+  border-radius:4px;
+  outline:none;
+}
+.audit-toolbar select:focus,
+.audit-toolbar input[type="text"]:focus{
+  border-color:var(--blue);
+}
+.audit-toolbar input[type="text"]{
+  min-width:140px;
+}
+.audit-toolbar input[type="text"]::placeholder{
+  color:var(--muted);
+}
+.audit-toolbar select{
+  cursor:pointer;
+  min-width:100px;
+}
+.btn{
+  padding:6px 14px;
+  border:1px solid var(--border);
+  background:var(--border-hi);
+  color:var(--text);
+  font-family:var(--mono);
+  font-size:11px;
+  border-radius:4px;
+  cursor:pointer;
+  transition:all .15s;
+  font-weight:600;
+}
+.btn:hover{
+  border-color:var(--blue);
+  color:var(--blue);
+}
+.btn-green{
+  background:var(--green-dim);
+  border-color:var(--green-dim);
+}
+.btn-green:hover{
+  background:var(--green);
+  border-color:var(--green);
+  color:var(--text);
+}
+.btn-small{
+  padding:4px 10px;
+  font-size:10px;
+}
+.toolbar-spacer{
+  flex:1;
+}
+
+/* Audit event list */
+.audit-list{
+  display:flex;
+  flex-direction:column;
+  gap:1px;
+}
+.audit-event{
+  display:grid;
+  grid-template-columns:80px 20px 1fr auto auto auto;
+  gap:8px;
+  align-items:center;
+  padding:6px 12px;
+  border-radius:4px;
+  font-size:11px;
+  cursor:pointer;
+  transition:background .1s;
+  background:var(--panel);
+  border:1px solid transparent;
+}
+.audit-event:hover{
+  background:var(--border);
+  border-color:var(--border-hi);
+}
+.audit-event.expanded{
+  background:var(--border);
+  border-color:var(--border-hi);
+  border-bottom-left-radius:0;
+  border-bottom-right-radius:0;
+}
+.audit-ts{
+  color:var(--muted);
+  font-size:10px;
+  white-space:nowrap;
+}
+.audit-icon{
+  text-align:center;
+  font-size:13px;
+}
+.audit-icon.ok{color:var(--green)}
+.audit-icon.denied{color:var(--red)}
+.audit-icon.error{color:var(--red)}
+.audit-icon.warn{color:var(--amber)}
+.audit-kind{
+  color:var(--text);
+  font-weight:500;
+}
+.audit-operation{
+  color:var(--blue);
+  font-size:10px;
+}
+.outcome-badge{
+  font-size:9px;
+  padding:2px 6px;
+  border-radius:3px;
+  font-weight:700;
+  letter-spacing:0.3px;
+  text-transform:uppercase;
+}
+.outcome-badge.ok{
+  background:rgba(63,185,80,.15);
+  color:var(--green);
+}
+.outcome-badge.denied{
+  background:rgba(248,81,73,.15);
+  color:var(--red);
+}
+.outcome-badge.error{
+  background:rgba(248,81,73,.15);
+  color:var(--red);
+}
+.outcome-badge.warn{
+  background:rgba(210,153,34,.15);
+  color:var(--amber);
+}
+.audit-latency{
+  color:var(--muted);
+  font-size:10px;
+  min-width:50px;
+  text-align:right;
+}
+.audit-detail-panel{
+  background:var(--bg);
+  border:1px solid var(--border-hi);
+  border-top:none;
+  border-bottom-left-radius:4px;
+  border-bottom-right-radius:4px;
+  padding:12px 16px;
+  margin-bottom:4px;
+  overflow-x:auto;
+}
+.audit-detail-panel pre{
+  font-size:11px;
+  line-height:1.6;
+  white-space:pre-wrap;
+  word-break:break-all;
+}
+.audit-empty{
+  text-align:center;
+  padding:40px 20px;
+  color:var(--muted);
+  font-style:italic;
+}
+.audit-paused-banner{
+  display:none;
+  align-items:center;
+  gap:8px;
+  padding:6px 12px;
+  background:rgba(210,153,34,.1);
+  border:1px solid rgba(210,153,34,.3);
+  border-radius:4px;
+  color:var(--amber);
+  font-size:11px;
+  margin-bottom:8px;
+}
+.audit-paused-banner.visible{
+  display:flex;
+}
+
+/* ===== Policy Tab ===== */
+.policy-info-bar{
+  display:flex;
+  align-items:center;
+  gap:16px;
+  padding:12px 16px;
+  background:var(--panel);
+  border:1px solid var(--border);
+  border-radius:6px;
+  margin-bottom:16px;
+  flex-wrap:wrap;
+}
+.policy-info-item{
+  display:flex;
+  align-items:center;
+  gap:6px;
+  font-size:11px;
+  color:var(--dim);
+}
+.policy-info-item .label{
+  color:var(--muted);
+  font-size:10px;
+  text-transform:uppercase;
+  letter-spacing:0.5px;
+}
+.policy-info-item .value{
+  color:var(--text);
+  font-weight:500;
+}
+.policy-info-item .icon{
+  font-size:14px;
+}
+
+.policy-rules-list{
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+}
+.policy-card{
+  background:var(--panel);
+  border:1px solid var(--border);
+  border-radius:6px;
+  padding:14px 16px;
+  transition:border-color .15s;
+}
+.policy-card:hover{
+  border-color:var(--border-hi);
+}
+.policy-card-header{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  margin-bottom:8px;
+}
+.policy-card-name{
+  font-weight:700;
+  font-size:13px;
+  color:var(--text);
+}
+.policy-card-effect{
+  font-size:9px;
+  padding:2px 8px;
+  border-radius:3px;
+  font-weight:700;
+  letter-spacing:0.5px;
+  text-transform:uppercase;
+}
+.policy-card-effect.allow{
+  background:rgba(63,185,80,.15);
+  color:var(--green);
+}
+.policy-card-effect.deny{
+  background:rgba(248,81,73,.15);
+  color:var(--red);
+}
+.policy-card-body{
+  display:flex;
+  flex-direction:column;
+  gap:4px;
+  font-size:11px;
+}
+.policy-card-row{
+  display:flex;
+  align-items:center;
+  gap:8px;
+}
+.policy-card-label{
+  color:var(--muted);
+  min-width:80px;
+  font-size:10px;
+  text-transform:uppercase;
+  letter-spacing:0.5px;
+}
+.policy-card-value{
+  color:var(--dim);
+}
+.policy-card-value.pattern{
+  color:var(--blue);
+  font-weight:600;
+}
+.policy-no-config{
+  text-align:center;
+  padding:40px 20px;
+  color:var(--muted);
+  font-style:italic;
+}
+
+/* ===== Sessions Tab ===== */
+.sessions-header{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  margin-bottom:12px;
+}
+.sessions-header h2{
+  font-size:14px;
+  font-weight:700;
+  color:var(--text);
+}
+.sessions-table{
+  width:100%;
+  border-collapse:collapse;
+  font-size:11px;
+}
+.sessions-table thead{
+  position:sticky;
+  top:0;
+  z-index:1;
+}
+.sessions-table th{
+  text-align:left;
+  padding:8px 12px;
+  background:var(--panel);
+  border-bottom:1px solid var(--border);
+  color:var(--muted);
+  font-size:10px;
+  text-transform:uppercase;
+  letter-spacing:0.8px;
+  font-weight:600;
+}
+.sessions-table td{
+  padding:8px 12px;
+  border-bottom:1px solid var(--border);
+  color:var(--text);
+}
+.sessions-table tbody tr{
+  transition:background .1s;
+}
+.sessions-table tbody tr:hover{
+  background:var(--panel);
+}
+.session-id{
+  font-family:var(--mono);
+  color:var(--blue);
+  font-weight:500;
+}
+.session-ttl{
+  font-family:var(--mono);
+  font-weight:600;
+}
+.session-ttl.expiring{
+  color:var(--amber);
+}
+.session-ttl.healthy{
+  color:var(--green);
+}
+.sessions-empty{
+  text-align:center;
+  padding:40px 20px;
+  color:var(--muted);
+  font-style:italic;
+}
+
+/* ===== Operations Tab ===== */
+.ops-group{
+  margin-bottom:20px;
+}
+.ops-group-header{
+  font-size:12px;
+  font-weight:700;
+  color:var(--dim);
+  text-transform:uppercase;
+  letter-spacing:1px;
+  padding:8px 0;
+  margin-bottom:6px;
+  border-bottom:1px solid var(--border);
+  display:flex;
+  align-items:center;
+  gap:8px;
+}
+.ops-group-header .provider-icon{
+  font-size:14px;
+}
+.ops-list{
+  display:flex;
+  flex-direction:column;
+  gap:4px;
+}
+.op-card{
+  display:grid;
+  grid-template-columns:1fr auto auto auto;
+  gap:10px;
+  align-items:center;
+  padding:10px 14px;
+  background:var(--panel);
+  border:1px solid var(--border);
+  border-radius:4px;
+  transition:border-color .15s;
+}
+.op-card:hover{
+  border-color:var(--border-hi);
+}
+.op-card-info{
+  display:flex;
+  flex-direction:column;
+  gap:2px;
+}
+.op-card-name{
+  font-weight:600;
+  font-size:12px;
+  color:var(--text);
+}
+.op-card-desc{
+  font-size:10px;
+  color:var(--dim);
+}
+.safety-badge{
+  font-size:9px;
+  padding:2px 6px;
+  border-radius:3px;
+  font-weight:700;
+  letter-spacing:0.3px;
+  text-transform:uppercase;
+}
+.safety-badge.safe{
+  background:rgba(63,185,80,.15);
+  color:var(--green);
+}
+.safety-badge.sensitive{
+  background:rgba(210,153,34,.15);
+  color:var(--amber);
+}
+.safety-badge.reveal{
+  background:rgba(248,81,73,.15);
+  color:var(--red);
+}
+.mcp-badge{
+  font-size:9px;
+  padding:2px 6px;
+  border-radius:3px;
+  font-weight:700;
+  letter-spacing:0.3px;
+}
+.mcp-badge.exposed{
+  background:rgba(63,185,80,.15);
+  color:var(--green);
+}
+.mcp-badge.internal{
+  background:rgba(125,133,144,.1);
+  color:var(--muted);
+}
+.approval-text{
+  font-size:10px;
+  color:var(--muted);
+}
+
+/* ===== JSON Syntax Highlighting ===== */
+.json-key{color:var(--blue)}
+.json-str{color:var(--green)}
+.json-num{color:var(--amber)}
+.json-bool{color:var(--cyan)}
+.json-null{color:var(--muted)}
+
+/* ===== Responsive ===== */
+@media (max-width: 768px) {
+  .audit-event{
+    grid-template-columns:60px 20px 1fr auto;
+  }
+  .audit-operation,
+  .audit-latency{
+    display:none;
+  }
+  .op-card{
+    grid-template-columns:1fr;
+    gap:6px;
+  }
+  .policy-info-bar{
+    flex-direction:column;
+    gap:8px;
+  }
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-icon">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M8 1L2 4v4c0 3.5 2.5 6.4 6 7 3.5-.6 6-3.5 6-7V4L8 1z" fill="#0d1117" stroke="#0d1117" stroke-width="0.5"/>
+        <path d="M8 2L3 4.5v3.5c0 2.9 2.1 5.3 5 5.9 2.9-.6 5-3 5-5.9V4.5L8 2z" fill="none" stroke="#0d1117" stroke-width="0.8"/>
+      </svg>
+    </div>
+    <span>OPAQUE</span>
+    <span style="color:var(--dim);font-size:11px;font-weight:400">dashboard</span>
+  </div>
+  <div class="header-right">
+    <div class="mode-indicator" id="mode-indicator">
+      <span class="mode-dot demo" id="mode-dot"></span>
+      <span id="mode-label">DEMO</span>
+    </div>
+    <span class="version-text" id="version-text"></span>
+  </div>
+</header>
+
+<nav class="tab-bar">
+  <button class="tab-btn active" data-tab="audit" onclick="switchTab('audit')">Audit</button>
+  <button class="tab-btn" data-tab="policy" onclick="switchTab('policy')">Policy</button>
+  <button class="tab-btn" data-tab="sessions" onclick="switchTab('sessions')">Sessions</button>
+  <button class="tab-btn" data-tab="operations" onclick="switchTab('operations')">Operations</button>
+</nav>
+
+<div class="content">
+  <!-- ===== AUDIT TAB ===== -->
+  <div class="tab-panel active" id="panel-audit">
+    <div class="audit-toolbar">
+      <select id="filter-kind">
+        <option value="">All Kinds</option>
+        <option value="request.received">request.received</option>
+        <option value="policy.allowed">policy.allowed</option>
+        <option value="policy.denied">policy.denied</option>
+        <option value="approval.granted">approval.granted</option>
+        <option value="approval.denied">approval.denied</option>
+        <option value="operation.succeeded">operation.succeeded</option>
+        <option value="operation.failed">operation.failed</option>
+        <option value="lease.hit">lease.hit</option>
+        <option value="lease.expired">lease.expired</option>
+        <option value="session.created">session.created</option>
+        <option value="session.revoked">session.revoked</option>
+        <option value="secret.resolved">secret.resolved</option>
+      </select>
+      <input type="text" id="filter-operation" placeholder="Operation...">
+      <select id="filter-outcome">
+        <option value="">All Outcomes</option>
+        <option value="ok">ok</option>
+        <option value="denied">denied</option>
+        <option value="error">error</option>
+      </select>
+      <input type="text" id="filter-q" placeholder="Search...">
+      <button class="btn btn-green" onclick="applyFilters()">Apply</button>
+      <div class="toolbar-spacer"></div>
+      <button class="btn btn-small" id="pause-btn" onclick="togglePause()">Pause</button>
+      <button class="btn btn-small" onclick="clearAudit()">Clear</button>
+    </div>
+    <div class="audit-paused-banner" id="paused-banner">
+      Streaming paused. New events are being buffered.
+      <button class="btn btn-small" onclick="togglePause()" style="margin-left:auto">Resume</button>
+    </div>
+    <div class="audit-list" id="audit-list">
+      <div class="audit-empty" id="audit-empty">Connecting to audit stream...</div>
+    </div>
+  </div>
+
+  <!-- ===== POLICY TAB ===== -->
+  <div class="tab-panel" id="panel-policy">
+    <div class="policy-info-bar" id="policy-info-bar">
+      <div class="policy-info-item">
+        <span class="label">Config</span>
+        <span class="value" id="policy-config-path">--</span>
+      </div>
+      <div class="policy-info-item">
+        <span class="icon" id="policy-seal-icon"></span>
+        <span class="value" id="policy-seal-status">Unsealed</span>
+      </div>
+      <div class="policy-info-item">
+        <span class="label">Agent Sessions</span>
+        <span class="value" id="policy-agent-sessions">--</span>
+      </div>
+      <div class="policy-info-item">
+        <span class="label">Session TTL</span>
+        <span class="value" id="policy-session-ttl">--</span>
+      </div>
+    </div>
+    <div class="policy-rules-list" id="policy-rules-list">
+      <div class="policy-no-config">Loading policy...</div>
+    </div>
+  </div>
+
+  <!-- ===== SESSIONS TAB ===== -->
+  <div class="tab-panel" id="panel-sessions">
+    <div class="sessions-header">
+      <h2>Agent Sessions</h2>
+      <button class="btn" onclick="loadSessions()">Refresh</button>
+    </div>
+    <div id="sessions-content">
+      <div class="sessions-empty">Loading sessions...</div>
+    </div>
+  </div>
+
+  <!-- ===== OPERATIONS TAB ===== -->
+  <div class="tab-panel" id="panel-operations">
+    <div id="operations-content">
+      <div class="audit-empty">Loading operations...</div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ============================================================================
+// STATE
+// ============================================================================
+
+var state = {
+  mode: 'demo',
+  daemonRunning: false,
+  daemonVersion: null,
+  activeTab: 'audit',
+  auditEvents: [],
+  auditPaused: false,
+  auditBuffer: [],
+  expandedEvent: null,
+  sseSource: null,
+  demoTimer: null,
+  demoSeqCounter: 100,
+  statusTimer: null,
+  sessionCountdownTimer: null,
+  sessionsData: [],
+};
+
+// ============================================================================
+// DOM HELPERS
+// ============================================================================
+
+function el(tag, attrs, children) {
+  var node = document.createElement(tag);
+  if (attrs) {
+    for (var key in attrs) {
+      if (!attrs.hasOwnProperty(key)) continue;
+      if (key === 'className') {
+        node.className = attrs[key];
+      } else if (key === 'textContent') {
+        node.textContent = attrs[key];
+      } else if (key.indexOf('on') === 0) {
+        node.addEventListener(key.slice(2).toLowerCase(), attrs[key]);
+      } else if (key === 'style' && typeof attrs[key] === 'object') {
+        for (var sk in attrs[key]) {
+          if (attrs[key].hasOwnProperty(sk)) node.style[sk] = attrs[key][sk];
+        }
+      } else {
+        node.setAttribute(key, attrs[key]);
+      }
+    }
+  }
+  if (children !== undefined && children !== null) {
+    if (typeof children === 'string') {
+      node.textContent = children;
+    } else if (Array.isArray(children)) {
+      for (var i = 0; i < children.length; i++) {
+        if (children[i]) node.appendChild(children[i]);
+      }
+    } else if (children.nodeType) {
+      node.appendChild(children);
+    }
+  }
+  return node;
+}
+
+function txt(s) {
+  return document.createTextNode(s);
+}
+
+/**
+ * Render a JSON object as syntax-highlighted DOM nodes (no innerHTML).
+ * Keys are blue, strings green, numbers amber, booleans cyan, null muted.
+ */
+function jsonToHighlightedDom(obj) {
+  var json = JSON.stringify(obj, null, 2);
+  if (!json) return document.createTextNode('');
+
+  var frag = document.createDocumentFragment();
+  var pre = document.createElement('pre');
+  pre.style.fontSize = '11px';
+  pre.style.lineHeight = '1.6';
+  pre.style.whiteSpace = 'pre-wrap';
+  pre.style.wordBreak = 'break-all';
+
+  // Tokenize JSON string into spans with appropriate classes.
+  // We walk through character by character.
+  var i = 0;
+  var len = json.length;
+
+  function appendPlain(text) {
+    if (text.length > 0) {
+      pre.appendChild(txt(text));
+    }
+  }
+
+  function appendSpan(text, cls) {
+    var span = document.createElement('span');
+    span.className = cls;
+    span.textContent = text;
+    pre.appendChild(span);
+  }
+
+  // Track whether the last non-whitespace before a value was a colon.
+  // If so, the string is a value; otherwise it is a key.
+  var afterColon = false;
+
+  while (i < len) {
+    var ch = json[i];
+
+    // String literal
+    if (ch === '"') {
+      var start = i;
+      i++; // skip opening quote
+      while (i < len && json[i] !== '"') {
+        if (json[i] === '\\') i++; // skip escaped char
+        i++;
+      }
+      i++; // skip closing quote
+      var str = json.slice(start, i);
+
+      if (afterColon) {
+        appendSpan(str, 'json-str');
+        afterColon = false;
+      } else {
+        // It is a key if followed by ':'
+        var peek = i;
+        while (peek < len && (json[peek] === ' ' || json[peek] === '\n' || json[peek] === '\r' || json[peek] === '\t')) peek++;
+        if (peek < len && json[peek] === ':') {
+          appendSpan(str, 'json-key');
+        } else {
+          appendSpan(str, 'json-str');
+        }
+      }
+      continue;
+    }
+
+    // Number
+    if ((ch >= '0' && ch <= '9') || ch === '-') {
+      var nStart = i;
+      if (ch === '-') i++;
+      while (i < len && ((json[i] >= '0' && json[i] <= '9') || json[i] === '.' || json[i] === 'e' || json[i] === 'E' || json[i] === '+' || json[i] === '-')) {
+        // Avoid re-matching the leading minus
+        if ((json[i] === '+' || json[i] === '-') && json[i-1] !== 'e' && json[i-1] !== 'E') break;
+        i++;
+      }
+      appendSpan(json.slice(nStart, i), 'json-num');
+      afterColon = false;
+      continue;
+    }
+
+    // true / false / null
+    if (json.slice(i, i+4) === 'true') {
+      appendSpan('true', 'json-bool');
+      i += 4;
+      afterColon = false;
+      continue;
+    }
+    if (json.slice(i, i+5) === 'false') {
+      appendSpan('false', 'json-bool');
+      i += 5;
+      afterColon = false;
+      continue;
+    }
+    if (json.slice(i, i+4) === 'null') {
+      appendSpan('null', 'json-null');
+      i += 4;
+      afterColon = false;
+      continue;
+    }
+
+    // Colon
+    if (ch === ':') {
+      afterColon = true;
+      appendPlain(ch);
+      i++;
+      continue;
+    }
+
+    // Comma, braces, brackets, whitespace
+    if (ch === ',' || ch === '{' || ch === '}' || ch === '[' || ch === ']') {
+      afterColon = false;
+      appendPlain(ch);
+      i++;
+      continue;
+    }
+
+    // Whitespace and anything else
+    appendPlain(ch);
+    i++;
+  }
+
+  frag.appendChild(pre);
+  return frag;
+}
+
+// ============================================================================
+// TAB SWITCHING
+// ============================================================================
+
+function switchTab(tab) {
+  state.activeTab = tab;
+
+  var buttons = document.querySelectorAll('.tab-btn');
+  for (var i = 0; i < buttons.length; i++) {
+    var btn = buttons[i];
+    if (btn.getAttribute('data-tab') === tab) {
+      btn.classList.add('active');
+    } else {
+      btn.classList.remove('active');
+    }
+  }
+
+  var panels = document.querySelectorAll('.tab-panel');
+  for (var j = 0; j < panels.length; j++) {
+    var panel = panels[j];
+    if (panel.id === 'panel-' + tab) {
+      panel.classList.add('active');
+    } else {
+      panel.classList.remove('active');
+    }
+  }
+
+  if (tab === 'policy') loadPolicy();
+  if (tab === 'sessions') loadSessions();
+  if (tab === 'operations') loadOperations();
+}
+
+// ============================================================================
+// STATUS POLLING
+// ============================================================================
+
+function pollStatus() {
+  fetch('/api/status')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      var prevMode = state.mode;
+      state.mode = data.mode || 'demo';
+      state.daemonRunning = data.daemon_running || false;
+      state.daemonVersion = data.daemon_version || null;
+      updateModeIndicator();
+
+      if (prevMode !== state.mode) {
+        refreshCurrentTab();
+        reconnectSSE();
+      }
+    })
+    .catch(function() {
+      state.mode = 'demo';
+      state.daemonRunning = false;
+      updateModeIndicator();
+    });
+}
+
+function updateModeIndicator() {
+  var dot = document.getElementById('mode-dot');
+  var label = document.getElementById('mode-label');
+  var versionEl = document.getElementById('version-text');
+
+  if (state.mode === 'live') {
+    dot.className = 'mode-dot live';
+    label.textContent = 'LIVE';
+  } else {
+    dot.className = 'mode-dot demo';
+    label.textContent = 'DEMO';
+  }
+
+  if (state.daemonVersion) {
+    versionEl.textContent = 'v' + state.daemonVersion;
+  } else {
+    versionEl.textContent = '';
+  }
+}
+
+function refreshCurrentTab() {
+  switch (state.activeTab) {
+    case 'audit':
+      applyFilters();
+      break;
+    case 'policy':
+      loadPolicy();
+      break;
+    case 'sessions':
+      loadSessions();
+      break;
+    case 'operations':
+      loadOperations();
+      break;
+  }
+}
+
+// ============================================================================
+// UTILITIES
+// ============================================================================
+
+function relativeTime(tsMs) {
+  var now = Date.now();
+  var diff = now - tsMs;
+  if (diff < 0) diff = 0;
+
+  var seconds = Math.floor(diff / 1000);
+  if (seconds < 5) return 'just now';
+  if (seconds < 60) return seconds + 's ago';
+
+  var minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return minutes + 'm ago';
+
+  var hours = Math.floor(minutes / 60);
+  if (hours < 24) return hours + 'h ago';
+
+  var days = Math.floor(hours / 24);
+  return days + 'd ago';
+}
+
+function absoluteTime(tsMs) {
+  var d = new Date(tsMs);
+  var h = String(d.getHours()).padStart(2, '0');
+  var m = String(d.getMinutes()).padStart(2, '0');
+  var s = String(d.getSeconds()).padStart(2, '0');
+  return h + ':' + m + ':' + s;
+}
+
+function formatTimestamp(tsMs) {
+  var now = Date.now();
+  var diff = now - tsMs;
+  if (diff < 600000) {
+    return relativeTime(tsMs);
+  }
+  return absoluteTime(tsMs);
+}
+
+function formatTtl(secs) {
+  if (secs <= 0) return '0s';
+  var h = Math.floor(secs / 3600);
+  var m = Math.floor((secs % 3600) / 60);
+  var s = Math.floor(secs % 60);
+  var parts = [];
+  if (h > 0) parts.push(h + 'h');
+  if (m > 0 || h > 0) parts.push(m + 'm');
+  parts.push(s + 's');
+  return parts.join(' ');
+}
+
+// ============================================================================
+// AUDIT TAB
+// ============================================================================
+
+function outcomeClass(event) {
+  var outcome = (event.outcome || '').toLowerCase();
+  if (outcome === 'ok') return 'ok';
+  if (outcome === 'denied') return 'denied';
+  if (outcome === 'error') return 'error';
+
+  var kind = (event.kind || '').toLowerCase();
+  if (kind.indexOf('denied') !== -1) return 'denied';
+  if (kind.indexOf('failed') !== -1) return 'error';
+  if (kind.indexOf('error') !== -1) return 'error';
+  if (kind.indexOf('warn') !== -1) return 'warn';
+  return 'ok';
+}
+
+function outcomeIcon(cls) {
+  switch (cls) {
+    case 'ok': return '\u2713';
+    case 'denied': return '\u2717';
+    case 'error': return '\u2717';
+    case 'warn': return '\u26A0';
+    default: return '\u2022';
+  }
+}
+
+function buildAuditEventRow(event, index) {
+  var cls = outcomeClass(event);
+  var ts = event.ts_utc_ms ? formatTimestamp(event.ts_utc_ms) : '--';
+  var kind = event.kind || '--';
+  var operation = event.operation || '';
+  var outcome = event.outcome || '';
+  var latency = event.latency_ms ? event.latency_ms + 'ms' : '';
+  var isExpanded = state.expandedEvent === index;
+
+  var row = el('div', {
+    className: 'audit-event' + (isExpanded ? ' expanded' : ''),
+    onClick: function() { toggleEventDetail(index); }
+  }, [
+    el('span', { className: 'audit-ts' }, ts),
+    el('span', { className: 'audit-icon ' + cls }, outcomeIcon(cls)),
+    el('span', { className: 'audit-kind' }, kind),
+    el('span', { className: 'audit-operation' }, operation),
+    outcome
+      ? el('span', { className: 'outcome-badge ' + cls }, outcome)
+      : el('span'),
+    el('span', { className: 'audit-latency' }, latency),
+  ]);
+
+  var frag = document.createDocumentFragment();
+  frag.appendChild(row);
+
+  if (isExpanded) {
+    var detail = el('div', { className: 'audit-detail-panel' });
+    detail.appendChild(jsonToHighlightedDom(event));
+    frag.appendChild(detail);
+  }
+
+  return frag;
+}
+
+function renderAuditList() {
+  var list = document.getElementById('audit-list');
+  list.textContent = '';
+
+  if (state.auditEvents.length === 0) {
+    var msg = state.mode === 'demo'
+      ? 'Demo mode active. Synthetic events will appear shortly.'
+      : 'No audit events. Waiting for activity...';
+    list.appendChild(el('div', { className: 'audit-empty' }, msg));
+    return;
+  }
+
+  for (var i = 0; i < state.auditEvents.length; i++) {
+    list.appendChild(buildAuditEventRow(state.auditEvents[i], i));
+  }
+}
+
+function prependAuditEvent(event) {
+  if (state.auditPaused) {
+    state.auditBuffer.push(event);
+    return;
+  }
+
+  // Remove duplicates by event_id
+  if (event.event_id) {
+    for (var i = 0; i < state.auditEvents.length; i++) {
+      if (state.auditEvents[i].event_id === event.event_id) return;
+    }
+  }
+
+  state.auditEvents.unshift(event);
+
+  // Cap at 200 events
+  if (state.auditEvents.length > 200) {
+    state.auditEvents = state.auditEvents.slice(0, 200);
+  }
+
+  renderAuditList();
+}
+
+function toggleEventDetail(index) {
+  if (state.expandedEvent === index) {
+    state.expandedEvent = null;
+  } else {
+    state.expandedEvent = index;
+  }
+  renderAuditList();
+}
+
+function togglePause() {
+  state.auditPaused = !state.auditPaused;
+  var btn = document.getElementById('pause-btn');
+  var banner = document.getElementById('paused-banner');
+
+  if (state.auditPaused) {
+    btn.textContent = 'Resume';
+    banner.classList.add('visible');
+  } else {
+    btn.textContent = 'Pause';
+    banner.classList.remove('visible');
+
+    // Flush buffer
+    var buffered = state.auditBuffer.slice();
+    state.auditBuffer = [];
+    for (var i = 0; i < buffered.length; i++) {
+      prependAuditEvent(buffered[i]);
+    }
+  }
+}
+
+function clearAudit() {
+  state.auditEvents = [];
+  state.auditBuffer = [];
+  state.expandedEvent = null;
+  renderAuditList();
+}
+
+function applyFilters() {
+  var kind = document.getElementById('filter-kind').value;
+  var operation = document.getElementById('filter-operation').value.trim();
+  var outcome = document.getElementById('filter-outcome').value;
+  var q = document.getElementById('filter-q').value.trim();
+
+  var params = new URLSearchParams();
+  if (kind) params.set('kind', kind);
+  if (operation) params.set('operation', operation);
+  if (outcome) params.set('outcome', outcome);
+  if (q) params.set('q', q);
+  params.set('limit', '100');
+
+  fetch('/api/audit?' + params.toString())
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      state.auditEvents = data.events || [];
+      state.expandedEvent = null;
+      renderAuditList();
+    })
+    .catch(function() {
+      // Silently ignore on connection failure
+    });
+}
+
+// ============================================================================
+// SSE STREAM
+// ============================================================================
+
+function connectSSE() {
+  if (state.sseSource) {
+    state.sseSource.close();
+    state.sseSource = null;
+  }
+
+  try {
+    state.sseSource = new EventSource('/api/audit/stream');
+  } catch (e) {
+    startDemoMode();
+    return;
+  }
+
+  state.sseSource.addEventListener('audit', function(e) {
+    try {
+      var event = JSON.parse(e.data);
+      prependAuditEvent(event);
+    } catch (err) {
+      // Ignore parse errors
+    }
+  });
+
+  state.sseSource.addEventListener('demo', function() {
+    startDemoMode();
+  });
+
+  state.sseSource.onerror = function() {
+    // On error, fall back to demo mode after a delay
+    setTimeout(function() {
+      if (state.sseSource && state.sseSource.readyState === EventSource.CLOSED) {
+        startDemoMode();
+      }
+    }, 3000);
+  };
+}
+
+function reconnectSSE() {
+  stopDemoMode();
+  connectSSE();
+}
+
+// ============================================================================
+// DEMO MODE
+// ============================================================================
+
+var DEMO_OPERATIONS = [
+  'github.set_actions_secret',
+  'github.set_codespaces_secret',
+  'github.set_dependabot_secret',
+  'github.set_org_secret',
+  'github.list_secrets',
+  'github.delete_secret',
+  'gitlab.set_ci_variable',
+  'onepassword.list_vaults',
+  'onepassword.list_items',
+  'bitwarden.list_projects',
+  'bitwarden.list_secrets',
+  'sandbox.exec',
+  'test.noop',
+];
+
+var DEMO_KINDS = [
+  'request.received',
+  'policy.allowed',
+  'policy.denied',
+  'approval.granted',
+  'operation.succeeded',
+  'operation.failed',
+  'lease.hit',
+  'session.created',
+];
+
+var DEMO_DETAILS = [
+  'repo=acme/api secret=DATABASE_URL',
+  'project=infra/deploy key=DEPLOY_TOKEN',
+  'factor=local_bio cached=true',
+  'SENSITIVE_OUTPUT blocked for agent clients',
+  'reused existing approval lease',
+  'matched rule github.* [any] ALLOW',
+  'default deny (no matching rule)',
+  '1Password CLI not found',
+  'session label=claude-code-main',
+  'vault=Engineering item=API Keys',
+  'created new agent session ttl=3600',
+  'secret_name=NPM_TOKEN scope=actions',
+];
+
+function randomItem(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function generateUUID() {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+    var r = Math.random() * 16 | 0;
+    var v = c === 'x' ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
+}
+
+function generateDemoEvent() {
+  var kind = randomItem(DEMO_KINDS);
+  var operation = randomItem(DEMO_OPERATIONS);
+  var outcome = 'ok';
+  var level = 'info';
+  var safety = 'Safe';
+  var latency = null;
+
+  if (kind === 'policy.denied') {
+    outcome = 'denied';
+    level = 'warn';
+  } else if (kind === 'operation.failed') {
+    outcome = 'error';
+    level = 'error';
+    latency = Math.floor(Math.random() * 5000) + 500;
+  } else if (kind === 'operation.succeeded') {
+    latency = Math.floor(Math.random() * 2000) + 50;
+  } else if (kind === 'approval.granted') {
+    latency = Math.floor(Math.random() * 3000) + 200;
+  }
+
+  if (operation === 'sandbox.exec') safety = 'SensitiveOutput';
+  if (operation === 'onepassword.read_field' || operation === 'bitwarden.read_secret') safety = 'Reveal';
+
+  state.demoSeqCounter++;
+
+  return {
+    event_id: generateUUID(),
+    sequence_number: state.demoSeqCounter,
+    ts_utc_ms: Date.now(),
+    level: level,
+    kind: kind,
+    request_id: generateUUID(),
+    operation: operation,
+    safety: safety,
+    outcome: outcome,
+    latency_ms: latency,
+    detail: randomItem(DEMO_DETAILS),
+  };
+}
+
+function startDemoMode() {
+  if (state.demoTimer) return;
+
+  function scheduleNext() {
+    var delay = 3000 + Math.floor(Math.random() * 2000);
+    state.demoTimer = setTimeout(function() {
+      var event = generateDemoEvent();
+      prependAuditEvent(event);
+      scheduleNext();
+    }, delay);
+  }
+
+  scheduleNext();
+}
+
+function stopDemoMode() {
+  if (state.demoTimer) {
+    clearTimeout(state.demoTimer);
+    state.demoTimer = null;
+  }
+}
+
+// ============================================================================
+// POLICY TAB
+// ============================================================================
+
+function loadPolicy() {
+  fetch('/api/policy')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      renderPolicy(data);
+    })
+    .catch(function() {
+      var target = document.getElementById('policy-rules-list');
+      target.textContent = '';
+      target.appendChild(el('div', { className: 'policy-no-config' }, 'Failed to load policy configuration.'));
+    });
+}
+
+function renderPolicy(data) {
+  // Info bar
+  document.getElementById('policy-config-path').textContent = data.config_path || '--';
+
+  var sealIcon = document.getElementById('policy-seal-icon');
+  var sealStatus = document.getElementById('policy-seal-status');
+  if (data.sealed) {
+    sealIcon.textContent = '\uD83D\uDD12';
+    sealStatus.textContent = 'Sealed';
+    sealStatus.style.color = 'var(--green)';
+  } else {
+    sealIcon.textContent = '\uD83D\uDD13';
+    sealStatus.textContent = 'Unsealed';
+    sealStatus.style.color = 'var(--amber)';
+  }
+
+  var agentSessions = document.getElementById('policy-agent-sessions');
+  agentSessions.textContent = data.enforce_agent_sessions ? 'Enforced' : 'Not enforced';
+  agentSessions.style.color = data.enforce_agent_sessions ? 'var(--green)' : 'var(--dim)';
+
+  var sessionTtl = document.getElementById('policy-session-ttl');
+  if (data.agent_session_ttl_secs) {
+    sessionTtl.textContent = formatTtl(data.agent_session_ttl_secs);
+  } else {
+    sessionTtl.textContent = '--';
+  }
+
+  // Rules
+  var list = document.getElementById('policy-rules-list');
+  var rules = data.rules || [];
+  list.textContent = '';
+
+  if (rules.length === 0) {
+    list.appendChild(el('div', { className: 'policy-no-config' }, 'No policy rules configured. Using default deny.'));
+    return;
+  }
+
+  for (var i = 0; i < rules.length; i++) {
+    list.appendChild(buildPolicyCard(rules[i]));
+  }
+}
+
+function buildPolicyCard(rule) {
+  var isAllow = rule.allow === true;
+  var effectClass = isAllow ? 'allow' : 'deny';
+  var effectLabel = isAllow ? 'ALLOW' : 'DENY';
+
+  var header = el('div', { className: 'policy-card-header' }, [
+    el('span', { className: 'policy-card-name' }, rule.name || 'unnamed'),
+    el('span', { className: 'policy-card-effect ' + effectClass }, effectLabel),
+  ]);
+
+  var bodyChildren = [];
+
+  // Pattern row
+  bodyChildren.push(el('div', { className: 'policy-card-row' }, [
+    el('span', { className: 'policy-card-label' }, 'Pattern'),
+    el('span', { className: 'policy-card-value pattern' }, rule.operation_pattern || '*'),
+  ]));
+
+  // Client types
+  if (rule.client_types && rule.client_types.length > 0) {
+    bodyChildren.push(el('div', { className: 'policy-card-row' }, [
+      el('span', { className: 'policy-card-label' }, 'Clients'),
+      el('span', { className: 'policy-card-value' }, rule.client_types.join(', ')),
+    ]));
+  }
+
+  // Approval config
+  if (rule.approval) {
+    var approvalParts = [];
+    if (rule.approval.require) {
+      approvalParts.push('Require: ' + rule.approval.require);
+    }
+    if (rule.approval.factors && rule.approval.factors.length > 0) {
+      approvalParts.push('Factors: ' + rule.approval.factors.join(', '));
+    }
+    if (rule.approval.lease_ttl) {
+      approvalParts.push('Lease TTL: ' + formatTtl(rule.approval.lease_ttl));
+    }
+    if (approvalParts.length > 0) {
+      bodyChildren.push(el('div', { className: 'policy-card-row' }, [
+        el('span', { className: 'policy-card-label' }, 'Approval'),
+        el('span', { className: 'policy-card-value' }, approvalParts.join(' | ')),
+      ]));
+    }
+  }
+
+  var body = el('div', { className: 'policy-card-body' }, bodyChildren);
+
+  return el('div', { className: 'policy-card' }, [header, body]);
+}
+
+// ============================================================================
+// SESSIONS TAB
+// ============================================================================
+
+function loadSessions() {
+  fetch('/api/sessions')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      state.sessionsData = data.sessions || [];
+      renderSessions();
+      startSessionCountdown();
+    })
+    .catch(function() {
+      var target = document.getElementById('sessions-content');
+      target.textContent = '';
+      target.appendChild(el('div', { className: 'sessions-empty' }, 'Failed to load sessions.'));
+    });
+}
+
+function startSessionCountdown() {
+  if (state.sessionCountdownTimer) {
+    clearInterval(state.sessionCountdownTimer);
+  }
+  state.sessionCountdownTimer = setInterval(function() {
+    if (state.activeTab === 'sessions' && state.sessionsData.length > 0) {
+      for (var i = 0; i < state.sessionsData.length; i++) {
+        if (state.sessionsData[i].ttl_remaining_secs > 0) {
+          state.sessionsData[i].ttl_remaining_secs--;
+        }
+      }
+      renderSessions();
+    }
+  }, 1000);
+}
+
+function renderSessions() {
+  var container = document.getElementById('sessions-content');
+  var sessions = state.sessionsData;
+  container.textContent = '';
+
+  if (!sessions || sessions.length === 0) {
+    container.appendChild(el('div', { className: 'sessions-empty' }, 'No active agent sessions'));
+    return;
+  }
+
+  var table = el('table', { className: 'sessions-table' });
+
+  // thead
+  var thead = el('thead');
+  var headerRow = el('tr', null, [
+    el('th', null, 'Session ID'),
+    el('th', null, 'Label'),
+    el('th', null, 'TTL Remaining'),
+    el('th', null, 'Expires At'),
+  ]);
+  thead.appendChild(headerRow);
+  table.appendChild(thead);
+
+  // tbody
+  var tbody = el('tbody');
+  for (var i = 0; i < sessions.length; i++) {
+    var s = sessions[i];
+    var ttl = s.ttl_remaining_secs || 0;
+    var ttlClass = ttl < 300 ? 'expiring' : 'healthy';
+    var expiresAt = s.expires_at_utc_ms
+      ? new Date(s.expires_at_utc_ms).toLocaleString()
+      : '--';
+
+    var tr = el('tr', null, [
+      el('td', null, [el('span', { className: 'session-id' }, s.session_id || '--')]),
+      el('td', null, s.label || '--'),
+      el('td', null, [el('span', { className: 'session-ttl ' + ttlClass }, formatTtl(ttl))]),
+      el('td', null, expiresAt),
+    ]);
+    tbody.appendChild(tr);
+  }
+
+  table.appendChild(tbody);
+  container.appendChild(table);
+}
+
+// ============================================================================
+// OPERATIONS TAB
+// ============================================================================
+
+var PROVIDER_ICONS = {
+  'github': '\u25C6',
+  'gitlab': '\u25C7',
+  '1password': '\u29C9',
+  'bitwarden': '\u229E',
+  'vault': '\u2394',
+  'sandbox': '\u25A3',
+  'test': '\u25CB',
+};
+
+var PROVIDER_ORDER = ['github', 'gitlab', '1password', 'bitwarden', 'vault', 'sandbox', 'test'];
+
+function loadOperations() {
+  fetch('/api/operations')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      renderOperations(data.operations || []);
+    })
+    .catch(function() {
+      var target = document.getElementById('operations-content');
+      target.textContent = '';
+      target.appendChild(el('div', { className: 'audit-empty' }, 'Failed to load operations.'));
+    });
+}
+
+function renderOperations(operations) {
+  var container = document.getElementById('operations-content');
+  container.textContent = '';
+
+  // Group by provider
+  var groups = {};
+  for (var i = 0; i < operations.length; i++) {
+    var op = operations[i];
+    var provider = op.provider || 'unknown';
+    if (!groups[provider]) groups[provider] = [];
+    groups[provider].push(op);
+  }
+
+  // Determine render order
+  var orderedProviders = PROVIDER_ORDER.slice();
+  for (var p in groups) {
+    if (groups.hasOwnProperty(p) && orderedProviders.indexOf(p) === -1) {
+      orderedProviders.push(p);
+    }
+  }
+
+  for (var j = 0; j < orderedProviders.length; j++) {
+    var prov = orderedProviders[j];
+    if (!groups[prov]) continue;
+    var ops = groups[prov];
+    var icon = PROVIDER_ICONS[prov] || '\u2022';
+
+    var groupDiv = el('div', { className: 'ops-group' });
+
+    // Group header
+    groupDiv.appendChild(el('div', { className: 'ops-group-header' }, [
+      el('span', { className: 'provider-icon' }, icon),
+      txt(prov),
+    ]));
+
+    // Operations list
+    var listDiv = el('div', { className: 'ops-list' });
+
+    for (var k = 0; k < ops.length; k++) {
+      var o = ops[k];
+      var safetyClass = 'safe';
+      var safetyLabel = 'SAFE';
+      if (o.safety === 'SensitiveOutput') {
+        safetyClass = 'sensitive';
+        safetyLabel = 'SENSITIVE';
+      } else if (o.safety === 'Reveal') {
+        safetyClass = 'reveal';
+        safetyLabel = 'REVEAL';
+      }
+
+      var mcpClass = o.mcp_exposed ? 'exposed' : 'internal';
+      var mcpLabel = o.mcp_exposed ? 'MCP' : 'Internal';
+
+      var approvalText = o.default_approval || '--';
+
+      var card = el('div', { className: 'op-card' }, [
+        el('div', { className: 'op-card-info' }, [
+          el('span', { className: 'op-card-name' }, o.name || '--'),
+          el('span', { className: 'op-card-desc' }, o.description || ''),
+        ]),
+        el('span', { className: 'safety-badge ' + safetyClass }, safetyLabel),
+        el('span', { className: 'mcp-badge ' + mcpClass }, mcpLabel),
+        el('span', { className: 'approval-text' }, approvalText),
+      ]);
+
+      listDiv.appendChild(card);
+    }
+
+    groupDiv.appendChild(listDiv);
+    container.appendChild(groupDiv);
+  }
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+function init() {
+  // Initial status poll
+  pollStatus();
+
+  // Poll status every 10 seconds
+  state.statusTimer = setInterval(pollStatus, 10000);
+
+  // Load initial audit data
+  applyFilters();
+
+  // Connect SSE for live audit events
+  connectSSE();
+
+  // Update relative timestamps every 15 seconds
+  setInterval(function() {
+    if (state.activeTab === 'audit' && state.auditEvents.length > 0) {
+      renderAuditList();
+    }
+  }, 15000);
+}
+
+init();
+</script>
+</body>
+</html>

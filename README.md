@@ -20,6 +20,7 @@ Opaque sits between your AI coding assistant and your secrets. LLMs get **operat
 - MCP server for Claude Code integration
 - Providers: GitHub secrets, 1Password, Bitwarden Secrets Manager
 - Policy presets for common workflows
+- Web dashboard with live audit streaming and demo mode
 
 ## Install (From Source)
 
@@ -34,6 +35,7 @@ Binaries:
 | `opaqued` | Trusted daemon (enclave, policy, approvals, audit) |
 | `opaque` | CLI client |
 | `opaque-mcp` | MCP server for Claude Code |
+| `opaque-web` | Live dashboard & demo explorer (localhost web UI) |
 
 ## Quickstart: Claude Code (MCP)
 
@@ -125,6 +127,12 @@ opaque agent run -- codex
    opaque audit tail --query github --limit 10
    ```
 
+7. Launch the web dashboard:
+   ```bash
+   opaque-web --open
+   ```
+   Opens a browser to `http://127.0.0.1:7380` with live audit streaming, policy viewer, session monitor, and operations registry. Works without the daemon in demo mode with simulated data.
+
 Full CLI docs: `docs/getting-started.md`
 
 ## Policy Presets
@@ -166,6 +174,7 @@ opaque policy preset github-secrets
 - Policy: `docs/policy.md`
 - Operations: `docs/operations.md`
 - LLM harness: `docs/llm-harness.md`
+- Web dashboard: `docs/web-dashboard.md`
 - Demos: `docs/demos.md`
 - Deployment: `docs/deployment.md`
 - Security assessment: `docs/security-assessment.md`
