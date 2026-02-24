@@ -47,6 +47,18 @@ zeroize = { version = "1.8", features = ["derive"] }
 console = "0.15"
 dialoguer = "0.11"
 indicatif = "0.17"
+jsonwebtoken = "9"
 wiremock = "0.6"
+p256 = { version = "0.13", features = ["ecdsa"] }
+chrono = { version = "0.4", features = ["serde"] }
+ring = "0.17"
+ed25519-dalek = { version = "2.1", features = ["rand_core", "serde"] }
+rand = "0.8"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
+rcgen = { version = "0.13", features = ["pem"] }
+tokio-rustls = "0.26"
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"
+mdns-sd = "0.12"
+hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "service", "server-auto"] }

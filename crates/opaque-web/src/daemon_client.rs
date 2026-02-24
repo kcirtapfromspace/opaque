@@ -54,11 +54,7 @@ impl DaemonClient {
 
     /// Send a request to the daemon and return the response.
     /// Returns `None` on any error (connection failure, timeout, protocol error).
-    pub async fn try_call(
-        &self,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Option<Response> {
+    pub async fn try_call(&self, method: &str, params: serde_json::Value) -> Option<Response> {
         self.call(method, params).await.ok()
     }
 

@@ -77,13 +77,13 @@ impl fmt::Debug for OnePasswordHandler {
 
 impl OnePasswordHandler {
     /// Create a handler backed by the Connect Server API.
-    pub fn new(audit: Arc<dyn AuditSink>, base_url: &str) -> Result<Self, String> {
+    pub fn new(audit: Arc<dyn AuditSink>, base_url: &str) -> Result<Self, client::ConnectApiError> {
         let connect_token_ref = std::env::var(CONNECT_TOKEN_REF_ENV)
             .unwrap_or_else(|_| DEFAULT_CONNECT_TOKEN_REF.to_owned());
         Ok(Self {
             audit,
             backend: OnePasswordBackend::ConnectServer {
-                client: OnePasswordClient::new(base_url).map_err(|e| e.to_string())?,
+                client: OnePasswordClient::new(base_url)?,
                 connect_token_ref,
             },
         })
