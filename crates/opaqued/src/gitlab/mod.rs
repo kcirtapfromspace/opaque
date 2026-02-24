@@ -38,11 +38,11 @@ impl fmt::Debug for GitLabHandler {
 }
 
 impl GitLabHandler {
-    pub fn new(audit: Arc<dyn AuditSink>) -> Self {
-        Self {
+    pub fn new(audit: Arc<dyn AuditSink>) -> Result<Self, String> {
+        Ok(Self {
             audit,
-            client: GitLabClient::new(),
-        }
+            client: GitLabClient::new().map_err(|e| e.to_string())?,
+        })
     }
 
     #[cfg(test)]
@@ -292,7 +292,7 @@ mod tests {
     #[test]
     fn handler_debug() {
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = GitLabHandler::new(audit);
+        let handler = GitLabHandler::new(audit).unwrap();
         let debug = format!("{handler:?}");
         assert!(debug.contains("GitLabHandler"));
     }
@@ -300,7 +300,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_operation_rejected() {
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = GitLabHandler::new(audit);
+        let handler = GitLabHandler::new(audit).unwrap();
         let request = make_request("gitlab.unknown", serde_json::json!({}));
         let result = handler.execute(&request).await;
         assert!(result.is_err());
@@ -310,7 +310,7 @@ mod tests {
     #[tokio::test]
     async fn missing_key_rejected() {
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = GitLabHandler::new(audit);
+        let handler = GitLabHandler::new(audit).unwrap();
         let request = make_request(
             "gitlab.set_ci_variable",
             serde_json::json!({
@@ -326,7 +326,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_variable_type_rejected() {
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = GitLabHandler::new(audit);
+        let handler = GitLabHandler::new(audit).unwrap();
         let request = make_request(
             "gitlab.set_ci_variable",
             serde_json::json!({

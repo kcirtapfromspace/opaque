@@ -31,6 +31,9 @@ pub enum BitwardenApiError {
 
     #[error("unexpected Bitwarden Secrets Manager response: status {0}")]
     UnexpectedStatus(u16),
+
+    #[error("{0}")]
+    InvalidUrlScheme(String),
 }
 
 /// A Bitwarden Secrets Manager project.
@@ -61,27 +64,27 @@ pub struct BitwardenSecret {
 }
 
 /// Validate that a URL uses `https://`, allowing `http://` only for localhost.
-fn validate_url_scheme(url: &str) {
+fn validate_url_scheme(url: &str) -> Result<(), BitwardenApiError> {
     if url.starts_with("https://") {
-        return;
+        return Ok(());
     }
     if url.starts_with("http://") {
         if let Some(host_part) = url.strip_prefix("http://") {
             let host = host_part.split('/').next().unwrap_or("");
             let host_no_port = host.split(':').next().unwrap_or("");
             if host_no_port == "localhost" || host_no_port == "127.0.0.1" {
-                return;
+                return Ok(());
             }
         }
-        panic!(
+        return Err(BitwardenApiError::InvalidUrlScheme(format!(
             "insecure HTTP URL rejected: {url}. \
              Only https:// URLs are allowed (http:// is permitted for localhost/127.0.0.1 only)"
-        );
+        )));
     }
-    panic!(
+    Err(BitwardenApiError::InvalidUrlScheme(format!(
         "unsupported URL scheme: {url}. \
          Only https:// URLs are allowed (http:// is permitted for localhost/127.0.0.1 only)"
-    );
+    )))
 }
 
 /// Bitwarden Secrets Manager REST API client.
@@ -101,10 +104,8 @@ impl BitwardenClient {
     }
 
     /// Create a new client pointing at the given Bitwarden Secrets Manager URL.
-    ///
-    /// Panics if the base URL uses `http://` for a non-localhost host.
-    pub fn new(base_url: &str) -> Self {
-        validate_url_scheme(base_url);
+    pub fn new(base_url: &str) -> Result<Self, BitwardenApiError> {
+        validate_url_scheme(base_url)?;
 
         let http = reqwest::Client::builder()
             .user_agent(Self::user_agent())
@@ -112,10 +113,10 @@ impl BitwardenClient {
             .build()
             .expect("failed to build reqwest client");
 
-        Self {
+        Ok(Self {
             http,
             base_url: base_url.trim_end_matches('/').to_owned(),
-        }
+        })
     }
 
     /// List all projects accessible with the given token.
@@ -244,13 +245,13 @@ mod tests {
 
     #[test]
     fn client_stores_base_url_trimmed() {
-        let client = BitwardenClient::new("http://localhost:8080/");
+        let client = BitwardenClient::new("http://localhost:8080/").unwrap();
         assert_eq!(client.base_url, "http://localhost:8080");
     }
 
     #[test]
     fn client_base_url_no_trailing_slash() {
-        let client = BitwardenClient::new("http://localhost:8080");
+        let client = BitwardenClient::new("http://localhost:8080").unwrap();
         assert_eq!(client.base_url, "http://localhost:8080");
     }
 
@@ -364,7 +365,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = BitwardenClient::new(&mock_server.uri());
+        let client = BitwardenClient::new(&mock_server.uri()).unwrap();
         let projects = client.list_projects("test-token").await.unwrap();
 
         assert_eq!(projects.len(), 2);
@@ -385,7 +386,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = BitwardenClient::new(&mock_server.uri());
+        let client = BitwardenClient::new(&mock_server.uri()).unwrap();
         let result = client.list_projects("bad-token").await;
 
         assert!(result.is_err());
@@ -406,7 +407,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = BitwardenClient::new(&mock_server.uri());
+        let client = BitwardenClient::new(&mock_server.uri()).unwrap();
         let result = client.list_projects("token").await;
 
         assert!(result.is_err());
@@ -431,7 +432,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = BitwardenClient::new(&mock_server.uri());
+        let client = BitwardenClient::new(&mock_server.uri()).unwrap();
         let secrets = client.list_secrets("test-token", None).await.unwrap();
 
         assert_eq!(secrets.len(), 2);
@@ -457,7 +458,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = BitwardenClient::new(&mock_server.uri());
+        let client = BitwardenClient::new(&mock_server.uri()).unwrap();
         let secret = client.get_secret("test-token", "sec-123").await.unwrap();
 
         assert_eq!(secret.id, "sec-123");
@@ -478,7 +479,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = BitwardenClient::new(&mock_server.uri());
+        let client = BitwardenClient::new(&mock_server.uri()).unwrap();
         let result = client.get_secret("token", "missing").await;
 
         assert!(result.is_err());
@@ -502,7 +503,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = BitwardenClient::new(&mock_server.uri());
+        let client = BitwardenClient::new(&mock_server.uri()).unwrap();
         let project_id = client
             .find_project_by_name("token", "Staging")
             .await
@@ -523,7 +524,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = BitwardenClient::new(&mock_server.uri());
+        let client = BitwardenClient::new(&mock_server.uri()).unwrap();
         let result = client.find_project_by_name("token", "Nonexistent").await;
 
         assert!(result.is_err());
@@ -547,7 +548,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = BitwardenClient::new(&mock_server.uri());
+        let client = BitwardenClient::new(&mock_server.uri()).unwrap();
         let secret_id = client
             .find_secret_by_key("token", "p1", "API_KEY")
             .await
@@ -594,7 +595,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = BitwardenClient::new(&mock_server.uri());
+        let client = BitwardenClient::new(&mock_server.uri()).unwrap();
         let token = "test-token";
 
         let project_id = client
@@ -626,7 +627,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = BitwardenClient::new(&mock_server.uri());
+        let client = BitwardenClient::new(&mock_server.uri()).unwrap();
         let projects = client.list_projects("my-secret-token").await.unwrap();
         assert!(projects.is_empty());
     }
@@ -647,7 +648,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = BitwardenClient::new(&mock_server.uri());
+        let client = BitwardenClient::new(&mock_server.uri()).unwrap();
         client.list_projects("token").await.unwrap();
     }
 
@@ -663,7 +664,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = BitwardenClient::new(&mock_server.uri());
+        let client = BitwardenClient::new(&mock_server.uri()).unwrap();
         let result = client.list_projects("token").await;
         assert!(matches!(
             result.unwrap_err(),
@@ -683,7 +684,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = BitwardenClient::new(&mock_server.uri());
+        let client = BitwardenClient::new(&mock_server.uri()).unwrap();
         let result = client.list_projects("token").await;
         assert!(matches!(
             result.unwrap_err(),
@@ -693,24 +694,24 @@ mod tests {
 
     #[test]
     fn validate_url_scheme_accepts_https() {
-        validate_url_scheme("https://api.bitwarden.com");
+        validate_url_scheme("https://api.bitwarden.com").unwrap();
     }
 
     #[test]
     fn validate_url_scheme_accepts_localhost_http() {
-        validate_url_scheme("http://localhost:8080");
-        validate_url_scheme("http://127.0.0.1:9000/api");
+        validate_url_scheme("http://localhost:8080").unwrap();
+        validate_url_scheme("http://127.0.0.1:9000/api").unwrap();
     }
 
     #[test]
-    #[should_panic(expected = "insecure HTTP URL rejected")]
     fn validate_url_scheme_rejects_remote_http() {
-        validate_url_scheme("http://api.bitwarden.com");
+        let err = validate_url_scheme("http://api.bitwarden.com").unwrap_err();
+        assert!(err.to_string().contains("insecure HTTP URL rejected"));
     }
 
     #[test]
-    #[should_panic(expected = "unsupported URL scheme")]
     fn validate_url_scheme_rejects_ftp() {
-        validate_url_scheme("ftp://example.com/file");
+        let err = validate_url_scheme("ftp://example.com/file").unwrap_err();
+        assert!(err.to_string().contains("unsupported URL scheme"));
     }
 }

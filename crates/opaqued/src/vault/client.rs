@@ -31,30 +31,33 @@ pub enum VaultApiError {
 
     #[error("unexpected Vault API response: status {0}")]
     UnexpectedStatus(u16),
+
+    #[error("{0}")]
+    InvalidUrlScheme(String),
 }
 
 /// Validate that a URL uses `https://`, allowing `http://` only for localhost.
-fn validate_url_scheme(url: &str) {
+fn validate_url_scheme(url: &str) -> Result<(), VaultApiError> {
     if url.starts_with("https://") {
-        return;
+        return Ok(());
     }
     if url.starts_with("http://") {
         if let Some(host_part) = url.strip_prefix("http://") {
             let host = host_part.split('/').next().unwrap_or("");
             let host_no_port = host.split(':').next().unwrap_or("");
             if host_no_port == "localhost" || host_no_port == "127.0.0.1" {
-                return;
+                return Ok(());
             }
         }
-        panic!(
+        return Err(VaultApiError::InvalidUrlScheme(format!(
             "insecure HTTP URL rejected: {url}. \
              Only https:// URLs are allowed (http:// is permitted for localhost/127.0.0.1 only)"
-        );
+        )));
     }
-    panic!(
+    Err(VaultApiError::InvalidUrlScheme(format!(
         "unsupported URL scheme: {url}. \
          Only https:// URLs are allowed (http:// is permitted for localhost/127.0.0.1 only)"
-    );
+    )))
 }
 
 /// Percent-encode a single URL path component.
@@ -181,19 +184,19 @@ impl VaultClient {
     }
 
     /// Create a client with env-configured or default base URL.
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self, VaultApiError> {
         let base_url = std::env::var(VAULT_URL_ENV).unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned());
-        validate_url_scheme(&base_url);
+        validate_url_scheme(&base_url)?;
         let http = reqwest::Client::builder()
             .user_agent(Self::user_agent())
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("failed to build reqwest client");
 
-        Self {
+        Ok(Self {
             http,
             base_url: base_url.trim_end_matches('/').to_owned(),
-        }
+        })
     }
 
     /// Create a client at custom base URL (for tests).
@@ -213,6 +216,7 @@ impl VaultClient {
     }
 
     /// Read a single secret field from Vault at the given path.
+    #[allow(dead_code)]
     pub async fn read_secret_field(
         &self,
         token: &str,
@@ -306,7 +310,7 @@ impl VaultClient {
 
 impl Default for VaultClient {
     fn default() -> Self {
-        Self::new()
+        Self::new().expect("invalid Vault URL scheme")
     }
 }
 
@@ -338,19 +342,19 @@ mod tests {
 
     #[test]
     fn validate_url_scheme_accepts_https() {
-        validate_url_scheme("https://vault.example.com");
+        validate_url_scheme("https://vault.example.com").unwrap();
     }
 
     #[test]
     fn validate_url_scheme_accepts_localhost_http() {
-        validate_url_scheme("http://localhost:8200");
-        validate_url_scheme("http://127.0.0.1:8200");
+        validate_url_scheme("http://localhost:8200").unwrap();
+        validate_url_scheme("http://127.0.0.1:8200").unwrap();
     }
 
     #[test]
-    #[should_panic(expected = "insecure HTTP URL rejected")]
     fn validate_url_scheme_rejects_remote_http() {
-        validate_url_scheme("http://vault.example.com");
+        let err = validate_url_scheme("http://vault.example.com").unwrap_err();
+        assert!(err.to_string().contains("insecure HTTP URL rejected"));
     }
 
     #[test]

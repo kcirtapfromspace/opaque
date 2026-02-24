@@ -227,7 +227,7 @@ mod tests {
 
     #[test]
     fn resolver_debug() {
-        let client = BitwardenClient::new("http://localhost:8080");
+        let client = BitwardenClient::new("http://localhost:8080").unwrap();
         let resolver = BitwardenResolver::new(client);
         let debug = format!("{resolver:?}");
         assert!(debug.contains("BitwardenResolver"));

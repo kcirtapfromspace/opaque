@@ -54,14 +54,14 @@ impl fmt::Debug for BitwardenHandler {
 
 impl BitwardenHandler {
     /// Create a handler for the Bitwarden Secrets Manager API.
-    pub fn new(audit: Arc<dyn AuditSink>, base_url: &str) -> Self {
+    pub fn new(audit: Arc<dyn AuditSink>, base_url: &str) -> Result<Self, String> {
         let token_ref =
             std::env::var(TOKEN_REF_ENV).unwrap_or_else(|_| DEFAULT_TOKEN_REF.to_owned());
-        Self {
+        Ok(Self {
             audit,
-            client: BitwardenClient::new(base_url),
+            client: BitwardenClient::new(base_url).map_err(|e| e.to_string())?,
             token_ref,
-        }
+        })
     }
 
     /// Resolve the Bitwarden access token.
@@ -266,7 +266,7 @@ mod tests {
     #[test]
     fn handler_debug() {
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = BitwardenHandler::new(audit, "http://localhost:8080");
+        let handler = BitwardenHandler::new(audit, "http://localhost:8080").unwrap();
         let debug = format!("{handler:?}");
         assert!(debug.contains("BitwardenHandler"));
     }
@@ -274,7 +274,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_operation_rejected() {
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = BitwardenHandler::new(audit, "http://localhost:8080");
+        let handler = BitwardenHandler::new(audit, "http://localhost:8080").unwrap();
         let request = make_request("bitwarden.unknown", serde_json::json!({}));
         let result = handler.execute(&request).await;
         assert!(result.is_err());
@@ -284,7 +284,7 @@ mod tests {
     #[tokio::test]
     async fn read_secret_missing_id_rejected() {
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = BitwardenHandler::new(audit, "http://localhost:8080");
+        let handler = BitwardenHandler::new(audit, "http://localhost:8080").unwrap();
         let request = make_request("bitwarden.read_secret", serde_json::json!({}));
         let result = handler.execute(&request).await;
         assert!(result.is_err());
@@ -311,7 +311,7 @@ mod tests {
         unsafe { std::env::set_var(&token_env, "test-bw-token") };
         unsafe { std::env::set_var(TOKEN_REF_ENV, format!("env:{token_env}")) };
 
-        let handler = BitwardenHandler::new(audit.clone(), &mock_server.uri());
+        let handler = BitwardenHandler::new(audit.clone(), &mock_server.uri()).unwrap();
         (handler, mock_server, audit)
     }
 

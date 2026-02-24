@@ -34,6 +34,9 @@ pub enum GitLabApiError {
 
     #[error("unexpected GitLab API response: status {0}")]
     UnexpectedStatus(u16),
+
+    #[error("{0}")]
+    InvalidUrlScheme(String),
 }
 
 impl GitLabApiError {
@@ -65,27 +68,27 @@ pub struct SetCiVariableOptions<'a> {
 }
 
 /// Validate that a URL uses `https://`, allowing `http://` only for localhost.
-fn validate_url_scheme(url: &str) {
+fn validate_url_scheme(url: &str) -> Result<(), GitLabApiError> {
     if url.starts_with("https://") {
-        return;
+        return Ok(());
     }
     if url.starts_with("http://") {
         if let Some(host_part) = url.strip_prefix("http://") {
             let host = host_part.split('/').next().unwrap_or("");
             let host_no_port = host.split(':').next().unwrap_or("");
             if host_no_port == "localhost" || host_no_port == "127.0.0.1" {
-                return;
+                return Ok(());
             }
         }
-        panic!(
+        return Err(GitLabApiError::InvalidUrlScheme(format!(
             "insecure HTTP URL rejected: {url}. \
              Only https:// URLs are allowed (http:// is permitted for localhost/127.0.0.1 only)"
-        );
+        )));
     }
-    panic!(
+    Err(GitLabApiError::InvalidUrlScheme(format!(
         "unsupported URL scheme: {url}. \
          Only https:// URLs are allowed (http:// is permitted for localhost/127.0.0.1 only)"
-    );
+    )))
 }
 
 /// Percent-encode a single URL path component.
@@ -160,17 +163,17 @@ impl GitLabClient {
     }
 
     /// Create a client with env-configured or default base URL.
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self, GitLabApiError> {
         let base_url =
             std::env::var(GITLAB_API_URL_ENV).unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned());
-        validate_url_scheme(&base_url);
+        validate_url_scheme(&base_url)?;
 
         let http = reqwest::Client::builder()
             .user_agent(Self::user_agent())
             .build()
             .expect("failed to build reqwest client");
 
-        Self { http, base_url }
+        Ok(Self { http, base_url })
     }
 
     /// Create a client at custom base URL (for tests).
@@ -266,7 +269,7 @@ impl GitLabClient {
 
 impl Default for GitLabClient {
     fn default() -> Self {
-        Self::new()
+        Self::new().expect("invalid GitLab URL scheme")
     }
 }
 
@@ -306,25 +309,25 @@ mod tests {
 
     #[test]
     fn validate_url_scheme_accepts_https() {
-        validate_url_scheme("https://gitlab.example.com/api/v4");
+        validate_url_scheme("https://gitlab.example.com/api/v4").unwrap();
     }
 
     #[test]
     fn validate_url_scheme_accepts_localhost_http() {
-        validate_url_scheme("http://localhost:8080/api/v4");
-        validate_url_scheme("http://127.0.0.1:8080/api/v4");
+        validate_url_scheme("http://localhost:8080/api/v4").unwrap();
+        validate_url_scheme("http://127.0.0.1:8080/api/v4").unwrap();
     }
 
     #[test]
-    #[should_panic(expected = "insecure HTTP URL rejected")]
     fn validate_url_scheme_rejects_remote_http() {
-        validate_url_scheme("http://gitlab.example.com/api/v4");
+        let err = validate_url_scheme("http://gitlab.example.com/api/v4").unwrap_err();
+        assert!(err.to_string().contains("insecure HTTP URL rejected"));
     }
 
     #[test]
-    #[should_panic(expected = "unsupported URL scheme")]
     fn validate_url_scheme_rejects_ftp() {
-        validate_url_scheme("ftp://gitlab.example.com/api/v4");
+        let err = validate_url_scheme("ftp://gitlab.example.com/api/v4").unwrap_err();
+        assert!(err.to_string().contains("unsupported URL scheme"));
     }
 
     #[tokio::test]
