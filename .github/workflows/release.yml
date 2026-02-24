@@ -1,0 +1,233 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            use_cross: false
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            use_cross: false
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            use_cross: false
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            use_cross: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "version=${INPUT_TAG}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-${{ matrix.target }}-
+
+      - name: Cache Cargo target directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: cargo-target-${{ matrix.target }}-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-target-${{ matrix.target }}-release-
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --locked
+
+      - name: Build binaries
+        env:
+          USE_CROSS: ${{ matrix.use_cross }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          BUILD_CMD="cargo"
+          if [ "$USE_CROSS" = "true" ]; then
+            BUILD_CMD="cross"
+          fi
+
+          $BUILD_CMD build --release --target "$TARGET" \
+            -p opaqued \
+            -p opaque \
+            -p opaque-mcp \
+            -p opaque-approve-helper
+
+      - name: Strip debug symbols
+        env:
+          USE_CROSS: ${{ matrix.use_cross }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          STRIP_CMD="strip"
+          if [ "$USE_CROSS" = "true" ]; then
+            # For cross-compiled aarch64 Linux, use the cross toolchain strip
+            STRIP_CMD="aarch64-linux-gnu-strip"
+            sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+          fi
+
+          $STRIP_CMD "target/${TARGET}/release/opaqued"
+          $STRIP_CMD "target/${TARGET}/release/opaque"
+          $STRIP_CMD "target/${TARGET}/release/opaque-mcp"
+          $STRIP_CMD "target/${TARGET}/release/opaque-approve-helper"
+
+      - name: Create tarball
+        id: tarball
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          ARCHIVE_NAME="opaque-${VERSION}-${TARGET}"
+          STAGING_DIR="${ARCHIVE_NAME}"
+
+          mkdir -p "${STAGING_DIR}"
+
+          cp "target/${TARGET}/release/opaqued" "${STAGING_DIR}/"
+          cp "target/${TARGET}/release/opaque" "${STAGING_DIR}/"
+          cp "target/${TARGET}/release/opaque-mcp" "${STAGING_DIR}/"
+          cp "target/${TARGET}/release/opaque-approve-helper" "${STAGING_DIR}/"
+          cp LICENSE "${STAGING_DIR}/"
+          cp README.md "${STAGING_DIR}/"
+
+          tar czf "${ARCHIVE_NAME}.tar.gz" "${STAGING_DIR}"
+          echo "archive=${ARCHIVE_NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Generate SHA256 checksum
+        id: checksum
+        env:
+          ARCHIVE: ${{ steps.tarball.outputs.archive }}
+        run: |
+          if command -v sha256sum &> /dev/null; then
+            sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
+          else
+            shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
+          fi
+          echo "checksum=${ARCHIVE}.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            ${{ steps.tarball.outputs.archive }}
+            ${{ steps.checksum.outputs.checksum }}
+          retention-days: 1
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine version
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "version=${INPUT_TAG}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate changelog
+        id: changelog
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --latest --strip header
+        env:
+          OUTPUT: CHANGELOG-release.md
+          GITHUB_REPO: ${{ github.repository }}
+
+      - name: Update CHANGELOG.md
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --tag ${{ steps.version.outputs.version }}
+        env:
+          OUTPUT: CHANGELOG.md
+          GITHUB_REPO: ${{ github.repository }}
+
+      - name: Commit updated CHANGELOG.md
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md
+          git diff --cached --quiet || git commit -m "chore(release): update CHANGELOG.md for ${VERSION}"
+          git push origin HEAD:main
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: release-*
+          merge-multiple: true
+
+      - name: List release assets
+        run: ls -lah artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: Opaque ${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.version, '-') }}
+          body_path: CHANGELOG-release.md
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.sha256
