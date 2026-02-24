@@ -48,6 +48,21 @@ pub enum ResolveError {
 
     #[error("Vault resolution failed for '{0}': {1}")]
     VaultError(String, String),
+
+    #[error("AWS resolution failed for '{0}': {1}")]
+    AwsError(String, String),
+
+    #[error("Azure resolution failed for '{0}': {1}")]
+    AzureError(String, String),
+
+    #[error("GCP resolution failed for '{0}': {1}")]
+    GcpError(String, String),
+
+    #[error("Doppler resolution failed for '{0}': {1}")]
+    DopplerError(String, String),
+
+    #[error("Infisical resolution failed for '{0}': {1}")]
+    InfisicalError(String, String),
 }
 
 // ---------------------------------------------------------------------------

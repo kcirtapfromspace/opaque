@@ -136,7 +136,9 @@ impl VaultResolver {
     fn get_cached_value(key: &str) -> Option<String> {
         let now = Instant::now();
         let cache = Self::lock_cache();
-        if let Some(entry) = cache.get(key).filter(|e| e.expires_at > now) {
+        if let Some(entry) = cache.get(key)
+            && entry.expires_at > now
+        {
             return Some(entry.value.clone());
         }
         None

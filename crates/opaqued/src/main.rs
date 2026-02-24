@@ -30,11 +30,29 @@ use uuid::Uuid;
 const DAEMON_TOKEN_FILENAME: &str = "daemon.token";
 
 mod approval;
+#[allow(dead_code)]
+mod approval_server;
+#[allow(dead_code)]
+mod aws;
+#[allow(dead_code)]
+mod azure;
 mod bitwarden;
+#[allow(dead_code)]
+mod doppler;
 mod enclave;
+#[allow(dead_code)]
+mod fido2;
+#[allow(dead_code)]
+mod gcp;
 mod github;
 mod gitlab;
+#[allow(dead_code)]
+mod infisical;
 mod onepassword;
+#[allow(dead_code)]
+mod pairing;
+#[allow(dead_code)]
+mod push;
 mod sandbox;
 pub mod secret;
 mod vault;
@@ -660,20 +678,20 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
     let audit: Arc<dyn AuditSink> = Arc::new(MultiAuditSink::new(vec![tracing_sink, sqlite_sink]));
 
     let sandbox_executor = sandbox::SandboxExecutor::new(audit.clone());
-    let github_actions_handler = github::GitHubHandler::new(audit.clone())
-        .expect("invalid GitHub API URL scheme");
-    let github_codespaces_handler = github::GitHubHandler::new(audit.clone())
-        .expect("invalid GitHub API URL scheme");
-    let github_dependabot_handler = github::GitHubHandler::new(audit.clone())
-        .expect("invalid GitHub API URL scheme");
-    let github_org_handler = github::GitHubHandler::new(audit.clone())
-        .expect("invalid GitHub API URL scheme");
-    let github_list_handler = github::GitHubHandler::new(audit.clone())
-        .expect("invalid GitHub API URL scheme");
-    let github_delete_handler = github::GitHubHandler::new(audit.clone())
-        .expect("invalid GitHub API URL scheme");
-    let gitlab_handler = gitlab::GitLabHandler::new(audit.clone())
-        .expect("invalid GitLab API URL scheme");
+    let github_actions_handler =
+        github::GitHubHandler::new(audit.clone()).expect("invalid GitHub API URL scheme");
+    let github_codespaces_handler =
+        github::GitHubHandler::new(audit.clone()).expect("invalid GitHub API URL scheme");
+    let github_dependabot_handler =
+        github::GitHubHandler::new(audit.clone()).expect("invalid GitHub API URL scheme");
+    let github_org_handler =
+        github::GitHubHandler::new(audit.clone()).expect("invalid GitHub API URL scheme");
+    let github_list_handler =
+        github::GitHubHandler::new(audit.clone()).expect("invalid GitHub API URL scheme");
+    let github_delete_handler =
+        github::GitHubHandler::new(audit.clone()).expect("invalid GitHub API URL scheme");
+    let gitlab_handler =
+        gitlab::GitLabHandler::new(audit.clone()).expect("invalid GitLab API URL scheme");
 
     // 1Password handler: prefer Connect Server URL, fall back to `op` CLI.
     let onepassword_connect_url =
@@ -704,14 +722,17 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
     if !onepassword_connect_url.is_empty() {
         // Connect Server backend (self-hosted REST API).
         let op_list_vaults_handler =
-            onepassword::OnePasswordHandler::new(audit.clone(), &onepassword_connect_url)
-                .expect("invalid 1Password Connect URL scheme");
+            onepassword::OnePasswordHandler::new(audit.clone(), &onepassword_connect_url).map_err(
+                |e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()),
+            )?;
         let op_list_items_handler =
-            onepassword::OnePasswordHandler::new(audit.clone(), &onepassword_connect_url)
-                .expect("invalid 1Password Connect URL scheme");
+            onepassword::OnePasswordHandler::new(audit.clone(), &onepassword_connect_url).map_err(
+                |e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()),
+            )?;
         let op_read_field_handler =
-            onepassword::OnePasswordHandler::new(audit.clone(), &onepassword_connect_url)
-                .expect("invalid 1Password Connect URL scheme");
+            onepassword::OnePasswordHandler::new(audit.clone(), &onepassword_connect_url).map_err(
+                |e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()),
+            )?;
         enclave_builder = enclave_builder
             .handler("onepassword.list_vaults", Box::new(op_list_vaults_handler))
             .handler("onepassword.list_items", Box::new(op_list_items_handler))
@@ -741,14 +762,17 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         .unwrap_or_else(|_| bitwarden::client::DEFAULT_BASE_URL.to_owned());
     {
         let bw_list_projects_handler =
-            bitwarden::BitwardenHandler::new(audit.clone(), &bitwarden_url)
-                .expect("invalid Bitwarden API URL scheme");
+            bitwarden::BitwardenHandler::new(audit.clone(), &bitwarden_url).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
+            })?;
         let bw_list_secrets_handler =
-            bitwarden::BitwardenHandler::new(audit.clone(), &bitwarden_url)
-                .expect("invalid Bitwarden API URL scheme");
+            bitwarden::BitwardenHandler::new(audit.clone(), &bitwarden_url).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
+            })?;
         let bw_read_secret_handler =
-            bitwarden::BitwardenHandler::new(audit.clone(), &bitwarden_url)
-                .expect("invalid Bitwarden API URL scheme");
+            bitwarden::BitwardenHandler::new(audit.clone(), &bitwarden_url).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
+            })?;
         enclave_builder = enclave_builder
             .handler(
                 "bitwarden.list_projects",
@@ -760,7 +784,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
     }
 
     let enclave = enclave_builder
-        .approval_gate(Box::new(NativeApprovalGate))
+        .approval_gate(Box::new(NativeApprovalGate::new()))
         .audit(audit.clone())
         .build();
 
@@ -3875,7 +3899,7 @@ exe_sha256 = "deadbeef"
         let enclave = Enclave::builder()
             .registry(registry)
             .policy(policy)
-            .approval_gate(Box::new(NativeApprovalGate))
+            .approval_gate(Box::new(NativeApprovalGate::new()))
             .audit(audit.clone())
             .build();
         DaemonState {
