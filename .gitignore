@@ -5,3 +5,8 @@
 .env.*
 !.env.example
 
+# Development artifacts
+plan-*.md
+tasks/
+*-explorer.html
+

@@ -322,7 +322,7 @@ mod tests {
 
     #[test]
     fn resolver_debug_connect_server() {
-        let client = OnePasswordClient::new("http://localhost:8080");
+        let client = OnePasswordClient::new("http://localhost:8080").unwrap();
         let resolver = OnePasswordResolver::new(client);
         let debug = format!("{resolver:?}");
         assert!(debug.contains("OnePasswordResolver"));

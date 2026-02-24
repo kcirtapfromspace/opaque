@@ -28,6 +28,9 @@ pub enum ConnectApiError {
 
     #[error("unexpected 1Password Connect response: status {0}")]
     UnexpectedStatus(u16),
+
+    #[error("{0}")]
+    InvalidUrlScheme(String),
 }
 
 /// A 1Password vault.
@@ -69,27 +72,27 @@ pub struct Field {
 }
 
 /// Validate that a URL uses `https://`, allowing `http://` only for localhost.
-fn validate_url_scheme(url: &str) {
+fn validate_url_scheme(url: &str) -> Result<(), ConnectApiError> {
     if url.starts_with("https://") {
-        return;
+        return Ok(());
     }
     if url.starts_with("http://") {
         if let Some(host_part) = url.strip_prefix("http://") {
             let host = host_part.split('/').next().unwrap_or("");
             let host_no_port = host.split(':').next().unwrap_or("");
             if host_no_port == "localhost" || host_no_port == "127.0.0.1" {
-                return;
+                return Ok(());
             }
         }
-        panic!(
+        return Err(ConnectApiError::InvalidUrlScheme(format!(
             "insecure HTTP URL rejected: {url}. \
              Only https:// URLs are allowed (http:// is permitted for localhost/127.0.0.1 only)"
-        );
+        )));
     }
-    panic!(
+    Err(ConnectApiError::InvalidUrlScheme(format!(
         "unsupported URL scheme: {url}. \
          Only https:// URLs are allowed (http:// is permitted for localhost/127.0.0.1 only)"
-    );
+    )))
 }
 
 /// 1Password Connect REST API client.
@@ -109,10 +112,8 @@ impl OnePasswordClient {
     }
 
     /// Create a new client pointing at the given Connect Server URL.
-    ///
-    /// Panics if the base URL uses `http://` for a non-localhost host.
-    pub fn new(base_url: &str) -> Self {
-        validate_url_scheme(base_url);
+    pub fn new(base_url: &str) -> Result<Self, ConnectApiError> {
+        validate_url_scheme(base_url)?;
 
         let http = reqwest::Client::builder()
             .user_agent(Self::user_agent())
@@ -120,10 +121,10 @@ impl OnePasswordClient {
             .build()
             .expect("failed to build reqwest client");
 
-        Self {
+        Ok(Self {
             http,
             base_url: base_url.trim_end_matches('/').to_owned(),
-        }
+        })
     }
 
     /// List all vaults accessible with the given token.
@@ -246,13 +247,13 @@ mod tests {
 
     #[test]
     fn client_stores_base_url_trimmed() {
-        let client = OnePasswordClient::new("http://localhost:8080/");
+        let client = OnePasswordClient::new("http://localhost:8080/").unwrap();
         assert_eq!(client.base_url, "http://localhost:8080");
     }
 
     #[test]
     fn client_base_url_no_trailing_slash() {
-        let client = OnePasswordClient::new("http://localhost:8080");
+        let client = OnePasswordClient::new("http://localhost:8080").unwrap();
         assert_eq!(client.base_url, "http://localhost:8080");
     }
 
@@ -382,7 +383,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = OnePasswordClient::new(&mock_server.uri());
+        let client = OnePasswordClient::new(&mock_server.uri()).unwrap();
         let vaults = client.list_vaults("test-token").await.unwrap();
 
         assert_eq!(vaults.len(), 2);
@@ -405,7 +406,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = OnePasswordClient::new(&mock_server.uri());
+        let client = OnePasswordClient::new(&mock_server.uri()).unwrap();
         let result = client.list_vaults("bad-token").await;
 
         assert!(result.is_err());
@@ -423,7 +424,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = OnePasswordClient::new(&mock_server.uri());
+        let client = OnePasswordClient::new(&mock_server.uri()).unwrap();
         let result = client.list_vaults("token").await;
 
         assert!(result.is_err());
@@ -445,7 +446,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = OnePasswordClient::new(&mock_server.uri());
+        let client = OnePasswordClient::new(&mock_server.uri()).unwrap();
         let items = client.list_items("test-token", "v1").await.unwrap();
 
         assert_eq!(items.len(), 2);
@@ -465,7 +466,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = OnePasswordClient::new(&mock_server.uri());
+        let client = OnePasswordClient::new(&mock_server.uri()).unwrap();
         let result = client.list_items("token", "nonexistent").await;
 
         assert!(result.is_err());
@@ -491,7 +492,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = OnePasswordClient::new(&mock_server.uri());
+        let client = OnePasswordClient::new(&mock_server.uri()).unwrap();
         let item = client.get_item("test-token", "v1", "i1").await.unwrap();
 
         assert_eq!(item.id, "i1");
@@ -514,7 +515,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = OnePasswordClient::new(&mock_server.uri());
+        let client = OnePasswordClient::new(&mock_server.uri()).unwrap();
         let result = client.get_item("token", "v1", "missing").await;
 
         assert!(result.is_err());
@@ -535,7 +536,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = OnePasswordClient::new(&mock_server.uri());
+        let client = OnePasswordClient::new(&mock_server.uri()).unwrap();
         let vault_id = client.find_vault_by_name("token", "Work").await.unwrap();
         assert_eq!(vault_id, "v2");
     }
@@ -553,7 +554,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = OnePasswordClient::new(&mock_server.uri());
+        let client = OnePasswordClient::new(&mock_server.uri()).unwrap();
         let result = client.find_vault_by_name("token", "Nonexistent").await;
 
         assert!(result.is_err());
@@ -574,7 +575,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = OnePasswordClient::new(&mock_server.uri());
+        let client = OnePasswordClient::new(&mock_server.uri()).unwrap();
         let item_id = client
             .find_item_by_title("token", "v1", "API Key")
             .await
@@ -623,7 +624,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = OnePasswordClient::new(&mock_server.uri());
+        let client = OnePasswordClient::new(&mock_server.uri()).unwrap();
         let token = "test-connect-token";
 
         // Simulate the full resolution chain that OnePasswordResolver does:
@@ -659,7 +660,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = OnePasswordClient::new(&mock_server.uri());
+        let client = OnePasswordClient::new(&mock_server.uri()).unwrap();
         let vaults = client.list_vaults("my-secret-token").await.unwrap();
         assert!(vaults.is_empty());
     }
@@ -680,7 +681,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = OnePasswordClient::new(&mock_server.uri());
+        let client = OnePasswordClient::new(&mock_server.uri()).unwrap();
         client.list_vaults("token").await.unwrap();
     }
 
@@ -696,7 +697,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = OnePasswordClient::new(&mock_server.uri());
+        let client = OnePasswordClient::new(&mock_server.uri()).unwrap();
         let result = client.list_vaults("token").await;
         assert!(matches!(
             result.unwrap_err(),
@@ -716,31 +717,31 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = OnePasswordClient::new(&mock_server.uri());
+        let client = OnePasswordClient::new(&mock_server.uri()).unwrap();
         let result = client.list_vaults("token").await;
         assert!(matches!(result.unwrap_err(), ConnectApiError::Unauthorized));
     }
 
     #[test]
     fn validate_url_scheme_accepts_https() {
-        validate_url_scheme("https://connect.1password.com");
+        validate_url_scheme("https://connect.1password.com").unwrap();
     }
 
     #[test]
     fn validate_url_scheme_accepts_localhost_http() {
-        validate_url_scheme("http://localhost:8080");
-        validate_url_scheme("http://127.0.0.1:9000/v1");
+        validate_url_scheme("http://localhost:8080").unwrap();
+        validate_url_scheme("http://127.0.0.1:9000/v1").unwrap();
     }
 
     #[test]
-    #[should_panic(expected = "insecure HTTP URL rejected")]
     fn validate_url_scheme_rejects_remote_http() {
-        validate_url_scheme("http://connect.1password.com");
+        let err = validate_url_scheme("http://connect.1password.com").unwrap_err();
+        assert!(err.to_string().contains("insecure HTTP URL rejected"));
     }
 
     #[test]
-    #[should_panic(expected = "unsupported URL scheme")]
     fn validate_url_scheme_rejects_ftp() {
-        validate_url_scheme("ftp://example.com/file");
+        let err = validate_url_scheme("ftp://example.com/file").unwrap_err();
+        assert!(err.to_string().contains("unsupported URL scheme"));
     }
 }

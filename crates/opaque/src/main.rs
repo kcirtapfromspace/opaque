@@ -1439,7 +1439,7 @@ async fn main() {
                 return;
             }
             PolicyAction::Preset { name } => {
-                match policy_apply_preset(&name) {
+                match policy_apply_preset(name) {
                     Ok(()) => {}
                     Err(e) => {
                         ui::error(&e);
@@ -2181,6 +2181,7 @@ async fn call_once(
 // ---------------------------------------------------------------------------
 
 /// Run the `audit tail` subcommand: query the local SQLite audit DB.
+#[allow(clippy::too_many_arguments)]
 fn run_audit_tail(
     limit: usize,
     kind: Option<&str>,
