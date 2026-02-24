@@ -76,7 +76,6 @@ Features explicitly decided against. Reopen only with strong user demand.
 
 | Feature | Reason |
 |---------|--------|
-| **Windows support** | Unix domain sockets, peer creds, polkit, LocalAuthentication — the entire architecture is Unix-first. Windows would require a parallel implementation (named pipes, Windows Hello, etc). Not enough demand to justify. |
 | **Multi-user daemon** | Opaque is a single-user local tool. Multi-user adds access control complexity (which user's keychain? which policy?). Use separate daemon instances per user. |
 | **GUI / menubar app** | CLI + LaunchAgent/systemd is the v1 model. A GUI adds a frontend project. Revisit if user research shows the CLI is a barrier to adoption. |
 | **Cloud-hosted relay for mobile approvals** | Adds a cloud dependency and a hosted service to operate. Local-network-only pairing (v3) is simpler and has a tighter threat model. Push notifications via APNs are acceptable if needed. |

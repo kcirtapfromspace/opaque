@@ -370,7 +370,7 @@ Store locally (SQLite) with optional export to JSON for enterprise setups.
 
 ## 13. Decisions (Based on Your Answers)
 
-1. Platforms: macOS + Linux (no Windows).
+1. Platforms: macOS + Linux.
 2. GitHub/GitLab auth: support both user tokens (PAT) and app-style integrations (least privilege).
 3. GitHub scopes: support repo secrets and environment secrets (v1).
 4. SaaS targets (v1): GitHub Actions secrets, GitHub Codespaces secrets, GitLab CI variables.
