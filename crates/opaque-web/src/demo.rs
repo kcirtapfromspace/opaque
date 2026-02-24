@@ -208,7 +208,10 @@ mod tests {
             .map(|e| e["sequence_number"].as_i64().unwrap())
             .collect();
         for i in 1..seqs.len() {
-            assert!(seqs[i - 1] > seqs[i], "events should be in descending sequence order");
+            assert!(
+                seqs[i - 1] > seqs[i],
+                "events should be in descending sequence order"
+            );
         }
     }
 

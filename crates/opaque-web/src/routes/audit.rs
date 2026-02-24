@@ -1,6 +1,6 @@
-use axum::extract::{Query, State};
 use axum::Json;
-use opaque_core::audit::{query_audit_db, AuditEventKind, AuditFilter};
+use axum::extract::{Query, State};
+use opaque_core::audit::{AuditEventKind, AuditFilter, query_audit_db};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -22,7 +22,10 @@ pub async fn get_audit(
     // Try live mode first.
     if state.audit_db_path.exists() {
         let filter = AuditFilter {
-            kind: params.kind.as_deref().and_then(|k| k.parse::<AuditEventKind>().ok()),
+            kind: params
+                .kind
+                .as_deref()
+                .and_then(|k| k.parse::<AuditEventKind>().ok()),
             operation: params.operation,
             outcome: params.outcome,
             text_query: params.q,
@@ -49,9 +52,7 @@ pub async fn get_audit(
     Json(json!({ "mode": "demo", "events": events }))
 }
 
-pub async fn get_audit_stream(
-    State(state): State<AppState>,
-) -> axum::response::Response {
+pub async fn get_audit_stream(State(state): State<AppState>) -> axum::response::Response {
     use axum::response::IntoResponse;
 
     if state.audit_db_path.exists() {

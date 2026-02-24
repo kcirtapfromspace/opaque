@@ -1120,8 +1120,34 @@ impl Enclave {
 
 /// Native OS approval gate that delegates to the platform-specific
 /// approval prompt (macOS LocalAuthentication / Linux polkit).
-#[derive(Debug)]
-pub struct NativeApprovalGate;
+pub struct NativeApprovalGate {
+    pairing_manager: Option<Arc<crate::pairing::PairingManager>>,
+}
+
+impl std::fmt::Debug for NativeApprovalGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeApprovalGate")
+            .field("has_pairing_manager", &self.pairing_manager.is_some())
+            .finish()
+    }
+}
+
+impl NativeApprovalGate {
+    /// Create a gate without iOS pairing support.
+    pub fn new() -> Self {
+        Self {
+            pairing_manager: None,
+        }
+    }
+
+    /// Create a gate backed by an existing [`PairingManager`].
+    #[allow(dead_code)]
+    pub fn with_pairing_manager(pm: Arc<crate::pairing::PairingManager>) -> Self {
+        Self {
+            pairing_manager: Some(pm),
+        }
+    }
+}
 
 impl ApprovalGate for NativeApprovalGate {
     fn request_approval(
@@ -1132,6 +1158,23 @@ impl ApprovalGate for NativeApprovalGate {
         description: &str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>>
     {
+        // Check whether any factor is IosFaceId and we have a pairing manager.
+        if _factors
+            .iter()
+            .any(|f| matches!(f, ApprovalFactor::IosFaceId))
+            && let Some(pm) = &self.pairing_manager
+            && let Ok(devices) = pm.list_devices()
+            && let Some(device) = devices.iter().find(|d| !d.revoked)
+        {
+            let challenge = pm.create_challenge(&_request.request_id.to_string(), description);
+            tracing::info!(
+                device_id = %device.device_id,
+                device_name = %device.name,
+                challenge_request_id = %challenge.request_id,
+                "iOS Face ID challenge created; awaiting device response"
+            );
+        }
+
         let desc = description.to_owned();
         Box::pin(async move {
             crate::approval::prompt(&desc)

@@ -4,9 +4,9 @@ pub mod policy;
 pub mod sessions;
 pub mod status;
 
+use axum::Router;
 use axum::response::Html;
 use axum::routing::get;
-use axum::Router;
 
 use crate::AppState;
 
