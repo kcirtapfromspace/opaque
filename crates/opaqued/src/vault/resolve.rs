@@ -136,10 +136,8 @@ impl VaultResolver {
     fn get_cached_value(key: &str) -> Option<String> {
         let now = Instant::now();
         let cache = Self::lock_cache();
-        if let Some(entry) = cache.get(key) {
-            if entry.expires_at > now {
-                return Some(entry.value.clone());
-            }
+        if let Some(entry) = cache.get(key).filter(|e| e.expires_at > now) {
+            return Some(entry.value.clone());
         }
         None
     }
@@ -301,7 +299,7 @@ mod tests {
 
     #[test]
     fn resolver_debug() {
-        let client = VaultClient::new();
+        let client = VaultClient::new().unwrap();
         let resolver = VaultResolver::new(client);
         let debug = format!("{resolver:?}");
         assert!(debug.contains("VaultResolver"));
