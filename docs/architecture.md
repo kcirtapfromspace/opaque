@@ -102,6 +102,7 @@ flowchart LR
   User["User"] -->|approve| Factor["Approval Factor(s)"]
   MCP --> D["opaqued (daemon)"]
   CLI["opaque (CLI)"] --> D
+  Web["opaque-web (dashboard)"] -->|IPC + SQLite| D
   Factor --> D
 
   D --> P["Provider Connectors<br/>1Password / Vault / ..."]

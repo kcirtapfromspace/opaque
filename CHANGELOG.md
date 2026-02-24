@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **Web dashboard (`opaque-web`)**: Localhost Axum server (port 7380) with embedded SPA for real-time monitoring and onboarding
+  - Live mode: audit event streaming (SSE), policy viewer, agent session monitor, operations registry
+  - Demo mode: graceful degradation with synthetic data when daemon is not running
+  - Auto-detection and switching between live/demo modes
+  - `--open` flag to launch browser on startup, `--port` flag for custom port
+  - Dark terminal theme matching the opaque-explorer playground
+
 ## [0.1.0] - 2026-02-23
 
 ### Added

@@ -6,6 +6,7 @@ members = [
   "crates/opaque",
   "crates/opaque-approve-helper",
   "crates/opaque-mcp",
+  "crates/opaque-web",
 ]
 
 [workspace.package]
@@ -47,3 +48,5 @@ console = "0.15"
 dialoguer = "0.11"
 indicatif = "0.17"
 wiremock = "0.6"
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
