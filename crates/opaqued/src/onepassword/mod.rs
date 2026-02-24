@@ -77,16 +77,16 @@ impl fmt::Debug for OnePasswordHandler {
 
 impl OnePasswordHandler {
     /// Create a handler backed by the Connect Server API.
-    pub fn new(audit: Arc<dyn AuditSink>, base_url: &str) -> Self {
+    pub fn new(audit: Arc<dyn AuditSink>, base_url: &str) -> Result<Self, String> {
         let connect_token_ref = std::env::var(CONNECT_TOKEN_REF_ENV)
             .unwrap_or_else(|_| DEFAULT_CONNECT_TOKEN_REF.to_owned());
-        Self {
+        Ok(Self {
             audit,
             backend: OnePasswordBackend::ConnectServer {
-                client: OnePasswordClient::new(base_url),
+                client: OnePasswordClient::new(base_url).map_err(|e| e.to_string())?,
                 connect_token_ref,
             },
-        }
+        })
     }
 
     /// Create a handler backed by the `op` CLI.
@@ -338,7 +338,7 @@ mod tests {
     #[test]
     fn handler_debug_connect() {
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = OnePasswordHandler::new(audit, "http://localhost:8080");
+        let handler = OnePasswordHandler::new(audit, "http://localhost:8080").unwrap();
         let debug = format!("{handler:?}");
         assert!(debug.contains("OnePasswordHandler"));
         assert!(debug.contains("ConnectServer"));
@@ -358,7 +358,7 @@ mod tests {
     #[test]
     fn backend_debug() {
         let backend = OnePasswordBackend::ConnectServer {
-            client: OnePasswordClient::new("http://localhost:8080"),
+            client: OnePasswordClient::new("http://localhost:8080").unwrap(),
             connect_token_ref: "keychain:test".into(),
         };
         assert_eq!(format!("{backend:?}"), "ConnectServer");
@@ -367,7 +367,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_operation_rejected() {
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = OnePasswordHandler::new(audit, "http://localhost:8080");
+        let handler = OnePasswordHandler::new(audit, "http://localhost:8080").unwrap();
         let request = make_request("onepassword.unknown", serde_json::json!({}));
         let result = handler.execute(&request).await;
         assert!(result.is_err());
@@ -377,7 +377,7 @@ mod tests {
     #[tokio::test]
     async fn list_items_missing_vault_rejected() {
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = OnePasswordHandler::new(audit, "http://localhost:8080");
+        let handler = OnePasswordHandler::new(audit, "http://localhost:8080").unwrap();
         let request = make_request("onepassword.list_items", serde_json::json!({}));
         let result = handler.execute(&request).await;
         assert!(result.is_err());
@@ -404,7 +404,7 @@ mod tests {
         unsafe { std::env::set_var(&token_env, "test-connect-token") };
         unsafe { std::env::set_var(CONNECT_TOKEN_REF_ENV, format!("env:{token_env}")) };
 
-        let handler = OnePasswordHandler::new(audit.clone(), &mock_server.uri());
+        let handler = OnePasswordHandler::new(audit.clone(), &mock_server.uri()).unwrap();
         (handler, mock_server, audit)
     }
 

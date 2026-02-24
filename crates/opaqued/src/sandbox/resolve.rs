@@ -283,10 +283,15 @@ impl CompositeResolver {
         // 3. Neither → onepassword disabled
         let onepassword =
             if let Ok(url) = std::env::var(crate::onepassword::client::CONNECT_URL_ENV) {
-                let client = crate::onepassword::client::OnePasswordClient::new(&url);
-                Some(crate::onepassword::resolve::OnePasswordResolver::new(
-                    client,
-                ))
+                match crate::onepassword::client::OnePasswordClient::new(&url) {
+                    Ok(client) => Some(crate::onepassword::resolve::OnePasswordResolver::new(
+                        client,
+                    )),
+                    Err(e) => {
+                        tracing::warn!("1Password Connect client disabled: {e}");
+                        None
+                    }
+                }
             } else if let Ok(cli) = crate::onepassword::op_cli::OpCliClient::new() {
                 Some(crate::onepassword::resolve::OnePasswordResolver::from_cli(
                     cli,
@@ -295,17 +300,25 @@ impl CompositeResolver {
                 None
             };
 
-        // Bitwarden backend: always available (uses default or configured URL).
+        // Bitwarden backend: available if URL scheme is valid.
         let bitwarden_url = std::env::var(crate::bitwarden::client::BITWARDEN_URL_ENV)
             .unwrap_or_else(|_| crate::bitwarden::client::DEFAULT_BASE_URL.to_owned());
-        let bitwarden = Some(crate::bitwarden::resolve::BitwardenResolver::new(
-            crate::bitwarden::client::BitwardenClient::new(&bitwarden_url),
-        ));
+        let bitwarden = match crate::bitwarden::client::BitwardenClient::new(&bitwarden_url) {
+            Ok(client) => Some(crate::bitwarden::resolve::BitwardenResolver::new(client)),
+            Err(e) => {
+                tracing::warn!("Bitwarden client disabled: {e}");
+                None
+            }
+        };
 
-        // Vault backend: always available (uses default or configured URL).
-        let vault = Some(crate::vault::resolve::VaultResolver::new(
-            crate::vault::client::VaultClient::new(),
-        ));
+        // Vault backend: available if URL scheme is valid.
+        let vault = match crate::vault::client::VaultClient::new() {
+            Ok(client) => Some(crate::vault::resolve::VaultResolver::new(client)),
+            Err(e) => {
+                tracing::warn!("Vault client disabled: {e}");
+                None
+            }
+        };
 
         Self {
             env: EnvResolver,

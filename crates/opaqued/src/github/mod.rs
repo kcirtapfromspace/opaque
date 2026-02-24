@@ -52,11 +52,11 @@ impl fmt::Debug for GitHubHandler {
 }
 
 impl GitHubHandler {
-    pub fn new(audit: Arc<dyn AuditSink>) -> Self {
-        Self {
+    pub fn new(audit: Arc<dyn AuditSink>) -> Result<Self, String> {
+        Ok(Self {
             audit,
-            client: GitHubClient::new(),
-        }
+            client: GitHubClient::new().map_err(|e| e.to_string())?,
+        })
     }
 
     #[cfg(test)]
@@ -917,7 +917,7 @@ mod tests {
     fn github_handler_debug() {
         use opaque_core::audit::InMemoryAuditEmitter;
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = GitHubHandler::new(audit);
+        let handler = GitHubHandler::new(audit).unwrap();
         let debug = format!("{handler:?}");
         assert!(debug.contains("GitHubHandler"));
     }
@@ -951,7 +951,7 @@ mod tests {
     async fn missing_repo_param_rejected() {
         use opaque_core::audit::InMemoryAuditEmitter;
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = GitHubHandler::new(audit);
+        let handler = GitHubHandler::new(audit).unwrap();
         let request = make_request("github.set_actions_secret", serde_json::json!({}));
         let result = handler.execute(&request).await;
         assert!(result.is_err());
@@ -962,7 +962,7 @@ mod tests {
     async fn missing_secret_name_rejected() {
         use opaque_core::audit::InMemoryAuditEmitter;
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = GitHubHandler::new(audit);
+        let handler = GitHubHandler::new(audit).unwrap();
         let request = make_request(
             "github.set_actions_secret",
             serde_json::json!({"repo": "owner/repo"}),
@@ -976,7 +976,7 @@ mod tests {
     async fn raw_value_ref_rejected() {
         use opaque_core::audit::InMemoryAuditEmitter;
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = GitHubHandler::new(audit);
+        let handler = GitHubHandler::new(audit).unwrap();
         let request = make_request(
             "github.set_actions_secret",
             serde_json::json!({
@@ -994,7 +994,7 @@ mod tests {
     async fn invalid_repo_format_rejected() {
         use opaque_core::audit::InMemoryAuditEmitter;
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = GitHubHandler::new(audit);
+        let handler = GitHubHandler::new(audit).unwrap();
         let request = make_request(
             "github.set_actions_secret",
             serde_json::json!({
@@ -1012,7 +1012,7 @@ mod tests {
     async fn invalid_environment_name_rejected() {
         use opaque_core::audit::InMemoryAuditEmitter;
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = GitHubHandler::new(audit);
+        let handler = GitHubHandler::new(audit).unwrap();
         let request = make_request(
             "github.set_actions_secret",
             serde_json::json!({
@@ -1033,7 +1033,7 @@ mod tests {
     async fn codespaces_missing_secret_name_rejected() {
         use opaque_core::audit::InMemoryAuditEmitter;
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = GitHubHandler::new(audit);
+        let handler = GitHubHandler::new(audit).unwrap();
         let request = make_request("github.set_codespaces_secret", serde_json::json!({}));
         let result = handler.execute(&request).await;
         assert!(result.is_err());
@@ -1044,7 +1044,7 @@ mod tests {
     async fn codespaces_missing_value_ref_rejected() {
         use opaque_core::audit::InMemoryAuditEmitter;
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = GitHubHandler::new(audit);
+        let handler = GitHubHandler::new(audit).unwrap();
         let request = make_request(
             "github.set_codespaces_secret",
             serde_json::json!({"secret_name": "MY_SECRET"}),
@@ -1060,7 +1060,7 @@ mod tests {
     async fn dependabot_missing_repo_rejected() {
         use opaque_core::audit::InMemoryAuditEmitter;
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = GitHubHandler::new(audit);
+        let handler = GitHubHandler::new(audit).unwrap();
         let request = make_request(
             "github.set_dependabot_secret",
             serde_json::json!({
@@ -1079,7 +1079,7 @@ mod tests {
     async fn org_secret_missing_org_rejected() {
         use opaque_core::audit::InMemoryAuditEmitter;
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = GitHubHandler::new(audit);
+        let handler = GitHubHandler::new(audit).unwrap();
         let request = make_request(
             "github.set_org_secret",
             serde_json::json!({
@@ -1096,7 +1096,7 @@ mod tests {
     async fn org_secret_invalid_org_name_rejected() {
         use opaque_core::audit::InMemoryAuditEmitter;
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = GitHubHandler::new(audit);
+        let handler = GitHubHandler::new(audit).unwrap();
         let request = make_request(
             "github.set_org_secret",
             serde_json::json!({
@@ -1114,7 +1114,7 @@ mod tests {
     async fn org_secret_invalid_visibility_rejected() {
         use opaque_core::audit::InMemoryAuditEmitter;
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = GitHubHandler::new(audit);
+        let handler = GitHubHandler::new(audit).unwrap();
         let request = make_request(
             "github.set_org_secret",
             serde_json::json!({
@@ -1135,7 +1135,7 @@ mod tests {
     async fn unknown_operation_rejected() {
         use opaque_core::audit::InMemoryAuditEmitter;
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = GitHubHandler::new(audit);
+        let handler = GitHubHandler::new(audit).unwrap();
         let request = make_request("github.unknown_op", serde_json::json!({}));
         let result = handler.execute(&request).await;
         assert!(result.is_err());
@@ -1235,7 +1235,7 @@ mod tests {
     async fn list_secrets_missing_repo_rejected() {
         use opaque_core::audit::InMemoryAuditEmitter;
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = GitHubHandler::new(audit);
+        let handler = GitHubHandler::new(audit).unwrap();
         let request = make_request("github.list_secrets", serde_json::json!({}));
         let result = handler.execute(&request).await;
         assert!(result.is_err());
@@ -1246,7 +1246,7 @@ mod tests {
     async fn list_secrets_invalid_scope_rejected() {
         use opaque_core::audit::InMemoryAuditEmitter;
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = GitHubHandler::new(audit);
+        let handler = GitHubHandler::new(audit).unwrap();
         let request = make_request(
             "github.list_secrets",
             serde_json::json!({"scope": "invalid"}),
@@ -1262,7 +1262,7 @@ mod tests {
     async fn delete_secret_missing_name_rejected() {
         use opaque_core::audit::InMemoryAuditEmitter;
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = GitHubHandler::new(audit);
+        let handler = GitHubHandler::new(audit).unwrap();
         let request = make_request(
             "github.delete_secret",
             serde_json::json!({"repo": "owner/repo"}),
@@ -1276,7 +1276,7 @@ mod tests {
     async fn delete_secret_invalid_name_rejected() {
         use opaque_core::audit::InMemoryAuditEmitter;
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = GitHubHandler::new(audit);
+        let handler = GitHubHandler::new(audit).unwrap();
         let request = make_request(
             "github.delete_secret",
             serde_json::json!({"repo": "owner/repo", "secret_name": "GITHUB_TOKEN"}),

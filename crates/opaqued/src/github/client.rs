@@ -44,6 +44,9 @@ pub enum GitHubApiError {
 
     #[error("unexpected GitHub API response: status {0}")]
     UnexpectedStatus(u16),
+
+    #[error("{0}")]
+    InvalidUrlScheme(String),
 }
 
 impl GitHubApiError {
@@ -241,27 +244,27 @@ struct SetSecretPayload {
 }
 
 /// Validate that a URL uses `https://`, allowing `http://` only for localhost.
-fn validate_url_scheme(url: &str) {
+fn validate_url_scheme(url: &str) -> Result<(), GitHubApiError> {
     if url.starts_with("https://") {
-        return;
+        return Ok(());
     }
     if url.starts_with("http://") {
         if let Some(host_part) = url.strip_prefix("http://") {
             let host = host_part.split('/').next().unwrap_or("");
             let host_no_port = host.split(':').next().unwrap_or("");
             if host_no_port == "localhost" || host_no_port == "127.0.0.1" {
-                return;
+                return Ok(());
             }
         }
-        panic!(
+        return Err(GitHubApiError::InvalidUrlScheme(format!(
             "insecure HTTP URL rejected: {url}. \
              Only https:// URLs are allowed (http:// is permitted for localhost/127.0.0.1 only)"
-        );
+        )));
     }
-    panic!(
+    Err(GitHubApiError::InvalidUrlScheme(format!(
         "unsupported URL scheme: {url}. \
          Only https:// URLs are allowed (http:// is permitted for localhost/127.0.0.1 only)"
-    );
+    )))
 }
 
 /// GitHub REST API client for secrets.
@@ -279,20 +282,18 @@ impl GitHubClient {
 
     /// Create a new client. Uses `OPAQUE_GITHUB_API_URL` env var if set,
     /// otherwise defaults to `https://api.github.com`.
-    ///
-    /// Panics if the base URL uses `http://` for a non-localhost host.
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self, GitHubApiError> {
         let base_url =
             std::env::var(GITHUB_API_URL_ENV).unwrap_or_else(|_| DEFAULT_GITHUB_API_URL.to_owned());
 
-        validate_url_scheme(&base_url);
+        validate_url_scheme(&base_url)?;
 
         let http = reqwest::Client::builder()
             .user_agent(Self::user_agent())
             .build()
             .expect("failed to build reqwest client");
 
-        Self { http, base_url }
+        Ok(Self { http, base_url })
     }
 
     /// Create a client pointing at a custom base URL (for testing with mock servers).
@@ -534,7 +535,7 @@ mod tests {
         let prev = std::env::var(super::GITHUB_API_URL_ENV).ok();
         unsafe { std::env::remove_var(super::GITHUB_API_URL_ENV) };
 
-        let client = GitHubClient::new();
+        let client = GitHubClient::new().unwrap();
         assert_eq!(client.base_url, super::DEFAULT_GITHUB_API_URL);
 
         // Restore if it was set.
@@ -551,7 +552,7 @@ mod tests {
                 "https://github.example.com/api/v3",
             )
         };
-        let client = GitHubClient::new();
+        let client = GitHubClient::new().unwrap();
         assert_eq!(client.base_url, "https://github.example.com/api/v3");
         unsafe { std::env::remove_var(super::GITHUB_API_URL_ENV) };
     }
@@ -926,24 +927,24 @@ mod tests {
 
     #[test]
     fn validate_url_scheme_accepts_https() {
-        validate_url_scheme("https://api.github.com");
+        validate_url_scheme("https://api.github.com").unwrap();
     }
 
     #[test]
     fn validate_url_scheme_accepts_localhost_http() {
-        validate_url_scheme("http://localhost:8080");
-        validate_url_scheme("http://127.0.0.1:9000/v1");
+        validate_url_scheme("http://localhost:8080").unwrap();
+        validate_url_scheme("http://127.0.0.1:9000/v1").unwrap();
     }
 
     #[test]
-    #[should_panic(expected = "insecure HTTP URL rejected")]
     fn validate_url_scheme_rejects_remote_http() {
-        validate_url_scheme("http://api.github.com");
+        let err = validate_url_scheme("http://api.github.com").unwrap_err();
+        assert!(err.to_string().contains("insecure HTTP URL rejected"));
     }
 
     #[test]
-    #[should_panic(expected = "unsupported URL scheme")]
     fn validate_url_scheme_rejects_ftp() {
-        validate_url_scheme("ftp://example.com/file");
+        let err = validate_url_scheme("ftp://example.com/file").unwrap_err();
+        assert!(err.to_string().contains("unsupported URL scheme"));
     }
 }
