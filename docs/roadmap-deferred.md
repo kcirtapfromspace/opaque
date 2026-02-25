@@ -14,13 +14,13 @@ Do not start a phase until the prior phase is shipped, tested with real users, a
 
 | Feature | Description | Status | Effort |
 |---------|-------------|--------|--------|
-| **MCP server** | Expose Opaque operations as MCP tools for Claude Code | **Shipped** — see `docs/mcp-integration.md` | Large |
-| **Bitwarden Secrets Manager** | `bitwarden:` ref scheme, browsing operations, service account auth | **Shipped** — see `docs/bitwarden.md` | Medium |
-| **GitLab CI variable sync** | `gitlab.set_ci_variable` operation | **Shipped** — daemon/CLI/MCP wiring with write-only provider flow and policy-bound secret refs. | Medium |
-| **GitHub Codespaces secrets (shipped)** | `github.set_codespaces_secret` operation (user + repo scope) | **Shipped** in v1. | Small |
-| **1Password provider connector (hardening)** | Fetch secrets from 1Password vaults via Connect API or service accounts | **Shipped** — `onepassword.read_field` is `REVEAL`, agent-visible channels remain blocked, and canonical secret ref derivation is enforced server-side for policy binding. | Medium |
-| **HashiCorp Vault provider connector** | Fetch secrets from Vault KV, dynamic secrets (DB, AWS) | **Partially shipped** — `vault:` refs resolve KV + dynamic engine fields for existing write-only operations, with lease-duration caching and best-effort revoke on refresh. Lease renewal for long-lived sessions remains deferred. | Large |
-| **SQLite FTS5 audit search** | Full-text search over sanitized audit event text | **Shipped** — local SQLite FTS5 index with `opaque audit tail --query`. | Small |
+| **MCP server** | Expose Opaque operations as MCP tools for Claude Code | ✅ **Done** — [MCP server runtime](../crates/opaque-mcp/src/main.rs), [safe tool definitions + daemon mapping](../crates/opaque-mcp/src/tools.rs), [daemon operation registration](../crates/opaqued/src/main.rs), [integration docs](mcp-integration.md). | Large |
+| **Bitwarden Secrets Manager** | `bitwarden:` ref scheme, browsing operations, service account auth | ✅ **Done** — [Bitwarden operation handler](../crates/opaqued/src/bitwarden/mod.rs), [bitwarden: ref resolver](../crates/opaqued/src/bitwarden/resolve.rs), [REST client](../crates/opaqued/src/bitwarden/client.rs), [setup docs](bitwarden.md). | Medium |
+| **GitLab CI variable sync** | `gitlab.set_ci_variable` operation | ✅ **Done** — [GitLab operation handler](../crates/opaqued/src/gitlab/mod.rs), [GitLab API client upsert flow](../crates/opaqued/src/gitlab/client.rs), [MCP tool wiring](../crates/opaque-mcp/src/tools.rs), [CLI wrapper](../crates/opaque/src/main.rs). | Medium |
+| **GitHub Codespaces secrets (shipped)** | `github.set_codespaces_secret` operation (user + repo scope) | ✅ **Done (v1)** — [Codespaces secret flow](../crates/opaqued/src/github/mod.rs), [operation registration](../crates/opaqued/src/main.rs), [MCP tool](../crates/opaque-mcp/src/tools.rs), [CLI command](../crates/opaque/src/main.rs). | Small |
+| **1Password provider connector (hardening)** | Fetch secrets from 1Password vaults via Connect API or service accounts | ✅ **Done** — [1Password handler (Connect + CLI backends)](../crates/opaqued/src/onepassword/mod.rs), [operation safety = REVEAL + policy-bound ref template](../crates/opaqued/src/main.rs), [server-side canonical ref derivation for `read_field`](../crates/opaqued/src/main.rs), [MCP excludes `read_field`](../crates/opaque-mcp/src/tools.rs). | Medium |
+| **HashiCorp Vault provider connector** | Fetch secrets from Vault KV, dynamic secrets (DB, AWS) | 🟨 **Partial** — [`vault:` resolver (KV + dynamic field reads, cache lifecycle)](../crates/opaqued/src/vault/resolve.rs), [Vault client (lease metadata + revoke API)](../crates/opaqued/src/vault/client.rs), [resolver wiring](../crates/opaqued/src/sandbox/resolve.rs), [current scope docs](vault.md#current-scope). Lease renewal for long-lived sessions remains deferred. | Large |
+| **SQLite FTS5 audit search** | Full-text search over sanitized audit event text | ✅ **Done** — [FTS5 table + triggers + query join](../crates/opaque-core/src/audit.rs), [CLI `audit tail --query` plumbing](../crates/opaque/src/main.rs). | Small |
 
 ---
 
@@ -50,7 +50,7 @@ Do not start a phase until the prior phase is shipped, tested with real users, a
 | **LanceDB semantic search** | Embed sanitized audit event text and support natural language search over history | Requires: choosing an embedding model (local ONNX or cloud API), async indexing pipeline, redaction-safe text generation, and a query interface with role-gated access. Massive dependency surface area (ONNX runtime or cloud API) for a feature nobody has asked for. Revisit if users demonstrate they can't find events with structured SQL + FTS5. | Large |
 | **SSE live feed** | HTTP `localhost` endpoint with Server-Sent Events for web/desktop UI | Adds an HTTP server dependency to a local daemon. `opaque audit tail --follow` over UDS is sufficient until a web UI exists. | Medium |
 | **Arrow Flight feed** | Arrow-native streaming for BI/analytics tools | Enterprise feature. No justification until there are enterprise users. | Large |
-| **Audit retention policies** | Configurable retention with automatic purge and Parquet rolloff | v1 has basic 90-day retention with row deletion. Parquet rolloff is only needed when data volume justifies it. | Medium |
+| **Audit retention policies** | Configurable retention with automatic purge and Parquet rolloff | 🟨 v1 has partial implementation: [configurable `audit_retention_days` (default 90)](../crates/opaqued/src/main.rs) + [startup row purge by cutoff](../crates/opaque-core/src/audit.rs). Parquet rolloff is deferred until data volume justifies it. | Medium |
 | **Compliance reporting** | Pre-built audit reports for SOX, HIPAA, SOC2 | Enterprise feature with significant regulatory research. | XL |
 
 ---

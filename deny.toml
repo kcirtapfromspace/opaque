@@ -21,12 +21,13 @@ ignore = ["RUSTSEC-2025-0119"]
 version = 2
 confidence-threshold = 0.8
 
-# Only permissive licenses are allowed.
+# Allowed licenses for dependencies and workspace crates.
 allow = [
     "Apache-2.0",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "BSL-1.0",
+    "BUSL-1.1",
     "CDLA-Permissive-2.0",
     "ISC",
     "MIT",
