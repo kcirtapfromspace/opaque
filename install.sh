@@ -17,7 +17,7 @@ set -eu
 
 REPO="kcirtapfromspace/opaque"
 INSTALL_DIR="${OPAQUE_INSTALL:-/usr/local/bin}"
-BINARIES="opaqued opaque opaque-mcp opaque-approve-helper"
+BINARIES="opaqued opaque opaque-mcp opaque-approve-helper opaque-web"
 NO_VERIFY=0
 
 # --- flag parsing -----------------------------------------------------------
