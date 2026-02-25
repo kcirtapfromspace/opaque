@@ -2597,6 +2597,7 @@ mod tests {
             branch: Some("feature/x".into()),
             head_sha: None,
             dirty: false,
+            workspace_verified: true,
         });
         let resp = enclave.execute(req).await;
         assert_eq!(resp.error_code(), Some("policy_denied"));
@@ -2609,6 +2610,7 @@ mod tests {
             branch: Some("main".into()),
             head_sha: None,
             dirty: false,
+            workspace_verified: true,
         });
         let resp = enclave.execute(req).await;
         assert!(resp.error_code().is_none());
@@ -2977,6 +2979,7 @@ mod tests {
             branch: Some("main".into()),
             head_sha: None,
             dirty: false,
+            workspace_verified: false,
         });
         let _ = enclave.execute(req).await;
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -2990,6 +2993,7 @@ mod tests {
             branch: Some("develop".into()),
             head_sha: None,
             dirty: true,
+            workspace_verified: false,
         });
         let _ = enclave.execute(req).await;
         assert_eq!(
