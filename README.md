@@ -25,8 +25,6 @@ Out of scope for alpha:
 - FIDO2 / WebAuthn approvals
 - headless/SSH-only/container-only approval flows
 
-Launch guardrails and incident/SLA process: [Launch week playbook](docs/launch-week-playbook.md)
-
 ## Features
 
 - Deny-by-default policy engine with allowlist rules
@@ -210,20 +208,18 @@ opaque policy preset github-secrets
 - [Policy](docs/policy.md)
 - [Operations](docs/operations.md)
 - [LLM harness](docs/llm-harness.md)
-- [Release checklist](docs/release-checklist.md)
-- [Launch week playbook](docs/launch-week-playbook.md)
 - [Demos](docs/demos.md)
 - [Deployment](docs/deployment.md)
-- [Security assessment](docs/security-assessment.md)
-- [Deferred roadmap](docs/roadmap-deferred.md)
+- [Architecture](docs/architecture.md)
+- [Audit analytics](docs/audit-analytics.md)
 
 ## Deferred
 
-See [Deferred roadmap](docs/roadmap-deferred.md). Notably:
+Key deferred items are tracked in architecture notes and release planning:
 
-- Vault dynamic secrets + lease lifecycle
-- iOS approvals / FaceID (v3)
-- FIDO2 / WebAuthn approvals (v3)
+- Vault dynamic secrets + lease lifecycle hardening
+- iOS approvals / FaceID
+- FIDO2 / WebAuthn approvals
 
 ## License
 
