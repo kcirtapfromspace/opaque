@@ -74,6 +74,11 @@ nav:
       - Operations: operations.md
       - Storage: storage.md
       - Deployment: deployment.md
+      - Release Checklist: release-checklist.md
+      - Launch Week Playbook: launch-week-playbook.md
+      - Alpha Go/No-Go Status (2026-02-25): alpha-go-no-go-status-2026-02-25.md
+      - Alpha Competitive Battlecard: alpha-competitive-battlecard.md
+      - Design-Partner Scorecard Template: design-partner-scorecard-template.md
   - Integrations:
       - MCP (Claude Code): mcp-integration.md
       - Bitwarden: bitwarden.md
