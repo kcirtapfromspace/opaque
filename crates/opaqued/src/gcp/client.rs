@@ -30,6 +30,16 @@ pub const GCP_ACCESS_TOKEN_ENV: &str = "OPAQUE_GCP_ACCESS_TOKEN";
 /// Environment variable for the path to a GCP service account JSON key file.
 pub const GCP_SERVICE_ACCOUNT_KEY_ENV: &str = "OPAQUE_GCP_SERVICE_ACCOUNT_KEY";
 
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("gcp test env lock poisoned")
+}
+
 /// Google OAuth2 token endpoint.
 const OAUTH2_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 
@@ -1020,6 +1030,7 @@ mod tests {
 
     #[tokio::test]
     async fn oauth_token_exchange_success() {
+        let _env_guard = test_env_lock();
         let mock_server = MockServer::start().await;
 
         // Mock the token endpoint.
@@ -1048,7 +1059,6 @@ mod tests {
         std::fs::write(&key_path, serde_json::to_string(&sa_key).unwrap()).unwrap();
 
         // Set env vars for service account auth.
-        let key_env = format!("OPAQUE_GCP_TEST_KEY_{}", uuid::Uuid::new_v4().as_simple());
         unsafe {
             std::env::remove_var(GCP_ACCESS_TOKEN_ENV);
             std::env::set_var(GCP_SERVICE_ACCOUNT_KEY_ENV, key_path.to_str().unwrap());
@@ -1072,6 +1082,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_access_token_takes_priority() {
+        let _env_guard = test_env_lock();
         let unique_token = format!("direct-token-{}", uuid::Uuid::new_v4().as_simple());
         unsafe {
             std::env::set_var(GCP_ACCESS_TOKEN_ENV, &unique_token);
@@ -1088,6 +1099,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_error_when_no_credentials() {
+        let _env_guard = test_env_lock();
         unsafe {
             std::env::remove_var(GCP_ACCESS_TOKEN_ENV);
             std::env::remove_var(GCP_SERVICE_ACCOUNT_KEY_ENV);

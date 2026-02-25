@@ -59,6 +59,5 @@ tower-http = { version = "0.6", features = ["cors"] }
 rcgen = { version = "0.13", features = ["pem"] }
 tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
-rustls-pemfile = "2"
 mdns-sd = "0.12"
 hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "service", "server-auto"] }
