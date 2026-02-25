@@ -1,6 +1,9 @@
 # Opaque
 
+![CI](https://github.com/anthropics/opaque/actions/workflows/ci.yml/badge.svg)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+![Release](https://img.shields.io/github/v/release/anthropics/opaque)
+![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-blue)
 
 Local approval-gated secrets broker for AI coding tools (Codex, Claude Code, etc) that must not disclose plaintext secrets to LLM context.
 
@@ -8,7 +11,7 @@ Local approval-gated secrets broker for AI coding tools (Codex, Claude Code, etc
 
 Opaque sits between your AI coding assistant and your secrets. LLMs get **operations** (e.g., "set this GitHub secret"), never plaintext values. Every operation passes through:
 
-**Policy → Approval → Execute → Sanitize → Audit**
+**Policy -> Approval -> Execute -> Sanitize -> Audit**
 
 ## Features
 
@@ -18,14 +21,27 @@ Opaque sits between your AI coding assistant and your secrets. LLMs get **operat
 - Typestate-enforced response sanitization + secret-pattern scrubbing
 - Structured audit events (SQLite) with correlation IDs
 - MCP server for Claude Code integration
-- Providers: GitHub secrets, 1Password, Bitwarden Secrets Manager
+- Providers: GitHub secrets, GitLab CI variables, 1Password, Bitwarden Secrets Manager, HashiCorp Vault, AWS Secrets Manager
 - Policy presets for common workflows
-- Web dashboard with live audit streaming and demo mode
 
-## Install (From Source)
+## Install
 
-```bash
-cargo build --release
+### macOS (Homebrew)
+
+```sh
+brew install anthropics/tap/opaque
+```
+
+### Linux / macOS (shell script)
+
+```sh
+curl -sSfL https://raw.githubusercontent.com/anthropics/opaque/main/install.sh | sh
+```
+
+### From Source
+
+```sh
+cargo install --git https://github.com/anthropics/opaque.git opaque opaqued opaque-mcp
 ```
 
 Binaries:
@@ -35,7 +51,16 @@ Binaries:
 | `opaqued` | Trusted daemon (enclave, policy, approvals, audit) |
 | `opaque` | CLI client |
 | `opaque-mcp` | MCP server for Claude Code |
-| `opaque-web` | Live dashboard & demo explorer (localhost web UI) |
+
+## Platform Support
+
+| Platform | Architecture | Status |
+|----------|-------------|--------|
+| macOS | Apple Silicon (aarch64) | Fully supported |
+| macOS | Intel (x86_64) | Fully supported |
+| Linux | x86_64 | Fully supported |
+| Linux | aarch64 | Fully supported |
+| Windows | -- | Not supported (Unix domain sockets required) |
 
 ## Quickstart: Claude Code (MCP)
 
@@ -127,12 +152,6 @@ opaque agent run -- codex
    opaque audit tail --query github --limit 10
    ```
 
-7. Launch the web dashboard:
-   ```bash
-   opaque-web --open
-   ```
-   Opens a browser to `http://127.0.0.1:7380` with live audit streaming, policy viewer, session monitor, and operations registry. Works without the daemon in demo mode with simulated data.
-
 Full CLI docs: `docs/getting-started.md`
 
 ## Policy Presets
@@ -174,7 +193,6 @@ opaque policy preset github-secrets
 - Policy: `docs/policy.md`
 - Operations: `docs/operations.md`
 - LLM harness: `docs/llm-harness.md`
-- Web dashboard: `docs/web-dashboard.md`
 - Demos: `docs/demos.md`
 - Deployment: `docs/deployment.md`
 - Security assessment: `docs/security-assessment.md`

@@ -3,6 +3,7 @@ name = "opaque"
 version = "0.1.0"
 edition = "2024"
 publish = false
+description = "CLI client for Opaque — approval-gated secrets broker for AI coding tools"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

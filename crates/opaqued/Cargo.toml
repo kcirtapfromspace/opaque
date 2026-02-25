@@ -3,6 +3,7 @@ name = "opaqued"
 version = "0.1.0"
 edition = "2024"
 publish = false
+description = "Opaque daemon — policy engine, approval orchestration, and provider execution"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
