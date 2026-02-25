@@ -1,6 +1,13 @@
 #!/bin/sh
 # install.sh — download and install Opaque binaries
 # Usage: curl -fsSL https://raw.githubusercontent.com/kcirtapfromspace/opaque/main/install.sh | sh
+#   or:  sh install.sh [--no-verify]
+#
+# Flags:
+#   --no-verify  Skip checksum verification when the .sha256 file is unavailable.
+#                This does NOT skip verification when a checksum is downloaded but
+#                does not match — mismatches always abort. Intended for air-gapped
+#                environments where release checksums are not reachable.
 #
 # Environment variables:
 #   OPAQUE_VERSION   — version to install (default: latest)
@@ -10,7 +17,42 @@ set -eu
 
 REPO="kcirtapfromspace/opaque"
 INSTALL_DIR="${OPAQUE_INSTALL:-/usr/local/bin}"
-BINARIES="opaqued opaque opaque-mcp opaque-approve-helper"
+BINARIES="opaqued opaque opaque-mcp opaque-approve-helper opaque-web"
+NO_VERIFY=0
+
+# --- flag parsing -----------------------------------------------------------
+
+usage() {
+    printf 'Usage: sh install.sh [--no-verify]\n'
+    printf '\n'
+    printf 'Flags:\n'
+    printf '  --no-verify  Skip checksum verification when the .sha256 file is\n'
+    printf '               unavailable. Mismatches still abort. For air-gapped\n'
+    printf '               environments.\n'
+    printf '\n'
+    printf 'Environment variables:\n'
+    printf '  OPAQUE_VERSION   version to install (default: latest)\n'
+    printf '  OPAQUE_INSTALL   install directory  (default: /usr/local/bin)\n'
+    printf '  GITHUB_TOKEN     optional, for private repos or rate-limited API\n'
+}
+
+parse_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --no-verify)
+                NO_VERIFY=1
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                die "unknown flag: $1 (see --help)"
+                ;;
+        esac
+        shift
+    done
+}
 
 # --- helpers ----------------------------------------------------------------
 
@@ -103,19 +145,32 @@ download_and_install() {
             || die "download failed: ${url}"
     fi
 
-    # Download and verify checksum
+    # Download checksum file
+    checksum_ok=0
     if [ -n "${GITHUB_TOKEN:-}" ]; then
-        curl -fsSL -H "Authorization: token ${GITHUB_TOKEN}" \
-            -o "${tmpdir}/${archive}.sha256" "$checksum_url" 2>/dev/null
+        if curl -fsSL -H "Authorization: token ${GITHUB_TOKEN}" \
+            -o "${tmpdir}/${archive}.sha256" "$checksum_url" 2>/dev/null; then
+            checksum_ok=1
+        fi
     else
-        curl -fsSL -o "${tmpdir}/${archive}.sha256" "$checksum_url" 2>/dev/null
+        if curl -fsSL -o "${tmpdir}/${archive}.sha256" "$checksum_url" 2>/dev/null; then
+            checksum_ok=1
+        fi
     fi
 
-    if [ -f "${tmpdir}/${archive}.sha256" ]; then
+    # Verify checksum (fail-closed by default)
+    if [ "$checksum_ok" = 1 ] && [ -f "${tmpdir}/${archive}.sha256" ]; then
         verify_checksum "${tmpdir}" "${archive}"
     else
-        printf 'warning: checksum file not available, skipping verification\n' >&2
+        if [ "$NO_VERIFY" = 1 ]; then
+            printf 'warning: checksum file not available, skipping verification (--no-verify)\n' >&2
+        else
+            die "checksum file not available for ${archive}; refusing to install without verification. Use --no-verify to skip checksum verification for air-gapped environments."
+        fi
     fi
+
+    # Opportunistic cosign signature verification
+    verify_cosign_signature "${tmpdir}" "${archive}" "$url"
 
     # Extract
     need_cmd tar
@@ -153,20 +208,61 @@ verify_checksum() {
     elif command -v shasum >/dev/null 2>&1; then
         actual="$(shasum -a 256 "${dir}/${archive}" | awk '{print $1}')"
     else
-        printf 'warning: neither sha256sum nor shasum found, skipping checksum verification\n' >&2
-        return 0
+        die "neither sha256sum nor shasum found; cannot verify archive integrity. Install one of these tools or use --no-verify."
     fi
 
     if [ "$expected" != "$actual" ]; then
-        die "checksum mismatch: expected ${expected}, got ${actual}"
+        die "checksum mismatch for ${archive}: expected ${expected}, got ${actual}. The archive may be corrupt or tampered with."
     fi
 
     printf 'Checksum verified.\n'
 }
 
+# --- cosign signature verification (opportunistic) --------------------------
+
+verify_cosign_signature() {
+    dir="$1"
+    archive="$2"
+    base_url="$3"
+
+    if ! command -v cosign >/dev/null 2>&1; then
+        return 0
+    fi
+
+    sig_url="${base_url}.sig"
+
+    printf 'cosign detected, attempting signature verification...\n'
+
+    # Download the .sig file
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+        if ! curl -fsSL -H "Authorization: token ${GITHUB_TOKEN}" \
+            -o "${dir}/${archive}.sig" "$sig_url" 2>/dev/null; then
+            printf 'warning: signature file not available at %s, skipping cosign verification\n' "$sig_url" >&2
+            return 0
+        fi
+    else
+        if ! curl -fsSL -o "${dir}/${archive}.sig" "$sig_url" 2>/dev/null; then
+            printf 'warning: signature file not available at %s, skipping cosign verification\n' "$sig_url" >&2
+            return 0
+        fi
+    fi
+
+    if cosign verify-blob \
+        --signature "${dir}/${archive}.sig" \
+        --certificate-identity-regexp ".*github\\.com/${REPO}.*" \
+        --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+        "${dir}/${archive}" 2>/dev/null; then
+        printf 'Cosign signature verified.\n'
+    else
+        die "cosign signature verification failed for ${archive}. The archive may be tampered with."
+    fi
+}
+
 # --- main -------------------------------------------------------------------
 
 main() {
+    parse_args "$@"
+
     need_cmd curl
     need_cmd tar
     need_cmd mktemp
@@ -178,4 +274,4 @@ main() {
     download_and_install "$version" "$target"
 }
 
-main
+main "$@"

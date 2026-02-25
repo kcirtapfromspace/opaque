@@ -5,10 +5,12 @@ pub mod sessions;
 pub mod status;
 
 use axum::Router;
+use axum::extract::State;
 use axum::response::Html;
 use axum::routing::get;
 
 use crate::AppState;
+use crate::security;
 
 static INDEX_HTML: &str = include_str!("../../static/index.html");
 
@@ -23,6 +25,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/operations", get(operations::get_operations))
 }
 
-async fn serve_spa() -> Html<&'static str> {
-    Html(INDEX_HTML)
+async fn serve_spa(State(state): State<AppState>) -> Html<String> {
+    let html = security::inject_token_meta(INDEX_HTML, &state.auth_token);
+    Html(html)
 }

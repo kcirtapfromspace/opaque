@@ -701,7 +701,13 @@ mod tests {
 
     /// Set up a handler pointing at a mock server with credentials
     /// provided via env vars.
-    async fn setup_handler_with_mock() -> (AwsHandler, MockServer, Arc<InMemoryAuditEmitter>) {
+    async fn setup_handler_with_mock() -> (
+        std::sync::MutexGuard<'static, ()>,
+        AwsHandler,
+        MockServer,
+        Arc<InMemoryAuditEmitter>,
+    ) {
+        let env_guard = crate::gcp::client::test_env_lock();
         let mock_server = MockServer::start().await;
         let audit = Arc::new(InMemoryAuditEmitter::new());
 
@@ -716,7 +722,7 @@ mod tests {
 
         let client = AwsClient::new_single(&mock_server.uri());
         let handler = AwsHandler::new(audit.clone(), client);
-        (handler, mock_server, audit)
+        (env_guard, handler, mock_server, audit)
     }
 
     /// Clean up env vars after test.
@@ -727,7 +733,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_caller_identity_via_handler() {
-        let (handler, mock_server, audit) = setup_handler_with_mock().await;
+        let (_env_guard, handler, mock_server, audit) = setup_handler_with_mock().await;
 
         Mock::given(method("POST"))
             .and(path("/"))
@@ -759,7 +765,7 @@ mod tests {
 
     #[tokio::test]
     async fn assume_role_via_handler() {
-        let (handler, mock_server, _audit) = setup_handler_with_mock().await;
+        let (_env_guard, handler, mock_server, _audit) = setup_handler_with_mock().await;
 
         Mock::given(method("POST"))
             .and(path("/"))
@@ -794,7 +800,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_secrets_via_handler() {
-        let (handler, mock_server, audit) = setup_handler_with_mock().await;
+        let (_env_guard, handler, mock_server, audit) = setup_handler_with_mock().await;
 
         Mock::given(method("POST"))
             .and(path("/"))
@@ -827,7 +833,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_secret_value_via_handler() {
-        let (handler, mock_server, _audit) = setup_handler_with_mock().await;
+        let (_env_guard, handler, mock_server, _audit) = setup_handler_with_mock().await;
 
         Mock::given(method("POST"))
             .and(path("/"))
@@ -855,7 +861,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_secret_value_not_found() {
-        let (handler, mock_server, _audit) = setup_handler_with_mock().await;
+        let (_env_guard, handler, mock_server, _audit) = setup_handler_with_mock().await;
 
         Mock::given(method("POST"))
             .and(path("/"))
@@ -879,7 +885,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_secret_via_handler() {
-        let (handler, mock_server, _audit) = setup_handler_with_mock().await;
+        let (_env_guard, handler, mock_server, _audit) = setup_handler_with_mock().await;
 
         Mock::given(method("POST"))
             .and(path("/"))
@@ -905,7 +911,7 @@ mod tests {
 
     #[tokio::test]
     async fn put_secret_value_via_handler() {
-        let (handler, mock_server, _audit) = setup_handler_with_mock().await;
+        let (_env_guard, handler, mock_server, _audit) = setup_handler_with_mock().await;
 
         Mock::given(method("POST"))
             .and(path("/"))
@@ -932,7 +938,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_secret_via_handler() {
-        let (handler, mock_server, _audit) = setup_handler_with_mock().await;
+        let (_env_guard, handler, mock_server, _audit) = setup_handler_with_mock().await;
 
         Mock::given(method("POST"))
             .and(path("/"))
@@ -957,7 +963,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_parameter_via_handler() {
-        let (handler, mock_server, _audit) = setup_handler_with_mock().await;
+        let (_env_guard, handler, mock_server, _audit) = setup_handler_with_mock().await;
 
         Mock::given(method("POST"))
             .and(path("/"))
@@ -990,7 +996,7 @@ mod tests {
 
     #[tokio::test]
     async fn put_parameter_via_handler() {
-        let (handler, mock_server, _audit) = setup_handler_with_mock().await;
+        let (_env_guard, handler, mock_server, _audit) = setup_handler_with_mock().await;
 
         Mock::given(method("POST"))
             .and(path("/"))
@@ -1016,7 +1022,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_parameters_by_path_via_handler() {
-        let (handler, mock_server, _audit) = setup_handler_with_mock().await;
+        let (_env_guard, handler, mock_server, _audit) = setup_handler_with_mock().await;
 
         Mock::given(method("POST"))
             .and(path("/"))
@@ -1050,7 +1056,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_parameter_via_handler() {
-        let (handler, mock_server, _audit) = setup_handler_with_mock().await;
+        let (_env_guard, handler, mock_server, _audit) = setup_handler_with_mock().await;
 
         Mock::given(method("POST"))
             .and(path("/"))
@@ -1073,7 +1079,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_secrets_auth_failure() {
-        let (handler, mock_server, _audit) = setup_handler_with_mock().await;
+        let (_env_guard, handler, mock_server, _audit) = setup_handler_with_mock().await;
 
         Mock::given(method("POST"))
             .and(path("/"))
