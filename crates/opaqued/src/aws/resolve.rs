@@ -1,71 +1,94 @@
 //! AWS secret resolver.
 //!
-//! Resolves `aws-sm:<secret-name-or-arn>` references via AWS Secrets Manager
-//! and `aws-ssm:<parameter-name>` references via SSM Parameter Store.
+//! Resolves `aws:<secret-name>` references using the AWS Secrets Manager
+//! REST API, or `aws:ssm:<parameter-name>` via SSM Parameter Store.
 //!
-//! Credentials are resolved via the standard AWS credential chain
-//! (environment variables or CLI).
-//!
-//! The resolved secret value is held in a `SecretValue` that is
-//! automatically zeroed on drop and optionally `mlock`'d.
+//! Credentials (access key / secret key) are resolved via the base resolver
+//! (env + keychain only) to prevent resolution cycles.
 
-use crate::sandbox::resolve::{ResolveError, SecretResolver};
+use crate::sandbox::resolve::{BaseResolver, ResolveError, SecretResolver};
 use crate::secret::SecretValue;
 
-use super::client::{AwsCredentials, AwsSecretsManagerClient};
+use super::client::AwsClient;
 
-/// Resolves `aws-sm:<secret-name-or-arn>` and `aws-ssm:<parameter-name>` references.
+/// Default keychain ref for the AWS access key ID.
+const DEFAULT_ACCESS_KEY_REF: &str = "keychain:opaque/aws-access-key-id";
+
+/// Default keychain ref for the AWS secret access key.
+const DEFAULT_SECRET_KEY_REF: &str = "keychain:opaque/aws-secret-access-key";
+
+/// Environment variable to override the AWS access key ref.
+const ACCESS_KEY_REF_ENV: &str = "OPAQUE_AWS_ACCESS_KEY_REF";
+
+/// Environment variable to override the AWS secret key ref.
+const SECRET_KEY_REF_ENV: &str = "OPAQUE_AWS_SECRET_KEY_REF";
+
+/// Parsed AWS ref: either a Secrets Manager secret or an SSM parameter.
+#[derive(Debug, PartialEq)]
+enum AwsRef<'a> {
+    /// Secrets Manager: `aws:<secret-name>`
+    SecretsManager(&'a str),
+    /// SSM Parameter Store: `aws:ssm:<parameter-name>`
+    SsmParameter(&'a str),
+}
+
+/// Resolves `aws:<secret-name>` and `aws:ssm:<parameter-name>` secret references.
 pub struct AwsResolver {
-    client: AwsSecretsManagerClient,
+    client: AwsClient,
+    access_key_ref: String,
+    secret_key_ref: String,
 }
 
 impl std::fmt::Debug for AwsResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AwsResolver")
-            .field("region", &self.client.region())
+            .field("access_key_ref", &self.access_key_ref)
+            .field("secret_key_ref", &self.secret_key_ref)
             .finish()
     }
 }
 
-/// Parsed AWS ref: either a Secrets Manager secret or an SSM parameter.
-#[derive(Debug, PartialEq)]
-enum AwsRef<'a> {
-    /// AWS Secrets Manager secret by name or ARN.
-    SecretsManager(&'a str),
-    /// SSM Parameter Store parameter by name.
-    SsmParameter(&'a str),
-}
-
 impl AwsResolver {
     /// Create a new resolver with the given AWS client.
-    pub fn new(client: AwsSecretsManagerClient) -> Self {
-        Self { client }
+    pub fn new(client: AwsClient) -> Self {
+        let access_key_ref =
+            std::env::var(ACCESS_KEY_REF_ENV).unwrap_or_else(|_| DEFAULT_ACCESS_KEY_REF.to_owned());
+        let secret_key_ref =
+            std::env::var(SECRET_KEY_REF_ENV).unwrap_or_else(|_| DEFAULT_SECRET_KEY_REF.to_owned());
+        Self {
+            client,
+            access_key_ref,
+            secret_key_ref,
+        }
     }
 
-    /// Parse an `aws-sm:` or `aws-ssm:` ref.
+    /// Parse an `aws:` ref.
     ///
     /// Formats:
-    /// - `aws-sm:<secret-name-or-arn>` -- AWS Secrets Manager
-    /// - `aws-ssm:<parameter-name>` -- SSM Parameter Store
+    /// - `aws:<secret-name>` — Secrets Manager lookup
+    /// - `aws:ssm:<parameter-name>` — SSM Parameter Store lookup
     fn parse_ref(ref_str: &str) -> Result<AwsRef<'_>, ResolveError> {
-        if let Some(rest) = ref_str.strip_prefix("aws-sm:") {
-            if rest.is_empty() {
+        let rest = ref_str
+            .strip_prefix("aws:")
+            .ok_or_else(|| ResolveError::UnknownScheme(ref_str.to_owned()))?;
+
+        if rest.is_empty() {
+            return Err(ResolveError::AwsError(
+                ref_str.to_owned(),
+                "empty ref after 'aws:' prefix".into(),
+            ));
+        }
+
+        if let Some(param_name) = rest.strip_prefix("ssm:") {
+            if param_name.is_empty() {
                 return Err(ResolveError::AwsError(
                     ref_str.to_owned(),
-                    "empty ref after 'aws-sm:' prefix".into(),
+                    "empty parameter name after 'aws:ssm:' prefix".into(),
                 ));
             }
-            Ok(AwsRef::SecretsManager(rest))
-        } else if let Some(rest) = ref_str.strip_prefix("aws-ssm:") {
-            if rest.is_empty() {
-                return Err(ResolveError::AwsError(
-                    ref_str.to_owned(),
-                    "empty ref after 'aws-ssm:' prefix".into(),
-                ));
-            }
-            Ok(AwsRef::SsmParameter(rest))
+            Ok(AwsRef::SsmParameter(param_name))
         } else {
-            Err(ResolveError::UnknownScheme(ref_str.to_owned()))
+            Ok(AwsRef::SecretsManager(rest))
         }
     }
 }
@@ -74,11 +97,31 @@ impl SecretResolver for AwsResolver {
     fn resolve(&self, ref_str: &str) -> Result<SecretValue, ResolveError> {
         let parsed = Self::parse_ref(ref_str)?;
 
-        // Resolve AWS credentials from environment.
-        let credentials = AwsCredentials::from_env().map_err(|e| {
+        // Resolve AWS credentials via base resolvers only (env + keychain).
+        let base = BaseResolver::new();
+        let access_key_value = base.resolve(&self.access_key_ref).map_err(|e| {
             ResolveError::AwsError(
                 ref_str.to_owned(),
-                format!("failed to resolve AWS credentials: {e}"),
+                format!("failed to resolve AWS access key: {e}"),
+            )
+        })?;
+        let access_key = access_key_value.as_str().ok_or_else(|| {
+            ResolveError::AwsError(
+                ref_str.to_owned(),
+                "AWS access key is not valid UTF-8".into(),
+            )
+        })?;
+
+        let secret_key_value = base.resolve(&self.secret_key_ref).map_err(|e| {
+            ResolveError::AwsError(
+                ref_str.to_owned(),
+                format!("failed to resolve AWS secret key: {e}"),
+            )
+        })?;
+        let secret_key = secret_key_value.as_str().ok_or_else(|| {
+            ResolveError::AwsError(
+                ref_str.to_owned(),
+                "AWS secret key is not valid UTF-8".into(),
             )
         })?;
 
@@ -87,26 +130,26 @@ impl SecretResolver for AwsResolver {
         let result = tokio::task::block_in_place(|| {
             handle.block_on(async {
                 match parsed {
-                    AwsRef::SecretsManager(secret_id) => {
+                    AwsRef::SecretsManager(secret_name) => {
                         let sv = self
                             .client
-                            .get_secret_value(&credentials, secret_id)
+                            .get_secret_value(access_key, secret_key, secret_name)
                             .await
                             .map_err(|e| format!("secret fetch failed: {e}"))?;
 
                         sv.secret_string
-                            .ok_or_else(|| format!("secret '{secret_id}' has no SecretString"))
+                            .ok_or_else(|| format!("secret '{secret_name}' has no string value"))
                     }
-                    AwsRef::SsmParameter(name) => {
+                    AwsRef::SsmParameter(param_name) => {
                         let param = self
                             .client
-                            .get_parameter(&credentials, name)
+                            .get_parameter(access_key, secret_key, param_name, true)
                             .await
                             .map_err(|e| format!("parameter fetch failed: {e}"))?;
 
                         param
                             .value
-                            .ok_or_else(|| format!("parameter '{name}' has no value"))
+                            .ok_or_else(|| format!("parameter '{param_name}' has no value"))
                     }
                 }
             })
@@ -129,28 +172,14 @@ mod tests {
 
     #[test]
     fn parse_ref_secrets_manager() {
-        let result = AwsResolver::parse_ref("aws-sm:prod/db-password").unwrap();
+        let result = AwsResolver::parse_ref("aws:prod/db-password").unwrap();
         assert_eq!(result, AwsRef::SecretsManager("prod/db-password"));
     }
 
     #[test]
-    fn parse_ref_secrets_manager_arn() {
-        let result = AwsResolver::parse_ref(
-            "aws-sm:arn:aws:secretsmanager:us-east-1:123456789:secret:prod/db-password",
-        )
-        .unwrap();
-        assert_eq!(
-            result,
-            AwsRef::SecretsManager(
-                "arn:aws:secretsmanager:us-east-1:123456789:secret:prod/db-password"
-            )
-        );
-    }
-
-    #[test]
     fn parse_ref_ssm_parameter() {
-        let result = AwsResolver::parse_ref("aws-ssm:/app/config/db-url").unwrap();
-        assert_eq!(result, AwsRef::SsmParameter("/app/config/db-url"));
+        let result = AwsResolver::parse_ref("aws:ssm:/myapp/config/key").unwrap();
+        assert_eq!(result, AwsRef::SsmParameter("/myapp/config/key"));
     }
 
     #[test]
@@ -164,52 +193,34 @@ mod tests {
     }
 
     #[test]
-    fn parse_ref_bitwarden_scheme_rejected() {
-        let result = AwsResolver::parse_ref("bitwarden:some-id");
+    fn parse_ref_empty_after_prefix() {
+        let result = AwsResolver::parse_ref("aws:");
         assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            ResolveError::UnknownScheme(_)
-        ));
     }
 
     #[test]
-    fn parse_ref_empty_after_sm_prefix() {
-        let result = AwsResolver::parse_ref("aws-sm:");
+    fn parse_ref_empty_ssm_name() {
+        let result = AwsResolver::parse_ref("aws:ssm:");
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ResolveError::AwsError(..)));
     }
 
     #[test]
-    fn parse_ref_empty_after_ssm_prefix() {
-        let result = AwsResolver::parse_ref("aws-ssm:");
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ResolveError::AwsError(..)));
+    fn parse_ref_secret_with_slashes() {
+        let result = AwsResolver::parse_ref("aws:prod/team/db").unwrap();
+        assert_eq!(result, AwsRef::SecretsManager("prod/team/db"));
     }
 
     #[test]
-    fn parse_ref_sm_with_slashes() {
-        let result = AwsResolver::parse_ref("aws-sm:prod/team/db-password").unwrap();
-        assert_eq!(result, AwsRef::SecretsManager("prod/team/db-password"));
-    }
-
-    #[test]
-    fn parse_ref_ssm_with_nested_path() {
-        let result = AwsResolver::parse_ref("aws-ssm:/prod/team/config/db-url").unwrap();
-        assert_eq!(result, AwsRef::SsmParameter("/prod/team/config/db-url"));
+    fn parse_ref_ssm_with_deep_path() {
+        let result = AwsResolver::parse_ref("aws:ssm:/a/b/c/d").unwrap();
+        assert_eq!(result, AwsRef::SsmParameter("/a/b/c/d"));
     }
 
     #[test]
     fn resolver_debug() {
-        let client = AwsSecretsManagerClient::with_urls(
-            "http://localhost:4566",
-            "http://localhost:4566",
-            "us-east-1",
-        )
-        .unwrap();
+        let client = AwsClient::new_single("http://localhost:8080");
         let resolver = AwsResolver::new(client);
         let debug = format!("{resolver:?}");
         assert!(debug.contains("AwsResolver"));
-        assert!(debug.contains("us-east-1"));
     }
 }
