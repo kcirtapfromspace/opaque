@@ -14,6 +14,7 @@
 - [Launch week playbook (messaging, quickstart gate, triage, SLAs)](launch-week-playbook.md)
 - [Alpha go/no-go status (2026-02-25)](alpha-go-no-go-status-2026-02-25.md)
 - [Alpha sign-off ledger (2026-02-25)](alpha-signoff-ledger-2026-02-25.md)
+- [Alpha macOS signing waiver template (2026-02-25)](alpha-macos-signing-waiver-template.md)
 - [Alpha competitive battlecard](alpha-competitive-battlecard.md)
 - [Design-partner scorecard template](design-partner-scorecard-template.md)
 - [Alpha design-partner usage log (2026-02-25)](alpha-design-partner-usage-log-2026-02-25.md)

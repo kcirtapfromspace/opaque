@@ -63,9 +63,18 @@ Release dry-run evidence:
 2. Confirm design-partner usage threshold (>= 3 weekly active partners).
 3. Collect and record approvals from PO, ENG, SEC, GTM, and REL.
 
+Tracking issues:
+- #12 `Configure macOS signing/notarization release secrets (or approve waiver)`:
+  - `https://github.com/kcirtapfromspace/opaque/issues/12`
+- #13 `Close PMF gate: verify >=3 weekly active design partners`:
+  - `https://github.com/kcirtapfromspace/opaque/issues/13`
+- #14 `Collect PO/ENG/SEC/GTM/REL launch sign-offs`:
+  - `https://github.com/kcirtapfromspace/opaque/issues/14`
+
 Execution artifacts for remaining blockers:
 - PMF usage capture: [Alpha design-partner usage log (2026-02-25)](alpha-design-partner-usage-log-2026-02-25.md)
 - Approval capture: [Alpha sign-off ledger (2026-02-25)](alpha-signoff-ledger-2026-02-25.md)
+- Signing waiver option: [Alpha macOS signing waiver template (2026-02-25)](alpha-macos-signing-waiver-template.md)
 
 ## Decision
 
