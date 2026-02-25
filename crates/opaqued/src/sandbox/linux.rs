@@ -115,7 +115,7 @@ fn detect_bubblewrap() -> bool {
 
 /// Check if the kernel supports Landlock by attempting to create a minimal ruleset.
 fn detect_landlock() -> bool {
-    use landlock::{ABI, Access, AccessFs, Ruleset};
+    use landlock::{ABI, Access, AccessFs, Ruleset, RulesetAttr};
 
     // Try to create a ruleset — if the kernel doesn't support Landlock,
     // this will fail gracefully.
@@ -176,7 +176,8 @@ fn protected_paths() -> Vec<PathBuf> {
 /// Returns `true` if Landlock was successfully applied, `false` if not supported.
 pub fn landlock_restrict(project_dir: &Path, extra_read_paths: &[PathBuf]) -> bool {
     use landlock::{
-        ABI, Access, AccessFs, Compatible, PathBeneath, PathFd, Ruleset, RulesetStatus,
+        ABI, Access, AccessFs, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
+        RulesetStatus,
     };
 
     // Set PR_SET_NO_NEW_PRIVS — required before Landlock and good security practice.
