@@ -27,43 +27,6 @@ const fn version_string() -> &'static str {
 /// Name of the daemon token file expected next to the socket.
 const DAEMON_TOKEN_FILENAME: &str = "daemon.token";
 
-/// Default sample config embedded in the binary for `opaque init`.
-const SAMPLE_CONFIG: &str = r#"# Opaque configuration file
-# See https://github.com/anthropics/opaque for documentation.
-#
-# Rules are evaluated in order; the first matching rule wins.
-# Default behavior is deny-all (no rules = nothing is permitted).
-
-# Example: Allow Claude Code to sync GitHub Actions secrets for your org.
-# Requires biometric approval on first use, then a 5-minute lease.
-#
-# [[rules]]
-# name = "allow-claude-github-secrets"
-# operation_pattern = "github.set_actions_secret"
-# allow = true
-# client_types = ["agent", "human"]
-#
-# [rules.client]
-# exe_path = "/usr/bin/claude*"
-#
-# [rules.target]
-# fields = { repo = "myorg/*" }
-#
-# [rules.workspace]
-#
-# [rules.secret_names]
-# patterns = ["GH_*"]
-#
-# [rules.approval]
-# require = "first_use"
-# factors = ["local_bio"]
-# lease_ttl = 300
-#
-# Optional: require session tokens for agent-classified clients.
-# enforce_agent_sessions = true
-# agent_session_ttl_secs = 3600
-"#;
-
 #[derive(Debug, Parser)]
 #[command(name = "opaque", version = version_string())]
 struct Cli {
@@ -2790,20 +2753,26 @@ fn policy_apply_preset(name: &str) -> Result<(), String> {
 fn run_init(force: bool, preset: Option<&str>) -> Result<(), String> {
     let base = default_opaque_dir();
 
-    // Determine config content.
-    let config_content = match preset {
-        Some(name) => get_preset(name).ok_or_else(|| {
-            format!(
-                "unknown preset '{name}'. Available: {}",
-                available_presets()
-                    .iter()
-                    .map(|(n, _, _)| *n)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        })?,
-        None => SAMPLE_CONFIG,
-    };
+    // Determine config content. Default to safe-demo if no preset specified.
+    let effective_preset = preset.unwrap_or("safe-demo");
+    let config_content = get_preset(effective_preset).ok_or_else(|| {
+        format!(
+            "unknown preset '{effective_preset}'. Available: {}",
+            available_presets()
+                .iter()
+                .map(|(n, _, _)| *n)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+
+    if preset.is_none() {
+        ui::info(&format!(
+            "Using default preset '{}'. Use --preset <name> to choose a different one.",
+            style("safe-demo").bold()
+        ));
+        println!();
+    }
 
     run_init_at(&base, force, config_content)?;
 
@@ -2817,20 +2786,25 @@ fn run_init(force: bool, preset: Option<&str>) -> Result<(), String> {
         "Created {}",
         style(base.join("profiles").display()).cyan()
     ));
-    if let Some(name) = preset {
-        ui::init_step(&format!(
-            "Wrote   {} (preset: {})",
-            style(base.join("config.toml").display()).cyan(),
-            style(name).bold()
-        ));
-    } else {
-        ui::init_step(&format!(
-            "Wrote   {}",
-            style(base.join("config.toml").display()).cyan()
-        ));
-    }
+    ui::init_step(&format!(
+        "Wrote   {} (preset: {})",
+        style(base.join("config.toml").display()).cyan(),
+        style(effective_preset).bold()
+    ));
     println!();
-    ui::info("Run 'opaque setup' to configure your security policy and seal it.");
+    println!("  Next steps:");
+    println!("    1. Start the daemon:   {}", style("opaqued").bold());
+    println!("    2. Test it works:      {}", style("opaque ping").bold());
+    println!(
+        "    3. Run a test op:      {}",
+        style("opaque execute test.noop").bold()
+    );
+    println!(
+        "    4. Check diagnostics:  {}",
+        style("opaque doctor").bold()
+    );
+    println!();
+    ui::info("Run 'opaque policy presets' to see all available presets.");
     Ok(())
 }
 
@@ -3892,7 +3866,7 @@ lease_ttl = 0
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join(".opaque");
 
-        let result = run_init_at(&base, false, SAMPLE_CONFIG);
+        let result = run_init_at(&base, false, PRESET_SAFE_DEMO);
         assert!(result.is_ok(), "expected Ok, got: {result:?}");
 
         assert!(base.exists());
@@ -3900,7 +3874,7 @@ lease_ttl = 0
         assert!(base.join("config.toml").exists());
 
         let content = fs::read_to_string(base.join("config.toml")).unwrap();
-        assert!(content.contains("Opaque configuration file"));
+        assert!(content.contains("safe-demo"));
     }
 
     #[test]
@@ -3910,7 +3884,7 @@ lease_ttl = 0
         fs::create_dir_all(&base).unwrap();
         fs::write(base.join("config.toml"), "existing").unwrap();
 
-        let result = run_init_at(&base, false, SAMPLE_CONFIG);
+        let result = run_init_at(&base, false, PRESET_SAFE_DEMO);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already exists"));
     }
@@ -3922,11 +3896,11 @@ lease_ttl = 0
         fs::create_dir_all(&base).unwrap();
         fs::write(base.join("config.toml"), "old content").unwrap();
 
-        let result = run_init_at(&base, true, SAMPLE_CONFIG);
+        let result = run_init_at(&base, true, PRESET_SAFE_DEMO);
         assert!(result.is_ok(), "expected Ok, got: {result:?}");
 
         let content = fs::read_to_string(base.join("config.toml")).unwrap();
-        assert!(content.contains("Opaque configuration file"));
+        assert!(content.contains("safe-demo"));
         // Old content should be replaced
         assert!(!content.contains("old content"));
     }
@@ -4036,7 +4010,7 @@ factors = []
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join(".opaque");
 
-        run_init_at(&base, false, SAMPLE_CONFIG).unwrap();
+        run_init_at(&base, false, PRESET_SAFE_DEMO).unwrap();
 
         #[cfg(unix)]
         {
@@ -4047,14 +4021,6 @@ factors = []
             let run_mode = fs::metadata(base.join("run")).unwrap().permissions().mode() & 0o777;
             assert_eq!(run_mode, 0o700, "run dir should be 0700, got {run_mode:o}");
         }
-    }
-
-    #[test]
-    fn sample_config_parses_successfully() {
-        // Verify the embedded SAMPLE_CONFIG is valid TOML that deserializes.
-        let config: PolicyConfig = toml_edit::de::from_str(SAMPLE_CONFIG).unwrap();
-        // All example rules are commented out, so 0 rules.
-        assert_eq!(config.rules.len(), 0);
     }
 
     /// Write a TOML config, return the temp path for use in policy_show / policy_simulate.
