@@ -75,6 +75,18 @@ pub enum AuditEventKind {
 
     /// Audit events were dropped due to channel backpressure.
     AuditDropped,
+
+    /// An execve was evaluated against policy.
+    ExecveChecked,
+
+    /// An execve was allowed (either by policy or cached lease).
+    ExecveAllowed,
+
+    /// An execve was denied by policy.
+    ExecveDenied,
+
+    /// An execve requires human approval before proceeding.
+    ExecvePrompted,
 }
 
 impl fmt::Display for AuditEventKind {
@@ -97,6 +109,10 @@ impl fmt::Display for AuditEventKind {
             Self::SandboxCompleted => "sandbox.completed",
             Self::SecretResolved => "secret.resolved",
             Self::AuditDropped => "audit.dropped",
+            Self::ExecveChecked => "execve.checked",
+            Self::ExecveAllowed => "execve.allowed",
+            Self::ExecveDenied => "execve.denied",
+            Self::ExecvePrompted => "execve.prompted",
         };
         write!(f, "{s}")
     }
@@ -124,6 +140,10 @@ impl std::str::FromStr for AuditEventKind {
             "sandbox.completed" => Ok(Self::SandboxCompleted),
             "secret.resolved" => Ok(Self::SecretResolved),
             "audit.dropped" => Ok(Self::AuditDropped),
+            "execve.checked" => Ok(Self::ExecveChecked),
+            "execve.allowed" => Ok(Self::ExecveAllowed),
+            "execve.denied" => Ok(Self::ExecveDenied),
+            "execve.prompted" => Ok(Self::ExecvePrompted),
             _ => Err(format!("unknown audit event kind: {s}")),
         }
     }
@@ -475,7 +495,8 @@ fn default_level_for_kind(kind: AuditEventKind) -> AuditLevel {
         AuditEventKind::PolicyDenied
         | AuditEventKind::ApprovalDenied
         | AuditEventKind::RateLimited
-        | AuditEventKind::AuditDropped => AuditLevel::Warn,
+        | AuditEventKind::AuditDropped
+        | AuditEventKind::ExecveDenied => AuditLevel::Warn,
         AuditEventKind::OperationFailed => AuditLevel::Error,
         _ => AuditLevel::Info,
     }
@@ -1411,6 +1432,10 @@ mod tests {
             (AuditEventKind::SandboxCompleted, "sandbox.completed"),
             (AuditEventKind::SecretResolved, "secret.resolved"),
             (AuditEventKind::AuditDropped, "audit.dropped"),
+            (AuditEventKind::ExecveChecked, "execve.checked"),
+            (AuditEventKind::ExecveAllowed, "execve.allowed"),
+            (AuditEventKind::ExecveDenied, "execve.denied"),
+            (AuditEventKind::ExecvePrompted, "execve.prompted"),
         ];
         for (kind, expected) in kinds {
             assert_eq!(format!("{kind}"), expected);
@@ -1697,6 +1722,10 @@ mod tests {
             AuditEventKind::SandboxCompleted,
             AuditEventKind::SecretResolved,
             AuditEventKind::AuditDropped,
+            AuditEventKind::ExecveChecked,
+            AuditEventKind::ExecveAllowed,
+            AuditEventKind::ExecveDenied,
+            AuditEventKind::ExecvePrompted,
         ];
         for kind in kinds {
             let s = format!("{kind}");
@@ -2327,5 +2356,54 @@ mod tests {
 
         drop(sink);
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn execve_audit_events_serialize() {
+        // Verify that all execve audit event kinds serialize and deserialize correctly.
+        let kinds = vec![
+            AuditEventKind::ExecveChecked,
+            AuditEventKind::ExecveAllowed,
+            AuditEventKind::ExecveDenied,
+            AuditEventKind::ExecvePrompted,
+        ];
+        for kind in kinds {
+            let event = AuditEvent::new(kind)
+                .with_operation("sandbox.execve_check")
+                .with_outcome("allow")
+                .with_detail("executable=/usr/bin/git args=[push, origin, main] cwd=/home/user sandbox_id=codex-abc");
+            let json = serde_json::to_string(&event).unwrap();
+            let deserialized: AuditEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(deserialized.kind, kind);
+            assert_eq!(
+                deserialized.operation.as_deref(),
+                Some("sandbox.execve_check")
+            );
+            assert!(
+                deserialized
+                    .detail
+                    .as_ref()
+                    .unwrap()
+                    .contains("/usr/bin/git")
+            );
+        }
+
+        // Verify default levels.
+        assert_eq!(
+            default_level_for_kind(AuditEventKind::ExecveChecked),
+            AuditLevel::Info
+        );
+        assert_eq!(
+            default_level_for_kind(AuditEventKind::ExecveAllowed),
+            AuditLevel::Info
+        );
+        assert_eq!(
+            default_level_for_kind(AuditEventKind::ExecveDenied),
+            AuditLevel::Warn
+        );
+        assert_eq!(
+            default_level_for_kind(AuditEventKind::ExecvePrompted),
+            AuditLevel::Info
+        );
     }
 }

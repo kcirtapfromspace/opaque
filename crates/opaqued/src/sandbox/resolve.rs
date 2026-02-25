@@ -138,10 +138,13 @@ impl SecretResolver for KeychainResolver {
                 })?;
 
             if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
+                let _stderr = String::from_utf8_lossy(&output.stderr);
                 return Err(ResolveError::KeychainError(
                     ref_str.to_owned(),
-                    format!("security command failed: {}", stderr.trim()),
+                    format!(
+                        "secret '{}/{}' not found in keychain \u{2014} store it with: opaque secrets add {}",
+                        service, account, account
+                    ),
                 ));
             }
 
@@ -164,10 +167,13 @@ impl SecretResolver for KeychainResolver {
                 })?;
 
             if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
+                let _stderr = String::from_utf8_lossy(&output.stderr);
                 return Err(ResolveError::KeychainError(
                     ref_str.to_owned(),
-                    format!("secret-tool failed: {}", stderr.trim()),
+                    format!(
+                        "secret '{}/{}' not found in keychain \u{2014} store it with: opaque secrets add {}",
+                        service, account, account
+                    ),
                 ));
             }
 
@@ -688,5 +694,22 @@ mod tests {
             result.unwrap_err(),
             ResolveError::ProfileError(..)
         ));
+    }
+
+    #[test]
+    fn error_message_keychain_not_found_includes_add_hint() {
+        let err = ResolveError::KeychainError(
+            "keychain:opaque/foo".into(),
+            "secret 'opaque/foo' not found in keychain \u{2014} store it with: opaque secrets add foo".into(),
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("opaque secrets add"),
+            "keychain error should suggest 'opaque secrets add', got: {msg}"
+        );
+        assert!(
+            msg.contains("foo"),
+            "keychain error should contain the secret name, got: {msg}"
+        );
     }
 }
