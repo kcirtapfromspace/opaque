@@ -138,8 +138,10 @@ impl WorkspaceMatch {
     /// Returns `true` if the workspace context (or lack thereof) matches.
     ///
     /// - No constraints + no workspace = match (backward compat)
+    /// - No constraints + workspace present = match (backward compat)
     /// - Constraints + no workspace = deny
-    /// - Constraints + workspace = check each field via glob
+    /// - Constraints + unverified workspace = deny (fail-closed)
+    /// - Constraints + verified workspace = check each field via glob
     /// - `require_clean && dirty = deny`
     pub fn matches(&self, workspace: Option<&WorkspaceContext>) -> bool {
         let has_constraints = self.remote_url_pattern.is_some()
@@ -155,6 +157,14 @@ impl WorkspaceMatch {
             (true, None) => false,
             // Constraints + workspace — check each.
             (true, Some(ws)) => {
+                // Fail-closed: workspace constraints require verified workspace state.
+                // If the daemon could not verify the claimed workspace (cwd unreadable,
+                // git commands failed, etc.), the workspace_verified flag is false and
+                // the rule must not match.
+                if !ws.workspace_verified {
+                    return false;
+                }
+
                 if let Some(ref pattern) = self.remote_url_pattern {
                     match &ws.remote_url {
                         Some(url) => {
@@ -907,6 +917,7 @@ mod tests {
             branch: Some("main".into()),
             head_sha: Some("abc123".into()),
             dirty: false,
+            workspace_verified: true,
         }
     }
 
@@ -1145,5 +1156,158 @@ mod tests {
         req.secret_ref_names = vec![]; // Empty — should fail closed.
         let decision = engine.evaluate(&req, OperationSafety::Safe);
         assert!(!decision.allowed);
+    }
+
+    // -- Workspace verification fail-closed tests (P1 security fix) --
+
+    fn test_workspace_verified() -> WorkspaceContext {
+        // A workspace context with workspace_verified = true (daemon confirmed git state).
+        WorkspaceContext {
+            repo_root: "/home/user/project".into(),
+            remote_url: Some("git@github.com:org/repo.git".into()),
+            branch: Some("main".into()),
+            head_sha: Some("abc123".into()),
+            dirty: false,
+            workspace_verified: true,
+        }
+    }
+
+    fn test_workspace_unverified() -> WorkspaceContext {
+        // A workspace context where verification could not be completed.
+        WorkspaceContext {
+            repo_root: "/home/user/project".into(),
+            remote_url: Some("git@github.com:org/repo.git".into()),
+            branch: Some("main".into()),
+            head_sha: Some("abc123".into()),
+            dirty: false,
+            workspace_verified: false,
+        }
+    }
+
+    #[test]
+    fn workspace_match_unverified_with_constraints_denied() {
+        // When a workspace rule has constraints (remote_url_pattern), an unverified
+        // workspace must NOT match — fail closed.
+        let wm = WorkspaceMatch {
+            remote_url_pattern: Some("*github.com:org/*".into()),
+            ..Default::default()
+        };
+        let ws = test_workspace_unverified();
+        assert!(!wm.matches(Some(&ws)));
+    }
+
+    #[test]
+    fn workspace_match_unverified_without_constraints_passes() {
+        // When a workspace rule has NO constraints, verification status is irrelevant.
+        let wm = WorkspaceMatch::default();
+        let ws = test_workspace_unverified();
+        assert!(wm.matches(Some(&ws)));
+    }
+
+    #[test]
+    fn workspace_match_verified_matching_remote_allowed() {
+        let wm = WorkspaceMatch {
+            remote_url_pattern: Some("*github.com:org/*".into()),
+            ..Default::default()
+        };
+        let ws = test_workspace_verified();
+        assert!(wm.matches(Some(&ws)));
+    }
+
+    #[test]
+    fn workspace_match_verified_nonmatching_remote_denied() {
+        let wm = WorkspaceMatch {
+            remote_url_pattern: Some("*gitlab.com:other/*".into()),
+            ..Default::default()
+        };
+        let ws = test_workspace_verified();
+        assert!(!wm.matches(Some(&ws)));
+    }
+
+    #[test]
+    fn workspace_match_unverified_with_branch_constraint_denied() {
+        let wm = WorkspaceMatch {
+            branch_pattern: Some("main".into()),
+            ..Default::default()
+        };
+        let ws = test_workspace_unverified();
+        assert!(!wm.matches(Some(&ws)));
+    }
+
+    #[test]
+    fn workspace_match_unverified_with_require_clean_denied() {
+        let wm = WorkspaceMatch {
+            require_clean: true,
+            ..Default::default()
+        };
+        let ws = test_workspace_unverified();
+        assert!(!wm.matches(Some(&ws)));
+    }
+
+    #[test]
+    fn policy_workspace_constraint_unverified_denied() {
+        // End-to-end: a policy rule with workspace constraints should deny
+        // a request that has an unverified workspace, even if all other
+        // fields match.
+        let mut rule = allow_rule();
+        rule.workspace = WorkspaceMatch {
+            remote_url_pattern: Some("*github.com:org/*".into()),
+            branch_pattern: Some("main".into()),
+            require_clean: false,
+        };
+        let engine = PolicyEngine::with_rules(vec![rule]);
+
+        let mut req = test_request("github.set_actions_secret", ClientType::Agent);
+        req.workspace = Some(test_workspace_unverified());
+        let decision = engine.evaluate(&req, OperationSafety::Safe);
+        assert!(
+            !decision.allowed,
+            "unverified workspace must be denied when constraints exist"
+        );
+    }
+
+    #[test]
+    fn policy_workspace_constraint_verified_allowed() {
+        // End-to-end: verified workspace with matching constraints -> allowed.
+        let mut rule = allow_rule();
+        rule.workspace = WorkspaceMatch {
+            remote_url_pattern: Some("*github.com:org/*".into()),
+            branch_pattern: Some("main".into()),
+            require_clean: false,
+        };
+        let engine = PolicyEngine::with_rules(vec![rule]);
+
+        let mut req = test_request("github.set_actions_secret", ClientType::Agent);
+        req.workspace = Some(test_workspace_verified());
+        let decision = engine.evaluate(&req, OperationSafety::Safe);
+        assert!(
+            decision.allowed,
+            "verified matching workspace must be allowed"
+        );
+    }
+
+    #[test]
+    fn policy_no_workspace_constraints_ignores_verification() {
+        // When a rule has NO workspace constraints, verification status
+        // is irrelevant — backward compatible.
+        let rule = allow_rule(); // default WorkspaceMatch (no constraints)
+        let engine = PolicyEngine::with_rules(vec![rule]);
+
+        // Unverified workspace still passes because rule has no constraints.
+        let mut req = test_request("github.set_actions_secret", ClientType::Agent);
+        req.workspace = Some(test_workspace_unverified());
+        let decision = engine.evaluate(&req, OperationSafety::Safe);
+        assert!(
+            decision.allowed,
+            "no workspace constraints => verification irrelevant"
+        );
+
+        // No workspace at all also passes.
+        let req2 = test_request("github.set_actions_secret", ClientType::Agent);
+        let decision2 = engine.evaluate(&req2, OperationSafety::Safe);
+        assert!(
+            decision2.allowed,
+            "no workspace constraints => None workspace ok"
+        );
     }
 }

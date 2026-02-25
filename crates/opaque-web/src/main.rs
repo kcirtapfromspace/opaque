@@ -1,14 +1,18 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use axum::extract::State;
+use axum::http::Request;
+use axum::middleware::Next;
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
-use tower_http::cors::{Any, CorsLayer};
 
 mod config;
 mod daemon_client;
 mod demo;
 mod routes;
+pub mod security;
 mod sse;
 
 #[derive(Parser)]
@@ -30,6 +34,7 @@ pub struct AppState {
     pub config_path: PathBuf,
     pub audit_db_path: PathBuf,
     pub cancel: CancellationToken,
+    pub auth_token: String,
 }
 
 #[tokio::main]
@@ -41,19 +46,39 @@ async fn main() {
     let args = Args::parse();
     let cancel = CancellationToken::new();
 
+    // Generate a local auth token and persist it to ~/.opaque/web.token.
+    let auth_token = security::generate_token();
+    let opaque_home = config::opaque_home();
+    match security::write_token_file(&opaque_home, &auth_token) {
+        Ok(path) => tracing::info!("auth token written to {}", path.display()),
+        Err(e) => {
+            tracing::error!("failed to write auth token: {e}");
+            std::process::exit(1);
+        }
+    }
+
     let state = AppState {
         daemon: daemon_client::DaemonClient::new(None),
         config_path: config::config_path(),
         audit_db_path: config::audit_db_path(),
         cancel: cancel.clone(),
+        auth_token: auth_token.clone(),
     };
 
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    let auth = security::AuthToken(Arc::new(auth_token));
 
-    let app = routes::router().layer(cors).with_state(state);
+    let app =
+        routes::router()
+            .layer(axum::middleware::from_fn_with_state(
+                auth.clone(),
+                |state: State<security::AuthToken>,
+                 request: Request<axum::body::Body>,
+                 next: Next| async move {
+                    security::require_api_token(state.0, request, next).await
+                },
+            ))
+            .layer(axum::middleware::from_fn(security::validate_origin))
+            .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
     tracing::info!("opaque-web listening on http://{addr}");

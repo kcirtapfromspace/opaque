@@ -393,8 +393,13 @@ mod tests {
 
     /// Set up a handler pointing at a mock server with the connect token
     /// provided via env var.
-    async fn setup_handler_with_mock() -> (OnePasswordHandler, MockServer, Arc<InMemoryAuditEmitter>)
-    {
+    async fn setup_handler_with_mock() -> (
+        std::sync::MutexGuard<'static, ()>,
+        OnePasswordHandler,
+        MockServer,
+        Arc<InMemoryAuditEmitter>,
+    ) {
+        let env_guard = crate::gcp::client::test_env_lock();
         let mock_server = MockServer::start().await;
         let audit = Arc::new(InMemoryAuditEmitter::new());
 
@@ -405,7 +410,7 @@ mod tests {
         unsafe { std::env::set_var(CONNECT_TOKEN_REF_ENV, format!("env:{token_env}")) };
 
         let handler = OnePasswordHandler::new(audit.clone(), &mock_server.uri()).unwrap();
-        (handler, mock_server, audit)
+        (env_guard, handler, mock_server, audit)
     }
 
     /// Clean up env vars after test.
@@ -415,7 +420,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_vaults_via_handler() {
-        let (handler, mock_server, audit) = setup_handler_with_mock().await;
+        let (_env_guard, handler, mock_server, audit) = setup_handler_with_mock().await;
 
         Mock::given(method("GET"))
             .and(path("/v1/vaults"))
@@ -448,7 +453,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_items_via_handler() {
-        let (handler, mock_server, _audit) = setup_handler_with_mock().await;
+        let (_env_guard, handler, mock_server, _audit) = setup_handler_with_mock().await;
 
         // Mock list_vaults to resolve vault name → ID
         Mock::given(method("GET"))
@@ -491,7 +496,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_vaults_auth_failure() {
-        let (handler, mock_server, _audit) = setup_handler_with_mock().await;
+        let (_env_guard, handler, mock_server, _audit) = setup_handler_with_mock().await;
 
         Mock::given(method("GET"))
             .and(path("/v1/vaults"))
@@ -511,7 +516,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_field_via_handler() {
-        let (handler, mock_server, audit) = setup_handler_with_mock().await;
+        let (_env_guard, handler, mock_server, audit) = setup_handler_with_mock().await;
 
         // Step 1: find vault by name
         Mock::given(method("GET"))
@@ -567,7 +572,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_field_missing_params_rejected() {
-        let (handler, _mock_server, _audit) = setup_handler_with_mock().await;
+        let (_env_guard, handler, _mock_server, _audit) = setup_handler_with_mock().await;
 
         // Missing vault
         let request = make_request(
@@ -601,7 +606,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_field_field_not_found() {
-        let (handler, mock_server, _audit) = setup_handler_with_mock().await;
+        let (_env_guard, handler, mock_server, _audit) = setup_handler_with_mock().await;
 
         Mock::given(method("GET"))
             .and(path("/v1/vaults"))
@@ -651,7 +656,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_items_vault_not_found() {
-        let (handler, mock_server, _audit) = setup_handler_with_mock().await;
+        let (_env_guard, handler, mock_server, _audit) = setup_handler_with_mock().await;
 
         // Vault lookup returns empty list → vault not found
         Mock::given(method("GET"))
