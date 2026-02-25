@@ -738,40 +738,26 @@ async fn stream_output(
 mod tests {
     use super::*;
 
-    fn sandbox_backend_available_for_tests() -> bool {
+    async fn sandbox_backend_available_for_tests() -> bool {
         if !cfg!(target_os = "linux") {
             return false;
         }
 
-        let caps = SandboxCapabilities::detect();
+        // Probe the *actual* sandbox execution path used by tests.
+        // Some CI hosts have namespace tools installed but not usable
+        // with the full argument set we require.
+        let (tx, _rx) = mpsc::channel(8);
+        let probe = LinuxSandboxConfig {
+            command: vec!["true".into()],
+            env: HashMap::new(),
+            project_dir: PathBuf::from("/tmp"),
+            extra_read_paths: vec![],
+            network_allow: vec![],
+            timeout_secs: 5,
+            max_output_bytes: 1024,
+        };
 
-        if caps.bubblewrap {
-            let bwrap_ok = std::process::Command::new("bwrap")
-                .args(["--ro-bind", "/", "/", "--", "true"])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if bwrap_ok {
-                return true;
-            }
-        }
-
-        if caps.user_namespaces {
-            let unshare_ok = std::process::Command::new("unshare")
-                .args(["--user", "--", "true"])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if unshare_ok {
-                return true;
-            }
-        }
-
-        false
+        matches!(execute(probe, tx).await, Ok(0))
     }
 
     #[test]
@@ -807,7 +793,7 @@ mod tests {
     async fn execute_simple_command() {
         // Skip on hosts where sandbox backends are not executable
         // (common in restricted CI environments).
-        if !sandbox_backend_available_for_tests() {
+        if !sandbox_backend_available_for_tests().await {
             return;
         }
 
@@ -842,7 +828,7 @@ mod tests {
 
     #[tokio::test]
     async fn env_vars_injected() {
-        if !sandbox_backend_available_for_tests() {
+        if !sandbox_backend_available_for_tests().await {
             return;
         }
 

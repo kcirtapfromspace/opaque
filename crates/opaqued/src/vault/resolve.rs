@@ -249,9 +249,18 @@ impl SecretResolver for VaultResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, OnceLock};
     use tokio::time::sleep;
     use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn test_lock() -> tokio::sync::OwnedMutexGuard<()> {
+        static LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+        LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+            .lock_owned()
+            .await
+    }
 
     #[test]
     fn parse_ref_valid() {
@@ -309,6 +318,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn resolve_reads_field_with_env_token_ref() {
+        let _guard = test_lock().await;
         VaultResolver::clear_cache_for_tests();
         let server = MockServer::start().await;
         let client = VaultClient::with_base_url(server.uri());
@@ -339,6 +349,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn resolve_propagates_client_failure() {
+        let _guard = test_lock().await;
         VaultResolver::clear_cache_for_tests();
         let server = MockServer::start().await;
         let client = VaultClient::with_base_url(server.uri());
@@ -363,6 +374,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn resolve_uses_cached_leased_value_before_expiry() {
+        let _guard = test_lock().await;
         VaultResolver::clear_cache_for_tests();
         let server = MockServer::start().await;
         let client = VaultClient::with_base_url(server.uri());
@@ -400,6 +412,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn resolve_refreshes_after_lease_expiry() {
+        let _guard = test_lock().await;
         VaultResolver::clear_cache_for_tests();
         let server = MockServer::start().await;
         let client = VaultClient::with_base_url(server.uri());
@@ -457,6 +470,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn resolve_revokes_expired_lease_before_refresh() {
+        let _guard = test_lock().await;
         VaultResolver::clear_cache_for_tests();
         let server = MockServer::start().await;
         let client = VaultClient::with_base_url(server.uri());
