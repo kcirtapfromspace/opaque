@@ -88,7 +88,7 @@ Binaries:
 4. Ask Claude Code to sync a secret:
    > "Set the GitHub Actions secret API_KEY for myorg/myrepo using my keychain"
 
-Full MCP docs: `docs/mcp-integration.md`
+Full MCP docs: [MCP integration](docs/mcp-integration.md)
 
 ## Quickstart: Codex / CLI
 
@@ -151,7 +151,7 @@ opaque agent run -- codex
    opaque audit tail --query github --limit 10
    ```
 
-Full CLI docs: `docs/getting-started.md`
+Full CLI docs: [Getting started](docs/getting-started.md)
 
 ## Policy Presets
 
@@ -184,22 +184,22 @@ opaque policy preset github-secrets
 
 ## Docs
 
-- Docs index: `docs/README.md`
-- Getting started: `docs/getting-started.md`
-- MCP integration: `docs/mcp-integration.md`
-- Bitwarden setup: `docs/bitwarden.md`
-- Vault setup: `docs/vault.md`
-- Policy: `docs/policy.md`
-- Operations: `docs/operations.md`
-- LLM harness: `docs/llm-harness.md`
-- Demos: `docs/demos.md`
-- Deployment: `docs/deployment.md`
-- Security assessment: `docs/security-assessment.md`
-- Deferred roadmap: `docs/roadmap-deferred.md`
+- [Docs index](docs/README.md)
+- [Getting started](docs/getting-started.md)
+- [MCP integration](docs/mcp-integration.md)
+- [Bitwarden setup](docs/bitwarden.md)
+- [Vault setup](docs/vault.md)
+- [Policy](docs/policy.md)
+- [Operations](docs/operations.md)
+- [LLM harness](docs/llm-harness.md)
+- [Demos](docs/demos.md)
+- [Deployment](docs/deployment.md)
+- [Security assessment](docs/security-assessment.md)
+- [Deferred roadmap](docs/roadmap-deferred.md)
 
 ## Deferred
 
-See `docs/roadmap-deferred.md`. Notably:
+See [Deferred roadmap](docs/roadmap-deferred.md). Notably:
 
 - Vault dynamic secrets + lease lifecycle
 - iOS approvals / FaceID (v3)

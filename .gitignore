@@ -11,3 +11,5 @@ plan-*.md
 tasks/
 *-explorer.html
 
+# MkDocs
+site/

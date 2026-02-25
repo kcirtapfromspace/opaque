@@ -303,6 +303,7 @@ pub struct DetectedAiTool {
 pub enum AiToolKind {
     ClaudeCode,
     Cursor,
+    Codex,
 }
 
 /// Detect AI coding tools installed on the system.
@@ -328,6 +329,15 @@ pub fn detect_ai_tools(env: &dyn Environment) -> Vec<DetectedAiTool> {
         });
     }
 
+    let codex_dir = home.join(".codex");
+    if env.path_exists(&codex_dir) {
+        tools.push(DetectedAiTool {
+            name: "Codex".into(),
+            config_dir: codex_dir,
+            kind: AiToolKind::Codex,
+        });
+    }
+
     tools
 }
 
@@ -342,29 +352,28 @@ pub fn generate_mcp_config(tool: &DetectedAiTool, opaque_mcp_path: &Path) -> Str
     let path_str = opaque_mcp_path.to_string_lossy();
 
     match tool.kind {
-        AiToolKind::ClaudeCode => {
-            serde_json::json!({
-                "mcpServers": {
-                    "opaque": {
-                        "command": path_str,
-                        "args": ["--stdio"],
-                        "env": {}
-                    }
+        AiToolKind::ClaudeCode => serde_json::json!({
+            "mcpServers": {
+                "opaque": {
+                    "command": path_str,
+                    "args": ["--stdio"],
+                    "env": {}
                 }
-            })
-            .to_string()
-        }
-        AiToolKind::Cursor => {
-            serde_json::json!({
-                "mcpServers": {
-                    "opaque": {
-                        "command": path_str,
-                        "args": ["--stdio"],
-                        "env": {}
-                    }
+            }
+        })
+        .to_string(),
+        AiToolKind::Cursor => serde_json::json!({
+            "mcpServers": {
+                "opaque": {
+                    "command": path_str,
+                    "args": ["--stdio"],
+                    "env": {}
                 }
-            })
-            .to_string()
+            }
+        })
+        .to_string(),
+        AiToolKind::Codex => {
+            format!("[mcp_servers.opaque]\ncommand = {path_str:?}\nargs = []\n")
         }
     }
 }
@@ -374,7 +383,16 @@ pub fn mcp_config_path(tool: &DetectedAiTool) -> PathBuf {
     match tool.kind {
         AiToolKind::ClaudeCode => tool.config_dir.join("settings.json"),
         AiToolKind::Cursor => tool.config_dir.join("mcp.json"),
+        AiToolKind::Codex => tool.config_dir.join("config.toml"),
     }
+}
+
+/// Return the Codex config file path (~/.codex/config.toml).
+pub fn codex_config_path() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".codex").join("config.toml")
 }
 
 // ---------------------------------------------------------------------------
@@ -403,10 +421,7 @@ impl Default for WizardOptions {
 }
 
 /// Generate a `config.toml` from detected providers and options.
-pub fn generate_config(
-    providers: &[DetectedProvider],
-    options: &WizardOptions,
-) -> String {
+pub fn generate_config(providers: &[DetectedProvider], options: &WizardOptions) -> String {
     let mut out = String::new();
 
     out.push_str("# Opaque configuration file\n");
@@ -669,10 +684,7 @@ fn write_rule(
 /// This is the entry point wired to `opaque init --interactive`.
 /// It performs provider detection, user selection, config generation,
 /// AI tool detection, and MCP registration.
-pub fn run_interactive(
-    base_dir: &Path,
-    force: bool,
-) -> Result<(), String> {
+pub fn run_interactive(base_dir: &Path, force: bool) -> Result<(), String> {
     let env = RealEnvironment;
 
     // Step 0: Check for existing config.
@@ -729,7 +741,7 @@ pub fn run_interactive(
     println!("  Detecting AI coding tools...");
     let ai_tools = detect_ai_tools(&env);
     if ai_tools.is_empty() {
-        println!("  No AI coding tools detected (Claude Code, Cursor).");
+        println!("  No AI coding tools detected (Claude Code, Cursor, Codex).");
     } else {
         for tool in &ai_tools {
             println!("    Found: {} ({})", tool.name, tool.config_dir.display());
@@ -746,16 +758,10 @@ pub fn run_interactive(
             if answer.is_empty() || answer.starts_with('y') || answer.starts_with('Y') {
                 match register_mcp(tool, mcp_path) {
                     Ok(()) => {
-                        crate::ui::success(&format!(
-                            "Registered opaque MCP with {}",
-                            tool.name
-                        ));
+                        crate::ui::success(&format!("Registered opaque MCP with {}", tool.name));
                     }
                     Err(e) => {
-                        crate::ui::warn(&format!(
-                            "Could not register with {}: {e}",
-                            tool.name
-                        ));
+                        crate::ui::warn(&format!("Could not register with {}: {e}", tool.name));
                     }
                 }
             }
@@ -811,12 +817,7 @@ fn print_detection_results(providers: &[DetectedProvider]) {
             DetectionStatus::Partial => console::style("~").yellow(),
             DetectionStatus::NotFound => console::style("-").dim(),
         };
-        println!(
-            "    {} {:<20} [{}]",
-            icon,
-            p.name,
-            status_label
-        );
+        println!("    {} {:<20} [{}]", icon, p.name, status_label);
         for hint in &p.config_hints {
             println!("      {}", console::style(hint).dim());
         }
@@ -900,7 +901,17 @@ fn find_opaque_mcp_binary() -> Option<PathBuf> {
 fn register_mcp(tool: &DetectedAiTool, opaque_mcp_path: &Path) -> Result<(), String> {
     let config_file = mcp_config_path(tool);
 
-    // Read existing config if present.
+    // Ensure parent directory exists.
+    if let Some(parent) = config_file.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+
+    if tool.kind == AiToolKind::Codex {
+        return register_mcp_codex(&config_file, opaque_mcp_path);
+    }
+
+    // JSON-based registration (Claude Code, Cursor).
     let mut config: serde_json::Value = if config_file.exists() {
         let content = std::fs::read_to_string(&config_file)
             .map_err(|e| format!("cannot read {}: {e}", config_file.display()))?;
@@ -918,7 +929,8 @@ fn register_mcp(tool: &DetectedAiTool, opaque_mcp_path: &Path) -> Result<(), Str
         .or_insert_with(|| serde_json::json!({}));
 
     let path_str = opaque_mcp_path.to_string_lossy().to_string();
-    servers.as_object_mut()
+    servers
+        .as_object_mut()
         .ok_or("mcpServers is not a JSON object")?
         .insert(
             "opaque".to_string(),
@@ -929,15 +941,46 @@ fn register_mcp(tool: &DetectedAiTool, opaque_mcp_path: &Path) -> Result<(), Str
             }),
         );
 
-    // Ensure parent directory exists.
-    if let Some(parent) = config_file.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
-    }
-
     let formatted = serde_json::to_string_pretty(&config)
         .map_err(|e| format!("cannot serialize config: {e}"))?;
     std::fs::write(&config_file, formatted)
+        .map_err(|e| format!("cannot write {}: {e}", config_file.display()))?;
+
+    Ok(())
+}
+
+/// Register the opaque MCP server in a Codex TOML config file.
+fn register_mcp_codex(config_file: &Path, opaque_mcp_path: &Path) -> Result<(), String> {
+    let path_str = opaque_mcp_path.to_string_lossy().to_string();
+
+    let mut doc: toml_edit::DocumentMut = if config_file.exists() {
+        let content = std::fs::read_to_string(config_file)
+            .map_err(|e| format!("cannot read {}: {e}", config_file.display()))?;
+        content
+            .parse()
+            .map_err(|e| format!("cannot parse {}: {e}", config_file.display()))?
+    } else {
+        toml_edit::DocumentMut::new()
+    };
+
+    // Ensure [mcp_servers] table exists.
+    if !doc.contains_key("mcp_servers") {
+        doc["mcp_servers"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+
+    // Create the [mcp_servers.opaque] entry.
+    let opaque_table = {
+        let mut t = toml_edit::Table::new();
+        t["command"] = toml_edit::value(&path_str);
+        let mut args = toml_edit::Array::new();
+        args.set_trailing("");
+        t["args"] = toml_edit::value(args);
+        t
+    };
+
+    doc["mcp_servers"]["opaque"] = toml_edit::Item::Table(opaque_table);
+
+    std::fs::write(config_file, doc.to_string())
         .map_err(|e| format!("cannot write {}: {e}", config_file.display()))?;
 
     Ok(())
@@ -1014,7 +1057,12 @@ mod tests {
         let result = detect_github(&env);
         assert_eq!(result.provider_type, ProviderType::GitHub);
         assert_eq!(result.status, DetectionStatus::Ready);
-        assert!(result.config_hints.iter().any(|h| h.contains("GITHUB_TOKEN")));
+        assert!(
+            result
+                .config_hints
+                .iter()
+                .any(|h| h.contains("GITHUB_TOKEN"))
+        );
 
         // Also GH_TOKEN should work.
         let env2 = FakeEnv::new().with_var("GH_TOKEN", "ghp_xyz");
@@ -1072,7 +1120,12 @@ mod tests {
         let env = FakeEnv::new().with_var("VAULT_ADDR", "https://vault.example.com");
         let result = detect_vault(&env);
         assert_eq!(result.status, DetectionStatus::Partial);
-        assert!(result.config_hints.iter().any(|h| h.contains("VAULT_TOKEN")));
+        assert!(
+            result
+                .config_hints
+                .iter()
+                .any(|h| h.contains("VAULT_TOKEN"))
+        );
     }
 
     #[test]
@@ -1097,7 +1150,12 @@ mod tests {
         let env = FakeEnv::new().with_var("OP_CONNECT_TOKEN", "abc");
         let result = detect_onepassword(&env);
         assert_eq!(result.status, DetectionStatus::Ready);
-        assert!(result.config_hints.iter().any(|h| h.contains("OP_CONNECT_TOKEN")));
+        assert!(
+            result
+                .config_hints
+                .iter()
+                .any(|h| h.contains("OP_CONNECT_TOKEN"))
+        );
     }
 
     #[test]
@@ -1132,11 +1190,15 @@ mod tests {
 
     #[test]
     fn test_detect_aws_credentials_file() {
-        let env = FakeEnv::new()
-            .with_path("/home/testuser/.aws/credentials");
+        let env = FakeEnv::new().with_path("/home/testuser/.aws/credentials");
         let result = detect_aws(&env);
         assert_eq!(result.status, DetectionStatus::Ready);
-        assert!(result.config_hints.iter().any(|h| h.contains(".aws/credentials")));
+        assert!(
+            result
+                .config_hints
+                .iter()
+                .any(|h| h.contains(".aws/credentials"))
+        );
     }
 
     #[test]
@@ -1404,12 +1466,31 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_codex() {
+        let env = FakeEnv::new().with_path("/home/testuser/.codex");
+        let tools = detect_ai_tools(&env);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].kind, AiToolKind::Codex);
+        assert_eq!(tools[0].name, "Codex");
+    }
+
+    #[test]
     fn test_detect_both_ai_tools() {
         let env = FakeEnv::new()
             .with_path("/home/testuser/.claude")
             .with_path("/home/testuser/.cursor");
         let tools = detect_ai_tools(&env);
         assert_eq!(tools.len(), 2);
+    }
+
+    #[test]
+    fn test_detect_all_ai_tools() {
+        let env = FakeEnv::new()
+            .with_path("/home/testuser/.claude")
+            .with_path("/home/testuser/.cursor")
+            .with_path("/home/testuser/.codex");
+        let tools = detect_ai_tools(&env);
+        assert_eq!(tools.len(), 3);
     }
 
     #[test]
@@ -1464,9 +1545,7 @@ mod tests {
         };
         let config = generate_mcp_config(&tool, Path::new("/usr/local/bin/opaque-mcp"));
         let parsed: serde_json::Value = serde_json::from_str(&config).unwrap();
-        let cmd = parsed["mcpServers"]["opaque"]["command"]
-            .as_str()
-            .unwrap();
+        let cmd = parsed["mcpServers"]["opaque"]["command"].as_str().unwrap();
         assert!(
             cmd.starts_with('/'),
             "MCP config command should be an absolute path, got: {cmd}"
@@ -1497,6 +1576,33 @@ mod tests {
             mcp_config_path(&tool),
             PathBuf::from("/home/user/.cursor/mcp.json")
         );
+    }
+
+    #[test]
+    fn test_mcp_config_path_codex() {
+        let tool = DetectedAiTool {
+            name: "Codex".into(),
+            config_dir: PathBuf::from("/home/user/.codex"),
+            kind: AiToolKind::Codex,
+        };
+        assert_eq!(
+            mcp_config_path(&tool),
+            PathBuf::from("/home/user/.codex/config.toml")
+        );
+    }
+
+    #[test]
+    fn test_generate_codex_mcp_config() {
+        let tool = DetectedAiTool {
+            name: "Codex".into(),
+            config_dir: PathBuf::from("/home/user/.codex"),
+            kind: AiToolKind::Codex,
+        };
+        let config = generate_mcp_config(&tool, Path::new("/usr/local/bin/opaque-mcp"));
+
+        assert!(config.contains("[mcp_servers.opaque]"));
+        assert!(config.contains("command = \"/usr/local/bin/opaque-mcp\""));
+        assert!(config.contains("args = []"));
     }
 
     // =======================================================================
@@ -1546,6 +1652,85 @@ mod tests {
         // Both servers should be present.
         assert!(content["mcpServers"]["other"].is_object());
         assert!(content["mcpServers"]["opaque"].is_object());
+    }
+
+    // =======================================================================
+    // Codex TOML registration tests
+    // =======================================================================
+
+    #[test]
+    fn test_register_mcp_codex_creates_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = DetectedAiTool {
+            name: "Codex".into(),
+            config_dir: dir.path().to_path_buf(),
+            kind: AiToolKind::Codex,
+        };
+        let mcp_path = Path::new("/usr/local/bin/opaque-mcp");
+        register_mcp(&tool, mcp_path).unwrap();
+
+        let config_file = dir.path().join("config.toml");
+        assert!(config_file.exists());
+        let content = std::fs::read_to_string(&config_file).unwrap();
+        assert!(content.contains("[mcp_servers.opaque]"));
+        assert!(content.contains("command = \"/usr/local/bin/opaque-mcp\""));
+    }
+
+    #[test]
+    fn test_register_mcp_codex_preserves_existing_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_file = dir.path().join("config.toml");
+        std::fs::write(
+            &config_file,
+            "[mcp_servers.other]\ncommand = \"other-mcp\"\nargs = []\n",
+        )
+        .unwrap();
+
+        let tool = DetectedAiTool {
+            name: "Codex".into(),
+            config_dir: dir.path().to_path_buf(),
+            kind: AiToolKind::Codex,
+        };
+        register_mcp(&tool, Path::new("/usr/bin/opaque-mcp")).unwrap();
+
+        let content = std::fs::read_to_string(&config_file).unwrap();
+        // Both servers should be present.
+        assert!(
+            content.contains("[mcp_servers.other]"),
+            "existing server should be preserved"
+        );
+        assert!(
+            content.contains("[mcp_servers.opaque]"),
+            "opaque server should be added"
+        );
+    }
+
+    #[test]
+    fn test_register_mcp_codex_updates_existing_opaque() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_file = dir.path().join("config.toml");
+        std::fs::write(
+            &config_file,
+            "[mcp_servers.opaque]\ncommand = \"/old/path/opaque-mcp\"\nargs = []\n",
+        )
+        .unwrap();
+
+        let tool = DetectedAiTool {
+            name: "Codex".into(),
+            config_dir: dir.path().to_path_buf(),
+            kind: AiToolKind::Codex,
+        };
+        register_mcp(&tool, Path::new("/new/path/opaque-mcp")).unwrap();
+
+        let content = std::fs::read_to_string(&config_file).unwrap();
+        assert!(
+            content.contains("/new/path/opaque-mcp"),
+            "opaque command should be updated"
+        );
+        assert!(
+            !content.contains("/old/path/opaque-mcp"),
+            "old path should be replaced"
+        );
     }
 
     // =======================================================================
