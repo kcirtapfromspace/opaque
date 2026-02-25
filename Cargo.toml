@@ -22,7 +22,7 @@ strip = true
 
 [workspace.dependencies]
 bytes = "1.10.1"
-clap = { version = "4.5.30", features = ["derive"] }
+clap = { version = "4.5.60", features = ["derive"] }
 futures-util = { version = "0.3.30", features = ["sink"] }
 getrandom = "0.3"
 glob-match = "0.2.1"
