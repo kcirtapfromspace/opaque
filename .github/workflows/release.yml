@@ -4,6 +4,18 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag label for archive names (for dry-run validation, e.g. v0.0.0-rc1)'
+        required: false
+        type: string
+        default: 'v0.0.0-dryrun'
+      dry_run:
+        description: 'Build/sign artifacts but skip GitHub Release publish'
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -51,14 +63,46 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 
+      - name: Resolve release tag
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+            if [ -z "$TAG" ]; then
+              TAG="v0.0.0-dryrun"
+            fi
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
       - name: Strip binaries
         run: |
-          for bin in opaqued opaque opaque-mcp opaque-approve-helper; do
+          for bin in opaqued opaque opaque-mcp opaque-approve-helper opaque-web; do
             strip "target/${{ matrix.target }}/release/$bin" 2>/dev/null || true
           done
 
+      - name: Validate macOS signing secrets
+        if: contains(matrix.target, 'apple-darwin') && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          missing=0
+          for key in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!key}" ]; then
+              echo "::error::Missing required secret: $key"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::Configure Apple signing secrets before publishing tag releases."
+            exit 1
+          fi
+
       - name: Codesign macOS binaries
-        if: contains(matrix.target, 'apple-darwin')
+        if: contains(matrix.target, 'apple-darwin') && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -84,15 +128,15 @@ jobs:
       - name: Create tarball
         id: tarball
         run: |
-          TAG="${GITHUB_REF#refs/tags/}"
+          TAG="${{ steps.meta.outputs.tag }}"
           ARCHIVE="opaque-${TAG}-${{ matrix.target }}.tar.gz"
           tar czf "$ARCHIVE" \
             -C "target/${{ matrix.target }}/release" \
-            opaqued opaque opaque-mcp opaque-approve-helper
+            opaqued opaque opaque-mcp opaque-approve-helper opaque-web
           echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
 
       - name: Notarize macOS tarball
-        if: contains(matrix.target, 'apple-darwin')
+        if: contains(matrix.target, 'apple-darwin') && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
@@ -104,11 +148,16 @@ jobs:
             --team-id "$APPLE_TEAM_ID" \
             --wait
 
+      - name: Generate SHA256 checksum
+        run: shasum -a 256 "${{ steps.tarball.outputs.archive }}" > "${{ steps.tarball.outputs.archive }}.sha256"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: opaque-${{ matrix.target }}
-          path: ${{ steps.tarball.outputs.archive }}
+          path: |
+            ${{ steps.tarball.outputs.archive }}
+            ${{ steps.tarball.outputs.archive }}.sha256
 
   release:
     name: Create release
@@ -134,10 +183,12 @@ jobs:
           done
 
       - name: Create GitHub Release
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           files: |
             artifacts/*.tar.gz
+            artifacts/*.tar.gz.sha256
             artifacts/*.tar.gz.sig
             artifacts/*.tar.gz.pem

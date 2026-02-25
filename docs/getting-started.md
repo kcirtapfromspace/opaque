@@ -68,7 +68,7 @@ Validate:
 ./target/release/opaque policy check
 ```
 
-For the full config format, see `docs/policy.md` and `examples/policy.toml`.
+For the full config format, see [Policy](policy.md) and `examples/policy.toml`.
 
 ## Bitwarden Secrets Manager
 
@@ -87,7 +87,7 @@ Opaque can resolve secrets from Bitwarden Secrets Manager using the `bitwarden:`
      --value-ref bitwarden:production/API_KEY
    ```
 
-See `docs/bitwarden.md` for full setup.
+See [Bitwarden setup](bitwarden.md) for full setup.
 
 ## HashiCorp Vault
 
@@ -111,7 +111,7 @@ Defaults:
 - Vault URL: `http://127.0.0.1:8200` (override with `OPAQUE_VAULT_URL`)
 - Vault token ref: `keychain:opaque/vault-token` (override with `OPAQUE_VAULT_TOKEN_REF`)
 
-See `docs/vault.md` for details.
+See [Vault setup](vault.md) for details.
 
 ## MCP Quickstart (Claude Code)
 
@@ -132,7 +132,7 @@ For Claude Code, the MCP server is the recommended integration path:
 
 3. Ask Claude Code to "list my GitHub secrets for owner/repo" — it will call the `opaque_github_list_secrets` tool via MCP.
 
-See `docs/mcp-integration.md` for full setup.
+See [MCP integration](mcp-integration.md) for full setup.
 
 ## Run The Daemon
 
@@ -333,7 +333,7 @@ The daemon writes a local SQLite audit DB at `~/.opaque/audit.db`.
 
 ## Next
 
-- MCP integration (Claude Code): `docs/mcp-integration.md`
-- Bitwarden setup: `docs/bitwarden.md`
-- Demo recordings: `docs/demos.md`
-- Deployment & OS approval backends: `docs/deployment.md`
+- [MCP integration (Claude Code)](mcp-integration.md)
+- [Bitwarden setup](bitwarden.md)
+- [Demo recordings](demos.md)
+- [Deployment & OS approval backends](deployment.md)
