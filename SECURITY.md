@@ -15,7 +15,7 @@ Only the latest release receives security updates.
 
 **Do not open a public GitHub issue for security vulnerabilities.**
 
-Please report vulnerabilities by emailing **security@anthropic.com**.
+Please report vulnerabilities by emailing **security@opaque.dev** or by opening a [private security advisory](https://github.com/kcirtapfromspace/opaque/security/advisories/new).
 
 Include:
 - Description of the vulnerability

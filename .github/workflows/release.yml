@@ -88,7 +88,7 @@ jobs:
           ARCHIVE="opaque-${TAG}-${{ matrix.target }}.tar.gz"
           tar czf "$ARCHIVE" \
             -C "target/${{ matrix.target }}/release" \
-            opaqued opaque opaque-mcp opaque-approve-helper
+            opaqued opaque opaque-mcp opaque-approve-helper opaque-web
           echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
 
       - name: Notarize macOS tarball
@@ -104,11 +104,16 @@ jobs:
             --team-id "$APPLE_TEAM_ID" \
             --wait
 
+      - name: Generate SHA256 checksum
+        run: shasum -a 256 "${{ steps.tarball.outputs.archive }}" > "${{ steps.tarball.outputs.archive }}.sha256"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: opaque-${{ matrix.target }}
-          path: ${{ steps.tarball.outputs.archive }}
+          path: |
+            ${{ steps.tarball.outputs.archive }}
+            ${{ steps.tarball.outputs.archive }}.sha256
 
   release:
     name: Create release
@@ -139,5 +144,6 @@ jobs:
           generate_release_notes: true
           files: |
             artifacts/*.tar.gz
+            artifacts/*.tar.gz.sha256
             artifacts/*.tar.gz.sig
             artifacts/*.tar.gz.pem

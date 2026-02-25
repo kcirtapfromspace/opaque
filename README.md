@@ -1,8 +1,8 @@
 # Opaque
 
-![CI](https://github.com/anthropics/opaque/actions/workflows/ci.yml/badge.svg)
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-![Release](https://img.shields.io/github/v/release/anthropics/opaque)
+![CI](https://github.com/kcirtapfromspace/opaque/actions/workflows/ci.yml/badge.svg)
+[![License: BSL 1.1](https://img.shields.io/badge/License-BSL%201.1-orange.svg)](LICENSE)
+![Release](https://img.shields.io/github/v/release/kcirtapfromspace/opaque)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-blue)
 
 Local approval-gated secrets broker for AI coding tools (Codex, Claude Code, etc) that must not disclose plaintext secrets to LLM context.
@@ -29,19 +29,19 @@ Opaque sits between your AI coding assistant and your secrets. LLMs get **operat
 ### macOS (Homebrew)
 
 ```sh
-brew install anthropics/tap/opaque
+brew install kcirtapfromspace/tap/opaque
 ```
 
 ### Linux / macOS (shell script)
 
 ```sh
-curl -sSfL https://raw.githubusercontent.com/anthropics/opaque/main/install.sh | sh
+curl -sSfL https://raw.githubusercontent.com/kcirtapfromspace/opaque/main/install.sh | sh
 ```
 
 ### From Source
 
 ```sh
-cargo install --git https://github.com/anthropics/opaque.git opaque opaqued opaque-mcp
+cargo install --git https://github.com/kcirtapfromspace/opaque.git opaque opaqued opaque-mcp
 ```
 
 Binaries:
@@ -89,7 +89,7 @@ Binaries:
 4. Ask Claude Code to sync a secret:
    > "Set the GitHub Actions secret API_KEY for myorg/myrepo using my keychain"
 
-Full MCP docs: `docs/mcp-integration.md`
+Full MCP docs: [MCP integration](docs/mcp-integration.md)
 
 ## Quickstart: Codex / CLI
 
@@ -152,7 +152,7 @@ opaque agent run -- codex
    opaque audit tail --query github --limit 10
    ```
 
-Full CLI docs: `docs/getting-started.md`
+Full CLI docs: [Getting started](docs/getting-started.md)
 
 ## Policy Presets
 
@@ -185,22 +185,22 @@ opaque policy preset github-secrets
 
 ## Docs
 
-- Docs index: `docs/README.md`
-- Getting started: `docs/getting-started.md`
-- MCP integration: `docs/mcp-integration.md`
-- Bitwarden setup: `docs/bitwarden.md`
-- Vault setup: `docs/vault.md`
-- Policy: `docs/policy.md`
-- Operations: `docs/operations.md`
-- LLM harness: `docs/llm-harness.md`
-- Demos: `docs/demos.md`
-- Deployment: `docs/deployment.md`
-- Security assessment: `docs/security-assessment.md`
-- Deferred roadmap: `docs/roadmap-deferred.md`
+- [Docs index](docs/README.md)
+- [Getting started](docs/getting-started.md)
+- [MCP integration](docs/mcp-integration.md)
+- [Bitwarden setup](docs/bitwarden.md)
+- [Vault setup](docs/vault.md)
+- [Policy](docs/policy.md)
+- [Operations](docs/operations.md)
+- [LLM harness](docs/llm-harness.md)
+- [Demos](docs/demos.md)
+- [Deployment](docs/deployment.md)
+- [Security assessment](docs/security-assessment.md)
+- [Deferred roadmap](docs/roadmap-deferred.md)
 
 ## Deferred
 
-See `docs/roadmap-deferred.md`. Notably:
+See [Deferred roadmap](docs/roadmap-deferred.md). Notably:
 
 - Vault dynamic secrets + lease lifecycle
 - iOS approvals / FaceID (v3)
@@ -208,4 +208,10 @@ See `docs/roadmap-deferred.md`. Notably:
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+**Business Source License 1.1** (BSL 1.1). See [LICENSE](LICENSE).
+
+- **Free for individuals, non-commercial use, and organizations with fewer than 10 developers.**
+- **Enterprise/commercial production use** (10+ developers or offered as a service) requires a [commercial license](mailto:patrick@opaque.dev).
+- Converts to **Apache 2.0** on **2030-02-25** (Change Date).
+
+See [LICENSE](LICENSE) for the full terms.

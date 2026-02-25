@@ -47,7 +47,7 @@ Why SQLite:
 - strong consistency, easy migrations, good tooling
 - no external service dependency
 
-For audit analytics and semantic search, see `docs/audit-analytics.md`.
+For audit analytics and semantic search, see [Audit log, live feed, and analytics](audit-analytics.md).
 
 ### 1.3.1 Why Not DuckDB or LanceDB As The Primary Store?
 
