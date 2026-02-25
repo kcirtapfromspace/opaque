@@ -60,7 +60,6 @@ Binaries:
 | macOS | Intel (x86_64) | Fully supported |
 | Linux | x86_64 | Fully supported |
 | Linux | aarch64 | Fully supported |
-| Windows | -- | Not supported (Unix domain sockets required) |
 
 ## Quickstart: Claude Code (MCP)
 
