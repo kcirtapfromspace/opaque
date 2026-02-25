@@ -10,7 +10,7 @@ This PRD attempts to retrofit security-critical properties -- operation-bound ap
 
 ### 2.1 Same-UID Attacks Are Not "Addressed", They Are Structural
 
-The PRD (US-003, FR-2) relies on Unix socket peer credentials (`uid/gid/pid`) plus executable hash as the client identity foundation. The architecture doc (`docs/architecture.md`, Section 6) confirms this. But:
+The PRD (US-003, FR-2) relies on Unix socket peer credentials (`uid/gid/pid`) plus executable hash as the client identity foundation. The architecture doc ([Architecture](architecture.md), Section 6) confirms this. But:
 
 - **Any process running as the same UID can connect to the socket.** The socket is at `~/.opaque/run/opaqued.sock` with mode `0600` (see `lock_down_socket_path` in `crates/opaqued/src/main.rs`, line 96-104). This means every process the user runs -- including the LLM agent runtime, any malware the agent downloads, any npm postinstall script, any compromised VS Code extension -- can connect.
 - **Executable hash is a speed bump, not a barrier.** The PRD says the daemon computes `exe_path + sha256`. But `/proc/<pid>/exe` on Linux is a symlink that a malicious process can manipulate via mount namespaces. On macOS, the executable path from `LOCAL_PEERPID` is more reliable but still trusts that the binary has not been replaced between hash computation and actual use (TOCTOU).
@@ -38,7 +38,7 @@ The PRD does not define rate limiting for approval requests per client, per oper
 
 ### 2.4 No Consideration of Supply Chain Attacks
 
-The policy model (`docs/policy.md`) matches clients by `exe_path` and `exe_sha256`. But there is no discussion of what happens when the client binary is legitimately updated (new version of Claude Code). Every update changes the hash, which means:
+The policy model ([Policy](policy.md)) matches clients by `exe_path` and `exe_sha256`. But there is no discussion of what happens when the client binary is legitimately updated (new version of Claude Code). Every update changes the hash, which means:
 - Policy rules with hardcoded hashes break on every client update.
 - If hashes are not checked (to avoid breakage), the identity model collapses to just `exe_path`, which any process can spoof by naming itself accordingly.
 - There is no key rotation or update ceremony for client identity.
