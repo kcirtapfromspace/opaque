@@ -110,6 +110,8 @@ Defaults:
 
 - Vault URL: `http://127.0.0.1:8200` (override with `OPAQUE_VAULT_URL`)
 - Vault token ref: `keychain:opaque/vault-token` (override with `OPAQUE_VAULT_TOKEN_REF`)
+- Vault lease renew window: `30` seconds (override with `OPAQUE_VAULT_LEASE_RENEW_WINDOW_SECS`, set `0` to disable proactive renewal)
+- Audit retention: `audit_retention_days = 90` (runtime purge continuously removes rows older than this window)
 
 See [Vault setup](vault.md) for details.
 

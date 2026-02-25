@@ -201,7 +201,6 @@ opaque policy preset github-secrets
 
 See [Deferred roadmap](docs/roadmap-deferred.md). Notably:
 
-- Vault dynamic secrets + lease lifecycle
 - iOS approvals / FaceID (v3)
 - FIDO2 / WebAuthn approvals (v3)
 

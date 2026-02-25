@@ -695,6 +695,11 @@ CREATE TRIGGER IF NOT EXISTS audit_events_ad AFTER DELETE ON audit_events BEGIN
 END;
 ";
 
+#[cfg(test)]
+const RETENTION_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+#[cfg(not(test))]
+const RETENTION_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
 /// A persistent audit sink backed by SQLite.
 ///
 /// Events are sent through a bounded channel and written by a dedicated
@@ -748,18 +753,7 @@ impl SqliteAuditSink {
         // Open connection, create schema, run retention cleanup.
         let conn = rusqlite::Connection::open(&db_path)?;
         conn.execute_batch(SCHEMA_SQL)?;
-
-        let cutoff_ms = {
-            let now = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64;
-            now - (retention_days as i64) * 86_400 * 1000
-        };
-        conn.execute(
-            "DELETE FROM audit_events WHERE ts_utc_ms < ?1",
-            rusqlite::params![cutoff_ms],
-        )?;
+        Self::run_retention_cleanup(&conn, retention_days)?;
         conn.execute(
             "INSERT OR IGNORE INTO audit_events_fts(rowid, search_text)
              SELECT
@@ -788,7 +782,7 @@ impl SqliteAuditSink {
         let writer_handle = std::thread::Builder::new()
             .name("audit-writer".into())
             .spawn(move || {
-                Self::writer_loop(&writer_path, receiver, &writer_pause_clone);
+                Self::writer_loop(&writer_path, receiver, &writer_pause_clone, retention_days);
             })
             .map_err(|e| AuditError::Other(format!("failed to spawn writer thread: {e}")))?;
 
@@ -905,6 +899,7 @@ impl SqliteAuditSink {
         db_path: &Path,
         receiver: std::sync::mpsc::Receiver<AuditEvent>,
         pause: &std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        retention_days: u64,
     ) {
         let conn = match rusqlite::Connection::open(db_path) {
             Ok(c) => c,
@@ -918,32 +913,77 @@ impl SqliteAuditSink {
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
 
         let mut batch = Vec::with_capacity(64);
+        let mut next_retention_cleanup = std::time::Instant::now() + RETENTION_CLEANUP_INTERVAL;
 
-        while let Ok(event) = receiver.recv() {
-            // Honor pause flag (for testing).
-            {
-                let (lock, cvar) = &**pause;
-                let mut paused = lock.lock().expect("pause lock poisoned");
-                while *paused {
-                    paused = cvar.wait(paused).expect("pause cvar poisoned");
+        loop {
+            let wait = next_retention_cleanup.saturating_duration_since(std::time::Instant::now());
+            match receiver.recv_timeout(wait) {
+                Ok(event) => {
+                    // Honor pause flag (for testing).
+                    {
+                        let (lock, cvar) = &**pause;
+                        let mut paused = lock.lock().expect("pause lock poisoned");
+                        while *paused {
+                            paused = cvar.wait(paused).expect("pause cvar poisoned");
+                        }
+                    }
+
+                    batch.push(event);
+
+                    // Drain any additional pending events without blocking.
+                    while batch.len() < 256 {
+                        match receiver.try_recv() {
+                            Ok(event) => batch.push(event),
+                            Err(_) => break,
+                        }
+                    }
+
+                    if let Err(e) = Self::insert_batch(&conn, &batch) {
+                        tracing::error!("audit writer insert failed: {e}");
+                    }
+                    batch.clear();
                 }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
 
-            batch.push(event);
-
-            // Drain any additional pending events without blocking.
-            while batch.len() < 256 {
-                match receiver.try_recv() {
-                    Ok(event) => batch.push(event),
-                    Err(_) => break,
+            if std::time::Instant::now() >= next_retention_cleanup {
+                match Self::run_retention_cleanup(&conn, retention_days) {
+                    Ok(deleted_rows) => {
+                        if deleted_rows > 0 {
+                            tracing::info!(
+                                deleted_rows,
+                                retention_days,
+                                "audit retention cleanup removed expired rows"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("audit retention cleanup failed: {e}");
+                    }
                 }
+                next_retention_cleanup = std::time::Instant::now() + RETENTION_CLEANUP_INTERVAL;
             }
-
-            if let Err(e) = Self::insert_batch(&conn, &batch) {
-                tracing::error!("audit writer insert failed: {e}");
-            }
-            batch.clear();
         }
+    }
+
+    fn retention_cutoff_ms(retention_days: u64) -> i64 {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        now - (retention_days as i64) * 86_400 * 1000
+    }
+
+    fn run_retention_cleanup(
+        conn: &rusqlite::Connection,
+        retention_days: u64,
+    ) -> Result<usize, rusqlite::Error> {
+        let cutoff_ms = Self::retention_cutoff_ms(retention_days);
+        conn.execute(
+            "DELETE FROM audit_events WHERE ts_utc_ms < ?1",
+            rusqlite::params![cutoff_ms],
+        )
     }
 
     /// Insert a batch of events within a single transaction.
@@ -1994,6 +2034,56 @@ mod tests {
         let events = query_audit_db(&db_path, &filter).unwrap();
         assert!(events.is_empty());
 
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn sqlite_retention_cleanup_runs_periodically_while_running() {
+        let db_path = temp_db_path();
+        let sink = SqliteAuditSink::new(db_path.clone(), 90).unwrap();
+
+        // Insert an old event after startup cleanup has already run.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(SCHEMA_SQL).unwrap();
+            conn.execute(
+                "INSERT INTO audit_events (event_id, sequence_number, ts_utc_ms, level, kind)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    Uuid::new_v4().to_string(),
+                    0,
+                    1000i64,
+                    "info",
+                    "request.received"
+                ],
+            )
+            .unwrap();
+        }
+
+        // Wait for periodic cleanup to purge the old row.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut purged = false;
+        while std::time::Instant::now() < deadline {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM audit_events WHERE ts_utc_ms = 1000",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            if count == 0 {
+                purged = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            purged,
+            "expected periodic retention cleanup to purge old rows"
+        );
+
+        drop(sink);
         let _ = std::fs::remove_file(&db_path);
     }
 

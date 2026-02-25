@@ -51,6 +51,18 @@ URL policy:
 - `https://` required for remote hosts
 - `http://` allowed only for `localhost` and `127.0.0.1`
 
+## Lease Renewal Window
+
+By default, Opaque proactively renews renewable Vault leases when they are
+within 30 seconds of expiry.
+
+Override with:
+
+- `OPAQUE_VAULT_LEASE_RENEW_WINDOW_SECS`
+  - integer seconds
+  - default `30`
+  - set to `0` to disable proactive renewal
+
 ## Example
 
 ```bash
@@ -67,8 +79,5 @@ Shipped in this phase:
 - Vault KV field resolution through `vault:` refs
 - Dynamic secret engine field resolution (for example `database/creds/...`)
 - Lease-aware caching for dynamic refs using Vault `lease_duration`
+- Proactive lease renewal for renewable leases near expiry
 - Best-effort revocation of expired cached leases on refresh
-
-Still deferred:
-
-- Lease renewal for long-running sessions

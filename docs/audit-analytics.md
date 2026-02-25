@@ -221,7 +221,7 @@ Audit can grow without bound.
 Recommended:
 
 - SQLite retains recent window (e.g. 30-90 days)
-- older events are rolled to Parquet and optionally removed from SQLite
+- daemon retention cleanup purges SQLite rows older than the configured window
+- older events can later be rolled to Parquet when that pipeline is enabled
 - embeddings store follows the same retention window
 - live feed uses bounded channels (drop-oldest or apply backpressure)
-
