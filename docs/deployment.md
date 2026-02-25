@@ -166,7 +166,6 @@ The daemon must refuse to start in these environments.
 | Environment | Reason |
 |-------------|--------|
 | **Headless / TTY-only** | No `zenity`/`kdialog`, no polkit agent, no display server |
-| **WSL** | No reliable GUI session (WSLg exists but polkit is not functional) |
 | **SSH sessions** | polkit `allow_inactive=no` blocks auth; intent dialog has no display |
 | **Containers / CI** | No interactive session |
 
