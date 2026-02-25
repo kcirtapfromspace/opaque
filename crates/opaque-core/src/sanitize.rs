@@ -166,6 +166,11 @@ impl SecretPatterns {
                 "hex_secret",
                 r"(?i)(?:secret|key|token)\s*[=:]\s*[0-9a-f]{64,}",
             ),
+            // Shell secret export statements (e.g. `export SECRET=value`).
+            (
+                "export_secret",
+                r"(?i)export\s+(?:SECRET|TOKEN|PASSWORD|API_KEY|PRIVATE_KEY)\s*=\s*\S+",
+            ),
         ];
 
         let patterns = raw
@@ -324,17 +329,36 @@ impl Sanitizer {
         }
     }
 
+    /// Sanitize an audit `detail` string by scrubbing opaque-specific
+    /// secret reference schemes and common secret patterns.
+    ///
+    /// This is applied centrally in the audit emit path to prevent
+    /// secret leakage into the audit database.
+    ///
+    /// Redacted patterns:
+    /// - `keychain:<value>` -> `keychain:[REDACTED]`
+    /// - `vault:<value>` -> `vault:[REDACTED]`
+    /// - `env:<value>` -> `env:[REDACTED]`
+    /// - `Bearer <token>` -> `Bearer [REDACTED]`
+    /// - `AKIA[A-Z0-9]{16}` -> `[REDACTED_AWS_KEY]`
+    /// - `(password|secret|token|key) := <value>` -> `[REDACTED]`
+    pub fn sanitize_detail(&self, detail: &str) -> String {
+        sanitize_detail(detail)
+    }
+
     /// Redact audit event text based on the redaction level.
     pub fn redact_audit_text(&self, text: &str, level: RedactionLevel) -> String {
+        // Always apply detail-level sanitization for secret ref schemes first.
+        let text = sanitize_detail(text);
         match level {
             RedactionLevel::Agent => {
                 // For agents: only include operation outcome keywords,
                 // strip everything else.
-                self.patterns.redact(&scrub_paths(&scrub_urls(text)))
+                self.patterns.redact(&scrub_paths(&scrub_urls(&text)))
             }
             RedactionLevel::Human => {
                 // For humans: keep target metadata but redact secret patterns.
-                self.patterns.redact(text)
+                self.patterns.redact(&text)
             }
         }
     }
@@ -344,6 +368,52 @@ impl Default for Sanitizer {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Audit detail sanitization
+// ---------------------------------------------------------------------------
+
+/// Scrub common secret patterns from an audit `detail` string.
+///
+/// This function is the central sanitization point for audit event detail
+/// fields. It strips opaque-specific secret reference values and common
+/// credential patterns before the detail is persisted.
+///
+/// Patterns redacted:
+/// - `keychain:<path>` -> `keychain:[REDACTED]`
+/// - `vault:<path>` -> `vault:[REDACTED]`
+/// - `env:<name>` -> `env:[REDACTED]`
+/// - `Bearer <token>` -> `Bearer [REDACTED]`
+/// - `AKIA[A-Z0-9]{16}` -> `[REDACTED_AWS_KEY]`
+/// - `(password|secret|token|key) [:=] <value>` -> key `[REDACTED]`
+pub fn sanitize_detail(detail: &str) -> String {
+    // Lazy-compiled regex patterns for audit detail sanitization.
+    // These are intentionally separate from SecretPatterns because they
+    // target opaque-specific reference schemes that appear in detail strings.
+    use std::sync::LazyLock;
+
+    static RE_KEYCHAIN: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"keychain:\S+").expect("valid regex"));
+    static RE_VAULT: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"vault:\S+").expect("valid regex"));
+    static RE_ENV: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"env:\S+").expect("valid regex"));
+    static RE_BEARER: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)Bearer\s+\S+").expect("valid regex"));
+    static RE_AWS_KEY: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"AKIA[A-Z0-9]{16}").expect("valid regex"));
+    static RE_CREDENTIAL_ASSIGN: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)(password|secret|token|key)\s*[:=]\s*\S+").expect("valid regex")
+    });
+
+    let result = RE_KEYCHAIN.replace_all(detail, "keychain:[REDACTED]");
+    let result = RE_VAULT.replace_all(&result, "vault:[REDACTED]");
+    let result = RE_ENV.replace_all(&result, "env:[REDACTED]");
+    let result = RE_BEARER.replace_all(&result, "Bearer [REDACTED]");
+    let result = RE_AWS_KEY.replace_all(&result, "[REDACTED_AWS_KEY]");
+    RE_CREDENTIAL_ASSIGN
+        .replace_all(&result, "[REDACTED]")
+        .into_owned()
 }
 
 /// Check if a JSON field name suggests it contains secret content.
@@ -694,5 +764,103 @@ mod tests {
         assert!(raw.error_code.is_none());
         assert!(raw.error_message.is_none());
         assert_eq!(raw.payload["key"], "val");
+    }
+
+    // -- sanitize_detail tests --
+
+    #[test]
+    fn sanitize_detail_keychain_ref() {
+        let result = sanitize_detail("resolved keychain:opaque/1password-connect-token for op");
+        assert_eq!(result, "resolved keychain:[REDACTED] for op");
+    }
+
+    #[test]
+    fn sanitize_detail_vault_ref() {
+        let result = sanitize_detail("ref=vault:secret/data/prod#api_key");
+        assert_eq!(result, "ref=vault:[REDACTED]");
+    }
+
+    #[test]
+    fn sanitize_detail_env_ref() {
+        let result = sanitize_detail("resolved env:MY_SECRET_TOKEN for profile");
+        assert_eq!(result, "resolved env:[REDACTED] for profile");
+    }
+
+    #[test]
+    fn sanitize_detail_bearer_token() {
+        let result = sanitize_detail("auth: Bearer super-secret-token-value-here");
+        assert_eq!(result, "auth: Bearer [REDACTED]");
+    }
+
+    #[test]
+    fn sanitize_detail_aws_key() {
+        let result = sanitize_detail("found AKIAIOSFODNN7EXAMPLE in config");
+        assert_eq!(result, "found [REDACTED_AWS_KEY] in config");
+    }
+
+    #[test]
+    fn sanitize_detail_credential_assignment() {
+        let result = sanitize_detail("password=hunter2 in config");
+        assert_eq!(result, "[REDACTED] in config");
+
+        let result = sanitize_detail("secret: my-secret-value");
+        assert_eq!(result, "[REDACTED]");
+
+        let result = sanitize_detail("token=abc123 used");
+        assert_eq!(result, "[REDACTED] used");
+
+        let result = sanitize_detail("KEY=some_api_key_value");
+        assert_eq!(result, "[REDACTED]");
+    }
+
+    #[test]
+    fn sanitize_detail_multiple_patterns() {
+        let result = sanitize_detail(
+            "resolved keychain:opaque/token and env:SECRET_VAR with Bearer some-long-token",
+        );
+        assert!(
+            !result.contains("opaque/token"),
+            "keychain value should be redacted"
+        );
+        assert!(
+            !result.contains("SECRET_VAR"),
+            "env value should be redacted"
+        );
+        assert!(
+            !result.contains("some-long-token"),
+            "bearer token should be redacted"
+        );
+    }
+
+    #[test]
+    fn sanitize_detail_no_false_positive_on_safe_text() {
+        let result = sanitize_detail("profile=dev command=[\"npm\", \"test\"] exit_code=0");
+        assert_eq!(
+            result,
+            "profile=dev command=[\"npm\", \"test\"] exit_code=0"
+        );
+    }
+
+    #[test]
+    fn sanitize_detail_integrated_with_redact_audit_text() {
+        // Verify that redact_audit_text also applies sanitize_detail patterns.
+        let sanitizer = Sanitizer::new();
+        let text = "resolved keychain:opaque/my-secret for sandbox.exec";
+        let redacted = sanitizer.redact_audit_text(text, RedactionLevel::Human);
+        assert!(
+            !redacted.contains("opaque/my-secret"),
+            "keychain value should be redacted via redact_audit_text"
+        );
+        assert!(redacted.contains("keychain:[REDACTED]"));
+    }
+
+    #[test]
+    fn detects_export_secret() {
+        let sanitizer = Sanitizer::new();
+        assert!(
+            sanitizer
+                .patterns
+                .contains_secret("export SECRET=mysupersecretvalue123")
+        );
     }
 }
