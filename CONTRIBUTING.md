@@ -11,7 +11,7 @@ Thank you for your interest in contributing to Opaque.
 ## Getting Started
 
 ```bash
-git clone https://github.com/anthropics/opaque.git
+git clone https://github.com/kcirtapfromspace/opaque.git
 cd opaque
 cargo build --workspace
 cargo test --workspace
