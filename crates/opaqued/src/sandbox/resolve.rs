@@ -24,7 +24,7 @@ pub trait SecretResolver: Send + Sync {
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ResolveError {
     #[error(
-        "unknown ref scheme in '{0}' (expected env:, keychain:, profile:, onepassword:, bitwarden:, or vault:)"
+        "unknown ref scheme in '{0}' (expected env:, keychain:, profile:, onepassword:, bitwarden:, aws:, or vault:)"
     )]
     UnknownScheme(String),
 
@@ -46,11 +46,11 @@ pub enum ResolveError {
     #[error("Bitwarden resolution failed for '{0}': {1}")]
     BitwardenError(String, String),
 
-    #[error("Vault resolution failed for '{0}': {1}")]
-    VaultError(String, String),
-
     #[error("AWS resolution failed for '{0}': {1}")]
     AwsError(String, String),
+
+    #[error("Vault resolution failed for '{0}': {1}")]
+    VaultError(String, String),
 
     #[error("Azure resolution failed for '{0}': {1}")]
     AzureError(String, String),
@@ -287,6 +287,7 @@ pub struct CompositeResolver {
     profile: ProfileResolver,
     onepassword: Option<crate::onepassword::resolve::OnePasswordResolver>,
     bitwarden: Option<crate::bitwarden::resolve::BitwardenResolver>,
+    aws: Option<crate::aws::resolve::AwsResolver>,
     vault: Option<crate::vault::resolve::VaultResolver>,
 }
 
@@ -326,6 +327,16 @@ impl CompositeResolver {
             }
         };
 
+        // AWS backend: always available (uses configured or default region URLs).
+        let aws_region = std::env::var(crate::aws::client::AWS_REGION_ENV)
+            .unwrap_or_else(|_| crate::aws::client::DEFAULT_REGION.to_owned());
+        let sts_url = format!("https://sts.{aws_region}.amazonaws.com");
+        let sm_url = format!("https://secretsmanager.{aws_region}.amazonaws.com");
+        let ssm_url = format!("https://ssm.{aws_region}.amazonaws.com");
+        let aws = Some(crate::aws::resolve::AwsResolver::new(
+            crate::aws::client::AwsClient::new(&sts_url, &sm_url, &ssm_url),
+        ));
+
         // Vault backend: available if URL scheme is valid.
         let vault = match crate::vault::client::VaultClient::new() {
             Ok(client) => Some(crate::vault::resolve::VaultResolver::new(client)),
@@ -341,6 +352,7 @@ impl CompositeResolver {
             profile: ProfileResolver,
             onepassword,
             bitwarden,
+            aws,
             vault,
         }
     }
@@ -354,6 +366,7 @@ impl CompositeResolver {
             profile: ProfileResolver,
             onepassword: None,
             bitwarden: None,
+            aws: None,
             vault: None,
         }
     }
@@ -388,6 +401,14 @@ impl SecretResolver for CompositeResolver {
                 None => Err(ResolveError::BitwardenError(
                     ref_str.to_owned(),
                     "Bitwarden not configured".into(),
+                )),
+            }
+        } else if ref_str.starts_with("aws:") {
+            match &self.aws {
+                Some(r) => r.resolve(ref_str),
+                None => Err(ResolveError::AwsError(
+                    ref_str.to_owned(),
+                    "AWS not configured".into(),
                 )),
             }
         } else if ref_str.starts_with("vault:") {

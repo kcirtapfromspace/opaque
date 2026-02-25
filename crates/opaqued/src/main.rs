@@ -32,7 +32,6 @@ const DAEMON_TOKEN_FILENAME: &str = "daemon.token";
 mod approval;
 #[allow(dead_code)]
 mod approval_server;
-#[allow(dead_code)]
 mod aws;
 #[allow(dead_code)]
 mod azure;
@@ -658,6 +657,206 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         })
         .expect("failed to register bitwarden.read_secret");
 
+    // AWS STS operations
+    registry
+        .register(OperationDef {
+            name: "aws.get_caller_identity".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::FirstUse,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Get the AWS caller identity (account, ARN, user ID)".into(),
+            params_schema: None,
+            allowed_target_keys: vec![],
+            secret_ref_param_keys: vec![],
+        })
+        .expect("failed to register aws.get_caller_identity");
+
+    registry
+        .register(OperationDef {
+            name: "aws.assume_role".into(),
+            safety: OperationSafety::SensitiveOutput,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Assume an AWS IAM role and get temporary credentials".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["role_arn"],
+                "properties": {
+                    "role_arn": {"type": "string"},
+                    "session_name": {"type": "string"}
+                }
+            })),
+            allowed_target_keys: vec!["role_arn".into()],
+            secret_ref_param_keys: vec![],
+        })
+        .expect("failed to register aws.assume_role");
+
+    // AWS Secrets Manager operations
+    registry
+        .register(OperationDef {
+            name: "aws.list_secrets".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::FirstUse,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "List AWS Secrets Manager secret names".into(),
+            params_schema: None,
+            allowed_target_keys: vec![],
+            secret_ref_param_keys: vec![],
+        })
+        .expect("failed to register aws.list_secrets");
+
+    registry
+        .register(OperationDef {
+            name: "aws.get_secret_value".into(),
+            safety: OperationSafety::Reveal,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Read a secret value from AWS Secrets Manager".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["secret_id"],
+                "properties": { "secret_id": {"type": "string"} }
+            })),
+            allowed_target_keys: vec!["secret_id".into()],
+            secret_ref_param_keys: vec!["secret_id".into()],
+        })
+        .expect("failed to register aws.get_secret_value");
+
+    registry
+        .register(OperationDef {
+            name: "aws.create_secret".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Create a new secret in AWS Secrets Manager".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["name", "value"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "value": {"type": "string"},
+                    "description": {"type": "string"}
+                }
+            })),
+            allowed_target_keys: vec!["name".into()],
+            secret_ref_param_keys: vec!["value".into()],
+        })
+        .expect("failed to register aws.create_secret");
+
+    registry
+        .register(OperationDef {
+            name: "aws.put_secret_value".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Update an existing AWS Secrets Manager secret value".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["secret_id", "value"],
+                "properties": {
+                    "secret_id": {"type": "string"},
+                    "value": {"type": "string"}
+                }
+            })),
+            allowed_target_keys: vec!["secret_id".into()],
+            secret_ref_param_keys: vec!["value".into()],
+        })
+        .expect("failed to register aws.put_secret_value");
+
+    registry
+        .register(OperationDef {
+            name: "aws.delete_secret".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Schedule an AWS Secrets Manager secret for deletion".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["secret_id"],
+                "properties": { "secret_id": {"type": "string"} }
+            })),
+            allowed_target_keys: vec!["secret_id".into()],
+            secret_ref_param_keys: vec![],
+        })
+        .expect("failed to register aws.delete_secret");
+
+    // AWS SSM Parameter Store operations
+    registry
+        .register(OperationDef {
+            name: "aws.get_parameter".into(),
+            safety: OperationSafety::Reveal,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Read a parameter from AWS SSM Parameter Store".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["name"],
+                "properties": { "name": {"type": "string"} }
+            })),
+            allowed_target_keys: vec!["name".into()],
+            secret_ref_param_keys: vec!["name".into()],
+        })
+        .expect("failed to register aws.get_parameter");
+
+    registry
+        .register(OperationDef {
+            name: "aws.put_parameter".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Write a parameter to AWS SSM Parameter Store".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["name", "value"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "value": {"type": "string"},
+                    "type": {"type": "string"},
+                    "overwrite": {"type": "boolean"}
+                }
+            })),
+            allowed_target_keys: vec!["name".into()],
+            secret_ref_param_keys: vec!["value".into()],
+        })
+        .expect("failed to register aws.put_parameter");
+
+    registry
+        .register(OperationDef {
+            name: "aws.get_parameters_by_path".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::FirstUse,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "List parameters under a path in AWS SSM Parameter Store".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": {"type": "string"},
+                    "with_decryption": {"type": "boolean"}
+                }
+            })),
+            allowed_target_keys: vec!["path".into()],
+            secret_ref_param_keys: vec![],
+        })
+        .expect("failed to register aws.get_parameters_by_path");
+
+    registry
+        .register(OperationDef {
+            name: "aws.delete_parameter".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Delete a parameter from AWS SSM Parameter Store".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["name"],
+                "properties": { "name": {"type": "string"} }
+            })),
+            allowed_target_keys: vec!["name".into()],
+            secret_ref_param_keys: vec![],
+        })
+        .expect("failed to register aws.delete_parameter");
+
     let policy = PolicyEngine::with_rules(config.rules.clone());
     info!("policy engine loaded with {} rules", policy.rule_count());
 
@@ -781,6 +980,35 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             .handler("bitwarden.list_secrets", Box::new(bw_list_secrets_handler))
             .handler("bitwarden.read_secret", Box::new(bw_read_secret_handler));
         info!("Bitwarden handler enabled ({})", bitwarden_url);
+    }
+
+    // AWS handler: construct per-region service URLs.
+    {
+        let aws_region = std::env::var(aws::client::AWS_REGION_ENV)
+            .unwrap_or_else(|_| aws::client::DEFAULT_REGION.to_owned());
+        let sts_url = format!("https://sts.{aws_region}.amazonaws.com");
+        let sm_url = format!("https://secretsmanager.{aws_region}.amazonaws.com");
+        let ssm_url = format!("https://ssm.{aws_region}.amazonaws.com");
+        let aws_client = aws::client::AwsClient::new(&sts_url, &sm_url, &ssm_url);
+
+        let aws_ops = [
+            "aws.get_caller_identity",
+            "aws.assume_role",
+            "aws.list_secrets",
+            "aws.get_secret_value",
+            "aws.create_secret",
+            "aws.put_secret_value",
+            "aws.delete_secret",
+            "aws.get_parameter",
+            "aws.put_parameter",
+            "aws.get_parameters_by_path",
+            "aws.delete_parameter",
+        ];
+        for op in aws_ops {
+            let handler = aws::AwsHandler::new(audit.clone(), aws_client.clone());
+            enclave_builder = enclave_builder.handler(op, Box::new(handler));
+        }
+        info!("AWS handler enabled (region: {})", aws_region);
     }
 
     let enclave = enclave_builder
