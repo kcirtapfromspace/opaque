@@ -152,7 +152,7 @@ pub enum ProfileError {
     PathTraversal { field: String, path: String },
 
     #[error(
-        "invalid secret ref scheme in '{name}': {ref_str} (expected env:, keychain:, profile:, onepassword:, bitwarden:, or vault:)"
+        "invalid secret ref scheme in '{name}': {ref_str} (expected env:, keychain:, profile:, onepassword:, bitwarden:, vault:, azure:, or gcp:)"
     )]
     InvalidSecretRef { name: String, ref_str: String },
 
@@ -187,6 +187,8 @@ pub const ALLOWED_REF_SCHEMES: &[&str] = &[
     "onepassword:",
     "bitwarden:",
     "vault:",
+    "azure:",
+    "gcp:",
 ];
 
 /// Load and validate an `ExecProfile` from a TOML string.

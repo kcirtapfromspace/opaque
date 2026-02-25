@@ -96,6 +96,16 @@ enum Cmd {
         #[command(subcommand)]
         action: GitlabAction,
     },
+    /// Manage Azure Key Vault secrets and metadata.
+    Azure {
+        #[command(subcommand)]
+        action: AzureAction,
+    },
+    /// Manage Google Cloud Secret Manager secrets and metadata.
+    Gcp {
+        #[command(subcommand)]
+        action: GcpAction,
+    },
     /// Browse 1Password vaults and items.
     #[command(name = "onepassword", alias = "1p")]
     OnePassword {
@@ -304,9 +314,13 @@ enum GithubAction {
         #[arg(long)]
         value_ref: String,
 
-        /// GitHub token ref (default: "keychain:opaque/github-pat").
+        /// GitHub token ref (default varies by --github-auth-mode).
         #[arg(long)]
         github_token_ref: Option<String>,
+
+        /// GitHub auth mode: "pat" (default) or "oauth" (Bearer token).
+        #[arg(long, value_parser = ["pat", "oauth"])]
+        github_auth_mode: Option<String>,
 
         /// GitHub environment name (for environment secrets).
         #[arg(long)]
@@ -326,9 +340,13 @@ enum GithubAction {
         #[arg(long)]
         value_ref: String,
 
-        /// GitHub token ref (default: "keychain:opaque/github-pat").
+        /// GitHub token ref (default varies by --github-auth-mode).
         #[arg(long)]
         github_token_ref: Option<String>,
+
+        /// GitHub auth mode: "pat" (default) or "oauth" (Bearer token).
+        #[arg(long, value_parser = ["pat", "oauth"])]
+        github_auth_mode: Option<String>,
 
         /// Selected repository IDs (comma-separated, for user-level secrets).
         #[arg(long, value_delimiter = ',')]
@@ -348,9 +366,13 @@ enum GithubAction {
         #[arg(long)]
         value_ref: String,
 
-        /// GitHub token ref (default: "keychain:opaque/github-pat").
+        /// GitHub token ref (default varies by --github-auth-mode).
         #[arg(long)]
         github_token_ref: Option<String>,
+
+        /// GitHub auth mode: "pat" (default) or "oauth" (Bearer token).
+        #[arg(long, value_parser = ["pat", "oauth"])]
+        github_auth_mode: Option<String>,
     },
     /// Set a GitHub Actions organization secret.
     SetOrgSecret {
@@ -366,9 +388,13 @@ enum GithubAction {
         #[arg(long)]
         value_ref: String,
 
-        /// GitHub token ref (default: "keychain:opaque/github-pat").
+        /// GitHub token ref (default varies by --github-auth-mode).
         #[arg(long)]
         github_token_ref: Option<String>,
+
+        /// GitHub auth mode: "pat" (default) or "oauth" (Bearer token).
+        #[arg(long, value_parser = ["pat", "oauth"])]
+        github_auth_mode: Option<String>,
 
         /// Secret visibility: "all", "private", or "selected" (default: "private").
         #[arg(long, default_value = "private")]
@@ -396,9 +422,13 @@ enum GithubAction {
         #[arg(long)]
         environment: Option<String>,
 
-        /// GitHub token ref (default: "keychain:opaque/github-pat").
+        /// GitHub token ref (default varies by --github-auth-mode).
         #[arg(long)]
         github_token_ref: Option<String>,
+
+        /// GitHub auth mode: "pat" (default) or "oauth" (Bearer token).
+        #[arg(long, value_parser = ["pat", "oauth"])]
+        github_auth_mode: Option<String>,
     },
     /// Delete a secret from a repository, environment, or organization.
     DeleteSecret {
@@ -422,9 +452,13 @@ enum GithubAction {
         #[arg(long)]
         environment: Option<String>,
 
-        /// GitHub token ref (default: "keychain:opaque/github-pat").
+        /// GitHub token ref (default varies by --github-auth-mode).
         #[arg(long)]
         github_token_ref: Option<String>,
+
+        /// GitHub auth mode: "pat" (default) or "oauth" (Bearer token).
+        #[arg(long, value_parser = ["pat", "oauth"])]
+        github_auth_mode: Option<String>,
     },
     /// Publish all keys from a .env-style template through Opaque.
     ///
@@ -450,9 +484,13 @@ enum GithubAction {
         #[arg(long)]
         value_ref_template: String,
 
-        /// GitHub token ref (default: "keychain:opaque/github-pat").
+        /// GitHub token ref (default varies by --github-auth-mode).
         #[arg(long)]
         github_token_ref: Option<String>,
+
+        /// GitHub auth mode: "pat" (default) or "oauth" (Bearer token).
+        #[arg(long, value_parser = ["pat", "oauth"])]
+        github_auth_mode: Option<String>,
 
         /// GitHub environment name (for environment-scoped Actions secrets).
         #[arg(long)]
@@ -503,9 +541,13 @@ enum GithubAction {
         #[arg(long)]
         repo: Option<String>,
 
-        /// GitHub token ref (default: "keychain:opaque/github-pat").
+        /// GitHub token ref (default varies by --github-auth-mode).
         #[arg(long)]
         github_token_ref: Option<String>,
+
+        /// GitHub auth mode: "pat" (default) or "oauth" (Bearer token).
+        #[arg(long, value_parser = ["pat", "oauth"])]
+        github_auth_mode: Option<String>,
 
         /// GitHub environment name (overrides manifest.environment when set).
         #[arg(long)]
@@ -541,6 +583,10 @@ enum GitlabAction {
         #[arg(long)]
         gitlab_token_ref: Option<String>,
 
+        /// GitLab auth mode: "pat" (PRIVATE-TOKEN header) or "oauth" (Bearer token).
+        #[arg(long, value_parser = ["pat", "oauth"])]
+        gitlab_auth_mode: Option<String>,
+
         /// Variable environment scope (default is provider-side default, usually "*").
         #[arg(long)]
         environment_scope: Option<String>,
@@ -560,6 +606,86 @@ enum GitlabAction {
         /// Variable type: "env_var" or "file".
         #[arg(long, default_value = "env_var")]
         variable_type: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AzureAction {
+    /// List Azure Key Vault secrets (metadata only).
+    ListSecrets,
+    /// List Azure Key Vault keys (metadata only).
+    ListKeys,
+    /// List Azure Key Vault certificates (metadata only).
+    ListCertificates,
+    /// Read a specific Azure Key Vault secret value.
+    GetSecret {
+        /// Secret name.
+        #[arg(long)]
+        name: String,
+        /// Optional secret version.
+        #[arg(long)]
+        version: Option<String>,
+    },
+    /// Set an Azure Key Vault secret value from a secure ref.
+    SetSecret {
+        /// Secret name.
+        #[arg(long)]
+        name: String,
+        /// Secret ref (e.g. "keychain:opaque/my-secret").
+        #[arg(long)]
+        value_ref: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum GcpAction {
+    /// List GCP Secret Manager secrets in a project (metadata only).
+    ListSecrets {
+        /// GCP project ID.
+        #[arg(long)]
+        project: String,
+    },
+    /// Get GCP Secret Manager secret metadata.
+    GetSecret {
+        /// GCP project ID.
+        #[arg(long)]
+        project: String,
+        /// Secret ID.
+        #[arg(long)]
+        secret_id: String,
+    },
+    /// Access a GCP Secret Manager secret version value.
+    AccessSecretVersion {
+        /// GCP project ID.
+        #[arg(long)]
+        project: String,
+        /// Secret ID.
+        #[arg(long)]
+        secret_id: String,
+        /// Secret version (default: latest).
+        #[arg(long)]
+        version: Option<String>,
+    },
+    /// Create a new GCP Secret Manager secret.
+    CreateSecret {
+        /// GCP project ID.
+        #[arg(long)]
+        project: String,
+        /// Secret ID.
+        #[arg(long)]
+        secret_id: String,
+    },
+    /// Add a new version to an existing GCP secret from a secure ref.
+    AddSecretVersion {
+        /// GCP project ID.
+        #[arg(long)]
+        project: String,
+        /// Secret ID.
+        #[arg(long)]
+        secret_id: String,
+        /// Secret ref (e.g. "keychain:opaque/my-secret").
+        #[arg(long)]
+        value_ref: String,
     },
 }
 
@@ -817,6 +943,7 @@ async fn run_github_publish_env(
     env_file: &Path,
     value_ref_template: &str,
     github_token_ref: Option<&str>,
+    github_auth_mode: Option<&str>,
     environment: Option<&str>,
     dry_run: bool,
     continue_on_error: bool,
@@ -877,6 +1004,9 @@ async fn run_github_publish_env(
         });
         if let Some(tok) = github_token_ref {
             params["github_token_ref"] = serde_json::Value::String(tok.to_owned());
+        }
+        if let Some(auth_mode) = github_auth_mode {
+            params["github_auth_mode"] = serde_json::Value::String(auth_mode.to_owned());
         }
         if let Some(env) = environment {
             params["environment"] = serde_json::Value::String(env.to_owned());
@@ -1095,6 +1225,7 @@ async fn run_github_publish_manifest(
     manifest_file: &Path,
     repo_override: Option<&str>,
     github_token_ref: Option<&str>,
+    github_auth_mode: Option<&str>,
     environment_override: Option<&str>,
     dry_run: bool,
     continue_on_error: bool,
@@ -1147,6 +1278,9 @@ async fn run_github_publish_manifest(
         });
         if let Some(tok) = github_token_ref {
             params["github_token_ref"] = serde_json::Value::String(tok.to_owned());
+        }
+        if let Some(auth_mode) = github_auth_mode {
+            params["github_auth_mode"] = serde_json::Value::String(auth_mode.to_owned());
         }
         if let Some(ref env) = environment {
             params["environment"] = serde_json::Value::String(env.to_owned());
@@ -1931,6 +2065,7 @@ async fn main() {
                 env_file,
                 value_ref_template,
                 github_token_ref,
+                github_auth_mode,
                 environment,
                 dry_run,
                 continue_on_error,
@@ -1941,6 +2076,7 @@ async fn main() {
                     env_file,
                     value_ref_template,
                     github_token_ref.as_deref(),
+                    github_auth_mode.as_deref(),
                     environment.as_deref(),
                     *dry_run,
                     *continue_on_error,
@@ -1952,6 +2088,7 @@ async fn main() {
                 manifest_file,
                 repo,
                 github_token_ref,
+                github_auth_mode,
                 environment,
                 dry_run,
                 continue_on_error,
@@ -1961,6 +2098,7 @@ async fn main() {
                     manifest_file,
                     repo.as_deref(),
                     github_token_ref.as_deref(),
+                    github_auth_mode.as_deref(),
                     environment.as_deref(),
                     *dry_run,
                     *continue_on_error,
@@ -2029,6 +2167,7 @@ async fn main() {
                 secret_name,
                 value_ref,
                 github_token_ref,
+                github_auth_mode,
                 environment,
             } => {
                 let scope = if environment.is_some() {
@@ -2045,6 +2184,9 @@ async fn main() {
                 if let Some(ref tok) = github_token_ref {
                     params["github_token_ref"] = serde_json::Value::String(tok.clone());
                 }
+                if let Some(ref auth_mode) = github_auth_mode {
+                    params["github_auth_mode"] = serde_json::Value::String(auth_mode.clone());
+                }
                 if let Some(ref env) = environment {
                     params["environment"] = serde_json::Value::String(env.clone());
                 }
@@ -2055,6 +2197,7 @@ async fn main() {
                 secret_name,
                 value_ref,
                 github_token_ref,
+                github_auth_mode,
                 selected_repository_ids,
             } => {
                 let scope = if repo.is_some() {
@@ -2073,6 +2216,9 @@ async fn main() {
                 if let Some(ref tok) = github_token_ref {
                     params["github_token_ref"] = serde_json::Value::String(tok.clone());
                 }
+                if let Some(ref auth_mode) = github_auth_mode {
+                    params["github_auth_mode"] = serde_json::Value::String(auth_mode.clone());
+                }
                 if let Some(ref ids) = selected_repository_ids {
                     params["selected_repository_ids"] = serde_json::json!(ids);
                 }
@@ -2083,6 +2229,7 @@ async fn main() {
                 secret_name,
                 value_ref,
                 github_token_ref,
+                github_auth_mode,
             } => {
                 let mut params = serde_json::json!({
                     "scope": "dependabot",
@@ -2093,6 +2240,9 @@ async fn main() {
                 if let Some(ref tok) = github_token_ref {
                     params["github_token_ref"] = serde_json::Value::String(tok.clone());
                 }
+                if let Some(ref auth_mode) = github_auth_mode {
+                    params["github_auth_mode"] = serde_json::Value::String(auth_mode.clone());
+                }
                 ("github", params)
             }
             GithubAction::SetOrgSecret {
@@ -2100,6 +2250,7 @@ async fn main() {
                 secret_name,
                 value_ref,
                 github_token_ref,
+                github_auth_mode,
                 visibility,
                 selected_repository_ids,
             } => {
@@ -2113,6 +2264,9 @@ async fn main() {
                 if let Some(ref tok) = github_token_ref {
                     params["github_token_ref"] = serde_json::Value::String(tok.clone());
                 }
+                if let Some(ref auth_mode) = github_auth_mode {
+                    params["github_auth_mode"] = serde_json::Value::String(auth_mode.clone());
+                }
                 if let Some(ref ids) = selected_repository_ids {
                     params["selected_repository_ids"] = serde_json::json!(ids);
                 }
@@ -2124,6 +2278,7 @@ async fn main() {
                 scope,
                 environment,
                 github_token_ref,
+                github_auth_mode,
             } => {
                 let mut params = serde_json::json!({
                     "action": "list_secrets",
@@ -2141,6 +2296,9 @@ async fn main() {
                 if let Some(ref tok) = github_token_ref {
                     params["github_token_ref"] = serde_json::Value::String(tok.clone());
                 }
+                if let Some(ref auth_mode) = github_auth_mode {
+                    params["github_auth_mode"] = serde_json::Value::String(auth_mode.clone());
+                }
                 ("github", params)
             }
             GithubAction::DeleteSecret {
@@ -2150,6 +2308,7 @@ async fn main() {
                 scope,
                 environment,
                 github_token_ref,
+                github_auth_mode,
             } => {
                 let mut params = serde_json::json!({
                     "action": "delete_secret",
@@ -2168,6 +2327,9 @@ async fn main() {
                 if let Some(ref tok) = github_token_ref {
                     params["github_token_ref"] = serde_json::Value::String(tok.clone());
                 }
+                if let Some(ref auth_mode) = github_auth_mode {
+                    params["github_auth_mode"] = serde_json::Value::String(auth_mode.clone());
+                }
                 ("github", params)
             }
             GithubAction::PublishEnv { .. }
@@ -2180,6 +2342,7 @@ async fn main() {
                 key,
                 value_ref,
                 gitlab_token_ref,
+                gitlab_auth_mode,
                 environment_scope,
                 protected,
                 masked,
@@ -2199,10 +2362,92 @@ async fn main() {
                 if let Some(ref tok) = gitlab_token_ref {
                     params["gitlab_token_ref"] = serde_json::Value::String(tok.clone());
                 }
+                if let Some(ref auth_mode) = gitlab_auth_mode {
+                    params["gitlab_auth_mode"] = serde_json::Value::String(auth_mode.clone());
+                }
                 if let Some(ref scope) = environment_scope {
                     params["environment_scope"] = serde_json::Value::String(scope.clone());
                 }
                 ("gitlab", params)
+            }
+        },
+        Cmd::Azure { action } => match action {
+            AzureAction::ListSecrets => ("azure", serde_json::json!({ "action": "list_secrets" })),
+            AzureAction::ListKeys => ("azure", serde_json::json!({ "action": "list_keys" })),
+            AzureAction::ListCertificates => (
+                "azure",
+                serde_json::json!({ "action": "list_certificates" }),
+            ),
+            AzureAction::GetSecret { name, version } => {
+                let mut params = serde_json::json!({
+                    "action": "get_secret",
+                    "name": name,
+                });
+                if let Some(ref v) = version {
+                    params["version"] = serde_json::Value::String(v.clone());
+                }
+                ("azure", params)
+            }
+            AzureAction::SetSecret { name, value_ref } => {
+                let params = serde_json::json!({
+                    "action": "set_secret",
+                    "name": name,
+                    "value_ref": value_ref,
+                });
+                ("azure", params)
+            }
+        },
+        Cmd::Gcp { action } => match action {
+            GcpAction::ListSecrets { project } => {
+                let params = serde_json::json!({
+                    "action": "list_secrets",
+                    "project": project,
+                });
+                ("gcp", params)
+            }
+            GcpAction::GetSecret { project, secret_id } => {
+                let params = serde_json::json!({
+                    "action": "get_secret",
+                    "project": project,
+                    "secret_id": secret_id,
+                });
+                ("gcp", params)
+            }
+            GcpAction::AccessSecretVersion {
+                project,
+                secret_id,
+                version,
+            } => {
+                let mut params = serde_json::json!({
+                    "action": "access_secret_version",
+                    "project": project,
+                    "secret_id": secret_id,
+                });
+                if let Some(ref v) = version {
+                    params["version"] = serde_json::Value::String(v.clone());
+                }
+                ("gcp", params)
+            }
+            GcpAction::CreateSecret { project, secret_id } => {
+                let params = serde_json::json!({
+                    "action": "create_secret",
+                    "project": project,
+                    "secret_id": secret_id,
+                });
+                ("gcp", params)
+            }
+            GcpAction::AddSecretVersion {
+                project,
+                secret_id,
+                value_ref,
+            } => {
+                let params = serde_json::json!({
+                    "action": "add_secret_version",
+                    "project": project,
+                    "secret_id": secret_id,
+                    "value_ref": value_ref,
+                });
+                ("gcp", params)
             }
         },
         Cmd::OnePassword { action } => match action {
@@ -3051,12 +3296,12 @@ fn available_presets() -> Vec<(&'static str, &'static str, &'static str)> {
         ),
         (
             "github-secrets",
-            "Sync GitHub secrets via AI agents — requires: keychain:opaque/github-pat",
+            "Sync GitHub secrets via AI agents — requires: a GitHub token ref (PAT or OAuth)",
             PRESET_GITHUB_SECRETS,
         ),
         (
             "gitlab-variables",
-            "Set GitLab CI/CD variables via AI agents — requires: keychain:opaque/gitlab-pat",
+            "Set GitLab CI/CD variables via AI agents — requires: a GitLab token ref (PAT or OAuth)",
             PRESET_GITLAB_VARIABLES,
         ),
         (
@@ -5122,16 +5367,17 @@ fn policy_show_preset(name: &str) -> Result<(), String> {
 fn preset_checklist(preset_name: &str) -> Vec<String> {
     match preset_name {
         "github-secrets" => vec![
-            "Store a GitHub PAT with 'repo' scope: opaque secrets add github-pat".into(),
+            "Store a GitHub token (PAT or OAuth): opaque secrets add github-token".into(),
             "Start the daemon: opaque service install".into(),
             "Connect to Claude Code: opaque connect claude".into(),
         ],
         "gitlab-variables" => vec![
             "Store a GitLab token with 'api' scope: opaque secrets add gitlab-token".into(),
+            "Optional: set OPAQUE_GITLAB_AUTH_MODE=oauth for OAuth bearer tokens".into(),
             "Start the daemon: opaque service install".into(),
         ],
         "agent-wrapper-github" => vec![
-            "Store a GitHub PAT: opaque secrets add github-pat".into(),
+            "Store a GitHub token (PAT or OAuth): opaque secrets add github-token".into(),
             "Start the daemon: opaque service install".into(),
             "Wrap your agent: opaque agent run -- <your-agent-command>".into(),
         ],
@@ -6156,8 +6402,8 @@ BAZ=
             checklist.len()
         );
         assert!(
-            checklist.iter().any(|s| s.contains("GitHub PAT")),
-            "should contain PAT step: {checklist:?}"
+            checklist.iter().any(|s| s.contains("GitHub token")),
+            "should contain GitHub token step: {checklist:?}"
         );
         assert!(
             checklist

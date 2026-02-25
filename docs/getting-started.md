@@ -110,8 +110,62 @@ Defaults:
 
 - Vault URL: `http://127.0.0.1:8200` (override with `OPAQUE_VAULT_URL`)
 - Vault token ref: `keychain:opaque/vault-token` (override with `OPAQUE_VAULT_TOKEN_REF`)
+- Vault lease renew window: `30` seconds (override with `OPAQUE_VAULT_LEASE_RENEW_WINDOW_SECS`, set `0` to disable proactive renewal)
+- Audit retention: `audit_retention_days = 90` (runtime purge continuously removes rows older than this window)
+- Audit SSE feed: disabled by default; set `OPAQUE_AUDIT_SSE_ADDR=127.0.0.1:8787` to enable (`OPAQUE_AUDIT_SSE_POLL_MS` and `OPAQUE_AUDIT_SSE_BATCH_LIMIT` are optional tuning knobs)
 
 See [Vault setup](vault.md) for details.
+
+## Azure Key Vault
+
+Opaque supports Azure Key Vault operations and `azure:` secret refs.
+
+Ref format:
+
+```text
+azure:<vault>/<secret>
+azure:<vault>/<secret>/<version>
+```
+
+Daemon env configuration (required for Azure operations and resolver auth):
+
+- `OPAQUE_AZURE_VAULT_URL` (used by `opaque azure ...` operations)
+- `OPAQUE_AZURE_TENANT_ID`
+- `OPAQUE_AZURE_CLIENT_ID`
+- `OPAQUE_AZURE_CLIENT_SECRET`
+
+Examples:
+
+```bash
+opaque azure list-secrets
+opaque azure set-secret --name API_KEY --value-ref keychain:opaque/api-key
+```
+
+## GCP Secret Manager
+
+Opaque supports GCP Secret Manager operations and `gcp:` secret refs.
+
+Ref format:
+
+```text
+gcp:<project>/<secret>
+gcp:<project>/<secret>/<version>
+```
+
+Daemon env configuration:
+
+- `OPAQUE_GCP_ACCESS_TOKEN` or `OPAQUE_GCP_SERVICE_ACCOUNT_KEY`
+- optional: `OPAQUE_GCP_SM_URL` (default: `https://secretmanager.googleapis.com/v1`)
+
+Examples:
+
+```bash
+opaque gcp list-secrets --project my-project
+opaque gcp add-secret-version \
+  --project my-project \
+  --secret-id API_KEY \
+  --value-ref keychain:opaque/api-key
+```
 
 ## MCP Quickstart (Claude Code)
 
@@ -205,6 +259,17 @@ The CLI exposes multiple GitHub secret scopes via `opaque github ...`.
   --value-ref keychain:opaque/my-token
 ```
 
+OAuth bearer token mode:
+
+```bash
+./target/release/opaque github set-secret \
+  --repo owner/repo \
+  --secret-name MY_TOKEN \
+  --value-ref keychain:opaque/my-token \
+  --github-auth-mode oauth \
+  --github-token-ref keychain:opaque/github-oauth-token
+```
+
 Environment-level Actions secret:
 
 ```bash
@@ -261,6 +326,17 @@ Set a project CI/CD variable:
   --project group/project \
   --key DATABASE_URL \
   --value-ref keychain:opaque/db-url
+```
+
+Use OAuth bearer tokens instead of `PRIVATE-TOKEN` headers:
+
+```bash
+./target/release/opaque gitlab set-ci-variable \
+  --project group/project \
+  --key DATABASE_URL \
+  --value-ref keychain:opaque/db-url \
+  --gitlab-auth-mode oauth \
+  --gitlab-token-ref keychain:opaque/gitlab-oauth-token
 ```
 
 Optionally set scope/attributes:
@@ -325,9 +401,11 @@ The daemon writes a local SQLite audit DB at `~/.opaque/audit.db`.
 
 - `OPAQUE_CONFIG`: override daemon/CLI config path (default: `~/.opaque/config.toml`)
 - `OPAQUE_SOCK`: override socket path for the CLI only (daemon ignores it)
-- `OPAQUE_GITHUB_TOKEN_REF`: override default GitHub PAT secret ref used by `github.set_actions_secret`
+- `OPAQUE_GITHUB_TOKEN_REF`: override default GitHub token ref used by `github.*` operations (default ref varies by auth mode)
+- `OPAQUE_GITHUB_AUTH_MODE`: set GitHub auth mode for `github.*` operations (`pat` default, or `oauth`)
 - `OPAQUE_GITHUB_API_URL`: override GitHub API base URL (GitHub Enterprise Server or local testing)
-- `OPAQUE_GITLAB_TOKEN_REF`: override default GitLab token ref used by `gitlab.set_ci_variable`
+- `OPAQUE_GITLAB_TOKEN_REF`: override default GitLab token ref used by `gitlab.set_ci_variable` (default ref varies by auth mode)
+- `OPAQUE_GITLAB_AUTH_MODE`: set GitLab auth mode for `gitlab.set_ci_variable` (`pat` default, or `oauth`)
 - `OPAQUE_GITLAB_API_URL`: override GitLab API base URL (GitLab.com / self-managed / local testing)
 - `OPAQUE_BITWARDEN_URL`: override Bitwarden API base URL (default: `https://api.bitwarden.com`)
 

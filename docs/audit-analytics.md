@@ -155,9 +155,18 @@ Internally:
 
 Externally (pick one or more):
 
-- UDS stream for local UI/CLI tail (`opaque tail --follow`)
-- HTTP `localhost` endpoint using SSE for a web/desktop UI
+- local SQLite query via CLI (`opaque audit tail`)
+- HTTP `localhost` endpoint using SSE for web/desktop UI (`/audit/stream`)
 - (later) Arrow Flight / FlightSQL stream for Arrow-native consumers
+
+Current SSE runtime:
+
+- disabled by default
+- enable with `OPAQUE_AUDIT_SSE_ADDR=127.0.0.1:8787`
+- optional tuning:
+  - `OPAQUE_AUDIT_SSE_POLL_MS`
+  - `OPAQUE_AUDIT_SSE_BATCH_LIMIT`
+- endpoint: `GET /audit/stream?since_ms=<unix_ms>`
 
 ### Preventing side channels
 

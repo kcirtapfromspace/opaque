@@ -17,13 +17,17 @@ use opaque_core::profile::ALLOWED_REF_SCHEMES;
 use crate::enclave::OperationHandler;
 use crate::sandbox::resolve::{CompositeResolver, SecretResolver};
 
-use client::{GitLabClient, SetCiVariableOptions, SetCiVariableResponse};
+use client::{GitLabAuthMode, GitLabClient, SetCiVariableOptions, SetCiVariableResponse};
 
-/// Default keychain ref for the GitLab token.
-const DEFAULT_GITLAB_TOKEN_REF: &str = "keychain:opaque/gitlab-pat";
+/// Default keychain ref for GitLab PAT/project/group access tokens.
+const DEFAULT_GITLAB_PAT_TOKEN_REF: &str = "keychain:opaque/gitlab-pat";
+/// Default keychain ref for GitLab OAuth access tokens.
+const DEFAULT_GITLAB_OAUTH_TOKEN_REF: &str = "keychain:opaque/gitlab-oauth-token";
 
 /// Environment variable to override default GitLab token ref.
 const GITLAB_TOKEN_REF_ENV: &str = "OPAQUE_GITLAB_TOKEN_REF";
+/// Environment variable to override default GitLab auth mode (`pat` or `oauth`).
+const GITLAB_AUTH_MODE_ENV: &str = "OPAQUE_GITLAB_AUTH_MODE";
 
 /// GitLab operation handler.
 pub struct GitLabHandler {
@@ -52,14 +56,34 @@ impl GitLabHandler {
 }
 
 /// Resolve GitLab token ref from params, env override, or default.
-fn resolve_gitlab_token_ref(params: &serde_json::Value) -> String {
+fn resolve_gitlab_token_ref(params: &serde_json::Value, auth_mode: GitLabAuthMode) -> String {
     let env_ref = std::env::var(GITLAB_TOKEN_REF_ENV).ok();
+    let default_ref = match auth_mode {
+        GitLabAuthMode::PersonalAccessToken => DEFAULT_GITLAB_PAT_TOKEN_REF,
+        GitLabAuthMode::OAuthBearer => DEFAULT_GITLAB_OAUTH_TOKEN_REF,
+    };
     params
         .get("gitlab_token_ref")
         .and_then(|v| v.as_str())
         .or(env_ref.as_deref())
-        .unwrap_or(DEFAULT_GITLAB_TOKEN_REF)
+        .unwrap_or(default_ref)
         .to_owned()
+}
+
+fn resolve_gitlab_auth_mode(params: &serde_json::Value) -> Result<GitLabAuthMode, String> {
+    let env_mode = std::env::var(GITLAB_AUTH_MODE_ENV).ok();
+    let raw = params
+        .get("gitlab_auth_mode")
+        .and_then(|v| v.as_str())
+        .or(env_mode.as_deref())
+        .unwrap_or("pat");
+    match raw {
+        "pat" => Ok(GitLabAuthMode::PersonalAccessToken),
+        "oauth" => Ok(GitLabAuthMode::OAuthBearer),
+        _ => Err(format!(
+            "gitlab_auth_mode must be 'pat' or 'oauth', got: '{raw}'"
+        )),
+    }
 }
 
 fn validate_project(project: &str) -> Result<(), String> {
@@ -146,8 +170,9 @@ impl OperationHandler for GitLabHandler {
                     validate_variable_key(key)?;
                     validate_value_ref(value_ref)?;
                     validate_variable_type(variable_type)?;
+                    let auth_mode = resolve_gitlab_auth_mode(&params)?;
 
-                    let gitlab_token_ref = resolve_gitlab_token_ref(&params);
+                    let gitlab_token_ref = resolve_gitlab_token_ref(&params, auth_mode);
                     validate_value_ref(&gitlab_token_ref)?;
 
                     let resolver = CompositeResolver::new();
@@ -199,6 +224,7 @@ impl OperationHandler for GitLabHandler {
                         .client
                         .set_ci_variable(
                             token,
+                            auth_mode,
                             project,
                             key,
                             value,
@@ -230,6 +256,7 @@ impl OperationHandler for GitLabHandler {
                         "status": status,
                         "project": project,
                         "key": key,
+                        "auth_mode": auth_mode.as_str(),
                     });
                     if let Some(scope) = environment_scope {
                         result["environment_scope"] = serde_json::Value::String(scope.to_owned());
@@ -386,6 +413,7 @@ mod tests {
         assert_eq!(result["status"], "updated");
         assert_eq!(result["project"], "group/proj");
         assert_eq!(result["key"], "API_KEY");
+        assert_eq!(result["auth_mode"], "pat");
         assert!(result.get("value").is_none());
 
         let events = audit.events();
@@ -396,5 +424,74 @@ mod tests {
             std::env::remove_var(&value_env);
             std::env::remove_var(GITLAB_TOKEN_REF_ENV);
         }
+    }
+
+    #[tokio::test]
+    async fn set_ci_variable_oauth_mode_via_handler() {
+        let mock_server = MockServer::start().await;
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let client = GitLabClient::with_base_url(mock_server.uri());
+        let handler = GitLabHandler::with_client(audit, client);
+
+        let token_env = format!(
+            "OPAQUE_TEST_GITLAB_OAUTH_TOKEN_{}",
+            uuid::Uuid::new_v4().as_simple()
+        );
+        let value_env = format!(
+            "OPAQUE_TEST_GITLAB_OAUTH_VALUE_{}",
+            uuid::Uuid::new_v4().as_simple()
+        );
+        unsafe { std::env::set_var(&token_env, "oauth-token-123") };
+        unsafe { std::env::set_var(&value_env, "secret-value") };
+
+        Mock::given(method("PUT"))
+            .and(path("/projects/group%2Fproj/variables/API_KEY"))
+            .and(header("authorization", "Bearer oauth-token-123"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let request = make_request(
+            "gitlab.set_ci_variable",
+            serde_json::json!({
+                "project": "group/proj",
+                "key": "API_KEY",
+                "value_ref": format!("env:{value_env}"),
+                "gitlab_token_ref": format!("env:{token_env}"),
+                "gitlab_auth_mode": "oauth",
+            }),
+        );
+
+        let result = handler.execute(&request).await.unwrap();
+        assert_eq!(result["status"], "updated");
+        assert_eq!(result["auth_mode"], "oauth");
+
+        unsafe {
+            std::env::remove_var(&token_env);
+            std::env::remove_var(&value_env);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_auth_mode_rejected() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let handler = GitLabHandler::new(audit).unwrap();
+        let request = make_request(
+            "gitlab.set_ci_variable",
+            serde_json::json!({
+                "project": "group/proj",
+                "key": "API_KEY",
+                "value_ref": "env:MY_VAR",
+                "gitlab_auth_mode": "invalid",
+            }),
+        );
+        let result = handler.execute(&request).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("gitlab_auth_mode must be 'pat' or 'oauth'")
+        );
     }
 }

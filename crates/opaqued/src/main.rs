@@ -29,12 +29,18 @@ use uuid::Uuid;
 
 /// Name of the daemon token file written next to the socket.
 const DAEMON_TOKEN_FILENAME: &str = "daemon.token";
+/// Optional bind address for the audit SSE server (for example `127.0.0.1:8787`).
+const AUDIT_SSE_ADDR_ENV: &str = "OPAQUE_AUDIT_SSE_ADDR";
+/// Optional poll interval override in milliseconds.
+const AUDIT_SSE_POLL_MS_ENV: &str = "OPAQUE_AUDIT_SSE_POLL_MS";
+/// Optional batch size override for each poll.
+const AUDIT_SSE_BATCH_LIMIT_ENV: &str = "OPAQUE_AUDIT_SSE_BATCH_LIMIT";
 
 mod approval;
 #[allow(dead_code)]
 mod approval_server;
+mod audit_sse;
 mod aws;
-#[allow(dead_code)]
 mod azure;
 mod bitwarden;
 #[allow(dead_code)]
@@ -42,7 +48,6 @@ mod doppler;
 mod enclave;
 #[allow(dead_code)]
 mod fido2;
-#[allow(dead_code)]
 mod gcp;
 mod github;
 mod gitlab;
@@ -221,6 +226,48 @@ fn load_config() -> DaemonConfig {
             info!("no config file at {}, using defaults", path.display());
             DaemonConfig::default()
         }
+    }
+}
+
+fn parse_optional_socket_addr_env(env_name: &str) -> std::io::Result<Option<std::net::SocketAddr>> {
+    match std::env::var(env_name) {
+        Ok(raw) => raw.parse::<std::net::SocketAddr>().map(Some).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid {env_name}='{raw}': {e}"),
+            )
+        }),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(err) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("failed to read {env_name}: {err}"),
+        )),
+    }
+}
+
+fn parse_optional_u64_env(env_name: &str) -> Option<u64> {
+    match std::env::var(env_name) {
+        Ok(raw) => match raw.parse::<u64>() {
+            Ok(value) => Some(value),
+            Err(err) => {
+                warn!("invalid {env_name}='{raw}' ({err}); ignoring");
+                None
+            }
+        },
+        Err(_) => None,
+    }
+}
+
+fn parse_optional_usize_env(env_name: &str) -> Option<usize> {
+    match std::env::var(env_name) {
+        Ok(raw) => match raw.parse::<usize>() {
+            Ok(value) => Some(value),
+            Err(err) => {
+                warn!("invalid {env_name}='{raw}' ({err}); ignoring");
+                None
+            }
+        },
+        Err(_) => None,
     }
 }
 
@@ -449,6 +496,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
                     "secret_name": {"type": "string"},
                     "value_ref": {"type": "string"},
                     "github_token_ref": {"type": "string"},
+                    "github_auth_mode": {"type": "string", "enum": ["pat", "oauth"]},
                     "environment": {"type": "string"}
                 }
             })),
@@ -472,6 +520,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
                     "value_ref": {"type": "string"},
                     "repo": {"type": "string"},
                     "github_token_ref": {"type": "string"},
+                    "github_auth_mode": {"type": "string", "enum": ["pat", "oauth"]},
                     "selected_repository_ids": {"type": "array", "items": {"type": "integer"}}
                 }
             })),
@@ -494,7 +543,8 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
                     "repo": {"type": "string"},
                     "secret_name": {"type": "string"},
                     "value_ref": {"type": "string"},
-                    "github_token_ref": {"type": "string"}
+                    "github_token_ref": {"type": "string"},
+                    "github_auth_mode": {"type": "string", "enum": ["pat", "oauth"]}
                 }
             })),
             allowed_target_keys: vec!["repo".into()],
@@ -517,6 +567,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
                     "secret_name": {"type": "string"},
                     "value_ref": {"type": "string"},
                     "github_token_ref": {"type": "string"},
+                    "github_auth_mode": {"type": "string", "enum": ["pat", "oauth"]},
                     "visibility": {"type": "string", "enum": ["all", "private", "selected"]},
                     "selected_repository_ids": {"type": "array", "items": {"type": "integer"}}
                 }
@@ -540,7 +591,8 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
                     "repo": {"type": "string"},
                     "org": {"type": "string"},
                     "environment": {"type": "string"},
-                    "github_token_ref": {"type": "string"}
+                    "github_token_ref": {"type": "string"},
+                    "github_auth_mode": {"type": "string", "enum": ["pat", "oauth"]}
                 }
             })),
             allowed_target_keys: vec!["repo".into(), "org".into()],
@@ -564,7 +616,8 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
                     "repo": {"type": "string"},
                     "org": {"type": "string"},
                     "environment": {"type": "string"},
-                    "github_token_ref": {"type": "string"}
+                    "github_token_ref": {"type": "string"},
+                    "github_auth_mode": {"type": "string", "enum": ["pat", "oauth"]}
                 }
             })),
             allowed_target_keys: vec!["repo".into(), "org".into()],
@@ -587,6 +640,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
                     "key": {"type": "string"},
                     "value_ref": {"type": "string"},
                     "gitlab_token_ref": {"type": "string"},
+                    "gitlab_auth_mode": {"type": "string", "enum": ["pat", "oauth"]},
                     "environment_scope": {"type": "string"},
                     "protected": {"type": "boolean"},
                     "masked": {"type": "boolean"},
@@ -598,6 +652,188 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             secret_ref_param_keys: vec!["value_ref".into(), "gitlab_token_ref".into()],
         })
         .expect("failed to register gitlab.set_ci_variable");
+
+    // Azure Key Vault operations
+    registry
+        .register(OperationDef {
+            name: "azure.list_secrets".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::FirstUse,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "List Azure Key Vault secret metadata".into(),
+            params_schema: None,
+            allowed_target_keys: vec![],
+            secret_ref_param_keys: vec![],
+        })
+        .expect("failed to register azure.list_secrets");
+
+    registry
+        .register(OperationDef {
+            name: "azure.list_keys".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::FirstUse,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "List Azure Key Vault key metadata".into(),
+            params_schema: None,
+            allowed_target_keys: vec![],
+            secret_ref_param_keys: vec![],
+        })
+        .expect("failed to register azure.list_keys");
+
+    registry
+        .register(OperationDef {
+            name: "azure.list_certificates".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::FirstUse,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "List Azure Key Vault certificate metadata".into(),
+            params_schema: None,
+            allowed_target_keys: vec![],
+            secret_ref_param_keys: vec![],
+        })
+        .expect("failed to register azure.list_certificates");
+
+    registry
+        .register(OperationDef {
+            name: "azure.get_secret".into(),
+            safety: OperationSafety::Reveal,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Read an Azure Key Vault secret value".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "version": {"type": "string"}
+                }
+            })),
+            allowed_target_keys: vec!["name".into()],
+            secret_ref_param_keys: vec![],
+        })
+        .expect("failed to register azure.get_secret");
+
+    registry
+        .register(OperationDef {
+            name: "azure.set_secret".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Set an Azure Key Vault secret value from a ref".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["name", "value_ref"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "value_ref": {"type": "string"}
+                }
+            })),
+            allowed_target_keys: vec!["name".into()],
+            secret_ref_param_keys: vec!["value_ref".into()],
+        })
+        .expect("failed to register azure.set_secret");
+
+    // GCP Secret Manager operations
+    registry
+        .register(OperationDef {
+            name: "gcp.list_secrets".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::FirstUse,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "List GCP Secret Manager secrets".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["project"],
+                "properties": {
+                    "project": {"type": "string"}
+                }
+            })),
+            allowed_target_keys: vec!["project".into()],
+            secret_ref_param_keys: vec![],
+        })
+        .expect("failed to register gcp.list_secrets");
+
+    registry
+        .register(OperationDef {
+            name: "gcp.get_secret".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::FirstUse,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Get GCP Secret Manager secret metadata".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["project", "secret_id"],
+                "properties": {
+                    "project": {"type": "string"},
+                    "secret_id": {"type": "string"}
+                }
+            })),
+            allowed_target_keys: vec!["project".into(), "secret_id".into()],
+            secret_ref_param_keys: vec![],
+        })
+        .expect("failed to register gcp.get_secret");
+
+    registry
+        .register(OperationDef {
+            name: "gcp.access_secret_version".into(),
+            safety: OperationSafety::Reveal,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Read a GCP Secret Manager secret version value".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["project", "secret_id"],
+                "properties": {
+                    "project": {"type": "string"},
+                    "secret_id": {"type": "string"},
+                    "version": {"type": "string"}
+                }
+            })),
+            allowed_target_keys: vec!["project".into(), "secret_id".into()],
+            secret_ref_param_keys: vec![],
+        })
+        .expect("failed to register gcp.access_secret_version");
+
+    registry
+        .register(OperationDef {
+            name: "gcp.create_secret".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Create a GCP Secret Manager secret".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["project", "secret_id"],
+                "properties": {
+                    "project": {"type": "string"},
+                    "secret_id": {"type": "string"}
+                }
+            })),
+            allowed_target_keys: vec!["project".into(), "secret_id".into()],
+            secret_ref_param_keys: vec![],
+        })
+        .expect("failed to register gcp.create_secret");
+
+    registry
+        .register(OperationDef {
+            name: "gcp.add_secret_version".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Add a GCP Secret Manager secret version from a ref".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["project", "secret_id", "value_ref"],
+                "properties": {
+                    "project": {"type": "string"},
+                    "secret_id": {"type": "string"},
+                    "value_ref": {"type": "string"}
+                }
+            })),
+            allowed_target_keys: vec!["project".into(), "secret_id".into()],
+            secret_ref_param_keys: vec!["value_ref".into()],
+        })
+        .expect("failed to register gcp.add_secret_version");
 
     registry
         .register(OperationDef {
@@ -1000,6 +1236,81 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         .handler("github.delete_secret", Box::new(github_delete_handler))
         .handler("gitlab.set_ci_variable", Box::new(gitlab_handler));
 
+    // Azure handler: requires a specific vault URL plus Azure AD credentials.
+    // The same handler is registered for all azure.* operations.
+    {
+        let azure_vault_url = std::env::var(azure::client::AZURE_VAULT_URL_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        let azure_tenant_id = std::env::var(azure::client::AZURE_TENANT_ID_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        let azure_client_id = std::env::var(azure::client::AZURE_CLIENT_ID_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        let azure_client_secret = std::env::var(azure::client::AZURE_CLIENT_SECRET_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+
+        if let (Some(vault_url), Some(tenant_id), Some(client_id), Some(client_secret)) = (
+            azure_vault_url,
+            azure_tenant_id,
+            azure_client_id,
+            azure_client_secret,
+        ) {
+            let azure_ops = [
+                "azure.list_secrets",
+                "azure.list_keys",
+                "azure.list_certificates",
+                "azure.get_secret",
+                "azure.set_secret",
+            ];
+            for op in azure_ops {
+                let handler = azure::AzureHandler::new(
+                    audit.clone(),
+                    &vault_url,
+                    tenant_id.clone(),
+                    client_id.clone(),
+                    client_secret.clone(),
+                )
+                .map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
+                })?;
+                enclave_builder = enclave_builder.handler(op, Box::new(handler));
+            }
+            info!("Azure handler enabled ({})", vault_url);
+        } else {
+            info!(
+                "Azure handler disabled (set {}, {}, {}, and {})",
+                azure::client::AZURE_VAULT_URL_ENV,
+                azure::client::AZURE_TENANT_ID_ENV,
+                azure::client::AZURE_CLIENT_ID_ENV,
+                azure::client::AZURE_CLIENT_SECRET_ENV
+            );
+        }
+    }
+
+    // GCP handler: base URL defaults to the standard Secret Manager endpoint.
+    // Authentication credentials are resolved per request by the client.
+    {
+        let gcp_sm_url = std::env::var(gcp::client::GCP_SM_URL_ENV)
+            .unwrap_or_else(|_| gcp::client::DEFAULT_BASE_URL.to_owned());
+        let gcp_ops = [
+            "gcp.list_secrets",
+            "gcp.get_secret",
+            "gcp.access_secret_version",
+            "gcp.create_secret",
+            "gcp.add_secret_version",
+        ];
+        for op in gcp_ops {
+            let handler = gcp::GcpHandler::new(audit.clone(), &gcp_sm_url).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
+            })?;
+            enclave_builder = enclave_builder.handler(op, Box::new(handler));
+        }
+        info!("GCP handler enabled ({})", gcp_sm_url);
+    }
+
     if !onepassword_connect_url.is_empty() {
         // Connect Server backend (self-hosted REST API).
         let op_list_vaults_handler =
@@ -1108,6 +1419,20 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         connection_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
     });
 
+    let mut audit_sse_handle = None;
+    if let Some(bind_addr) = parse_optional_socket_addr_env(AUDIT_SSE_ADDR_ENV)? {
+        let mut sse_config = audit_sse::AuditSseServerConfig::new(bind_addr, audit_db_path.clone());
+        if let Some(poll_ms) = parse_optional_u64_env(AUDIT_SSE_POLL_MS_ENV) {
+            sse_config.poll_interval = std::time::Duration::from_millis(poll_ms);
+        }
+        if let Some(batch_limit) = parse_optional_usize_env(AUDIT_SSE_BATCH_LIMIT_ENV) {
+            sse_config.batch_limit = batch_limit;
+        }
+        let (handle, local_addr) = audit_sse::start_server(sse_config).await?;
+        info!("audit SSE feed enabled at http://{local_addr}/audit/stream");
+        audit_sse_handle = Some(handle);
+    }
+
     // Shutdown coordination: watch channel + active connection counter.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let active_connections = Arc::new(AtomicUsize::new(0));
@@ -1165,6 +1490,11 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         warn!("{remaining} connections still active after drain timeout");
     } else {
         info!("all connections drained");
+    }
+
+    if let Some(handle) = audit_sse_handle.take() {
+        handle.abort();
+        let _ = handle.await;
     }
 
     Ok(())
@@ -2369,6 +2699,16 @@ async fn handle_request(
                 .and_then(|v| v.as_str())
                 .unwrap_or("set_secret");
 
+            if let Some(auth_mode) = req.params.get("github_auth_mode").and_then(|v| v.as_str())
+                && !matches!(auth_mode, "pat" | "oauth")
+            {
+                return Response::err(
+                    Some(req.id),
+                    "bad_request",
+                    "github_auth_mode must be 'pat' or 'oauth'",
+                );
+            }
+
             // Route list_secrets and delete_secret to their own dispatch paths.
             if action == "list_secrets" {
                 return handle_github_list_secrets(&req, state, identity, client_type).await;
@@ -2474,6 +2814,11 @@ async fn handle_request(
                     if let Some(tok) = req.params.get("github_token_ref").and_then(|v| v.as_str()) {
                         params["github_token_ref"] = serde_json::Value::String(tok.into());
                     }
+                    if let Some(auth_mode) =
+                        req.params.get("github_auth_mode").and_then(|v| v.as_str())
+                    {
+                        params["github_auth_mode"] = serde_json::Value::String(auth_mode.into());
+                    }
                     if let Some(env) = req.params.get("environment").and_then(|v| v.as_str()) {
                         params["environment"] = serde_json::Value::String(env.into());
                     }
@@ -2493,6 +2838,11 @@ async fn handle_request(
                     });
                     if let Some(tok) = req.params.get("github_token_ref").and_then(|v| v.as_str()) {
                         params["github_token_ref"] = serde_json::Value::String(tok.into());
+                    }
+                    if let Some(auth_mode) =
+                        req.params.get("github_auth_mode").and_then(|v| v.as_str())
+                    {
+                        params["github_auth_mode"] = serde_json::Value::String(auth_mode.into());
                     }
                     if let Some(ids) = req.params.get("selected_repository_ids") {
                         params["selected_repository_ids"] = ids.clone();
@@ -2526,6 +2876,11 @@ async fn handle_request(
                     if let Some(tok) = req.params.get("github_token_ref").and_then(|v| v.as_str()) {
                         params["github_token_ref"] = serde_json::Value::String(tok.into());
                     }
+                    if let Some(auth_mode) =
+                        req.params.get("github_auth_mode").and_then(|v| v.as_str())
+                    {
+                        params["github_auth_mode"] = serde_json::Value::String(auth_mode.into());
+                    }
                     let target = HashMap::from([
                         ("repo".into(), repo),
                         ("secret_name".into(), secret_name.clone()),
@@ -2558,6 +2913,11 @@ async fn handle_request(
                     if let Some(tok) = req.params.get("github_token_ref").and_then(|v| v.as_str()) {
                         params["github_token_ref"] = serde_json::Value::String(tok.into());
                     }
+                    if let Some(auth_mode) =
+                        req.params.get("github_auth_mode").and_then(|v| v.as_str())
+                    {
+                        params["github_auth_mode"] = serde_json::Value::String(auth_mode.into());
+                    }
                     let target = HashMap::from([
                         ("repo".into(), repo),
                         ("secret_name".into(), secret_name.clone()),
@@ -2582,6 +2942,11 @@ async fn handle_request(
                     });
                     if let Some(tok) = req.params.get("github_token_ref").and_then(|v| v.as_str()) {
                         params["github_token_ref"] = serde_json::Value::String(tok.into());
+                    }
+                    if let Some(auth_mode) =
+                        req.params.get("github_auth_mode").and_then(|v| v.as_str())
+                    {
+                        params["github_auth_mode"] = serde_json::Value::String(auth_mode.into());
                     }
                     if let Some(vis) = req.params.get("visibility").and_then(|v| v.as_str()) {
                         params["visibility"] = serde_json::Value::String(vis.into());
@@ -2713,6 +3078,15 @@ async fn handle_request(
             if let Some(tok) = req.params.get("gitlab_token_ref").and_then(|v| v.as_str()) {
                 refs_to_validate.push(tok.to_owned());
             }
+            if let Some(auth_mode) = req.params.get("gitlab_auth_mode").and_then(|v| v.as_str())
+                && !matches!(auth_mode, "pat" | "oauth")
+            {
+                return Response::err(
+                    Some(req.id),
+                    "bad_request",
+                    "gitlab_auth_mode must be 'pat' or 'oauth'",
+                );
+            }
             if let Err(e) = InputValidator::validate_secret_ref_names(&refs_to_validate) {
                 return Response::err(
                     Some(req.id),
@@ -2743,6 +3117,9 @@ async fn handle_request(
             });
             if let Some(tok) = req.params.get("gitlab_token_ref").and_then(|v| v.as_str()) {
                 op_params["gitlab_token_ref"] = serde_json::Value::String(tok.to_owned());
+            }
+            if let Some(auth_mode) = req.params.get("gitlab_auth_mode").and_then(|v| v.as_str()) {
+                op_params["gitlab_auth_mode"] = serde_json::Value::String(auth_mode.to_owned());
             }
             if let Some(scope) = req.params.get("environment_scope").and_then(|v| v.as_str()) {
                 op_params["environment_scope"] = serde_json::Value::String(scope.to_owned());
@@ -2779,6 +3156,8 @@ async fn handle_request(
                 .await
                 .into_proto_response(req.id)
         }
+        "azure" => handle_azure_request(&req, state, identity, client_type).await,
+        "gcp" => handle_gcp_request(&req, state, identity, client_type).await,
         "onepassword" => {
             // The onepassword method is a convenience wrapper that builds an
             // "execute" request for the appropriate onepassword.* operation.
@@ -3146,6 +3525,9 @@ async fn handle_github_list_secrets(
     if let Some(tok) = req.params.get("github_token_ref").and_then(|v| v.as_str()) {
         op_params["github_token_ref"] = serde_json::Value::String(tok.into());
     }
+    if let Some(auth_mode) = req.params.get("github_auth_mode").and_then(|v| v.as_str()) {
+        op_params["github_auth_mode"] = serde_json::Value::String(auth_mode.into());
+    }
 
     // Validate target before building OperationRequest.
     let target = match InputValidator::validate_target(&target) {
@@ -3221,6 +3603,9 @@ async fn handle_github_delete_secret(
     if let Some(tok) = req.params.get("github_token_ref").and_then(|v| v.as_str()) {
         op_params["github_token_ref"] = serde_json::Value::String(tok.into());
     }
+    if let Some(auth_mode) = req.params.get("github_auth_mode").and_then(|v| v.as_str()) {
+        op_params["github_auth_mode"] = serde_json::Value::String(auth_mode.into());
+    }
 
     // Validate target before building OperationRequest.
     let target = match InputValidator::validate_target(&target) {
@@ -3237,6 +3622,394 @@ async fn handle_github_delete_secret(
         operation: "github.delete_secret".into(),
         target,
         secret_ref_names: vec![],
+        created_at: SystemTime::now(),
+        expires_at: None,
+        params: op_params,
+        workspace: None,
+    };
+
+    state
+        .enclave
+        .execute(op_req)
+        .await
+        .into_proto_response(req.id)
+}
+
+/// Handle `azure` daemon method wrappers.
+///
+/// Routes to `azure.*` enclave operations based on `action`.
+async fn handle_azure_request(
+    req: &opaque_core::proto::Request,
+    state: &DaemonState,
+    identity: &ClientIdentity,
+    client_type: ClientType,
+) -> opaque_core::proto::Response {
+    let action = req
+        .params
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+
+    if action.is_empty() {
+        return Response::err(Some(req.id), "bad_request", "missing 'action' field");
+    }
+
+    let (operation, target, op_params, secret_ref_names) = match action.as_str() {
+        "list_secrets" => (
+            "azure.list_secrets",
+            HashMap::new(),
+            serde_json::json!({}),
+            vec![],
+        ),
+        "list_keys" => (
+            "azure.list_keys",
+            HashMap::new(),
+            serde_json::json!({}),
+            vec![],
+        ),
+        "list_certificates" => (
+            "azure.list_certificates",
+            HashMap::new(),
+            serde_json::json!({}),
+            vec![],
+        ),
+        "get_secret" => {
+            let name = req
+                .params
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            if name.is_empty() {
+                return Response::err(Some(req.id), "bad_request", "missing 'name' field");
+            }
+
+            let mut params = serde_json::json!({ "name": name });
+            if let Some(version) = req.params.get("version").and_then(|v| v.as_str()) {
+                params["version"] = serde_json::Value::String(version.to_owned());
+            }
+
+            (
+                "azure.get_secret",
+                HashMap::from([("name".into(), name)]),
+                params,
+                vec![],
+            )
+        }
+        "set_secret" => {
+            let name = req
+                .params
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            if name.is_empty() {
+                return Response::err(Some(req.id), "bad_request", "missing 'name' field");
+            }
+
+            let value_ref = req
+                .params
+                .get("value_ref")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            if value_ref.is_empty() {
+                return Response::err(Some(req.id), "bad_request", "missing 'value_ref' field");
+            }
+            if !opaque_core::profile::ALLOWED_REF_SCHEMES
+                .iter()
+                .any(|s| value_ref.starts_with(s))
+            {
+                return Response::err(
+                    Some(req.id),
+                    "bad_request",
+                    format!(
+                        "value_ref must start with a known scheme ({:?})",
+                        opaque_core::profile::ALLOWED_REF_SCHEMES
+                    ),
+                );
+            }
+            let refs = vec![value_ref.clone()];
+            if let Err(e) = InputValidator::validate_secret_ref_names(&refs) {
+                return Response::err(
+                    Some(req.id),
+                    "bad_request",
+                    format!("invalid secret ref: {e}"),
+                );
+            }
+
+            (
+                "azure.set_secret",
+                HashMap::from([("name".into(), name.clone())]),
+                serde_json::json!({
+                    "name": name,
+                    "value_ref": value_ref,
+                }),
+                refs,
+            )
+        }
+        unknown => {
+            return Response::err(
+                Some(req.id),
+                "bad_request",
+                format!(
+                    "unknown action '{unknown}' (expected: list_secrets, list_keys, list_certificates, get_secret, set_secret)"
+                ),
+            );
+        }
+    };
+
+    let target = match InputValidator::validate_target(&target) {
+        Ok(t) => t,
+        Err(e) => {
+            return Response::err(Some(req.id), "bad_request", format!("invalid target: {e}"));
+        }
+    };
+
+    let op_req = OperationRequest {
+        request_id: Uuid::new_v4(),
+        client_identity: identity.clone(),
+        client_type,
+        operation: operation.into(),
+        target,
+        secret_ref_names,
+        created_at: SystemTime::now(),
+        expires_at: None,
+        params: op_params,
+        workspace: None,
+    };
+
+    state
+        .enclave
+        .execute(op_req)
+        .await
+        .into_proto_response(req.id)
+}
+
+/// Handle `gcp` daemon method wrappers.
+///
+/// Routes to `gcp.*` enclave operations based on `action`.
+async fn handle_gcp_request(
+    req: &opaque_core::proto::Request,
+    state: &DaemonState,
+    identity: &ClientIdentity,
+    client_type: ClientType,
+) -> opaque_core::proto::Response {
+    let action = req
+        .params
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+
+    if action.is_empty() {
+        return Response::err(Some(req.id), "bad_request", "missing 'action' field");
+    }
+
+    let (operation, target, op_params, secret_ref_names) = match action.as_str() {
+        "list_secrets" => {
+            let project = req
+                .params
+                .get("project")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            if project.is_empty() {
+                return Response::err(Some(req.id), "bad_request", "missing 'project' field");
+            }
+            (
+                "gcp.list_secrets",
+                HashMap::from([("project".into(), project.clone())]),
+                serde_json::json!({ "project": project }),
+                vec![],
+            )
+        }
+        "get_secret" => {
+            let project = req
+                .params
+                .get("project")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            if project.is_empty() {
+                return Response::err(Some(req.id), "bad_request", "missing 'project' field");
+            }
+            let secret_id = req
+                .params
+                .get("secret_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            if secret_id.is_empty() {
+                return Response::err(Some(req.id), "bad_request", "missing 'secret_id' field");
+            }
+            (
+                "gcp.get_secret",
+                HashMap::from([
+                    ("project".into(), project.clone()),
+                    ("secret_id".into(), secret_id.clone()),
+                ]),
+                serde_json::json!({
+                    "project": project,
+                    "secret_id": secret_id,
+                }),
+                vec![],
+            )
+        }
+        "access_secret_version" => {
+            let project = req
+                .params
+                .get("project")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            if project.is_empty() {
+                return Response::err(Some(req.id), "bad_request", "missing 'project' field");
+            }
+            let secret_id = req
+                .params
+                .get("secret_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            if secret_id.is_empty() {
+                return Response::err(Some(req.id), "bad_request", "missing 'secret_id' field");
+            }
+            let mut params = serde_json::json!({
+                "project": project,
+                "secret_id": secret_id,
+            });
+            if let Some(version) = req.params.get("version").and_then(|v| v.as_str()) {
+                params["version"] = serde_json::Value::String(version.to_owned());
+            }
+            (
+                "gcp.access_secret_version",
+                HashMap::from([("project".into(), project), ("secret_id".into(), secret_id)]),
+                params,
+                vec![],
+            )
+        }
+        "create_secret" => {
+            let project = req
+                .params
+                .get("project")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            if project.is_empty() {
+                return Response::err(Some(req.id), "bad_request", "missing 'project' field");
+            }
+            let secret_id = req
+                .params
+                .get("secret_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            if secret_id.is_empty() {
+                return Response::err(Some(req.id), "bad_request", "missing 'secret_id' field");
+            }
+            (
+                "gcp.create_secret",
+                HashMap::from([
+                    ("project".into(), project.clone()),
+                    ("secret_id".into(), secret_id.clone()),
+                ]),
+                serde_json::json!({
+                    "project": project,
+                    "secret_id": secret_id,
+                }),
+                vec![],
+            )
+        }
+        "add_secret_version" => {
+            let project = req
+                .params
+                .get("project")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            if project.is_empty() {
+                return Response::err(Some(req.id), "bad_request", "missing 'project' field");
+            }
+            let secret_id = req
+                .params
+                .get("secret_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            if secret_id.is_empty() {
+                return Response::err(Some(req.id), "bad_request", "missing 'secret_id' field");
+            }
+            let value_ref = req
+                .params
+                .get("value_ref")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            if value_ref.is_empty() {
+                return Response::err(Some(req.id), "bad_request", "missing 'value_ref' field");
+            }
+            if !opaque_core::profile::ALLOWED_REF_SCHEMES
+                .iter()
+                .any(|s| value_ref.starts_with(s))
+            {
+                return Response::err(
+                    Some(req.id),
+                    "bad_request",
+                    format!(
+                        "value_ref must start with a known scheme ({:?})",
+                        opaque_core::profile::ALLOWED_REF_SCHEMES
+                    ),
+                );
+            }
+            let refs = vec![value_ref.clone()];
+            if let Err(e) = InputValidator::validate_secret_ref_names(&refs) {
+                return Response::err(
+                    Some(req.id),
+                    "bad_request",
+                    format!("invalid secret ref: {e}"),
+                );
+            }
+            (
+                "gcp.add_secret_version",
+                HashMap::from([
+                    ("project".into(), project.clone()),
+                    ("secret_id".into(), secret_id.clone()),
+                ]),
+                serde_json::json!({
+                    "project": project,
+                    "secret_id": secret_id,
+                    "value_ref": value_ref,
+                }),
+                refs,
+            )
+        }
+        unknown => {
+            return Response::err(
+                Some(req.id),
+                "bad_request",
+                format!(
+                    "unknown action '{unknown}' (expected: list_secrets, get_secret, access_secret_version, create_secret, add_secret_version)"
+                ),
+            );
+        }
+    };
+
+    let target = match InputValidator::validate_target(&target) {
+        Ok(t) => t,
+        Err(e) => {
+            return Response::err(Some(req.id), "bad_request", format!("invalid target: {e}"));
+        }
+    };
+
+    let op_req = OperationRequest {
+        request_id: Uuid::new_v4(),
+        client_identity: identity.clone(),
+        client_type,
+        operation: operation.into(),
+        target,
+        secret_ref_names,
         created_at: SystemTime::now(),
         expires_at: None,
         params: op_params,
@@ -3816,6 +4589,79 @@ exe_sha256 = "deadbeef"
         let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, "unknown_method");
+    }
+
+    #[tokio::test]
+    async fn azure_wrapper_requires_action() {
+        let state = make_test_state();
+        let req = Request {
+            id: 30,
+            method: "azure".into(),
+            params: serde_json::json!({}),
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        let err = resp.error.expect("expected bad_request");
+        assert_eq!(err.code, "bad_request");
+        assert!(err.message.contains("missing 'action'"));
+    }
+
+    #[tokio::test]
+    async fn azure_set_secret_rejects_invalid_value_ref() {
+        let state = make_test_state();
+        let req = Request {
+            id: 31,
+            method: "azure".into(),
+            params: serde_json::json!({
+                "action": "set_secret",
+                "name": "MY_SECRET",
+                "value_ref": "literal:not-allowed",
+            }),
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        let err = resp.error.expect("expected bad_request");
+        assert_eq!(err.code, "bad_request");
+        assert!(
+            err.message
+                .contains("value_ref must start with a known scheme")
+        );
+    }
+
+    #[tokio::test]
+    async fn gcp_wrapper_requires_project_for_list() {
+        let state = make_test_state();
+        let req = Request {
+            id: 32,
+            method: "gcp".into(),
+            params: serde_json::json!({
+                "action": "list_secrets",
+            }),
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        let err = resp.error.expect("expected bad_request");
+        assert_eq!(err.code, "bad_request");
+        assert!(err.message.contains("missing 'project'"));
+    }
+
+    #[tokio::test]
+    async fn gcp_add_secret_version_rejects_invalid_value_ref() {
+        let state = make_test_state();
+        let req = Request {
+            id: 33,
+            method: "gcp".into(),
+            params: serde_json::json!({
+                "action": "add_secret_version",
+                "project": "my-project",
+                "secret_id": "my-secret",
+                "value_ref": "literal:not-allowed",
+            }),
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        let err = resp.error.expect("expected bad_request");
+        assert_eq!(err.code, "bad_request");
+        assert!(
+            err.message
+                .contains("value_ref must start with a known scheme")
+        );
     }
 
     #[tokio::test]
