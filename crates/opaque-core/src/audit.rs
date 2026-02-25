@@ -981,10 +981,15 @@ impl SqliteAuditSink {
                     .workspace
                     .as_ref()
                     .and_then(|w| serde_json::to_string(w).ok());
+                let sequence_number_i64 = i64::try_from(event.sequence_number).map_err(|_| {
+                    rusqlite::Error::ToSqlConversionFailure(Box::new(AuditError::Other(
+                        "sequence_number exceeds i64 range".into(),
+                    )))
+                })?;
 
                 stmt.execute(rusqlite::params![
                     event.event_id.to_string(),
-                    event.sequence_number,
+                    sequence_number_i64,
                     event.ts_utc_ms,
                     event.level.to_string(),
                     event.kind.to_string(),
@@ -1185,7 +1190,14 @@ fn row_to_audit_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditEvent> {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
     })?;
 
-    let sequence_number: u64 = row.get("sequence_number")?;
+    let sequence_number_i64: i64 = row.get("sequence_number")?;
+    let sequence_number = u64::try_from(sequence_number_i64).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Integer,
+            Box::new(AuditError::Other("sequence_number must be non-negative".into())),
+        )
+    })?;
     let ts_utc_ms: i64 = row.get("ts_utc_ms")?;
 
     let level_str: String = row.get("level")?;
