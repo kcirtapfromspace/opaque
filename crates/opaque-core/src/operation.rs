@@ -320,6 +320,13 @@ pub struct WorkspaceContext {
 
     /// Whether the working tree has uncommitted changes.
     pub dirty: bool,
+
+    /// Whether the daemon successfully verified the claimed workspace state
+    /// (cwd within repo_root, git remote URL, git branch) against the actual
+    /// process and git state. Policy rules with workspace constraints must
+    /// reject requests where this is false (fail-closed).
+    #[serde(default)]
+    pub workspace_verified: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -806,6 +813,7 @@ mod tests {
             branch: Some("main".into()),
             head_sha: Some("abc123".into()),
             dirty: false,
+            workspace_verified: false,
         };
         let json = serde_json::to_string(&ws).unwrap();
         let rt: WorkspaceContext = serde_json::from_str(&json).unwrap();
@@ -978,6 +986,7 @@ mod tests {
             branch: Some("main".into()),
             head_sha: None,
             dirty: false,
+            workspace_verified: false,
         });
 
         assert_ne!(req_no_ws.content_hash(), req_with_ws.content_hash());
@@ -1008,6 +1017,7 @@ mod tests {
                 branch: Some("feature/x".into()),
                 head_sha: None,
                 dirty: true,
+                workspace_verified: false,
             }),
         };
         let dbg = format!("{req:?}");
