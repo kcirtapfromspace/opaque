@@ -89,6 +89,11 @@ struct DaemonConfig {
     /// Default TTL for agent sessions in seconds.
     #[serde(default)]
     agent_session_ttl_secs: Option<u64>,
+
+    /// When true, the daemon refuses to start if the config is not sealed.
+    /// Production deployments should set this to `true`.
+    #[serde(default)]
+    require_seal: bool,
 }
 
 /// A single entry in the known human clients allowlist.
@@ -215,9 +220,7 @@ fn load_config() -> DaemonConfig {
 /// - **Verified**: config matches seal — proceed normally.
 /// - **Unsealed**: no seal found — warn and continue (backward compatible).
 /// - **Tampered**: seal exists but doesn't match — hard stop.
-fn verify_config_seal() -> std::io::Result<()> {
-    use opaque_core::seal::{self, SealStatus};
-
+fn verify_config_seal(require_seal: bool, allow_unsealed: bool) -> std::io::Result<()> {
     let config_path = std::env::var("OPAQUE_CONFIG")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
@@ -228,19 +231,43 @@ fn verify_config_seal() -> std::io::Result<()> {
     let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
     let seal_file = config_dir.join("config.seal");
 
+    check_seal(&config_path, &seal_file, require_seal, allow_unsealed)
+}
+
+/// Core seal-check logic, separated from env-var resolution for testability.
+fn check_seal(
+    config_path: &Path,
+    seal_file: &Path,
+    require_seal: bool,
+    allow_unsealed: bool,
+) -> std::io::Result<()> {
+    use opaque_core::seal::{self, SealStatus};
+
     // If config doesn't exist, nothing to verify (load_config handles defaults).
     if !config_path.exists() {
         return Ok(());
     }
 
-    let config_bytes = std::fs::read(&config_path)?;
+    let config_bytes = std::fs::read(config_path)?;
 
-    match seal::verify_seal(&config_bytes, &seal_file) {
+    match seal::verify_seal(&config_bytes, seal_file) {
         Ok(SealStatus::Verified) => {
             info!("config seal verified");
         }
         Ok(SealStatus::Unsealed) => {
-            warn!("config is unsealed — run 'opaque setup --seal' to protect it");
+            if require_seal && !allow_unsealed {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "config is unsealed but require_seal is enabled. \
+                     Seal your config with 'opaque setup --seal' or \
+                     start the daemon with '--allow-unsealed' for development use.",
+                ));
+            }
+            if allow_unsealed {
+                warn!("config is unsealed — continuing because --allow-unsealed was passed");
+            } else {
+                warn!("config is unsealed — run 'opaque setup --seal' to protect it");
+            }
         }
         Ok(SealStatus::Tampered { .. }) => {
             return Err(std::io::Error::new(
@@ -364,8 +391,11 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
 
     let config = load_config();
 
+    // Check if --allow-unsealed was passed on the command line.
+    let allow_unsealed = std::env::args().any(|a| a == "--allow-unsealed");
+
     // Verify config seal before proceeding.
-    verify_config_seal()?;
+    verify_config_seal(config.require_seal, allow_unsealed)?;
 
     // Build enclave with registered operations and policy from config.
     let mut registry = OperationRegistry::new();
@@ -1415,32 +1445,39 @@ fn read_client_cwd_macos(pid: i32) -> Option<PathBuf> {
 /// actual process state. Runs external `git` commands.
 ///
 /// Checks:
-/// - Client's cwd is within the claimed repo_root
+/// - Client's cwd is within the claimed repo_root (fail-closed if unreadable)
 /// - `git rev-parse --show-toplevel` in repo_root matches
-/// - Claimed remote_url matches actual `git remote get-url origin`
-/// - Claimed branch matches actual `git rev-parse --abbrev-ref HEAD`
+/// - Claimed remote_url matches actual `git remote get-url origin` (fail-closed if git fails)
+/// - Claimed branch matches actual `git rev-parse --abbrev-ref HEAD` (fail-closed if git fails)
 fn verify_workspace_blocking(
     claimed: &opaque_core::operation::WorkspaceContext,
     client_pid: Option<i32>,
 ) -> Result<(), String> {
     // Verify client cwd is within claimed repo_root.
-    if let Some(pid) = client_pid
-        && let Some(cwd) = read_client_cwd(pid)
-    {
-        let repo_root = claimed
-            .repo_root
-            .canonicalize()
-            .unwrap_or(claimed.repo_root.clone());
-        let cwd = cwd.canonicalize().unwrap_or(cwd);
-        if !cwd.starts_with(&repo_root) {
-            return Err(format!(
-                "client cwd {} is not within claimed repo_root {}",
-                cwd.display(),
-                repo_root.display(),
-            ));
+    // Fail-closed: if we cannot determine the client cwd, we reject.
+    if let Some(pid) = client_pid {
+        match read_client_cwd(pid) {
+            Some(cwd) => {
+                let repo_root = claimed
+                    .repo_root
+                    .canonicalize()
+                    .unwrap_or(claimed.repo_root.clone());
+                let cwd = cwd.canonicalize().unwrap_or(cwd);
+                if !cwd.starts_with(&repo_root) {
+                    return Err(format!(
+                        "client cwd {} is not within claimed repo_root {}",
+                        cwd.display(),
+                        repo_root.display(),
+                    ));
+                }
+            }
+            None => {
+                return Err(format!(
+                    "cannot read cwd for pid {pid}: workspace verification requires readable cwd"
+                ));
+            }
         }
     }
-    // If we can't read the cwd, we don't fail — best-effort.
 
     // Verify git toplevel matches.
     let toplevel = safe_command("git")
@@ -1475,6 +1512,7 @@ fn verify_workspace_blocking(
     }
 
     // Verify remote URL if claimed.
+    // Fail-closed: if git remote command fails, deny the request.
     if let Some(ref claimed_url) = claimed.remote_url {
         let remote = safe_command("git")
             .args([
@@ -1486,22 +1524,26 @@ fn verify_workspace_blocking(
             ])
             .output()
             .map_err(|e| format!("failed to get remote url: {e}"))?;
-        if remote.status.success() {
-            let actual_url = String::from_utf8_lossy(&remote.stdout).trim().to_string();
-            if actual_url != *claimed_url {
-                // Sanitize URLs before embedding in error messages to strip
-                // embedded credentials (e.g. https://token@host/...).
-                let safe_claimed = InputValidator::sanitize_url(claimed_url);
-                let safe_actual = InputValidator::sanitize_url(&actual_url);
-                return Err(format!(
-                    "claimed remote_url '{}' does not match actual '{}'",
-                    safe_claimed, safe_actual,
-                ));
-            }
+        if !remote.status.success() {
+            return Err(
+                "git remote get-url origin failed: cannot verify claimed remote_url".to_string(),
+            );
+        }
+        let actual_url = String::from_utf8_lossy(&remote.stdout).trim().to_string();
+        if actual_url != *claimed_url {
+            // Sanitize URLs before embedding in error messages to strip
+            // embedded credentials (e.g. https://token@host/...).
+            let safe_claimed = InputValidator::sanitize_url(claimed_url);
+            let safe_actual = InputValidator::sanitize_url(&actual_url);
+            return Err(format!(
+                "claimed remote_url '{}' does not match actual '{}'",
+                safe_claimed, safe_actual,
+            ));
         }
     }
 
     // Verify branch if claimed.
+    // Fail-closed: if git branch command fails, deny the request.
     if let Some(ref claimed_branch) = claimed.branch {
         let branch = safe_command("git")
             .args([
@@ -1513,14 +1555,17 @@ fn verify_workspace_blocking(
             ])
             .output()
             .map_err(|e| format!("failed to get branch: {e}"))?;
-        if branch.status.success() {
-            let actual_branch = String::from_utf8_lossy(&branch.stdout).trim().to_string();
-            if actual_branch != *claimed_branch {
-                return Err(format!(
-                    "claimed branch '{}' does not match actual '{}'",
-                    claimed_branch, actual_branch,
-                ));
-            }
+        if !branch.status.success() {
+            return Err(
+                "git rev-parse --abbrev-ref HEAD failed: cannot verify claimed branch".to_string(),
+            );
+        }
+        let actual_branch = String::from_utf8_lossy(&branch.stdout).trim().to_string();
+        if actual_branch != *claimed_branch {
+            return Err(format!(
+                "claimed branch '{}' does not match actual '{}'",
+                claimed_branch, actual_branch,
+            ));
         }
     }
 
@@ -2230,6 +2275,13 @@ async fn handle_request(
                     "workspace_verification_failed",
                     "workspace verification failed",
                 );
+            }
+
+            // Mark workspace as verified — the daemon confirmed the claimed
+            // workspace state matches the actual process and git state.
+            // Policy rules with workspace constraints will check this flag.
+            if let Some(ref mut ws) = workspace {
+                ws.workspace_verified = true;
             }
 
             let op_req = OperationRequest {
@@ -4144,5 +4196,150 @@ exe_sha256 = "deadbeef"
     fn make_test_state() -> DaemonState {
         let audit: Arc<dyn AuditSink> = Arc::new(TracingAuditEmitter::new());
         make_test_state_with_audit(audit)
+    }
+
+    // -----------------------------------------------------------------------
+    // Seal enforcement tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: create a temp dir with a config.toml and optionally a seal file.
+    fn setup_seal_test(
+        config_content: &str,
+        sealed: bool,
+    ) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        use opaque_core::seal;
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let seal_file = dir.path().join("config.seal");
+        std::fs::write(&config_path, config_content).unwrap();
+        if sealed {
+            let seal_hash = seal::compute_seal(config_content.as_bytes());
+            std::fs::write(&seal_file, &seal_hash).unwrap();
+        }
+        (dir, config_path, seal_file)
+    }
+
+    #[test]
+    fn seal_require_true_and_sealed_succeeds() {
+        let (_dir, config_path, seal_file) = setup_seal_test("[daemon]\n", true);
+        let result = check_seal(&config_path, &seal_file, true, false);
+        assert!(
+            result.is_ok(),
+            "sealed config with require_seal=true should succeed"
+        );
+    }
+
+    #[test]
+    fn seal_require_true_and_unsealed_fails() {
+        let (_dir, config_path, seal_file) = setup_seal_test("[daemon]\n", false);
+        let result = check_seal(&config_path, &seal_file, true, false);
+        assert!(
+            result.is_err(),
+            "unsealed config with require_seal=true should fail"
+        );
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("require_seal"),
+            "error should mention require_seal, got: {msg}"
+        );
+        assert!(
+            msg.contains("opaque setup --seal"),
+            "error should suggest 'opaque setup --seal', got: {msg}"
+        );
+        assert!(
+            msg.contains("--allow-unsealed"),
+            "error should suggest --allow-unsealed, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn seal_require_true_allow_unsealed_succeeds() {
+        let (_dir, config_path, seal_file) = setup_seal_test("[daemon]\n", false);
+        let result = check_seal(&config_path, &seal_file, true, true);
+        assert!(
+            result.is_ok(),
+            "unsealed config with require_seal=true + allow_unsealed should succeed"
+        );
+    }
+
+    #[test]
+    fn seal_require_false_default_unsealed_succeeds() {
+        let (_dir, config_path, seal_file) = setup_seal_test("[daemon]\n", false);
+        let result = check_seal(&config_path, &seal_file, false, false);
+        assert!(
+            result.is_ok(),
+            "unsealed config with require_seal=false should succeed (backward compat)"
+        );
+    }
+
+    #[test]
+    fn seal_config_without_require_seal_defaults_false() {
+        // A config TOML without `require_seal` should deserialize with default false.
+        let toml_str = r#"
+            enforce_agent_sessions = true
+        "#;
+        let config: DaemonConfig = toml_edit::de::from_str(toml_str).unwrap();
+        assert!(
+            !config.require_seal,
+            "require_seal should default to false for backward compatibility"
+        );
+    }
+
+    #[test]
+    fn seal_config_with_require_seal_true() {
+        let toml_str = r#"
+            require_seal = true
+            enforce_agent_sessions = false
+        "#;
+        let config: DaemonConfig = toml_edit::de::from_str(toml_str).unwrap();
+        assert!(
+            config.require_seal,
+            "require_seal should be true when explicitly set"
+        );
+    }
+
+    #[test]
+    fn seal_tampered_always_fails_regardless_of_flags() {
+        // Create sealed config, then modify the config content (tamper).
+        use opaque_core::seal;
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let seal_file = dir.path().join("config.seal");
+
+        let original = "[daemon]\n";
+        std::fs::write(&config_path, original).unwrap();
+        let seal_hash = seal::compute_seal(original.as_bytes());
+        std::fs::write(&seal_file, &seal_hash).unwrap();
+
+        // Now tamper: change config but leave seal unchanged.
+        std::fs::write(&config_path, "[daemon]\nrequire_seal = true\n").unwrap();
+
+        // Should fail with require_seal=false.
+        let result = check_seal(&config_path, &seal_file, false, false);
+        assert!(result.is_err(), "tampered config should always fail");
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+
+        // Should fail even with allow_unsealed=true.
+        let result = check_seal(&config_path, &seal_file, false, true);
+        assert!(
+            result.is_err(),
+            "tampered config should fail even with allow_unsealed"
+        );
+    }
+
+    #[test]
+    fn seal_no_config_file_always_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("nonexistent.toml");
+        let seal_file = dir.path().join("config.seal");
+
+        // Even with require_seal=true, if there's no config file it's OK.
+        let result = check_seal(&config_path, &seal_file, true, false);
+        assert!(
+            result.is_ok(),
+            "missing config file should not cause seal failure"
+        );
     }
 }
