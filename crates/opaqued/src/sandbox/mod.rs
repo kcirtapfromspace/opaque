@@ -8,6 +8,7 @@
 //! 5. Emitting audit events
 //! 6. Cleaning up secret memory after execution
 
+pub mod execve_hook;
 pub mod resolve;
 
 #[cfg(target_os = "linux")]
@@ -248,6 +249,7 @@ async fn execute_platform_sandbox(
             env,
             project_dir: profile.project_dir.clone(),
             extra_read_paths: profile.extra_read_paths.clone(),
+            network_allow: profile.network.allow.clone(),
             timeout_secs: profile.limits.timeout_secs,
             max_output_bytes: profile.limits.max_output_bytes,
         };

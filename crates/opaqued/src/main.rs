@@ -11,6 +11,7 @@ use opaque_core::audit::{
     AuditEvent, AuditEventKind, AuditSink, ClientSummary, MultiAuditSink, SqliteAuditSink,
     TracingAuditEmitter,
 };
+use opaque_core::execve_map::{ExecveDefault, ExecveMapper, ExecveRule};
 use opaque_core::operation::{
     ApprovalFactor, ApprovalRequirement, ClientIdentity, ClientType, OperationDef,
     OperationRegistry, OperationRequest, OperationSafety,
@@ -94,6 +95,14 @@ struct DaemonConfig {
     /// Production deployments should set this to `true`.
     #[serde(default)]
     require_seal: bool,
+
+    /// Execve-to-operation mapping rules for external sandbox policy hooks.
+    #[serde(default)]
+    execve_rules: Vec<ExecveRule>,
+
+    /// Default decision for execve requests that do not match any rule.
+    #[serde(default)]
+    execve_default: ExecveDefault,
 }
 
 /// A single entry in the known human clients allowlist.
@@ -887,6 +896,33 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         })
         .expect("failed to register aws.delete_parameter");
 
+    // Sandbox execve policy hook operations.
+    registry
+        .register(OperationDef {
+            name: "sandbox.execve_check".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Never,
+            default_factors: vec![],
+            description: "Evaluate an execve against policy".into(),
+            params_schema: None,
+            allowed_target_keys: vec![],
+            secret_ref_param_keys: vec![],
+        })
+        .expect("failed to register sandbox.execve_check");
+
+    registry
+        .register(OperationDef {
+            name: "sandbox.execve_approve".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Never,
+            default_factors: vec![],
+            description: "Complete an execve approval".into(),
+            params_schema: None,
+            allowed_target_keys: vec![],
+            secret_ref_param_keys: vec![],
+        })
+        .expect("failed to register sandbox.execve_approve");
+
     let policy = PolicyEngine::with_rules(config.rules.clone());
     info!("policy engine loaded with {} rules", policy.rule_count());
 
@@ -907,6 +943,20 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
     let audit: Arc<dyn AuditSink> = Arc::new(MultiAuditSink::new(vec![tracing_sink, sqlite_sink]));
 
     let sandbox_executor = sandbox::SandboxExecutor::new(audit.clone());
+
+    // Execve policy hook handlers.
+    let execve_mapper = Arc::new(ExecveMapper::new(
+        config.execve_rules.clone(),
+        config.execve_default.clone(),
+    ));
+    info!(
+        "execve mapper loaded with {} rules (default: {:?})",
+        execve_mapper.rule_count(),
+        config.execve_default.decision,
+    );
+    let (execve_check_handler, execve_approve_handler) =
+        sandbox::execve_hook::create_execve_handlers(audit.clone(), execve_mapper);
+
     let github_actions_handler =
         github::GitHubHandler::new(audit.clone()).expect("invalid GitHub API URL scheme");
     let github_codespaces_handler =
@@ -931,6 +981,8 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         .policy(policy)
         .handler("test.noop", Box::new(NoopHandler))
         .handler("sandbox.exec", Box::new(sandbox_executor))
+        .handler("sandbox.execve_check", Box::new(execve_check_handler))
+        .handler("sandbox.execve_approve", Box::new(execve_approve_handler))
         .handler(
             "github.set_actions_secret",
             Box::new(github_actions_handler),
