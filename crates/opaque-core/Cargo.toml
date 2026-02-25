@@ -3,6 +3,7 @@ name = "opaque-core"
 version = "0.1.0"
 edition = "2024"
 publish = false
+description = "Shared types and policy engine for the Opaque secrets broker"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

@@ -3,6 +3,7 @@ name = "opaque-mcp"
 version = "0.1.0"
 edition = "2024"
 publish = false
+description = "MCP server for Opaque — exposes safe secret operations to AI coding assistants"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

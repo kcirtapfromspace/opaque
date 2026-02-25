@@ -97,7 +97,8 @@ jobs:
             -p opaqued \
             -p opaque \
             -p opaque-mcp \
-            -p opaque-approve-helper
+            -p opaque-approve-helper \
+            -p opaque-web
 
       - name: Strip debug symbols
         env:
@@ -115,6 +116,7 @@ jobs:
           $STRIP_CMD "target/${TARGET}/release/opaque"
           $STRIP_CMD "target/${TARGET}/release/opaque-mcp"
           $STRIP_CMD "target/${TARGET}/release/opaque-approve-helper"
+          $STRIP_CMD "target/${TARGET}/release/opaque-web"
 
       - name: Create tarball
         id: tarball
@@ -131,6 +133,7 @@ jobs:
           cp "target/${TARGET}/release/opaque" "${STAGING_DIR}/"
           cp "target/${TARGET}/release/opaque-mcp" "${STAGING_DIR}/"
           cp "target/${TARGET}/release/opaque-approve-helper" "${STAGING_DIR}/"
+          cp "target/${TARGET}/release/opaque-web" "${STAGING_DIR}/"
           cp LICENSE "${STAGING_DIR}/"
           cp README.md "${STAGING_DIR}/"
 
