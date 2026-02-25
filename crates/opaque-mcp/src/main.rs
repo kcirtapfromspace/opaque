@@ -157,6 +157,17 @@ async fn handle_tools_call(
         .cloned()
         .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
 
+    // Handle client-side tools that don't need daemon communication.
+    match tool_name {
+        "opaque_sandbox_list_profiles" => {
+            return handle_list_profiles(id);
+        }
+        "opaque_secrets_status" => {
+            return handle_secrets_status(id, &arguments);
+        }
+        _ => {}
+    }
+
     // Look up the daemon IPC method for this tool.
     let daemon_method = match tools::tool_to_daemon_method(tool_name) {
         Some(m) => m,
@@ -203,6 +214,9 @@ async fn handle_tools_call(
                         "isError": true
                     }),
                 )
+            } else if tool_name == "opaque_sandbox_exec" {
+                // Sandbox exec returns structured output with stdout/stderr.
+                format_sandbox_exec_response(id, resp.result)
             } else {
                 // Daemon returned success.
                 let result_text = match resp.result {
@@ -234,6 +248,114 @@ async fn handle_tools_call(
             )
         }
     }
+}
+
+/// Handle `opaque_sandbox_list_profiles` client-side by reading profile TOMLs.
+fn handle_list_profiles(id: Option<serde_json::Value>) -> JsonRpcResponse {
+    let profiles_dir = opaque_core::profile::profiles_dir();
+    let profiles = tools::list_profiles(&profiles_dir);
+
+    let result_text = serde_json::to_string_pretty(&profiles).unwrap_or_else(|_| "[]".to_string());
+
+    JsonRpcResponse::ok(
+        id,
+        json!({
+            "content": [{"type": "text", "text": result_text}]
+        }),
+    )
+}
+
+/// Handle `opaque_secrets_status` client-side by parsing profile secrets.
+fn handle_secrets_status(
+    id: Option<serde_json::Value>,
+    arguments: &serde_json::Value,
+) -> JsonRpcResponse {
+    let profile_name = match arguments.get("profile").and_then(|v| v.as_str()) {
+        Some(name) => name,
+        None => {
+            return JsonRpcResponse::ok(
+                id,
+                json!({
+                    "content": [{"type": "text", "text": "missing required parameter: profile"}],
+                    "isError": true
+                }),
+            );
+        }
+    };
+
+    let profiles_dir = opaque_core::profile::profiles_dir();
+    match tools::secrets_status(&profiles_dir, profile_name) {
+        Ok(statuses) => {
+            let result_text =
+                serde_json::to_string_pretty(&statuses).unwrap_or_else(|_| "[]".to_string());
+            JsonRpcResponse::ok(
+                id,
+                json!({
+                    "content": [{"type": "text", "text": result_text}]
+                }),
+            )
+        }
+        Err(e) => JsonRpcResponse::ok(
+            id,
+            json!({
+                "content": [{"type": "text", "text": e}],
+                "isError": true
+            }),
+        ),
+    }
+}
+
+/// Format a sandbox exec daemon response into MCP content items with stdout/stderr.
+fn format_sandbox_exec_response(
+    id: Option<serde_json::Value>,
+    result: Option<serde_json::Value>,
+) -> JsonRpcResponse {
+    let Some(val) = result else {
+        return JsonRpcResponse::ok(
+            id,
+            json!({
+                "content": [{"type": "text", "text": "Sandbox execution completed (no output)."}]
+            }),
+        );
+    };
+
+    let mut content = Vec::new();
+
+    // Build metadata summary.
+    let exit_code = val.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(-1);
+    let duration_ms = val.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+    let truncated = val
+        .get("truncated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let mut meta = format!("exit_code: {exit_code}, duration: {duration_ms}ms");
+    if truncated {
+        meta.push_str(" (output truncated)");
+    }
+    content.push(json!({"type": "text", "text": meta}));
+
+    // Add stdout as a text content item if present and non-empty.
+    if let Some(stdout) = val.get("stdout").and_then(|v| v.as_str())
+        && !stdout.is_empty()
+    {
+        content.push(json!({"type": "text", "text": format!("--- stdout ---\n{stdout}")}));
+    }
+
+    // Add stderr as a text content item if present and non-empty.
+    if let Some(stderr) = val.get("stderr").and_then(|v| v.as_str())
+        && !stderr.is_empty()
+    {
+        content.push(json!({"type": "text", "text": format!("--- stderr ---\n{stderr}")}));
+    }
+
+    let is_error = exit_code != 0;
+    let mut result_obj = json!({ "content": content });
+    if is_error {
+        result_obj["isError"] = json!(true);
+    }
+
+    JsonRpcResponse::ok(id, result_obj)
 }
 
 // ---------------------------------------------------------------------------
@@ -355,7 +477,7 @@ mod tests {
         let resp = handle_tools_list(Some(json!(1)));
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 14);
 
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
 
@@ -366,14 +488,15 @@ mod tests {
         assert!(tool_names.contains(&"opaque_onepassword_list_vaults"));
         assert!(tool_names.contains(&"opaque_bitwarden_list_projects"));
 
-        // Verify no Reveal/SensitiveOutput operations leak through.
+        // Verify sandbox tools are present.
+        assert!(tool_names.contains(&"opaque_sandbox_exec"));
+        assert!(tool_names.contains(&"opaque_sandbox_list_profiles"));
+        assert!(tool_names.contains(&"opaque_secrets_status"));
+
+        // Verify no Reveal operations leak through.
         for name in &tool_names {
             assert!(!name.contains("read_field"), "Reveal tool leaked: {name}");
             assert!(!name.contains("read_secret"), "Reveal tool leaked: {name}");
-            assert!(
-                !name.contains("sandbox"),
-                "SensitiveOutput tool leaked: {name}"
-            );
             assert!(!name.contains("noop"), "test tool leaked: {name}");
         }
     }
@@ -431,5 +554,113 @@ mod tests {
     fn initialize_response_id_propagated() {
         let resp = handle_initialize(Some(json!("abc-123")));
         assert_eq!(resp.id, Some(json!("abc-123")));
+    }
+
+    #[test]
+    fn sandbox_exec_response_success() {
+        let result = json!({
+            "exit_code": 0,
+            "duration_ms": 1234,
+            "stdout_length": 10,
+            "stderr_length": 0,
+            "truncated": false,
+            "stdout": "all passed",
+            "stderr": ""
+        });
+
+        let resp = format_sandbox_exec_response(Some(json!(1)), Some(result));
+        let r = resp.result.unwrap();
+        let content = r["content"].as_array().unwrap();
+
+        // First item is metadata.
+        assert!(
+            content[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("exit_code: 0")
+        );
+        assert!(
+            content[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("duration: 1234ms")
+        );
+
+        // Second item is stdout.
+        assert!(content[1]["text"].as_str().unwrap().contains("all passed"));
+
+        // isError should not be set for exit_code 0.
+        assert!(r.get("isError").is_none());
+    }
+
+    #[test]
+    fn sandbox_exec_response_failure() {
+        let result = json!({
+            "exit_code": 1,
+            "duration_ms": 500,
+            "stdout_length": 0,
+            "stderr_length": 5,
+            "truncated": false,
+            "stdout": "",
+            "stderr": "error"
+        });
+
+        let resp = format_sandbox_exec_response(Some(json!(1)), Some(result));
+        let r = resp.result.unwrap();
+
+        // isError should be set for non-zero exit_code.
+        assert_eq!(r["isError"], true);
+
+        let content = r["content"].as_array().unwrap();
+        // Metadata + stderr (stdout is empty so not included).
+        assert_eq!(content.len(), 2);
+        assert!(content[1]["text"].as_str().unwrap().contains("error"));
+    }
+
+    #[test]
+    fn sandbox_exec_response_truncated() {
+        let result = json!({
+            "exit_code": 0,
+            "duration_ms": 100,
+            "truncated": true,
+            "stdout": "partial",
+            "stderr": ""
+        });
+
+        let resp = format_sandbox_exec_response(Some(json!(1)), Some(result));
+        let r = resp.result.unwrap();
+        let content = r["content"].as_array().unwrap();
+        assert!(content[0]["text"].as_str().unwrap().contains("truncated"));
+    }
+
+    #[test]
+    fn sandbox_exec_response_no_result() {
+        let resp = format_sandbox_exec_response(Some(json!(1)), None);
+        let r = resp.result.unwrap();
+        let content = r["content"].as_array().unwrap();
+        assert!(content[0]["text"].as_str().unwrap().contains("no output"));
+    }
+
+    #[test]
+    fn handle_list_profiles_returns_json() {
+        // This reads from the real ~/.opaque/profiles/ which may not exist.
+        // The function should gracefully return an empty list.
+        let resp = handle_list_profiles(Some(json!(1)));
+        let r = resp.result.unwrap();
+        let content = r["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "text");
+        // Should be valid JSON (either [] or a list of profiles).
+        let text = content[0]["text"].as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert!(parsed.is_array());
+    }
+
+    #[test]
+    fn handle_secrets_status_missing_profile_param() {
+        let resp = handle_secrets_status(Some(json!(1)), &json!({}));
+        let r = resp.result.unwrap();
+        assert_eq!(r["isError"], true);
+        let text = r["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("missing required parameter"));
     }
 }
