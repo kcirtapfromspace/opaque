@@ -1,6 +1,6 @@
 # Opaque Security Assessment
 
-> NOTE: This document is historical and may not match the current code. For the latest adversarial review and demos, see `docs/adversarial-security-review-2026-02-14.md`.
+> NOTE: This document is historical and may not match the current code. For the latest adversarial review and demos, see [Adversarial security review](adversarial-security-review-2026-02-14.md).
 
 **Date:** 2026-02-12
 **Assessor:** Security Engineering Review
@@ -69,8 +69,8 @@
 
 ### Finding 2.1: CRITICAL -- Generic `approval.prompt` RPC Exposed Without Authorization
 
-**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/main.rs`, lines 174-188
-**File:** `/Users/thinkstudio/agent_pass/crates/opaque/src/main.rs`, lines 47-53
+**File:** `../crates/opaqued/src/main.rs`, lines 174-188
+**File:** `../crates/opaque/src/main.rs`, lines 47-53
 
 **Description:**
 The `approval.prompt` method is directly callable by any process that can connect to the UDS socket. There is no client identity verification, no policy check, and no operation binding. The `reason` string is entirely client-controlled and displayed directly to the user in the OS authentication dialog.
@@ -121,7 +121,7 @@ echo '{"id":1,"method":"approval.prompt","params":{"reason":"URGENT: Approve to 
 
 ### Finding 2.2: CRITICAL -- No Client Identity Verification or Authorization
 
-**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/main.rs`, lines 122-168
+**File:** `../crates/opaqued/src/main.rs`, lines 122-168
 
 **Description:**
 The `handle_conn` function retrieves peer credentials (`uid`, `gid`, `pid`) but only logs them. No authorization decision is made. Every connected client has full access to all RPC methods.
@@ -156,7 +156,7 @@ A malicious npm postinstall script (TA-3) running under the same UID connects to
 
 ### Finding 2.3: HIGH -- Approval Error Leaks LocalAuthentication Details
 
-**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/approval.rs`, lines 59-63
+**File:** `../crates/opaqued/src/approval.rs`, lines 59-63
 
 **Description:**
 When LocalAuthentication is unavailable, the error includes the full `localizedDescription()` from `NSError`, which may contain system-internal details about the authentication configuration.
@@ -190,8 +190,8 @@ An LLM agent probes the `approval.prompt` endpoint. If LocalAuthentication is no
 
 ### Finding 2.4: HIGH -- Client-Controlled Reason String Displayed in OS Auth Dialog
 
-**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/approval.rs`, lines 68-85
-**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/approval.rs`, lines 120-122
+**File:** `../crates/opaqued/src/approval.rs`, lines 68-85
+**File:** `../crates/opaqued/src/approval.rs`, lines 120-122
 
 **Description:**
 The `reason` parameter from the client is passed directly to:
@@ -215,7 +215,7 @@ An attacker sends a reason string designed to deceive the user:
 
 ### Finding 2.5: HIGH -- Unsafe Code Review in `peer.rs`
 
-**File:** `/Users/thinkstudio/agent_pass/crates/opaque-core/src/peer.rs`, lines 20-28 and 77-88
+**File:** `../crates/opaque-core/src/peer.rs`, lines 20-28 and 77-88
 
 **Description:**
 There are three `unsafe` blocks in `peer.rs`. All involve FFI calls to `libc` functions (`getsockopt`, `getpeereid`).
@@ -268,7 +268,7 @@ let rc = unsafe {
 
 ### Finding 2.6: HIGH -- Unsafe Code Review in `approval.rs`
 
-**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/approval.rs`, lines 57-85
+**File:** `../crates/opaqued/src/approval.rs`, lines 57-85
 
 **Description:**
 There are three `unsafe` blocks in `approval.rs`, all related to Objective-C interop via the `objc2` crate.
@@ -313,7 +313,7 @@ unsafe {
 
 ### Finding 2.7: MEDIUM -- Denial of Service via Approval Semaphore Starvation
 
-**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/main.rs`, lines 63, 181-183
+**File:** `../crates/opaqued/src/main.rs`, lines 63, 181-183
 
 **Description:**
 The `approval_gate` is a `Semaphore::new(1)`, which correctly ensures only one approval dialog is active at a time. However, the semaphore is held for the entire duration of the approval (up to 120 seconds on macOS). During this time, all other approval requests block.
@@ -343,7 +343,7 @@ Even without a malicious actor, a legitimate but slow approval (user steps away)
 
 ### Finding 2.8: MEDIUM -- Unbounded Connection Spawning
 
-**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/main.rs`, lines 81-89
+**File:** `../crates/opaqued/src/main.rs`, lines 81-89
 
 **Description:**
 Every incoming connection spawns a new Tokio task with no limit on concurrent connections.
@@ -374,7 +374,7 @@ A malicious process opens thousands of connections to the UDS socket. Each conne
 
 ### Finding 2.9: MEDIUM -- Connection Error Leaks Frame Parsing Details
 
-**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/main.rs`, lines 141-158
+**File:** `../crates/opaqued/src/main.rs`, lines 141-158
 
 **Description:**
 Frame parsing errors and JSON deserialization errors are sent back to the client with the full `e.to_string()` error message.
@@ -403,7 +403,7 @@ This information assists in fingerprinting the server implementation.
 
 ### Finding 2.10: MEDIUM -- Peer Credentials Not Verified Against UID
 
-**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/main.rs`, lines 122-134
+**File:** `../crates/opaqued/src/main.rs`, lines 122-134
 
 **Description:**
 The daemon retrieves peer credentials but does not verify that the connecting process's UID matches the daemon's UID. While socket permissions (0600) should prevent cross-user connections, the daemon should defensively verify this.
@@ -425,7 +425,7 @@ If socket permissions are misconfigured (e.g., the directory is world-readable d
 
 ### Finding 2.11: LOW -- `whoami` Endpoint Not Implemented
 
-**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/main.rs`, lines 190-193
+**File:** `../crates/opaqued/src/main.rs`, lines 190-193
 
 **Description:**
 The `whoami` endpoint returns `{"note": "not implemented"}`. When implemented, it should return the server-observed client identity. If the implementation returns too much detail, it could be used for fingerprinting.
@@ -445,7 +445,7 @@ The `whoami` endpoint returns `{"note": "not implemented"}`. When implemented, i
 
 ### Finding 2.12: LOW -- Request ID Type Is Not Cryptographically Random
 
-**File:** `/Users/thinkstudio/agent_pass/crates/opaque-core/src/proto.rs`, line 5
+**File:** `../crates/opaque-core/src/proto.rs`, line 5
 
 **Description:**
 The `Request.id` field is a `u64`, and the client CLI hardcodes it to `1`. When operation requests are implemented, the `request_id` should be a cryptographically random UUID to prevent prediction and replay.
@@ -458,7 +458,7 @@ The `Request.id` field is a `u64`, and the client CLI hardcodes it to `1`. When 
 
 ### Finding 2.13: LOW -- No Rate Limiting on Any Endpoint
 
-**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/main.rs`, lines 170-196
+**File:** `../crates/opaqued/src/main.rs`, lines 170-196
 
 **Description:**
 There is no rate limiting on RPC calls. A malicious client can send thousands of `ping` or `version` requests per second, or spam `approval.prompt` requests.
@@ -473,8 +473,8 @@ There is no rate limiting on RPC calls. A malicious client can send thousands of
 
 ### 3.1 JSON Deserialization
 
-**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/main.rs`, line 151
-**File:** `/Users/thinkstudio/agent_pass/crates/opaque-core/src/proto.rs`, lines 1-9
+**File:** `../crates/opaqued/src/main.rs`, line 151
+**File:** `../crates/opaque-core/src/proto.rs`, lines 1-9
 
 **Analysis:**
 The protocol uses `serde_json::from_slice` to deserialize incoming frames into the `Request` struct. The `params` field is `serde_json::Value`, which means arbitrary JSON is accepted.
@@ -494,8 +494,8 @@ The protocol uses `serde_json::from_slice` to deserialize incoming frames into t
 
 ### 3.2 Frame Smuggling via Length-Delimited Codec
 
-**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/main.rs`, lines 135-137
-**File:** `/Users/thinkstudio/agent_pass/crates/opaque/src/main.rs`, lines 78-80
+**File:** `../crates/opaqued/src/main.rs`, lines 135-137
+**File:** `../crates/opaque/src/main.rs`, lines 78-80
 
 **Analysis:**
 Both client and server use `LengthDelimitedCodec` with a 1MB max frame length. This codec prepends a 4-byte big-endian length header to each frame.
@@ -556,7 +556,7 @@ Requests are not signed or authenticated. The daemon relies entirely on socket-l
 
 #### 4.1.1 Prompt Spoofing
 
-**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/approval.rs`, lines 68-85
+**File:** `../crates/opaqued/src/approval.rs`, lines 68-85
 
 **Analysis:**
 The `localizedReason` string is the only context the user sees in the Touch ID dialog. macOS displays this as: `"opaqued" is trying to [reason]`. The application name comes from the process name, not the reason string.
@@ -583,7 +583,7 @@ The code at line 59 calls `canEvaluatePolicy_error` which should detect this and
 - Test behavior when the screen is locked.
 - Consider detecting `IOServiceGetMatchingService(kIOMainPortDefault, ...)` for display sleep state.
 
-**Status (PARTIALLY RESOLVED):** The deployment model (LaunchAgent only, `LimitLoadToSessionType: Aqua`) is now documented in `docs/deployment.md`. The LaunchAgent plist prevents loading in non-GUI sessions. Session detection at daemon startup (calling `canEvaluatePolicy` as a preflight and refusing to start on failure) is specified but not yet implemented. Screen-lock behavior and Fast User Switching remain to be tested.
+**Status (PARTIALLY RESOLVED):** The deployment model (LaunchAgent only, `LimitLoadToSessionType: Aqua`) is now documented in [Deployment](deployment.md). The LaunchAgent plist prevents loading in non-GUI sessions. Session detection at daemon startup (calling `canEvaluatePolicy` as a preflight and refusing to start on failure) is specified but not yet implemented. Screen-lock behavior and Fast User Switching remain to be tested.
 
 #### 4.1.3 Process Interaction with Prompt
 
@@ -603,7 +603,7 @@ However, a malicious process *can*:
 
 #### 4.1.4 120-Second Timeout as DoS Vector
 
-**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/approval.rs`, line 88
+**File:** `../crates/opaqued/src/approval.rs`, line 88
 
 **Analysis:**
 The 120-second timeout on `rx.recv_timeout(Duration::from_secs(120))` means the approval gate semaphore is held for up to 2 minutes per approval request.
@@ -619,7 +619,7 @@ The 120-second timeout on `rx.recv_timeout(Duration::from_secs(120))` means the 
 
 #### 4.2.1 `auth_self` Policy Analysis
 
-**File:** `/Users/thinkstudio/agent_pass/assets/linux/polkit/com.opaque.approve.policy`, lines 9-13
+**File:** `../assets/linux/polkit/com.opaque.approve.policy`, lines 9-13
 
 **Policy:**
 ```xml
@@ -648,7 +648,7 @@ This means on many Linux setups, the user sees: `"Authentication is required to 
 - As specified in the PRD (US-006/FR-6): if the environment cannot display intent, fail closed with `approval_unavailable`.
 - Consider implementing a dedicated Opaque approval UI helper for Linux that shows full operation details, using polkit only for the authentication step.
 
-**Status (RESOLVED):** A two-step approval flow has been implemented in `approval.rs`. Step 1 shows an intent dialog via `zenity --question` or `kdialog --yesno` with full operation details. Step 2 performs the polkit authentication. This separates intent visibility (our code, always works) from authentication (polkit, always requires password). If no intent dialog UI is available (no zenity, no kdialog, no TTY), approval fails closed. Supported desktop tiers are documented in `docs/deployment.md`.
+**Status (RESOLVED):** A two-step approval flow has been implemented in `approval.rs`. Step 1 shows an intent dialog via `zenity --question` or `kdialog --yesno` with full operation details. Step 2 performs the polkit authentication. This separates intent visibility (our code, always works) from authentication (polkit, always requires password). If no intent dialog UI is available (no zenity, no kdialog, no TTY), approval fails closed. Supported desktop tiers are documented in [Deployment](deployment.md).
 
 #### 4.2.2 Action ID Hijacking
 
@@ -665,7 +665,7 @@ The polkit action ID `com.opaque.approve` is a reverse-DNS identifier. A malicio
 
 #### 4.3.1 QR Pairing Crypto Protocol Weaknesses
 
-**File:** `/Users/thinkstudio/agent_pass/docs/mobile-approvals.md`, Section 2
+**File:** `mobile-approvals.md`, Section 2
 
 **Analysis:**
 The pairing protocol described in the documentation includes:
@@ -728,8 +728,8 @@ challenge = H(server_id || request_id || sha256(request_summary_json) || expires
 
 ### 5.1 Socket Path Permissions
 
-**File:** `/Users/thinkstudio/agent_pass/crates/opaque-core/src/socket.rs`, lines 24-39
-**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/main.rs`, lines 96-104
+**File:** `../crates/opaque-core/src/socket.rs`, lines 24-39
+**File:** `../crates/opaqued/src/main.rs`, lines 96-104
 
 **Analysis:**
 The socket creation follows these steps:
@@ -751,7 +751,7 @@ unsafe { libc::umask(old_umask) };
 
 ### 5.2 Directory Permission Race Conditions
 
-**File:** `/Users/thinkstudio/agent_pass/crates/opaque-core/src/socket.rs`, lines 24-39
+**File:** `../crates/opaque-core/src/socket.rs`, lines 24-39
 
 **Analysis:**
 `create_dir_all` followed by `set_permissions` has a TOCTOU race: another process could create the directory (or a symlink) between the check and the permission set.
@@ -774,7 +774,7 @@ if meta.uid() != current_uid {
 
 ### 5.3 Stale Socket File Handling (TOCTOU)
 
-**File:** `/Users/thinkstudio/agent_pass/crates/opaqued/src/main.rs`, lines 40-53
+**File:** `../crates/opaqued/src/main.rs`, lines 40-53
 
 **Code:**
 ```rust
@@ -814,7 +814,7 @@ if flock(lock.as_raw_fd(), FlockArg::LockExclusiveNonblock).is_err() {
 
 ### 5.4 Symlink Attacks on Socket Path
 
-**File:** `/Users/thinkstudio/agent_pass/crates/opaque-core/src/socket.rs`, lines 6-22
+**File:** `../crates/opaque-core/src/socket.rs`, lines 6-22
 
 **Analysis:**
 The `OPAQUE_SOCK` environment variable allows the user to specify an arbitrary socket path. If the daemon runs as the user, and the path points to a symlink, `UnixListener::bind` will follow the symlink.
@@ -1064,8 +1064,8 @@ If a runtime dependency is compromised:
 | H-4 | Finding 2.13 | Implement per-connection rate limiting (token bucket). | Medium |
 | H-5 | Section 5.2 | Add symlink and ownership checks on socket directory. | Small |
 | H-6 | Section 5.3 | Add PID file with advisory locking for single-instance protection. | Small |
-| H-7 | Section 4.2.1 | ~~Implement polkit intent visibility detection. Fail closed when the auth agent cannot show operation details.~~ **DONE:** Two-step approval flow (intent dialog + polkit auth) implemented. Supported desktops documented in `docs/deployment.md`. | Medium |
-| H-8 | Section 4.1.2 | ~~Document supported macOS deployment models (LaunchAgent only).~~ **PARTIALLY DONE:** Documented in `docs/deployment.md`. Session detection at daemon startup not yet implemented. | Medium |
+| H-7 | Section 4.2.1 | ~~Implement polkit intent visibility detection. Fail closed when the auth agent cannot show operation details.~~ **DONE:** Two-step approval flow (intent dialog + polkit auth) implemented. Supported desktops documented in [Deployment](deployment.md). | Medium |
+| H-8 | Section 4.1.2 | ~~Document supported macOS deployment models (LaunchAgent only).~~ **PARTIALLY DONE:** Documented in [Deployment](deployment.md). Session detection at daemon startup not yet implemented. | Medium |
 | H-9 | Section 6.3 | Add `cargo audit` to CI pipeline. Pin all dependency versions. | Small |
 | H-10 | -- | Implement the `OperationRequest` envelope (PRD US-002) with versioning, binding approvals to specific operations. | Large |
 
@@ -1105,27 +1105,27 @@ If a runtime dependency is compromised:
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `/Users/thinkstudio/agent_pass/crates/opaque-core/src/lib.rs` | 6 | Core library root, API version constant |
-| `/Users/thinkstudio/agent_pass/crates/opaque-core/src/proto.rs` | 46 | JSON-RPC Request/Response types |
-| `/Users/thinkstudio/agent_pass/crates/opaque-core/src/socket.rs` | 40 | Socket path resolution and directory setup |
-| `/Users/thinkstudio/agent_pass/crates/opaque-core/src/peer.rs` | 91 | UDS peer credential extraction (unsafe FFI) |
-| `/Users/thinkstudio/agent_pass/crates/opaque/src/main.rs` | 103 | CLI client |
-| `/Users/thinkstudio/agent_pass/crates/opaqued/src/main.rs` | 200 | Daemon: listener, connection handler, request dispatch |
-| `/Users/thinkstudio/agent_pass/crates/opaqued/src/approval.rs` | 137 | macOS LocalAuthentication and Linux polkit approval flows |
-| `/Users/thinkstudio/agent_pass/assets/linux/polkit/com.opaque.approve.policy` | 16 | polkit policy XML |
-| `/Users/thinkstudio/agent_pass/Cargo.toml` | 21 | Workspace configuration |
-| `/Users/thinkstudio/agent_pass/Cargo.lock` | 1489 | Full dependency tree |
-| `/Users/thinkstudio/agent_pass/docs/architecture.md` | 381 | System architecture |
-| `/Users/thinkstudio/agent_pass/docs/operations.md` | 163 | Operation contract definitions |
-| `/Users/thinkstudio/agent_pass/docs/policy.md` | 115 | Policy model |
-| `/Users/thinkstudio/agent_pass/docs/llm-harness.md` | 137 | LLM integration safety model |
-| `/Users/thinkstudio/agent_pass/docs/mobile-approvals.md` | 107 | Mobile pairing and approval protocol |
-| `/Users/thinkstudio/agent_pass/docs/storage.md` | 206 | Storage and data model |
-| `/Users/thinkstudio/agent_pass/docs/audit-analytics.md` | 228 | Audit, live feed, and analytics design |
-| `/Users/thinkstudio/agent_pass/docs/linux-polkit.md` | 23 | Linux polkit setup instructions |
-| `/Users/thinkstudio/agent_pass/tasks/prd-secure-approval-and-audit-hardening.md` | 165 | PRD for security hardening |
-| `/Users/thinkstudio/agent_pass/README.md` | 24 | Project overview |
-| `/Users/thinkstudio/agent_pass/AGENTS.md` | 25 | LLM tool guidance |
+| `../crates/opaque-core/src/lib.rs` | 6 | Core library root, API version constant |
+| `../crates/opaque-core/src/proto.rs` | 46 | JSON-RPC Request/Response types |
+| `../crates/opaque-core/src/socket.rs` | 40 | Socket path resolution and directory setup |
+| `../crates/opaque-core/src/peer.rs` | 91 | UDS peer credential extraction (unsafe FFI) |
+| `../crates/opaque/src/main.rs` | 103 | CLI client |
+| `../crates/opaqued/src/main.rs` | 200 | Daemon: listener, connection handler, request dispatch |
+| `../crates/opaqued/src/approval.rs` | 137 | macOS LocalAuthentication and Linux polkit approval flows |
+| `../assets/linux/polkit/com.opaque.approve.policy` | 16 | polkit policy XML |
+| `../Cargo.toml` | 21 | Workspace configuration |
+| `../Cargo.lock` | 1489 | Full dependency tree |
+| `architecture.md` | 381 | System architecture |
+| `operations.md` | 163 | Operation contract definitions |
+| `policy.md` | 115 | Policy model |
+| `llm-harness.md` | 137 | LLM integration safety model |
+| `mobile-approvals.md` | 107 | Mobile pairing and approval protocol |
+| `storage.md` | 206 | Storage and data model |
+| `audit-analytics.md` | 228 | Audit, live feed, and analytics design |
+| `linux-polkit.md` | 23 | Linux polkit setup instructions |
+| `../tasks/prd-secure-approval-and-audit-hardening.md` | 165 | PRD for security hardening |
+| `../README.md` | 24 | Project overview |
+| `../AGENTS.md` | 25 | LLM tool guidance |
 
 ## Appendix B: Dependency Count Summary
 

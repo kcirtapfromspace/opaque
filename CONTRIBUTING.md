@@ -11,7 +11,7 @@ Thank you for your interest in contributing to Opaque.
 ## Getting Started
 
 ```bash
-git clone https://github.com/anthropics/opaque.git
+git clone https://github.com/kcirtapfromspace/opaque.git
 cd opaque
 cargo build --workspace
 cargo test --workspace
@@ -62,7 +62,7 @@ cargo build --release
 
 ## Architecture
 
-See `docs/architecture.md` for an overview. Key principles:
+See [Architecture](docs/architecture.md) for an overview. Key principles:
 
 - **Deny-by-default**: Nothing is permitted without an explicit policy rule
 - **Fail closed**: Errors and unavailable backends result in denial, never in secret disclosure
