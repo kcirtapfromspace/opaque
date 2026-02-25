@@ -72,6 +72,21 @@ pub enum AuditEventKind {
 
     /// A secret reference was resolved (value never logged).
     SecretResolved,
+
+    /// Audit events were dropped due to channel backpressure.
+    AuditDropped,
+
+    /// An execve was evaluated against policy.
+    ExecveChecked,
+
+    /// An execve was allowed (either by policy or cached lease).
+    ExecveAllowed,
+
+    /// An execve was denied by policy.
+    ExecveDenied,
+
+    /// An execve requires human approval before proceeding.
+    ExecvePrompted,
 }
 
 impl fmt::Display for AuditEventKind {
@@ -93,6 +108,11 @@ impl fmt::Display for AuditEventKind {
             Self::SandboxCreated => "sandbox.created",
             Self::SandboxCompleted => "sandbox.completed",
             Self::SecretResolved => "secret.resolved",
+            Self::AuditDropped => "audit.dropped",
+            Self::ExecveChecked => "execve.checked",
+            Self::ExecveAllowed => "execve.allowed",
+            Self::ExecveDenied => "execve.denied",
+            Self::ExecvePrompted => "execve.prompted",
         };
         write!(f, "{s}")
     }
@@ -119,6 +139,11 @@ impl std::str::FromStr for AuditEventKind {
             "sandbox.created" => Ok(Self::SandboxCreated),
             "sandbox.completed" => Ok(Self::SandboxCompleted),
             "secret.resolved" => Ok(Self::SecretResolved),
+            "audit.dropped" => Ok(Self::AuditDropped),
+            "execve.checked" => Ok(Self::ExecveChecked),
+            "execve.allowed" => Ok(Self::ExecveAllowed),
+            "execve.denied" => Ok(Self::ExecveDenied),
+            "execve.prompted" => Ok(Self::ExecvePrompted),
             _ => Err(format!("unknown audit event kind: {s}")),
         }
     }
@@ -469,7 +494,9 @@ fn default_level_for_kind(kind: AuditEventKind) -> AuditLevel {
     match kind {
         AuditEventKind::PolicyDenied
         | AuditEventKind::ApprovalDenied
-        | AuditEventKind::RateLimited => AuditLevel::Warn,
+        | AuditEventKind::RateLimited
+        | AuditEventKind::AuditDropped
+        | AuditEventKind::ExecveDenied => AuditLevel::Warn,
         AuditEventKind::OperationFailed => AuditLevel::Error,
         _ => AuditLevel::Info,
     }
@@ -675,7 +702,14 @@ END;
 pub struct SqliteAuditSink {
     sender: std::sync::mpsc::SyncSender<AuditEvent>,
     next_sequence: AtomicU64,
+    /// Counter of events dropped due to channel backpressure.
+    dropped_count: std::sync::Arc<AtomicU64>,
     writer_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    drop_monitor_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Shared flag used in tests to pause/resume the writer thread.
+    writer_pause: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    /// Signal to stop the drop-monitor thread (bool=should_stop, condvar for wake).
+    monitor_stop: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     sanitizer: crate::sanitize::Sanitizer,
 }
 
@@ -683,6 +717,7 @@ impl fmt::Debug for SqliteAuditSink {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SqliteAuditSink")
             .field("next_sequence", &self.next_sequence.load(Ordering::Relaxed))
+            .field("dropped_count", &self.dropped_count.load(Ordering::Relaxed))
             .finish()
     }
 }
@@ -693,6 +728,18 @@ impl SqliteAuditSink {
     /// Creates the schema if needed and runs retention cleanup, deleting events
     /// older than `retention_days`.
     pub fn new(db_path: PathBuf, retention_days: u64) -> Result<Self, AuditError> {
+        Self::new_with_capacity(db_path, retention_days, 4096)
+    }
+
+    /// Open (or create) the audit database with a custom channel capacity.
+    ///
+    /// The `capacity` parameter controls the bounded channel size. In production
+    /// use [`Self::new`] which defaults to 4096.
+    pub(crate) fn new_with_capacity(
+        db_path: PathBuf,
+        retention_days: u64,
+        capacity: usize,
+    ) -> Result<Self, AuditError> {
         // Ensure parent directory exists.
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -731,26 +778,134 @@ impl SqliteAuditSink {
         )?;
         drop(conn);
 
-        let (sender, receiver) = std::sync::mpsc::sync_channel::<AuditEvent>(4096);
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<AuditEvent>(capacity);
+
+        let writer_pause =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let writer_pause_clone = writer_pause.clone();
 
         let writer_path = db_path.clone();
         let writer_handle = std::thread::Builder::new()
             .name("audit-writer".into())
             .spawn(move || {
-                Self::writer_loop(&writer_path, receiver);
+                Self::writer_loop(&writer_path, receiver, &writer_pause_clone);
             })
             .map_err(|e| AuditError::Other(format!("failed to spawn writer thread: {e}")))?;
+
+        let dropped_count = std::sync::Arc::new(AtomicU64::new(0));
+
+        // Spawn the drop-monitor thread that periodically emits synthetic
+        // AuditDropped events when events have been dropped.
+        let monitor_stop =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let monitor_sender = sender.clone();
+        let monitor_dropped = dropped_count.clone();
+        let monitor_stop_clone = monitor_stop.clone();
+        let drop_monitor_handle = std::thread::Builder::new()
+            .name("audit-drop-monitor".into())
+            .spawn(move || {
+                Self::drop_monitor_loop(monitor_sender, monitor_dropped, monitor_stop_clone);
+            })
+            .map_err(|e| AuditError::Other(format!("failed to spawn drop monitor thread: {e}")))?;
 
         Ok(Self {
             sender,
             next_sequence: AtomicU64::new(0),
+            dropped_count,
             writer_handle: std::sync::Mutex::new(Some(writer_handle)),
+            drop_monitor_handle: std::sync::Mutex::new(Some(drop_monitor_handle)),
+            writer_pause,
+            monitor_stop,
             sanitizer: crate::sanitize::Sanitizer::new(),
         })
     }
 
+    /// Returns the number of audit events dropped due to channel backpressure.
+    ///
+    /// This value is suitable for health checks and monitoring (e.g. `opaque doctor`).
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped_count.load(Ordering::Relaxed)
+    }
+
+    /// Pause the writer thread (for testing only). Events sent while paused
+    /// will accumulate in the channel and eventually be dropped.
+    #[cfg(test)]
+    pub(crate) fn pause_writer(&self) {
+        let (lock, _cvar) = &*self.writer_pause;
+        let mut paused = lock.lock().expect("pause lock poisoned");
+        *paused = true;
+    }
+
+    /// Resume the writer thread (for testing only).
+    #[cfg(test)]
+    pub(crate) fn resume_writer(&self) {
+        let (lock, cvar) = &*self.writer_pause;
+        let mut paused = lock.lock().expect("pause lock poisoned");
+        *paused = false;
+        cvar.notify_all();
+    }
+
+    /// Manually flush a synthetic `AuditDropped` event if any events have been
+    /// dropped. Resets the counter to 0. Used for testing the periodic flush
+    /// behavior.
+    #[cfg(test)]
+    pub(crate) fn flush_dropped_events(&self) {
+        let count = self.dropped_count.swap(0, Ordering::SeqCst);
+        if count > 0 {
+            let event = AuditEvent::new(AuditEventKind::AuditDropped)
+                .with_detail(format!(
+                    "{count} audit events dropped due to channel backpressure"
+                ))
+                .with_level(AuditLevel::Warn);
+            // Best-effort send — if the channel is still full, this will also
+            // be dropped, but the counter has been reset so the next period
+            // will try again.
+            let _ = self.sender.try_send(event);
+        }
+    }
+
+    /// Background drop-monitor loop. Every 60 seconds, checks if events have
+    /// been dropped and emits a synthetic `AuditDropped` event.
+    fn drop_monitor_loop(
+        sender: std::sync::mpsc::SyncSender<AuditEvent>,
+        dropped_count: std::sync::Arc<AtomicU64>,
+        stop: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    ) {
+        let (lock, cvar) = &*stop;
+        loop {
+            // Wait for 60 seconds or until signalled to stop.
+            {
+                let guard = lock.lock().expect("monitor stop lock poisoned");
+                let (guard, _timeout) = cvar
+                    .wait_timeout(guard, std::time::Duration::from_secs(60))
+                    .expect("monitor stop cvar poisoned");
+                if *guard {
+                    break;
+                }
+            }
+
+            let count = dropped_count.swap(0, Ordering::SeqCst);
+            if count > 0 {
+                tracing::warn!(
+                    dropped_count = count,
+                    "audit drop monitor: emitting synthetic AuditDropped event"
+                );
+                let event = AuditEvent::new(AuditEventKind::AuditDropped)
+                    .with_detail(format!(
+                        "{count} audit events dropped due to channel backpressure"
+                    ))
+                    .with_level(AuditLevel::Warn);
+                let _ = sender.try_send(event);
+            }
+        }
+    }
+
     /// Background writer loop. Drains the channel and inserts events in batches.
-    fn writer_loop(db_path: &Path, receiver: std::sync::mpsc::Receiver<AuditEvent>) {
+    fn writer_loop(
+        db_path: &Path,
+        receiver: std::sync::mpsc::Receiver<AuditEvent>,
+        pause: &std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    ) {
         let conn = match rusqlite::Connection::open(db_path) {
             Ok(c) => c,
             Err(e) => {
@@ -765,6 +920,15 @@ impl SqliteAuditSink {
         let mut batch = Vec::with_capacity(64);
 
         while let Ok(event) = receiver.recv() {
+            // Honor pause flag (for testing).
+            {
+                let (lock, cvar) = &**pause;
+                let mut paused = lock.lock().expect("pause lock poisoned");
+                while *paused {
+                    paused = cvar.wait(paused).expect("pause cvar poisoned");
+                }
+            }
+
             batch.push(event);
 
             // Drain any additional pending events without blocking.
@@ -869,13 +1033,43 @@ impl AuditSink for SqliteAuditSink {
                     .redact_audit_text(detail, crate::sanitize::RedactionLevel::Human),
             );
         }
-        // Non-blocking send. If the channel is full, drop the event.
-        let _ = self.sender.try_send(event);
+        // Non-blocking send. If the channel is full, increment the dropped
+        // counter and log a warning with the event kind.
+        if let Err(std::sync::mpsc::TrySendError::Full(dropped_event)) = self.sender.try_send(event)
+        {
+            let prev = self.dropped_count.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                kind = %dropped_event.kind,
+                dropped_total = prev + 1,
+                "audit event dropped due to channel backpressure"
+            );
+        }
     }
 }
 
 impl Drop for SqliteAuditSink {
     fn drop(&mut self) {
+        // Signal the drop-monitor thread to stop and join it.
+        {
+            let (lock, cvar) = &*self.monitor_stop;
+            let mut should_stop = lock.lock().expect("monitor stop lock poisoned");
+            *should_stop = true;
+            cvar.notify_all();
+        }
+        if let Ok(mut guard) = self.drop_monitor_handle.lock()
+            && let Some(h) = guard.take()
+        {
+            let _ = h.join();
+        }
+
+        // Ensure writer is not paused so it can drain.
+        {
+            let (lock, cvar) = &*self.writer_pause;
+            let mut paused = lock.lock().expect("pause lock poisoned");
+            *paused = false;
+            cvar.notify_all();
+        }
+
         // Drop the sender to signal the writer thread to finish.
         // We create a dummy channel and swap to effectively drop our sender.
         let (new_sender, _) = std::sync::mpsc::sync_channel(1);
@@ -1237,6 +1431,11 @@ mod tests {
             (AuditEventKind::SandboxCreated, "sandbox.created"),
             (AuditEventKind::SandboxCompleted, "sandbox.completed"),
             (AuditEventKind::SecretResolved, "secret.resolved"),
+            (AuditEventKind::AuditDropped, "audit.dropped"),
+            (AuditEventKind::ExecveChecked, "execve.checked"),
+            (AuditEventKind::ExecveAllowed, "execve.allowed"),
+            (AuditEventKind::ExecveDenied, "execve.denied"),
+            (AuditEventKind::ExecvePrompted, "execve.prompted"),
         ];
         for (kind, expected) in kinds {
             assert_eq!(format!("{kind}"), expected);
@@ -1492,6 +1691,7 @@ mod tests {
             branch: Some("main".into()),
             head_sha: None,
             dirty: false,
+            workspace_verified: false,
         };
         let summary = WorkspaceSummary::sanitized(&ws);
         let url = summary.remote_url.unwrap();
@@ -1521,6 +1721,11 @@ mod tests {
             AuditEventKind::SandboxCreated,
             AuditEventKind::SandboxCompleted,
             AuditEventKind::SecretResolved,
+            AuditEventKind::AuditDropped,
+            AuditEventKind::ExecveChecked,
+            AuditEventKind::ExecveAllowed,
+            AuditEventKind::ExecveDenied,
+            AuditEventKind::ExecvePrompted,
         ];
         for kind in kinds {
             let s = format!("{kind}");
@@ -1937,6 +2142,268 @@ mod tests {
         assert!(
             detail.contains("[REDACTED:github_token]"),
             "audit detail should contain redaction marker"
+        );
+    }
+
+    // -- Dropped event accounting tests (P2 security fix) --
+
+    #[test]
+    fn dropped_counter_starts_at_zero() {
+        let db_path = temp_db_path();
+        let sink = SqliteAuditSink::new(db_path.clone(), 90).unwrap();
+        assert_eq!(sink.dropped_count(), 0);
+        drop(sink);
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn dropped_counter_increments_on_full_channel() {
+        let db_path = temp_db_path();
+        // Use a tiny channel (capacity=2) so we can easily overflow it.
+        let sink = SqliteAuditSink::new_with_capacity(db_path.clone(), 90, 2).unwrap();
+
+        // Pause the writer so it cannot drain the channel.
+        sink.pause_writer();
+
+        // Emit 10 events — the first 2 fill the channel, the remaining 8 should be dropped.
+        for _ in 0..10 {
+            sink.emit(AuditEvent::new(AuditEventKind::RequestReceived));
+        }
+
+        assert!(
+            sink.dropped_count() > 0,
+            "expected dropped_count > 0, got {}",
+            sink.dropped_count()
+        );
+
+        sink.resume_writer();
+        drop(sink);
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn dropped_count_returns_correct_value() {
+        let db_path = temp_db_path();
+        let sink = SqliteAuditSink::new_with_capacity(db_path.clone(), 90, 1).unwrap();
+
+        sink.pause_writer();
+
+        // With capacity 1: writer holds 1 event (from recv), channel holds 1,
+        // remaining 8 out of 10 are dropped.
+        for _ in 0..10 {
+            sink.emit(AuditEvent::new(AuditEventKind::OperationSucceeded));
+        }
+
+        // At least 8 should be dropped (writer holds 1, channel holds 1, 8 overflow).
+        assert!(
+            sink.dropped_count() >= 8,
+            "expected dropped_count >= 8, got {}",
+            sink.dropped_count()
+        );
+
+        sink.resume_writer();
+        drop(sink);
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn normal_operation_no_drops() {
+        let db_path = temp_db_path();
+        let sink = SqliteAuditSink::new(db_path.clone(), 90).unwrap();
+
+        // Emit a small number of events — writer should keep up.
+        for _ in 0..5 {
+            sink.emit(AuditEvent::new(AuditEventKind::RequestReceived));
+        }
+
+        // Give the writer a moment to drain.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        assert_eq!(
+            sink.dropped_count(),
+            0,
+            "no events should be dropped under normal load"
+        );
+
+        drop(sink);
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn audit_dropped_event_kind_exists() {
+        // The AuditDropped kind should exist and round-trip through Display/FromStr.
+        let kind = AuditEventKind::AuditDropped;
+        let s = format!("{kind}");
+        assert_eq!(s, "audit.dropped");
+        let parsed: AuditEventKind = s.parse().unwrap();
+        assert_eq!(parsed, AuditEventKind::AuditDropped);
+    }
+
+    #[test]
+    fn audit_dropped_default_level_is_warn() {
+        assert_eq!(
+            default_level_for_kind(AuditEventKind::AuditDropped),
+            AuditLevel::Warn
+        );
+    }
+
+    #[test]
+    fn synthetic_audit_dropped_event_emitted_with_count() {
+        let db_path = temp_db_path();
+        // Use capacity=2 so we can overflow, but still have room for the
+        // synthetic event after the writer drains.
+        let sink = SqliteAuditSink::new_with_capacity(db_path.clone(), 90, 2).unwrap();
+
+        sink.pause_writer();
+
+        // Overflow the channel to create drops.
+        for _ in 0..10 {
+            sink.emit(AuditEvent::new(AuditEventKind::RequestReceived));
+        }
+
+        let dropped_before = sink.dropped_count();
+        assert!(dropped_before > 0);
+
+        // Resume writer and wait for it to drain the channel.
+        sink.resume_writer();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Manually trigger the periodic flush of the dropped counter.
+        sink.flush_dropped_events();
+
+        // After flushing, the counter should reset to 0.
+        assert_eq!(
+            sink.dropped_count(),
+            0,
+            "counter should reset after synthetic event emission"
+        );
+
+        // Give writer time to persist the synthetic event.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        drop(sink);
+
+        // Query the DB for the synthetic AuditDropped event.
+        let filter = AuditFilter {
+            kind: Some(AuditEventKind::AuditDropped),
+            ..Default::default()
+        };
+        let events = query_audit_db(&db_path, &filter).unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "should have exactly one AuditDropped event"
+        );
+
+        let dropped_event = &events[0];
+        assert_eq!(dropped_event.kind, AuditEventKind::AuditDropped);
+        assert_eq!(dropped_event.level, AuditLevel::Warn);
+
+        // The detail should contain the dropped count.
+        let detail = dropped_event.detail.as_deref().unwrap();
+        assert!(
+            detail.contains(&dropped_before.to_string()),
+            "detail should contain the dropped count ({dropped_before}), got: {detail}"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn counter_resets_after_synthetic_event() {
+        let db_path = temp_db_path();
+        let sink = SqliteAuditSink::new_with_capacity(db_path.clone(), 90, 1).unwrap();
+
+        sink.pause_writer();
+
+        // Create some drops.
+        for _ in 0..5 {
+            sink.emit(AuditEvent::new(AuditEventKind::RequestReceived));
+        }
+        assert!(sink.dropped_count() > 0);
+
+        sink.resume_writer();
+        // Flush the dropped counter — should reset to 0.
+        sink.flush_dropped_events();
+        assert_eq!(sink.dropped_count(), 0);
+
+        // Create more drops.
+        sink.pause_writer();
+        for _ in 0..3 {
+            sink.emit(AuditEvent::new(AuditEventKind::OperationFailed));
+        }
+
+        // The counter should reflect only the new drops, not old ones.
+        let new_count = sink.dropped_count();
+        assert!(
+            new_count > 0 && new_count <= 3,
+            "counter should only reflect new drops, got {new_count}"
+        );
+
+        sink.resume_writer();
+        drop(sink);
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn dropped_count_health_accessor() {
+        // Verify dropped_count is publicly accessible for health/metrics.
+        let db_path = temp_db_path();
+        let sink = SqliteAuditSink::new(db_path.clone(), 90).unwrap();
+
+        // This tests the public API surface — dropped_count() must be pub.
+        let count: u64 = sink.dropped_count();
+        assert_eq!(count, 0);
+
+        drop(sink);
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn execve_audit_events_serialize() {
+        // Verify that all execve audit event kinds serialize and deserialize correctly.
+        let kinds = vec![
+            AuditEventKind::ExecveChecked,
+            AuditEventKind::ExecveAllowed,
+            AuditEventKind::ExecveDenied,
+            AuditEventKind::ExecvePrompted,
+        ];
+        for kind in kinds {
+            let event = AuditEvent::new(kind)
+                .with_operation("sandbox.execve_check")
+                .with_outcome("allow")
+                .with_detail("executable=/usr/bin/git args=[push, origin, main] cwd=/home/user sandbox_id=codex-abc");
+            let json = serde_json::to_string(&event).unwrap();
+            let deserialized: AuditEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(deserialized.kind, kind);
+            assert_eq!(
+                deserialized.operation.as_deref(),
+                Some("sandbox.execve_check")
+            );
+            assert!(
+                deserialized
+                    .detail
+                    .as_ref()
+                    .unwrap()
+                    .contains("/usr/bin/git")
+            );
+        }
+
+        // Verify default levels.
+        assert_eq!(
+            default_level_for_kind(AuditEventKind::ExecveChecked),
+            AuditLevel::Info
+        );
+        assert_eq!(
+            default_level_for_kind(AuditEventKind::ExecveAllowed),
+            AuditLevel::Info
+        );
+        assert_eq!(
+            default_level_for_kind(AuditEventKind::ExecveDenied),
+            AuditLevel::Warn
+        );
+        assert_eq!(
+            default_level_for_kind(AuditEventKind::ExecvePrompted),
+            AuditLevel::Info
         );
     }
 }

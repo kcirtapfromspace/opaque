@@ -760,7 +760,10 @@ impl Enclave {
                     .with_detail(&reason),
             );
 
-            let err = EnclaveError::PolicyDenied(reason);
+            let err = EnclaveError::PolicyDenied(format!(
+                "operation '{}' denied by policy \u{2014} debug with: opaque policy simulate --operation {}",
+                request.operation, request.operation
+            ));
             return self.error_to_sanitized(&err);
         }
 
@@ -1045,9 +1048,27 @@ impl Enclave {
                         .with_latency_ms(approval_latency.as_millis() as i64)
                         .with_request_hash(&content_hash),
                 );
-                Err(EnclaveError::ApprovalNotGranted(
-                    "user denied the approval request".into(),
-                ))
+                let factor_names: Vec<&str> = decision
+                    .required_factors
+                    .iter()
+                    .map(|f| match f {
+                        ApprovalFactor::LocalBio => "local_bio",
+                        ApprovalFactor::IosFaceId => "ios_faceid",
+                        ApprovalFactor::Fido2 => "fido2",
+                    })
+                    .collect();
+                let factor_str = factor_names.join(", ");
+                let platform_hint = if cfg!(target_os = "macos") {
+                    "Touch ID will prompt on the next attempt"
+                } else if cfg!(target_os = "linux") {
+                    "configure polkit for biometric approval"
+                } else {
+                    "approve via the configured factor"
+                };
+                Err(EnclaveError::ApprovalNotGranted(format!(
+                    "operation '{}' requires approval ({}) \u{2014} {}",
+                    request.operation, factor_str, platform_hint
+                )))
             }
             Err(e) => {
                 self.audit.emit(
@@ -2597,6 +2618,7 @@ mod tests {
             branch: Some("feature/x".into()),
             head_sha: None,
             dirty: false,
+            workspace_verified: true,
         });
         let resp = enclave.execute(req).await;
         assert_eq!(resp.error_code(), Some("policy_denied"));
@@ -2609,6 +2631,7 @@ mod tests {
             branch: Some("main".into()),
             head_sha: None,
             dirty: false,
+            workspace_verified: true,
         });
         let resp = enclave.execute(req).await;
         assert!(resp.error_code().is_none());
@@ -2977,6 +3000,7 @@ mod tests {
             branch: Some("main".into()),
             head_sha: None,
             dirty: false,
+            workspace_verified: false,
         });
         let _ = enclave.execute(req).await;
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -2990,6 +3014,7 @@ mod tests {
             branch: Some("develop".into()),
             head_sha: None,
             dirty: true,
+            workspace_verified: false,
         });
         let _ = enclave.execute(req).await;
         assert_eq!(
@@ -3358,5 +3383,64 @@ mod tests {
         });
         let result = super::derive_secret_ref_names(&keys, &params);
         assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn error_message_operation_denied_includes_simulate_hint() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let enclave = build_enclave(Box::new(AlwaysApproveGate), audit.clone());
+
+        // Request with wrong target (other-org) to trigger policy deny.
+        let mut req = test_request("github.set_actions_secret", ClientType::Agent);
+        req.target.insert("repo".into(), "other-org/repo".into());
+        let resp = enclave.execute(req).await;
+
+        assert_eq!(resp.error_code(), Some("policy_denied"));
+        let msg = resp.error_message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("opaque policy simulate"),
+            "policy denied message should contain simulate hint, got: {msg}"
+        );
+        assert!(
+            msg.contains("github.set_actions_secret"),
+            "policy denied message should contain the operation name, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_message_approval_required_includes_factor() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let enclave = build_enclave(Box::new(AlwaysDenyGate), audit.clone());
+
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let resp = enclave.execute(req).await;
+
+        assert_eq!(resp.error_code(), Some("approval_not_granted"));
+        let msg = resp.error_message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("local_bio"),
+            "approval error should contain the factor name, got: {msg}"
+        );
+        assert!(
+            msg.contains("github.set_actions_secret"),
+            "approval error should contain the operation name, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_message_platform_hint_macos() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let enclave = build_enclave(Box::new(AlwaysDenyGate), audit.clone());
+
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let resp = enclave.execute(req).await;
+
+        let msg = resp.error_message.as_deref().unwrap_or("");
+        if cfg!(target_os = "macos") {
+            assert!(
+                msg.contains("Touch ID"),
+                "on macOS, approval error should mention Touch ID, got: {msg}"
+            );
+        }
     }
 }

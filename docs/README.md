@@ -1,16 +1,30 @@
 # Docs
 
-- Getting started: `docs/getting-started.md`
-- Policy model + config format: `docs/policy.md`
-- Operations contract: `docs/operations.md`
-- MCP integration (Claude Code): `docs/mcp-integration.md`
-- Bitwarden Secrets Manager: `docs/bitwarden.md`
-- HashiCorp Vault: `docs/vault.md`
-- LLM harness: `docs/llm-harness.md`
-- Web dashboard: `docs/web-dashboard.md`
-- Demo recordings: `docs/demos.md`
-- Deployment guide (macOS LaunchAgent, Linux systemd user service + polkit): `docs/deployment.md`
-- Architecture (broader design notes, includes deferred items): `docs/architecture.md`
-- Security assessment: `docs/security-assessment.md`
-- Adversarial security review (latest): `docs/adversarial-security-review-2026-02-14.md`
-- Deferred roadmap: `docs/roadmap-deferred.md`
+- [Getting started](getting-started.md)
+- [Policy model + config format](policy.md)
+- [Operations contract](operations.md)
+- [MCP integration (Claude Code)](mcp-integration.md)
+- [Bitwarden Secrets Manager](bitwarden.md)
+- [HashiCorp Vault](vault.md)
+- [LLM harness](llm-harness.md)
+- [Web dashboard](web-dashboard.md)
+- [Demo recordings](demos.md)
+- [Deployment guide (macOS LaunchAgent, Linux systemd user service + polkit)](deployment.md)
+- [Release go/no-go checklist](release-checklist.md)
+- [Launch week playbook (messaging, quickstart gate, triage, SLAs)](launch-week-playbook.md)
+- [Alpha go/no-go status (2026-02-25)](alpha-go-no-go-status-2026-02-25.md)
+- [Alpha sign-off ledger (2026-02-25)](alpha-signoff-ledger-2026-02-25.md)
+- [Alpha macOS signing waiver template (2026-02-25)](alpha-macos-signing-waiver-template.md)
+- [Alpha competitive battlecard](alpha-competitive-battlecard.md)
+- [Design-partner scorecard template](design-partner-scorecard-template.md)
+- [Alpha design-partner usage log (2026-02-25)](alpha-design-partner-usage-log-2026-02-25.md)
+- [Architecture (broader design notes, includes deferred items)](architecture.md)
+- [Enterprise architecture](enterprise-architecture.md)
+- [Security assessment](security-assessment.md)
+- [Adversarial security review (latest)](adversarial-security-review-2026-02-14.md)
+- [PRD hardening critique](critique-prd-hardening.md)
+- [Storage and data model](storage.md)
+- [Linux polkit setup](linux-polkit.md)
+- [Mobile approvals](mobile-approvals.md)
+- [Audit log, live feed, and analytics](audit-analytics.md)
+- [Deferred roadmap](roadmap-deferred.md)

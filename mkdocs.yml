@@ -1,0 +1,103 @@
+site_name: Opaque
+site_description: Approval-gated secrets broker for AI coding tools
+site_url: https://kcirtapfromspace.github.io/opaque/
+repo_url: https://github.com/kcirtapfromspace/opaque
+repo_name: kcirtapfromspace/opaque
+docs_dir: docs
+exclude_docs: README.md
+
+theme:
+  name: material
+  icon:
+    logo: material/shield-lock
+  palette:
+    - scheme: slate
+      primary: indigo
+      accent: blue
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+    - scheme: default
+      primary: indigo
+      accent: blue
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.tabs.link
+    - toc.integrate
+
+markdown_extensions:
+  - toc:
+      permalink: true
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+  - attr_list
+  - md_in_html
+  - tables
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+plugins:
+  - search
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/kcirtapfromspace/opaque
+
+copyright: "Copyright &copy; 2026 Patrick Deutsch"
+
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Quick Start: getting-started.md
+      - Demos: demos.md
+      - Web Dashboard: web-dashboard.md
+  - Configuration:
+      - Policy Engine: policy.md
+      - Operations: operations.md
+      - Storage: storage.md
+      - Deployment: deployment.md
+      - Release Checklist: release-checklist.md
+      - Launch Week Playbook: launch-week-playbook.md
+      - Alpha Go/No-Go Status (2026-02-25): alpha-go-no-go-status-2026-02-25.md
+      - Alpha Sign-Off Ledger (2026-02-25): alpha-signoff-ledger-2026-02-25.md
+      - Alpha macOS Signing Waiver Template (2026-02-25): alpha-macos-signing-waiver-template.md
+      - Alpha Competitive Battlecard: alpha-competitive-battlecard.md
+      - Design-Partner Scorecard Template: design-partner-scorecard-template.md
+      - Alpha Design-Partner Usage Log (2026-02-25): alpha-design-partner-usage-log-2026-02-25.md
+  - Integrations:
+      - MCP (Claude Code): mcp-integration.md
+      - Bitwarden: bitwarden.md
+      - HashiCorp Vault: vault.md
+      - LLM Harness: llm-harness.md
+  - Platform:
+      - Linux polkit: linux-polkit.md
+      - Mobile Approvals: mobile-approvals.md
+      - Enterprise Architecture: enterprise-architecture.md
+  - Security:
+      - Security Assessment: security-assessment.md
+      - Adversarial Review: adversarial-security-review-2026-02-14.md
+      - Audit Analytics: audit-analytics.md
+      - Critique & Hardening: critique-prd-hardening.md
+  - Architecture:
+      - Design Notes: architecture.md
+      - Roadmap (Deferred): roadmap-deferred.md
+  - Blog:
+      - Why We Built Opaque: blog/why-we-built-opaque.md
