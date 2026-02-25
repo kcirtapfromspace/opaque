@@ -39,6 +39,7 @@ Release dry-run evidence:
   - Failure reason: macOS signing secrets missing (`APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_TEAM_ID`)
 - Second dry-run attempt (success): `https://github.com/kcirtapfromspace/opaque/actions/runs/22386149718`
   - Branch/ref: `codex/release-dry-run-blocker-20260225`
+  - PR for merge to `main`: `https://github.com/kcirtapfromspace/opaque/pull/11`
   - Artifacts downloaded: `.tmp_release_validation_2026-02-25/run-22386149718/`
   - Checksum verification: `.tmp_release_validation_2026-02-25/run-22386149718/checksum-verify.txt` (all PASS)
   - Consolidated report: `.tmp_release_validation_2026-02-25/release-dry-run-report.txt`
