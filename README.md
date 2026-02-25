@@ -1,17 +1,31 @@
 # Opaque
 
 ![CI](https://github.com/kcirtapfromspace/opaque/actions/workflows/ci.yml/badge.svg)
-[![License: BUSL-1.1](https://img.shields.io/badge/License-BUSL--1.1-orange.svg)](LICENSE)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 ![Release](https://img.shields.io/github/v/release/kcirtapfromspace/opaque)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-blue)
 
-Local approval-gated secrets broker for AI coding tools (Codex, Claude Code, etc) that must not disclose plaintext secrets to LLM context.
+Local approval-gated secrets broker for AI coding tools (Codex, Claude Code, etc) that must not disclose plaintext secrets to LLM context. Current alpha scope is macOS/Linux desktop sessions.
 
 ## What It Does
 
 Opaque sits between your AI coding assistant and your secrets. LLMs get **operations** (e.g., "set this GitHub secret"), never plaintext values. Every operation passes through:
 
 **Policy -> Approval -> Execute -> Sanitize -> Audit**
+
+## Alpha Scope (Launch)
+
+In scope for the current alpha:
+- macOS and Linux desktop-session deployments
+- operation-bound approvals (Touch ID on macOS, polkit on Linux)
+- provider operations for GitHub, GitLab, 1Password, Bitwarden, Vault, and AWS Secrets Manager
+
+Out of scope for alpha:
+- iOS approvals / APNs push
+- FIDO2 / WebAuthn approvals
+- headless/SSH-only/container-only approval flows
+
+Launch guardrails and incident/SLA process: [Launch week playbook](docs/launch-week-playbook.md)
 
 ## Features
 
@@ -41,7 +55,8 @@ curl -sSfL https://raw.githubusercontent.com/kcirtapfromspace/opaque/main/instal
 ### From Source
 
 ```sh
-cargo install --git https://github.com/kcirtapfromspace/opaque.git opaque opaqued opaque-mcp
+cargo install --git https://github.com/kcirtapfromspace/opaque.git \
+  opaque opaqued opaque-mcp opaque-approve-helper opaque-web
 ```
 
 Binaries:
@@ -51,6 +66,8 @@ Binaries:
 | `opaqued` | Trusted daemon (enclave, policy, approvals, audit) |
 | `opaque` | CLI client |
 | `opaque-mcp` | MCP server for Claude Code |
+| `opaque-approve-helper` | Native approval helper binary (platform integration) |
+| `opaque-web` | Local web dashboard for audit and status views |
 
 ## Platform Support
 
@@ -106,6 +123,7 @@ Full MCP docs: [MCP integration](docs/mcp-integration.md)
    ```bash
    opaque ping
    opaque execute test.noop
+   opaque audit tail --limit 5
    ```
 
 Optional: run your agent through Opaque wrapper mode (session-scoped):
@@ -178,7 +196,7 @@ opaque policy preset github-secrets
 
 ![quickstart demo](assets/demos/quickstart.gif)
 
-### Sandboxed Exec (Captured stdout/stderr)
+### Sandboxed Exec (Metadata-Only Result)
 
 ![sandbox exec demo](assets/demos/sandbox-exec.gif)
 
@@ -192,6 +210,8 @@ opaque policy preset github-secrets
 - [Policy](docs/policy.md)
 - [Operations](docs/operations.md)
 - [LLM harness](docs/llm-harness.md)
+- [Release checklist](docs/release-checklist.md)
+- [Launch week playbook](docs/launch-week-playbook.md)
 - [Demos](docs/demos.md)
 - [Deployment](docs/deployment.md)
 - [Security assessment](docs/security-assessment.md)
@@ -207,4 +227,4 @@ See [Deferred roadmap](docs/roadmap-deferred.md). Notably:
 
 ## License
 
-Business Source License 1.1 (BUSL-1.1). See [LICENSE](LICENSE).
+Apache License 2.0. See [LICENSE](LICENSE).

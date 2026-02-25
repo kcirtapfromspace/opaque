@@ -17,6 +17,7 @@ LLMs get **operations** (e.g., "set this GitHub secret"), never plaintext values
 - [:material-shield-check: **Policy Engine**](policy.md) -- Deny-by-default rules, presets, and allowlists
 - [:material-connection: **MCP Integration**](mcp-integration.md) -- Connect Opaque to Claude Code via MCP
 - [:material-sitemap: **Architecture**](architecture.md) -- Design notes and system overview
+- [:material-clipboard-check: **Launch Week Playbook**](launch-week-playbook.md) -- Messaging guardrails, quickstart gate, incident triage, and SLAs
 
 </div>
 
@@ -50,7 +51,8 @@ LLMs get **operations** (e.g., "set this GitHub secret"), never plaintext values
 === "From Source"
 
     ```sh
-    cargo install --git https://github.com/kcirtapfromspace/opaque.git opaque opaqued opaque-mcp
+    cargo install --git https://github.com/kcirtapfromspace/opaque.git \
+      opaque opaqued opaque-mcp opaque-approve-helper opaque-web
     ```
 
 | Binary | Role |
@@ -58,6 +60,8 @@ LLMs get **operations** (e.g., "set this GitHub secret"), never plaintext values
 | `opaqued` | Trusted daemon (enclave, policy, approvals, audit) |
 | `opaque` | CLI client |
 | `opaque-mcp` | MCP server for Claude Code |
+| `opaque-approve-helper` | Native approval helper binary (platform integration) |
+| `opaque-web` | Local web dashboard for audit and status views |
 
 ## Quick Start (Claude Code)
 
@@ -98,4 +102,4 @@ See the [full getting-started guide](getting-started.md) for CLI and Codex workf
 
 ## License
 
-**Business Source License 1.1** (BSL 1.1). Free for individuals, non-commercial use, and organizations with fewer than 10 developers. See [LICENSE](https://github.com/kcirtapfromspace/opaque/blob/main/LICENSE) for details.
+**Apache License 2.0**. See [LICENSE](https://github.com/kcirtapfromspace/opaque/blob/main/LICENSE) for details.
