@@ -115,7 +115,7 @@ fn detect_bubblewrap() -> bool {
 
 /// Check if the kernel supports Landlock by attempting to create a minimal ruleset.
 fn detect_landlock() -> bool {
-    use landlock::{ABI, Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr};
+    use landlock::{ABI, Access, AccessFs, Ruleset};
 
     // Try to create a ruleset — if the kernel doesn't support Landlock,
     // this will fail gracefully.
@@ -176,8 +176,7 @@ fn protected_paths() -> Vec<PathBuf> {
 /// Returns `true` if Landlock was successfully applied, `false` if not supported.
 pub fn landlock_restrict(project_dir: &Path, extra_read_paths: &[PathBuf]) -> bool {
     use landlock::{
-        ABI, Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr,
-        RulesetStatus,
+        ABI, Access, AccessFs, Compatible, PathBeneath, PathFd, Ruleset, RulesetStatus,
     };
 
     // Set PR_SET_NO_NEW_PRIVS — required before Landlock and good security practice.
@@ -211,7 +210,7 @@ pub fn landlock_restrict(project_dir: &Path, extra_read_paths: &[PathBuf]) -> bo
     };
 
     // Helper: add a rule if the path exists.
-    let mut add_rule = |path: &Path, access: AccessFs| {
+    let mut add_rule = |path: &Path, access| {
         if let Ok(fd) = PathFd::new(path) {
             let rule = PathBeneath::new(fd, access);
             if let Err(e) = created.add_rule(rule) {
@@ -303,7 +302,7 @@ pub fn landlock_ruleset_paths(
 ///
 /// Returns `true` if the filter was applied, `false` if not available.
 pub fn seccomp_restrict_network(network_blocked: bool) -> bool {
-    use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, SeccompRule};
+    use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, SeccompRule, TargetArch};
     use std::collections::BTreeMap;
 
     let default_action = SeccompAction::Allow;
@@ -348,11 +347,19 @@ pub fn seccomp_restrict_network(network_blocked: bool) -> bool {
         }
     }
 
+    let target_arch = match TargetArch::try_from(std::env::consts::ARCH) {
+        Ok(arch) => arch,
+        Err(e) => {
+            warn!("unsupported seccomp target architecture {}: {e}", std::env::consts::ARCH);
+            return false;
+        }
+    };
+
     let filter = match SeccompFilter::new(
         rules,
         default_action,
         block_action,
-        std::env::consts::ARCH.into(),
+        target_arch,
     ) {
         Ok(f) => f,
         Err(e) => {
