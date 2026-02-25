@@ -1,8 +1,8 @@
 # Opaque
 
-![CI](https://github.com/anthropics/opaque/actions/workflows/ci.yml/badge.svg)
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-![Release](https://img.shields.io/github/v/release/anthropics/opaque)
+![CI](https://github.com/kcirtapfromspace/opaque/actions/workflows/ci.yml/badge.svg)
+[![License: BUSL-1.1](https://img.shields.io/badge/License-BUSL--1.1-orange.svg)](LICENSE)
+![Release](https://img.shields.io/github/v/release/kcirtapfromspace/opaque)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-blue)
 
 Local approval-gated secrets broker for AI coding tools (Codex, Claude Code, etc) that must not disclose plaintext secrets to LLM context.
@@ -29,19 +29,19 @@ Opaque sits between your AI coding assistant and your secrets. LLMs get **operat
 ### macOS (Homebrew)
 
 ```sh
-brew install anthropics/tap/opaque
+brew install kcirtapfromspace/tap/opaque
 ```
 
 ### Linux / macOS (shell script)
 
 ```sh
-curl -sSfL https://raw.githubusercontent.com/anthropics/opaque/main/install.sh | sh
+curl -sSfL https://raw.githubusercontent.com/kcirtapfromspace/opaque/main/install.sh | sh
 ```
 
 ### From Source
 
 ```sh
-cargo install --git https://github.com/anthropics/opaque.git opaque opaqued opaque-mcp
+cargo install --git https://github.com/kcirtapfromspace/opaque.git opaque opaqued opaque-mcp
 ```
 
 Binaries:
@@ -208,4 +208,4 @@ See `docs/roadmap-deferred.md`. Notably:
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+Business Source License 1.1 (BUSL-1.1). See [LICENSE](LICENSE).
