@@ -10,9 +10,9 @@ members = [
 ]
 
 [workspace.package]
-license = "Apache-2.0"
-repository = "https://github.com/anthropics/opaque"
-homepage = "https://github.com/anthropics/opaque"
+license = "BUSL-1.1"
+repository = "https://github.com/kcirtapfromspace/opaque"
+homepage = "https://github.com/kcirtapfromspace/opaque"
 
 [profile.release]
 opt-level = 3
