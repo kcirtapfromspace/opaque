@@ -1,198 +1,181 @@
 #!/bin/sh
-# Opaque installer — POSIX-compatible shell script.
-# Usage:
-#   curl -fsSL https://raw.githubusercontent.com/anthropics/opaque/main/install.sh | sh
+# install.sh — download and install Opaque binaries
+# Usage: curl -fsSL https://raw.githubusercontent.com/kcirtapfromspace/opaque/main/install.sh | sh
 #
 # Environment variables:
-#   OPAQUE_VERSION  — version to install (default: latest)
-#   INSTALL_DIR     — installation directory (default: ~/.local/bin)
-
+#   OPAQUE_VERSION   — version to install (default: latest)
+#   OPAQUE_INSTALL   — install directory (default: /usr/local/bin)
+#   GITHUB_TOKEN     — optional, for private repos or rate-limited API calls
 set -eu
 
-REPO="anthropics/opaque"
-GITHUB="https://github.com/${REPO}"
-BINARIES="opaqued opaque opaque-mcp opaque-approve-helper opaque-web"
+REPO="kcirtapfromspace/opaque"
+INSTALL_DIR="${OPAQUE_INSTALL:-/usr/local/bin}"
+BINARIES="opaqued opaque opaque-mcp opaque-approve-helper"
 
-# --------------------------------------------------------------------------- #
-# Helpers                                                                     #
-# --------------------------------------------------------------------------- #
+# --- helpers ----------------------------------------------------------------
 
-err() {
-    printf "error: %s\n" "$1" >&2
+die() {
+    printf 'error: %s\n' "$1" >&2
     exit 1
 }
 
-info() {
-    printf "  %s\n" "$1"
-}
-
 need_cmd() {
-    if ! command -v "$1" > /dev/null 2>&1; then
-        err "need '$1' (command not found)"
-    fi
+    command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
 
-# --------------------------------------------------------------------------- #
-# Platform detection                                                          #
-# --------------------------------------------------------------------------- #
+# --- detect platform --------------------------------------------------------
 
-detect_platform() {
-    OS="$(uname -s)"
-    ARCH="$(uname -m)"
+detect_target() {
+    os="$(uname -s)"
+    arch="$(uname -m)"
 
-    case "$OS" in
-        Linux)  OS="unknown-linux-gnu" ;;
-        Darwin) OS="apple-darwin" ;;
-        MINGW*|MSYS*|CYGWIN*|Windows_NT)
-            err "Windows is not supported. Please use WSL2 and re-run this script inside the Linux environment."
-            ;;
-        *)
-            err "unsupported operating system: $OS"
-            ;;
+    case "$os" in
+        Linux)  os_part="unknown-linux-gnu" ;;
+        Darwin) os_part="apple-darwin" ;;
+        *)      die "unsupported OS: $os" ;;
     esac
 
-    case "$ARCH" in
-        x86_64|amd64)   ARCH="x86_64" ;;
-        aarch64|arm64)   ARCH="aarch64" ;;
-        *)
-            err "unsupported architecture: $ARCH"
-            ;;
+    case "$arch" in
+        x86_64|amd64)   arch_part="x86_64" ;;
+        aarch64|arm64)   arch_part="aarch64" ;;
+        *)               die "unsupported architecture: $arch" ;;
     esac
 
-    TARGET="${ARCH}-${OS}"
+    printf '%s-%s' "$arch_part" "$os_part"
 }
 
-# --------------------------------------------------------------------------- #
-# Version resolution                                                          #
-# --------------------------------------------------------------------------- #
+# --- resolve version --------------------------------------------------------
 
 resolve_version() {
     if [ -n "${OPAQUE_VERSION:-}" ]; then
-        VERSION="$OPAQUE_VERSION"
+        printf '%s' "$OPAQUE_VERSION"
         return
     fi
 
     need_cmd curl
 
-    VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-        | grep '"tag_name"' \
-        | head -1 \
-        | sed 's/.*"tag_name": *"v\{0,1\}\([^"]*\)".*/\1/')" \
-        || err "failed to determine latest release version — set OPAQUE_VERSION and retry"
-
-    if [ -z "$VERSION" ]; then
-        err "could not parse latest release version from GitHub API"
+    auth_header=""
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+        auth_header="Authorization: token ${GITHUB_TOKEN}"
     fi
+
+    # Fetch latest release tag from GitHub API
+    if [ -n "$auth_header" ]; then
+        latest="$(curl -fsSL -H "$auth_header" \
+            "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null)" \
+            || die "failed to fetch latest release (API). Set OPAQUE_VERSION to install a specific version."
+    else
+        latest="$(curl -fsSL \
+            "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null)" \
+            || die "failed to fetch latest release (API). Set OPAQUE_VERSION to install a specific version."
+    fi
+
+    # Parse tag_name from JSON without jq (POSIX sed)
+    tag="$(printf '%s' "$latest" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+    [ -n "$tag" ] || die "could not determine latest version from GitHub API response"
+
+    # Strip leading "v" prefix
+    printf '%s' "${tag#v}"
 }
 
-# --------------------------------------------------------------------------- #
-# Download and verify                                                         #
-# --------------------------------------------------------------------------- #
+# --- download & verify ------------------------------------------------------
 
 download_and_install() {
-    TARBALL="opaque-v${VERSION}-${TARGET}.tar.gz"
-    URL="${GITHUB}/releases/download/v${VERSION}/${TARBALL}"
-    CHECKSUM_URL="${GITHUB}/releases/download/v${VERSION}/${TARBALL}.sha256"
+    version="$1"
+    target="$2"
 
-    TMPDIR="$(mktemp -d)"
-    trap 'rm -rf "$TMPDIR"' EXIT
+    archive="opaque-${version}-${target}.tar.gz"
+    url="https://github.com/${REPO}/releases/download/v${version}/${archive}"
+    checksum_url="${url}.sha256"
 
-    info "downloading ${TARBALL} ..."
-    curl -fsSL -o "${TMPDIR}/${TARBALL}" "$URL" \
-        || err "download failed — does release v${VERSION} exist for ${TARGET}?"
+    tmpdir="$(mktemp -d)" || die "failed to create temporary directory"
+    trap 'rm -r -- "$tmpdir"' EXIT INT TERM
 
-    info "downloading checksum ..."
-    if curl -fsSL -o "${TMPDIR}/${TARBALL}.sha256" "$CHECKSUM_URL" 2>/dev/null; then
-        info "verifying SHA256 checksum ..."
-        EXPECTED="$(awk '{print $1}' "${TMPDIR}/${TARBALL}.sha256")"
-        if command -v sha256sum > /dev/null 2>&1; then
-            ACTUAL="$(sha256sum "${TMPDIR}/${TARBALL}" | awk '{print $1}')"
-        elif command -v shasum > /dev/null 2>&1; then
-            ACTUAL="$(shasum -a 256 "${TMPDIR}/${TARBALL}" | awk '{print $1}')"
+    printf 'Downloading opaque %s for %s...\n' "$version" "$target"
+
+    # Download archive
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+        curl -fSL -H "Authorization: token ${GITHUB_TOKEN}" \
+            -o "${tmpdir}/${archive}" "$url" \
+            || die "download failed: ${url}"
+    else
+        curl -fSL -o "${tmpdir}/${archive}" "$url" \
+            || die "download failed: ${url}"
+    fi
+
+    # Download and verify checksum
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+        curl -fsSL -H "Authorization: token ${GITHUB_TOKEN}" \
+            -o "${tmpdir}/${archive}.sha256" "$checksum_url" 2>/dev/null
+    else
+        curl -fsSL -o "${tmpdir}/${archive}.sha256" "$checksum_url" 2>/dev/null
+    fi
+
+    if [ -f "${tmpdir}/${archive}.sha256" ]; then
+        verify_checksum "${tmpdir}" "${archive}"
+    else
+        printf 'warning: checksum file not available, skipping verification\n' >&2
+    fi
+
+    # Extract
+    need_cmd tar
+    tar xzf "${tmpdir}/${archive}" -C "${tmpdir}" \
+        || die "failed to extract archive"
+
+    # Install binaries
+    printf 'Installing to %s...\n' "$INSTALL_DIR"
+    mkdir -p "$INSTALL_DIR" || die "failed to create install directory: ${INSTALL_DIR}"
+
+    for bin in $BINARIES; do
+        if [ -f "${tmpdir}/${bin}" ]; then
+            install -m 755 "${tmpdir}/${bin}" "${INSTALL_DIR}/${bin}" \
+                || die "failed to install ${bin} to ${INSTALL_DIR}"
         else
-            info "warning: no sha256sum or shasum found — skipping verification"
-            ACTUAL="$EXPECTED"
-        fi
-
-        if [ "$EXPECTED" != "$ACTUAL" ]; then
-            err "checksum mismatch (expected ${EXPECTED}, got ${ACTUAL})"
-        fi
-        info "checksum OK"
-    else
-        info "warning: checksum file not found — skipping verification"
-    fi
-
-    info "extracting ..."
-    tar xzf "${TMPDIR}/${TARBALL}" -C "$TMPDIR"
-
-    # The tarball contains a directory named opaque-v<version>-<target>/
-    EXTRACT_DIR="${TMPDIR}/opaque-v${VERSION}-${TARGET}"
-    if [ ! -d "$EXTRACT_DIR" ]; then
-        # Fallback: binaries may be at the root of the tarball
-        EXTRACT_DIR="$TMPDIR"
-    fi
-
-    # Determine install directory
-    INSTALL_DIR="${INSTALL_DIR:-${HOME}/.local/bin}"
-
-    if [ -w "$INSTALL_DIR" ] 2>/dev/null || mkdir -p "$INSTALL_DIR" 2>/dev/null; then
-        SUDO=""
-    elif [ -w "/usr/local/bin" ]; then
-        INSTALL_DIR="/usr/local/bin"
-        SUDO=""
-    else
-        INSTALL_DIR="/usr/local/bin"
-        SUDO="sudo"
-        info "installing to ${INSTALL_DIR} (requires sudo) ..."
-    fi
-
-    $SUDO mkdir -p "$INSTALL_DIR" 2>/dev/null || true
-
-    for BIN in $BINARIES; do
-        if [ -f "${EXTRACT_DIR}/${BIN}" ]; then
-            $SUDO install -m 755 "${EXTRACT_DIR}/${BIN}" "${INSTALL_DIR}/${BIN}"
+            printf 'warning: binary %s not found in archive (may not be built for this platform)\n' "$bin" >&2
         fi
     done
 
-    info "installed to ${INSTALL_DIR}"
+    printf 'Successfully installed opaque %s to %s\n' "$version" "$INSTALL_DIR"
+    printf 'Binaries: %s\n' "$BINARIES"
 }
 
-# --------------------------------------------------------------------------- #
-# Main                                                                        #
-# --------------------------------------------------------------------------- #
+# --- checksum verification --------------------------------------------------
+
+verify_checksum() {
+    dir="$1"
+    archive="$2"
+
+    expected="$(awk '{print $1}' "${dir}/${archive}.sha256")"
+    [ -n "$expected" ] || die "checksum file is empty or malformed"
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual="$(sha256sum "${dir}/${archive}" | awk '{print $1}')"
+    elif command -v shasum >/dev/null 2>&1; then
+        actual="$(shasum -a 256 "${dir}/${archive}" | awk '{print $1}')"
+    else
+        printf 'warning: neither sha256sum nor shasum found, skipping checksum verification\n' >&2
+        return 0
+    fi
+
+    if [ "$expected" != "$actual" ]; then
+        die "checksum mismatch: expected ${expected}, got ${actual}"
+    fi
+
+    printf 'Checksum verified.\n'
+}
+
+# --- main -------------------------------------------------------------------
 
 main() {
-    printf "\n  Opaque Installer\n\n"
-
     need_cmd curl
     need_cmd tar
-    need_cmd uname
+    need_cmd mktemp
+    need_cmd install
 
-    detect_platform
-    info "detected platform: ${TARGET}"
+    target="$(detect_target)"
+    version="$(resolve_version)"
 
-    resolve_version
-    info "version: ${VERSION}"
-
-    download_and_install
-
-    printf "\n"
-    info "Installation complete!"
-    printf "\n"
-
-    # Check if install dir is in PATH
-    case ":${PATH}:" in
-        *":${INSTALL_DIR}:"*) ;;
-        *)
-            info "Add ${INSTALL_DIR} to your PATH:"
-            info "  export PATH=\"${INSTALL_DIR}:\$PATH\""
-            printf "\n"
-            ;;
-    esac
-
-    info "Get started:"
-    info "  opaque init"
-    printf "\n"
+    download_and_install "$version" "$target"
 }
 
 main
