@@ -1,439 +1,276 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Opaque - Local Approval-Gated Secrets Broker for AI Coding Tools</title>
-  <meta name="description" content="Opaque is a local secrets broker that gates every secret operation behind policy checks, native OS approval (Touch ID / polkit), and a full audit trail. LLMs get operations, never plaintext values.">
-  <meta property="og:title" content="Opaque - Secrets Broker for AI Coding Tools">
-  <meta property="og:description" content="Local approval-gated secrets broker. LLMs get operations, never plaintext values. Policy, approval, execute, sanitize, audit.">
-  <meta property="og:type" content="website">
-  <meta property="og:url" content="https://anthropics.github.io/opaque/">
-  <meta property="og:image" content="https://anthropics.github.io/opaque/og-image.png">
-  <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="Opaque - Secrets Broker for AI Coding Tools">
-  <meta name="twitter:description" content="Local approval-gated secrets broker. LLMs get operations, never plaintext values.">
-  <link rel="canonical" href="https://anthropics.github.io/opaque/">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Opaque — Approval-Gated Secrets Broker for AI Coding Tools</title>
+  <meta name="description" content="Opaque is a local secrets broker that lets AI coding tools like Claude Code and Codex perform secret operations without ever seeing plaintext values.">
   <style>
-    /* Reset & Base */
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    html { scroll-behavior: smooth; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-      background: #0a0e17;
-      color: #c9d1d9;
-      line-height: 1.6;
-      -webkit-font-smoothing: antialiased;
+    :root {
+      --bg: #0d1117;
+      --fg: #c9d1d9;
+      --accent: #58a6ff;
+      --accent-hover: #79c0ff;
+      --surface: #161b22;
+      --border: #30363d;
+      --code-bg: #1c2129;
+      --success: #3fb950;
+      --warn: #d29922;
     }
-    a { color: #58a6ff; text-decoration: none; }
-    a:hover { text-decoration: underline; }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--fg);
+      line-height: 1.6;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { color: var(--accent-hover); text-decoration: underline; }
+    code {
+      font-family: 'SF Mono', 'Fira Code', 'Fira Mono', monospace;
+      background: var(--code-bg);
+      padding: 0.15em 0.4em;
+      border-radius: 4px;
+      font-size: 0.9em;
+    }
+    pre {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1em 1.2em;
+      overflow-x: auto;
+      font-size: 0.88em;
+      line-height: 1.5;
+    }
+    pre code { background: none; padding: 0; }
 
     /* Layout */
-    .container { max-width: 1100px; margin: 0 auto; padding: 0 24px; }
-
-    /* Nav */
-    nav {
-      position: fixed; top: 0; left: 0; right: 0;
-      background: rgba(10, 14, 23, 0.92);
-      backdrop-filter: blur(12px);
-      border-bottom: 1px solid #1b2333;
-      z-index: 100;
-      padding: 0 24px;
-    }
-    nav .nav-inner {
-      max-width: 1100px; margin: 0 auto;
-      display: flex; align-items: center; justify-content: space-between;
-      height: 56px;
-    }
-    nav .logo { font-weight: 700; font-size: 1.2rem; color: #e6edf3; letter-spacing: -0.02em; }
-    nav .logo span { color: #58a6ff; }
-    nav .nav-links { display: flex; gap: 24px; align-items: center; }
-    nav .nav-links a { color: #8b949e; font-size: 0.9rem; font-weight: 500; }
-    nav .nav-links a:hover { color: #e6edf3; text-decoration: none; }
-    .gh-btn {
-      display: inline-flex; align-items: center; gap: 6px;
-      background: #21262d; border: 1px solid #30363d; border-radius: 6px;
-      padding: 5px 12px; font-size: 0.85rem; color: #c9d1d9; font-weight: 500;
-    }
-    .gh-btn:hover { background: #30363d; text-decoration: none; }
+    .container { max-width: 960px; margin: 0 auto; padding: 0 1.5rem; }
 
     /* Hero */
     .hero {
-      padding: 160px 0 100px;
       text-align: center;
+      padding: 4rem 0 3rem;
+      border-bottom: 1px solid var(--border);
     }
-    .hero-label {
-      display: inline-block;
-      background: rgba(88, 166, 255, 0.1);
-      border: 1px solid rgba(88, 166, 255, 0.25);
-      color: #58a6ff;
-      font-size: 0.8rem; font-weight: 600;
-      padding: 4px 14px; border-radius: 20px;
-      margin-bottom: 24px; letter-spacing: 0.04em; text-transform: uppercase;
-    }
-    .hero h1 {
-      font-size: 3.5rem; font-weight: 800; color: #e6edf3;
-      line-height: 1.1; margin-bottom: 20px; letter-spacing: -0.03em;
-    }
-    .hero h1 span { color: #58a6ff; }
-    .hero p {
-      font-size: 1.2rem; color: #8b949e; max-width: 640px; margin: 0 auto 40px;
-    }
-    .hero-install {
-      background: #161b22;
-      border: 1px solid #30363d;
-      border-radius: 8px;
-      display: inline-flex; align-items: center; gap: 12px;
-      padding: 14px 24px;
-      font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
-      font-size: 0.95rem; color: #c9d1d9;
-      margin-bottom: 32px;
-    }
-    .hero-install .prompt { color: #484f58; user-select: none; }
-    .hero-actions { display: flex; gap: 16px; justify-content: center; flex-wrap: wrap; }
-    .btn-primary {
-      background: #238636; color: #fff; font-weight: 600;
-      padding: 12px 28px; border-radius: 6px; font-size: 1rem;
-      border: 1px solid #2ea043;
-    }
-    .btn-primary:hover { background: #2ea043; text-decoration: none; }
-    .btn-secondary {
-      background: #21262d; color: #c9d1d9; font-weight: 600;
-      padding: 12px 28px; border-radius: 6px; font-size: 1rem;
-      border: 1px solid #30363d;
-    }
-    .btn-secondary:hover { background: #30363d; text-decoration: none; }
-
-    /* Section */
-    section { padding: 80px 0; }
-    .section-title {
-      font-size: 2rem; font-weight: 700; color: #e6edf3;
-      text-align: center; margin-bottom: 12px; letter-spacing: -0.02em;
-    }
-    .section-subtitle {
-      text-align: center; color: #8b949e; font-size: 1.05rem;
-      max-width: 600px; margin: 0 auto 48px;
-    }
+    .hero h1 { font-size: 2.8rem; font-weight: 700; margin-bottom: 0.5rem; }
+    .hero .tagline { font-size: 1.2rem; color: #8b949e; margin-bottom: 2rem; }
+    .hero .badges { display: flex; gap: 0.5rem; justify-content: center; flex-wrap: wrap; margin-bottom: 1.5rem; }
+    .hero .badges img { height: 22px; }
+    .cta { display: inline-block; padding: 0.7rem 1.8rem; background: var(--accent); color: #0d1117; font-weight: 600; border-radius: 6px; font-size: 1rem; }
+    .cta:hover { background: var(--accent-hover); text-decoration: none; color: #0d1117; }
 
     /* Pipeline */
-    .pipeline-section { border-top: 1px solid #1b2333; }
     .pipeline {
-      display: flex; align-items: center; justify-content: center;
-      gap: 8px; flex-wrap: wrap; margin-bottom: 40px;
+      display: flex;
+      justify-content: center;
+      gap: 0;
+      margin: 2rem 0;
+      flex-wrap: wrap;
     }
-    .pipeline-step {
-      background: #161b22; border: 1px solid #30363d;
-      border-radius: 8px; padding: 16px 24px;
-      text-align: center; min-width: 120px;
+    .pipeline .step {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      padding: 0.6rem 1.2rem;
+      font-weight: 600;
+      font-size: 0.95rem;
     }
-    .pipeline-step .step-icon { font-size: 1.5rem; margin-bottom: 6px; }
-    .pipeline-step .step-label { font-weight: 600; font-size: 0.9rem; color: #e6edf3; }
-    .pipeline-step .step-desc { font-size: 0.75rem; color: #8b949e; margin-top: 2px; }
-    .pipeline-arrow { color: #30363d; font-size: 1.3rem; font-weight: 700; }
-    .pipeline-detail {
-      max-width: 700px; margin: 0 auto;
-      color: #8b949e; font-size: 0.95rem; text-align: center;
-    }
+    .pipeline .step:first-child { border-radius: 6px 0 0 6px; }
+    .pipeline .step:last-child { border-radius: 0 6px 6px 0; }
+    .pipeline .arrow { display: flex; align-items: center; color: var(--accent); font-size: 1.2rem; padding: 0 0.3rem; }
 
-    /* Features Grid */
-    .features-section { border-top: 1px solid #1b2333; }
-    .features-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-      gap: 20px;
-    }
-    .feature-card {
-      background: #161b22; border: 1px solid #21262d;
-      border-radius: 10px; padding: 28px;
-    }
-    .feature-card:hover { border-color: #30363d; }
-    .feature-icon { font-size: 1.6rem; margin-bottom: 12px; }
-    .feature-card h3 { font-size: 1.1rem; color: #e6edf3; margin-bottom: 8px; font-weight: 600; }
-    .feature-card p { font-size: 0.9rem; color: #8b949e; }
+    /* Sections */
+    section { padding: 3rem 0; border-bottom: 1px solid var(--border); }
+    section:last-of-type { border-bottom: none; }
+    section h2 { font-size: 1.8rem; margin-bottom: 1rem; }
+    section h3 { font-size: 1.2rem; margin-bottom: 0.5rem; color: var(--accent); }
 
-    /* Providers */
-    .providers-section { border-top: 1px solid #1b2333; }
-    .providers-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-      gap: 16px; max-width: 700px; margin: 0 auto;
+    /* Features grid */
+    .features { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1.5rem; margin-top: 1.5rem; }
+    .feature {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1.5rem;
     }
-    .provider-card {
-      background: #161b22; border: 1px solid #21262d;
-      border-radius: 8px; padding: 20px; text-align: center;
-    }
-    .provider-card:hover { border-color: #30363d; }
-    .provider-name { font-weight: 600; color: #c9d1d9; font-size: 0.95rem; }
-    .provider-type { font-size: 0.75rem; color: #484f58; margin-top: 4px; }
+    .feature h3 { margin-bottom: 0.4rem; }
+    .feature p { color: #8b949e; font-size: 0.95rem; }
 
-    /* Tools */
-    .tools-section { border-top: 1px solid #1b2333; }
-    .tools-grid {
-      display: flex; justify-content: center; gap: 24px; flex-wrap: wrap;
-    }
-    .tool-card {
-      background: #161b22; border: 1px solid #21262d;
-      border-radius: 8px; padding: 20px 28px; text-align: center;
-      min-width: 160px;
-    }
-    .tool-card:hover { border-color: #30363d; }
-    .tool-name { font-weight: 600; color: #c9d1d9; font-size: 1rem; }
-    .tool-note { font-size: 0.75rem; color: #484f58; margin-top: 4px; }
-
-    /* CTA */
-    .cta-section {
-      border-top: 1px solid #1b2333;
-      text-align: center;
-    }
-    .cta-install {
-      background: #161b22; border: 1px solid #30363d;
-      border-radius: 8px; padding: 16px 28px;
-      font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
-      font-size: 0.95rem; color: #c9d1d9;
-      display: inline-block; margin: 32px 0;
-    }
-    .cta-install .prompt { color: #484f58; user-select: none; }
-    .cta-links { display: flex; gap: 16px; justify-content: center; flex-wrap: wrap; }
+    /* Install table */
+    table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
+    th, td { text-align: left; padding: 0.6rem 1rem; border-bottom: 1px solid var(--border); }
+    th { color: var(--accent); font-weight: 600; }
 
     /* Footer */
-    footer {
-      border-top: 1px solid #1b2333;
-      padding: 40px 0;
-      text-align: center; color: #484f58; font-size: 0.85rem;
-    }
-    footer .footer-links { display: flex; gap: 24px; justify-content: center; margin-bottom: 16px; }
-    footer .footer-links a { color: #8b949e; font-size: 0.85rem; }
-    footer .footer-links a:hover { color: #c9d1d9; }
-
-    /* Responsive */
-    @media (max-width: 768px) {
-      .hero h1 { font-size: 2.2rem; }
-      .hero p { font-size: 1rem; }
-      .hero-install { font-size: 0.8rem; padding: 10px 16px; }
-      .pipeline { gap: 4px; }
-      .pipeline-step { padding: 12px 14px; min-width: 90px; }
-      .pipeline-step .step-label { font-size: 0.8rem; }
-      .pipeline-arrow { font-size: 1rem; }
-      .features-grid { grid-template-columns: 1fr; }
-      .providers-grid { grid-template-columns: repeat(2, 1fr); }
-      nav .nav-links { gap: 12px; }
-      nav .nav-links a { font-size: 0.8rem; }
-    }
-    @media (max-width: 480px) {
-      .hero h1 { font-size: 1.8rem; }
-      .pipeline { flex-direction: column; }
-      .pipeline-arrow { transform: rotate(90deg); }
-      .hero-install { font-size: 0.75rem; padding: 8px 12px; }
-      .providers-grid { grid-template-columns: 1fr 1fr; }
-      .nav-links .hide-mobile { display: none; }
-    }
+    footer { padding: 2rem 0; text-align: center; color: #484f58; font-size: 0.9rem; border-top: 1px solid var(--border); }
   </style>
 </head>
 <body>
 
-  <!-- Navigation -->
-  <nav>
-    <div class="nav-inner">
-      <div class="logo"><span>&#9670;</span> Opaque</div>
-      <div class="nav-links">
-        <a href="#how-it-works" class="hide-mobile">How It Works</a>
-        <a href="#features" class="hide-mobile">Features</a>
-        <a href="#providers" class="hide-mobile">Providers</a>
-        <a href="https://github.com/anthropics/opaque" class="gh-btn">
-          <svg height="16" width="16" viewBox="0 0 16 16" fill="#c9d1d9"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"></path></svg>
-          GitHub
-        </a>
-      </div>
-    </div>
-  </nav>
+<div class="container">
 
   <!-- Hero -->
-  <section class="hero">
-    <div class="container">
-      <div class="hero-label">Open Source &middot; Apache-2.0</div>
-      <h1>Secrets stay <span>opaque</span><br>to the LLM</h1>
-      <p>A local approval-gated secrets broker for AI coding tools. LLMs get operations, never plaintext values. Every action passes through policy, approval, and audit.</p>
-      <div class="hero-install">
-        <span class="prompt">$</span> brew install anthropics/tap/opaque
-      </div>
-      <div class="hero-actions">
-        <a href="https://github.com/anthropics/opaque" class="btn-primary">Get Started</a>
-        <a href="https://github.com/anthropics/opaque/blob/main/docs/getting-started.md" class="btn-secondary">Read the Docs</a>
-      </div>
+  <header class="hero">
+    <div class="badges">
+      <a href="https://github.com/anthropics/opaque/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License: Apache-2.0"></a>
+      <a href="https://github.com/anthropics/opaque/actions/workflows/ci.yml"><img src="https://github.com/anthropics/opaque/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
     </div>
-  </section>
+    <h1>Opaque</h1>
+    <p class="tagline">Approval-gated secrets broker for AI coding tools.</p>
+    <p style="max-width:640px; margin:0 auto 2rem; color:#8b949e;">
+      LLMs get <strong style="color:var(--fg);">operations</strong> (e.g., "set this GitHub secret"),
+      never plaintext values. Every operation passes through a five-stage enforcement pipeline.
+    </p>
 
-  <!-- How It Works -->
-  <section id="how-it-works" class="pipeline-section">
-    <div class="container">
-      <h2 class="section-title">How It Works</h2>
-      <p class="section-subtitle">Every secret operation flows through a five-stage pipeline. The LLM never touches a plaintext value.</p>
-      <div class="pipeline">
-        <div class="pipeline-step">
-          <div class="step-icon">&#128220;</div>
-          <div class="step-label">Policy</div>
-          <div class="step-desc">Deny-by-default rules</div>
-        </div>
-        <div class="pipeline-arrow">&#8594;</div>
-        <div class="pipeline-step">
-          <div class="step-icon">&#128274;</div>
-          <div class="step-label">Approval</div>
-          <div class="step-desc">Touch ID / polkit</div>
-        </div>
-        <div class="pipeline-arrow">&#8594;</div>
-        <div class="pipeline-step">
-          <div class="step-icon">&#9889;</div>
-          <div class="step-label">Execute</div>
-          <div class="step-desc">Provider action</div>
-        </div>
-        <div class="pipeline-arrow">&#8594;</div>
-        <div class="pipeline-step">
-          <div class="step-icon">&#128683;</div>
-          <div class="step-label">Sanitize</div>
-          <div class="step-desc">Strip secret values</div>
-        </div>
-        <div class="pipeline-arrow">&#8594;</div>
-        <div class="pipeline-step">
-          <div class="step-icon">&#128209;</div>
-          <div class="step-label">Audit</div>
-          <div class="step-desc">Structured log</div>
-        </div>
-      </div>
-      <p class="pipeline-detail">
-        The AI agent requests an operation like "set the GitHub secret API_KEY." Opaque checks the policy,
-        prompts you for biometric approval, executes the operation against the provider, strips any secret
-        material from the response, and logs an auditable record. The LLM only ever sees a success/failure confirmation.
-      </p>
+    <div class="pipeline">
+      <span class="step">Policy</span><span class="arrow">&rarr;</span>
+      <span class="step">Approval</span><span class="arrow">&rarr;</span>
+      <span class="step">Execute</span><span class="arrow">&rarr;</span>
+      <span class="step">Sanitize</span><span class="arrow">&rarr;</span>
+      <span class="step">Audit</span>
     </div>
-  </section>
+
+    <a class="cta" href="https://github.com/anthropics/opaque#quickstart-claude-code-mcp">Get Started</a>
+  </header>
 
   <!-- Features -->
-  <section id="features" class="features-section">
-    <div class="container">
-      <h2 class="section-title">Features</h2>
-      <p class="section-subtitle">Everything you need to let AI tools work with secrets safely.</p>
-      <div class="features-grid">
-        <div class="feature-card">
-          <div class="feature-icon">&#128273;</div>
-          <h3>Multi-Vault Support</h3>
-          <p>Connect to GitHub, GitLab, 1Password, Bitwarden, HashiCorp Vault, and AWS Secrets Manager. Reference secrets across providers in a single workflow.</p>
-        </div>
-        <div class="feature-card">
-          <div class="feature-icon">&#128268;</div>
-          <h3>MCP Server</h3>
-          <p>First-class Model Context Protocol integration. Add Opaque to Claude Code's MCP config and your AI assistant can manage secrets through natural language.</p>
-        </div>
-        <div class="feature-card">
-          <div class="feature-icon">&#128271;</div>
-          <h3>Touch ID Approval</h3>
-          <p>Every secret operation requires explicit biometric approval on macOS. Linux uses polkit for native desktop prompts. No silent access.</p>
-        </div>
-        <div class="feature-card">
-          <div class="feature-icon">&#128209;</div>
-          <h3>Audit Trail</h3>
-          <p>Structured SQLite audit log with correlation IDs, client identity, session tracking, and queryable history. Know exactly what happened and when.</p>
-        </div>
-        <div class="feature-card">
-          <div class="feature-icon">&#128220;</div>
-          <h3>Policy Engine</h3>
-          <p>Deny-by-default with fine-grained allowlist rules. Control which operations each client can perform. Ship with built-in presets for common workflows.</p>
-        </div>
-        <div class="feature-card">
-          <div class="feature-icon">&#128187;</div>
-          <h3>Web Dashboard</h3>
-          <p>Built-in audit analytics dashboard for reviewing operation history, approval patterns, and policy hit rates across all your agent sessions.</p>
-        </div>
+  <section>
+    <h2>Features</h2>
+    <div class="features">
+      <div class="feature">
+        <h3>Deny-by-Default Policy</h3>
+        <p>Allowlist-based rules with glob patterns on operations, client identity, target fields, and secret names. No rule means no access.</p>
+      </div>
+      <div class="feature">
+        <h3>Biometric Approvals</h3>
+        <p>Operation-bound native OS prompts: macOS Touch ID via LocalAuthentication and Linux polkit. Approval leases avoid prompt fatigue.</p>
+      </div>
+      <div class="feature">
+        <h3>Typestate Sanitization</h3>
+        <p>Compile-time enforcement that only sanitized responses leave the enclave. Secret-pattern scrubbing as defense-in-depth.</p>
+      </div>
+      <div class="feature">
+        <h3>Structured Audit Log</h3>
+        <p>Every request, approval, and outcome is recorded to SQLite with correlation IDs. Query with <code>opaque audit tail</code>.</p>
+      </div>
+      <div class="feature">
+        <h3>MCP Server</h3>
+        <p>First-class Claude Code integration via the Model Context Protocol. The <code>opaque-mcp</code> binary exposes only Safe operations over stdio.</p>
+      </div>
+      <div class="feature">
+        <h3>Multiple Providers</h3>
+        <p>GitHub Actions/Codespaces/Dependabot/org secrets, GitLab CI variables, 1Password, Bitwarden Secrets Manager, and HashiCorp Vault.</p>
+      </div>
+      <div class="feature">
+        <h3>Client Identity</h3>
+        <p>Identifies callers via Unix peer credentials, executable path/hash, and optional macOS code-signing Team ID.</p>
+      </div>
+      <div class="feature">
+        <h3>Config Seal</h3>
+        <p>SHA-256 integrity seal stored in the OS keychain. The daemon refuses to start if the policy has been tampered with.</p>
+      </div>
+      <div class="feature">
+        <h3>Agent Session Wrapping</h3>
+        <p>Run AI agents in scoped sessions with <code>opaque agent run</code>. Session tokens enforce per-invocation access boundaries.</p>
       </div>
     </div>
   </section>
 
-  <!-- Providers -->
-  <section id="providers" class="providers-section">
-    <div class="container">
-      <h2 class="section-title">Supported Providers</h2>
-      <p class="section-subtitle">Opaque brokers operations to the secret stores you already use.</p>
-      <div class="providers-grid">
-        <div class="provider-card">
-          <div class="provider-name">GitHub</div>
-          <div class="provider-type">Actions Secrets</div>
-        </div>
-        <div class="provider-card">
-          <div class="provider-name">GitLab</div>
-          <div class="provider-type">CI/CD Variables</div>
-        </div>
-        <div class="provider-card">
-          <div class="provider-name">1Password</div>
-          <div class="provider-type">Vault Items</div>
-        </div>
-        <div class="provider-card">
-          <div class="provider-name">Bitwarden</div>
-          <div class="provider-type">Secrets Manager</div>
-        </div>
-        <div class="provider-card">
-          <div class="provider-name">Vault</div>
-          <div class="provider-type">HashiCorp KV + Dynamic</div>
-        </div>
-        <div class="provider-card">
-          <div class="provider-name">AWS</div>
-          <div class="provider-type">Secrets Manager</div>
-        </div>
-      </div>
-    </div>
+  <!-- Install -->
+  <section>
+    <h2>Install</h2>
+
+    <h3>From Source</h3>
+    <pre><code>cargo build --release</code></pre>
+
+    <p style="margin-top:1rem;">This produces three binaries:</p>
+    <table>
+      <thead>
+        <tr><th>Binary</th><th>Role</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>opaqued</code></td><td>Trusted daemon (enclave, policy, approvals, audit)</td></tr>
+        <tr><td><code>opaque</code></td><td>CLI client</td></tr>
+        <tr><td><code>opaque-mcp</code></td><td>MCP server for Claude Code</td></tr>
+      </tbody>
+    </table>
   </section>
 
-  <!-- AI Tools -->
-  <section id="tools" class="tools-section">
-    <div class="container">
-      <h2 class="section-title">For AI Coding Tools</h2>
-      <p class="section-subtitle">Opaque works with any AI coding tool that can call a CLI or use MCP.</p>
-      <div class="tools-grid">
-        <div class="tool-card">
-          <div class="tool-name">Claude Code</div>
-          <div class="tool-note">MCP integration</div>
-        </div>
-        <div class="tool-card">
-          <div class="tool-name">GitHub Copilot</div>
-          <div class="tool-note">CLI wrapper</div>
-        </div>
-        <div class="tool-card">
-          <div class="tool-name">Cursor</div>
-          <div class="tool-note">CLI wrapper</div>
-        </div>
-        <div class="tool-card">
-          <div class="tool-name">Codex</div>
-          <div class="tool-note">Agent wrapper</div>
-        </div>
-      </div>
-    </div>
+  <!-- Quickstart -->
+  <section>
+    <h2>Quickstart</h2>
+
+    <h3>Claude Code (MCP)</h3>
+    <pre><code># 1. Initialize with a preset
+opaque init --preset github-secrets
+
+# 2. Start the daemon
+opaqued
+
+# 3. Add to Claude Code MCP config
+# {
+#   "mcpServers": {
+#     "opaque": { "command": "/path/to/opaque-mcp" }
+#   }
+# }
+
+# 4. Ask Claude Code:
+#    "Set the GitHub Actions secret API_KEY for myorg/myrepo using my keychain"</code></pre>
+
+    <h3>CLI / Codex</h3>
+    <pre><code># Initialize and start
+opaque init --preset github-secrets
+opaqued
+
+# Test connectivity
+opaque ping
+opaque execute test.noop
+
+# Sync a GitHub secret
+opaque github set-secret \
+  --repo myorg/myrepo \
+  --secret-name API_KEY \
+  --value-ref keychain:opaque/api-key
+
+# Review audit log
+opaque audit tail --limit 10</code></pre>
   </section>
 
-  <!-- CTA -->
-  <section class="cta-section">
-    <div class="container">
-      <h2 class="section-title">Get Started in 60 Seconds</h2>
-      <p class="section-subtitle">Install Opaque, initialize a preset, start the daemon, and your AI tool is ready to manage secrets safely.</p>
-      <div class="cta-install">
-        <span class="prompt">$</span> brew install anthropics/tap/opaque &amp;&amp; opaque init --preset github-secrets &amp;&amp; opaqued
-      </div>
-      <div class="cta-links">
-        <a href="https://github.com/anthropics/opaque" class="btn-primary">View on GitHub</a>
-        <a href="https://github.com/anthropics/opaque/blob/main/docs/getting-started.md" class="btn-secondary">Getting Started Guide</a>
-      </div>
-    </div>
+  <!-- Policy Presets -->
+  <section>
+    <h2>Policy Presets</h2>
+    <pre><code>opaque policy presets                        # list available presets
+opaque init --preset safe-demo               # test.noop only
+opaque init --preset github-secrets          # GitHub secret sync
+opaque init --preset gitlab-variables        # GitLab CI variable sync
+opaque init --preset sandbox-human           # sandbox exec for humans only
+opaque init --preset agent-wrapper-github    # wrapped-agent GitHub sync</code></pre>
   </section>
 
-  <!-- Footer -->
-  <footer>
-    <div class="container">
-      <div class="footer-links">
-        <a href="https://github.com/anthropics/opaque">GitHub</a>
-        <a href="https://github.com/anthropics/opaque/blob/main/docs/README.md">Documentation</a>
-        <a href="https://github.com/anthropics/opaque/blob/main/docs/security-assessment.md">Security</a>
-        <a href="https://github.com/anthropics/opaque/blob/main/LICENSE">License</a>
-      </div>
-      <p>Opaque is open source under the Apache-2.0 license.</p>
-    </div>
-  </footer>
+  <!-- Docs links -->
+  <section>
+    <h2>Documentation</h2>
+    <table>
+      <tbody>
+        <tr><td><a href="https://github.com/anthropics/opaque/blob/main/docs/getting-started.md">Getting Started</a></td><td>Full setup and first-run walkthrough</td></tr>
+        <tr><td><a href="https://github.com/anthropics/opaque/blob/main/docs/mcp-integration.md">MCP Integration</a></td><td>Claude Code setup and available tools</td></tr>
+        <tr><td><a href="https://github.com/anthropics/opaque/blob/main/docs/policy.md">Policy</a></td><td>Rule syntax, matching semantics, approval config</td></tr>
+        <tr><td><a href="https://github.com/anthropics/opaque/blob/main/docs/bitwarden.md">Bitwarden</a></td><td>Bitwarden Secrets Manager setup</td></tr>
+        <tr><td><a href="https://github.com/anthropics/opaque/blob/main/docs/vault.md">Vault</a></td><td>HashiCorp Vault integration</td></tr>
+        <tr><td><a href="https://github.com/anthropics/opaque/blob/main/docs/operations.md">Operations</a></td><td>Full operation reference</td></tr>
+        <tr><td><a href="https://github.com/anthropics/opaque/blob/main/docs/deployment.md">Deployment</a></td><td>Production deployment guide</td></tr>
+        <tr><td><a href="https://github.com/anthropics/opaque/blob/main/SECURITY.md">Security</a></td><td>Vulnerability disclosure policy</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+</div>
+
+<footer>
+  <div class="container">
+    <p>Apache-2.0 &middot; <a href="https://github.com/anthropics/opaque">GitHub</a></p>
+  </div>
+</footer>
 
 </body>
 </html>
