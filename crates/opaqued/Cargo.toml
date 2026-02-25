@@ -40,7 +40,6 @@ axum = { workspace = true }
 rcgen = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 mdns-sd = { workspace = true }
 hyper-util = { workspace = true }
 
