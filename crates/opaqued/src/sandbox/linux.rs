@@ -214,7 +214,7 @@ pub fn landlock_restrict(project_dir: &Path, extra_read_paths: &[PathBuf]) -> bo
     let mut add_rule = |path: &Path, access| {
         if let Ok(fd) = PathFd::new(path) {
             let rule = PathBeneath::new(fd, access);
-            if let Err(e) = created.add_rule(rule) {
+            if let Err(e) = (&mut created).add_rule(rule) {
                 warn!("landlock: failed to add rule for {}: {e}", path.display());
             }
         }
