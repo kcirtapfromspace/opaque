@@ -27,6 +27,7 @@ Current snapshot: [Alpha go/no-go status (2026-02-25)](alpha-go-no-go-status-202
 - [ ] SHA256 files generated for every release archive.
 - [ ] Install instructions in `README.md` match the produced artifacts.
 - [ ] Dry-run evidence captured (workflow URL + artifact list + checksum verification notes).
+- [ ] Apple signing/notarization secrets configured for tag releases, or explicit waiver approved by `SEC` + `REL`.
 
 Dry-run execution command:
 
