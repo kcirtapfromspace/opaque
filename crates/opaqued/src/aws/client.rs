@@ -1,25 +1,24 @@
-//! AWS Secrets Manager + SSM Parameter Store API client.
+//! AWS API client.
 //!
-//! Wraps the REST endpoints needed to browse, read, and write secrets via
-//! AWS Secrets Manager and SSM Parameter Store APIs.
+//! Wraps the REST endpoints needed for AWS STS, Secrets Manager, and SSM
+//! Parameter Store. Uses standard AWS JSON protocol over HTTPS with
+//! credential-based auth (access key / secret key / region).
 //!
-//! Authentication uses the AWS CLI credential chain: the client shells out
-//! to `aws` CLI to obtain credentials, avoiding the need to bundle the full
-//! AWS SDK or manually implement SigV4 signing.
-//!
-//! **Never** leaks raw API error bodies to callers -- all errors are
+//! **Never** leaks raw API error bodies to callers — all errors are
 //! mapped to sanitized strings.
 
 use serde::{Deserialize, Serialize};
 
-/// Environment variable to override the default AWS Secrets Manager base URL.
-pub const AWS_SM_URL_ENV: &str = "OPAQUE_AWS_SM_URL";
+/// Environment variable for the AWS access key ID.
+#[allow(dead_code)]
+pub const AWS_ACCESS_KEY_ID_ENV: &str = "OPAQUE_AWS_ACCESS_KEY_ID";
 
-/// Environment variable to override the default SSM base URL.
-pub const AWS_SSM_URL_ENV: &str = "OPAQUE_AWS_SSM_URL";
+/// Environment variable for the AWS secret access key.
+#[allow(dead_code)]
+pub const AWS_SECRET_ACCESS_KEY_ENV: &str = "OPAQUE_AWS_SECRET_ACCESS_KEY";
 
-/// Environment variable for AWS region (fallback if AWS_REGION is not set).
-pub const AWS_REGION_ENV: &str = "AWS_REGION";
+/// Environment variable for the AWS region.
+pub const AWS_REGION_ENV: &str = "OPAQUE_AWS_REGION";
 
 /// Default AWS region when none is configured.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -30,184 +29,204 @@ pub enum AwsApiError {
     #[error("network error communicating with AWS")]
     Network(#[source] reqwest::Error),
 
-    #[error("AWS authentication failed (check credentials)")]
-    AuthError,
+    #[error("AWS authentication failed (check access key and secret key)")]
+    Unauthorized,
 
-    #[error("resource not found: {0}")]
+    #[error("AWS resource not found: {0}")]
     NotFound(String),
-
-    #[error("access denied: {0}")]
-    AccessDenied(String),
 
     #[error("AWS server error")]
     ServerError,
 
+    #[error("AWS request rejected: {0}")]
+    BadRequest(String),
+
     #[error("unexpected AWS response: status {0}")]
     UnexpectedStatus(u16),
 
-    #[error("invalid URL: {0}")]
-    InvalidUrl(String),
-
-    #[error("AWS CLI error: {0}")]
-    CliError(String),
+    #[error("AWS response parse error: {0}")]
+    ParseError(String),
 }
 
-/// An AWS Secrets Manager secret summary (returned by list endpoints).
+// ---------------------------------------------------------------------------
+// STS types
+// ---------------------------------------------------------------------------
+
+/// STS GetCallerIdentity response.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct AwsSecret {
-    #[serde(rename = "Name")]
-    pub name: String,
-    #[serde(rename = "ARN", default)]
-    pub arn: Option<String>,
-    #[serde(rename = "Description", default)]
-    pub description: Option<String>,
+pub struct CallerIdentity {
+    #[serde(rename = "Account")]
+    pub account: String,
+    #[serde(rename = "Arn")]
+    pub arn: String,
+    #[serde(rename = "UserId")]
+    pub user_id: String,
 }
 
-/// An AWS Secrets Manager secret value.
+/// STS AssumeRole response (simplified).
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct AwsSecretValue {
-    #[serde(rename = "Name")]
-    pub name: String,
+pub struct AssumedRoleCredentials {
+    #[serde(rename = "AccessKeyId")]
+    pub access_key_id: String,
+    #[serde(rename = "SecretAccessKey")]
+    pub secret_access_key: String,
+    #[serde(rename = "SessionToken")]
+    pub session_token: String,
+    #[serde(rename = "Expiration")]
+    pub expiration: String,
+}
+
+// ---------------------------------------------------------------------------
+// Secrets Manager types
+// ---------------------------------------------------------------------------
+
+/// Secrets Manager secret value response.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SecretValue {
     #[serde(rename = "ARN", default)]
     pub arn: Option<String>,
+    #[serde(rename = "Name")]
+    pub name: String,
     #[serde(rename = "SecretString", default)]
     pub secret_string: Option<String>,
     #[serde(rename = "VersionId", default)]
     pub version_id: Option<String>,
 }
 
-/// An AWS Secrets Manager secret description.
+/// Secrets Manager secret summary (from ListSecrets).
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct AwsSecretDescription {
-    #[serde(rename = "Name")]
-    pub name: String,
+pub struct SecretSummary {
     #[serde(rename = "ARN", default)]
     pub arn: Option<String>,
+    #[serde(rename = "Name")]
+    pub name: String,
     #[serde(rename = "Description", default)]
     pub description: Option<String>,
-    #[serde(rename = "LastChangedDate", default)]
-    pub last_changed_date: Option<f64>,
-    #[serde(rename = "LastAccessedDate", default)]
-    pub last_accessed_date: Option<f64>,
 }
 
-/// Response wrapper for ListSecrets API.
-#[derive(Debug, Clone, Deserialize)]
-struct ListSecretsResponse {
-    #[serde(rename = "SecretList", default)]
-    secret_list: Vec<AwsSecret>,
-}
-
-/// Response wrapper for PutSecretValue API.
+/// Secrets Manager ListSecrets response.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct PutSecretValueResponse {
-    #[serde(rename = "Name")]
-    pub name: String,
+pub struct ListSecretsResponse {
+    #[serde(rename = "SecretList", default)]
+    pub secret_list: Vec<SecretSummary>,
+    #[serde(rename = "NextToken", default)]
+    pub next_token: Option<String>,
+}
+
+/// Secrets Manager CreateSecret response.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CreateSecretResponse {
     #[serde(rename = "ARN", default)]
     pub arn: Option<String>,
+    #[serde(rename = "Name")]
+    pub name: String,
     #[serde(rename = "VersionId", default)]
     pub version_id: Option<String>,
 }
 
-/// An SSM Parameter.
+// ---------------------------------------------------------------------------
+// SSM Parameter Store types
+// ---------------------------------------------------------------------------
+
+/// SSM Parameter.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SsmParameter {
     #[serde(rename = "Name")]
     pub name: String,
-    #[serde(rename = "Value", default)]
-    pub value: Option<String>,
     #[serde(rename = "Type", default)]
     pub parameter_type: Option<String>,
+    #[serde(rename = "Value", default)]
+    pub value: Option<String>,
     #[serde(rename = "Version", default)]
     pub version: Option<i64>,
+    #[serde(rename = "ARN", default)]
+    pub arn: Option<String>,
 }
 
-/// Response wrapper for SSM GetParameter API.
-#[derive(Debug, Clone, Deserialize)]
-struct GetParameterResponse {
-    #[serde(rename = "Parameter")]
-    parameter: SsmParameter,
-}
-
-/// Response wrapper for SSM PutParameter API.
+/// SSM GetParameter response wrapper.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct PutParameterResponse {
-    #[serde(rename = "Version", default)]
-    pub version: Option<i64>,
+pub struct GetParameterResponse {
+    #[serde(rename = "Parameter")]
+    pub parameter: SsmParameter,
+}
+
+/// SSM GetParametersByPath response.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GetParametersByPathResponse {
+    #[serde(rename = "Parameters", default)]
+    pub parameters: Vec<SsmParameter>,
+    #[serde(rename = "NextToken", default)]
+    pub next_token: Option<String>,
 }
 
 /// Validate that a URL uses `https://`, allowing `http://` only for localhost.
-fn validate_url_scheme(url: &str) -> Result<(), AwsApiError> {
+fn validate_url_scheme(url: &str) {
     if url.starts_with("https://") {
-        return Ok(());
+        return;
     }
     if url.starts_with("http://") {
         if let Some(host_part) = url.strip_prefix("http://") {
             let host = host_part.split('/').next().unwrap_or("");
             let host_no_port = host.split(':').next().unwrap_or("");
             if host_no_port == "localhost" || host_no_port == "127.0.0.1" {
-                return Ok(());
+                return;
             }
         }
-        return Err(AwsApiError::InvalidUrl(format!(
+        panic!(
             "insecure HTTP URL rejected: {url}. \
              Only https:// URLs are allowed (http:// is permitted for localhost/127.0.0.1 only)"
-        )));
+        );
     }
-    Err(AwsApiError::InvalidUrl(format!(
+    panic!(
         "unsupported URL scheme: {url}. \
          Only https:// URLs are allowed (http:// is permitted for localhost/127.0.0.1 only)"
-    )))
+    );
 }
 
-/// Determine the AWS region from environment variables.
-fn resolve_region() -> String {
-    std::env::var(AWS_REGION_ENV)
-        .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
-        .unwrap_or_else(|_| DEFAULT_REGION.to_owned())
+/// Map an HTTP status code to an appropriate error.
+fn map_status(status: u16, context: &str) -> AwsApiError {
+    match status {
+        400 => AwsApiError::BadRequest(context.to_owned()),
+        401 | 403 => AwsApiError::Unauthorized,
+        404 => AwsApiError::NotFound(context.to_owned()),
+        500..=599 => AwsApiError::ServerError,
+        other => AwsApiError::UnexpectedStatus(other),
+    }
 }
 
-/// AWS Secrets Manager + SSM Parameter Store REST API client.
+/// AWS REST API client.
 ///
-/// Uses the AWS JSON API protocol (POST with X-Amz-Target headers).
-/// Authentication is delegated to the `aws` CLI via credential helpers,
-/// or reads credentials from standard AWS environment variables.
+/// Follows the same pattern as `BitwardenClient`: no stored credentials
+/// (passed per-call), timeouts, and a user-agent header.
+///
+/// This client uses simple HTTP calls against AWS-compatible endpoints.
+/// Credentials (access key, secret key) are passed per-call and sent via
+/// headers rather than AWS Signature V4 — suitable for mock testing and
+/// local development. Production usage should layer SigV4 signing.
 #[derive(Debug, Clone)]
-pub struct AwsSecretsManagerClient {
+pub struct AwsClient {
     http: reqwest::Client,
-    sm_base_url: String,
-    ssm_base_url: String,
-    region: String,
+    /// Base URL for STS calls (e.g., `https://sts.us-east-1.amazonaws.com`).
+    pub sts_url: String,
+    /// Base URL for Secrets Manager calls.
+    pub secretsmanager_url: String,
+    /// Base URL for SSM calls.
+    pub ssm_url: String,
 }
 
-impl AwsSecretsManagerClient {
+impl AwsClient {
     /// Build the user-agent string from the crate version.
     fn user_agent() -> String {
         format!("opaqued/{}", env!("CARGO_PKG_VERSION"))
     }
 
-    /// Create a new client for the given region.
+    /// Create a new client with separate service URLs.
     ///
-    /// Returns an error if any base URL uses an unsupported scheme.
-    pub fn new() -> Result<Self, AwsApiError> {
-        let region = resolve_region();
-
-        let sm_base_url = std::env::var(AWS_SM_URL_ENV)
-            .unwrap_or_else(|_| format!("https://secretsmanager.{region}.amazonaws.com"));
-        let ssm_base_url = std::env::var(AWS_SSM_URL_ENV)
-            .unwrap_or_else(|_| format!("https://ssm.{region}.amazonaws.com"));
-
-        Self::with_urls(&sm_base_url, &ssm_base_url, &region)
-    }
-
-    /// Create a new client with explicit base URLs (useful for testing).
-    pub fn with_urls(
-        sm_base_url: &str,
-        ssm_base_url: &str,
-        region: &str,
-    ) -> Result<Self, AwsApiError> {
-        validate_url_scheme(sm_base_url)?;
-        validate_url_scheme(ssm_base_url)?;
+    /// Panics if any URL uses `http://` for a non-localhost host.
+    pub fn new(sts_url: &str, secretsmanager_url: &str, ssm_url: &str) -> Self {
+        validate_url_scheme(sts_url);
+        validate_url_scheme(secretsmanager_url);
+        validate_url_scheme(ssm_url);
 
         let http = reqwest::Client::builder()
             .user_agent(Self::user_agent())
@@ -215,27 +234,157 @@ impl AwsSecretsManagerClient {
             .build()
             .expect("failed to build reqwest client");
 
-        Ok(Self {
+        Self {
             http,
-            sm_base_url: sm_base_url.trim_end_matches('/').to_owned(),
-            ssm_base_url: ssm_base_url.trim_end_matches('/').to_owned(),
-            region: region.to_owned(),
-        })
+            sts_url: sts_url.trim_end_matches('/').to_owned(),
+            secretsmanager_url: secretsmanager_url.trim_end_matches('/').to_owned(),
+            ssm_url: ssm_url.trim_end_matches('/').to_owned(),
+        }
     }
 
-    /// Get the configured region.
-    pub fn region(&self) -> &str {
-        &self.region
+    /// Create a client where all services point at the same base URL.
+    /// Useful for testing with a single mock server.
+    #[cfg(test)]
+    pub fn new_single(base_url: &str) -> Self {
+        Self::new(base_url, base_url, base_url)
     }
 
-    /// Map an HTTP status code to an AwsApiError.
-    fn map_status(status: u16, context: &str) -> AwsApiError {
-        match status {
-            401 | 403 => AwsApiError::AccessDenied(context.into()),
-            400 => AwsApiError::AuthError,
-            404 => AwsApiError::NotFound(context.into()),
-            500..=599 => AwsApiError::ServerError,
-            other => AwsApiError::UnexpectedStatus(other),
+    // -----------------------------------------------------------------------
+    // STS operations
+    // -----------------------------------------------------------------------
+
+    /// STS GetCallerIdentity — returns the account, ARN, and user ID
+    /// associated with the provided credentials.
+    pub async fn get_caller_identity(
+        &self,
+        access_key: &str,
+        secret_key: &str,
+    ) -> Result<CallerIdentity, AwsApiError> {
+        let resp = self
+            .http
+            .post(&self.sts_url)
+            .header("X-Amz-Access-Key", access_key)
+            .header("X-Amz-Secret-Key", secret_key)
+            .header(
+                "X-Amz-Target",
+                "AWSSecurityTokenServiceV20110615.GetCallerIdentity",
+            )
+            .header("Content-Type", "application/x-amz-json-1.1")
+            .body("{}")
+            .send()
+            .await
+            .map_err(AwsApiError::Network)?;
+
+        let status = resp.status().as_u16();
+        if status != 200 {
+            return Err(map_status(status, "GetCallerIdentity"));
+        }
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(rename = "GetCallerIdentityResponse", default)]
+            response: Option<InnerResponse>,
+            // Flat fallback fields for direct JSON responses.
+            #[serde(rename = "Account", default)]
+            account: Option<String>,
+            #[serde(rename = "Arn", default)]
+            arn: Option<String>,
+            #[serde(rename = "UserId", default)]
+            user_id: Option<String>,
+        }
+
+        #[derive(Deserialize)]
+        struct InnerResponse {
+            #[serde(rename = "GetCallerIdentityResult")]
+            result: CallerIdentity,
+        }
+
+        let body = resp.text().await.map_err(AwsApiError::Network)?;
+        let wrapper: Wrapper = serde_json::from_str(&body)
+            .map_err(|e| AwsApiError::ParseError(format!("GetCallerIdentity: {e}")))?;
+
+        if let Some(inner) = wrapper.response {
+            Ok(inner.result)
+        } else if let (Some(account), Some(arn), Some(user_id)) =
+            (wrapper.account, wrapper.arn, wrapper.user_id)
+        {
+            Ok(CallerIdentity {
+                account,
+                arn,
+                user_id,
+            })
+        } else {
+            Err(AwsApiError::ParseError(
+                "missing CallerIdentity fields in response".into(),
+            ))
+        }
+    }
+
+    /// STS AssumeRole — returns temporary credentials for the specified role.
+    pub async fn assume_role(
+        &self,
+        access_key: &str,
+        secret_key: &str,
+        role_arn: &str,
+        session_name: &str,
+    ) -> Result<AssumedRoleCredentials, AwsApiError> {
+        let body = serde_json::json!({
+            "RoleArn": role_arn,
+            "RoleSessionName": session_name,
+        });
+
+        let resp = self
+            .http
+            .post(&self.sts_url)
+            .header("X-Amz-Access-Key", access_key)
+            .header("X-Amz-Secret-Key", secret_key)
+            .header(
+                "X-Amz-Target",
+                "AWSSecurityTokenServiceV20110615.AssumeRole",
+            )
+            .header("Content-Type", "application/x-amz-json-1.1")
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(AwsApiError::Network)?;
+
+        let status = resp.status().as_u16();
+        if status != 200 {
+            return Err(map_status(status, "AssumeRole"));
+        }
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(rename = "AssumeRoleResponse", default)]
+            response: Option<InnerResponse>,
+            #[serde(rename = "Credentials", default)]
+            credentials: Option<AssumedRoleCredentials>,
+        }
+
+        #[derive(Deserialize)]
+        struct InnerResponse {
+            #[serde(rename = "AssumeRoleResult")]
+            result: AssumeRoleResult,
+        }
+
+        #[derive(Deserialize)]
+        struct AssumeRoleResult {
+            #[serde(rename = "Credentials")]
+            credentials: AssumedRoleCredentials,
+        }
+
+        let resp_body = resp.text().await.map_err(AwsApiError::Network)?;
+        let wrapper: Wrapper = serde_json::from_str(&resp_body)
+            .map_err(|e| AwsApiError::ParseError(format!("AssumeRole: {e}")))?;
+
+        if let Some(inner) = wrapper.response {
+            Ok(inner.result.credentials)
+        } else if let Some(creds) = wrapper.credentials {
+            Ok(creds)
+        } else {
+            Err(AwsApiError::ParseError(
+                "missing Credentials in AssumeRole response".into(),
+            ))
         }
     }
 
@@ -243,287 +392,316 @@ impl AwsSecretsManagerClient {
     // Secrets Manager operations
     // -----------------------------------------------------------------------
 
-    /// List all secrets in Secrets Manager.
-    pub async fn list_secrets(
+    /// Secrets Manager GetSecretValue — fetch a secret's value by name or ARN.
+    pub async fn get_secret_value(
         &self,
-        credentials: &AwsCredentials,
-    ) -> Result<Vec<AwsSecret>, AwsApiError> {
+        access_key: &str,
+        secret_key: &str,
+        secret_id: &str,
+    ) -> Result<SecretValue, AwsApiError> {
+        let body = serde_json::json!({
+            "SecretId": secret_id,
+        });
+
         let resp = self
             .http
-            .post(&self.sm_base_url)
+            .post(&self.secretsmanager_url)
+            .header("X-Amz-Access-Key", access_key)
+            .header("X-Amz-Secret-Key", secret_key)
+            .header("X-Amz-Target", "secretsmanager.GetSecretValue")
             .header("Content-Type", "application/x-amz-json-1.1")
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(AwsApiError::Network)?;
+
+        let status = resp.status().as_u16();
+        if status != 200 {
+            return Err(map_status(status, &format!("secret '{secret_id}'")));
+        }
+
+        resp.json::<SecretValue>()
+            .await
+            .map_err(|e| AwsApiError::ParseError(format!("GetSecretValue: {e}")))
+    }
+
+    /// Secrets Manager CreateSecret — create a new secret.
+    pub async fn create_secret(
+        &self,
+        access_key: &str,
+        secret_key: &str,
+        name: &str,
+        secret_string: &str,
+        description: Option<&str>,
+    ) -> Result<CreateSecretResponse, AwsApiError> {
+        let mut body = serde_json::json!({
+            "Name": name,
+            "SecretString": secret_string,
+        });
+        if let Some(desc) = description {
+            body["Description"] = serde_json::Value::String(desc.to_owned());
+        }
+
+        let resp = self
+            .http
+            .post(&self.secretsmanager_url)
+            .header("X-Amz-Access-Key", access_key)
+            .header("X-Amz-Secret-Key", secret_key)
+            .header("X-Amz-Target", "secretsmanager.CreateSecret")
+            .header("Content-Type", "application/x-amz-json-1.1")
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(AwsApiError::Network)?;
+
+        let status = resp.status().as_u16();
+        if status != 200 {
+            return Err(map_status(status, &format!("create secret '{name}'")));
+        }
+
+        resp.json::<CreateSecretResponse>()
+            .await
+            .map_err(|e| AwsApiError::ParseError(format!("CreateSecret: {e}")))
+    }
+
+    /// Secrets Manager PutSecretValue — update an existing secret's value.
+    pub async fn put_secret_value(
+        &self,
+        access_key: &str,
+        secret_key: &str,
+        secret_id: &str,
+        secret_string: &str,
+    ) -> Result<(), AwsApiError> {
+        let body = serde_json::json!({
+            "SecretId": secret_id,
+            "SecretString": secret_string,
+        });
+
+        let resp = self
+            .http
+            .post(&self.secretsmanager_url)
+            .header("X-Amz-Access-Key", access_key)
+            .header("X-Amz-Secret-Key", secret_key)
+            .header("X-Amz-Target", "secretsmanager.PutSecretValue")
+            .header("Content-Type", "application/x-amz-json-1.1")
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(AwsApiError::Network)?;
+
+        let status = resp.status().as_u16();
+        if status != 200 {
+            return Err(map_status(status, &format!("put secret '{secret_id}'")));
+        }
+
+        Ok(())
+    }
+
+    /// Secrets Manager ListSecrets — list all secrets.
+    pub async fn list_secrets(
+        &self,
+        access_key: &str,
+        secret_key: &str,
+    ) -> Result<ListSecretsResponse, AwsApiError> {
+        let resp = self
+            .http
+            .post(&self.secretsmanager_url)
+            .header("X-Amz-Access-Key", access_key)
+            .header("X-Amz-Secret-Key", secret_key)
             .header("X-Amz-Target", "secretsmanager.ListSecrets")
-            .header("X-Amz-Date", &credentials.amz_date)
-            .header("Authorization", &credentials.authorization)
+            .header("Content-Type", "application/x-amz-json-1.1")
             .body("{}")
             .send()
             .await
             .map_err(AwsApiError::Network)?;
 
-        match resp.status().as_u16() {
-            200 => {
-                let body: ListSecretsResponse = resp.json().await.map_err(AwsApiError::Network)?;
-                Ok(body.secret_list)
-            }
-            status => Err(Self::map_status(status, "list_secrets")),
+        let status = resp.status().as_u16();
+        if status != 200 {
+            return Err(map_status(status, "ListSecrets"));
         }
-    }
 
-    /// Get a secret value from Secrets Manager.
-    pub async fn get_secret_value(
-        &self,
-        credentials: &AwsCredentials,
-        secret_id: &str,
-    ) -> Result<AwsSecretValue, AwsApiError> {
-        let body = serde_json::json!({ "SecretId": secret_id });
-
-        let resp = self
-            .http
-            .post(&self.sm_base_url)
-            .header("Content-Type", "application/x-amz-json-1.1")
-            .header("X-Amz-Target", "secretsmanager.GetSecretValue")
-            .header("X-Amz-Date", &credentials.amz_date)
-            .header("Authorization", &credentials.authorization)
-            .json(&body)
-            .send()
+        resp.json::<ListSecretsResponse>()
             .await
-            .map_err(AwsApiError::Network)?;
-
-        match resp.status().as_u16() {
-            200 => resp.json().await.map_err(AwsApiError::Network),
-            404 => Err(AwsApiError::NotFound(format!("secret '{secret_id}'"))),
-            status => Err(Self::map_status(
-                status,
-                &format!("get_secret_value({secret_id})"),
-            )),
-        }
+            .map_err(|e| AwsApiError::ParseError(format!("ListSecrets: {e}")))
     }
 
-    /// Put a secret value into Secrets Manager.
-    pub async fn put_secret_value(
+    /// Secrets Manager DeleteSecret — schedule a secret for deletion.
+    pub async fn delete_secret(
         &self,
-        credentials: &AwsCredentials,
+        access_key: &str,
+        secret_key: &str,
         secret_id: &str,
-        value: &str,
-    ) -> Result<PutSecretValueResponse, AwsApiError> {
+    ) -> Result<(), AwsApiError> {
         let body = serde_json::json!({
             "SecretId": secret_id,
-            "SecretString": value,
+            "ForceDeleteWithoutRecovery": false,
         });
 
         let resp = self
             .http
-            .post(&self.sm_base_url)
+            .post(&self.secretsmanager_url)
+            .header("X-Amz-Access-Key", access_key)
+            .header("X-Amz-Secret-Key", secret_key)
+            .header("X-Amz-Target", "secretsmanager.DeleteSecret")
             .header("Content-Type", "application/x-amz-json-1.1")
-            .header("X-Amz-Target", "secretsmanager.PutSecretValue")
-            .header("X-Amz-Date", &credentials.amz_date)
-            .header("Authorization", &credentials.authorization)
-            .json(&body)
+            .body(body.to_string())
             .send()
             .await
             .map_err(AwsApiError::Network)?;
 
-        match resp.status().as_u16() {
-            200 => resp.json().await.map_err(AwsApiError::Network),
-            404 => Err(AwsApiError::NotFound(format!("secret '{secret_id}'"))),
-            status => Err(Self::map_status(
-                status,
-                &format!("put_secret_value({secret_id})"),
-            )),
+        let status = resp.status().as_u16();
+        if status != 200 {
+            return Err(map_status(status, &format!("delete secret '{secret_id}'")));
         }
-    }
 
-    /// Describe a secret in Secrets Manager (metadata only, no value).
-    pub async fn describe_secret(
-        &self,
-        credentials: &AwsCredentials,
-        secret_id: &str,
-    ) -> Result<AwsSecretDescription, AwsApiError> {
-        let body = serde_json::json!({ "SecretId": secret_id });
-
-        let resp = self
-            .http
-            .post(&self.sm_base_url)
-            .header("Content-Type", "application/x-amz-json-1.1")
-            .header("X-Amz-Target", "secretsmanager.DescribeSecret")
-            .header("X-Amz-Date", &credentials.amz_date)
-            .header("Authorization", &credentials.authorization)
-            .json(&body)
-            .send()
-            .await
-            .map_err(AwsApiError::Network)?;
-
-        match resp.status().as_u16() {
-            200 => resp.json().await.map_err(AwsApiError::Network),
-            404 => Err(AwsApiError::NotFound(format!("secret '{secret_id}'"))),
-            status => Err(Self::map_status(
-                status,
-                &format!("describe_secret({secret_id})"),
-            )),
-        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
     // SSM Parameter Store operations
     // -----------------------------------------------------------------------
 
-    /// Get a parameter from SSM Parameter Store.
+    /// SSM GetParameter — fetch a parameter by name.
     pub async fn get_parameter(
         &self,
-        credentials: &AwsCredentials,
+        access_key: &str,
+        secret_key: &str,
         name: &str,
+        with_decryption: bool,
     ) -> Result<SsmParameter, AwsApiError> {
         let body = serde_json::json!({
             "Name": name,
-            "WithDecryption": true,
+            "WithDecryption": with_decryption,
         });
 
         let resp = self
             .http
-            .post(&self.ssm_base_url)
-            .header("Content-Type", "application/x-amz-json-1.1")
+            .post(&self.ssm_url)
+            .header("X-Amz-Access-Key", access_key)
+            .header("X-Amz-Secret-Key", secret_key)
             .header("X-Amz-Target", "AmazonSSM.GetParameter")
-            .header("X-Amz-Date", &credentials.amz_date)
-            .header("Authorization", &credentials.authorization)
-            .json(&body)
+            .header("Content-Type", "application/x-amz-json-1.1")
+            .body(body.to_string())
             .send()
             .await
             .map_err(AwsApiError::Network)?;
 
-        match resp.status().as_u16() {
-            200 => {
-                let wrapper: GetParameterResponse =
-                    resp.json().await.map_err(AwsApiError::Network)?;
-                Ok(wrapper.parameter)
-            }
-            404 => Err(AwsApiError::NotFound(format!("parameter '{name}'"))),
-            status => Err(Self::map_status(status, &format!("get_parameter({name})"))),
+        let status = resp.status().as_u16();
+        if status != 200 {
+            return Err(map_status(status, &format!("parameter '{name}'")));
         }
+
+        let wrapper = resp
+            .json::<GetParameterResponse>()
+            .await
+            .map_err(|e| AwsApiError::ParseError(format!("GetParameter: {e}")))?;
+
+        Ok(wrapper.parameter)
     }
 
-    /// Put a parameter into SSM Parameter Store.
+    /// SSM PutParameter — create or update a parameter.
     pub async fn put_parameter(
         &self,
-        credentials: &AwsCredentials,
+        access_key: &str,
+        secret_key: &str,
         name: &str,
         value: &str,
-        param_type: &str,
-    ) -> Result<PutParameterResponse, AwsApiError> {
+        parameter_type: &str,
+        overwrite: bool,
+    ) -> Result<(), AwsApiError> {
         let body = serde_json::json!({
             "Name": name,
             "Value": value,
-            "Type": param_type,
-            "Overwrite": true,
+            "Type": parameter_type,
+            "Overwrite": overwrite,
         });
 
         let resp = self
             .http
-            .post(&self.ssm_base_url)
-            .header("Content-Type", "application/x-amz-json-1.1")
+            .post(&self.ssm_url)
+            .header("X-Amz-Access-Key", access_key)
+            .header("X-Amz-Secret-Key", secret_key)
             .header("X-Amz-Target", "AmazonSSM.PutParameter")
-            .header("X-Amz-Date", &credentials.amz_date)
-            .header("Authorization", &credentials.authorization)
-            .json(&body)
+            .header("Content-Type", "application/x-amz-json-1.1")
+            .body(body.to_string())
             .send()
             .await
             .map_err(AwsApiError::Network)?;
 
-        match resp.status().as_u16() {
-            200 => resp.json().await.map_err(AwsApiError::Network),
-            status => Err(Self::map_status(status, &format!("put_parameter({name})"))),
+        let status = resp.status().as_u16();
+        if status != 200 {
+            return Err(map_status(status, &format!("put parameter '{name}'")));
         }
-    }
-}
 
-/// AWS credentials resolved from the environment or CLI.
-///
-/// For real AWS calls, `authorization` is the full SigV4 Authorization
-/// header and `amz_date` is the ISO 8601 date. For testing with mocked
-/// endpoints, these can be simple placeholder strings.
-#[derive(Debug, Clone)]
-pub struct AwsCredentials {
-    pub authorization: String,
-    pub amz_date: String,
-}
-
-impl AwsCredentials {
-    /// Create credentials from environment variables.
-    ///
-    /// This reads `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and
-    /// optionally `AWS_SESSION_TOKEN` from the environment. The actual
-    /// SigV4 signing is simplified here -- we pass the access key in
-    /// a bearer-like header for the mock/test path. Real production
-    /// use should integrate with `aws-sigv4` or shell out to the CLI.
-    pub fn from_env() -> Result<Self, AwsApiError> {
-        let access_key = std::env::var("AWS_ACCESS_KEY_ID").map_err(|_| AwsApiError::AuthError)?;
-        let secret_key =
-            std::env::var("AWS_SECRET_ACCESS_KEY").map_err(|_| AwsApiError::AuthError)?;
-        let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
-
-        // Build a simplified authorization header.
-        // In production this would use full SigV4 signing.
-        let credential = format!("AWS4-HMAC-SHA256 Credential={access_key}");
-        let auth = if let Some(token) = session_token {
-            format!("{credential}, SessionToken={token}")
-        } else {
-            credential
-        };
-
-        // Use the secret_key reference to avoid unused variable warning.
-        let _ = &secret_key;
-
-        let now = chrono_like_date();
-
-        Ok(Self {
-            authorization: auth,
-            amz_date: now,
-        })
+        Ok(())
     }
 
-    /// Create test credentials with the given authorization string.
-    #[cfg(test)]
-    pub fn test(auth: &str) -> Self {
-        Self {
-            authorization: auth.to_owned(),
-            amz_date: "20260101T000000Z".to_owned(),
+    /// SSM GetParametersByPath — list parameters under a path prefix.
+    pub async fn get_parameters_by_path(
+        &self,
+        access_key: &str,
+        secret_key: &str,
+        path: &str,
+        with_decryption: bool,
+    ) -> Result<GetParametersByPathResponse, AwsApiError> {
+        let body = serde_json::json!({
+            "Path": path,
+            "WithDecryption": with_decryption,
+            "Recursive": true,
+        });
+
+        let resp = self
+            .http
+            .post(&self.ssm_url)
+            .header("X-Amz-Access-Key", access_key)
+            .header("X-Amz-Secret-Key", secret_key)
+            .header("X-Amz-Target", "AmazonSSM.GetParametersByPath")
+            .header("Content-Type", "application/x-amz-json-1.1")
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(AwsApiError::Network)?;
+
+        let status = resp.status().as_u16();
+        if status != 200 {
+            return Err(map_status(status, &format!("parameters path '{path}'")));
         }
+
+        resp.json::<GetParametersByPathResponse>()
+            .await
+            .map_err(|e| AwsApiError::ParseError(format!("GetParametersByPath: {e}")))
     }
-}
 
-/// Generate an ISO 8601 date string like `20260224T120000Z`.
-fn chrono_like_date() -> String {
-    use std::time::SystemTime;
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = now.as_secs();
-    // Simple UTC date formatting without chrono dependency.
-    let days = secs / 86400;
-    let time_of_day = secs % 86400;
-    let hours = time_of_day / 3600;
-    let minutes = (time_of_day % 3600) / 60;
-    let seconds = time_of_day % 60;
+    /// SSM DeleteParameter — delete a parameter by name.
+    pub async fn delete_parameter(
+        &self,
+        access_key: &str,
+        secret_key: &str,
+        name: &str,
+    ) -> Result<(), AwsApiError> {
+        let body = serde_json::json!({
+            "Name": name,
+        });
 
-    // Calculate year/month/day from days since epoch (1970-01-01).
-    let (year, month, day) = days_to_ymd(days);
+        let resp = self
+            .http
+            .post(&self.ssm_url)
+            .header("X-Amz-Access-Key", access_key)
+            .header("X-Amz-Secret-Key", secret_key)
+            .header("X-Amz-Target", "AmazonSSM.DeleteParameter")
+            .header("Content-Type", "application/x-amz-json-1.1")
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(AwsApiError::Network)?;
 
-    format!("{year:04}{month:02}{day:02}T{hours:02}{minutes:02}{seconds:02}Z")
-}
+        let status = resp.status().as_u16();
+        if status != 200 {
+            return Err(map_status(status, &format!("delete parameter '{name}'")));
+        }
 
-/// Convert days since Unix epoch to (year, month, day).
-fn days_to_ymd(days: u64) -> (u64, u64, u64) {
-    // Civil calendar algorithm from https://howardhinnant.github.io/date_algorithms.html
-    let z = days + 719468;
-    let era = z / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if m <= 2 { y + 1 } else { y };
-    (year, m, d)
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -534,198 +712,137 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 mod tests {
     use super::*;
 
-    // -- Unit tests for data types and validation --
+    // -- Serialization tests --
 
     #[test]
-    fn client_stores_base_urls_trimmed() {
-        let client = AwsSecretsManagerClient::with_urls(
-            "http://localhost:4566/",
-            "http://localhost:4566/",
-            "us-east-1",
-        )
-        .unwrap();
-        assert_eq!(client.sm_base_url, "http://localhost:4566");
-        assert_eq!(client.ssm_base_url, "http://localhost:4566");
+    fn caller_identity_deserialize() {
+        let json = r#"{"Account":"123456789012","Arn":"arn:aws:iam::123456789012:user/test","UserId":"AIDEXAMPLE"}"#;
+        let id: CallerIdentity = serde_json::from_str(json).unwrap();
+        assert_eq!(id.account, "123456789012");
+        assert_eq!(id.arn, "arn:aws:iam::123456789012:user/test");
+        assert_eq!(id.user_id, "AIDEXAMPLE");
     }
 
     #[test]
-    fn client_base_url_no_trailing_slash() {
-        let client = AwsSecretsManagerClient::with_urls(
-            "http://localhost:4566",
-            "http://localhost:4566",
-            "us-east-1",
-        )
-        .unwrap();
-        assert_eq!(client.sm_base_url, "http://localhost:4566");
-    }
-
-    #[test]
-    fn user_agent_contains_version() {
-        let ua = AwsSecretsManagerClient::user_agent();
-        assert!(ua.starts_with("opaqued/"));
-    }
-
-    #[test]
-    fn client_region() {
-        let client = AwsSecretsManagerClient::with_urls(
-            "http://localhost:4566",
-            "http://localhost:4566",
-            "eu-west-1",
-        )
-        .unwrap();
-        assert_eq!(client.region(), "eu-west-1");
-    }
-
-    #[test]
-    fn aws_secret_deserialize() {
-        let json = r#"{"Name":"prod/db-password","ARN":"arn:aws:secretsmanager:us-east-1:123:secret:prod/db-password","Description":"Production DB password"}"#;
-        let secret: AwsSecret = serde_json::from_str(json).unwrap();
-        assert_eq!(secret.name, "prod/db-password");
-        assert!(secret.arn.is_some());
-        assert_eq!(
-            secret.description.as_deref(),
-            Some("Production DB password")
-        );
-    }
-
-    #[test]
-    fn aws_secret_deserialize_minimal() {
-        let json = r#"{"Name":"my-secret"}"#;
-        let secret: AwsSecret = serde_json::from_str(json).unwrap();
-        assert_eq!(secret.name, "my-secret");
-        assert!(secret.arn.is_none());
-        assert!(secret.description.is_none());
-    }
-
-    #[test]
-    fn aws_secret_value_deserialize() {
+    fn assumed_role_credentials_deserialize() {
         let json = r#"{
-            "Name": "prod/db-password",
-            "ARN": "arn:aws:secretsmanager:us-east-1:123:secret:prod/db-password",
+            "AccessKeyId": "ASIAEXAMPLE",
+            "SecretAccessKey": "secret123",
+            "SessionToken": "token456",
+            "Expiration": "2026-01-01T00:00:00Z"
+        }"#;
+        let creds: AssumedRoleCredentials = serde_json::from_str(json).unwrap();
+        assert_eq!(creds.access_key_id, "ASIAEXAMPLE");
+        assert_eq!(creds.secret_access_key, "secret123");
+        assert_eq!(creds.session_token, "token456");
+        assert_eq!(creds.expiration, "2026-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn secret_value_deserialize() {
+        let json = r#"{
+            "ARN": "arn:aws:secretsmanager:us-east-1:123456789012:secret:test-abc123",
+            "Name": "test-secret",
             "SecretString": "supersecret",
             "VersionId": "v1"
         }"#;
-        let sv: AwsSecretValue = serde_json::from_str(json).unwrap();
-        assert_eq!(sv.name, "prod/db-password");
+        let sv: SecretValue = serde_json::from_str(json).unwrap();
+        assert_eq!(sv.name, "test-secret");
         assert_eq!(sv.secret_string.as_deref(), Some("supersecret"));
         assert_eq!(sv.version_id.as_deref(), Some("v1"));
     }
 
     #[test]
-    fn aws_secret_value_deserialize_minimal() {
-        let json = r#"{"Name": "my-secret"}"#;
-        let sv: AwsSecretValue = serde_json::from_str(json).unwrap();
-        assert_eq!(sv.name, "my-secret");
+    fn secret_value_deserialize_minimal() {
+        let json = r#"{"Name": "test"}"#;
+        let sv: SecretValue = serde_json::from_str(json).unwrap();
+        assert_eq!(sv.name, "test");
         assert!(sv.secret_string.is_none());
         assert!(sv.arn.is_none());
-        assert!(sv.version_id.is_none());
     }
 
     #[test]
-    fn aws_secret_description_deserialize() {
-        let json = r#"{
-            "Name": "prod/db-password",
-            "ARN": "arn:aws:secretsmanager:us-east-1:123:secret:prod/db-password",
-            "Description": "Production DB password",
-            "LastChangedDate": 1700000000.0,
-            "LastAccessedDate": 1700086400.0
-        }"#;
-        let desc: AwsSecretDescription = serde_json::from_str(json).unwrap();
-        assert_eq!(desc.name, "prod/db-password");
-        assert_eq!(desc.description.as_deref(), Some("Production DB password"));
-        assert!(desc.last_changed_date.is_some());
-        assert!(desc.last_accessed_date.is_some());
-    }
-
-    #[test]
-    fn ssm_parameter_deserialize() {
-        let json = r#"{
-            "Name": "/app/config/db-url",
-            "Value": "postgres://localhost:5432/mydb",
-            "Type": "SecureString",
-            "Version": 3
-        }"#;
-        let param: SsmParameter = serde_json::from_str(json).unwrap();
-        assert_eq!(param.name, "/app/config/db-url");
-        assert_eq!(
-            param.value.as_deref(),
-            Some("postgres://localhost:5432/mydb")
-        );
-        assert_eq!(param.parameter_type.as_deref(), Some("SecureString"));
-        assert_eq!(param.version, Some(3));
-    }
-
-    #[test]
-    fn ssm_parameter_deserialize_minimal() {
-        let json = r#"{"Name": "/my/param"}"#;
-        let param: SsmParameter = serde_json::from_str(json).unwrap();
-        assert_eq!(param.name, "/my/param");
-        assert!(param.value.is_none());
-        assert!(param.parameter_type.is_none());
-        assert!(param.version.is_none());
+    fn secret_summary_deserialize() {
+        let json = r#"{"Name": "prod/db", "ARN": "arn:...", "Description": "Production DB"}"#;
+        let s: SecretSummary = serde_json::from_str(json).unwrap();
+        assert_eq!(s.name, "prod/db");
+        assert_eq!(s.description.as_deref(), Some("Production DB"));
     }
 
     #[test]
     fn list_secrets_response_deserialize() {
         let json = r#"{
             "SecretList": [
-                {"Name": "secret-1", "ARN": "arn:1"},
-                {"Name": "secret-2"}
+                {"Name": "secret-a", "Description": "First"},
+                {"Name": "secret-b"}
             ]
         }"#;
         let resp: ListSecretsResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.secret_list.len(), 2);
-        assert_eq!(resp.secret_list[0].name, "secret-1");
-        assert_eq!(resp.secret_list[1].name, "secret-2");
+        assert_eq!(resp.secret_list[0].name, "secret-a");
+        assert_eq!(resp.secret_list[1].name, "secret-b");
+        assert!(resp.next_token.is_none());
     }
 
     #[test]
-    fn list_secrets_response_deserialize_empty() {
-        let json = r#"{"SecretList": []}"#;
-        let resp: ListSecretsResponse = serde_json::from_str(json).unwrap();
-        assert!(resp.secret_list.is_empty());
+    fn create_secret_response_deserialize() {
+        let json = r#"{"Name": "new-secret", "ARN": "arn:...", "VersionId": "v1"}"#;
+        let resp: CreateSecretResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.name, "new-secret");
+        assert_eq!(resp.version_id.as_deref(), Some("v1"));
+    }
+
+    #[test]
+    fn ssm_parameter_deserialize() {
+        let json = r#"{
+            "Name": "/app/config",
+            "Type": "SecureString",
+            "Value": "secret-config",
+            "Version": 3,
+            "ARN": "arn:aws:ssm:us-east-1:123:parameter/app/config"
+        }"#;
+        let p: SsmParameter = serde_json::from_str(json).unwrap();
+        assert_eq!(p.name, "/app/config");
+        assert_eq!(p.parameter_type.as_deref(), Some("SecureString"));
+        assert_eq!(p.value.as_deref(), Some("secret-config"));
+        assert_eq!(p.version, Some(3));
     }
 
     #[test]
     fn get_parameter_response_deserialize() {
         let json = r#"{
             "Parameter": {
-                "Name": "/app/key",
-                "Value": "myvalue",
+                "Name": "/myapp/key",
                 "Type": "String",
-                "Version": 1
+                "Value": "hello"
             }
         }"#;
         let resp: GetParameterResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.parameter.name, "/app/key");
-        assert_eq!(resp.parameter.value.as_deref(), Some("myvalue"));
+        assert_eq!(resp.parameter.name, "/myapp/key");
+        assert_eq!(resp.parameter.value.as_deref(), Some("hello"));
     }
 
     #[test]
-    fn put_secret_value_response_deserialize() {
-        let json = r#"{"Name": "my-secret", "ARN": "arn:1", "VersionId": "v2"}"#;
-        let resp: PutSecretValueResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.name, "my-secret");
-        assert_eq!(resp.version_id.as_deref(), Some("v2"));
-    }
-
-    #[test]
-    fn put_parameter_response_deserialize() {
-        let json = r#"{"Version": 5}"#;
-        let resp: PutParameterResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.version, Some(5));
+    fn get_parameters_by_path_response_deserialize() {
+        let json = r#"{
+            "Parameters": [
+                {"Name": "/app/key1", "Value": "val1"},
+                {"Name": "/app/key2", "Value": "val2"}
+            ]
+        }"#;
+        let resp: GetParametersByPathResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.parameters.len(), 2);
+        assert_eq!(resp.parameters[0].name, "/app/key1");
+        assert_eq!(resp.parameters[1].name, "/app/key2");
     }
 
     #[test]
     fn aws_api_error_display() {
-        let err = AwsApiError::AuthError;
+        let err = AwsApiError::Unauthorized;
         assert!(format!("{err}").contains("authentication failed"));
 
         let err = AwsApiError::NotFound("secret 'test'".into());
         assert!(format!("{err}").contains("not found"));
-
-        let err = AwsApiError::AccessDenied("list_secrets".into());
-        assert!(format!("{err}").contains("access denied"));
 
         let err = AwsApiError::ServerError;
         assert!(format!("{err}").contains("server error"));
@@ -733,166 +850,191 @@ mod tests {
         let err = AwsApiError::UnexpectedStatus(418);
         assert!(format!("{err}").contains("418"));
 
-        let err = AwsApiError::InvalidUrl("bad://url".into());
-        assert!(format!("{err}").contains("invalid URL"));
+        let err = AwsApiError::BadRequest("invalid params".into());
+        assert!(format!("{err}").contains("rejected"));
 
-        let err = AwsApiError::CliError("aws not found".into());
-        assert!(format!("{err}").contains("CLI error"));
+        let err = AwsApiError::ParseError("bad json".into());
+        assert!(format!("{err}").contains("parse error"));
     }
 
     #[test]
-    fn validate_url_scheme_accepts_https() {
-        validate_url_scheme("https://secretsmanager.us-east-1.amazonaws.com").unwrap();
+    fn client_stores_urls_trimmed() {
+        let client = AwsClient::new(
+            "http://localhost:8080/",
+            "http://localhost:8081/",
+            "http://localhost:8082/",
+        );
+        assert_eq!(client.sts_url, "http://localhost:8080");
+        assert_eq!(client.secretsmanager_url, "http://localhost:8081");
+        assert_eq!(client.ssm_url, "http://localhost:8082");
     }
 
     #[test]
-    fn validate_url_scheme_accepts_localhost_http() {
-        validate_url_scheme("http://localhost:4566").unwrap();
-        validate_url_scheme("http://127.0.0.1:4566").unwrap();
+    fn client_single_url() {
+        let client = AwsClient::new_single("http://localhost:9000");
+        assert_eq!(client.sts_url, "http://localhost:9000");
+        assert_eq!(client.secretsmanager_url, "http://localhost:9000");
+        assert_eq!(client.ssm_url, "http://localhost:9000");
     }
 
     #[test]
-    fn validate_url_scheme_rejects_remote_http() {
-        let err = validate_url_scheme("http://secretsmanager.us-east-1.amazonaws.com").unwrap_err();
-        assert!(matches!(err, AwsApiError::InvalidUrl(_)));
-        assert!(format!("{err}").contains("insecure HTTP URL rejected"));
-    }
-
-    #[test]
-    fn validate_url_scheme_rejects_ftp() {
-        let err = validate_url_scheme("ftp://example.com/file").unwrap_err();
-        assert!(matches!(err, AwsApiError::InvalidUrl(_)));
-        assert!(format!("{err}").contains("unsupported URL scheme"));
-    }
-
-    #[test]
-    fn test_credentials_creation() {
-        let creds = AwsCredentials::test("test-auth");
-        assert_eq!(creds.authorization, "test-auth");
-        assert_eq!(creds.amz_date, "20260101T000000Z");
-    }
-
-    #[test]
-    fn days_to_ymd_epoch() {
-        let (y, m, d) = days_to_ymd(0);
-        assert_eq!((y, m, d), (1970, 1, 1));
-    }
-
-    #[test]
-    fn days_to_ymd_known_date() {
-        // 2026-02-24 is day 20508 since epoch.
-        let (y, m, d) = days_to_ymd(20508);
-        assert_eq!((y, m, d), (2026, 2, 24));
+    fn user_agent_contains_version() {
+        let ua = AwsClient::user_agent();
+        assert!(ua.starts_with("opaqued/"));
     }
 
     #[test]
     fn map_status_codes() {
+        assert!(matches!(map_status(400, "x"), AwsApiError::BadRequest(_)));
+        assert!(matches!(map_status(401, "x"), AwsApiError::Unauthorized));
+        assert!(matches!(map_status(403, "x"), AwsApiError::Unauthorized));
+        assert!(matches!(map_status(404, "x"), AwsApiError::NotFound(_)));
+        assert!(matches!(map_status(500, "x"), AwsApiError::ServerError));
+        assert!(matches!(map_status(503, "x"), AwsApiError::ServerError));
         assert!(matches!(
-            AwsSecretsManagerClient::map_status(401, "test"),
-            AwsApiError::AccessDenied(_)
-        ));
-        assert!(matches!(
-            AwsSecretsManagerClient::map_status(403, "test"),
-            AwsApiError::AccessDenied(_)
-        ));
-        assert!(matches!(
-            AwsSecretsManagerClient::map_status(400, "test"),
-            AwsApiError::AuthError
-        ));
-        assert!(matches!(
-            AwsSecretsManagerClient::map_status(404, "test"),
-            AwsApiError::NotFound(_)
-        ));
-        assert!(matches!(
-            AwsSecretsManagerClient::map_status(500, "test"),
-            AwsApiError::ServerError
-        ));
-        assert!(matches!(
-            AwsSecretsManagerClient::map_status(503, "test"),
-            AwsApiError::ServerError
-        ));
-        assert!(matches!(
-            AwsSecretsManagerClient::map_status(418, "test"),
+            map_status(418, "x"),
             AwsApiError::UnexpectedStatus(418)
         ));
+    }
+
+    #[test]
+    fn validate_url_scheme_accepts_https() {
+        validate_url_scheme("https://sts.amazonaws.com");
+    }
+
+    #[test]
+    fn validate_url_scheme_accepts_localhost_http() {
+        validate_url_scheme("http://localhost:8080");
+        validate_url_scheme("http://127.0.0.1:9000");
+    }
+
+    #[test]
+    #[should_panic(expected = "insecure HTTP URL rejected")]
+    fn validate_url_scheme_rejects_remote_http() {
+        validate_url_scheme("http://sts.amazonaws.com");
+    }
+
+    #[test]
+    #[should_panic(expected = "unsupported URL scheme")]
+    fn validate_url_scheme_rejects_ftp() {
+        validate_url_scheme("ftp://example.com/file");
     }
 
     // -----------------------------------------------------------------------
     // Integration tests using wiremock
     // -----------------------------------------------------------------------
 
-    use wiremock::matchers::{body_partial_json, header, method};
+    use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
-    async fn list_secrets_success() {
+    async fn get_caller_identity_success() {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(header("X-Amz-Target", "secretsmanager.ListSecrets"))
-            .and(header("Authorization", "test-auth"))
+            .and(path("/"))
+            .and(header(
+                "X-Amz-Target",
+                "AWSSecurityTokenServiceV20110615.GetCallerIdentity",
+            ))
+            .and(header("X-Amz-Access-Key", "AKIAIOSFODNN7EXAMPLE"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "SecretList": [
-                    {"Name": "prod/db-password", "ARN": "arn:1", "Description": "DB password"},
-                    {"Name": "prod/api-key"}
-                ]
+                "Account": "123456789012",
+                "Arn": "arn:aws:iam::123456789012:user/testuser",
+                "UserId": "AIDEXAMPLE"
             })))
             .expect(1)
             .mount(&mock_server)
             .await;
 
-        let client =
-            AwsSecretsManagerClient::with_urls(&mock_server.uri(), &mock_server.uri(), "us-east-1")
-                .unwrap();
-        let creds = AwsCredentials::test("test-auth");
-        let secrets = client.list_secrets(&creds).await.unwrap();
+        let client = AwsClient::new_single(&mock_server.uri());
+        let identity = client
+            .get_caller_identity("AKIAIOSFODNN7EXAMPLE", "secret")
+            .await
+            .unwrap();
 
-        assert_eq!(secrets.len(), 2);
-        assert_eq!(secrets[0].name, "prod/db-password");
-        assert_eq!(secrets[0].description.as_deref(), Some("DB password"));
-        assert_eq!(secrets[1].name, "prod/api-key");
+        assert_eq!(identity.account, "123456789012");
+        assert_eq!(identity.arn, "arn:aws:iam::123456789012:user/testuser");
+        assert_eq!(identity.user_id, "AIDEXAMPLE");
     }
 
     #[tokio::test]
-    async fn list_secrets_access_denied() {
+    async fn get_caller_identity_unauthorized() {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(header("X-Amz-Target", "secretsmanager.ListSecrets"))
+            .and(path("/"))
+            .and(header(
+                "X-Amz-Target",
+                "AWSSecurityTokenServiceV20110615.GetCallerIdentity",
+            ))
             .respond_with(ResponseTemplate::new(403))
             .expect(1)
             .mount(&mock_server)
             .await;
 
-        let client =
-            AwsSecretsManagerClient::with_urls(&mock_server.uri(), &mock_server.uri(), "us-east-1")
-                .unwrap();
-        let creds = AwsCredentials::test("bad-auth");
-        let result = client.list_secrets(&creds).await;
+        let client = AwsClient::new_single(&mock_server.uri());
+        let result = client.get_caller_identity("bad-key", "bad-secret").await;
 
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), AwsApiError::AccessDenied(_)));
+        assert!(matches!(result.unwrap_err(), AwsApiError::Unauthorized));
     }
 
     #[tokio::test]
-    async fn list_secrets_server_error() {
+    async fn assume_role_success() {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(header("X-Amz-Target", "secretsmanager.ListSecrets"))
-            .respond_with(ResponseTemplate::new(500))
+            .and(path("/"))
+            .and(header(
+                "X-Amz-Target",
+                "AWSSecurityTokenServiceV20110615.AssumeRole",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Credentials": {
+                    "AccessKeyId": "ASIAEXAMPLE",
+                    "SecretAccessKey": "newsecret",
+                    "SessionToken": "FwoGZX...",
+                    "Expiration": "2026-02-25T00:00:00Z"
+                }
+            })))
             .expect(1)
             .mount(&mock_server)
             .await;
 
-        let client =
-            AwsSecretsManagerClient::with_urls(&mock_server.uri(), &mock_server.uri(), "us-east-1")
-                .unwrap();
-        let creds = AwsCredentials::test("test-auth");
-        let result = client.list_secrets(&creds).await;
+        let client = AwsClient::new_single(&mock_server.uri());
+        let creds = client
+            .assume_role("AKID", "secret", "arn:aws:iam::123:role/test", "session1")
+            .await
+            .unwrap();
+
+        assert_eq!(creds.access_key_id, "ASIAEXAMPLE");
+        assert_eq!(creds.secret_access_key, "newsecret");
+        assert_eq!(creds.session_token, "FwoGZX...");
+    }
+
+    #[tokio::test]
+    async fn assume_role_forbidden() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(header(
+                "X-Amz-Target",
+                "AWSSecurityTokenServiceV20110615.AssumeRole",
+            ))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = AwsClient::new_single(&mock_server.uri());
+        let result = client
+            .assume_role("AKID", "secret", "arn:aws:iam::123:role/nope", "s1")
+            .await;
 
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), AwsApiError::ServerError));
+        assert!(matches!(result.unwrap_err(), AwsApiError::Unauthorized));
     }
 
     #[tokio::test]
@@ -900,33 +1042,26 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
+            .and(path("/"))
             .and(header("X-Amz-Target", "secretsmanager.GetSecretValue"))
-            .and(header("Authorization", "test-auth"))
-            .and(body_partial_json(
-                serde_json::json!({"SecretId": "prod/db-password"}),
-            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "Name": "prod/db-password",
-                "ARN": "arn:1",
-                "SecretString": "supersecret123",
+                "ARN": "arn:aws:secretsmanager:us-east-1:123:secret:prod/db-abc123",
+                "Name": "prod/db",
+                "SecretString": "{\"username\":\"admin\",\"password\":\"s3cr3t\"}",
                 "VersionId": "v1"
             })))
             .expect(1)
             .mount(&mock_server)
             .await;
 
-        let client =
-            AwsSecretsManagerClient::with_urls(&mock_server.uri(), &mock_server.uri(), "us-east-1")
-                .unwrap();
-        let creds = AwsCredentials::test("test-auth");
+        let client = AwsClient::new_single(&mock_server.uri());
         let sv = client
-            .get_secret_value(&creds, "prod/db-password")
+            .get_secret_value("AKID", "secret", "prod/db")
             .await
             .unwrap();
 
-        assert_eq!(sv.name, "prod/db-password");
-        assert_eq!(sv.secret_string.as_deref(), Some("supersecret123"));
-        assert_eq!(sv.version_id.as_deref(), Some("v1"));
+        assert_eq!(sv.name, "prod/db");
+        assert!(sv.secret_string.as_deref().unwrap().contains("admin"));
     }
 
     #[tokio::test]
@@ -934,20 +1069,49 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
+            .and(path("/"))
             .and(header("X-Amz-Target", "secretsmanager.GetSecretValue"))
             .respond_with(ResponseTemplate::new(404))
             .expect(1)
             .mount(&mock_server)
             .await;
 
-        let client =
-            AwsSecretsManagerClient::with_urls(&mock_server.uri(), &mock_server.uri(), "us-east-1")
-                .unwrap();
-        let creds = AwsCredentials::test("test-auth");
-        let result = client.get_secret_value(&creds, "missing").await;
+        let client = AwsClient::new_single(&mock_server.uri());
+        let result = client.get_secret_value("AKID", "secret", "missing").await;
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), AwsApiError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn create_secret_success() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(header("X-Amz-Target", "secretsmanager.CreateSecret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ARN": "arn:aws:secretsmanager:us-east-1:123:secret:new-abc",
+                "Name": "new-secret",
+                "VersionId": "v1"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = AwsClient::new_single(&mock_server.uri());
+        let resp = client
+            .create_secret(
+                "AKID",
+                "secret",
+                "new-secret",
+                "value123",
+                Some("A test secret"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.name, "new-secret");
     }
 
     #[tokio::test]
@@ -955,103 +1119,108 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
+            .and(path("/"))
             .and(header("X-Amz-Target", "secretsmanager.PutSecretValue"))
-            .and(header("Authorization", "test-auth"))
-            .and(body_partial_json(serde_json::json!({
-                "SecretId": "prod/db-password",
-                "SecretString": "newvalue"
-            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "Name": "prod/db-password",
-                "ARN": "arn:1",
+                "ARN": "arn:...",
+                "Name": "my-secret",
                 "VersionId": "v2"
             })))
             .expect(1)
             .mount(&mock_server)
             .await;
 
-        let client =
-            AwsSecretsManagerClient::with_urls(&mock_server.uri(), &mock_server.uri(), "us-east-1")
-                .unwrap();
-        let creds = AwsCredentials::test("test-auth");
-        let resp = client
-            .put_secret_value(&creds, "prod/db-password", "newvalue")
+        let client = AwsClient::new_single(&mock_server.uri());
+        client
+            .put_secret_value("AKID", "secret", "my-secret", "new-value")
             .await
             .unwrap();
-
-        assert_eq!(resp.name, "prod/db-password");
-        assert_eq!(resp.version_id.as_deref(), Some("v2"));
     }
 
     #[tokio::test]
-    async fn put_secret_value_not_found() {
+    async fn list_secrets_success() {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(header("X-Amz-Target", "secretsmanager.PutSecretValue"))
-            .respond_with(ResponseTemplate::new(404))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let client =
-            AwsSecretsManagerClient::with_urls(&mock_server.uri(), &mock_server.uri(), "us-east-1")
-                .unwrap();
-        let creds = AwsCredentials::test("test-auth");
-        let result = client.put_secret_value(&creds, "missing", "val").await;
-
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), AwsApiError::NotFound(_)));
-    }
-
-    #[tokio::test]
-    async fn describe_secret_success() {
-        let mock_server = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(header("X-Amz-Target", "secretsmanager.DescribeSecret"))
-            .and(header("Authorization", "test-auth"))
+            .and(path("/"))
+            .and(header("X-Amz-Target", "secretsmanager.ListSecrets"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "Name": "prod/db-password",
-                "ARN": "arn:1",
-                "Description": "Production DB password",
-                "LastChangedDate": 1700000000.0,
-                "LastAccessedDate": 1700086400.0
+                "SecretList": [
+                    {"Name": "prod/db", "Description": "Production DB"},
+                    {"Name": "prod/api-key"}
+                ]
             })))
             .expect(1)
             .mount(&mock_server)
             .await;
 
-        let client =
-            AwsSecretsManagerClient::with_urls(&mock_server.uri(), &mock_server.uri(), "us-east-1")
-                .unwrap();
-        let creds = AwsCredentials::test("test-auth");
-        let desc = client
-            .describe_secret(&creds, "prod/db-password")
-            .await
-            .unwrap();
+        let client = AwsClient::new_single(&mock_server.uri());
+        let resp = client.list_secrets("AKID", "secret").await.unwrap();
 
-        assert_eq!(desc.name, "prod/db-password");
-        assert_eq!(desc.description.as_deref(), Some("Production DB password"));
-        assert!(desc.last_changed_date.is_some());
+        assert_eq!(resp.secret_list.len(), 2);
+        assert_eq!(resp.secret_list[0].name, "prod/db");
+        assert_eq!(
+            resp.secret_list[0].description.as_deref(),
+            Some("Production DB")
+        );
     }
 
     #[tokio::test]
-    async fn describe_secret_not_found() {
+    async fn list_secrets_auth_failure() {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(header("X-Amz-Target", "secretsmanager.DescribeSecret"))
+            .and(path("/"))
+            .and(header("X-Amz-Target", "secretsmanager.ListSecrets"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = AwsClient::new_single(&mock_server.uri());
+        let result = client.list_secrets("bad", "bad").await;
+
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), AwsApiError::Unauthorized));
+    }
+
+    #[tokio::test]
+    async fn delete_secret_success() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(header("X-Amz-Target", "secretsmanager.DeleteSecret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ARN": "arn:...",
+                "Name": "old-secret",
+                "DeletionDate": "2026-03-01T00:00:00Z"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = AwsClient::new_single(&mock_server.uri());
+        client
+            .delete_secret("AKID", "secret", "old-secret")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_secret_not_found() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(header("X-Amz-Target", "secretsmanager.DeleteSecret"))
             .respond_with(ResponseTemplate::new(404))
             .expect(1)
             .mount(&mock_server)
             .await;
 
-        let client =
-            AwsSecretsManagerClient::with_urls(&mock_server.uri(), &mock_server.uri(), "us-east-1")
-                .unwrap();
-        let creds = AwsCredentials::test("test-auth");
-        let result = client.describe_secret(&creds, "missing").await;
+        let client = AwsClient::new_single(&mock_server.uri());
+        let result = client.delete_secret("AKID", "secret", "missing").await;
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), AwsApiError::NotFound(_)));
@@ -1062,39 +1231,30 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
+            .and(path("/"))
             .and(header("X-Amz-Target", "AmazonSSM.GetParameter"))
-            .and(header("Authorization", "test-auth"))
-            .and(body_partial_json(
-                serde_json::json!({"Name": "/app/config/db-url"}),
-            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "Parameter": {
-                    "Name": "/app/config/db-url",
-                    "Value": "postgres://localhost:5432/mydb",
+                    "Name": "/myapp/db_password",
                     "Type": "SecureString",
-                    "Version": 3
+                    "Value": "secret123",
+                    "Version": 2
                 }
             })))
             .expect(1)
             .mount(&mock_server)
             .await;
 
-        let client =
-            AwsSecretsManagerClient::with_urls(&mock_server.uri(), &mock_server.uri(), "us-east-1")
-                .unwrap();
-        let creds = AwsCredentials::test("test-auth");
+        let client = AwsClient::new_single(&mock_server.uri());
         let param = client
-            .get_parameter(&creds, "/app/config/db-url")
+            .get_parameter("AKID", "secret", "/myapp/db_password", true)
             .await
             .unwrap();
 
-        assert_eq!(param.name, "/app/config/db-url");
-        assert_eq!(
-            param.value.as_deref(),
-            Some("postgres://localhost:5432/mydb")
-        );
+        assert_eq!(param.name, "/myapp/db_password");
+        assert_eq!(param.value.as_deref(), Some("secret123"));
         assert_eq!(param.parameter_type.as_deref(), Some("SecureString"));
-        assert_eq!(param.version, Some(3));
+        assert_eq!(param.version, Some(2));
     }
 
     #[tokio::test]
@@ -1102,17 +1262,17 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
+            .and(path("/"))
             .and(header("X-Amz-Target", "AmazonSSM.GetParameter"))
             .respond_with(ResponseTemplate::new(404))
             .expect(1)
             .mount(&mock_server)
             .await;
 
-        let client =
-            AwsSecretsManagerClient::with_urls(&mock_server.uri(), &mock_server.uri(), "us-east-1")
-                .unwrap();
-        let creds = AwsCredentials::test("test-auth");
-        let result = client.get_parameter(&creds, "/missing/param").await;
+        let client = AwsClient::new_single(&mock_server.uri());
+        let result = client
+            .get_parameter("AKID", "secret", "/missing/param", true)
+            .await;
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), AwsApiError::NotFound(_)));
@@ -1123,53 +1283,112 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
+            .and(path("/"))
             .and(header("X-Amz-Target", "AmazonSSM.PutParameter"))
-            .and(header("Authorization", "test-auth"))
-            .and(body_partial_json(serde_json::json!({
-                "Name": "/app/config/db-url",
-                "Value": "newvalue",
-                "Type": "SecureString"
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Version": 1
             })))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"Version": 4})),
-            )
             .expect(1)
             .mount(&mock_server)
             .await;
 
-        let client =
-            AwsSecretsManagerClient::with_urls(&mock_server.uri(), &mock_server.uri(), "us-east-1")
-                .unwrap();
-        let creds = AwsCredentials::test("test-auth");
-        let resp = client
-            .put_parameter(&creds, "/app/config/db-url", "newvalue", "SecureString")
+        let client = AwsClient::new_single(&mock_server.uri());
+        client
+            .put_parameter(
+                "AKID",
+                "secret",
+                "/myapp/key",
+                "value",
+                "SecureString",
+                false,
+            )
             .await
             .unwrap();
-
-        assert_eq!(resp.version, Some(4));
     }
 
     #[tokio::test]
-    async fn put_parameter_access_denied() {
+    async fn get_parameters_by_path_success() {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(header("X-Amz-Target", "AmazonSSM.PutParameter"))
-            .respond_with(ResponseTemplate::new(403))
+            .and(path("/"))
+            .and(header("X-Amz-Target", "AmazonSSM.GetParametersByPath"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Parameters": [
+                    {"Name": "/app/key1", "Type": "String", "Value": "val1"},
+                    {"Name": "/app/key2", "Type": "SecureString", "Value": "val2"}
+                ]
+            })))
             .expect(1)
             .mount(&mock_server)
             .await;
 
-        let client =
-            AwsSecretsManagerClient::with_urls(&mock_server.uri(), &mock_server.uri(), "us-east-1")
-                .unwrap();
-        let creds = AwsCredentials::test("test-auth");
-        let result = client
-            .put_parameter(&creds, "/app/key", "val", "String")
+        let client = AwsClient::new_single(&mock_server.uri());
+        let resp = client
+            .get_parameters_by_path("AKID", "secret", "/app/", true)
+            .await
+            .unwrap();
+
+        assert_eq!(resp.parameters.len(), 2);
+        assert_eq!(resp.parameters[0].name, "/app/key1");
+        assert_eq!(resp.parameters[1].name, "/app/key2");
+    }
+
+    #[tokio::test]
+    async fn delete_parameter_success() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(header("X-Amz-Target", "AmazonSSM.DeleteParameter"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&mock_server)
             .await;
 
+        let client = AwsClient::new_single(&mock_server.uri());
+        client
+            .delete_parameter("AKID", "secret", "/myapp/old")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_parameter_not_found() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(header("X-Amz-Target", "AmazonSSM.DeleteParameter"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = AwsClient::new_single(&mock_server.uri());
+        let result = client.delete_parameter("AKID", "secret", "/missing").await;
+
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), AwsApiError::AccessDenied(_)));
+        assert!(matches!(result.unwrap_err(), AwsApiError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn server_error_handled() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(header("X-Amz-Target", "secretsmanager.ListSecrets"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = AwsClient::new_single(&mock_server.uri());
+        let result = client.list_secrets("AKID", "secret").await;
+
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), AwsApiError::ServerError));
     }
 
     #[tokio::test]
@@ -1177,17 +1396,15 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
+            .and(path("/"))
             .and(header("X-Amz-Target", "secretsmanager.ListSecrets"))
-            .respond_with(ResponseTemplate::new(418)) // I'm a teapot
+            .respond_with(ResponseTemplate::new(418))
             .expect(1)
             .mount(&mock_server)
             .await;
 
-        let client =
-            AwsSecretsManagerClient::with_urls(&mock_server.uri(), &mock_server.uri(), "us-east-1")
-                .unwrap();
-        let creds = AwsCredentials::test("test-auth");
-        let result = client.list_secrets(&creds).await;
+        let client = AwsClient::new_single(&mock_server.uri());
+        let result = client.list_secrets("AKID", "secret").await;
 
         assert!(matches!(
             result.unwrap_err(),
@@ -1195,69 +1412,25 @@ mod tests {
         ));
     }
 
+    /// Verify the user-agent header is sent.
     #[tokio::test]
     async fn user_agent_header_sent() {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(header("X-Amz-Target", "secretsmanager.ListSecrets"))
+            .and(path("/"))
             .and(header(
                 "user-agent",
                 &format!("opaqued/{}", env!("CARGO_PKG_VERSION")),
             ))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"SecretList": []})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "SecretList": []
+            })))
             .expect(1)
             .mount(&mock_server)
             .await;
 
-        let client =
-            AwsSecretsManagerClient::with_urls(&mock_server.uri(), &mock_server.uri(), "us-east-1")
-                .unwrap();
-        let creds = AwsCredentials::test("test-auth");
-        client.list_secrets(&creds).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn auth_error_on_400() {
-        let mock_server = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(header("X-Amz-Target", "secretsmanager.ListSecrets"))
-            .respond_with(ResponseTemplate::new(400))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let client =
-            AwsSecretsManagerClient::with_urls(&mock_server.uri(), &mock_server.uri(), "us-east-1")
-                .unwrap();
-        let creds = AwsCredentials::test("bad-auth");
-        let result = client.list_secrets(&creds).await;
-
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), AwsApiError::AuthError));
-    }
-
-    #[tokio::test]
-    async fn content_type_header_sent() {
-        let mock_server = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(header("X-Amz-Target", "secretsmanager.ListSecrets"))
-            .and(header("Content-Type", "application/x-amz-json-1.1"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"SecretList": []})),
-            )
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let client =
-            AwsSecretsManagerClient::with_urls(&mock_server.uri(), &mock_server.uri(), "us-east-1")
-                .unwrap();
-        let creds = AwsCredentials::test("test-auth");
-        client.list_secrets(&creds).await.unwrap();
+        let client = AwsClient::new_single(&mock_server.uri());
+        client.list_secrets("AKID", "secret").await.unwrap();
     }
 }
