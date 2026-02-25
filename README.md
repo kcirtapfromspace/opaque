@@ -237,7 +237,6 @@ opaque policy preset github-secrets
 
 Key deferred items are tracked in architecture notes and release planning:
 
-- Vault dynamic secrets + lease lifecycle hardening
 - iOS approvals / FaceID
 - FIDO2 / WebAuthn approvals
 
