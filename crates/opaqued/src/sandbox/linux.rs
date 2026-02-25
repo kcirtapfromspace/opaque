@@ -738,6 +738,42 @@ async fn stream_output(
 mod tests {
     use super::*;
 
+    fn sandbox_backend_available_for_tests() -> bool {
+        if !cfg!(target_os = "linux") {
+            return false;
+        }
+
+        let caps = SandboxCapabilities::detect();
+
+        if caps.bubblewrap {
+            let bwrap_ok = std::process::Command::new("bwrap")
+                .args(["--ro-bind", "/", "/", "--", "true"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if bwrap_ok {
+                return true;
+            }
+        }
+
+        if caps.user_namespaces {
+            let unshare_ok = std::process::Command::new("unshare")
+                .args(["--user", "--", "true"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if unshare_ok {
+                return true;
+            }
+        }
+
+        false
+    }
+
     #[test]
     fn sandbox_error_display() {
         let err = SandboxError::Setup("test".into());
@@ -769,16 +805,9 @@ mod tests {
 
     #[tokio::test]
     async fn execute_simple_command() {
-        // This test requires Linux with unshare support.
-        // Skip on non-Linux or when unshare is not available.
-        if !cfg!(target_os = "linux") {
-            return;
-        }
-        if std::process::Command::new("unshare")
-            .arg("--help")
-            .output()
-            .is_err()
-        {
+        // Skip on hosts where sandbox backends are not executable
+        // (common in restricted CI environments).
+        if !sandbox_backend_available_for_tests() {
             return;
         }
 
@@ -813,14 +842,7 @@ mod tests {
 
     #[tokio::test]
     async fn env_vars_injected() {
-        if !cfg!(target_os = "linux") {
-            return;
-        }
-        if std::process::Command::new("unshare")
-            .arg("--help")
-            .output()
-            .is_err()
-        {
+        if !sandbox_backend_available_for_tests() {
             return;
         }
 
