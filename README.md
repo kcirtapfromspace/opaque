@@ -33,7 +33,7 @@ Out of scope for alpha:
 - Typestate-enforced response sanitization + secret-pattern scrubbing
 - Structured audit events (SQLite) with correlation IDs
 - MCP server for Claude Code integration
-- Providers: GitHub secrets, GitLab CI variables, 1Password, Bitwarden Secrets Manager, HashiCorp Vault, AWS Secrets Manager
+- Providers: GitHub secrets, GitLab CI variables, 1Password, Bitwarden Secrets Manager, HashiCorp Vault, AWS Secrets Manager, Azure Key Vault, GCP Secret Manager
 - Policy presets for common workflows
 
 ## Install
@@ -138,12 +138,32 @@ opaque agent run -- codex
      --value-ref keychain:opaque/api-key
    ```
 
+   GitHub OAuth bearer token mode (optional):
+   ```bash
+   opaque github set-secret \
+     --repo myorg/myrepo \
+     --secret-name API_KEY \
+     --value-ref keychain:opaque/api-key \
+     --github-auth-mode oauth \
+     --github-token-ref keychain:opaque/github-oauth-token
+   ```
+
    Sync a GitLab CI variable:
    ```bash
    opaque gitlab set-ci-variable \
      --project mygroup/myproject \
      --key API_KEY \
      --value-ref keychain:opaque/api-key
+   ```
+
+   OAuth bearer token mode (optional):
+   ```bash
+   opaque gitlab set-ci-variable \
+     --project mygroup/myproject \
+     --key API_KEY \
+     --value-ref keychain:opaque/api-key \
+     --gitlab-auth-mode oauth \
+     --gitlab-token-ref keychain:opaque/gitlab-oauth-token
    ```
 
 5. Build a refs-only manifest from `.env.example` and publish through Opaque:

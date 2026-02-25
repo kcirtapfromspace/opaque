@@ -72,11 +72,15 @@ The MCP server exposes only `SAFE` operations. Operations classified as `SENSITI
 | `opaque_github_list_secrets` | `github.list_secrets` | List secret names (no values) |
 | `opaque_github_delete_secret` | `github.delete_secret` | Delete a secret |
 
+GitHub tools accept optional `github_auth_mode` (`pat` default, `oauth` for bearer token auth).
+
 ### GitLab
 
 | Tool | Operation | Description |
 |------|-----------|-------------|
 | `opaque_gitlab_set_ci_variable` | `gitlab.set_ci_variable` | Set a project CI/CD variable (write-only) |
+
+`opaque_gitlab_set_ci_variable` accepts optional `gitlab_auth_mode` (`pat` default, `oauth` for bearer token auth).
 
 ### 1Password
 

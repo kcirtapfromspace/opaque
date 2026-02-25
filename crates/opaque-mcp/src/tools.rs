@@ -146,7 +146,12 @@ pub fn safe_tools() -> Vec<ToolDef> {
                     },
                     "github_token_ref": {
                         "type": "string",
-                        "description": "GitHub token ref (default: keychain:opaque/github-pat)"
+                        "description": "GitHub token ref (default: keychain:opaque/github-pat for pat mode, keychain:opaque/github-oauth-token for oauth mode)"
+                    },
+                    "github_auth_mode": {
+                        "type": "string",
+                        "enum": ["pat", "oauth"],
+                        "description": "GitHub auth mode (default: pat)"
                     },
                     "environment": {
                         "type": "string",
@@ -186,7 +191,12 @@ pub fn safe_tools() -> Vec<ToolDef> {
                     },
                     "github_token_ref": {
                         "type": "string",
-                        "description": "GitHub token ref"
+                        "description": "GitHub token ref (default varies by github_auth_mode)"
+                    },
+                    "github_auth_mode": {
+                        "type": "string",
+                        "enum": ["pat", "oauth"],
+                        "description": "GitHub auth mode (default: pat)"
                     },
                     "selected_repository_ids": {
                         "type": "array",
@@ -234,7 +244,12 @@ pub fn safe_tools() -> Vec<ToolDef> {
                     },
                     "github_token_ref": {
                         "type": "string",
-                        "description": "GitHub token ref"
+                        "description": "GitHub token ref (default varies by github_auth_mode)"
+                    },
+                    "github_auth_mode": {
+                        "type": "string",
+                        "enum": ["pat", "oauth"],
+                        "description": "GitHub auth mode (default: pat)"
                     }
                 }
             }),
@@ -266,7 +281,12 @@ pub fn safe_tools() -> Vec<ToolDef> {
                     },
                     "github_token_ref": {
                         "type": "string",
-                        "description": "GitHub token ref"
+                        "description": "GitHub token ref (default varies by github_auth_mode)"
+                    },
+                    "github_auth_mode": {
+                        "type": "string",
+                        "enum": ["pat", "oauth"],
+                        "description": "GitHub auth mode (default: pat)"
                     },
                     "visibility": {
                         "type": "string",
@@ -313,7 +333,12 @@ pub fn safe_tools() -> Vec<ToolDef> {
                     },
                     "github_token_ref": {
                         "type": "string",
-                        "description": "GitHub token ref"
+                        "description": "GitHub token ref (default varies by github_auth_mode)"
+                    },
+                    "github_auth_mode": {
+                        "type": "string",
+                        "enum": ["pat", "oauth"],
+                        "description": "GitHub auth mode (default: pat)"
                     }
                 }
             }),
@@ -354,7 +379,12 @@ pub fn safe_tools() -> Vec<ToolDef> {
                     },
                     "github_token_ref": {
                         "type": "string",
-                        "description": "GitHub token ref"
+                        "description": "GitHub token ref (default varies by github_auth_mode)"
+                    },
+                    "github_auth_mode": {
+                        "type": "string",
+                        "enum": ["pat", "oauth"],
+                        "description": "GitHub auth mode (default: pat)"
                     }
                 }
             }),
@@ -388,7 +418,12 @@ pub fn safe_tools() -> Vec<ToolDef> {
                     },
                     "gitlab_token_ref": {
                         "type": "string",
-                        "description": "GitLab token ref (default: keychain:opaque/gitlab-pat)"
+                        "description": "GitLab token ref (default: keychain:opaque/gitlab-pat for pat mode, keychain:opaque/gitlab-oauth-token for oauth mode)"
+                    },
+                    "gitlab_auth_mode": {
+                        "type": "string",
+                        "enum": ["pat", "oauth"],
+                        "description": "GitLab auth mode (default: pat)"
                     },
                     "environment_scope": {
                         "type": "string",
@@ -417,6 +452,150 @@ pub fn safe_tools() -> Vec<ToolDef> {
             build_params: |args| {
                 let mut params = args.clone();
                 params["action"] = json!("set_ci_variable");
+                params
+            },
+        },
+        // --- Azure operations (Safe only — get_secret is Reveal, excluded) ---
+        ToolDef {
+            name: "opaque_azure_list_secrets",
+            description: "List Azure Key Vault secrets (metadata only).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+            build_params: |_args| json!({ "action": "list_secrets" }),
+        },
+        ToolDef {
+            name: "opaque_azure_list_keys",
+            description: "List Azure Key Vault keys (metadata only).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+            build_params: |_args| json!({ "action": "list_keys" }),
+        },
+        ToolDef {
+            name: "opaque_azure_list_certificates",
+            description: "List Azure Key Vault certificates (metadata only).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+            build_params: |_args| json!({ "action": "list_certificates" }),
+        },
+        ToolDef {
+            name: "opaque_azure_set_secret",
+            description: "Set an Azure Key Vault secret from a secure value_ref via Opaque's approval-gated enclave.",
+            input_schema: json!({
+                "type": "object",
+                "required": ["name", "value_ref"],
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Secret name"
+                    },
+                    "value_ref": {
+                        "type": "string",
+                        "description": "Secret ref (e.g. keychain:opaque/my-secret)"
+                    }
+                }
+            }),
+            build_params: |args| {
+                let mut params = args.clone();
+                params["action"] = json!("set_secret");
+                params
+            },
+        },
+        // --- GCP operations (Safe only — access_secret_version is Reveal, excluded) ---
+        ToolDef {
+            name: "opaque_gcp_list_secrets",
+            description: "List GCP Secret Manager secrets in a project (metadata only).",
+            input_schema: json!({
+                "type": "object",
+                "required": ["project"],
+                "properties": {
+                    "project": {
+                        "type": "string",
+                        "description": "GCP project ID"
+                    }
+                }
+            }),
+            build_params: |args| {
+                let mut params = args.clone();
+                params["action"] = json!("list_secrets");
+                params
+            },
+        },
+        ToolDef {
+            name: "opaque_gcp_get_secret",
+            description: "Get GCP Secret Manager secret metadata (no secret values).",
+            input_schema: json!({
+                "type": "object",
+                "required": ["project", "secret_id"],
+                "properties": {
+                    "project": {
+                        "type": "string",
+                        "description": "GCP project ID"
+                    },
+                    "secret_id": {
+                        "type": "string",
+                        "description": "Secret ID"
+                    }
+                }
+            }),
+            build_params: |args| {
+                let mut params = args.clone();
+                params["action"] = json!("get_secret");
+                params
+            },
+        },
+        ToolDef {
+            name: "opaque_gcp_create_secret",
+            description: "Create a new GCP Secret Manager secret.",
+            input_schema: json!({
+                "type": "object",
+                "required": ["project", "secret_id"],
+                "properties": {
+                    "project": {
+                        "type": "string",
+                        "description": "GCP project ID"
+                    },
+                    "secret_id": {
+                        "type": "string",
+                        "description": "Secret ID"
+                    }
+                }
+            }),
+            build_params: |args| {
+                let mut params = args.clone();
+                params["action"] = json!("create_secret");
+                params
+            },
+        },
+        ToolDef {
+            name: "opaque_gcp_add_secret_version",
+            description: "Add a new version to an existing GCP Secret Manager secret from a secure value_ref.",
+            input_schema: json!({
+                "type": "object",
+                "required": ["project", "secret_id", "value_ref"],
+                "properties": {
+                    "project": {
+                        "type": "string",
+                        "description": "GCP project ID"
+                    },
+                    "secret_id": {
+                        "type": "string",
+                        "description": "Secret ID"
+                    },
+                    "value_ref": {
+                        "type": "string",
+                        "description": "Secret ref (e.g. keychain:opaque/my-secret)"
+                    }
+                }
+            }),
+            build_params: |args| {
+                let mut params = args.clone();
+                params["action"] = json!("add_secret_version");
                 params
             },
         },
@@ -566,6 +745,14 @@ pub fn tool_to_daemon_method(tool_name: &str) -> Option<&'static str> {
         ("opaque_github_list_secrets", "github"),
         ("opaque_github_delete_secret", "github"),
         ("opaque_gitlab_set_ci_variable", "gitlab"),
+        ("opaque_azure_list_secrets", "azure"),
+        ("opaque_azure_list_keys", "azure"),
+        ("opaque_azure_list_certificates", "azure"),
+        ("opaque_azure_set_secret", "azure"),
+        ("opaque_gcp_list_secrets", "gcp"),
+        ("opaque_gcp_get_secret", "gcp"),
+        ("opaque_gcp_create_secret", "gcp"),
+        ("opaque_gcp_add_secret_version", "gcp"),
         ("opaque_onepassword_list_vaults", "onepassword"),
         ("opaque_onepassword_list_items", "onepassword"),
         ("opaque_bitwarden_list_projects", "bitwarden"),
@@ -594,6 +781,8 @@ mod tests {
         let allowed_methods = [
             "github",
             "gitlab",
+            "azure",
+            "gcp",
             "onepassword",
             "bitwarden",
             "sandbox.exec",
@@ -644,7 +833,7 @@ mod tests {
     #[test]
     fn tool_count() {
         let tools = safe_tools();
-        assert_eq!(tools.len(), 14);
+        assert_eq!(tools.len(), 22);
     }
 
     #[test]

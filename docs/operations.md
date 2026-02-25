@@ -26,6 +26,8 @@ Operations that accept `value_ref` or `*_token_ref` support:
 - `onepassword:<vault>/<item>/<field>`
 - `bitwarden:<project>/<key>` or `bitwarden:<secret-id>`
 - `vault:<path>#<field>`
+- `azure:<vault>/<secret>` or `azure:<vault>/<secret>/<version>`
+- `gcp:<project>/<secret>` or `gcp:<project>/<secret>/<version>`
 
 ## Implemented Operations
 
@@ -74,7 +76,8 @@ Inputs:
 - `repo`: `owner/repo`
 - `secret_name`: secret name (ex: `AWS_ACCESS_KEY_ID`)
 - `value_ref`: secret reference (ex: `keychain:opaque/my-token`)
-- optional: `github_token_ref`: GitHub PAT ref (default: `keychain:opaque/github-pat`)
+- optional: `github_token_ref`: GitHub token ref (default: `keychain:opaque/github-pat` for `pat` mode, `keychain:opaque/github-oauth-token` for `oauth` mode)
+- optional: `github_auth_mode`: `"pat" | "oauth"` (default: `pat`)
 - optional: `environment`: when set, writes an Actions environment secret instead of a repo secret
 
 Result:
@@ -83,11 +86,13 @@ Result:
 - `repo`
 - optional: `environment`
 - `secret_name`
+- `auth_mode`: `pat` | `oauth`
 
 Notes:
 
 - Never return the secret value or its ciphertext.
 - For GitHub Enterprise Server or local testing, `opaqued` honors `OPAQUE_GITHUB_API_URL` as the API base URL.
+- `github_auth_mode` controls token-ref defaults; GitHub API calls use `Authorization: Bearer`.
 
 ### `github.set_codespaces_secret` (`SAFE`)
 
@@ -103,7 +108,8 @@ Inputs:
 - `secret_name`
 - `value_ref`
 - optional: `repo` (`owner/repo`) (when set, creates a repo-level Codespaces secret)
-- optional: `github_token_ref` (default: `keychain:opaque/github-pat`)
+- optional: `github_token_ref` (default: `keychain:opaque/github-pat` for `pat` mode, `keychain:opaque/github-oauth-token` for `oauth` mode)
+- optional: `github_auth_mode`: `"pat" | "oauth"` (default: `pat`)
 - optional: `selected_repository_ids` (user-level only; when omitted, GitHub defaults apply)
 
 Result:
@@ -112,6 +118,7 @@ Result:
 - `secret_name`
 - optional: `repo` (repo-level)
 - optional: `scope`: `"user"` (user-level)
+- `auth_mode`: `pat` | `oauth`
 
 Notes:
 
@@ -126,13 +133,15 @@ Inputs:
 - `repo`: `owner/repo`
 - `secret_name`
 - `value_ref`
-- optional: `github_token_ref`
+- optional: `github_token_ref` (default: `keychain:opaque/github-pat` for `pat` mode, `keychain:opaque/github-oauth-token` for `oauth` mode)
+- optional: `github_auth_mode`: `"pat" | "oauth"` (default: `pat`)
 
 Result:
 
 - `status`: `created` | `updated`
 - `repo`
 - `secret_name`
+- `auth_mode`: `pat` | `oauth`
 
 Notes:
 
@@ -147,7 +156,8 @@ Inputs:
 - `org`
 - `secret_name`
 - `value_ref`
-- optional: `github_token_ref`
+- optional: `github_token_ref` (default: `keychain:opaque/github-pat` for `pat` mode, `keychain:opaque/github-oauth-token` for `oauth` mode)
+- optional: `github_auth_mode`: `"pat" | "oauth"` (default: `pat`)
 - optional: `visibility`: `"all" | "private" | "selected"` (default: `"private"`)
 - optional: `selected_repository_ids` (when `visibility = "selected"`)
 
@@ -156,6 +166,7 @@ Result:
 - `status`: `created` | `updated`
 - `org`
 - `secret_name`
+- `auth_mode`: `pat` | `oauth`
 
 Notes:
 
@@ -170,7 +181,8 @@ Inputs:
 - `project`: project path or ID (ex: `group/project`)
 - `key`: variable key (ex: `DATABASE_URL`)
 - `value_ref`: secret reference (ex: `keychain:opaque/db-url`)
-- optional: `gitlab_token_ref`: GitLab token ref (default: `keychain:opaque/gitlab-pat`)
+- optional: `gitlab_token_ref`: GitLab token ref (default: `keychain:opaque/gitlab-pat` for `pat` mode, `keychain:opaque/gitlab-oauth-token` for `oauth` mode)
+- optional: `gitlab_auth_mode`: `"pat" | "oauth"` (default: `pat`)
 - optional: `environment_scope`
 - optional: `protected`: boolean
 - optional: `masked`: boolean
@@ -187,11 +199,165 @@ Result:
 - optional: `masked`
 - optional: `raw`
 - optional: `variable_type`
+- `auth_mode`: `pat` | `oauth`
 
 Notes:
 
 - Never returns variable values.
 - Supports GitLab self-managed or alternate API hosts via `OPAQUE_GITLAB_API_URL`.
+- `pat` mode sends `PRIVATE-TOKEN`; `oauth` mode sends `Authorization: Bearer`.
+
+### `azure.list_secrets` (`SAFE`)
+
+Lists Azure Key Vault secret metadata.
+
+Inputs: none.
+
+Result:
+
+- `secrets`: array of `{ name, enabled }`
+
+### `azure.list_keys` (`SAFE`)
+
+Lists Azure Key Vault key metadata.
+
+Inputs: none.
+
+Result:
+
+- `keys`: array of `{ name, enabled }`
+
+### `azure.list_certificates` (`SAFE`)
+
+Lists Azure Key Vault certificate metadata.
+
+Inputs: none.
+
+Result:
+
+- `certificates`: array of `{ name, enabled }`
+
+### `azure.get_secret` (`REVEAL`)
+
+Reads a specific Azure Key Vault secret value.
+
+Inputs:
+
+- `name`
+- optional: `version`
+
+Result:
+
+- `name`
+- `value` (plaintext)
+
+Notes:
+
+- Hard-blocked for agent workflows by default policy (reveal operation).
+
+### `azure.set_secret` (`SAFE`)
+
+Writes an Azure Key Vault secret value from a secure reference.
+
+Inputs:
+
+- `name`
+- `value_ref`
+
+Result:
+
+- `name`
+- `status` (`ok`)
+
+Notes:
+
+- Never returns secret values.
+- Requires Azure configuration in the daemon environment:
+  `OPAQUE_AZURE_VAULT_URL`, `OPAQUE_AZURE_TENANT_ID`,
+  `OPAQUE_AZURE_CLIENT_ID`, `OPAQUE_AZURE_CLIENT_SECRET`.
+
+### `gcp.list_secrets` (`SAFE`)
+
+Lists GCP Secret Manager secret metadata for a project.
+
+Inputs:
+
+- `project`
+
+Result:
+
+- `project`
+- `secrets`: array of `{ name }`
+
+### `gcp.get_secret` (`SAFE`)
+
+Reads GCP Secret Manager secret metadata (no value).
+
+Inputs:
+
+- `project`
+- `secret_id`
+
+Result:
+
+- `name`
+- `create_time`
+
+### `gcp.access_secret_version` (`REVEAL`)
+
+Reads a specific GCP secret version value.
+
+Inputs:
+
+- `project`
+- `secret_id`
+- optional: `version` (default: `latest`)
+
+Result:
+
+- `project`
+- `secret_id`
+- `version`
+- `value` (plaintext)
+
+Notes:
+
+- Hard-blocked for agent workflows by default policy (reveal operation).
+
+### `gcp.create_secret` (`SAFE`)
+
+Creates a new secret in GCP Secret Manager.
+
+Inputs:
+
+- `project`
+- `secret_id`
+
+Result:
+
+- `name`
+- `create_time`
+
+### `gcp.add_secret_version` (`SAFE`)
+
+Adds a new version to an existing GCP secret from a secure reference.
+
+Inputs:
+
+- `project`
+- `secret_id`
+- `value_ref`
+
+Result:
+
+- `version`
+- `state`
+
+Notes:
+
+- Never returns secret values.
+- Requires GCP auth configured via `OPAQUE_GCP_ACCESS_TOKEN` or
+  `OPAQUE_GCP_SERVICE_ACCOUNT_KEY`.
 
 ### `onepassword.list_vaults` (`SAFE`)
 

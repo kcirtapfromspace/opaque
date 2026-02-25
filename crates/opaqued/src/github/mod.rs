@@ -28,13 +28,31 @@ use crate::sandbox::resolve::{CompositeResolver, SecretResolver};
 use client::{GitHubClient, SecretScope};
 use crypto::encrypt_secret;
 
-/// Default keychain ref for the GitHub PAT when not specified by the caller.
-/// Override with the `OPAQUE_GITHUB_TOKEN_REF` environment variable to use a
-/// different keychain entry or ref scheme for the GitHub personal access token.
-const DEFAULT_GITHUB_TOKEN_REF: &str = "keychain:opaque/github-pat";
+/// Default keychain ref for GitHub PATs when not specified by the caller.
+const DEFAULT_GITHUB_PAT_TOKEN_REF: &str = "keychain:opaque/github-pat";
+/// Default keychain ref for GitHub OAuth bearer tokens when not specified.
+const DEFAULT_GITHUB_OAUTH_TOKEN_REF: &str = "keychain:opaque/github-oauth-token";
 
-/// Environment variable to override the default GitHub PAT ref.
+/// Environment variable to override the default GitHub token ref.
 const GITHUB_TOKEN_REF_ENV: &str = "OPAQUE_GITHUB_TOKEN_REF";
+/// Environment variable to override default GitHub auth mode (`pat` or `oauth`).
+const GITHUB_AUTH_MODE_ENV: &str = "OPAQUE_GITHUB_AUTH_MODE";
+
+/// Authentication mode for GitHub API token resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitHubAuthMode {
+    PersonalAccessToken,
+    OAuthBearer,
+}
+
+impl GitHubAuthMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PersonalAccessToken => "pat",
+            Self::OAuthBearer => "oauth",
+        }
+    }
+}
 
 /// The GitHub secret handler.
 ///
@@ -167,11 +185,12 @@ async fn set_secret_flow(
     scope: &SecretScope<'_>,
     secret_name: &str,
     value_ref: &str,
+    auth_mode: GitHubAuthMode,
     github_token_ref: &str,
     operation_name: &str,
     extra_body: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-    // 1. Resolve secret value and GitHub PAT.
+    // 1. Resolve secret value and GitHub token.
     let resolver = CompositeResolver::new();
 
     let secret_value = resolver
@@ -257,6 +276,7 @@ async fn set_secret_flow(
     let mut resp = serde_json::json!({
         "status": status,
         "secret_name": secret_name,
+        "auth_mode": auth_mode.as_str(),
     });
 
     match scope {
@@ -284,15 +304,35 @@ async fn set_secret_flow(
     Ok(resp)
 }
 
-/// Resolve the GitHub token ref from params, env, or default.
-fn resolve_github_token_ref(params: &serde_json::Value) -> String {
+/// Resolve the GitHub token ref from params, env, or mode-specific default.
+fn resolve_github_token_ref(params: &serde_json::Value, auth_mode: GitHubAuthMode) -> String {
     let env_token_ref = std::env::var(GITHUB_TOKEN_REF_ENV).ok();
+    let default_ref = match auth_mode {
+        GitHubAuthMode::PersonalAccessToken => DEFAULT_GITHUB_PAT_TOKEN_REF,
+        GitHubAuthMode::OAuthBearer => DEFAULT_GITHUB_OAUTH_TOKEN_REF,
+    };
     params
         .get("github_token_ref")
         .and_then(|v| v.as_str())
         .or(env_token_ref.as_deref())
-        .unwrap_or(DEFAULT_GITHUB_TOKEN_REF)
+        .unwrap_or(default_ref)
         .to_owned()
+}
+
+fn resolve_github_auth_mode(params: &serde_json::Value) -> Result<GitHubAuthMode, String> {
+    let env_mode = std::env::var(GITHUB_AUTH_MODE_ENV).ok();
+    let raw = params
+        .get("github_auth_mode")
+        .and_then(|v| v.as_str())
+        .or(env_mode.as_deref())
+        .unwrap_or("pat");
+    match raw {
+        "pat" => Ok(GitHubAuthMode::PersonalAccessToken),
+        "oauth" => Ok(GitHubAuthMode::OAuthBearer),
+        _ => Err(format!(
+            "github_auth_mode must be 'pat' or 'oauth', got: '{raw}'"
+        )),
+    }
 }
 
 impl OperationHandler for GitHubHandler {
@@ -355,7 +395,8 @@ impl GitHubHandler {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing 'value_ref' parameter".to_string())?;
         let environment = params.get("environment").and_then(|v| v.as_str());
-        let github_token_ref = resolve_github_token_ref(params);
+        let auth_mode = resolve_github_auth_mode(params)?;
+        let github_token_ref = resolve_github_token_ref(params, auth_mode);
 
         let (owner, repo_name) = validate_repo(repo)?;
         validate_secret_name(secret_name)?;
@@ -383,6 +424,7 @@ impl GitHubHandler {
             &scope,
             secret_name,
             value_ref,
+            auth_mode,
             &github_token_ref,
             "github.set_actions_secret",
             None,
@@ -406,7 +448,8 @@ impl GitHubHandler {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing 'value_ref' parameter".to_string())?;
         let repo = params.get("repo").and_then(|v| v.as_str());
-        let github_token_ref = resolve_github_token_ref(params);
+        let auth_mode = resolve_github_auth_mode(params)?;
+        let github_token_ref = resolve_github_token_ref(params, auth_mode);
 
         validate_secret_name(secret_name)?;
         validate_value_ref(value_ref)?;
@@ -438,6 +481,7 @@ impl GitHubHandler {
             &scope,
             secret_name,
             value_ref,
+            auth_mode,
             &github_token_ref,
             "github.set_codespaces_secret",
             extra_body.as_ref(),
@@ -464,7 +508,8 @@ impl GitHubHandler {
             .get("value_ref")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing 'value_ref' parameter".to_string())?;
-        let github_token_ref = resolve_github_token_ref(params);
+        let auth_mode = resolve_github_auth_mode(params)?;
+        let github_token_ref = resolve_github_token_ref(params, auth_mode);
 
         let (owner, repo_name) = validate_repo(repo)?;
         validate_secret_name(secret_name)?;
@@ -483,6 +528,7 @@ impl GitHubHandler {
             &scope,
             secret_name,
             value_ref,
+            auth_mode,
             &github_token_ref,
             "github.set_dependabot_secret",
             None,
@@ -509,7 +555,8 @@ impl GitHubHandler {
             .get("value_ref")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing 'value_ref' parameter".to_string())?;
-        let github_token_ref = resolve_github_token_ref(params);
+        let auth_mode = resolve_github_auth_mode(params)?;
+        let github_token_ref = resolve_github_token_ref(params, auth_mode);
 
         validate_org_name(org)?;
         validate_secret_name(secret_name)?;
@@ -542,6 +589,7 @@ impl GitHubHandler {
             &scope,
             secret_name,
             value_ref,
+            auth_mode,
             &github_token_ref,
             "github.set_org_secret",
             Some(&extra),
@@ -556,7 +604,8 @@ impl GitHubHandler {
         params: &serde_json::Value,
         audit: &Arc<dyn AuditSink>,
     ) -> Result<serde_json::Value, String> {
-        let github_token_ref = resolve_github_token_ref(params);
+        let auth_mode = resolve_github_auth_mode(params)?;
+        let github_token_ref = resolve_github_token_ref(params, auth_mode);
         validate_value_ref(&github_token_ref)?;
 
         let scope = parse_scope(params)?;
@@ -610,6 +659,7 @@ impl GitHubHandler {
         Ok(serde_json::json!({
             "total_count": list_resp.total_count,
             "secrets": secrets,
+            "auth_mode": auth_mode.as_str(),
         }))
     }
 
@@ -624,7 +674,8 @@ impl GitHubHandler {
             .get("secret_name")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing 'secret_name' parameter".to_string())?;
-        let github_token_ref = resolve_github_token_ref(params);
+        let auth_mode = resolve_github_auth_mode(params)?;
+        let github_token_ref = resolve_github_token_ref(params, auth_mode);
 
         validate_secret_name(secret_name)?;
         validate_value_ref(&github_token_ref)?;
@@ -669,6 +720,7 @@ impl GitHubHandler {
         let mut resp = serde_json::json!({
             "status": "deleted",
             "secret_name": secret_name,
+            "auth_mode": auth_mode.as_str(),
         });
 
         match &scope {
@@ -838,6 +890,29 @@ mod tests {
         assert!(validate_value_ref("literal:foo").is_err());
         assert!(validate_value_ref("raw-value").is_err());
         assert!(validate_value_ref("").is_err());
+    }
+
+    #[test]
+    fn github_auth_mode_defaults_to_pat() {
+        let params = serde_json::json!({});
+        let mode = resolve_github_auth_mode(&params).unwrap();
+        assert_eq!(mode, GitHubAuthMode::PersonalAccessToken);
+    }
+
+    #[test]
+    fn github_auth_mode_from_params() {
+        let params = serde_json::json!({"github_auth_mode": "oauth"});
+        let mode = resolve_github_auth_mode(&params).unwrap();
+        assert_eq!(mode, GitHubAuthMode::OAuthBearer);
+    }
+
+    #[test]
+    fn github_token_ref_default_varies_by_auth_mode() {
+        let params = serde_json::json!({});
+        let pat_ref = resolve_github_token_ref(&params, GitHubAuthMode::PersonalAccessToken);
+        let oauth_ref = resolve_github_token_ref(&params, GitHubAuthMode::OAuthBearer);
+        assert_eq!(pat_ref, DEFAULT_GITHUB_PAT_TOKEN_REF);
+        assert_eq!(oauth_ref, DEFAULT_GITHUB_OAUTH_TOKEN_REF);
     }
 
     // -----------------------------------------------------------------------
@@ -1140,6 +1215,29 @@ mod tests {
         let result = handler.execute(&request).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("unknown GitHub operation"));
+    }
+
+    #[tokio::test]
+    async fn invalid_auth_mode_rejected() {
+        use opaque_core::audit::InMemoryAuditEmitter;
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let handler = GitHubHandler::new(audit).unwrap();
+        let request = make_request(
+            "github.set_actions_secret",
+            serde_json::json!({
+                "repo": "owner/repo",
+                "secret_name": "MY_SECRET",
+                "value_ref": "env:MY_VAR",
+                "github_auth_mode": "invalid",
+            }),
+        );
+        let result = handler.execute(&request).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("github_auth_mode must be 'pat' or 'oauth'")
+        );
     }
 
     // --- parse_scope tests ---

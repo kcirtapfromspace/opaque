@@ -24,7 +24,7 @@ pub trait SecretResolver: Send + Sync {
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ResolveError {
     #[error(
-        "unknown ref scheme in '{0}' (expected env:, keychain:, profile:, onepassword:, bitwarden:, aws:, or vault:)"
+        "unknown ref scheme in '{0}' (expected env:, keychain:, profile:, onepassword:, bitwarden:, aws:, vault:, azure:, or gcp:)"
     )]
     UnknownScheme(String),
 
@@ -285,7 +285,7 @@ impl SecretResolver for BaseResolver {
 // ---------------------------------------------------------------------------
 
 /// A composite resolver that dispatches to the correct resolver based on
-/// the ref scheme prefix (`env:`, `keychain:`, `profile:`, `onepassword:`, `bitwarden:`, `vault:`).
+/// the ref scheme prefix (`env:`, `keychain:`, `profile:`, `onepassword:`, `bitwarden:`, `vault:`, `azure:`, `gcp:`).
 #[derive(Debug)]
 pub struct CompositeResolver {
     env: EnvResolver,
@@ -295,6 +295,8 @@ pub struct CompositeResolver {
     bitwarden: Option<crate::bitwarden::resolve::BitwardenResolver>,
     aws: Option<crate::aws::resolve::AwsResolver>,
     vault: Option<crate::vault::resolve::VaultResolver>,
+    azure: Option<crate::azure::resolve::AzureResolver>,
+    gcp: Option<crate::gcp::resolve::GcpResolver>,
 }
 
 impl CompositeResolver {
@@ -352,6 +354,66 @@ impl CompositeResolver {
             }
         };
 
+        // Azure backend: enabled when all AAD credentials are configured.
+        let azure = {
+            let has_tenant = std::env::var(crate::azure::client::AZURE_TENANT_ID_ENV)
+                .ok()
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false);
+            let has_client_id = std::env::var(crate::azure::client::AZURE_CLIENT_ID_ENV)
+                .ok()
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false);
+            let has_client_secret = std::env::var(crate::azure::client::AZURE_CLIENT_SECRET_ENV)
+                .ok()
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false);
+
+            if has_tenant && has_client_id && has_client_secret {
+                Some(crate::azure::resolve::AzureResolver)
+            } else {
+                tracing::warn!(
+                    "Azure resolver disabled: set {}, {}, and {}",
+                    crate::azure::client::AZURE_TENANT_ID_ENV,
+                    crate::azure::client::AZURE_CLIENT_ID_ENV,
+                    crate::azure::client::AZURE_CLIENT_SECRET_ENV
+                );
+                None
+            }
+        };
+
+        // GCP backend: enabled when auth is configured and base URL is valid.
+        let gcp = {
+            let has_direct_token = std::env::var(crate::gcp::client::GCP_ACCESS_TOKEN_ENV)
+                .ok()
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false);
+            let has_service_account_key =
+                std::env::var(crate::gcp::client::GCP_SERVICE_ACCOUNT_KEY_ENV)
+                    .ok()
+                    .map(|v| !v.trim().is_empty())
+                    .unwrap_or(false);
+
+            if has_direct_token || has_service_account_key {
+                let gcp_url = std::env::var(crate::gcp::client::GCP_SM_URL_ENV)
+                    .unwrap_or_else(|_| crate::gcp::client::DEFAULT_BASE_URL.to_owned());
+                match crate::gcp::client::GcpSecretManagerClient::new(&gcp_url) {
+                    Ok(client) => Some(crate::gcp::resolve::GcpResolver::new(client)),
+                    Err(e) => {
+                        tracing::warn!("GCP resolver disabled: {e}");
+                        None
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "GCP resolver disabled: set {} or {}",
+                    crate::gcp::client::GCP_ACCESS_TOKEN_ENV,
+                    crate::gcp::client::GCP_SERVICE_ACCOUNT_KEY_ENV
+                );
+                None
+            }
+        };
+
         Self {
             env: EnvResolver,
             keychain: KeychainResolver,
@@ -360,6 +422,8 @@ impl CompositeResolver {
             bitwarden,
             aws,
             vault,
+            azure,
+            gcp,
         }
     }
 
@@ -374,6 +438,8 @@ impl CompositeResolver {
             bitwarden: None,
             aws: None,
             vault: None,
+            azure: None,
+            gcp: None,
         }
     }
 }
@@ -423,6 +489,24 @@ impl SecretResolver for CompositeResolver {
                 None => Err(ResolveError::VaultError(
                     ref_str.to_owned(),
                     "Vault not configured".into(),
+                )),
+            }
+        } else if ref_str.starts_with("azure:") {
+            match &self.azure {
+                Some(r) => r.resolve(ref_str),
+                None => Err(ResolveError::AzureError(
+                    ref_str.to_owned(),
+                    "Azure not configured (set OPAQUE_AZURE_TENANT_ID, OPAQUE_AZURE_CLIENT_ID, and OPAQUE_AZURE_CLIENT_SECRET)"
+                        .into(),
+                )),
+            }
+        } else if ref_str.starts_with("gcp:") {
+            match &self.gcp {
+                Some(r) => r.resolve(ref_str),
+                None => Err(ResolveError::GcpError(
+                    ref_str.to_owned(),
+                    "GCP not configured (set OPAQUE_GCP_ACCESS_TOKEN or OPAQUE_GCP_SERVICE_ACCOUNT_KEY)"
+                        .into(),
                 )),
             }
         } else {
@@ -631,6 +715,26 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, ResolveError::VaultError(..)));
+        assert!(format!("{err}").contains("not configured"));
+    }
+
+    #[test]
+    fn composite_resolver_azure_dispatch() {
+        let resolver = CompositeResolver::without_onepassword();
+        let result = resolver.resolve("azure:my-vault/my-secret");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ResolveError::AzureError(..)));
+        assert!(format!("{err}").contains("not configured"));
+    }
+
+    #[test]
+    fn composite_resolver_gcp_dispatch() {
+        let resolver = CompositeResolver::without_onepassword();
+        let result = resolver.resolve("gcp:my-project/my-secret");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ResolveError::GcpError(..)));
         assert!(format!("{err}").contains("not configured"));
     }
 

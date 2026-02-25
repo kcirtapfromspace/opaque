@@ -67,6 +67,35 @@ pub struct SetCiVariableOptions<'a> {
     pub variable_type: Option<&'a str>,
 }
 
+/// Authentication mode for GitLab API requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitLabAuthMode {
+    /// Use `PRIVATE-TOKEN: <token>` header (PAT / project/group access tokens).
+    PersonalAccessToken,
+    /// Use `Authorization: Bearer <token>` header (OAuth access tokens).
+    OAuthBearer,
+}
+
+impl GitLabAuthMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PersonalAccessToken => "pat",
+            Self::OAuthBearer => "oauth",
+        }
+    }
+}
+
+fn with_auth_header(
+    req: reqwest::RequestBuilder,
+    auth_mode: GitLabAuthMode,
+    token: &str,
+) -> reqwest::RequestBuilder {
+    match auth_mode {
+        GitLabAuthMode::PersonalAccessToken => req.header("PRIVATE-TOKEN", token),
+        GitLabAuthMode::OAuthBearer => req.header("Authorization", format!("Bearer {token}")),
+    }
+}
+
 /// Validate that a URL uses `https://`, allowing `http://` only for localhost.
 fn validate_url_scheme(url: &str) -> Result<(), GitLabApiError> {
     if url.starts_with("https://") {
@@ -193,6 +222,7 @@ impl GitLabClient {
     pub async fn set_ci_variable(
         &self,
         token: &str,
+        auth_mode: GitLabAuthMode,
         project: &str,
         key: &str,
         value: &str,
@@ -214,10 +244,7 @@ impl GitLabClient {
             variable_type: options.variable_type,
         };
 
-        let update_resp = self
-            .http
-            .put(&update_url)
-            .header("PRIVATE-TOKEN", token)
+        let update_resp = with_auth_header(self.http.put(&update_url), auth_mode, token)
             .header("Accept", "application/json")
             .json(&update_payload)
             .send()
@@ -246,10 +273,7 @@ impl GitLabClient {
             variable_type: options.variable_type,
         };
 
-        let create_resp = self
-            .http
-            .post(&create_url)
-            .header("PRIVATE-TOKEN", token)
+        let create_resp = with_auth_header(self.http.post(&create_url), auth_mode, token)
             .header("Accept", "application/json")
             .json(&create_payload)
             .send()
@@ -346,6 +370,7 @@ mod tests {
         let result = client
             .set_ci_variable(
                 "glpat-test",
+                GitLabAuthMode::PersonalAccessToken,
                 "group/proj",
                 "MY_KEY",
                 "secret-value",
@@ -380,6 +405,7 @@ mod tests {
         let result = client
             .set_ci_variable(
                 "glpat-test",
+                GitLabAuthMode::PersonalAccessToken,
                 "group/proj",
                 "MY_KEY",
                 "secret-value",
@@ -412,6 +438,7 @@ mod tests {
         let err = client
             .set_ci_variable(
                 "bad-token",
+                GitLabAuthMode::PersonalAccessToken,
                 "group/proj",
                 "MY_KEY",
                 "secret-value",
@@ -445,6 +472,7 @@ mod tests {
         let err = client
             .set_ci_variable(
                 "glpat-test",
+                GitLabAuthMode::PersonalAccessToken,
                 "group/missing",
                 "MY_KEY",
                 "secret-value",
@@ -455,5 +483,33 @@ mod tests {
 
         assert!(matches!(err, GitLabApiError::NotFound(_)));
         assert!(format!("{err}").contains("group/missing"));
+    }
+
+    #[tokio::test]
+    async fn set_ci_variable_oauth_mode_uses_bearer_header() {
+        let mock_server = MockServer::start().await;
+        let client = GitLabClient::with_base_url(mock_server.uri());
+
+        Mock::given(method("PUT"))
+            .and(path("/projects/group%2Fproj/variables/MY_KEY"))
+            .and(header("authorization", "Bearer oauth-token"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let result = client
+            .set_ci_variable(
+                "oauth-token",
+                GitLabAuthMode::OAuthBearer,
+                "group/proj",
+                "MY_KEY",
+                "secret-value",
+                SetCiVariableOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result, SetCiVariableResponse::Updated);
     }
 }
