@@ -141,6 +141,8 @@ enum Cmd {
     },
     /// Diagnose your Opaque installation and report issues.
     Doctor,
+    /// One-step onboarding: init with safe-demo preset, check daemon, run diagnostics.
+    Quickstart,
     /// List active approval leases in the daemon.
     Leases,
 }
@@ -1503,6 +1505,10 @@ async fn main() {
             run_doctor().await;
             return;
         }
+        Cmd::Quickstart => {
+            run_quickstart().await;
+            return;
+        }
         Cmd::Service { action } => {
             let op = match action {
                 ServiceAction::Install => service::ServiceOp::Install,
@@ -1904,7 +1910,8 @@ async fn main() {
         | Cmd::Profile { .. }
         | Cmd::Setup { .. }
         | Cmd::Service { .. }
-        | Cmd::Doctor => {
+        | Cmd::Doctor
+        | Cmd::Quickstart => {
             unreachable!()
         }
     };
@@ -2800,7 +2807,7 @@ fn run_init(force: bool, preset: Option<&str>) -> Result<(), String> {
         style("opaque execute test.noop").bold()
     );
     println!(
-        "    4. Check diagnostics:  {}",
+        "    4. Check everything:   {}",
         style("opaque doctor").bold()
     );
     println!();
@@ -2833,6 +2840,140 @@ fn run_init_at(base: &Path, force: bool, config_content: &str) -> Result<(), Str
         .map_err(|e| format!("failed to write {}: {e}", config_path.display()))?;
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// quickstart
+// ---------------------------------------------------------------------------
+
+/// Perform the init portion of quickstart at the given base path.
+///
+/// If config already exists, this is a no-op (skip gracefully).
+/// Otherwise, initializes with the safe-demo preset.
+///
+/// Returns `true` if init was performed, `false` if skipped.
+fn run_quickstart_at(base: &Path) -> Result<bool, String> {
+    let config_path = base.join("config.toml");
+    if config_path.exists() {
+        return Ok(false);
+    }
+
+    run_init_at(base, false, PRESET_SAFE_DEMO)?;
+    Ok(true)
+}
+
+/// Run the full quickstart flow with styled output.
+async fn run_quickstart() {
+    let base = default_opaque_dir();
+
+    ui::header("Opaque Quickstart");
+    println!();
+
+    // Step 1: Init with safe-demo preset (if needed).
+    match run_quickstart_at(&base) {
+        Ok(true) => {
+            ui::init_step(&format!(
+                "Initialized {} with {} preset",
+                style(base.display()).cyan(),
+                style("safe-demo").bold()
+            ));
+        }
+        Ok(false) => {
+            ui::init_step(&format!(
+                "Config already exists at {} (skipped init)",
+                style(base.display()).cyan()
+            ));
+        }
+        Err(e) => {
+            ui::error(&format!("Init failed: {e}"));
+            std::process::exit(1);
+        }
+    }
+
+    // Step 2: Check if daemon is running.
+    let sock = socket_path();
+    let daemon_running = if sock.exists() {
+        match tokio::time::timeout(Duration::from_secs(3), try_ping(&sock)).await {
+            Ok(Ok(())) => {
+                ui::init_step("Daemon is running (ping OK)");
+                true
+            }
+            _ => {
+                ui::warn("Daemon is not responding");
+                false
+            }
+        }
+    } else {
+        ui::warn("Daemon is not running (no socket found)");
+        false
+    };
+
+    if !daemon_running {
+        println!();
+        ui::info("Start the daemon with one of:");
+        println!(
+            "    {}    {}",
+            style("opaque service install").cyan().bold(),
+            style("# recommended: install as system service").dim()
+        );
+        println!(
+            "    {}              {}",
+            style("opaqued").cyan().bold(),
+            style("# or run directly in another terminal").dim()
+        );
+        println!();
+        ui::info("Then re-run 'opaque quickstart' to continue.");
+        return;
+    }
+
+    // Step 3: Execute test.noop to verify end-to-end.
+    ui::info("Testing end-to-end with test.noop operation...");
+    let test_params = serde_json::json!({
+        "operation": "test.noop",
+        "target": {},
+        "secret_refs": [],
+    });
+    match tokio::time::timeout(Duration::from_secs(10), call(&sock, "execute", test_params)).await {
+        Ok(Ok(resp)) => {
+            if let Some(err) = resp.error {
+                // Approval-required is expected (not a failure).
+                if err.code == "approval_required" {
+                    ui::init_step("test.noop requires approval (policy is working correctly)");
+                } else {
+                    ui::warn(&format!("test.noop returned error: {}", err.message));
+                }
+            } else {
+                ui::init_step("test.noop executed successfully");
+            }
+        }
+        Ok(Err(e)) => {
+            ui::warn(&format!("test.noop call failed: {e}"));
+        }
+        Err(_) => {
+            ui::warn("test.noop call timed out (10s)");
+        }
+    }
+
+    // Step 4: Print success summary.
+    println!();
+    ui::success("Quickstart complete!");
+    println!();
+    ui::info("Next steps:");
+    println!(
+        "    {}         {}",
+        style("opaque doctor").cyan().bold(),
+        style("# run full diagnostics").dim()
+    );
+    println!(
+        "    {}    {}",
+        style("opaque setup --seal").cyan().bold(),
+        style("# seal your config to prevent tampering").dim()
+    );
+    println!(
+        "    {}  {}",
+        style("opaque policy presets").cyan().bold(),
+        style("# explore other policy presets").dim()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -4235,5 +4376,127 @@ BAZ=
         let output = "2026-02-21T06:38:23Z INFO opaque_mcp: opaque-mcp 0.1.0+fd008f0 starting";
         let version = parse_version_from_output(output, "opaque-mcp");
         assert_eq!(version.as_deref(), Some("0.1.0+fd008f0"));
+    }
+
+    // -----------------------------------------------------------------------
+    // quickstart tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn quickstart_creates_config_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join(".opaque");
+
+        let result = run_quickstart_at(&base);
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+
+        // Should have created the directory structure
+        assert!(base.exists(), "base dir should exist");
+        assert!(base.join("run").exists(), "run dir should exist");
+        assert!(base.join("profiles").exists(), "profiles dir should exist");
+        assert!(
+            base.join("config.toml").exists(),
+            "config.toml should exist"
+        );
+    }
+
+    #[test]
+    fn quickstart_uses_safe_demo_preset() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join(".opaque");
+
+        let result = run_quickstart_at(&base);
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+
+        let content = fs::read_to_string(base.join("config.toml")).unwrap();
+        // safe-demo preset contains test.noop rule
+        assert!(
+            content.contains("test.noop"),
+            "config should contain test.noop from safe-demo preset"
+        );
+        assert!(
+            content.contains("safe-demo"),
+            "config should reference safe-demo preset"
+        );
+    }
+
+    #[test]
+    fn quickstart_skips_init_when_config_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join(".opaque");
+
+        // First run — creates config
+        let result = run_quickstart_at(&base);
+        assert!(result.is_ok(), "first run should succeed: {result:?}");
+
+        // Write custom content so we can verify it's not overwritten
+        let config_path = base.join("config.toml");
+        fs::write(&config_path, "# custom config\n").unwrap();
+
+        // Second run — should skip init, not error
+        let result = run_quickstart_at(&base);
+        assert!(result.is_ok(), "second run should succeed: {result:?}");
+
+        // Config should NOT be overwritten
+        let content = fs::read_to_string(&config_path).unwrap();
+        assert_eq!(
+            content, "# custom config\n",
+            "existing config should not be overwritten"
+        );
+    }
+
+    #[test]
+    fn quickstart_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join(".opaque");
+
+        // Run three times — should all succeed
+        for i in 0..3 {
+            let result = run_quickstart_at(&base);
+            assert!(result.is_ok(), "run {i} should succeed: {result:?}");
+        }
+
+        // Config should still be the safe-demo preset from first run
+        let content = fs::read_to_string(base.join("config.toml")).unwrap();
+        assert!(content.contains("test.noop"));
+    }
+
+    #[test]
+    fn quickstart_init_equivalent_to_init_preset_safe_demo() {
+        // quickstart init should produce the same config as `init --preset safe-demo`
+        let qs_dir = tempfile::tempdir().unwrap();
+        let qs_base = qs_dir.path().join(".opaque");
+
+        let init_dir = tempfile::tempdir().unwrap();
+        let init_base = init_dir.path().join(".opaque");
+
+        run_quickstart_at(&qs_base).unwrap();
+        run_init_at(&init_base, false, PRESET_SAFE_DEMO).unwrap();
+
+        let qs_config = fs::read_to_string(qs_base.join("config.toml")).unwrap();
+        let init_config = fs::read_to_string(init_base.join("config.toml")).unwrap();
+
+        assert_eq!(
+            qs_config, init_config,
+            "quickstart config should match init --preset safe-demo"
+        );
+    }
+
+    #[test]
+    fn quickstart_creates_dirs_with_correct_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join(".opaque");
+
+        run_quickstart_at(&base).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&base).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "base dir should be 0700, got {mode:o}");
+
+            let run_mode = fs::metadata(base.join("run")).unwrap().permissions().mode() & 0o777;
+            assert_eq!(run_mode, 0o700, "run dir should be 0700, got {run_mode:o}");
+        }
     }
 }
