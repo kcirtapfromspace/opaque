@@ -177,7 +177,7 @@ fn protected_paths() -> Vec<PathBuf> {
 pub fn landlock_restrict(project_dir: &Path, extra_read_paths: &[PathBuf]) -> bool {
     use landlock::{
         ABI, Access, AccessFs, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
-        RulesetStatus,
+        RulesetCreatedAttr, RulesetStatus,
     };
 
     // Set PR_SET_NO_NEW_PRIVS — required before Landlock and good security practice.
