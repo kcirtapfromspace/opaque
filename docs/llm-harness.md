@@ -15,7 +15,7 @@ LLMs get **operations**, not values.
 
 The recommended path for MCP-aware tools like Claude Code is the `opaque-mcp` server. It exposes Safe operations as MCP tools over stdio, so the LLM calls Opaque tools natively without shell access.
 
-See `docs/mcp-integration.md` for setup.
+See [MCP integration](mcp-integration.md) for setup.
 
 ### CLI Harness (Fallback)
 

@@ -64,7 +64,7 @@ Every operation flows through a five-stage pipeline with no bypass paths:
 The daemon identifies callers through Unix peer credentials (`SO_PEERCRED`
 on Linux, `getpeereid` on macOS), resolves the executable path and SHA-256
 hash, and on macOS can verify code-signing Team IDs. This lets policy rules
-distinguish between "Claude Code signed by Anthropic" and "unknown script
+distinguish between "Claude Code signed by a trusted vendor" and "unknown script
 in /tmp."
 
 ## What Can Agents Do?
@@ -128,7 +128,7 @@ to sync a secret. For Codex or other CLI-based agents, use `opaque agent run`
 to wrap the agent in a scoped session.
 
 Full documentation lives in the `docs/` directory of the
-[repository](https://github.com/anthropics/opaque).
+[repository](https://github.com/kcirtapfromspace/opaque).
 
 ## What's Next
 

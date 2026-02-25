@@ -6,7 +6,7 @@ v1 transport is local only:
 
 - `opaque` (CLI) -> Unix domain socket -> `opaqued` (daemon)
 
-For MCP-aware tools (Claude Code), `opaque-mcp` provides a stdio-based MCP server that exposes Safe operations as tools. See `docs/mcp-integration.md`.
+For MCP-aware tools (Claude Code), `opaque-mcp` provides a stdio-based MCP server that exposes Safe operations as tools. See [MCP integration](mcp-integration.md).
 
 ## Safety Classes
 

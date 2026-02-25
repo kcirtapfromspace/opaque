@@ -6,7 +6,7 @@ class Opaque < Formula
   desc "Approval-gated secrets broker for AI coding tools"
   homepage "https://github.com/kcirtapfromspace/opaque"
   version "0.1.0"
-  license "Apache-2.0"
+  license "BSL-1.1"
 
   on_macos do
     on_arm do
@@ -37,6 +37,7 @@ class Opaque < Formula
     bin.install "opaque"
     bin.install "opaque-mcp"
     bin.install "opaque-approve-helper"
+    bin.install "opaque-web"
   end
 
   test do
