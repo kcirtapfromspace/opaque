@@ -17,7 +17,7 @@ LLMs get **operations** (e.g., "set this GitHub secret"), never plaintext values
 - [:material-shield-check: **Policy Engine**](policy.md) -- Deny-by-default rules, presets, and allowlists
 - [:material-connection: **MCP Integration**](mcp-integration.md) -- Connect Opaque to Claude Code via MCP
 - [:material-sitemap: **Architecture**](architecture.md) -- Design notes and system overview
-- [:material-clipboard-check: **Launch Week Playbook**](launch-week-playbook.md) -- Messaging guardrails, quickstart gate, incident triage, and SLAs
+- [:material-cog: **Deployment**](deployment.md) -- Run Opaque as a local service on macOS or Linux
 
 </div>
 
