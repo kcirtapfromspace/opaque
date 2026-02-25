@@ -276,6 +276,47 @@ impl VaultClient {
         }
     }
 
+    /// Renew a previously-issued Vault lease.
+    pub async fn renew_lease(
+        &self,
+        token: &str,
+        lease_id: &str,
+    ) -> Result<VaultLease, VaultApiError> {
+        let lease_id_trimmed = lease_id.trim();
+        if lease_id_trimmed.is_empty() {
+            return Err(VaultApiError::BadRequest);
+        }
+
+        let url = format!("{}/v1/sys/leases/renew", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .header("X-Vault-Token", token)
+            .header("Accept", "application/json")
+            .json(&serde_json::json!({ "lease_id": lease_id_trimmed }))
+            .send()
+            .await
+            .map_err(VaultApiError::Network)?;
+
+        match resp.status().as_u16() {
+            200 => {
+                let body = resp
+                    .json::<serde_json::Value>()
+                    .await
+                    .map_err(VaultApiError::Network)?;
+                extract_lease(&body).ok_or(VaultApiError::ServerError)
+            }
+            400 => Err(VaultApiError::BadRequest),
+            401 | 403 => Err(VaultApiError::Unauthorized),
+            404 => Err(VaultApiError::NotFound(format!(
+                "lease '{lease_id_trimmed}'"
+            ))),
+            429 => Err(VaultApiError::RateLimited),
+            500..=599 => Err(VaultApiError::ServerError),
+            other => Err(VaultApiError::UnexpectedStatus(other)),
+        }
+    }
+
     /// Revoke a previously-issued Vault lease.
     pub async fn revoke_lease(&self, token: &str, lease_id: &str) -> Result<(), VaultApiError> {
         let lease_id_trimmed = lease_id.trim();
@@ -503,5 +544,65 @@ mod tests {
             .revoke_lease("vault-token", "database/creds/readonly/a1")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn renew_lease_posts_expected_payload() {
+        let server = MockServer::start().await;
+        let client = VaultClient::with_base_url(server.uri());
+
+        Mock::given(method("POST"))
+            .and(path("/v1/sys/leases/renew"))
+            .and(header("x-vault-token", "vault-token"))
+            .and(body_json(serde_json::json!({
+                "lease_id": "database/creds/readonly/a1"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "lease_id": "database/creds/readonly/a1",
+                "lease_duration": 90,
+                "renewable": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let lease = client
+            .renew_lease("vault-token", "database/creds/readonly/a1")
+            .await
+            .unwrap();
+        assert_eq!(lease.lease_id, "database/creds/readonly/a1");
+        assert_eq!(lease.lease_duration_secs, 90);
+        assert!(lease.renewable);
+    }
+
+    #[tokio::test]
+    async fn renew_lease_maps_error_statuses() {
+        let server = MockServer::start().await;
+        let client = VaultClient::with_base_url(server.uri());
+
+        Mock::given(method("POST"))
+            .and(path("/v1/sys/leases/renew"))
+            .respond_with(ResponseTemplate::new(400))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let bad_request = client
+            .renew_lease("vault-token", "database/creds/readonly/a1")
+            .await
+            .unwrap_err();
+        assert!(matches!(bad_request, VaultApiError::BadRequest));
+
+        server.reset().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/sys/leases/renew"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let not_found = client
+            .renew_lease("vault-token", "database/creds/readonly/a1")
+            .await
+            .unwrap_err();
+        assert!(matches!(not_found, VaultApiError::NotFound(_)));
     }
 }

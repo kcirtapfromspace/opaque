@@ -17,12 +17,15 @@ const DEFAULT_TOKEN_REF: &str = "keychain:opaque/vault-token";
 
 /// Environment variable to override the default Vault token ref.
 const TOKEN_REF_ENV: &str = "OPAQUE_VAULT_TOKEN_REF";
+const LEASE_RENEW_WINDOW_ENV: &str = "OPAQUE_VAULT_LEASE_RENEW_WINDOW_SECS";
+const DEFAULT_LEASE_RENEW_WINDOW_SECS: u64 = 30;
 
 #[derive(Debug, Clone)]
 struct LeaseCacheEntry {
     value: String,
     expires_at: Instant,
     lease_id: Option<String>,
+    renewable: bool,
 }
 
 static LEASE_CACHE: LazyLock<Mutex<HashMap<String, LeaseCacheEntry>>> =
@@ -133,13 +136,13 @@ impl VaultResolver {
         LEASE_CACHE.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    fn get_cached_value(key: &str) -> Option<String> {
+    fn get_cached_entry(key: &str) -> Option<LeaseCacheEntry> {
         let now = Instant::now();
         let cache = Self::lock_cache();
         if let Some(entry) = cache.get(key)
             && entry.expires_at > now
         {
-            return Some(entry.value.clone());
+            return Some(entry.clone());
         }
         None
     }
@@ -161,6 +164,7 @@ impl VaultResolver {
         value: String,
         lease_duration_secs: u64,
         lease_id: Option<String>,
+        renewable: bool,
     ) {
         if lease_duration_secs == 0 {
             return;
@@ -174,8 +178,27 @@ impl VaultResolver {
                 value,
                 expires_at,
                 lease_id,
+                renewable,
             },
         );
+    }
+
+    fn lease_renew_window_secs() -> u64 {
+        match std::env::var(LEASE_RENEW_WINDOW_ENV) {
+            Ok(raw) => match raw.parse::<u64>() {
+                Ok(value) => value,
+                Err(_) => {
+                    tracing::warn!(
+                        "invalid {} value '{}'; falling back to default {} seconds",
+                        LEASE_RENEW_WINDOW_ENV,
+                        raw,
+                        DEFAULT_LEASE_RENEW_WINDOW_SECS
+                    );
+                    DEFAULT_LEASE_RENEW_WINDOW_SECS
+                }
+            },
+            Err(_) => DEFAULT_LEASE_RENEW_WINDOW_SECS,
+        }
     }
 
     #[cfg(test)]
@@ -203,8 +226,37 @@ impl SecretResolver for VaultResolver {
         })?;
         let handle = tokio::runtime::Handle::current();
         let cache_key = self.lease_cache_key(token, parsed.path, parsed.field);
-        if let Some(value) = Self::get_cached_value(&cache_key) {
-            return Ok(SecretValue::from_string(value));
+        if let Some(cached) = Self::get_cached_entry(&cache_key) {
+            let renew_window_secs = Self::lease_renew_window_secs();
+            let remaining_ttl = cached.expires_at.saturating_duration_since(Instant::now());
+            if renew_window_secs > 0
+                && cached.renewable
+                && remaining_ttl <= Duration::from_secs(renew_window_secs)
+                && let Some(lease_id) = cached.lease_id.clone()
+            {
+                let renew_result = tokio::task::block_in_place(|| {
+                    handle.block_on(async { self.client.renew_lease(token, &lease_id).await })
+                });
+                match renew_result {
+                    Ok(lease) => {
+                        Self::store_cached_value(
+                            cache_key.clone(),
+                            cached.value.clone(),
+                            lease.lease_duration_secs,
+                            Some(lease.lease_id),
+                            lease.renewable,
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "best-effort Vault lease renewal failed for {}: {}",
+                            parsed.path,
+                            err
+                        );
+                    }
+                }
+            }
+            return Ok(SecretValue::from_string(cached.value));
         }
         if let Some(expired_lease_id) = Self::take_expired_lease_for_key(&cache_key) {
             let revoke_result = tokio::task::block_in_place(|| {
@@ -237,6 +289,7 @@ impl SecretResolver for VaultResolver {
                         read.value.clone(),
                         lease.lease_duration_secs,
                         Some(lease.lease_id),
+                        lease.renewable,
                     );
                 }
                 Ok(SecretValue::from_string(read.value))
@@ -534,5 +587,206 @@ mod tests {
         assert_eq!(second.as_str(), Some("second-password"));
 
         unsafe { std::env::remove_var("OPAQUE_TEST_VAULT_TOKEN_REVOKE") };
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_proactively_renews_near_expiry_lease() {
+        let _guard = test_lock().await;
+        VaultResolver::clear_cache_for_tests();
+        let server = MockServer::start().await;
+        let client = VaultClient::with_base_url(server.uri());
+
+        Mock::given(method("GET"))
+            .and(path("/v1/database/creds/readonly"))
+            .and(header("x-vault-token", "vault-token-123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "lease_id": "database/creds/readonly/a1",
+                "lease_duration": 2,
+                "renewable": true,
+                "data": {
+                    "password": "first-password"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/sys/leases/renew"))
+            .and(header("x-vault-token", "vault-token-123"))
+            .and(body_json(serde_json::json!({
+                "lease_id": "database/creds/readonly/a1"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "lease_id": "database/creds/readonly/a1",
+                "lease_duration": 60,
+                "renewable": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        unsafe {
+            std::env::set_var("OPAQUE_TEST_VAULT_TOKEN_RENEW", "vault-token-123");
+            std::env::set_var("OPAQUE_VAULT_LEASE_RENEW_WINDOW_SECS", "30");
+        };
+        let resolver =
+            VaultResolver::with_token_ref(client, "env:OPAQUE_TEST_VAULT_TOKEN_RENEW".into());
+        let first = resolver
+            .resolve("vault:database/creds/readonly#password")
+            .unwrap();
+        let second = resolver
+            .resolve("vault:database/creds/readonly#password")
+            .unwrap();
+        assert_eq!(first.as_str(), Some("first-password"));
+        assert_eq!(second.as_str(), Some("first-password"));
+
+        unsafe {
+            std::env::remove_var("OPAQUE_TEST_VAULT_TOKEN_RENEW");
+            std::env::remove_var("OPAQUE_VAULT_LEASE_RENEW_WINDOW_SECS");
+        };
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_renew_failure_falls_back_until_expiry_then_refreshes() {
+        let _guard = test_lock().await;
+        VaultResolver::clear_cache_for_tests();
+        let server = MockServer::start().await;
+        let client = VaultClient::with_base_url(server.uri());
+
+        Mock::given(method("GET"))
+            .and(path("/v1/database/creds/readonly"))
+            .and(header("x-vault-token", "vault-token-123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "lease_id": "database/creds/readonly/a1",
+                "lease_duration": 2,
+                "renewable": true,
+                "data": {
+                    "password": "first-password"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/sys/leases/renew"))
+            .and(header("x-vault-token", "vault-token-123"))
+            .and(body_json(serde_json::json!({
+                "lease_id": "database/creds/readonly/a1"
+            })))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        unsafe {
+            std::env::set_var("OPAQUE_TEST_VAULT_TOKEN_RENEW_FAIL", "vault-token-123");
+            std::env::set_var("OPAQUE_VAULT_LEASE_RENEW_WINDOW_SECS", "30");
+        };
+        let resolver = VaultResolver::with_token_ref(
+            client.clone(),
+            "env:OPAQUE_TEST_VAULT_TOKEN_RENEW_FAIL".into(),
+        );
+        let first = resolver
+            .resolve("vault:database/creds/readonly#password")
+            .unwrap();
+        assert_eq!(first.as_str(), Some("first-password"));
+
+        let second = resolver
+            .resolve("vault:database/creds/readonly#password")
+            .unwrap();
+        assert_eq!(second.as_str(), Some("first-password"));
+
+        sleep(Duration::from_secs(3)).await;
+
+        server.reset().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/sys/leases/revoke"))
+            .and(header("x-vault-token", "vault-token-123"))
+            .and(body_json(serde_json::json!({
+                "lease_id": "database/creds/readonly/a1"
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/database/creds/readonly"))
+            .and(header("x-vault-token", "vault-token-123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "lease_id": "database/creds/readonly/b2",
+                "lease_duration": 30,
+                "renewable": true,
+                "data": {
+                    "password": "second-password"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let refreshed = resolver
+            .resolve("vault:database/creds/readonly#password")
+            .unwrap();
+        assert_eq!(refreshed.as_str(), Some("second-password"));
+
+        unsafe {
+            std::env::remove_var("OPAQUE_TEST_VAULT_TOKEN_RENEW_FAIL");
+            std::env::remove_var("OPAQUE_VAULT_LEASE_RENEW_WINDOW_SECS");
+        };
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_non_renewable_lease_does_not_attempt_renewal() {
+        let _guard = test_lock().await;
+        VaultResolver::clear_cache_for_tests();
+        let server = MockServer::start().await;
+        let client = VaultClient::with_base_url(server.uri());
+
+        Mock::given(method("GET"))
+            .and(path("/v1/database/creds/readonly"))
+            .and(header("x-vault-token", "vault-token-123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "lease_id": "database/creds/readonly/a1",
+                "lease_duration": 30,
+                "renewable": false,
+                "data": {
+                    "password": "first-password"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/sys/leases/renew"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "lease_id": "database/creds/readonly/a1",
+                "lease_duration": 60,
+                "renewable": true
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        unsafe {
+            std::env::set_var("OPAQUE_TEST_VAULT_TOKEN_NO_RENEW", "vault-token-123");
+            std::env::set_var("OPAQUE_VAULT_LEASE_RENEW_WINDOW_SECS", "30");
+        };
+        let resolver =
+            VaultResolver::with_token_ref(client, "env:OPAQUE_TEST_VAULT_TOKEN_NO_RENEW".into());
+        let first = resolver
+            .resolve("vault:database/creds/readonly#password")
+            .unwrap();
+        let second = resolver
+            .resolve("vault:database/creds/readonly#password")
+            .unwrap();
+        assert_eq!(first.as_str(), Some("first-password"));
+        assert_eq!(second.as_str(), Some("first-password"));
+
+        unsafe {
+            std::env::remove_var("OPAQUE_TEST_VAULT_TOKEN_NO_RENEW");
+            std::env::remove_var("OPAQUE_VAULT_LEASE_RENEW_WINDOW_SECS");
+        };
     }
 }

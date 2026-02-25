@@ -67,8 +67,8 @@ Shipped in this phase:
 - Vault KV field resolution through `vault:` refs
 - Dynamic secret engine field resolution (for example `database/creds/...`)
 - Lease-aware caching for dynamic refs using Vault `lease_duration`
+- Proactive lease renewal on cache hits for renewable leases near expiry
+  - Controlled by `OPAQUE_VAULT_LEASE_RENEW_WINDOW_SECS` (default `30`, set `0` to disable)
+  - Renewal uses `POST /v1/sys/leases/renew`
+  - Renewal failures do not break active requests before true lease expiry
 - Best-effort revocation of expired cached leases on refresh
-
-Still deferred:
-
-- Lease renewal for long-running sessions
