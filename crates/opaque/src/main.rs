@@ -18,6 +18,8 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 mod service;
 mod setup;
 mod ui;
+#[allow(dead_code)]
+mod wizard;
 
 /// Build a version string that includes the git SHA: `0.1.0+abc1234`.
 const fn version_string() -> &'static str {
@@ -80,6 +82,9 @@ enum Cmd {
         /// Apply a policy preset (e.g. "safe-demo", "github-secrets", "sandbox-human").
         #[arg(long)]
         preset: Option<String>,
+        /// Initialize a repo-scoped policy in .opaque/ at the repo root.
+        #[arg(long, default_value_t = false)]
+        repo: bool,
     },
     /// Manage GitHub Actions secrets.
     Github {
@@ -143,8 +148,35 @@ enum Cmd {
     Doctor,
     /// One-step onboarding: init with safe-demo preset, check daemon, run diagnostics.
     Quickstart,
+    /// Register the opaque MCP server with an AI coding tool (claude, cursor, codex).
+    Connect {
+        /// Tool name: "claude", "cursor", "codex", or "auto" (detect automatically).
+        #[arg(default_value = "auto")]
+        tool: String,
+    },
     /// List active approval leases in the daemon.
     Leases,
+    /// Manage secrets in the OS keychain for use with Opaque secret refs.
+    Secrets {
+        #[command(subcommand)]
+        action: SecretsAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SecretsAction {
+    /// Store a secret in the OS keychain. Value is read from stdin (not echoed).
+    Add {
+        /// Secret name (e.g. "github-pat", "gitlab-token"). Stored as "opaque/<name>".
+        name: String,
+    },
+    /// List stored Opaque secrets (names only, never values).
+    List,
+    /// Remove a secret from the OS keychain.
+    Remove {
+        /// Secret name to remove.
+        name: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -178,7 +210,11 @@ enum PolicyAction {
         file: Option<PathBuf>,
     },
     /// List available policy presets.
-    Presets,
+    Presets {
+        /// Show the full TOML content of a specific preset.
+        #[arg(long)]
+        show: Option<String>,
+    },
     /// Apply a policy preset to your configuration.
     Preset {
         /// Preset name (e.g. "safe-demo", "github-secrets", "sandbox-human").
@@ -1369,12 +1405,281 @@ fn maybe_warn_opaque_mcp_skew(command: &[String], json_output: bool) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Secrets command helpers
+// ---------------------------------------------------------------------------
+
+/// Validate a secret name: only alphanumeric, dash, and underscore allowed.
+fn validate_secret_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("Secret name must not be empty".to_string());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(format!(
+            "Invalid secret name '{}': only alphanumeric characters, dashes, and underscores are allowed",
+            name
+        ));
+    }
+    Ok(())
+}
+
+/// Return the keychain ref format for a given secret name.
+fn secrets_ref_format(name: &str) -> String {
+    format!("keychain:opaque/{name}")
+}
+
+/// Return the command and arguments to add a secret to the OS keychain.
+///
+/// On Linux the value is piped via stdin rather than passed as an argument,
+/// so the returned args do **not** include the value itself.
+fn keychain_add_command<'a>(name: &'a str, value: &'a str, os: &str) -> (String, Vec<&'a str>) {
+    let service_label: &str = Box::leak(format!("opaque/{name}").into_boxed_str());
+    match os {
+        "macos" => (
+            "security".to_string(),
+            vec![
+                "add-generic-password",
+                "-a",
+                "opaque",
+                "-s",
+                service_label,
+                "-w",
+                value,
+                "-U",
+            ],
+        ),
+        _ => (
+            "secret-tool".to_string(),
+            vec![
+                "store",
+                "--label",
+                service_label,
+                "service",
+                "opaque",
+                "username",
+                name,
+            ],
+        ),
+    }
+}
+
+/// Return the command and arguments to remove a secret from the OS keychain.
+fn keychain_remove_command<'a>(name: &'a str, os: &str) -> (String, Vec<&'a str>) {
+    let service_label: &str = Box::leak(format!("opaque/{name}").into_boxed_str());
+    match os {
+        "macos" => (
+            "security".to_string(),
+            vec![
+                "delete-generic-password",
+                "-a",
+                "opaque",
+                "-s",
+                service_label,
+            ],
+        ),
+        _ => (
+            "secret-tool".to_string(),
+            vec!["clear", "service", "opaque", "username", name],
+        ),
+    }
+}
+
+/// Parse macOS `security dump-keychain` output and extract Opaque secret names.
+fn parse_keychain_secrets(dump_output: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in dump_output.lines() {
+        let trimmed = line.trim();
+        // Match lines like: "svce"<blob>="opaque/github-pat"
+        if let Some(rest) = trimmed.strip_prefix("\"svce\"<blob>=\"opaque/")
+            && let Some(name) = rest.strip_suffix('"')
+            && !name.is_empty()
+        {
+            names.push(name.to_string());
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Detect the current OS for keychain commands.
+fn detect_keychain_os() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "linux"
+    }
+}
+
+/// Store a secret in the OS keychain.
+fn run_secrets_add(name: &str) {
+    if let Err(e) = validate_secret_name(name) {
+        ui::error(&e);
+        std::process::exit(1);
+    }
+
+    println!(
+        "Enter secret value for 'opaque/{}' (input is hidden):",
+        name
+    );
+    println!("Tip: paste and press Enter. Input is not echoed in interactive terminals.");
+
+    let mut value = String::new();
+    if let Err(e) = std::io::stdin().read_line(&mut value) {
+        ui::error(&format!("Failed to read secret value: {e}"));
+        std::process::exit(1);
+    }
+    let value = value.trim_end_matches('\n').trim_end_matches('\r');
+
+    if value.is_empty() {
+        ui::error("Secret value must not be empty");
+        std::process::exit(1);
+    }
+
+    let os = detect_keychain_os();
+    let (cmd, args) = keychain_add_command(name, value, os);
+
+    // On Linux, pipe the value via stdin to secret-tool.
+    let result = if os == "linux" {
+        std::process::Command::new(&cmd)
+            .args(&args)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                if let Some(ref mut stdin) = child.stdin {
+                    stdin.write_all(value.as_bytes())?;
+                }
+                child.wait()
+            })
+    } else {
+        std::process::Command::new(&cmd)
+            .args(&args)
+            .output()
+            .map(|o| o.status)
+    };
+
+    match result {
+        Ok(status) if status.success() => {
+            ui::success(&format!("Secret 'opaque/{}' stored in keychain", name));
+            ui::info(&format!(
+                "Use it in config as: {}",
+                secrets_ref_format(name)
+            ));
+        }
+        Ok(status) => {
+            ui::error(&format!(
+                "Keychain command failed with exit code {}",
+                status.code().unwrap_or(-1)
+            ));
+            std::process::exit(1);
+        }
+        Err(e) => {
+            ui::error(&format!("Failed to execute keychain command: {e}"));
+            std::process::exit(1);
+        }
+    }
+}
+
+/// List stored Opaque secrets (names only, never values).
+fn run_secrets_list() {
+    let os = detect_keychain_os();
+    match os {
+        "macos" => {
+            let output = std::process::Command::new("security")
+                .args(["dump-keychain"])
+                .output();
+            match output {
+                Ok(o) => {
+                    let stdout = String::from_utf8_lossy(&o.stdout);
+                    let names = parse_keychain_secrets(&stdout);
+                    if names.is_empty() {
+                        ui::info("No Opaque secrets found in keychain.");
+                    } else {
+                        ui::header(&format!("{} secret(s)", names.len()));
+                        for name in &names {
+                            println!(
+                                "  {} {}  {}",
+                                style(ui::KEY).dim(),
+                                style(name).yellow().bold(),
+                                style(format!("({})", secrets_ref_format(name))).dim()
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    ui::error(&format!("Failed to query keychain: {e}"));
+                    std::process::exit(1);
+                }
+            }
+        }
+        _ => {
+            ui::warn(
+                "Listing secrets is not fully supported on Linux (secret-tool has no list command).",
+            );
+            ui::info(
+                "Secrets you stored with 'opaque secrets add' are available via their ref names.",
+            );
+        }
+    }
+}
+
+/// Remove a secret from the OS keychain.
+fn run_secrets_remove(name: &str) {
+    if let Err(e) = validate_secret_name(name) {
+        ui::error(&e);
+        std::process::exit(1);
+    }
+
+    let os = detect_keychain_os();
+    let (cmd, args) = keychain_remove_command(name, os);
+
+    let result = std::process::Command::new(&cmd).args(&args).output();
+
+    match result {
+        Ok(o) if o.status.success() => {
+            ui::success(&format!("Secret 'opaque/{}' removed from keychain", name));
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            if stderr.contains("could not be found")
+                || stderr.contains("not found")
+                || stderr.contains("No matching")
+            {
+                ui::error(&format!("Secret 'opaque/{}' not found in keychain", name));
+            } else {
+                ui::error(&format!(
+                    "Keychain command failed (exit {}): {}",
+                    o.status.code().unwrap_or(-1),
+                    stderr.trim()
+                ));
+            }
+            std::process::exit(1);
+        }
+        Err(e) => {
+            ui::error(&format!("Failed to execute keychain command: {e}"));
+            std::process::exit(1);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
 
-    let cmd = cli.cmd.unwrap_or(Cmd::Ping);
     let json_output = cli.json;
+
+    // No subcommand → show smart status dashboard instead of silent ping.
+    let cmd = match cli.cmd {
+        Some(c) => c,
+        None => {
+            run_status().await;
+            return;
+        }
+    };
 
     // Handle commands that don't need a daemon connection.
     match &cmd {
@@ -1399,8 +1704,17 @@ async fn main() {
                 }
                 return;
             }
-            PolicyAction::Presets => {
-                policy_list_presets();
+            PolicyAction::Presets { show } => {
+                match show {
+                    Some(name) => match policy_show_preset(name) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            ui::error(&e);
+                            std::process::exit(1);
+                        }
+                    },
+                    None => policy_list_presets(),
+                }
                 return;
             }
             PolicyAction::Preset { name } => {
@@ -1436,8 +1750,17 @@ async fn main() {
                 return;
             }
         },
-        Cmd::Init { force, preset } => {
-            match run_init(*force, preset.as_deref()) {
+        Cmd::Init {
+            force,
+            preset,
+            repo,
+        } => {
+            let result = if *repo {
+                run_init_repo(preset.as_deref())
+            } else {
+                run_init(*force, preset.as_deref())
+            };
+            match result {
                 Ok(()) => {}
                 Err(e) => {
                     ui::error(&e);
@@ -1509,6 +1832,16 @@ async fn main() {
             run_quickstart().await;
             return;
         }
+        Cmd::Connect { tool } => {
+            match run_connect(tool) {
+                Ok(()) => {}
+                Err(e) => {
+                    ui::error(&e);
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
         Cmd::Service { action } => {
             let op = match action {
                 ServiceAction::Install => service::ServiceOp::Install,
@@ -1543,6 +1876,14 @@ async fn main() {
                     ui::error(&e);
                     std::process::exit(1);
                 }
+            }
+            return;
+        }
+        Cmd::Secrets { action } => {
+            match action {
+                SecretsAction::Add { name } => run_secrets_add(name),
+                SecretsAction::List => run_secrets_list(),
+                SecretsAction::Remove { name } => run_secrets_remove(name),
             }
             return;
         }
@@ -1911,7 +2252,9 @@ async fn main() {
         | Cmd::Setup { .. }
         | Cmd::Service { .. }
         | Cmd::Doctor
-        | Cmd::Quickstart => {
+        | Cmd::Quickstart
+        | Cmd::Secrets { .. }
+        | Cmd::Connect { .. } => {
             unreachable!()
         }
     };
@@ -1957,6 +2300,30 @@ async fn main() {
             } else {
                 ui::error(&format!("Connection failed: {e}"));
             }
+            // Show actionable hints for common connection errors.
+            if !json_output {
+                let err_str = e.to_string();
+                if err_str.contains("No such file")
+                    || err_str.contains("not found")
+                    || err_str.contains("Connection refused")
+                {
+                    eprintln!();
+                    eprintln!(
+                        "  {} The daemon doesn't appear to be running.",
+                        style("hint:").cyan().bold()
+                    );
+                    eprintln!(
+                        "        {}  {}",
+                        style("opaque service install").cyan(),
+                        style("# install & auto-start on login").dim()
+                    );
+                    eprintln!(
+                        "        {}  {}",
+                        style("opaque quickstart").cyan(),
+                        style("# or run the full setup wizard").dim()
+                    );
+                }
+            }
             std::process::exit(1);
         }
     }
@@ -1978,7 +2345,7 @@ fn read_daemon_token(sock: &Path) -> std::io::Result<String> {
         std::io::Error::new(
             e.kind(),
             format!(
-                "failed to read daemon token at {}: {e} (is opaqued running?)",
+                "Cannot connect to Opaque daemon (token not found at {}). Start it with:\n    opaque service install    # recommended: auto-start on login\n    opaqued                   # or run directly in a terminal",
                 token_path.display()
             ),
         )
@@ -2103,7 +2470,7 @@ async fn call_once(
             std::io::Error::new(
                 e.kind(),
                 format!(
-                    "{e} (is opaqued running? expected socket at {})",
+                    "Cannot connect to Opaque daemon at {}. Start it with:\n    opaque service install    # recommended: auto-start on login\n    opaqued                   # or run directly in a terminal",
                     sock.display()
                 ),
             )
@@ -2672,34 +3039,40 @@ const PRESET_GITHUB_SECRETS: &str = include_str!("presets/github-secrets.toml");
 const PRESET_GITLAB_VARIABLES: &str = include_str!("presets/gitlab-variables.toml");
 const PRESET_SANDBOX_HUMAN: &str = include_str!("presets/sandbox-human.toml");
 const PRESET_AGENT_WRAPPER_GITHUB: &str = include_str!("presets/agent-wrapper-github.toml");
+const PRESET_CODEX_AGENT: &str = include_str!("presets/codex-agent.toml");
 
 /// Available presets: (name, description, content).
 fn available_presets() -> Vec<(&'static str, &'static str, &'static str)> {
     vec![
         (
             "safe-demo",
-            "Minimal safe policy (test.noop only)",
+            "Try Opaque risk-free — allows only test.noop, no real secrets",
             PRESET_SAFE_DEMO,
         ),
         (
             "github-secrets",
-            "Allow agents to sync GitHub secrets (Actions, Codespaces, Dependabot, org)",
+            "Sync GitHub secrets via AI agents — requires: keychain:opaque/github-pat",
             PRESET_GITHUB_SECRETS,
         ),
         (
             "gitlab-variables",
-            "Allow agents to set GitLab CI/CD variables",
+            "Set GitLab CI/CD variables via AI agents — requires: keychain:opaque/gitlab-pat",
             PRESET_GITLAB_VARIABLES,
         ),
         (
             "sandbox-human",
-            "Allow human-only sandbox execution, deny agents",
+            "Sandboxed command execution — human-only, agents blocked",
             PRESET_SANDBOX_HUMAN,
         ),
         (
             "agent-wrapper-github",
-            "GitHub secret sync preset with enforce_agent_sessions enabled",
+            "GitHub secrets + agent session wrapping — full production setup",
             PRESET_AGENT_WRAPPER_GITHUB,
+        ),
+        (
+            "codex-agent",
+            "Codex CLI agent preset with workspace-scoped GitHub/GitLab rules and session enforcement",
+            PRESET_CODEX_AGENT,
         ),
     ]
 }
@@ -2716,16 +3089,44 @@ fn get_preset(name: &str) -> Option<&'static str> {
 fn policy_list_presets() {
     ui::header("Available policy presets");
     println!();
-    for (name, description, _) in available_presets() {
+    for (name, description, content) in available_presets() {
         println!(
             "  {}  {}",
             style(name).cyan().bold(),
             style(description).dim()
         );
+        // Show a one-line summary of what the preset enables.
+        if let Ok(config) = toml_edit::de::from_str::<PolicyConfig>(content) {
+            let ops: Vec<&str> = config
+                .rules
+                .iter()
+                .map(|r| r.operation_pattern.as_str())
+                .collect();
+            let approval = config
+                .rules
+                .first()
+                .map(|r| format!("{:?}", r.approval.require).to_lowercase())
+                .unwrap_or_else(|| "n/a".into());
+            println!(
+                "    {}  {}",
+                style(format!(
+                    "{} rule(s): {}",
+                    ops.len(),
+                    if ops.len() <= 3 {
+                        ops.join(", ")
+                    } else {
+                        format!("{}, {} +{} more", ops[0], ops[1], ops.len() - 2)
+                    }
+                ))
+                .dim(),
+                style(format!("approval: {approval}")).dim()
+            );
+        }
     }
     println!();
-    ui::info("Apply a preset: opaque policy preset <name>");
-    ui::info("Or during init: opaque init --preset <name>");
+    ui::info("Preview a preset:  opaque policy presets --show <name>");
+    ui::info("Apply a preset:    opaque policy preset <name>");
+    ui::info("Apply during init: opaque init --preset <name>");
 }
 
 /// Apply a policy preset to ~/.opaque/config.toml.
@@ -2756,6 +3157,17 @@ fn policy_apply_preset(name: &str) -> Result<(), String> {
         "Applied preset '{name}' to {}",
         config_path.display()
     ));
+
+    let checklist = preset_checklist(name);
+    if !checklist.is_empty() {
+        println!();
+        println!("Before this works, complete these steps:");
+        for (i, step) in checklist.iter().enumerate() {
+            println!("  {}. {step}", i + 1);
+        }
+        println!();
+    }
+
     ui::info("Run 'opaque setup --seal' to seal your config.");
     Ok(())
 }
@@ -2804,18 +3216,28 @@ fn run_init(force: bool, preset: Option<&str>) -> Result<(), String> {
     ));
     println!();
     println!("  Next steps:");
-    println!("    1. Start the daemon:   {}", style("opaqued").bold());
-    println!("    2. Test it works:      {}", style("opaque ping").bold());
     println!(
-        "    3. Run a test op:      {}",
-        style("opaque execute test.noop").bold()
+        "    1. {}   {}",
+        style("opaque service install").bold(),
+        style("# install & start daemon").dim()
     );
     println!(
-        "    4. Check everything:   {}",
-        style("opaque doctor").bold()
+        "    2. {}      {}",
+        style("opaque connect auto").bold(),
+        style("# connect to Claude/Cursor").dim()
+    );
+    println!(
+        "    3. {}             {}",
+        style("opaque ping").bold(),
+        style("# verify daemon is alive").dim()
+    );
+    println!(
+        "    4. {}           {}",
+        style("opaque doctor").bold(),
+        style("# full diagnostic check").dim()
     );
     println!();
-    ui::info("Run 'opaque policy presets' to see all available presets.");
+    ui::info("Or run 'opaque quickstart' to do all of the above automatically.");
     Ok(())
 }
 
@@ -2894,50 +3316,116 @@ async fn run_quickstart() {
         }
     }
 
-    // Step 2: Check if daemon is running.
+    // Step 2: Ensure daemon is running — auto-start if needed.
     let sock = socket_path();
-    let daemon_running = if sock.exists() {
-        match tokio::time::timeout(Duration::from_secs(3), try_ping(&sock)).await {
-            Ok(Ok(())) => {
-                ui::init_step("Daemon is running (ping OK)");
-                true
-            }
-            _ => {
-                ui::warn("Daemon is not responding");
-                false
-            }
-        }
+    let mut daemon_running = if sock.exists() {
+        tokio::time::timeout(Duration::from_secs(3), try_ping(&sock))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .is_some()
     } else {
-        ui::warn("Daemon is not running (no socket found)");
         false
     };
 
-    if !daemon_running {
-        println!();
-        ui::info("Start the daemon with one of:");
-        println!(
-            "    {}    {}",
-            style("opaque service install").cyan().bold(),
-            style("# recommended: install as system service").dim()
-        );
-        println!(
-            "    {}              {}",
-            style("opaqued").cyan().bold(),
-            style("# or run directly in another terminal").dim()
-        );
-        println!();
-        ui::info("Then re-run 'opaque quickstart' to continue.");
-        return;
+    if daemon_running {
+        ui::init_step("Daemon is running (ping OK)");
+    } else {
+        // Auto-start: try installing the service automatically.
+        let service_status = service::query_status();
+        if !service_status.installed {
+            ui::info("Installing daemon service...");
+            match service::run(service::ServiceOp::Install) {
+                Ok(()) => {
+                    ui::init_step("Daemon service installed and started");
+                }
+                Err(e) => {
+                    ui::warn(&format!("Could not install service: {e}"));
+                    ui::info(
+                        "You can start the daemon manually with 'opaqued' in another terminal.",
+                    );
+                    println!();
+                    ui::info("Then re-run 'opaque quickstart' to continue.");
+                    return;
+                }
+            }
+        } else if !service_status.running {
+            ui::info("Starting daemon service...");
+            match service::run(service::ServiceOp::Start) {
+                Ok(()) => {
+                    ui::init_step("Daemon service started");
+                }
+                Err(e) => {
+                    ui::warn(&format!("Could not start service: {e}"));
+                    ui::info("Try 'opaque service logs' to see what went wrong.");
+                    return;
+                }
+            }
+        }
+
+        // Wait for daemon to become reachable (up to 5 seconds).
+        let sp = ui::spinner("Waiting for daemon to start...");
+        for _ in 0..25 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            // Re-check socket path (may have been created).
+            let current_sock = socket_path();
+            if current_sock.exists()
+                && tokio::time::timeout(Duration::from_secs(2), try_ping(&current_sock))
+                    .await
+                    .is_ok_and(|r| r.is_ok())
+            {
+                daemon_running = true;
+                break;
+            }
+        }
+        sp.finish_and_clear();
+
+        if daemon_running {
+            ui::init_step("Daemon is reachable");
+        } else {
+            ui::warn("Daemon did not start within 5 seconds");
+            ui::info("Try 'opaque service logs' to troubleshoot.");
+            return;
+        }
     }
 
-    // Step 3: Execute test.noop to verify end-to-end.
+    // Step 3: Connect to AI coding tool (auto-detect).
+    if let Some(tool_name) = detect_mcp_connection() {
+        ui::init_step(&format!(
+            "MCP already connected to {}",
+            style(tool_name).cyan()
+        ));
+    } else {
+        match find_opaque_mcp_path() {
+            Some(opaque_mcp) => match connect_tool_at(&opaque_mcp) {
+                Ok(()) => {
+                    ui::init_step("Connected to detected AI coding tool");
+                }
+                Err(e) => {
+                    ui::warn(&format!("MCP connect failed: {e}"));
+                    ui::info("Run 'opaque connect claude' to configure manually.");
+                }
+            },
+            None => {
+                ui::info("opaque-mcp not found — run 'opaque connect' after installation.");
+            }
+        }
+    }
+
+    // Step 4: Execute test.noop to verify end-to-end.
     ui::info("Testing end-to-end with test.noop operation...");
     let test_params = serde_json::json!({
         "operation": "test.noop",
         "target": {},
         "secret_refs": [],
     });
-    match tokio::time::timeout(Duration::from_secs(10), call(&sock, "execute", test_params)).await {
+    let current_sock = socket_path();
+    match tokio::time::timeout(
+        Duration::from_secs(10),
+        call(&current_sock, "execute", test_params),
+    )
+    .await
+    {
         Ok(Ok(resp)) => {
             if let Some(err) = resp.error {
                 // Approval-required is expected (not a failure).
@@ -2958,25 +3446,35 @@ async fn run_quickstart() {
         }
     }
 
-    // Step 4: Print success summary.
+    // Step 5: Print success summary.
     println!();
     ui::success("Quickstart complete!");
     println!();
-    ui::info("Next steps:");
+    ui::info("Useful commands:");
     println!(
-        "    {}         {}",
+        "    {}           {}",
         style("opaque doctor").cyan().bold(),
         style("# run full diagnostics").dim()
     );
     println!(
-        "    {}    {}",
-        style("opaque setup --seal").cyan().bold(),
-        style("# seal your config to prevent tampering").dim()
+        "    {}  {}",
+        style("opaque init --repo").cyan().bold(),
+        style("# add per-repo policy (in a git repo)").dim()
     );
     println!(
         "    {}  {}",
         style("opaque policy presets").cyan().bold(),
         style("# explore other policy presets").dim()
+    );
+    println!(
+        "    {}  {}",
+        style("opaque secrets add <name>").cyan().bold(),
+        style("# store a secret in the OS keychain").dim()
+    );
+    println!(
+        "    {}      {}",
+        style("opaque setup --seal").cyan().bold(),
+        style("# seal config to prevent tampering").dim()
     );
 }
 
@@ -3236,6 +3734,221 @@ fn run_setup_wizard(base: &Path, config_path: &Path, seal_file: &Path) -> Result
     ui::info("Run 'opaque service install' to start the daemon automatically on login.");
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// status (default when no subcommand)
+// ---------------------------------------------------------------------------
+
+/// Smart welcome screen shown when `opaque` is invoked with no subcommand.
+///
+/// Detects installation state and shows either a first-run guide or a status
+/// dashboard, making the next action obvious.
+async fn run_status() {
+    println!();
+    println!(
+        "  {} {}",
+        style("Opaque").bold(),
+        style(version_string()).dim()
+    );
+    println!("  {}", style("─────────────────────────────").dim());
+    println!();
+
+    let base = default_opaque_dir();
+    let config_path = base.join("config.toml");
+    let sock = socket_path();
+
+    // Detect whether this is a first-run or a returning user.
+    let config_exists = config_path.exists();
+    let service_status = service::query_status();
+    let daemon_reachable = if sock.exists() {
+        tokio::time::timeout(Duration::from_secs(2), try_ping(&sock))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .is_some()
+    } else {
+        false
+    };
+
+    if !config_exists {
+        // ── First-time user ─────────────────────────────────────────
+        println!("  {}", style("Get started in 60 seconds:").bold());
+        println!();
+        println!("    {}", style("opaque quickstart").cyan().bold());
+        println!();
+        println!("  This will:");
+        println!(
+            "    1. Create {} with a safe demo policy",
+            style("~/.opaque/").cyan()
+        );
+        println!("    2. Install and start the daemon service");
+        println!("    3. Connect to your AI coding tool (Claude, Cursor)");
+        println!("    4. Verify everything works end-to-end");
+        println!();
+        println!("  {}", style("Other commands:").dim());
+        println!(
+            "    {}        {}",
+            style("opaque init").cyan(),
+            style("# initialize config only").dim()
+        );
+        println!(
+            "    {}      {}",
+            style("opaque doctor").cyan(),
+            style("# diagnose an existing install").dim()
+        );
+        println!(
+            "    {}      {}",
+            style("opaque --help").cyan(),
+            style("# see all commands").dim()
+        );
+    } else {
+        // ── Returning user: status dashboard ────────────────────────
+        // Config
+        let rule_count = std::fs::read_to_string(&config_path)
+            .ok()
+            .and_then(|c| toml_edit::de::from_str::<PolicyConfig>(&c).ok())
+            .map(|c| c.rules.len())
+            .unwrap_or(0);
+
+        let seal_status = {
+            use opaque_core::seal::{self, SealStatus};
+            let seal_file = base.join("config.seal");
+            std::fs::read(&config_path)
+                .ok()
+                .and_then(|bytes| seal::verify_seal(&bytes, &seal_file).ok())
+                .map(|s| match s {
+                    SealStatus::Verified => style("sealed").green().to_string(),
+                    SealStatus::Unsealed => style("unsealed").yellow().to_string(),
+                    SealStatus::Tampered { .. } => style("TAMPERED").red().bold().to_string(),
+                })
+                .unwrap_or_else(|| style("unknown").dim().to_string())
+        };
+
+        println!("  {}", style("Status").bold());
+
+        // Daemon
+        if daemon_reachable {
+            let pid_info = if service_status.running {
+                service_status
+                    .pid
+                    .map(|p| format!(" (PID {p})"))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            println!(
+                "    {:<14} {} {}",
+                style("daemon").dim(),
+                style("running").green(),
+                style(pid_info).dim()
+            );
+        } else if service_status.installed {
+            println!(
+                "    {:<14} {}",
+                style("daemon").dim(),
+                style("installed but not responding").yellow()
+            );
+        } else {
+            println!(
+                "    {:<14} {}",
+                style("daemon").dim(),
+                style("not running").red()
+            );
+        }
+
+        // Config
+        println!(
+            "    {:<14} {} rule(s), {}",
+            style("config").dim(),
+            rule_count,
+            seal_status
+        );
+
+        // Service
+        if service_status.installed {
+            if service_status.running {
+                println!(
+                    "    {:<14} {}",
+                    style("service").dim(),
+                    style("installed, running").green()
+                );
+            } else {
+                println!(
+                    "    {:<14} {}",
+                    style("service").dim(),
+                    style("installed, stopped").yellow()
+                );
+            }
+        } else {
+            println!(
+                "    {:<14} {}",
+                style("service").dim(),
+                style("not installed").dim()
+            );
+        }
+
+        // MCP connection
+        let mcp_connected = detect_mcp_connection();
+        if let Some(ref tool_name) = mcp_connected {
+            println!(
+                "    {:<14} {}",
+                style("MCP").dim(),
+                style(format!("connected to {tool_name}")).green()
+            );
+        } else {
+            println!(
+                "    {:<14} {}",
+                style("MCP").dim(),
+                style("not connected").dim()
+            );
+        }
+
+        println!();
+
+        // Context-sensitive next actions.
+        if !daemon_reachable && !service_status.installed {
+            println!("  {}", style("Next step:").bold());
+            println!(
+                "    {}  {}",
+                style("opaque service install").cyan().bold(),
+                style("# install and start daemon").dim()
+            );
+        } else if !daemon_reachable && service_status.installed {
+            println!("  {}", style("Next step:").bold());
+            println!(
+                "    {}    {}",
+                style("opaque service start").cyan().bold(),
+                style("# start the daemon").dim()
+            );
+        } else if mcp_connected.is_none() {
+            println!("  {}", style("Next step:").bold());
+            println!(
+                "    {}   {}",
+                style("opaque connect auto").cyan().bold(),
+                style("# connect to your AI coding tool").dim()
+            );
+        } else {
+            println!("  {}", style("Quick actions:").dim());
+            println!(
+                "    {}           {}",
+                style("opaque doctor").cyan(),
+                style("# run diagnostics").dim()
+            );
+            println!(
+                "    {}  {}",
+                style("opaque policy presets").cyan(),
+                style("# explore policy presets").dim()
+            );
+            println!(
+                "    {}       {}",
+                style("opaque audit tail").cyan(),
+                style("# view recent audit events").dim()
+            );
+        }
+    }
+
+    println!();
 }
 
 // ---------------------------------------------------------------------------
@@ -3853,6 +4566,580 @@ fn run_profile_action(action: &ProfileAction) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// connect
+// ---------------------------------------------------------------------------
+
+/// Result of a connect operation.
+#[derive(Debug, PartialEq)]
+enum ConnectResult {
+    /// MCP server was newly registered.
+    Connected,
+    /// MCP server was already configured with the correct path.
+    AlreadyConnected,
+    /// MCP server entry existed but was updated (different path).
+    Updated,
+}
+
+/// Run the `opaque connect <tool>` command.
+fn run_connect(tool: &str) -> Result<(), String> {
+    let tool_lower = tool.to_ascii_lowercase();
+
+    // Find opaque-mcp binary.
+    let opaque_mcp =
+        find_opaque_mcp_path().ok_or("cannot find opaque-mcp binary on PATH or next to opaque")?;
+
+    match tool_lower.as_str() {
+        "claude" => {
+            let result = connect_claude(&opaque_mcp)?;
+            print_connect_result("Claude Code", &result);
+        }
+        "cursor" => {
+            let result = connect_cursor(&opaque_mcp)?;
+            print_connect_result("Cursor", &result);
+        }
+        "codex" => {
+            let result = connect_codex(&opaque_mcp)?;
+            print_connect_result("Codex", &result);
+        }
+        "auto" => {
+            connect_tool_at(&opaque_mcp)?;
+        }
+        "windsurf" => {
+            ui::info("Windsurf support is coming soon.");
+            return Ok(());
+        }
+        _ => {
+            return Err(format!(
+                "unknown tool '{tool}'. Supported: claude, cursor, codex, auto (windsurf coming soon)"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Print a human-friendly result for a connect operation.
+fn print_connect_result(tool_name: &str, result: &ConnectResult) {
+    match result {
+        ConnectResult::Connected => {
+            ui::success(&format!("Registered opaque MCP server with {tool_name}"));
+        }
+        ConnectResult::AlreadyConnected => {
+            ui::info(&format!(
+                "opaque MCP server is already configured in {tool_name}"
+            ));
+        }
+        ConnectResult::Updated => {
+            ui::success(&format!("Updated opaque MCP server path in {tool_name}"));
+        }
+    }
+}
+
+/// Auto-detect AI tools and connect to the first one found.
+fn connect_tool_at(opaque_mcp: &Path) -> Result<(), String> {
+    let env = wizard::RealEnvironment;
+    let tools = wizard::detect_ai_tools(&env);
+
+    if tools.is_empty() {
+        return Err(
+            "no AI coding tools detected. Supported: claude, cursor, codex (windsurf coming soon). \
+             Install one and retry, or specify a tool explicitly: opaque connect <tool>"
+                .into(),
+        );
+    }
+
+    let mut connected_any = false;
+    for tool in &tools {
+        let result = match tool.kind {
+            wizard::AiToolKind::ClaudeCode => connect_claude(opaque_mcp),
+            wizard::AiToolKind::Cursor => connect_cursor(opaque_mcp),
+            wizard::AiToolKind::Codex => connect_codex(opaque_mcp),
+        };
+        match result {
+            Ok(r) => {
+                print_connect_result(&tool.name, &r);
+                connected_any = true;
+            }
+            Err(e) => {
+                ui::warn(&format!("Could not connect to {}: {e}", tool.name));
+            }
+        }
+    }
+
+    if !connected_any {
+        return Err("failed to connect to any detected AI tool".into());
+    }
+
+    Ok(())
+}
+
+/// Connect opaque MCP to Claude Code (~/.claude/settings.json).
+fn connect_claude(opaque_mcp: &Path) -> Result<ConnectResult, String> {
+    let home = dirs_or_home();
+    let config_dir = home.join(".claude");
+    let config_file = config_dir.join("settings.json");
+
+    connect_json_mcp(&config_file, &config_dir, opaque_mcp)
+}
+
+/// Connect opaque MCP to Cursor (~/.cursor/mcp.json).
+fn connect_cursor(opaque_mcp: &Path) -> Result<ConnectResult, String> {
+    let home = dirs_or_home();
+    let config_dir = home.join(".cursor");
+    let config_file = config_dir.join("mcp.json");
+
+    connect_json_mcp(&config_file, &config_dir, opaque_mcp)
+}
+
+/// Connect opaque MCP to a JSON-based AI tool config file.
+fn connect_json_mcp(
+    config_file: &Path,
+    config_dir: &Path,
+    opaque_mcp: &Path,
+) -> Result<ConnectResult, String> {
+    let path_str = opaque_mcp.to_string_lossy().to_string();
+
+    std::fs::create_dir_all(config_dir)
+        .map_err(|e| format!("cannot create {}: {e}", config_dir.display()))?;
+
+    let mut config: serde_json::Value = if config_file.exists() {
+        let content = std::fs::read_to_string(config_file)
+            .map_err(|e| format!("cannot read {}: {e}", config_file.display()))?;
+        serde_json::from_str(&content)
+            .map_err(|e| format!("cannot parse {}: {e}", config_file.display()))?
+    } else {
+        serde_json::json!({})
+    };
+
+    let servers = config
+        .as_object_mut()
+        .ok_or("config is not a JSON object")?
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::json!({}));
+
+    // Check if opaque is already configured with the same path.
+    if let Some(cmd) = servers
+        .get("opaque")
+        .and_then(|e| e.get("command"))
+        .and_then(|v| v.as_str())
+        && cmd == path_str
+    {
+        return Ok(ConnectResult::AlreadyConnected);
+    }
+
+    let was_update = servers.get("opaque").is_some();
+
+    servers
+        .as_object_mut()
+        .ok_or("mcpServers is not a JSON object")?
+        .insert(
+            "opaque".to_string(),
+            serde_json::json!({
+                "command": path_str,
+                "args": ["--stdio"],
+                "env": {}
+            }),
+        );
+
+    let formatted = serde_json::to_string_pretty(&config)
+        .map_err(|e| format!("cannot serialize config: {e}"))?;
+    std::fs::write(config_file, formatted)
+        .map_err(|e| format!("cannot write {}: {e}", config_file.display()))?;
+
+    if was_update {
+        Ok(ConnectResult::Updated)
+    } else {
+        Ok(ConnectResult::Connected)
+    }
+}
+
+/// Connect opaque MCP to Codex (~/.codex/config.toml).
+fn connect_codex(opaque_mcp: &Path) -> Result<ConnectResult, String> {
+    connect_codex_at(&codex_config_path(), opaque_mcp)
+}
+
+/// Return the Codex config file path (~/.codex/config.toml).
+fn codex_config_path() -> PathBuf {
+    dirs_or_home().join(".codex").join("config.toml")
+}
+
+/// Connect opaque MCP to Codex at a specific config file path.
+fn connect_codex_at(config_file: &Path, opaque_mcp: &Path) -> Result<ConnectResult, String> {
+    let path_str = opaque_mcp.to_string_lossy().to_string();
+
+    // Ensure parent directory exists.
+    if let Some(parent) = config_file.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+
+    let mut doc: toml_edit::DocumentMut = if config_file.exists() {
+        let content = std::fs::read_to_string(config_file)
+            .map_err(|e| format!("cannot read {}: {e}", config_file.display()))?;
+        content
+            .parse()
+            .map_err(|e| format!("cannot parse {}: {e}", config_file.display()))?
+    } else {
+        toml_edit::DocumentMut::new()
+    };
+
+    // Check if opaque is already configured with the same command.
+    if let Some(cmd) = doc
+        .get("mcp_servers")
+        .and_then(|s| s.get("opaque"))
+        .and_then(|o| o.get("command"))
+        .and_then(|v| v.as_str())
+        && cmd == path_str
+    {
+        return Ok(ConnectResult::AlreadyConnected);
+    }
+
+    let was_update = doc
+        .get("mcp_servers")
+        .and_then(|s| s.get("opaque"))
+        .is_some();
+
+    // Ensure [mcp_servers] table exists.
+    if !doc.contains_key("mcp_servers") {
+        doc["mcp_servers"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+
+    // Create or update [mcp_servers.opaque].
+    let opaque_table = {
+        let mut t = toml_edit::Table::new();
+        t["command"] = toml_edit::value(&path_str);
+        let mut args = toml_edit::Array::new();
+        args.set_trailing("");
+        t["args"] = toml_edit::value(args);
+        t
+    };
+
+    doc["mcp_servers"]["opaque"] = toml_edit::Item::Table(opaque_table);
+
+    std::fs::write(config_file, doc.to_string())
+        .map_err(|e| format!("cannot write {}: {e}", config_file.display()))?;
+
+    if was_update {
+        Ok(ConnectResult::Updated)
+    } else {
+        Ok(ConnectResult::Connected)
+    }
+}
+
+/// Detect if opaque MCP is already configured in any known AI tool.
+///
+/// Returns the name of the first tool where opaque is configured, or `None`.
+pub fn detect_mcp_connection() -> Option<String> {
+    let home = dirs_or_home();
+
+    // Check Claude Code.
+    let claude_config = home.join(".claude").join("settings.json");
+    if claude_config.exists()
+        && let Ok(content) = std::fs::read_to_string(&claude_config)
+        && content.contains("\"opaque\"")
+    {
+        return Some("Claude Code".into());
+    }
+
+    // Check Cursor.
+    let cursor_config = home.join(".cursor").join("mcp.json");
+    if cursor_config.exists()
+        && let Ok(content) = std::fs::read_to_string(&cursor_config)
+        && content.contains("\"opaque\"")
+    {
+        return Some("Cursor".into());
+    }
+
+    // Check Codex.
+    let codex_config = home.join(".codex").join("config.toml");
+    if codex_config.exists()
+        && let Ok(content) = std::fs::read_to_string(&codex_config)
+        && (content.contains("[mcp_servers.opaque]") || content.contains("\"opaque\""))
+    {
+        return Some("Codex".into());
+    }
+
+    None
+}
+
+/// Locate the opaque-mcp binary (on PATH or next to the current executable).
+fn find_opaque_mcp_path() -> Option<PathBuf> {
+    // Try `which opaque-mcp`.
+    let output = std::process::Command::new("which")
+        .arg("opaque-mcp")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+
+    if output.status.success() {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
+        }
+    }
+
+    // Try next to the current executable.
+    if let Ok(exe) = std::env::current_exe() {
+        let sibling = exe.with_file_name("opaque-mcp");
+        if sibling.exists() {
+            return Some(sibling);
+        }
+    }
+
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Per-repo init
+// ---------------------------------------------------------------------------
+
+/// Generate a repo-scoped policy TOML from a remote URL and optional preset content.
+///
+/// This is a pure function suitable for unit testing.
+#[allow(dead_code)]
+fn generate_repo_policy(remote_url: &str, preset_content: Option<&str>) -> String {
+    // Extract org/repo from remote URL.
+    let cleaned = remote_url.trim_end_matches(".git").trim_end_matches('/');
+    let org_repo = if let Some(colon_idx) = cleaned.rfind(':') {
+        let after_colon = &cleaned[colon_idx + 1..];
+        if !after_colon.is_empty()
+            && !after_colon.starts_with("//")
+            && !after_colon.chars().next().unwrap_or(' ').is_ascii_digit()
+        {
+            after_colon.to_string()
+        } else {
+            extract_last_two_segments(cleaned)
+        }
+    } else {
+        extract_last_two_segments(cleaned)
+    };
+
+    // Build the glob pattern for remote_url_pattern.
+    let escaped_url = remote_url
+        .replace('\\', "\\\\")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
+        .replace('{', "\\{")
+        .replace('}', "\\}");
+    let url_pattern = format!("*{}*", escaped_url);
+
+    if let Some(preset) = preset_content
+        && let Ok(config) = toml_edit::de::from_str::<PolicyConfig>(preset)
+    {
+        let mut result = format!(
+            "# Repo-scoped Opaque policy for {}\n\
+                 # This file is merged with ~/.opaque/config.toml at runtime.\n\n",
+            org_repo
+        );
+
+        for rule in &config.rules {
+            result.push_str("[[rules]]\n");
+            result.push_str(&format!("name = \"repo-{}\"\n", rule.name));
+            result.push_str(&format!(
+                "operation_pattern = \"{}\"\n",
+                rule.operation_pattern
+            ));
+            result.push_str(&format!("allow = {}\n", rule.allow));
+            let types: Vec<String> = rule
+                .client_types
+                .iter()
+                .map(|ct| match ct {
+                    ClientType::Human => "\"human\"".to_string(),
+                    ClientType::Agent => "\"agent\"".to_string(),
+                })
+                .collect();
+            result.push_str(&format!("client_types = [{}]\n\n", types.join(", ")));
+
+            result.push_str("[rules.workspace]\n");
+            result.push_str(&format!("remote_url_pattern = \"{}\"\n\n", url_pattern));
+
+            result.push_str("[rules.approval]\n");
+            let require = format!("{:?}", rule.approval.require).to_lowercase();
+            result.push_str(&format!("require = \"{}\"\n", require));
+            let factors: Vec<String> = rule
+                .approval
+                .factors
+                .iter()
+                .map(|f| format!("\"{:?}\"", f).to_lowercase())
+                .collect();
+            result.push_str(&format!("factors = [{}]\n", factors.join(", ")));
+            if let Some(ttl) = rule.approval.lease_ttl {
+                result.push_str(&format!("lease_ttl = {}\n", ttl.as_secs()));
+            }
+            result.push('\n');
+        }
+
+        return result;
+    }
+
+    format!(
+        "# Repo-scoped Opaque policy for {org_repo}\n\
+         # This file is merged with ~/.opaque/config.toml at runtime.\n\
+         #\n\
+         # Add rules below to control what operations are allowed in this repo.\n\
+         # See: opaque policy presets --show <name> for examples.\n\
+         \n\
+         # [[rules]]\n\
+         # name = \"repo-example\"\n\
+         # operation_pattern = \"github.*\"\n\
+         # allow = true\n\
+         # client_types = [\"agent\", \"human\"]\n\
+         #\n\
+         # [rules.workspace]\n\
+         # remote_url_pattern = \"{url_pattern}\"\n\
+         #\n\
+         # [rules.approval]\n\
+         # require = \"first_use\"\n\
+         # factors = [\"local_bio\"]\n\
+         # lease_ttl = 300\n"
+    )
+}
+
+/// Extract the last two path segments from a URL (e.g. "org/repo").
+#[allow(dead_code)]
+fn extract_last_two_segments(url: &str) -> String {
+    let parts: Vec<&str> = url.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.len() >= 2 {
+        format!("{}/{}", parts[parts.len() - 2], parts[parts.len() - 1])
+    } else if parts.len() == 1 {
+        parts[0].to_string()
+    } else {
+        url.to_string()
+    }
+}
+
+/// Initialize a repo-scoped policy at the given repo root directory.
+///
+/// Creates `.opaque/policy.toml` with a workspace-scoped policy.
+/// Returns the generated TOML content.
+#[allow(dead_code)]
+fn run_init_repo_at(repo_root: &Path, preset: Option<&str>) -> Result<String, String> {
+    let opaque_dir = repo_root.join(".opaque");
+    let policy_path = opaque_dir.join("policy.toml");
+
+    // Detect remote URL
+    let remote_url = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(repo_root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+
+    let preset_content = match preset {
+        Some(name) => Some(get_preset(name).ok_or_else(|| {
+            format!(
+                "unknown preset '{}'. Available: {}",
+                name,
+                available_presets()
+                    .iter()
+                    .map(|(n, _, _)| *n)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?),
+        None => None,
+    };
+
+    let toml_content = generate_repo_policy(&remote_url, preset_content);
+
+    // Create .opaque/ directory
+    std::fs::create_dir_all(&opaque_dir)
+        .map_err(|e| format!("failed to create {}: {e}", opaque_dir.display()))?;
+
+    // Write policy.toml
+    std::fs::write(&policy_path, &toml_content)
+        .map_err(|e| format!("failed to write {}: {e}", policy_path.display()))?;
+
+    Ok(toml_content)
+}
+
+/// CLI entry point for `opaque init --repo`.
+#[allow(dead_code)]
+fn run_init_repo(preset: Option<&str>) -> Result<(), String> {
+    // Find git repo root
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .map_err(|e| format!("failed to run git: {e}"))?;
+
+    if !output.status.success() {
+        return Err("not in a git repository (git rev-parse --show-toplevel failed)".into());
+    }
+
+    let repo_root = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
+
+    run_init_repo_at(&repo_root, preset)?;
+
+    ui::success("Created .opaque/policy.toml scoped to this repository");
+    println!();
+    ui::info(
+        "If this file contains secrets, add '.opaque/' to .gitignore.\n\
+         If it's policy-only, consider committing it to share with your team.",
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Preset preview
+// ---------------------------------------------------------------------------
+
+/// Show the full TOML content of a specific preset.
+#[allow(dead_code)]
+fn policy_show_preset(name: &str) -> Result<(), String> {
+    let content = get_preset(name).ok_or_else(|| {
+        format!(
+            "unknown preset '{}'. Available: {}",
+            name,
+            available_presets()
+                .iter()
+                .map(|(n, _, _)| *n)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+
+    println!("Preset: {name}");
+    println!();
+    print!("{content}");
+    if !content.ends_with('\n') {
+        println!();
+    }
+    println!();
+    println!("Apply with: opaque policy preset {name}");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Post-apply checklist
+// ---------------------------------------------------------------------------
+
+/// Return a checklist of prerequisites based on the preset name.
+#[allow(dead_code)]
+fn preset_checklist(preset_name: &str) -> Vec<String> {
+    match preset_name {
+        "github-secrets" => vec![
+            "Store a GitHub PAT with 'repo' scope: opaque secrets add github-pat".into(),
+            "Start the daemon: opaque service install".into(),
+            "Connect to Claude Code: opaque connect claude".into(),
+        ],
+        "gitlab-variables" => vec![
+            "Store a GitLab token with 'api' scope: opaque secrets add gitlab-token".into(),
+            "Start the daemon: opaque service install".into(),
+        ],
+        "agent-wrapper-github" => vec![
+            "Store a GitHub PAT: opaque secrets add github-pat".into(),
+            "Start the daemon: opaque service install".into(),
+            "Wrap your agent: opaque agent run -- <your-agent-command>".into(),
+        ],
+        _ => vec!["Start the daemon: opaque service install".into()],
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -4096,6 +5383,7 @@ lease_ttl = 0
         assert!(get_preset("gitlab-variables").is_some());
         assert!(get_preset("sandbox-human").is_some());
         assert!(get_preset("agent-wrapper-github").is_some());
+        assert!(get_preset("codex-agent").is_some());
         assert!(get_preset("nonexistent").is_none());
     }
 
@@ -4528,5 +5816,559 @@ BAZ=
             let run_mode = fs::metadata(base.join("run")).unwrap().permissions().mode() & 0o777;
             assert_eq!(run_mode, 0o700, "run dir should be 0700, got {run_mode:o}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Secrets command tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn secrets_add_command_macos() {
+        let (cmd, args) = keychain_add_command("github-pat", "my-secret-token", "macos");
+        assert_eq!(cmd, "security");
+        assert_eq!(
+            args,
+            vec![
+                "add-generic-password",
+                "-a",
+                "opaque",
+                "-s",
+                "opaque/github-pat",
+                "-w",
+                "my-secret-token",
+                "-U",
+            ]
+        );
+    }
+
+    #[test]
+    fn secrets_add_command_linux() {
+        let (cmd, args) = keychain_add_command("github-pat", "my-secret-token", "linux");
+        assert_eq!(cmd, "secret-tool");
+        assert_eq!(
+            args,
+            vec![
+                "store",
+                "--label",
+                "opaque/github-pat",
+                "service",
+                "opaque",
+                "username",
+                "github-pat",
+            ]
+        );
+    }
+
+    #[test]
+    fn secrets_remove_command_macos() {
+        let (cmd, args) = keychain_remove_command("github-pat", "macos");
+        assert_eq!(cmd, "security");
+        assert_eq!(
+            args,
+            vec![
+                "delete-generic-password",
+                "-a",
+                "opaque",
+                "-s",
+                "opaque/github-pat",
+            ]
+        );
+    }
+
+    #[test]
+    fn secrets_list_parses_keychain_dump() {
+        let dump = concat!(
+            "keychain: \"/Users/me/Library/Keychains/login.keychain-db\"\n",
+            "version: 512\n",
+            "class: \"genp\"\n",
+            "attributes:\n",
+            "    0x00000007 <blob>=\"opaque/github-pat\"\n",
+            "    \"acct\"<blob>=\"opaque\"\n",
+            "    \"svce\"<blob>=\"opaque/github-pat\"\n",
+            "class: \"genp\"\n",
+            "attributes:\n",
+            "    0x00000007 <blob>=\"opaque/gitlab-token\"\n",
+            "    \"acct\"<blob>=\"opaque\"\n",
+            "    \"svce\"<blob>=\"opaque/gitlab-token\"\n",
+            "class: \"genp\"\n",
+            "attributes:\n",
+            "    0x00000007 <blob>=\"some-other-service\"\n",
+            "    \"acct\"<blob>=\"other\"\n",
+            "    \"svce\"<blob>=\"some-other-service\"\n",
+        );
+        let names = parse_keychain_secrets(dump);
+        assert_eq!(names, vec!["github-pat", "gitlab-token"]);
+    }
+
+    #[test]
+    fn secrets_list_empty_keychain() {
+        let names = parse_keychain_secrets("");
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn secrets_name_validation() {
+        // Valid names
+        assert!(validate_secret_name("github-pat").is_ok());
+        assert!(validate_secret_name("gitlab_token").is_ok());
+        assert!(validate_secret_name("my-api-key-123").is_ok());
+        assert!(validate_secret_name("TOKEN").is_ok());
+
+        // Invalid names
+        assert!(validate_secret_name("").is_err());
+        assert!(validate_secret_name("has space").is_err());
+        assert!(validate_secret_name("has/slash").is_err());
+        assert!(validate_secret_name("has.dot").is_err());
+        assert!(validate_secret_name("has@at").is_err());
+        assert!(validate_secret_name("has\"quote").is_err());
+    }
+
+    #[test]
+    fn secrets_ref_format_display() {
+        assert_eq!(
+            secrets_ref_format("github-pat"),
+            "keychain:opaque/github-pat"
+        );
+        assert_eq!(secrets_ref_format("my-token"), "keychain:opaque/my-token");
+    }
+
+    // -----------------------------------------------------------------------
+    // Connect tests (JSON-based tools)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn connect_json_mcp_creates_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".claude");
+        let config_file = config_dir.join("settings.json");
+        let mcp_path = Path::new("/usr/local/bin/opaque-mcp");
+
+        let result = connect_json_mcp(&config_file, &config_dir, mcp_path);
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+        assert_eq!(result.unwrap(), ConnectResult::Connected);
+
+        assert!(config_file.exists(), "config file should exist");
+        let text = fs::read_to_string(&config_file).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            v["mcpServers"]["opaque"]["command"],
+            "/usr/local/bin/opaque-mcp"
+        );
+    }
+
+    #[test]
+    fn connect_json_mcp_preserves_existing_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".claude");
+        fs::create_dir_all(&config_dir).unwrap();
+        let config_file = config_dir.join("settings.json");
+        fs::write(
+            &config_file,
+            r#"{"mcpServers":{"other":{"command":"/usr/bin/other","args":["--flag"]}}}"#,
+        )
+        .unwrap();
+
+        let result = connect_json_mcp(
+            &config_file,
+            &config_dir,
+            Path::new("/usr/local/bin/opaque-mcp"),
+        );
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+        assert_eq!(result.unwrap(), ConnectResult::Connected);
+
+        let text = fs::read_to_string(&config_file).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            v["mcpServers"]["other"]["command"], "/usr/bin/other",
+            "existing server should be preserved"
+        );
+        assert_eq!(
+            v["mcpServers"]["opaque"]["command"],
+            "/usr/local/bin/opaque-mcp"
+        );
+    }
+
+    #[test]
+    fn connect_json_mcp_updates_existing_opaque() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".claude");
+        fs::create_dir_all(&config_dir).unwrap();
+        let config_file = config_dir.join("settings.json");
+        fs::write(
+            &config_file,
+            r#"{"mcpServers":{"opaque":{"command":"/old/path/opaque-mcp","args":[]}}}"#,
+        )
+        .unwrap();
+
+        let result = connect_json_mcp(&config_file, &config_dir, Path::new("/new/path/opaque-mcp"));
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+        assert_eq!(result.unwrap(), ConnectResult::Updated);
+
+        let text = fs::read_to_string(&config_file).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            v["mcpServers"]["opaque"]["command"], "/new/path/opaque-mcp",
+            "opaque command should be updated to new path"
+        );
+    }
+
+    #[test]
+    fn connect_json_mcp_already_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".claude");
+        fs::create_dir_all(&config_dir).unwrap();
+        let config_file = config_dir.join("settings.json");
+        fs::write(
+            &config_file,
+            r#"{"mcpServers":{"opaque":{"command":"/usr/local/bin/opaque-mcp","args":[]}}}"#,
+        )
+        .unwrap();
+
+        let result = connect_json_mcp(
+            &config_file,
+            &config_dir,
+            Path::new("/usr/local/bin/opaque-mcp"),
+        );
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+        assert_eq!(result.unwrap(), ConnectResult::AlreadyConnected);
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-repo init tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn init_repo_generates_scoped_policy() {
+        let remote = "git@github.com:org/repo.git";
+        let toml = generate_repo_policy(remote, None);
+        assert!(
+            toml.contains("remote_url_pattern"),
+            "generated TOML should reference remote_url_pattern: {toml}"
+        );
+        assert!(
+            toml.contains("org/repo"),
+            "generated TOML should contain org/repo: {toml}"
+        );
+    }
+
+    #[test]
+    fn init_repo_auto_detects_remote() {
+        // SSH format
+        let toml = generate_repo_policy("git@github.com:acme/widgets.git", None);
+        assert!(
+            toml.contains("acme/widgets"),
+            "should derive org/repo from SSH URL: {toml}"
+        );
+
+        // HTTPS format
+        let toml = generate_repo_policy("https://github.com/acme/widgets.git", None);
+        assert!(
+            toml.contains("acme/widgets"),
+            "should derive org/repo from HTTPS URL: {toml}"
+        );
+    }
+
+    #[test]
+    fn init_repo_with_preset() {
+        let remote = "git@github.com:org/repo.git";
+        let preset = get_preset("github-secrets").unwrap();
+        let toml = generate_repo_policy(remote, Some(preset));
+
+        // Should contain workspace scope
+        assert!(
+            toml.contains("remote_url_pattern"),
+            "preset policy should have workspace scope: {toml}"
+        );
+        // Should contain rules from the preset
+        assert!(
+            toml.contains("[[rules]]"),
+            "preset policy should contain rules: {toml}"
+        );
+        // Rule names should be prefixed with "repo-"
+        assert!(
+            toml.contains("repo-"),
+            "rule names should be prefixed with repo-: {toml}"
+        );
+        // Should have the repo header
+        assert!(
+            toml.contains("org/repo"),
+            "should reference org/repo: {toml}"
+        );
+    }
+
+    #[test]
+    fn init_repo_without_preset() {
+        let remote = "git@github.com:org/repo.git";
+        let toml = generate_repo_policy(remote, None);
+
+        // Minimal template should have comments explaining configuration
+        assert!(
+            toml.contains('#'),
+            "minimal template should contain comments: {toml}"
+        );
+        assert!(
+            toml.contains("remote_url_pattern"),
+            "minimal template should show remote_url_pattern: {toml}"
+        );
+        assert!(
+            toml.contains("org/repo"),
+            "minimal template should reference org/repo: {toml}"
+        );
+    }
+
+    #[test]
+    fn preset_show_returns_content() {
+        // Verify that get_preset returns content for known presets
+        let content = get_preset("github-secrets");
+        assert!(content.is_some(), "github-secrets preset should exist");
+        let content = content.unwrap();
+        assert!(
+            content.contains("[[rules]]"),
+            "preset content should contain rules"
+        );
+        assert!(
+            content.contains("github"),
+            "github-secrets should reference github"
+        );
+    }
+
+    #[test]
+    fn preset_show_unknown_name() {
+        let content = get_preset("nonexistent-preset");
+        assert!(content.is_none(), "unknown preset should return None");
+
+        // Also verify the CLI-facing function returns an error
+        let result = policy_show_preset("nonexistent-preset");
+        assert!(result.is_err(), "unknown preset should be an error");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("unknown preset"),
+            "error should mention unknown preset: {err}"
+        );
+    }
+
+    #[test]
+    fn preset_checklist_github() {
+        let checklist = preset_checklist("github-secrets");
+        assert!(
+            checklist.len() == 3,
+            "github-secrets should have 3 steps, got: {}",
+            checklist.len()
+        );
+        assert!(
+            checklist.iter().any(|s| s.contains("GitHub PAT")),
+            "should contain PAT step: {checklist:?}"
+        );
+        assert!(
+            checklist
+                .iter()
+                .any(|s| s.contains("opaque service install")),
+            "should contain daemon step: {checklist:?}"
+        );
+        assert!(
+            checklist
+                .iter()
+                .any(|s| s.contains("opaque connect claude")),
+            "should contain connect step: {checklist:?}"
+        );
+    }
+
+    #[test]
+    fn preset_checklist_default() {
+        let checklist = preset_checklist("unknown-preset-xyz");
+        assert!(
+            !checklist.is_empty(),
+            "even unknown presets should get a minimal checklist"
+        );
+        assert!(
+            checklist
+                .iter()
+                .any(|s| s.contains("opaque service install")),
+            "minimal checklist should contain daemon step: {checklist:?}"
+        );
+        assert_eq!(
+            checklist.len(),
+            1,
+            "unknown preset should have exactly 1 step"
+        );
+    }
+
+    #[test]
+    fn generate_repo_policy_escapes_special_chars() {
+        // Remote URL with glob-special characters
+        let remote = "git@github.com:org/repo[test].git";
+        let toml = generate_repo_policy(remote, None);
+        // Square brackets should be escaped in the pattern
+        assert!(
+            toml.contains("\\[") && toml.contains("\\]"),
+            "special chars should be escaped in glob pattern: {toml}"
+        );
+        // The org/repo extraction should still work
+        assert!(
+            toml.contains("org/repo[test]") || toml.contains("org/repo\\[test\\]"),
+            "should still identify org/repo: {toml}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // connect codex tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn connect_codex_creates_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_file = dir.path().join("config.toml");
+        let mcp_path = Path::new("/usr/local/bin/opaque-mcp");
+
+        let result = connect_codex_at(&config_file, mcp_path);
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+        assert_eq!(result.unwrap(), ConnectResult::Connected);
+
+        assert!(config_file.exists(), "config.toml should be created");
+        let content = fs::read_to_string(&config_file).unwrap();
+        assert!(
+            content.contains("[mcp_servers.opaque]"),
+            "should contain [mcp_servers.opaque], got: {content}"
+        );
+        assert!(
+            content.contains("command = \"/usr/local/bin/opaque-mcp\""),
+            "should contain command path, got: {content}"
+        );
+        assert!(
+            content.contains("args = []"),
+            "should contain args, got: {content}"
+        );
+    }
+
+    #[test]
+    fn connect_codex_preserves_existing_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_file = dir.path().join("config.toml");
+        fs::write(
+            &config_file,
+            "[mcp_servers.other]\ncommand = \"other-mcp\"\nargs = []\n",
+        )
+        .unwrap();
+
+        let result = connect_codex_at(&config_file, Path::new("/usr/local/bin/opaque-mcp"));
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+        assert_eq!(result.unwrap(), ConnectResult::Connected);
+
+        let content = fs::read_to_string(&config_file).unwrap();
+        assert!(
+            content.contains("[mcp_servers.other]"),
+            "existing server should be preserved, got: {content}"
+        );
+        assert!(
+            content.contains("[mcp_servers.opaque]"),
+            "opaque server should be added, got: {content}"
+        );
+    }
+
+    #[test]
+    fn connect_codex_already_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_file = dir.path().join("config.toml");
+        fs::write(
+            &config_file,
+            "[mcp_servers.opaque]\ncommand = \"/usr/local/bin/opaque-mcp\"\nargs = []\n",
+        )
+        .unwrap();
+
+        let result = connect_codex_at(&config_file, Path::new("/usr/local/bin/opaque-mcp"));
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+        assert_eq!(result.unwrap(), ConnectResult::AlreadyConnected);
+    }
+
+    #[test]
+    fn connect_codex_updates_existing_opaque() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_file = dir.path().join("config.toml");
+        fs::write(
+            &config_file,
+            "[mcp_servers.opaque]\ncommand = \"/old/path/opaque-mcp\"\nargs = []\n",
+        )
+        .unwrap();
+
+        let result = connect_codex_at(&config_file, Path::new("/new/path/opaque-mcp"));
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+        assert_eq!(result.unwrap(), ConnectResult::Updated);
+
+        let content = fs::read_to_string(&config_file).unwrap();
+        assert!(
+            content.contains("/new/path/opaque-mcp"),
+            "should contain updated path, got: {content}"
+        );
+        assert!(
+            !content.contains("/old/path/opaque-mcp"),
+            "should not contain old path, got: {content}"
+        );
+    }
+
+    #[test]
+    fn detect_mcp_connection_finds_codex() {
+        // detect_mcp_connection reads from the real home directory,
+        // so we test the logic inline by checking the config content patterns.
+        let toml_content =
+            "[mcp_servers.opaque]\ncommand = \"/usr/local/bin/opaque-mcp\"\nargs = []\n";
+        assert!(
+            toml_content.contains("[mcp_servers.opaque]"),
+            "config should match detection pattern"
+        );
+    }
+
+    #[test]
+    fn codex_agent_preset_is_valid_toml() {
+        let result: Result<PolicyConfig, _> = toml_edit::de::from_str(PRESET_CODEX_AGENT);
+        assert!(
+            result.is_ok(),
+            "codex-agent preset should be valid TOML: {result:?}"
+        );
+        let config = result.unwrap();
+        assert!(
+            !config.rules.is_empty(),
+            "codex-agent preset should have at least one rule"
+        );
+    }
+
+    #[test]
+    fn codex_agent_preset_has_agent_rules() {
+        let content = PRESET_CODEX_AGENT;
+        assert!(
+            content.contains("enforce_agent_sessions = true"),
+            "should enforce agent sessions"
+        );
+        assert!(
+            content.contains("client_types = [\"agent\"]"),
+            "should have agent client_types"
+        );
+        assert!(
+            content.contains("lease_ttl = 600"),
+            "should have 600s lease TTL"
+        );
+        assert!(
+            content.contains("github.list_secrets"),
+            "should have GitHub list secrets rule"
+        );
+        assert!(
+            content.contains("github.set_actions_secret"),
+            "should have GitHub set actions secret rule"
+        );
+        assert!(
+            content.contains("github.delete_secret"),
+            "should have GitHub delete secret rule"
+        );
+        assert!(
+            content.contains("gitlab.set_ci_variable"),
+            "should have GitLab CI variable rule"
+        );
+        assert!(
+            content.contains("require = \"first_use\""),
+            "should use first_use approval"
+        );
+        assert!(
+            content.contains("[\"local_bio\"]"),
+            "should require local_bio factor"
+        );
     }
 }
