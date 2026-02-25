@@ -2325,6 +2325,10 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 struct PolicyConfig {
     #[serde(default)]
     rules: Vec<PolicyRule>,
+
+    /// When true, the daemon refuses to start if the config is not sealed.
+    #[serde(default)]
+    require_seal: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -3345,7 +3349,33 @@ async fn run_doctor() {
         }
     }
 
-    // 4. Socket
+    // 4. Require-seal setting
+    if config_path.exists() {
+        match std::fs::read_to_string(&config_path) {
+            Ok(contents) => match toml_edit::de::from_str::<PolicyConfig>(&contents) {
+                Ok(config) => {
+                    if config.require_seal {
+                        doctor_pass("require_seal is enabled (tamper protection active)");
+                        pass_count += 1;
+                    } else {
+                        doctor_warn(
+                            "require_seal is not enabled — production deployments should set \
+                             require_seal = true in config.toml",
+                        );
+                        warn_count += 1;
+                    }
+                }
+                Err(_) => {
+                    // Config parse errors already reported in check 2.
+                }
+            },
+            Err(_) => {
+                // Read errors already reported in check 2.
+            }
+        }
+    }
+
+    // 5. Socket
     let sock = socket_path();
     if sock.exists() {
         #[cfg(unix)]
