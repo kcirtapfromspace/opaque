@@ -91,8 +91,8 @@ In practice, “hard guarantee” becomes:
 
 ### Supported platforms (v1)
 
-- macOS (LaunchAgent in GUI session — see `docs/deployment.md`)
-- Linux (systemd user service in graphical session — see `docs/deployment.md`)
+- macOS (LaunchAgent in GUI session — see [Deployment](deployment.md))
+- Linux (systemd user service in graphical session — see [Deployment](deployment.md))
 
 ### Component diagram
 
@@ -186,11 +186,11 @@ Opaque v1 uses **native OS authentication prompts** (not terminal prompts) to en
   - **Step 2: Polkit authentication** — `CheckAuthorization` with `AllowUserInteraction` for system auth
   - This separation ensures the user always sees what they are approving, regardless of whether the polkit agent displays operation details
   - Requires a graphical session, a polkit auth agent, and `zenity` or `kdialog`
-  - Supported desktops: GNOME, KDE Plasma, MATE, XFCE, Cinnamon, Budgie, LXQt (see `docs/deployment.md` for full tier list)
+  - Supported desktops: GNOME, KDE Plasma, MATE, XFCE, Cinnamon, Budgie, LXQt (see [Deployment](deployment.md) for full tier list)
 - iOS (second device, deferred to v3):
-  - QR pairing + Face ID gated approvals via a companion app (see `docs/mobile-approvals.md`)
+  - QR pairing + Face ID gated approvals via a companion app (see [Mobile approvals](mobile-approvals.md))
 
-If the daemon is running without access to an interactive user session (headless / no auth agent / no display server), approvals **fail closed**. The daemon refuses to start. See `docs/deployment.md` for session detection requirements.
+If the daemon is running without access to an interactive user session (headless / no auth agent / no display server), approvals **fail closed**. The daemon refuses to start. See [Deployment](deployment.md) for session detection requirements.
 
 ### Approval sequence
 

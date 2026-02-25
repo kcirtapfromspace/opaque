@@ -43,12 +43,12 @@ The policy uses `auth_self` for active sessions:
 
 ## Supported Desktops
 
-See `docs/deployment.md` for the full tiered support matrix. Summary:
+See [Deployment](deployment.md) for the full tiered support matrix. Summary:
 
 - **Tier 1 (full support):** GNOME 42+, KDE Plasma 5.20+
 - **Tier 2 (supported, minor setup):** MATE, XFCE, Cinnamon, Budgie, LXQt
 - **Tier 3 (manual setup):** Sway, Hyprland, i3, dwm (user must manually start a polkit agent)
-- **Tier 4 (unsupported, fail closed):** Headless, WSL, SSH, containers
+- **Tier 4 (unsupported, fail closed):** Headless, SSH, containers
 
 ## Credential Caching
 
@@ -56,7 +56,7 @@ Some polkit auth agents (notably GNOME's) cache credentials for a short period (
 
 ## Daemon Lifecycle
 
-Use a systemd user service. See `docs/deployment.md` for the recommended unit file with hardening options.
+Use a systemd user service. See [Deployment](deployment.md) for the recommended unit file with hardening options.
 
 ```bash
 systemctl --user enable --now opaqued.service

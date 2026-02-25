@@ -210,4 +210,3 @@ Planned capabilities:
 - Audit log forwarding
 - iOS / FaceID mobile approvals
 - FIDO2 / WebAuthn approval factors
-- Windows support

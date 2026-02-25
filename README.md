@@ -1,17 +1,31 @@
 # Opaque
 
-![CI](https://github.com/anthropics/opaque/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/kcirtapfromspace/opaque/actions/workflows/ci.yml/badge.svg)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-![Release](https://img.shields.io/github/v/release/anthropics/opaque)
+![Release](https://img.shields.io/github/v/release/kcirtapfromspace/opaque)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-blue)
 
-Local approval-gated secrets broker for AI coding tools (Codex, Claude Code, etc) that must not disclose plaintext secrets to LLM context.
+Local approval-gated secrets broker for AI coding tools (Codex, Claude Code, etc) that must not disclose plaintext secrets to LLM context. Current alpha scope is macOS/Linux desktop sessions.
 
 ## What It Does
 
 Opaque sits between your AI coding assistant and your secrets. LLMs get **operations** (e.g., "set this GitHub secret"), never plaintext values. Every operation passes through:
 
 **Policy -> Approval -> Execute -> Sanitize -> Audit**
+
+## Alpha Scope (Launch)
+
+In scope for the current alpha:
+- macOS and Linux desktop-session deployments
+- operation-bound approvals (Touch ID on macOS, polkit on Linux)
+- provider operations for GitHub, GitLab, 1Password, Bitwarden, Vault, and AWS Secrets Manager
+
+Out of scope for alpha:
+- iOS approvals / APNs push
+- FIDO2 / WebAuthn approvals
+- headless/SSH-only/container-only approval flows
+
+Launch guardrails and incident/SLA process: [Launch week playbook](docs/launch-week-playbook.md)
 
 ## Features
 
@@ -29,19 +43,20 @@ Opaque sits between your AI coding assistant and your secrets. LLMs get **operat
 ### macOS (Homebrew)
 
 ```sh
-brew install anthropics/tap/opaque
+brew install kcirtapfromspace/tap/opaque
 ```
 
 ### Linux / macOS (shell script)
 
 ```sh
-curl -sSfL https://raw.githubusercontent.com/anthropics/opaque/main/install.sh | sh
+curl -sSfL https://raw.githubusercontent.com/kcirtapfromspace/opaque/main/install.sh | sh
 ```
 
 ### From Source
 
 ```sh
-cargo install --git https://github.com/anthropics/opaque.git opaque opaqued opaque-mcp
+cargo install --git https://github.com/kcirtapfromspace/opaque.git \
+  opaque opaqued opaque-mcp opaque-approve-helper opaque-web
 ```
 
 Binaries:
@@ -51,6 +66,8 @@ Binaries:
 | `opaqued` | Trusted daemon (enclave, policy, approvals, audit) |
 | `opaque` | CLI client |
 | `opaque-mcp` | MCP server for Claude Code |
+| `opaque-approve-helper` | Native approval helper binary (platform integration) |
+| `opaque-web` | Local web dashboard for audit and status views |
 
 ## Platform Support
 
@@ -60,7 +77,6 @@ Binaries:
 | macOS | Intel (x86_64) | Fully supported |
 | Linux | x86_64 | Fully supported |
 | Linux | aarch64 | Fully supported |
-| Windows | -- | Not supported (Unix domain sockets required) |
 
 ## Quickstart: Claude Code (MCP)
 
@@ -89,7 +105,7 @@ Binaries:
 4. Ask Claude Code to sync a secret:
    > "Set the GitHub Actions secret API_KEY for myorg/myrepo using my keychain"
 
-Full MCP docs: `docs/mcp-integration.md`
+Full MCP docs: [MCP integration](docs/mcp-integration.md)
 
 ## Quickstart: Codex / CLI
 
@@ -107,6 +123,7 @@ Full MCP docs: `docs/mcp-integration.md`
    ```bash
    opaque ping
    opaque execute test.noop
+   opaque audit tail --limit 5
    ```
 
 Optional: run your agent through Opaque wrapper mode (session-scoped):
@@ -152,7 +169,7 @@ opaque agent run -- codex
    opaque audit tail --query github --limit 10
    ```
 
-Full CLI docs: `docs/getting-started.md`
+Full CLI docs: [Getting started](docs/getting-started.md)
 
 ## Policy Presets
 
@@ -179,28 +196,30 @@ opaque policy preset github-secrets
 
 ![quickstart demo](assets/demos/quickstart.gif)
 
-### Sandboxed Exec (Captured stdout/stderr)
+### Sandboxed Exec (Metadata-Only Result)
 
 ![sandbox exec demo](assets/demos/sandbox-exec.gif)
 
 ## Docs
 
-- Docs index: `docs/README.md`
-- Getting started: `docs/getting-started.md`
-- MCP integration: `docs/mcp-integration.md`
-- Bitwarden setup: `docs/bitwarden.md`
-- Vault setup: `docs/vault.md`
-- Policy: `docs/policy.md`
-- Operations: `docs/operations.md`
-- LLM harness: `docs/llm-harness.md`
-- Demos: `docs/demos.md`
-- Deployment: `docs/deployment.md`
-- Security assessment: `docs/security-assessment.md`
-- Deferred roadmap: `docs/roadmap-deferred.md`
+- [Docs index](docs/README.md)
+- [Getting started](docs/getting-started.md)
+- [MCP integration](docs/mcp-integration.md)
+- [Bitwarden setup](docs/bitwarden.md)
+- [Vault setup](docs/vault.md)
+- [Policy](docs/policy.md)
+- [Operations](docs/operations.md)
+- [LLM harness](docs/llm-harness.md)
+- [Release checklist](docs/release-checklist.md)
+- [Launch week playbook](docs/launch-week-playbook.md)
+- [Demos](docs/demos.md)
+- [Deployment](docs/deployment.md)
+- [Security assessment](docs/security-assessment.md)
+- [Deferred roadmap](docs/roadmap-deferred.md)
 
 ## Deferred
 
-See `docs/roadmap-deferred.md`. Notably:
+See [Deferred roadmap](docs/roadmap-deferred.md). Notably:
 
 - Vault dynamic secrets + lease lifecycle
 - iOS approvals / FaceID (v3)
@@ -208,4 +227,4 @@ See `docs/roadmap-deferred.md`. Notably:
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+Apache License 2.0. See [LICENSE](LICENSE).
