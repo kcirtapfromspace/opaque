@@ -1,0 +1,563 @@
+/* ═══════════════════════════════════════════
+   OPAQUE — Material for MkDocs Brand Overrides
+   "What is hidden stays hidden."
+   ═══════════════════════════════════════════ */
+
+/* ─── Import brand fonts ───────────────── */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+/* ═══════════════════════════════════════════
+   COLOR SCHEME OVERRIDE — Dark only
+   ═══════════════════════════════════════════ */
+
+:root,
+[data-md-color-scheme="slate"] {
+  /* Core backgrounds */
+  --md-default-bg-color:               #0a0c10;
+  --md-default-bg-color--light:        #0f1218;
+  --md-default-bg-color--lighter:      #161a22;
+  --md-default-bg-color--lightest:     #1c2028;
+
+  /* Text */
+  --md-default-fg-color:               #e8ecf1;
+  --md-default-fg-color--light:        #8b919e;
+  --md-default-fg-color--lighter:      #555b67;
+  --md-default-fg-color--lightest:     rgba(255, 255, 255, 0.05);
+
+  /* Primary — header, nav tabs */
+  --md-primary-fg-color:               #3b82f6;
+  --md-primary-bg-color:               #0a0c10;
+  --md-primary-fg-color--light:        #60a5fa;
+  --md-primary-fg-color--dark:         #2563eb;
+  --md-primary-bg-color--light:        #0f1218;
+
+  /* Accent — links, highlights */
+  --md-accent-fg-color:                #8b5cf6;
+  --md-accent-fg-color--transparent:   rgba(139, 92, 246, 0.1);
+  --md-accent-bg-color:                #8b5cf6;
+  --md-accent-bg-color--light:         rgba(139, 92, 246, 0.1);
+
+  /* Links */
+  --md-typeset-a-color:                #3b82f6;
+
+  /* Code */
+  --md-code-bg-color:                  #0f1218;
+  --md-code-fg-color:                  #e8ecf1;
+  --md-code-hl-color:                  rgba(59, 130, 246, 0.08);
+  --md-code-hl-number-color:           #f59e0b;
+  --md-code-hl-special-color:          #f43f5e;
+  --md-code-hl-function-color:         #3b82f6;
+  --md-code-hl-constant-color:         #8b5cf6;
+  --md-code-hl-keyword-color:          #8b5cf6;
+  --md-code-hl-string-color:           #10b981;
+  --md-code-hl-name-color:             #e8ecf1;
+  --md-code-hl-operator-color:         #f59e0b;
+  --md-code-hl-punctuation-color:      #8b919e;
+  --md-code-hl-comment-color:          #555b67;
+  --md-code-hl-generic-color:          #8b919e;
+  --md-code-hl-variable-color:         #e8ecf1;
+
+  /* Footer */
+  --md-footer-bg-color:                #050709;
+  --md-footer-bg-color--dark:          #050709;
+  --md-footer-fg-color:                #8b919e;
+  --md-footer-fg-color--light:         #555b67;
+  --md-footer-fg-color--lighter:       #2a2f3a;
+
+  /* Admonition accent defaults */
+  --md-admonition-bg-color:            rgba(15, 18, 24, 0.7);
+
+  /* Shadow */
+  --md-shadow-z1: 0 2px 8px rgba(0, 0, 0, 0.4);
+  --md-shadow-z2: 0 8px 24px rgba(0, 0, 0, 0.5);
+  --md-shadow-z3: 0 16px 48px rgba(0, 0, 0, 0.6);
+
+  /* Typography */
+  --md-text-font: "Inter", -apple-system, BlinkMacSystemFont, sans-serif;
+  --md-code-font: "JetBrains Mono", "SF Mono", "Cascadia Code", monospace;
+
+  /* Opaque custom properties */
+  --opaque-border:     #1c2028;
+  --opaque-border-hi:  #2a2f3a;
+  --opaque-surface:    #0f1218;
+  --opaque-surface-hi: #161a22;
+  --opaque-redact:     #2a2f3a;
+  --opaque-accent-1:   #3b82f6;
+  --opaque-accent-2:   #8b5cf6;
+  --opaque-accent-3:   #06b6d4;
+  --opaque-green:      #10b981;
+  --opaque-amber:      #f59e0b;
+  --opaque-red:        #f43f5e;
+}
+
+/* ═══════════════════════════════════════════
+   GLOBAL BODY
+   ═══════════════════════════════════════════ */
+body {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ═══════════════════════════════════════════
+   HEADER / TOP NAV
+   ═══════════════════════════════════════════ */
+.md-header {
+  background: rgba(10, 12, 16, 0.85) !important;
+  backdrop-filter: blur(20px) saturate(1.2);
+  -webkit-backdrop-filter: blur(20px) saturate(1.2);
+  border-bottom: 1px solid var(--opaque-border);
+  box-shadow: none;
+}
+
+/* Header title */
+.md-header__title {
+  font-weight: 800;
+  letter-spacing: -0.03em;
+}
+
+/* Nav tabs */
+.md-tabs {
+  background: transparent !important;
+  border-bottom: 1px solid var(--opaque-border);
+}
+
+.md-tabs__link {
+  font-weight: 500;
+  opacity: 0.6;
+  transition: opacity 0.2s, color 0.2s;
+}
+
+.md-tabs__link:hover,
+.md-tabs__link--active {
+  opacity: 1;
+}
+
+/* ═══════════════════════════════════════════
+   SIDEBAR NAVIGATION
+   ═══════════════════════════════════════════ */
+.md-sidebar {
+  border-right: 1px solid var(--opaque-border);
+}
+
+.md-sidebar--secondary {
+  border-left: 1px solid var(--opaque-border);
+  border-right: none;
+}
+
+/* Active nav item with gradient left border */
+.md-nav__item--active > .md-nav__link {
+  color: var(--opaque-accent-1);
+  font-weight: 600;
+}
+
+.md-nav__item--active > .md-nav__link::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 4px;
+  bottom: 4px;
+  width: 2px;
+  background: linear-gradient(180deg, var(--opaque-accent-1), var(--opaque-accent-2));
+  border-radius: 1px;
+}
+
+.md-nav__item > .md-nav__link {
+  position: relative;
+}
+
+/* Nav section labels */
+.md-nav__item--section > .md-nav__link {
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: var(--md-default-fg-color);
+}
+
+/* ═══════════════════════════════════════════
+   CONTENT AREA
+   ═══════════════════════════════════════════ */
+
+/* Headings */
+.md-typeset h1 {
+  font-weight: 800;
+  letter-spacing: -0.03em;
+  color: var(--md-default-fg-color);
+}
+
+.md-typeset h2 {
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  border-bottom: 1px solid var(--opaque-border);
+  padding-bottom: 0.4em;
+}
+
+.md-typeset h3 {
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+/* Links with gradient hover */
+.md-typeset a:hover {
+  color: var(--opaque-accent-2);
+}
+
+/* Horizontal rules — frosted divider style */
+.md-typeset hr {
+  border: none;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--opaque-border-hi), transparent);
+}
+
+/* ═══════════════════════════════════════════
+   CODE BLOCKS — Terminal DNA
+   ═══════════════════════════════════════════ */
+.md-typeset code {
+  border-radius: 4px;
+  border: 1px solid var(--opaque-border);
+  background: var(--opaque-surface);
+  font-size: 0.85em;
+  padding: 0.1em 0.4em;
+}
+
+.md-typeset pre {
+  border-radius: 8px;
+  border: 1px solid var(--opaque-border);
+  position: relative;
+  overflow: hidden;
+}
+
+/* Gradient top-line on code blocks */
+.md-typeset pre::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--opaque-accent-2), transparent);
+  z-index: 1;
+  pointer-events: none;
+}
+
+.md-typeset pre > code {
+  border: none;
+  border-radius: 0;
+  padding: 1em 1.2em;
+  font-size: 0.82em;
+  line-height: 1.7;
+}
+
+/* Code copy button */
+.md-clipboard {
+  color: var(--md-default-fg-color--lighter);
+}
+
+.md-clipboard:hover {
+  color: var(--opaque-accent-1);
+}
+
+/* ═══════════════════════════════════════════
+   ADMONITIONS — Glassmorphism style
+   ═══════════════════════════════════════════ */
+.md-typeset .admonition,
+.md-typeset details {
+  border-radius: 8px;
+  border: 1px solid var(--opaque-border);
+  background: rgba(15, 18, 24, 0.7);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  box-shadow: none;
+  overflow: hidden;
+}
+
+/* Gradient top-line on admonitions */
+.md-typeset .admonition::before,
+.md-typeset details::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  pointer-events: none;
+}
+
+.md-typeset .admonition {
+  position: relative;
+}
+
+/* Info/note admonitions */
+.md-typeset .admonition.note,
+.md-typeset .admonition.info {
+  border-left: 3px solid var(--opaque-accent-1);
+}
+
+/* Warning admonitions */
+.md-typeset .admonition.warning,
+.md-typeset .admonition.caution {
+  border-left: 3px solid var(--opaque-amber);
+}
+
+/* Danger admonitions */
+.md-typeset .admonition.danger,
+.md-typeset .admonition.error {
+  border-left: 3px solid var(--opaque-red);
+}
+
+/* Success/tip admonitions */
+.md-typeset .admonition.tip,
+.md-typeset .admonition.success {
+  border-left: 3px solid var(--opaque-green);
+}
+
+/* Example admonitions */
+.md-typeset .admonition.example {
+  border-left: 3px solid var(--opaque-accent-2);
+}
+
+/* Admonition title */
+.md-typeset .admonition > .admonition-title,
+.md-typeset details > summary {
+  background: rgba(255, 255, 255, 0.02);
+  border-bottom: 1px solid var(--opaque-border);
+  font-weight: 600;
+}
+
+/* ═══════════════════════════════════════════
+   TABLES
+   ═══════════════════════════════════════════ */
+.md-typeset table:not([class]) {
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid var(--opaque-border);
+  background: var(--opaque-surface);
+}
+
+.md-typeset table:not([class]) thead {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.md-typeset table:not([class]) th {
+  font-weight: 600;
+  font-size: 0.8em;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--md-default-fg-color--light);
+  border-bottom: 1px solid var(--opaque-border);
+  padding: 0.8em 1em;
+}
+
+.md-typeset table:not([class]) td {
+  border-bottom: 1px solid rgba(28, 32, 40, 0.5);
+  padding: 0.7em 1em;
+}
+
+.md-typeset table:not([class]) tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.md-typeset table:not([class]) tbody tr:hover {
+  background: rgba(255, 255, 255, 0.01);
+}
+
+/* ═══════════════════════════════════════════
+   TABS (content tabs)
+   ═══════════════════════════════════════════ */
+.md-typeset .tabbed-labels {
+  border-bottom: 1px solid var(--opaque-border);
+}
+
+.md-typeset .tabbed-labels > label {
+  font-weight: 500;
+  opacity: 0.6;
+  transition: opacity 0.2s;
+}
+
+.md-typeset .tabbed-labels > label:hover {
+  opacity: 0.85;
+}
+
+.md-typeset .tabbed-labels > label.tabbed-labels--active,
+.md-typeset .tabbed-labels > input:checked + label {
+  opacity: 1;
+  color: var(--opaque-accent-1);
+  border-color: var(--opaque-accent-1);
+}
+
+/* ═══════════════════════════════════════════
+   SEARCH
+   ═══════════════════════════════════════════ */
+.md-search__form {
+  background: var(--opaque-surface) !important;
+  border: 1px solid var(--opaque-border);
+  border-radius: 8px;
+}
+
+.md-search__form:hover {
+  border-color: var(--opaque-border-hi);
+}
+
+.md-search__output {
+  background: var(--md-default-bg-color);
+  border: 1px solid var(--opaque-border);
+  border-radius: 0 0 8px 8px;
+}
+
+.md-search-result__link:hover {
+  background: rgba(59, 130, 246, 0.05);
+}
+
+.md-search-result__meta {
+  color: var(--md-default-fg-color--lighter);
+}
+
+/* ═══════════════════════════════════════════
+   FOOTER
+   ═══════════════════════════════════════════ */
+.md-footer {
+  border-top: 1px solid var(--opaque-border);
+}
+
+.md-footer-nav__link {
+  transition: opacity 0.2s;
+  opacity: 0.7;
+}
+
+.md-footer-nav__link:hover {
+  opacity: 1;
+}
+
+/* ═══════════════════════════════════════════
+   OPAQUE VISUAL OVERLAYS
+   Noise · Scanlines · Frosted accents
+   ═══════════════════════════════════════════ */
+
+/* Film grain noise */
+.opaque-noise {
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  z-index: 999;
+  pointer-events: none;
+  opacity: 0.025;
+  mix-blend-mode: overlay;
+}
+
+/* CRT scanlines */
+.opaque-scanlines {
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  z-index: 998;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0, 0, 0, 0.02) 2px,
+    rgba(0, 0, 0, 0.02) 4px
+  );
+}
+
+/* ═══════════════════════════════════════════
+   CUSTOM LOGO — Redacted data mark
+   ═══════════════════════════════════════════ */
+.md-header__button.md-logo img,
+.md-header__button.md-logo svg {
+  display: none;
+}
+
+.md-header__button.md-logo {
+  display: flex;
+  align-items: center;
+}
+
+/* ═══════════════════════════════════════════
+   SCROLLBAR STYLING
+   ═══════════════════════════════════════════ */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--md-default-bg-color);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--opaque-border-hi);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #3a4050;
+}
+
+/* ═══════════════════════════════════════════
+   SELECTION
+   ═══════════════════════════════════════════ */
+::selection {
+  background: rgba(59, 130, 246, 0.25);
+  color: var(--md-default-fg-color);
+}
+
+/* ═══════════════════════════════════════════
+   CONTENT-SPECIFIC REFINEMENTS
+   ═══════════════════════════════════════════ */
+
+/* Blockquotes — frosted style */
+.md-typeset blockquote {
+  border-left: 3px solid var(--opaque-accent-2);
+  background: rgba(139, 92, 246, 0.03);
+  padding: 0.8em 1.2em;
+  border-radius: 0 8px 8px 0;
+  color: var(--md-default-fg-color--light);
+}
+
+/* Keyboard keys */
+.md-typeset kbd {
+  background: var(--opaque-surface-hi);
+  border: 1px solid var(--opaque-border-hi);
+  border-radius: 4px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+  color: var(--md-default-fg-color);
+}
+
+/* Definition lists */
+.md-typeset dt {
+  font-weight: 700;
+}
+
+/* Images — subtle border */
+.md-typeset img {
+  border-radius: 8px;
+  border: 1px solid var(--opaque-border);
+}
+
+/* ═══════════════════════════════════════════
+   NAV FOOTER (prev/next)
+   ═══════════════════════════════════════════ */
+.md-footer__inner {
+  padding: 1.2em 0;
+}
+
+.md-footer-nav__direction {
+  font-size: 0.7em;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  opacity: 0.5;
+}
+
+/* ═══════════════════════════════════════════
+   ANNOTATION MARKERS
+   ═══════════════════════════════════════════ */
+.md-annotation__index {
+  background: var(--opaque-accent-1) !important;
+  box-shadow: 0 0 8px rgba(59, 130, 246, 0.2);
+}
+
+/* ═══════════════════════════════════════════
+   RESPONSIVE TWEAKS
+   ═══════════════════════════════════════════ */
+@media screen and (max-width: 76.1875em) {
+  .md-nav--primary .md-nav__title {
+    background: var(--md-default-bg-color);
+  }
+}

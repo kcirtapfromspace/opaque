@@ -8,21 +8,16 @@ exclude_docs: README.md
 
 theme:
   name: material
+  custom_dir: docs/overrides
   icon:
     logo: material/shield-lock
+  font:
+    text: Inter
+    code: JetBrains Mono
   palette:
-    - scheme: slate
-      primary: indigo
-      accent: blue
-      toggle:
-        icon: material/brightness-4
-        name: Switch to light mode
-    - scheme: default
-      primary: indigo
-      accent: blue
-      toggle:
-        icon: material/brightness-7
-        name: Switch to dark mode
+    scheme: slate
+    primary: custom
+    accent: custom
   features:
     - navigation.tabs
     - navigation.sections
@@ -33,6 +28,9 @@ theme:
     - content.code.copy
     - content.tabs.link
     - toc.integrate
+
+extra_css:
+  - stylesheets/extra.css
 
 markdown_extensions:
   - toc:

@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Opaque — Zero-Knowledge Secrets Broker for AI Agents</title>
+<meta name="description" content="Opaque is a local approval-gated secrets broker that keeps plaintext secrets out of LLM context. AI agents get operations, never raw values.">
+<meta property="og:title" content="Opaque — Zero-Knowledge Secrets Broker for AI Agents">
+<meta property="og:description" content="Local approval-gated secrets broker for AI coding tools. LLMs get operations, never plaintext values.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://opaque.dev">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="canonical" href="https://opaque.dev">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+/* ═══════════════════════════════════════════
+   OPAQUE — Brand & Landing Page Styles
+   "What is hidden stays hidden."
+   ═══════════════════════════════════════════ */
+
+:root {
+  --bg-deep:     #050709;
+  --bg:          #0a0c10;
+  --surface:     #0f1218;
+  --surface-hi:  #161a22;
+  --border:      #1c2028;
+  --border-hi:   #2a2f3a;
+  --text:        #e8ecf1;
+  --text-sec:    #8b919e;
+  --text-dim:    #555b67;
+  --accent-1:    #3b82f6;
+  --accent-2:    #8b5cf6;
+  --accent-3:    #06b6d4;
+  --green:       #10b981;
+  --green-dim:   #059669;
+  --amber:       #f59e0b;
+  --red:         #f43f5e;
+  --redact:      #2a2f3a;
+  --redact-hi:   #353b48;
+  --max-w:       1200px;
+  --radius:      12px;
+  --radius-sm:   8px;
+}
+
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+html { scroll-behavior: smooth; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
+body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; overflow-x: hidden; }
+code, pre, .mono { font-family: 'JetBrains Mono', 'SF Mono', 'Cascadia Code', monospace; }
+a { color: var(--accent-1); text-decoration: none; transition: color 0.2s; }
+a:hover { color: var(--accent-3); }
+
+.container { max-width: var(--max-w); margin: 0 auto; padding: 0 24px; }
+.gradient-text { background: linear-gradient(135deg, var(--accent-1), var(--accent-2), var(--accent-3)); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+
+.badge { display: inline-flex; align-items: center; gap: 6px; padding: 6px 14px; border-radius: 100px; font-size: 13px; font-weight: 500; border: 1px solid var(--border); background: rgba(59,130,246,0.06); color: var(--accent-1); letter-spacing: 0.02em; }
+.btn { display: inline-flex; align-items: center; gap: 8px; padding: 12px 24px; border-radius: var(--radius-sm); font-size: 15px; font-weight: 600; border: none; cursor: pointer; transition: all 0.25s ease; text-decoration: none; letter-spacing: -0.01em; }
+.btn-primary { background: linear-gradient(135deg, var(--accent-1), var(--accent-2)); color: white; box-shadow: 0 0 24px rgba(59,130,246,0.2); }
+.btn-primary:hover { box-shadow: 0 0 40px rgba(59,130,246,0.35); transform: translateY(-1px); color: white; }
+.btn-ghost { background: rgba(255,255,255,0.03); color: var(--text); border: 1px solid var(--border); }
+.btn-ghost:hover { background: rgba(255,255,255,0.06); border-color: var(--border-hi); color: var(--text); }
+
+/* ─── Noise overlay ────────────────────── */
+.noise-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; z-index: 999; pointer-events: none; opacity: 0.035; mix-blend-mode: overlay; }
+.scanlines { position: fixed; top: 0; left: 0; right: 0; bottom: 0; z-index: 998; pointer-events: none; background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,0.03) 2px, rgba(0,0,0,0.03) 4px); }
+
+/* ─── Mesh background ──────────────────── */
+.mesh-bg { position: fixed; top: 0; left: 0; right: 0; bottom: 0; z-index: -2; overflow: hidden; pointer-events: none; }
+.mesh-orb { position: absolute; border-radius: 50%; filter: blur(140px); opacity: 0.1; animation: float 25s ease-in-out infinite; }
+.mesh-orb-1 { width: 700px; height: 700px; background: var(--accent-1); top: -300px; left: -200px; }
+.mesh-orb-2 { width: 500px; height: 500px; background: var(--accent-2); top: 50%; right: -200px; animation-delay: -8s; }
+.mesh-orb-3 { width: 400px; height: 400px; background: var(--accent-3); bottom: -150px; left: 25%; animation-delay: -16s; }
+@keyframes float { 0%, 100% { transform: translate(0,0) scale(1); } 33% { transform: translate(40px,-40px) scale(1.05); } 66% { transform: translate(-30px,30px) scale(0.95); } }
+
+.grid-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; z-index: -1; pointer-events: none; background-image: linear-gradient(rgba(255,255,255,0.012) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.012) 1px, transparent 1px); background-size: 80px 80px; mask-image: radial-gradient(ellipse 70% 50% at 50% 30%, black, transparent); -webkit-mask-image: radial-gradient(ellipse 70% 50% at 50% 30%, black, transparent); }
+
+/* ─── Redacted text ────────────────────── */
+.redacted { display: inline-block; background: var(--redact); color: transparent; border-radius: 3px; padding: 0 2px; user-select: none; position: relative; }
+.redacted::after { content: ''; position: absolute; inset: 0; background: var(--redact); border-radius: 3px; }
+
+/* ─── Frost divider ────────────────────── */
+.frost-divider { height: 1px; background: linear-gradient(90deg, transparent, var(--border-hi), transparent); position: relative; }
+.frost-divider::after { content: ''; position: absolute; top: -20px; left: 0; right: 0; bottom: -20px; background: linear-gradient(180deg, transparent, rgba(59,130,246,0.02), transparent); pointer-events: none; }
+
+/* ═══════════════════════════════════════════ NAV */
+nav { position: fixed; top: 0; left: 0; right: 0; z-index: 100; padding: 16px 0; transition: background 0.3s, backdrop-filter 0.3s; }
+nav.scrolled { background: rgba(5,7,9,0.8); backdrop-filter: blur(20px) saturate(1.2); -webkit-backdrop-filter: blur(20px) saturate(1.2); border-bottom: 1px solid var(--border); }
+nav .container { display: flex; align-items: center; justify-content: space-between; }
+.nav-logo { display: flex; align-items: center; gap: 10px; font-size: 20px; font-weight: 800; letter-spacing: -0.03em; color: var(--text); }
+.nav-logo svg { width: 30px; height: 30px; }
+.nav-links { display: flex; align-items: center; gap: 32px; list-style: none; }
+.nav-links a { color: var(--text-sec); font-size: 14px; font-weight: 500; transition: color 0.2s; }
+.nav-links a:hover { color: var(--text); }
+.nav-cta { display: flex; align-items: center; gap: 12px; }
+.nav-cta .btn { padding: 8px 18px; font-size: 14px; }
+.gh-star { display: inline-flex; align-items: center; gap: 6px; padding: 6px 14px; border-radius: 100px; font-size: 13px; font-weight: 600; background: rgba(255,255,255,0.03); border: 1px solid var(--border); color: var(--text-sec); transition: all 0.2s; }
+.gh-star:hover { border-color: var(--border-hi); color: var(--text); }
+
+/* ═══════════════════════════════════════════ HERO */
+.hero { padding: 180px 0 120px; text-align: center; position: relative; }
+.hero-badge { margin-bottom: 28px; }
+.hero h1 { font-size: clamp(42px, 6vw, 72px); font-weight: 900; letter-spacing: -0.04em; line-height: 1.05; margin-bottom: 24px; }
+.hero h1 .line-break { display: block; }
+.hero p.subtitle { font-size: clamp(17px, 2vw, 20px); color: var(--text-sec); max-width: 640px; margin: 0 auto 40px; line-height: 1.7; }
+.hero-actions { display: flex; align-items: center; justify-content: center; gap: 16px; margin-bottom: 64px; flex-wrap: wrap; }
+
+.hero-redact-left, .hero-redact-right { position: absolute; opacity: 0.06; pointer-events: none; }
+.hero-redact-left { left: 5%; top: 35%; }
+.hero-redact-right { right: 5%; top: 45%; }
+.hero-redact-left .r-bar, .hero-redact-right .r-bar { display: block; height: 6px; background: var(--text); border-radius: 3px; margin-bottom: 8px; }
+
+.install-cmd { display: flex; align-items: center; gap: 12px; padding: 14px 20px; border-radius: var(--radius-sm); background: var(--surface); border: 1px solid var(--border); max-width: 480px; margin: 0 auto; cursor: pointer; transition: border-color 0.2s, box-shadow 0.2s; }
+.install-cmd:hover { border-color: var(--border-hi); box-shadow: 0 0 20px rgba(59,130,246,0.06); }
+.install-cmd .prompt { color: var(--green); font-weight: 600; }
+.install-cmd code { color: var(--text-sec); font-size: 14px; flex: 1; text-align: left; }
+.install-cmd .copy-icon { color: var(--text-dim); transition: color 0.2s; flex-shrink: 0; }
+.install-cmd:hover .copy-icon { color: var(--text-sec); }
+
+.hero-visual { margin-top: 80px; }
+.pipeline-viz { display: flex; align-items: center; justify-content: center; gap: 0; flex-wrap: wrap; padding: 0 20px; }
+.pipeline-step { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 24px 20px; position: relative; }
+.pipeline-icon { width: 56px; height: 56px; border-radius: 14px; display: flex; align-items: center; justify-content: center; border: 1px solid var(--border); transition: all 0.3s ease; backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); }
+.pipeline-step:hover .pipeline-icon { border-color: var(--accent-1); box-shadow: 0 0 24px rgba(59,130,246,0.12); transform: translateY(-2px); }
+.pipeline-icon.pi-policy   { background: rgba(59,130,246,0.08); }
+.pipeline-icon.pi-approve  { background: rgba(139,92,246,0.08); }
+.pipeline-icon.pi-execute  { background: rgba(16,185,129,0.08); }
+.pipeline-icon.pi-sanitize { background: rgba(6,182,212,0.08); }
+.pipeline-icon.pi-audit    { background: rgba(245,158,11,0.08); }
+.pipeline-label { font-size: 13px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-sec); }
+.pipeline-arrow { color: var(--text-dim); font-size: 20px; padding: 0 4px; margin-top: -20px; opacity: 0.4; }
+
+/* ═══════════════════════════════════════════ SECTIONS */
+.section { padding: 120px 0; position: relative; }
+.section-label { font-size: 13px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; color: var(--accent-1); margin-bottom: 16px; }
+.section-title { font-size: clamp(28px, 4vw, 44px); font-weight: 800; letter-spacing: -0.03em; line-height: 1.15; margin-bottom: 20px; }
+.section-desc { font-size: 17px; color: var(--text-sec); max-width: 640px; line-height: 1.7; }
+.section-center { text-align: center; }
+.section-center .section-desc { margin: 0 auto 60px; }
+
+/* ─── Problem cards ────────────────────── */
+.problem-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 24px; margin-top: 48px; }
+.problem-card { padding: 32px; border-radius: var(--radius); background: rgba(15,18,24,0.6); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); border: 1px solid var(--border); transition: all 0.3s ease; position: relative; overflow: hidden; }
+.problem-card::after { content: ''; position: absolute; bottom: 8px; left: 20px; right: 20px; height: 4px; border-radius: 2px; background: var(--redact); opacity: 0; transition: opacity 0.3s; }
+.problem-card:hover::after { opacity: 0.4; }
+.problem-card:hover { border-color: var(--border-hi); transform: translateY(-2px); box-shadow: 0 8px 32px rgba(0,0,0,0.4); }
+.problem-card .icon-wrap { width: 48px; height: 48px; border-radius: 12px; display: flex; align-items: center; justify-content: center; margin-bottom: 20px; }
+.problem-card h3 { font-size: 18px; font-weight: 700; margin-bottom: 10px; letter-spacing: -0.01em; }
+.problem-card p { font-size: 15px; color: var(--text-sec); line-height: 1.65; }
+
+/* ─── How it works ─────────────────────── */
+.how-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 64px; align-items: center; margin-top: 48px; }
+.how-steps { display: flex; flex-direction: column; gap: 28px; }
+.how-step { display: flex; gap: 20px; padding: 20px; border-radius: var(--radius-sm); transition: background 0.2s; cursor: default; }
+.how-step:hover { background: rgba(255,255,255,0.015); }
+.step-num { width: 36px; height: 36px; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 14px; font-weight: 700; flex-shrink: 0; background: linear-gradient(135deg, rgba(59,130,246,0.1), rgba(139,92,246,0.1)); border: 1px solid rgba(59,130,246,0.15); color: var(--accent-1); }
+.step-content h4 { font-size: 16px; font-weight: 700; margin-bottom: 6px; letter-spacing: -0.01em; }
+.step-content p { font-size: 14px; color: var(--text-sec); line-height: 1.6; }
+
+/* ─── Code block ───────────────────────── */
+.code-block { border-radius: var(--radius); background: var(--surface); border: 1px solid var(--border); overflow: hidden; position: relative; }
+.code-block::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 1px; background: linear-gradient(90deg, transparent, rgba(139,92,246,0.3), transparent); }
+.code-header { display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; border-bottom: 1px solid var(--border); font-size: 13px; color: var(--text-dim); }
+.code-dots { display: flex; gap: 6px; }
+.code-dots span { width: 10px; height: 10px; border-radius: 50%; }
+.code-dots span:nth-child(1) { background: rgba(244,63,94,0.4); }
+.code-dots span:nth-child(2) { background: rgba(245,158,11,0.4); }
+.code-dots span:nth-child(3) { background: rgba(16,185,129,0.4); }
+.code-block pre { padding: 20px; overflow-x: auto; font-size: 13px; line-height: 1.7; }
+.code-block code { color: var(--text-sec); }
+.hl-kw { color: var(--accent-2); } .hl-str { color: var(--green); } .hl-fn { color: var(--accent-1); }
+.hl-cm { color: var(--text-dim); font-style: italic; } .hl-num { color: var(--amber); } .hl-op { color: var(--text-dim); }
+
+/* ─── Features grid ────────────────────── */
+.features-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; margin-top: 60px; }
+.feature-card { padding: 32px; border-radius: var(--radius); background: rgba(15,18,24,0.6); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); border: 1px solid var(--border); transition: all 0.3s ease; position: relative; overflow: hidden; }
+.feature-card::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 1px; background: linear-gradient(90deg, transparent, var(--accent-1), var(--accent-2), transparent); opacity: 0; transition: opacity 0.3s; }
+.feature-card:hover::before { opacity: 1; }
+.feature-card:hover { border-color: var(--border-hi); transform: translateY(-2px); box-shadow: 0 8px 32px rgba(0,0,0,0.4); }
+.feature-icon { width: 44px; height: 44px; border-radius: 10px; display: flex; align-items: center; justify-content: center; margin-bottom: 20px; background: rgba(59,130,246,0.06); border: 1px solid rgba(59,130,246,0.1); }
+.feature-card h3 { font-size: 17px; font-weight: 700; margin-bottom: 10px; letter-spacing: -0.01em; }
+.feature-card p { font-size: 14px; color: var(--text-sec); line-height: 1.65; }
+
+/* ─── Providers ────────────────────────── */
+.providers-row { display: flex; align-items: center; justify-content: center; gap: 32px; flex-wrap: wrap; margin-top: 56px; }
+.provider-chip { display: flex; align-items: center; gap: 10px; padding: 14px 24px; border-radius: var(--radius-sm); background: rgba(15,18,24,0.6); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); border: 1px solid var(--border); font-size: 15px; font-weight: 600; color: var(--text); transition: all 0.25s ease; }
+.provider-chip:hover { border-color: var(--border-hi); transform: translateY(-1px); box-shadow: 0 4px 16px rgba(0,0,0,0.3); }
+.provider-chip .p-icon { font-size: 20px; width: 24px; text-align: center; }
+
+/* ─── Operations table ─────────────────── */
+.ops-table-wrap { margin-top: 48px; border-radius: var(--radius); border: 1px solid var(--border); overflow: hidden; background: var(--surface); }
+.ops-table { width: 100%; border-collapse: collapse; font-size: 14px; }
+.ops-table thead { background: rgba(255,255,255,0.015); }
+.ops-table th { text-align: left; padding: 14px 20px; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-dim); border-bottom: 1px solid var(--border); }
+.ops-table td { padding: 14px 20px; border-bottom: 1px solid rgba(28,32,40,0.5); color: var(--text-sec); }
+.ops-table tbody tr:last-child td { border-bottom: none; }
+.ops-table tbody tr:hover { background: rgba(255,255,255,0.01); }
+.ops-table .op-name { font-family: 'JetBrains Mono', monospace; color: var(--accent-1); font-size: 13px; font-weight: 500; }
+.safety-badge { display: inline-block; padding: 3px 10px; border-radius: 100px; font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
+.safety-safe { background: rgba(16,185,129,0.08); color: var(--green); border: 1px solid rgba(16,185,129,0.15); }
+.safety-sensitive { background: rgba(245,158,11,0.08); color: var(--amber); border: 1px solid rgba(245,158,11,0.15); }
+.safety-dangerous { background: rgba(244,63,94,0.08); color: var(--red); border: 1px solid rgba(244,63,94,0.15); }
+
+/* ─── Quote ────────────────────────────── */
+.quote-section { padding: 120px 0; text-align: center; position: relative; }
+.quote-section::before, .quote-section::after { content: ''; position: absolute; left: 10%; right: 10%; height: 1px; background: linear-gradient(90deg, transparent, var(--border-hi), transparent); }
+.quote-section::before { top: 0; } .quote-section::after { bottom: 0; }
+.quote-decor { display: flex; justify-content: center; gap: 24px; margin-bottom: 32px; }
+.quote-decor .qd-bar { width: 40px; height: 4px; border-radius: 2px; background: var(--redact-hi); }
+.quote-text { font-size: clamp(24px, 3.5vw, 40px); font-weight: 700; letter-spacing: -0.03em; line-height: 1.3; max-width: 900px; margin: 0 auto 24px; }
+.quote-attr { font-size: 15px; color: var(--text-dim); font-style: italic; }
+
+/* ─── CTA ──────────────────────────────── */
+.cta-section { padding: 120px 0; text-align: center; }
+.cta-box { padding: 64px 48px; border-radius: 20px; background: rgba(15,18,24,0.7); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); border: 1px solid rgba(59,130,246,0.12); position: relative; overflow: hidden; }
+.cta-box::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 1px; background: linear-gradient(90deg, transparent, var(--accent-1), var(--accent-2), transparent); }
+.cta-decor-tl, .cta-decor-br { position: absolute; pointer-events: none; opacity: 0.06; }
+.cta-decor-tl { top: 20px; left: 24px; } .cta-decor-br { bottom: 20px; right: 24px; }
+.cta-decor-tl .cd-bar, .cta-decor-br .cd-bar { display: block; height: 4px; background: var(--text); border-radius: 2px; margin-bottom: 5px; }
+.cta-box h2 { font-size: clamp(28px, 3.5vw, 40px); font-weight: 800; letter-spacing: -0.03em; margin-bottom: 16px; }
+.cta-box p { font-size: 17px; color: var(--text-sec); max-width: 500px; margin: 0 auto 36px; line-height: 1.7; }
+.cta-actions { display: flex; align-items: center; justify-content: center; gap: 16px; flex-wrap: wrap; }
+
+/* ─── Footer ───────────────────────────── */
+footer { padding: 48px 0; border-top: 1px solid var(--border); }
+footer .container { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 24px; }
+.footer-left { display: flex; align-items: center; gap: 24px; }
+.footer-logo { display: flex; align-items: center; gap: 8px; font-weight: 700; font-size: 16px; color: var(--text); }
+.footer-logo svg { width: 22px; height: 22px; }
+.footer-copy { font-size: 13px; color: var(--text-dim); }
+.footer-links { display: flex; align-items: center; gap: 24px; list-style: none; }
+.footer-links a { color: var(--text-dim); font-size: 14px; transition: color 0.2s; }
+.footer-links a:hover { color: var(--text); }
+
+/* ─── Animations ───────────────────────── */
+.fade-up { opacity: 0; transform: translateY(24px); filter: blur(6px); transition: opacity 0.7s ease, transform 0.7s ease, filter 0.7s ease; }
+.fade-up.visible { opacity: 1; transform: translateY(0); filter: blur(0); }
+.stagger > * { opacity: 0; transform: translateY(16px); filter: blur(4px); transition: opacity 0.5s ease, transform 0.5s ease, filter 0.5s ease; }
+.stagger.visible > *:nth-child(1) { transition-delay: 0s; } .stagger.visible > *:nth-child(2) { transition-delay: 0.08s; }
+.stagger.visible > *:nth-child(3) { transition-delay: 0.08s; } .stagger.visible > *:nth-child(4) { transition-delay: 0.16s; }
+.stagger.visible > *:nth-child(5) { transition-delay: 0.24s; } .stagger.visible > *:nth-child(6) { transition-delay: 0.32s; }
+.stagger.visible > *:nth-child(7) { transition-delay: 0.40s; } .stagger.visible > *:nth-child(8) { transition-delay: 0.48s; }
+.stagger.visible > *:nth-child(9) { transition-delay: 0.56s; }
+.stagger.visible > * { opacity: 1; transform: translateY(0); filter: blur(0); }
+
+/* ─── Responsive ───────────────────────── */
+@media (max-width: 1024px) { .features-grid { grid-template-columns: repeat(2, 1fr); } .how-grid { grid-template-columns: 1fr; gap: 48px; } .hero-redact-left, .hero-redact-right { display: none; } }
+@media (max-width: 768px) { .hero { padding: 140px 0 80px; } .features-grid { grid-template-columns: 1fr; } .problem-grid { grid-template-columns: 1fr; } .pipeline-arrow { display: none; } .nav-links { display: none; } .providers-row { gap: 16px; } .provider-chip { padding: 10px 16px; font-size: 13px; } .ops-table-wrap { overflow-x: auto; } .ops-table { min-width: 600px; } footer .container { flex-direction: column; text-align: center; } .footer-left { flex-direction: column; } }
+@media (max-width: 480px) { .hero-actions { flex-direction: column; } .install-cmd { width: 100%; } .cta-box { padding: 40px 24px; } .cta-actions { flex-direction: column; } }
+</style>
+</head>
+<body>
+
+<!-- Overlays -->
+<svg class="noise-overlay" width="100%" height="100%">
+  <filter id="noise"><feTurbulence type="fractalNoise" baseFrequency="0.8" numOctaves="4" stitchTiles="stitch"/><feColorMatrix type="saturate" values="0"/></filter>
+  <rect width="100%" height="100%" filter="url(#noise)"/>
+</svg>
+<div class="scanlines"></div>
+<div class="mesh-bg"><div class="mesh-orb mesh-orb-1"></div><div class="mesh-orb mesh-orb-2"></div><div class="mesh-orb mesh-orb-3"></div></div>
+<div class="grid-overlay"></div>
+
+<!-- NAV -->
+<nav id="nav">
+  <div class="container">
+    <a href="#" class="nav-logo">
+      <svg viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <rect x="2" y="2" width="28" height="28" rx="7" fill="url(#logo-bg)" stroke="url(#logo-stroke)" stroke-width="1.2"/>
+        <rect x="7" y="9" width="18" height="3.5" rx="1.75" fill="url(#bar-grad)" opacity="0.7"/>
+        <rect x="7" y="15" width="13" height="3.5" rx="1.75" fill="url(#bar-grad)" opacity="0.4"/>
+        <rect x="7" y="21" width="9" height="3.5" rx="1.75" fill="url(#bar-grad)" opacity="0.18"/>
+        <defs>
+          <linearGradient id="logo-bg" x1="2" y1="2" x2="30" y2="30" gradientUnits="userSpaceOnUse"><stop stop-color="#3b82f6" stop-opacity="0.08"/><stop offset="1" stop-color="#8b5cf6" stop-opacity="0.06"/></linearGradient>
+          <linearGradient id="logo-stroke" x1="2" y1="2" x2="30" y2="30" gradientUnits="userSpaceOnUse"><stop stop-color="#3b82f6" stop-opacity="0.5"/><stop offset="1" stop-color="#8b5cf6" stop-opacity="0.4"/></linearGradient>
+          <linearGradient id="bar-grad" x1="7" y1="0" x2="25" y2="0" gradientUnits="userSpaceOnUse"><stop stop-color="#e8ecf1"/><stop offset="1" stop-color="#94a3b8"/></linearGradient>
+        </defs>
+      </svg>
+      Opaque
+    </a>
+    <ul class="nav-links">
+      <li><a href="#features">Features</a></li>
+      <li><a href="#how-it-works">How It Works</a></li>
+      <li><a href="#providers">Providers</a></li>
+      <li><a href="#operations">Operations</a></li>
+      <li><a href="https://kcirtapfromspace.github.io/opaque/">Docs</a></li>
+    </ul>
+    <div class="nav-cta">
+      <a href="https://github.com/kcirtapfromspace/opaque" class="gh-star" target="_blank" rel="noopener">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        Star
+      </a>
+      <a href="#get-started" class="btn btn-primary">Get Started</a>
+    </div>
+  </div>
+</nav>
+
+<!-- HERO -->
+<section class="hero">
+  <div class="hero-redact-left" aria-hidden="true"><span class="r-bar" style="width:120px"></span><span class="r-bar" style="width:80px"></span><span class="r-bar" style="width:100px"></span><span class="r-bar" style="width:60px"></span><span class="r-bar" style="width:90px"></span></div>
+  <div class="hero-redact-right" aria-hidden="true"><span class="r-bar" style="width:90px;margin-left:auto"></span><span class="r-bar" style="width:70px;margin-left:auto"></span><span class="r-bar" style="width:110px;margin-left:auto"></span><span class="r-bar" style="width:50px;margin-left:auto"></span></div>
+  <div class="container">
+    <div class="hero-badge fade-up"><span class="badge"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="3" y="3" width="18" height="18" rx="4"/><line x1="7" y1="9" x2="17" y2="9" opacity="0.7"/><line x1="7" y1="13" x2="14" y2="13" opacity="0.4"/><line x1="7" y1="17" x2="11" y2="17" opacity="0.2"/></svg> Zero-Knowledge Secrets Broker</span></div>
+    <h1 class="fade-up"><span>Secrets stay <span class="redacted" aria-label="hidden">secret</span>.</span><span class="line-break"><span class="gradient-text">Agents stay powerful.</span></span></h1>
+    <p class="subtitle fade-up">Opaque is a local approval-gated secrets broker for AI coding tools. LLMs get <strong>operations</strong>&thinsp;&mdash;&thinsp;never plaintext values.</p>
+    <div class="hero-actions fade-up">
+      <a href="#get-started" class="btn btn-primary"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg> Get Started</a>
+      <a href="https://github.com/kcirtapfromspace/opaque" class="btn btn-ghost" target="_blank" rel="noopener"><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg> GitHub</a>
+    </div>
+    <div class="install-cmd fade-up" onclick="copyInstall()" id="install-cmd"><span class="prompt mono">$</span><code>curl -fsSL https://opaque.dev/install.sh | sh</code><svg class="copy-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg></div>
+    <div class="hero-visual fade-up">
+      <div class="pipeline-viz stagger" id="pipeline">
+        <div class="pipeline-step"><div class="pipeline-icon pi-policy"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg></div><span class="pipeline-label">Policy</span></div>
+        <span class="pipeline-arrow">&rarr;</span>
+        <div class="pipeline-step"><div class="pipeline-icon pi-approve"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#8b5cf6" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg></div><span class="pipeline-label">Approval</span></div>
+        <span class="pipeline-arrow">&rarr;</span>
+        <div class="pipeline-step"><div class="pipeline-icon pi-execute"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg></div><span class="pipeline-label">Execute</span></div>
+        <span class="pipeline-arrow">&rarr;</span>
+        <div class="pipeline-step"><div class="pipeline-icon pi-sanitize"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#06b6d4" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div><span class="pipeline-label">Sanitize</span></div>
+        <span class="pipeline-arrow">&rarr;</span>
+        <div class="pipeline-step"><div class="pipeline-icon pi-audit"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></div><span class="pipeline-label">Audit</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- THE PROBLEM -->
+<div class="container"><div class="frost-divider"></div></div>
+<section class="section" id="problem"><div class="container"><div class="section-center">
+  <span class="section-label">The Problem</span>
+  <h2 class="section-title fade-up">AI agents need secrets.<br><span class="gradient-text">They shouldn't see them.</span></h2>
+  <p class="section-desc fade-up">Most secret-consuming workflows are <strong>write-only</strong> from the agent's perspective. Agents don't need plaintext&thinsp;&mdash;&thinsp;they just need to request the operation.</p>
+</div>
+<div class="problem-grid stagger" id="problems">
+  <div class="problem-card"><div class="icon-wrap" style="background:rgba(244,63,94,0.08)"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#f43f5e" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg></div><h3>Plaintext Leaks</h3><p>Environment variables and config files expose secrets directly to LLM context windows. One hallucination away from leaking credentials.</p></div>
+  <div class="problem-card"><div class="icon-wrap" style="background:rgba(245,158,11,0.08)"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></div><h3>No Approval Gate</h3><p>AI agents act on secrets without human confirmation. There's no biometric check, no intent dialog&thinsp;&mdash;&thinsp;just blind trust in a probabilistic model.</p></div>
+  <div class="problem-card"><div class="icon-wrap" style="background:rgba(139,92,246,0.08)"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#8b5cf6" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></div><h3>Zero Auditability</h3><p>When something goes wrong, there's no record of which agent accessed what secret, when, or why. Incident response starts from zero.</p></div>
+</div></div></section>
+
+<!-- HOW IT WORKS -->
+<div class="container"><div class="frost-divider"></div></div>
+<section class="section" id="how-it-works"><div class="container">
+  <span class="section-label">How It Works</span>
+  <h2 class="section-title fade-up">Five stages. <span class="gradient-text">No bypass paths.</span></h2>
+  <p class="section-desc fade-up" style="margin-bottom:48px">Every operation passes through a strict five-stage pipeline enforced by Rust's type system. There are no shortcuts.</p>
+  <div class="how-grid">
+    <div class="how-steps stagger" id="how-steps">
+      <div class="how-step"><div class="step-num">1</div><div class="step-content"><h4>Policy Check</h4><p>Deny-by-default engine evaluates allowlist rules matching on operation name, client identity, and target fields.</p></div></div>
+      <div class="how-step"><div class="step-num">2</div><div class="step-content"><h4>Native OS Approval</h4><p>Touch ID on macOS or polkit on Linux. Real biometric or password confirmation for every sensitive operation.</p></div></div>
+      <div class="how-step"><div class="step-num">3</div><div class="step-content"><h4>Secure Execution</h4><p>Operations run inside a trusted daemon. Secrets are resolved from providers and used&thinsp;&mdash;&thinsp;but never returned to the caller.</p></div></div>
+      <div class="how-step"><div class="step-num">4</div><div class="step-content"><h4>Typestate Sanitization</h4><p>Rust's type system guarantees only sanitized responses can reach clients. Regex-based scrubbing adds defense in depth.</p></div></div>
+      <div class="how-step"><div class="step-num">5</div><div class="step-content"><h4>Structured Audit</h4><p>Every operation is logged to SQLite with correlation IDs, full-text search, and real-time streaming via SSE.</p></div></div>
+    </div>
+    <div class="code-block fade-up"><div class="code-header"><div class="code-dots"><span></span><span></span><span></span></div><span>policy.toml</span></div>
+<pre><code><span class="hl-cm"># Deny-by-default: only listed operations are allowed</span>
+
+<span class="hl-kw">[[rules]]</span>
+<span class="hl-fn">name</span>     <span class="hl-op">=</span> <span class="hl-str">"Allow GitHub secret sync"</span>
+<span class="hl-fn">operations</span> <span class="hl-op">=</span> [<span class="hl-str">"github.set_secret"</span>, <span class="hl-str">"github.list_secrets"</span>]
+<span class="hl-fn">clients</span>  <span class="hl-op">=</span> [<span class="hl-str">"claude-code"</span>]
+<span class="hl-fn">effect</span>   <span class="hl-op">=</span> <span class="hl-str">"allow"</span>
+<span class="hl-fn">approval</span> <span class="hl-op">=</span> <span class="hl-str">"biometric"</span>
+
+<span class="hl-kw">[[rules]]</span>
+<span class="hl-fn">name</span>     <span class="hl-op">=</span> <span class="hl-str">"Allow Vault reads"</span>
+<span class="hl-fn">operations</span> <span class="hl-op">=</span> [<span class="hl-str">"vault.get_secret"</span>]
+<span class="hl-fn">clients</span>  <span class="hl-op">=</span> [<span class="hl-str">"*"</span>]
+<span class="hl-fn">effect</span>   <span class="hl-op">=</span> <span class="hl-str">"allow"</span>
+<span class="hl-fn">approval</span> <span class="hl-op">=</span> <span class="hl-str">"lease"</span>
+<span class="hl-fn">lease_ttl</span> <span class="hl-op">=</span> <span class="hl-num">300</span></code></pre></div>
+  </div>
+</div></section>
+
+<!-- FEATURES -->
+<div class="container"><div class="frost-divider"></div></div>
+<section class="section section-center" id="features"><div class="container">
+  <span class="section-label">Features</span>
+  <h2 class="section-title fade-up">Built for <span class="gradient-text">production security.</span></h2>
+  <p class="section-desc fade-up">Every feature exists to keep secrets out of LLM context while maximizing agent capabilities.</p>
+  <div class="features-grid stagger" id="features-grid">
+    <div class="feature-card"><div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div><h3>Typestate Sanitization</h3><p>Rust's type system makes it a compile-time error to return unsanitized responses. Not a convention&thinsp;&mdash;&thinsp;a guarantee.</p></div>
+    <div class="feature-card"><div class="feature-icon" style="background:rgba(139,92,246,0.06);border-color:rgba(139,92,246,0.1)"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#8b5cf6" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg></div><h3>Touch ID / Polkit</h3><p>Native OS approval for every sensitive operation. Touch ID on macOS, polkit on Linux. Real biometric trust.</p></div>
+    <div class="feature-card"><div class="feature-icon" style="background:rgba(16,185,129,0.06);border-color:rgba(16,185,129,0.1)"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg></div><h3>MCP Integration</h3><p>First-class Model Context Protocol server. Claude Code sees Opaque operations as native tools&thinsp;&mdash;&thinsp;zero configuration.</p></div>
+    <div class="feature-card"><div class="feature-icon" style="background:rgba(6,182,212,0.06);border-color:rgba(6,182,212,0.1)"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#06b6d4" stroke-width="2"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg></div><h3>Approval Leases</h3><p>Approve once, reuse the lease. Prevents approval fatigue without compromising security. Configurable TTL per rule.</p></div>
+    <div class="feature-card"><div class="feature-icon" style="background:rgba(245,158,11,0.06);border-color:rgba(245,158,11,0.1)"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></div><h3>Real-Time Audit</h3><p>Every operation logged to SQLite with correlation IDs and full-text search. Live streaming via Server-Sent Events.</p></div>
+    <div class="feature-card"><div class="feature-icon" style="background:rgba(244,63,94,0.06);border-color:rgba(244,63,94,0.1)"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#f43f5e" stroke-width="2"><path d="M16 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="8.5" cy="7" r="4"/><path d="M20 8v6M23 11h-6"/></svg></div><h3>Client Identity</h3><p>Unix peer credentials + executable SHA-256 hash + optional macOS Team ID. Know exactly which process is asking.</p></div>
+  </div>
+</div></section>
+
+<!-- PROVIDERS -->
+<div class="container"><div class="frost-divider"></div></div>
+<section class="section section-center" id="providers"><div class="container">
+  <span class="section-label">Integrations</span>
+  <h2 class="section-title fade-up">Your secrets. <span class="gradient-text">Wherever they live.</span></h2>
+  <p class="section-desc fade-up">Opaque connects to the providers you already use. Resolve secrets from any source with a unified reference scheme.</p>
+  <div class="providers-row stagger" id="providers-row">
+    <div class="provider-chip"><span class="p-icon"><svg width="20" height="20" viewBox="0 0 16 16" fill="#e8ecf1"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg></span> GitHub</div>
+    <div class="provider-chip"><span class="p-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="#e8ecf1"><path d="M22.65 14.39L12 22.13 1.35 14.39a.84.84 0 01-.3-.94l1.22-3.78 2.44-7.51A.42.42 0 014.82 2a.43.43 0 01.58 0 .42.42 0 01.11.18l2.44 7.49h8.1l2.44-7.51A.42.42 0 0118.6 2a.43.43 0 01.58 0 .42.42 0 01.11.18l2.44 7.51L23 13.45a.84.84 0 01-.35.94z"/></svg></span> GitLab</div>
+    <div class="provider-chip"><span class="p-icon" style="font-size:22px;font-weight:800;color:#0572ec">1P</span> 1Password</div>
+    <div class="provider-chip"><span class="p-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#175ddc" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span> Bitwarden</div>
+    <div class="provider-chip"><span class="p-icon" style="font-size:14px;font-weight:800;color:#ffec6e">HCV</span> Vault</div>
+    <div class="provider-chip"><span class="p-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ff9900" stroke-width="2"><path d="M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 003 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0021 16z"/></svg></span> AWS</div>
+    <div class="provider-chip"><span class="p-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#0078d4" stroke-width="2"><rect x="2" y="3" width="20" height="18" rx="2"/><path d="M8 21V7l8 14V3"/></svg></span> Azure</div>
+    <div class="provider-chip"><span class="p-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#4285f4" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/></svg></span> GCP</div>
+  </div>
+  <p style="margin-top:32px;font-size:14px;color:var(--text-dim)">Plus macOS Keychain &middot; Linux secret-tool &middot; Environment variables &middot; Execution profiles</p>
+</div></section>
+
+<!-- OPERATIONS TABLE -->
+<div class="container"><div class="frost-divider"></div></div>
+<section class="section section-center" id="operations"><div class="container">
+  <span class="section-label">Operations</span>
+  <h2 class="section-title fade-up">Operations, <span class="gradient-text">not secrets.</span></h2>
+  <p class="section-desc fade-up">Agents invoke named operations with safety classifications. The daemon resolves secrets internally and returns only sanitized results.</p>
+  <div class="ops-table-wrap fade-up"><table class="ops-table"><thead><tr><th>Operation</th><th>Provider</th><th>Description</th><th>Safety</th></tr></thead><tbody>
+    <tr><td class="op-name">github.set_secret</td><td>GitHub</td><td>Set an Actions, Codespaces, or Dependabot secret</td><td><span class="safety-badge safety-sensitive">Sensitive</span></td></tr>
+    <tr><td class="op-name">github.list_secrets</td><td>GitHub</td><td>List secret names (never values) for a repository</td><td><span class="safety-badge safety-safe">Safe</span></td></tr>
+    <tr><td class="op-name">gitlab.set_variable</td><td>GitLab</td><td>Set a CI/CD variable with full options (protected, masked)</td><td><span class="safety-badge safety-sensitive">Sensitive</span></td></tr>
+    <tr><td class="op-name">vault.get_secret</td><td>Vault</td><td>Read a KV v1/v2 secret with lease-aware caching</td><td><span class="safety-badge safety-sensitive">Sensitive</span></td></tr>
+    <tr><td class="op-name">vault.put_secret</td><td>Vault</td><td>Write a secret to Vault KV store</td><td><span class="safety-badge safety-dangerous">Dangerous</span></td></tr>
+    <tr><td class="op-name">onepassword.get_item</td><td>1Password</td><td>Retrieve an item from a 1Password vault</td><td><span class="safety-badge safety-sensitive">Sensitive</span></td></tr>
+    <tr><td class="op-name">bitwarden.get_secret</td><td>Bitwarden</td><td>Fetch a secret via Bitwarden Secrets Manager</td><td><span class="safety-badge safety-sensitive">Sensitive</span></td></tr>
+    <tr><td class="op-name">sandbox.exec</td><td>System</td><td>Execute a command with injected secrets in a sandbox</td><td><span class="safety-badge safety-dangerous">Dangerous</span></td></tr>
+    <tr><td class="op-name">test.noop</td><td>System</td><td>No-op for testing the pipeline end-to-end</td><td><span class="safety-badge safety-safe">Safe</span></td></tr>
+  </tbody></table></div>
+</div></section>
+
+<!-- QUOTE -->
+<section class="quote-section"><div class="container">
+  <div class="quote-decor" aria-hidden="true"><span class="qd-bar"></span><span class="qd-bar" style="width:24px;opacity:0.5"></span><span class="qd-bar" style="width:16px;opacity:0.3"></span></div>
+  <p class="quote-text fade-up">&ldquo;AI coding tools and strong security<br><span class="gradient-text">are not at odds.</span>&rdquo;</p>
+  <p class="quote-attr fade-up">The Opaque Manifesto</p>
+</div></section>
+
+<!-- GET STARTED -->
+<section class="section" id="get-started"><div class="container">
+  <div class="how-grid">
+    <div>
+      <span class="section-label">Get Started</span>
+      <h2 class="section-title fade-up">Up and running<br><span class="gradient-text">in sixty seconds.</span></h2>
+      <div class="how-steps stagger" id="start-steps" style="margin-top:32px">
+        <div class="how-step"><div class="step-num">1</div><div class="step-content"><h4>Install</h4><p>Single-line install script, or build from source with <code>cargo install</code>.</p></div></div>
+        <div class="how-step"><div class="step-num">2</div><div class="step-content"><h4>Configure</h4><p>Run <code>opaque init</code> to generate a policy file and set up your first provider.</p></div></div>
+        <div class="how-step"><div class="step-num">3</div><div class="step-content"><h4>Connect</h4><p>Add the MCP server to Claude Code. Agent tools appear automatically.</p></div></div>
+      </div>
+    </div>
+    <div class="code-block fade-up"><div class="code-header"><div class="code-dots"><span></span><span></span><span></span></div><span>terminal</span></div>
+<pre><code><span class="hl-cm"># Install Opaque</span>
+<span class="hl-fn">$</span> curl -fsSL https://opaque.dev/install.sh | sh
+
+<span class="hl-cm"># Initialize configuration</span>
+<span class="hl-fn">$</span> opaque init
+<span class="hl-str">  Creating ~/.opaque/config.toml...</span>
+<span class="hl-str">  Generating web dashboard token...</span>
+<span class="hl-str">  Done! Run `opaqued` to start the daemon.</span>
+
+<span class="hl-cm"># Start the daemon</span>
+<span class="hl-fn">$</span> opaqued
+<span class="hl-str">  Listening on /tmp/opaque.sock</span>
+<span class="hl-str">  Web dashboard: http://127.0.0.1:7380</span>
+<span class="hl-str">  Policy loaded: 3 rules, 0 warnings</span>
+
+<span class="hl-cm"># Add to Claude Code</span>
+<span class="hl-fn">$</span> opaque mcp install
+<span class="hl-str">  MCP server registered with Claude Code</span>
+<span class="hl-str">  Available tools: 9 operations</span></code></pre></div>
+  </div>
+</div></section>
+
+<!-- CTA -->
+<section class="cta-section"><div class="container"><div class="cta-box fade-up">
+  <div class="cta-decor-tl" aria-hidden="true"><span class="cd-bar" style="width:48px"></span><span class="cd-bar" style="width:32px"></span><span class="cd-bar" style="width:20px"></span></div>
+  <div class="cta-decor-br" aria-hidden="true"><span class="cd-bar" style="width:20px;margin-left:auto"></span><span class="cd-bar" style="width:36px;margin-left:auto"></span></div>
+  <h2>Ready to keep secrets <span class="gradient-text">out of context?</span></h2>
+  <p>Open source under Apache-2.0. Works on macOS and Linux. Built with Rust.</p>
+  <div class="cta-actions">
+    <a href="https://github.com/kcirtapfromspace/opaque" class="btn btn-primary" target="_blank" rel="noopener"><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg> View on GitHub</a>
+    <a href="https://kcirtapfromspace.github.io/opaque/" class="btn btn-ghost"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 016.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 014 19.5v-15A2.5 2.5 0 016.5 2z"/></svg> Read the Docs</a>
+  </div>
+</div></div></section>
+
+<!-- FOOTER -->
+<footer><div class="container">
+  <div class="footer-left">
+    <a href="#" class="footer-logo">
+      <svg viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="2" y="2" width="28" height="28" rx="7" fill="rgba(59,130,246,0.06)" stroke="rgba(139,92,246,0.35)" stroke-width="1.2"/><rect x="7" y="9" width="18" height="3.5" rx="1.75" fill="#e8ecf1" opacity="0.6"/><rect x="7" y="15" width="13" height="3.5" rx="1.75" fill="#e8ecf1" opacity="0.35"/><rect x="7" y="21" width="9" height="3.5" rx="1.75" fill="#e8ecf1" opacity="0.15"/></svg>
+      Opaque
+    </a>
+    <span class="footer-copy">Apache-2.0 &middot; macOS &middot; Linux</span>
+  </div>
+  <ul class="footer-links">
+    <li><a href="https://kcirtapfromspace.github.io/opaque/">Docs</a></li>
+    <li><a href="https://github.com/kcirtapfromspace/opaque">GitHub</a></li>
+    <li><a href="https://github.com/kcirtapfromspace/opaque/blob/main/CHANGELOG.md">Changelog</a></li>
+    <li><a href="https://github.com/kcirtapfromspace/opaque/blob/main/SECURITY.md">Security</a></li>
+  </ul>
+</div></footer>
+
+<script>
+const nav = document.getElementById('nav');
+window.addEventListener('scroll', () => { nav.classList.toggle('scrolled', window.scrollY > 40); }, { passive: true });
+function copyInstall() { const cmd = 'curl -fsSL https://opaque.dev/install.sh | sh'; navigator.clipboard.writeText(cmd).then(() => { const el = document.getElementById('install-cmd'); el.querySelector('code').textContent = 'Copied to clipboard!'; setTimeout(() => { el.querySelector('code').textContent = cmd; }, 1500); }); }
+const observer = new IntersectionObserver((entries) => { entries.forEach((entry) => { if (entry.isIntersecting) entry.target.classList.add('visible'); }); }, { threshold: 0.12, rootMargin: '0px 0px -40px 0px' });
+document.querySelectorAll('.fade-up, .stagger').forEach((el) => { observer.observe(el); });
+document.querySelectorAll('a[href^="#"]').forEach(anchor => { anchor.addEventListener('click', (e) => { const target = document.querySelector(anchor.getAttribute('href')); if (target) { e.preventDefault(); target.scrollIntoView({ behavior: 'smooth', block: 'start' }); } }); });
+</script>
+</body>
+</html>
