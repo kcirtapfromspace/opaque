@@ -17,7 +17,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::get;
 use axum::{Json, Router};
 use futures_util::stream;
-use opaque_core::audit::{AuditEvent, AuditFilter, query_audit_db};
+use opaque_core::audit::{AuditEvent, AuditFilter, AuditNotify, query_audit_db};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 use tracing::warn;
@@ -34,6 +34,7 @@ pub struct AuditSseServerConfig {
     pub db_path: PathBuf,
     pub poll_interval: Duration,
     pub batch_limit: usize,
+    pub notify: Option<AuditNotify>,
 }
 
 impl AuditSseServerConfig {
@@ -43,6 +44,7 @@ impl AuditSseServerConfig {
             db_path,
             poll_interval: Duration::from_millis(DEFAULT_POLL_INTERVAL_MS),
             batch_limit: DEFAULT_BATCH_LIMIT,
+            notify: None,
         }
     }
 }
@@ -52,6 +54,7 @@ struct AuditSseState {
     db_path: PathBuf,
     poll_interval: Duration,
     batch_limit: usize,
+    notify: Option<AuditNotify>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,6 +77,7 @@ struct StreamState {
     batch_limit: usize,
     pending: VecDeque<AuditEvent>,
     fetched_once: bool,
+    notify: Option<AuditNotify>,
 }
 
 pub async fn start_server(
@@ -83,6 +87,7 @@ pub async fn start_server(
         db_path: config.db_path,
         poll_interval: config.poll_interval,
         batch_limit: config.batch_limit.clamp(1, MAX_BATCH_LIMIT),
+        notify: config.notify,
     });
     let app = build_router(state);
 
@@ -130,6 +135,7 @@ async fn audit_stream_handler(
         batch_limit,
         pending: VecDeque::new(),
         fetched_once: false,
+        notify: state.notify.clone(),
     };
 
     let event_stream = stream::unfold(stream_state, |mut st| async move {
@@ -147,7 +153,11 @@ async fn audit_stream_handler(
             }
 
             if st.fetched_once {
-                tokio::time::sleep(st.poll_interval).await;
+                if let Some(ref n) = st.notify {
+                    n.wait_or_timeout(st.poll_interval).await;
+                } else {
+                    tokio::time::sleep(st.poll_interval).await;
+                }
             } else {
                 st.fetched_once = true;
             }
@@ -238,6 +248,7 @@ mod tests {
             db_path,
             poll_interval: Duration::from_millis(100),
             batch_limit: 50,
+            notify: None,
         };
         let (handle, addr) = start_server(config).await.unwrap();
         let client = reqwest::Client::new();
@@ -272,6 +283,7 @@ mod tests {
             db_path,
             poll_interval: Duration::from_millis(50),
             batch_limit: 100,
+            notify: None,
         };
         let (handle, addr) = start_server(config).await.unwrap();
 
@@ -304,6 +316,58 @@ mod tests {
         .unwrap_or(false);
 
         assert!(found, "did not observe expected SSE audit frame");
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn sse_falls_back_to_polling_without_notify() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("audit.db");
+        let sink = SqliteAuditSink::new(db_path.clone(), 90).unwrap();
+
+        // Emit an event.
+        sink.emit(
+            AuditEvent::new(AuditEventKind::RequestReceived)
+                .with_operation("test.poll_fallback"),
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Start server without notify (None) — should still work via polling.
+        let config = AuditSseServerConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            db_path,
+            poll_interval: Duration::from_millis(50),
+            batch_limit: 100,
+            notify: None,
+        };
+        let (handle, addr) = start_server(config).await.unwrap();
+
+        let client = reqwest::Client::new();
+        let mut resp = client
+            .get(format!(
+                "http://{addr}/audit/stream?since_ms=0&poll_ms=50&limit=10"
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let found = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let next = resp.chunk().await.unwrap();
+                let Some(chunk) = next else {
+                    return false;
+                };
+                let text = String::from_utf8_lossy(&chunk).to_string();
+                if text.contains("test.poll_fallback") {
+                    return true;
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        assert!(found, "events should arrive via polling even without notify");
 
         handle.abort();
     }

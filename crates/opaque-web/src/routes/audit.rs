@@ -56,7 +56,7 @@ pub async fn get_audit_stream(State(state): State<AppState>) -> axum::response::
     use axum::response::IntoResponse;
 
     if state.audit_db_path.exists() {
-        crate::sse::audit_sse_stream(state.audit_db_path.clone(), state.cancel.clone())
+        crate::sse::audit_sse_stream(state.audit_db_path.clone(), state.cancel.clone(), None)
             .into_response()
     } else {
         // In demo mode, return SSE that sends a hint to use frontend-generated events.

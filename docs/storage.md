@@ -196,6 +196,18 @@ Fields:
 
 You can keep this as the canonical history instead of adding many “state” tables.
 
+### 4.6 Audit Database Maintenance
+
+The audit SQLite database (`~/.opaque/audit.db`) is automatically maintained:
+
+- **Auto-vacuum**: new databases use `PRAGMA auto_vacuum = INCREMENTAL` to allow pages to be reclaimed without a full VACUUM
+- **Periodic cleanup**: the writer thread deletes events older than the configured retention period (default 90 days) every 6 hours, using batched deletes to avoid stalling writes
+- **Incremental vacuum**: after each cleanup, up to 500 freed pages are reclaimed
+- **Overflow queue**: a separate `audit.overflow.db` file acts as a disk-backed overflow buffer (up to 100k events) when the in-memory channel is saturated; the writer drains overflow events automatically
+- **Push notifications**: SSE consumers receive immediate notification when new events are written, reducing live-feed latency from 500-1000ms to near-zero
+
+For existing databases with `auto_vacuum = NONE`, a one-time `VACUUM` is recommended to enable incremental mode. The daemon logs an info message at startup when this applies.
+
 ## 5. What NOT To Store
 
 - plaintext secrets

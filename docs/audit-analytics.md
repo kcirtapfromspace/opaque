@@ -227,10 +227,16 @@ Never embed:
 
 Audit can grow without bound.
 
-Recommended:
+### Implemented
 
-- SQLite retains recent window (e.g. 30-90 days)
-- older events are rolled to Parquet and optionally removed from SQLite
-- embeddings store follows the same retention window
-- live feed uses bounded channels (drop-oldest or apply backpressure)
+- **Periodic cleanup**: the writer thread deletes events older than `retention_days` every 6 hours (configurable via `audit_cleanup_interval_secs` in config.toml), using batched deletes of 5,000 rows to avoid stalling the writer
+- **Incremental vacuum**: after each cleanup pass, `PRAGMA incremental_vacuum(500)` reclaims freed pages without a full VACUUM
+- **Auto-vacuum**: new databases are created with `PRAGMA auto_vacuum = INCREMENTAL`; existing databases log an info message suggesting a one-time VACUUM migration
+- **Disk-backed overflow queue**: when the bounded channel (4,096 events) fills, events spill to a separate `audit.overflow.db` file (up to 100k events) rather than being dropped; the writer thread drains overflow events back into the main DB after each batch
+- **Push-based SSE**: the writer thread signals an `AuditNotify` handle after each successful insert, waking SSE consumers immediately instead of polling on a fixed interval; SSE falls back to polling when no notify handle is available
+
+### Recommended (future)
+
+- Older events rolled to Parquet and optionally removed from SQLite
+- Embeddings store follows the same retention window
 
