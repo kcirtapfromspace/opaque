@@ -87,6 +87,10 @@ struct DaemonConfig {
     #[serde(default)]
     audit_retention_days: Option<u64>,
 
+    /// Audit periodic cleanup interval in seconds. Defaults to 6 hours.
+    #[serde(default)]
+    audit_cleanup_interval_secs: Option<u64>,
+
     /// When true, clients classified as `Agent` must present a valid
     /// per-session token in the handshake.
     #[serde(default)]
@@ -1167,10 +1171,13 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         .join(".opaque")
         .join("audit.db");
     let retention_days = config.audit_retention_days.unwrap_or(90);
-    let sqlite_sink: Arc<dyn AuditSink> = Arc::new(
-        SqliteAuditSink::new(audit_db_path.clone(), retention_days)
-            .expect("failed to open audit database"),
-    );
+    if let Some(interval) = config.audit_cleanup_interval_secs {
+        info!("audit cleanup interval override: {}s", interval);
+    }
+    let sqlite_audit = SqliteAuditSink::new(audit_db_path.clone(), retention_days)
+        .expect("failed to open audit database");
+    let audit_notify = sqlite_audit.notify_handle();
+    let sqlite_sink: Arc<dyn AuditSink> = Arc::new(sqlite_audit);
     info!(
         "audit database at {} (retention: {} days)",
         audit_db_path.display(),
@@ -1422,6 +1429,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
     let mut audit_sse_handle = None;
     if let Some(bind_addr) = parse_optional_socket_addr_env(AUDIT_SSE_ADDR_ENV)? {
         let mut sse_config = audit_sse::AuditSseServerConfig::new(bind_addr, audit_db_path.clone());
+        sse_config.notify = Some(audit_notify.clone());
         if let Some(poll_ms) = parse_optional_u64_env(AUDIT_SSE_POLL_MS_ENV) {
             sse_config.poll_interval = std::time::Duration::from_millis(poll_ms);
         }

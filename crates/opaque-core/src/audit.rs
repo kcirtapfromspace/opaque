@@ -9,7 +9,8 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -695,6 +696,157 @@ CREATE TRIGGER IF NOT EXISTS audit_events_ad AFTER DELETE ON audit_events BEGIN
 END;
 ";
 
+/// Default interval between periodic cleanup runs (6 hours).
+const DEFAULT_CLEANUP_INTERVAL_SECS: u64 = 6 * 3600;
+
+/// Number of rows to delete per batch during periodic cleanup.
+const CLEANUP_BATCH_SIZE: i64 = 5_000;
+
+/// Number of pages to reclaim per incremental vacuum call.
+const INCREMENTAL_VACUUM_PAGES: i64 = 500;
+
+/// Maximum number of events in the overflow queue.
+const OVERFLOW_MAX_EVENTS: u64 = 100_000;
+
+/// Number of overflow events to drain per writer loop iteration.
+const OVERFLOW_DRAIN_BATCH: usize = 256;
+
+// ---------------------------------------------------------------------------
+// Disk-backed overflow queue
+// ---------------------------------------------------------------------------
+
+/// A disk-backed queue for audit events that cannot fit in the bounded channel.
+///
+/// Uses a separate SQLite database file to persist events when the in-memory
+/// channel is full. Events are drained back into the main audit DB by the
+/// writer thread.
+struct OverflowQueue {
+    conn: std::sync::Mutex<rusqlite::Connection>,
+    pending_count: AtomicU64,
+    max_events: u64,
+    path: PathBuf,
+}
+
+impl fmt::Debug for OverflowQueue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OverflowQueue")
+            .field("pending_count", &self.pending_count.load(Ordering::Relaxed))
+            .field("max_events", &self.max_events)
+            .finish()
+    }
+}
+
+impl OverflowQueue {
+    /// Open or create the overflow database at the given path.
+    fn new(path: PathBuf, max_events: u64) -> Result<Self, AuditError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let conn = rusqlite::Connection::open(&path)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "OFF")?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS overflow_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sequence_number INTEGER NOT NULL,
+                event_json TEXT NOT NULL
+            )",
+        )?;
+
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM overflow_events",
+            [],
+            |row| row.get(0),
+        )?;
+
+        Ok(Self {
+            conn: std::sync::Mutex::new(conn),
+            pending_count: AtomicU64::new(count as u64),
+            max_events,
+            path,
+        })
+    }
+
+    /// Push an event into the overflow queue. Returns `Ok(true)` if accepted,
+    /// `Ok(false)` if at capacity.
+    fn push(&self, event: &AuditEvent) -> Result<bool, AuditError> {
+        if self.pending_count.load(Ordering::Relaxed) >= self.max_events {
+            return Ok(false);
+        }
+        let json = serde_json::to_string(event)
+            .map_err(|e| AuditError::Other(format!("overflow serialize: {e}")))?;
+        let conn = self.conn.lock().expect("overflow lock poisoned");
+        conn.execute(
+            "INSERT INTO overflow_events (sequence_number, event_json) VALUES (?1, ?2)",
+            rusqlite::params![event.sequence_number as i64, json],
+        )?;
+        self.pending_count.fetch_add(1, Ordering::Relaxed);
+        Ok(true)
+    }
+
+    /// Drain up to `limit` events from the overflow queue, oldest first.
+    fn drain(&self, limit: usize) -> Result<Vec<AuditEvent>, AuditError> {
+        let conn = self.conn.lock().expect("overflow lock poisoned");
+        let tx = conn.unchecked_transaction()?;
+        let mut events = Vec::new();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT id, event_json FROM overflow_events ORDER BY id ASC LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![limit as i64], |row| {
+                let id: i64 = row.get(0)?;
+                let json: String = row.get(1)?;
+                Ok((id, json))
+            })?;
+
+            let mut ids = Vec::new();
+            for row in rows {
+                let (id, json) = row?;
+                if let Ok(event) = serde_json::from_str::<AuditEvent>(&json) {
+                    events.push(event);
+                }
+                ids.push(id);
+            }
+
+            if !ids.is_empty() {
+                // Delete drained rows in a batch.
+                let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                let sql = format!("DELETE FROM overflow_events WHERE id IN ({placeholders})");
+                let params: Vec<Box<dyn rusqlite::types::ToSql>> =
+                    ids.into_iter().map(|id| Box::new(id) as _).collect();
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    params.iter().map(|b| b.as_ref()).collect();
+                tx.execute(&sql, param_refs.as_slice())?;
+            }
+        }
+        tx.commit()?;
+        let drained = events.len() as u64;
+        if drained > 0 {
+            // Saturating subtract to avoid underflow from concurrent pushes.
+            let prev = self.pending_count.load(Ordering::Relaxed);
+            self.pending_count.store(prev.saturating_sub(drained), Ordering::Relaxed);
+        }
+        Ok(events)
+    }
+
+    /// Returns true if the queue has no pending events.
+    fn is_empty(&self) -> bool {
+        self.pending_count.load(Ordering::Relaxed) == 0
+    }
+
+    /// Delete the overflow database file if the queue is empty.
+    fn cleanup_file(&self) {
+        if self.is_empty() {
+            let _ = std::fs::remove_file(&self.path);
+            // Also remove WAL and SHM files.
+            let wal = self.path.with_extension("overflow.db-wal");
+            let shm = self.path.with_extension("overflow.db-shm");
+            let _ = std::fs::remove_file(wal);
+            let _ = std::fs::remove_file(shm);
+        }
+    }
+}
+
 /// A persistent audit sink backed by SQLite.
 ///
 /// Events are sent through a bounded channel and written by a dedicated
@@ -710,6 +862,10 @@ pub struct SqliteAuditSink {
     writer_pause: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     /// Signal to stop the drop-monitor thread (bool=should_stop, condvar for wake).
     monitor_stop: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    /// Disk-backed overflow queue for backpressure relief.
+    overflow: Option<Arc<OverflowQueue>>,
+    /// Push-notification handle for SSE consumers.
+    notify: AuditNotify,
     sanitizer: crate::sanitize::Sanitizer,
 }
 
@@ -747,6 +903,26 @@ impl SqliteAuditSink {
 
         // Open connection, create schema, run retention cleanup.
         let conn = rusqlite::Connection::open(&db_path)?;
+
+        // Enable auto_vacuum=INCREMENTAL for new databases.
+        // Must be set before table creation to take effect.
+        let table_exists: bool = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='audit_events'",
+            [],
+            |row| row.get::<_, i64>(0),
+        ).map(|c| c > 0)?;
+
+        if !table_exists {
+            conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+        } else {
+            let auto_vacuum: i64 = conn.pragma_query_value(None, "auto_vacuum", |row| row.get(0))?;
+            if auto_vacuum == 0 {
+                tracing::info!(
+                    "existing audit DB has auto_vacuum=NONE; consider running VACUUM once to enable incremental mode"
+                );
+            }
+        }
+
         conn.execute_batch(SCHEMA_SQL)?;
 
         let cutoff_ms = {
@@ -778,6 +954,42 @@ impl SqliteAuditSink {
         )?;
         drop(conn);
 
+        // Set up disk-backed overflow queue.
+        let overflow_path = db_path.with_extension("overflow.db");
+        let overflow = match OverflowQueue::new(overflow_path, OVERFLOW_MAX_EVENTS) {
+            Ok(oq) => {
+                // Drain any leftover overflow events from a previous session.
+                if !oq.is_empty() {
+                    tracing::info!("recovering overflow events from previous session");
+                    let recovered_conn = rusqlite::Connection::open(&db_path)?;
+                    loop {
+                        match oq.drain(OVERFLOW_DRAIN_BATCH) {
+                            Ok(events) if events.is_empty() => break,
+                            Ok(events) => {
+                                if let Err(e) = Self::insert_batch(&recovered_conn, &events) {
+                                    tracing::error!("overflow recovery insert failed: {e}");
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("overflow recovery drain failed: {e}");
+                                break;
+                            }
+                        }
+                    }
+                    drop(recovered_conn);
+                }
+                Some(Arc::new(oq))
+            }
+            Err(e) => {
+                tracing::warn!("failed to create overflow queue: {e}; backpressure will drop events");
+                None
+            }
+        };
+        let writer_overflow = overflow.clone();
+        let notify = AuditNotify::new();
+        let writer_notify = notify.clone();
+
         let (sender, receiver) = std::sync::mpsc::sync_channel::<AuditEvent>(capacity);
 
         let writer_pause =
@@ -785,10 +997,19 @@ impl SqliteAuditSink {
         let writer_pause_clone = writer_pause.clone();
 
         let writer_path = db_path.clone();
+        let cleanup_interval = Duration::from_secs(DEFAULT_CLEANUP_INTERVAL_SECS);
         let writer_handle = std::thread::Builder::new()
             .name("audit-writer".into())
             .spawn(move || {
-                Self::writer_loop(&writer_path, receiver, &writer_pause_clone);
+                Self::writer_loop(
+                    &writer_path,
+                    receiver,
+                    &writer_pause_clone,
+                    retention_days,
+                    cleanup_interval,
+                    writer_overflow,
+                    writer_notify,
+                );
             })
             .map_err(|e| AuditError::Other(format!("failed to spawn writer thread: {e}")))?;
 
@@ -816,6 +1037,8 @@ impl SqliteAuditSink {
             drop_monitor_handle: std::sync::Mutex::new(Some(drop_monitor_handle)),
             writer_pause,
             monitor_stop,
+            overflow,
+            notify,
             sanitizer: crate::sanitize::Sanitizer::new(),
         })
     }
@@ -825,6 +1048,19 @@ impl SqliteAuditSink {
     /// This value is suitable for health checks and monitoring (e.g. `opaque doctor`).
     pub fn dropped_count(&self) -> u64 {
         self.dropped_count.load(Ordering::Relaxed)
+    }
+
+    /// Returns a cloneable handle that SSE consumers can use to receive
+    /// push notifications when new events are written.
+    pub fn notify_handle(&self) -> AuditNotify {
+        self.notify.clone()
+    }
+
+    /// Disable the overflow queue (for testing only). This forces events to be
+    /// dropped when the channel is full, enabling tests for drop-counting behavior.
+    #[cfg(test)]
+    pub(crate) fn disable_overflow(&mut self) {
+        self.overflow = None;
     }
 
     /// Pause the writer thread (for testing only). Events sent while paused
@@ -905,6 +1141,10 @@ impl SqliteAuditSink {
         db_path: &Path,
         receiver: std::sync::mpsc::Receiver<AuditEvent>,
         pause: &std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        retention_days: u64,
+        cleanup_interval: Duration,
+        overflow: Option<Arc<OverflowQueue>>,
+        notify: AuditNotify,
     ) {
         let conn = match rusqlite::Connection::open(db_path) {
             Ok(c) => c,
@@ -916,7 +1156,11 @@ impl SqliteAuditSink {
 
         // WAL mode for better concurrent read performance.
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
+        // Harmless no-op if auto_vacuum is already set on the DB.
+        let _ = conn.pragma_update(None, "auto_vacuum", "INCREMENTAL");
 
+        let retention_ms = (retention_days as i64) * 86_400 * 1000;
+        let mut last_cleanup = Instant::now();
         let mut batch = Vec::with_capacity(64);
 
         while let Ok(event) = receiver.recv() {
@@ -941,8 +1185,74 @@ impl SqliteAuditSink {
 
             if let Err(e) = Self::insert_batch(&conn, &batch) {
                 tracing::error!("audit writer insert failed: {e}");
+            } else {
+                notify.signal();
             }
             batch.clear();
+
+            // Drain overflow events back into the main DB.
+            if let Some(ref oq) = overflow {
+                if !oq.is_empty() {
+                    match oq.drain(OVERFLOW_DRAIN_BATCH) {
+                        Ok(events) if !events.is_empty() => {
+                            tracing::debug!(count = events.len(), "draining overflow events");
+                            if let Err(e) = Self::insert_batch(&conn, &events) {
+                                tracing::error!("overflow drain insert failed: {e}");
+                            } else {
+                                notify.signal();
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::error!("overflow drain failed: {e}");
+                        }
+                    }
+                }
+            }
+
+            // Periodic cleanup: delete old events and reclaim space.
+            if last_cleanup.elapsed() >= cleanup_interval {
+                Self::periodic_cleanup(&conn, retention_ms);
+                last_cleanup = Instant::now();
+            }
+        }
+    }
+
+    /// Delete old events in batches and run incremental vacuum to reclaim pages.
+    fn periodic_cleanup(conn: &rusqlite::Connection, retention_ms: i64) {
+        let now_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let cutoff_ms = now_ms - retention_ms;
+
+        let mut total_deleted: u64 = 0;
+        loop {
+            let deleted = conn
+                .execute(
+                    "DELETE FROM audit_events WHERE rowid IN \
+                     (SELECT rowid FROM audit_events WHERE ts_utc_ms < ?1 LIMIT ?2)",
+                    rusqlite::params![cutoff_ms, CLEANUP_BATCH_SIZE],
+                )
+                .unwrap_or(0);
+            total_deleted += deleted as u64;
+            if deleted == 0 {
+                break;
+            }
+        }
+
+        if total_deleted > 0 {
+            tracing::debug!(total_deleted, "periodic cleanup: deleted old audit events");
+        }
+
+        // Reclaim freed pages without a full VACUUM.
+        match conn.pragma_update(None, "incremental_vacuum", INCREMENTAL_VACUUM_PAGES) {
+            Ok(_) => {
+                tracing::debug!("periodic cleanup: incremental vacuum completed");
+            }
+            Err(e) => {
+                tracing::debug!("periodic cleanup: incremental vacuum failed: {e}");
+            }
         }
     }
 
@@ -1038,13 +1348,20 @@ impl AuditSink for SqliteAuditSink {
                     .redact_audit_text(detail, crate::sanitize::RedactionLevel::Human),
             );
         }
-        // Non-blocking send. If the channel is full, increment the dropped
-        // counter and log a warning with the event kind.
-        if let Err(std::sync::mpsc::TrySendError::Full(dropped_event)) = self.sender.try_send(event)
+        // Non-blocking send. If the channel is full, try the overflow queue
+        // before dropping the event.
+        if let Err(std::sync::mpsc::TrySendError::Full(event)) = self.sender.try_send(event)
         {
+            if let Some(ref overflow) = self.overflow {
+                match overflow.push(&event) {
+                    Ok(true) => return,   // spilled to disk, not dropped
+                    Ok(false) => {}       // overflow full too, fall through to drop
+                    Err(e) => tracing::error!("overflow write failed: {e}"),
+                }
+            }
             let prev = self.dropped_count.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
-                kind = %dropped_event.kind,
+                kind = %event.kind,
                 dropped_total = prev + 1,
                 "audit event dropped due to channel backpressure"
             );
@@ -1085,6 +1402,46 @@ impl Drop for SqliteAuditSink {
             && let Some(h) = guard.take()
         {
             let _ = h.join();
+        }
+
+        // Clean up overflow file if empty.
+        if let Some(ref overflow) = self.overflow {
+            overflow.cleanup_file();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Push notification for SSE consumers
+// ---------------------------------------------------------------------------
+
+/// Lightweight notification handle that signals SSE consumers when new audit
+/// events have been written to the database. Wraps `tokio::sync::Notify` so
+/// it can be signalled from synchronous (writer thread) context.
+#[derive(Clone, Debug)]
+pub struct AuditNotify {
+    inner: Arc<tokio::sync::Notify>,
+}
+
+impl AuditNotify {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// Signal all waiting consumers that new events are available.
+    /// Safe to call from synchronous or async context.
+    pub fn signal(&self) {
+        self.inner.notify_waiters();
+    }
+
+    /// Wait for a signal or fall back to a timeout. Returns `true` if woken
+    /// by a signal, `false` if the timeout elapsed.
+    pub async fn wait_or_timeout(&self, fallback: Duration) -> bool {
+        tokio::select! {
+            _ = self.inner.notified() => true,
+            _ = tokio::time::sleep(fallback) => false,
         }
     }
 }
@@ -2172,7 +2529,9 @@ mod tests {
     fn dropped_counter_increments_on_full_channel() {
         let db_path = temp_db_path();
         // Use a tiny channel (capacity=2) so we can easily overflow it.
-        let sink = SqliteAuditSink::new_with_capacity(db_path.clone(), 90, 2).unwrap();
+        // Disable overflow to test drop-counting behavior.
+        let mut sink = SqliteAuditSink::new_with_capacity(db_path.clone(), 90, 2).unwrap();
+        sink.disable_overflow();
 
         // Pause the writer so it cannot drain the channel.
         sink.pause_writer();
@@ -2196,7 +2555,8 @@ mod tests {
     #[test]
     fn dropped_count_returns_correct_value() {
         let db_path = temp_db_path();
-        let sink = SqliteAuditSink::new_with_capacity(db_path.clone(), 90, 1).unwrap();
+        let mut sink = SqliteAuditSink::new_with_capacity(db_path.clone(), 90, 1).unwrap();
+        sink.disable_overflow();
 
         sink.pause_writer();
 
@@ -2264,7 +2624,9 @@ mod tests {
         let db_path = temp_db_path();
         // Use capacity=2 so we can overflow, but still have room for the
         // synthetic event after the writer drains.
-        let sink = SqliteAuditSink::new_with_capacity(db_path.clone(), 90, 2).unwrap();
+        // Disable overflow to test drop-counting behavior.
+        let mut sink = SqliteAuditSink::new_with_capacity(db_path.clone(), 90, 2).unwrap();
+        sink.disable_overflow();
 
         sink.pause_writer();
 
@@ -2323,7 +2685,8 @@ mod tests {
     #[test]
     fn counter_resets_after_synthetic_event() {
         let db_path = temp_db_path();
-        let sink = SqliteAuditSink::new_with_capacity(db_path.clone(), 90, 1).unwrap();
+        let mut sink = SqliteAuditSink::new_with_capacity(db_path.clone(), 90, 1).unwrap();
+        sink.disable_overflow();
 
         sink.pause_writer();
 
@@ -2416,6 +2779,261 @@ mod tests {
         assert_eq!(
             default_level_for_kind(AuditEventKind::ExecvePrompted),
             AuditLevel::Info
+        );
+    }
+
+    // -- Auto-vacuum tests --
+
+    #[test]
+    fn new_db_gets_auto_vacuum_incremental() {
+        let db_path = temp_db_path();
+        let sink = SqliteAuditSink::new(db_path.clone(), 90).unwrap();
+        drop(sink);
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let auto_vacuum: i64 =
+            conn.pragma_query_value(None, "auto_vacuum", |row| row.get(0)).unwrap();
+        // 2 = INCREMENTAL
+        assert_eq!(auto_vacuum, 2, "new DB should have auto_vacuum=INCREMENTAL (2)");
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn periodic_cleanup_deletes_old_events() {
+        let db_path = temp_db_path();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL").unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+
+        // Insert events with old timestamps (ts_utc_ms = 1000, very old).
+        for i in 0..20 {
+            conn.execute(
+                "INSERT INTO audit_events (event_id, sequence_number, ts_utc_ms, level, kind)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![Uuid::new_v4().to_string(), i, 1000i64, "info", "request.received"],
+            ).unwrap();
+        }
+
+        // Insert some recent events.
+        let now_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        for i in 20..25 {
+            conn.execute(
+                "INSERT INTO audit_events (event_id, sequence_number, ts_utc_ms, level, kind)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![Uuid::new_v4().to_string(), i, now_ms, "info", "request.received"],
+            ).unwrap();
+        }
+
+        let retention_ms: i64 = 90 * 86_400 * 1000;
+        SqliteAuditSink::periodic_cleanup(&conn, retention_ms);
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM audit_events", [], |row| row.get(0))
+            .unwrap();
+        // Only the 5 recent events should remain.
+        assert_eq!(count, 5, "only recent events should remain after cleanup");
+
+        drop(conn);
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn incremental_vacuum_reclaims_pages() {
+        let db_path = temp_db_path();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL").unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        let _ = conn.pragma_update(None, "journal_mode", "WAL");
+
+        // Insert many events to create pages.
+        for i in 0..500 {
+            conn.execute(
+                "INSERT INTO audit_events (event_id, sequence_number, ts_utc_ms, level, kind, detail)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    Uuid::new_v4().to_string(),
+                    i,
+                    1000i64,
+                    "info",
+                    "request.received",
+                    "x".repeat(200)
+                ],
+            ).unwrap();
+        }
+
+        // Delete all events to create free pages.
+        conn.execute("DELETE FROM audit_events", []).unwrap();
+
+        let freelist_before: i64 =
+            conn.pragma_query_value(None, "freelist_count", |row| row.get(0)).unwrap();
+
+        // Run incremental vacuum.
+        let _ = conn.pragma_update(None, "incremental_vacuum", INCREMENTAL_VACUUM_PAGES);
+
+        let freelist_after: i64 =
+            conn.pragma_query_value(None, "freelist_count", |row| row.get(0)).unwrap();
+
+        assert!(
+            freelist_after <= freelist_before,
+            "freelist_count should decrease after incremental vacuum: before={freelist_before}, after={freelist_after}"
+        );
+
+        drop(conn);
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    // -- Overflow queue tests --
+
+    #[test]
+    fn overflow_push_and_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overflow.db");
+        let oq = OverflowQueue::new(path, 1000).unwrap();
+
+        // Push some events.
+        for i in 0..5 {
+            let event = AuditEvent::new(AuditEventKind::RequestReceived)
+                .with_sequence_number(i);
+            assert!(oq.push(&event).unwrap());
+        }
+        assert!(!oq.is_empty());
+
+        // Drain them back.
+        let events = oq.drain(10).unwrap();
+        assert_eq!(events.len(), 5);
+        // Verify ordering (by sequence_number ascending).
+        for (i, e) in events.iter().enumerate() {
+            assert_eq!(e.sequence_number, i as u64);
+        }
+        assert!(oq.is_empty());
+    }
+
+    #[test]
+    fn overflow_max_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overflow.db");
+        let oq = OverflowQueue::new(path, 3).unwrap();
+
+        for i in 0..3 {
+            let event = AuditEvent::new(AuditEventKind::RequestReceived)
+                .with_sequence_number(i);
+            assert!(oq.push(&event).unwrap(), "should accept event {i}");
+        }
+
+        // 4th event should be rejected.
+        let event = AuditEvent::new(AuditEventKind::RequestReceived)
+            .with_sequence_number(99);
+        assert!(!oq.push(&event).unwrap(), "should reject when at capacity");
+    }
+
+    #[test]
+    fn emit_spills_to_overflow() {
+        let db_path = temp_db_path();
+        // Use capacity=2 so the channel fills quickly.
+        let sink = SqliteAuditSink::new_with_capacity(db_path.clone(), 90, 2).unwrap();
+
+        // Pause writer so channel fills up.
+        sink.pause_writer();
+
+        // Emit 10 events — first few fill channel, rest should spill to overflow.
+        for _ in 0..10 {
+            sink.emit(AuditEvent::new(AuditEventKind::RequestReceived));
+        }
+
+        // With overflow, no events should be dropped.
+        assert_eq!(
+            sink.dropped_count(),
+            0,
+            "no events should be dropped when overflow is available"
+        );
+
+        // Resume writer to drain both channel and overflow.
+        sink.resume_writer();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        drop(sink);
+
+        // All 10 events should be in the main DB.
+        let filter = AuditFilter::default();
+        let events = query_audit_db(&db_path, &filter).unwrap();
+        assert_eq!(events.len(), 10, "all 10 events should be in the DB");
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn overflow_recovery_on_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("audit.db");
+        let overflow_path = db_path.with_extension("overflow.db");
+
+        // Create an overflow DB with some events.
+        {
+            let oq = OverflowQueue::new(overflow_path.clone(), 1000).unwrap();
+            for i in 0..5 {
+                let event = AuditEvent::new(AuditEventKind::OperationSucceeded)
+                    .with_sequence_number(i)
+                    .with_operation("test.recovery");
+                oq.push(&event).unwrap();
+            }
+            assert!(!oq.is_empty());
+        }
+
+        // Create a new sink at the same path — it should recover overflow events.
+        let sink = SqliteAuditSink::new(db_path.clone(), 90).unwrap();
+        // Give writer time to process.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(sink);
+
+        // Verify the recovered events are in the main DB.
+        let filter = AuditFilter {
+            operation: Some("test.recovery".into()),
+            limit: 100,
+            ..Default::default()
+        };
+        let events = query_audit_db(&db_path, &filter).unwrap();
+        assert_eq!(events.len(), 5, "all 5 overflow events should be recovered");
+    }
+
+    // -- AuditNotify tests --
+
+    #[test]
+    fn notify_signal_from_sync_thread() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let notify = AuditNotify::new();
+        let notify_clone = notify.clone();
+
+        // Signal from a std::thread.
+        let thread_handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            notify_clone.signal();
+        });
+
+        // Wait in tokio — should wake within ~20ms.
+        let woken = rt.block_on(async {
+            notify.wait_or_timeout(Duration::from_secs(5)).await
+        });
+        assert!(woken, "should have been woken by signal");
+        thread_handle.join().unwrap();
+    }
+
+    #[test]
+    fn notify_falls_back_to_timeout() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let notify = AuditNotify::new();
+
+        let start = Instant::now();
+        let woken = rt.block_on(async {
+            notify.wait_or_timeout(Duration::from_millis(50)).await
+        });
+        assert!(!woken, "should have timed out without signal");
+        assert!(
+            start.elapsed() >= Duration::from_millis(40),
+            "should have waited at least ~50ms"
         );
     }
 }

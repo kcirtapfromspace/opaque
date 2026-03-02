@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use axum::response::sse::{Event, Sse};
 use futures_util::stream::Stream;
+use opaque_core::audit::AuditNotify;
 use tokio_util::sync::CancellationToken;
 
 /// State for the polling SSE stream.
@@ -13,19 +14,23 @@ struct PollState {
     cancel: CancellationToken,
     /// Buffer of events from the last poll, drained one at a time.
     buffer: Vec<serde_json::Value>,
+    notify: Option<AuditNotify>,
 }
 
 /// Create an SSE stream that polls the audit SQLite database for new events.
 ///
-/// Polls every 500ms for events with `sequence_number > last_seen`.
+/// Polls every 500ms (or wakes on push notification) for events with
+/// `sequence_number > last_seen`.
 /// The stream ends when the cancellation token is triggered (server shutdown).
 pub fn audit_sse_stream(
     db_path: PathBuf,
     cancel: CancellationToken,
+    notify: Option<AuditNotify>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let stream = futures_util::stream::unfold(None, move |state: Option<PollState>| {
         let db_path = db_path.clone();
         let cancel = cancel.clone();
+        let notify = notify.clone();
         async move {
             // Initialize on first call.
             let mut state = match state {
@@ -59,6 +64,7 @@ pub fn audit_sse_stream(
                         last_seq,
                         cancel,
                         buffer: vec![],
+                        notify,
                     }
                 }
             };
@@ -76,10 +82,16 @@ pub fn audit_sse_stream(
                     return Some((Ok(event), Some(state)));
                 }
 
-                // Wait for next poll interval or cancellation.
+                // Wait for push notification, poll interval, or cancellation.
                 tokio::select! {
                     _ = state.cancel.cancelled() => return None,
-                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                    _ = async {
+                        if let Some(ref n) = state.notify {
+                            n.wait_or_timeout(Duration::from_millis(500)).await;
+                        } else {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+                    } => {}
                 }
 
                 // Poll for new events.
