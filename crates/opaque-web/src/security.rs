@@ -61,12 +61,14 @@ pub async fn require_api_token(auth_token: AuthToken, request: Request, next: Ne
 }
 
 /// Check whether the request carries a valid Bearer token.
+///
+/// Uses constant-time comparison to prevent timing side-channel attacks.
 fn is_bearer_authorized(headers: &HeaderMap, expected: &str) -> bool {
     headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|token| token == expected)
+        .is_some_and(|token| constant_time_eq(token.as_bytes(), expected.as_bytes()))
 }
 
 /// Generate a 32-byte random hex token using `getrandom`.
@@ -94,8 +96,10 @@ pub fn write_token_file(dir: &Path, token: &str) -> std::io::Result<PathBuf> {
 /// Inject a `<meta name="opaque-auth-token" content="...">` tag into the HTML `<head>`.
 ///
 /// The dashboard JavaScript reads this to authenticate API requests.
+/// The token value is HTML-escaped to prevent attribute injection.
 pub fn inject_token_meta(html: &str, token: &str) -> String {
-    let meta_tag = format!(r#"<meta name="opaque-auth-token" content="{token}">"#);
+    let escaped = html_escape_attr(token);
+    let meta_tag = format!(r#"<meta name="opaque-auth-token" content="{escaped}">"#);
     // Insert right after the opening <head> tag.
     if let Some(pos) = html.find("<head>") {
         let insert_at = pos + "<head>".len();
@@ -109,6 +113,33 @@ pub fn inject_token_meta(html: &str, token: &str) -> String {
         // Fallback: prepend (should not happen with well-formed HTML).
         format!("{meta_tag}\n{html}")
     }
+}
+
+/// Escape a string for safe inclusion in an HTML double-quoted attribute value.
+fn html_escape_attr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Constant-time byte comparison to prevent timing side-channel attacks.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -305,6 +336,27 @@ mod tests {
     // ---------------------------------------------------------------
     // HTML meta tag injection test
     // ---------------------------------------------------------------
+
+    #[test]
+    fn html_meta_tag_escapes_special_chars() {
+        let html = "<html><head></head><body></body></html>";
+        let malicious = r#""><script>alert(1)</script><meta x=""#;
+        let injected = inject_token_meta(html, malicious);
+        assert!(
+            !injected.contains("<script>"),
+            "special characters must be escaped to prevent XSS"
+        );
+        assert!(injected.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn constant_time_eq_works() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(!constant_time_eq(b"", b"a"));
+        assert!(constant_time_eq(b"", b""));
+    }
 
     #[test]
     fn html_meta_tag_injection() {

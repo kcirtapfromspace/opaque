@@ -15,12 +15,20 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Run package tests
-        run: cargo test -p opaque -p opaque-mcp -p opaqued
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run workspace tests
+        run: cargo test --workspace
 
       - name: Verify wrapper enforcement handshake test
         run: cargo test -p opaqued enforce_agent_sessions_rejects_unwrapped_and_allows_session_token -- --exact
