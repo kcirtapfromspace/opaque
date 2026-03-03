@@ -178,20 +178,44 @@ download_and_install() {
         || die "failed to extract archive"
 
     # Install binaries
+    SUDO=""
+    if ! mkdir -p "$INSTALL_DIR" 2>/dev/null || ! test -w "$INSTALL_DIR"; then
+        if command -v sudo >/dev/null 2>&1; then
+            printf 'Need elevated permissions to install to %s\n' "$INSTALL_DIR"
+            SUDO="sudo"
+            $SUDO mkdir -p "$INSTALL_DIR" || die "failed to create install directory: ${INSTALL_DIR}"
+        else
+            # No sudo — fall back to ~/.local/bin
+            INSTALL_DIR="${HOME}/.local/bin"
+            printf 'No write access to /usr/local/bin and sudo not found.\n'
+            printf 'Installing to %s instead.\n' "$INSTALL_DIR"
+            mkdir -p "$INSTALL_DIR" || die "failed to create install directory: ${INSTALL_DIR}"
+        fi
+    fi
+
     printf 'Installing to %s...\n' "$INSTALL_DIR"
-    mkdir -p "$INSTALL_DIR" || die "failed to create install directory: ${INSTALL_DIR}"
 
     for bin in $BINARIES; do
         if [ -f "${tmpdir}/${bin}" ]; then
-            install -m 755 "${tmpdir}/${bin}" "${INSTALL_DIR}/${bin}" \
+            $SUDO install -m 755 "${tmpdir}/${bin}" "${INSTALL_DIR}/${bin}" \
                 || die "failed to install ${bin} to ${INSTALL_DIR}"
         else
             printf 'warning: binary %s not found in archive (may not be built for this platform)\n' "$bin" >&2
         fi
     done
 
-    printf 'Successfully installed opaque %s to %s\n' "$version" "$INSTALL_DIR"
+    printf '\nSuccessfully installed opaque %s to %s\n' "$version" "$INSTALL_DIR"
     printf 'Binaries: %s\n' "$BINARIES"
+
+    # Check if install dir is in PATH
+    case ":${PATH}:" in
+        *:"${INSTALL_DIR}":*) ;;
+        *)
+            printf '\nNote: %s is not in your PATH.\n' "$INSTALL_DIR"
+            printf 'Add it with:\n'
+            printf '  export PATH="%s:$PATH"\n' "$INSTALL_DIR"
+            ;;
+    esac
 }
 
 # --- checksum verification --------------------------------------------------
