@@ -8,8 +8,8 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -753,11 +753,8 @@ impl OverflowQueue {
             )",
         )?;
 
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM overflow_events",
-            [],
-            |row| row.get(0),
-        )?;
+        let count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM overflow_events", [], |row| row.get(0))?;
 
         Ok(Self {
             conn: std::sync::Mutex::new(conn),
@@ -790,9 +787,8 @@ impl OverflowQueue {
         let tx = conn.unchecked_transaction()?;
         let mut events = Vec::new();
         {
-            let mut stmt = tx.prepare(
-                "SELECT id, event_json FROM overflow_events ORDER BY id ASC LIMIT ?1",
-            )?;
+            let mut stmt =
+                tx.prepare("SELECT id, event_json FROM overflow_events ORDER BY id ASC LIMIT ?1")?;
             let rows = stmt.query_map(rusqlite::params![limit as i64], |row| {
                 let id: i64 = row.get(0)?;
                 let json: String = row.get(1)?;
@@ -824,7 +820,8 @@ impl OverflowQueue {
         if drained > 0 {
             // Saturating subtract to avoid underflow from concurrent pushes.
             let prev = self.pending_count.load(Ordering::Relaxed);
-            self.pending_count.store(prev.saturating_sub(drained), Ordering::Relaxed);
+            self.pending_count
+                .store(prev.saturating_sub(drained), Ordering::Relaxed);
         }
         Ok(events)
     }
@@ -906,16 +903,19 @@ impl SqliteAuditSink {
 
         // Enable auto_vacuum=INCREMENTAL for new databases.
         // Must be set before table creation to take effect.
-        let table_exists: bool = conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='audit_events'",
-            [],
-            |row| row.get::<_, i64>(0),
-        ).map(|c| c > 0)?;
+        let table_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='audit_events'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)?;
 
         if !table_exists {
             conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
         } else {
-            let auto_vacuum: i64 = conn.pragma_query_value(None, "auto_vacuum", |row| row.get(0))?;
+            let auto_vacuum: i64 =
+                conn.pragma_query_value(None, "auto_vacuum", |row| row.get(0))?;
             if auto_vacuum == 0 {
                 tracing::info!(
                     "existing audit DB has auto_vacuum=NONE; consider running VACUUM once to enable incremental mode"
@@ -982,7 +982,9 @@ impl SqliteAuditSink {
                 Some(Arc::new(oq))
             }
             Err(e) => {
-                tracing::warn!("failed to create overflow queue: {e}; backpressure will drop events");
+                tracing::warn!(
+                    "failed to create overflow queue: {e}; backpressure will drop events"
+                );
                 None
             }
         };
@@ -1191,21 +1193,21 @@ impl SqliteAuditSink {
             batch.clear();
 
             // Drain overflow events back into the main DB.
-            if let Some(ref oq) = overflow {
-                if !oq.is_empty() {
-                    match oq.drain(OVERFLOW_DRAIN_BATCH) {
-                        Ok(events) if !events.is_empty() => {
-                            tracing::debug!(count = events.len(), "draining overflow events");
-                            if let Err(e) = Self::insert_batch(&conn, &events) {
-                                tracing::error!("overflow drain insert failed: {e}");
-                            } else {
-                                notify.signal();
-                            }
+            if let Some(ref oq) = overflow
+                && !oq.is_empty()
+            {
+                match oq.drain(OVERFLOW_DRAIN_BATCH) {
+                    Ok(events) if !events.is_empty() => {
+                        tracing::debug!(count = events.len(), "draining overflow events");
+                        if let Err(e) = Self::insert_batch(&conn, &events) {
+                            tracing::error!("overflow drain insert failed: {e}");
+                        } else {
+                            notify.signal();
                         }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::error!("overflow drain failed: {e}");
-                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::error!("overflow drain failed: {e}");
                     }
                 }
             }
@@ -1350,12 +1352,11 @@ impl AuditSink for SqliteAuditSink {
         }
         // Non-blocking send. If the channel is full, try the overflow queue
         // before dropping the event.
-        if let Err(std::sync::mpsc::TrySendError::Full(event)) = self.sender.try_send(event)
-        {
+        if let Err(std::sync::mpsc::TrySendError::Full(event)) = self.sender.try_send(event) {
             if let Some(ref overflow) = self.overflow {
                 match overflow.push(&event) {
-                    Ok(true) => return,   // spilled to disk, not dropped
-                    Ok(false) => {}       // overflow full too, fall through to drop
+                    Ok(true) => return, // spilled to disk, not dropped
+                    Ok(false) => {}     // overflow full too, fall through to drop
                     Err(e) => tracing::error!("overflow write failed: {e}"),
                 }
             }
@@ -1552,7 +1553,9 @@ fn row_to_audit_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditEvent> {
         rusqlite::Error::FromSqlConversionFailure(
             0,
             rusqlite::types::Type::Integer,
-            Box::new(AuditError::Other("sequence_number must be non-negative".into())),
+            Box::new(AuditError::Other(
+                "sequence_number must be non-negative".into(),
+            )),
         )
     })?;
     let ts_utc_ms: i64 = row.get("ts_utc_ms")?;
@@ -2791,10 +2794,14 @@ mod tests {
         drop(sink);
 
         let conn = rusqlite::Connection::open(&db_path).unwrap();
-        let auto_vacuum: i64 =
-            conn.pragma_query_value(None, "auto_vacuum", |row| row.get(0)).unwrap();
+        let auto_vacuum: i64 = conn
+            .pragma_query_value(None, "auto_vacuum", |row| row.get(0))
+            .unwrap();
         // 2 = INCREMENTAL
-        assert_eq!(auto_vacuum, 2, "new DB should have auto_vacuum=INCREMENTAL (2)");
+        assert_eq!(
+            auto_vacuum, 2,
+            "new DB should have auto_vacuum=INCREMENTAL (2)"
+        );
 
         let _ = std::fs::remove_file(&db_path);
     }
@@ -2803,7 +2810,8 @@ mod tests {
     fn periodic_cleanup_deletes_old_events() {
         let db_path = temp_db_path();
         let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL").unwrap();
+        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")
+            .unwrap();
         conn.execute_batch(SCHEMA_SQL).unwrap();
 
         // Insert events with old timestamps (ts_utc_ms = 1000, very old).
@@ -2811,8 +2819,15 @@ mod tests {
             conn.execute(
                 "INSERT INTO audit_events (event_id, sequence_number, ts_utc_ms, level, kind)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![Uuid::new_v4().to_string(), i, 1000i64, "info", "request.received"],
-            ).unwrap();
+                rusqlite::params![
+                    Uuid::new_v4().to_string(),
+                    i,
+                    1000i64,
+                    "info",
+                    "request.received"
+                ],
+            )
+            .unwrap();
         }
 
         // Insert some recent events.
@@ -2824,8 +2839,15 @@ mod tests {
             conn.execute(
                 "INSERT INTO audit_events (event_id, sequence_number, ts_utc_ms, level, kind)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![Uuid::new_v4().to_string(), i, now_ms, "info", "request.received"],
-            ).unwrap();
+                rusqlite::params![
+                    Uuid::new_v4().to_string(),
+                    i,
+                    now_ms,
+                    "info",
+                    "request.received"
+                ],
+            )
+            .unwrap();
         }
 
         let retention_ms: i64 = 90 * 86_400 * 1000;
@@ -2845,7 +2867,8 @@ mod tests {
     fn incremental_vacuum_reclaims_pages() {
         let db_path = temp_db_path();
         let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL").unwrap();
+        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")
+            .unwrap();
         conn.execute_batch(SCHEMA_SQL).unwrap();
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
 
@@ -2868,14 +2891,16 @@ mod tests {
         // Delete all events to create free pages.
         conn.execute("DELETE FROM audit_events", []).unwrap();
 
-        let freelist_before: i64 =
-            conn.pragma_query_value(None, "freelist_count", |row| row.get(0)).unwrap();
+        let freelist_before: i64 = conn
+            .pragma_query_value(None, "freelist_count", |row| row.get(0))
+            .unwrap();
 
         // Run incremental vacuum.
         let _ = conn.pragma_update(None, "incremental_vacuum", INCREMENTAL_VACUUM_PAGES);
 
-        let freelist_after: i64 =
-            conn.pragma_query_value(None, "freelist_count", |row| row.get(0)).unwrap();
+        let freelist_after: i64 = conn
+            .pragma_query_value(None, "freelist_count", |row| row.get(0))
+            .unwrap();
 
         assert!(
             freelist_after <= freelist_before,
@@ -2896,8 +2921,7 @@ mod tests {
 
         // Push some events.
         for i in 0..5 {
-            let event = AuditEvent::new(AuditEventKind::RequestReceived)
-                .with_sequence_number(i);
+            let event = AuditEvent::new(AuditEventKind::RequestReceived).with_sequence_number(i);
             assert!(oq.push(&event).unwrap());
         }
         assert!(!oq.is_empty());
@@ -2919,14 +2943,12 @@ mod tests {
         let oq = OverflowQueue::new(path, 3).unwrap();
 
         for i in 0..3 {
-            let event = AuditEvent::new(AuditEventKind::RequestReceived)
-                .with_sequence_number(i);
+            let event = AuditEvent::new(AuditEventKind::RequestReceived).with_sequence_number(i);
             assert!(oq.push(&event).unwrap(), "should accept event {i}");
         }
 
         // 4th event should be rejected.
-        let event = AuditEvent::new(AuditEventKind::RequestReceived)
-            .with_sequence_number(99);
+        let event = AuditEvent::new(AuditEventKind::RequestReceived).with_sequence_number(99);
         assert!(!oq.push(&event).unwrap(), "should reject when at capacity");
     }
 
@@ -3014,9 +3036,7 @@ mod tests {
         });
 
         // Wait in tokio — should wake within ~20ms.
-        let woken = rt.block_on(async {
-            notify.wait_or_timeout(Duration::from_secs(5)).await
-        });
+        let woken = rt.block_on(async { notify.wait_or_timeout(Duration::from_secs(5)).await });
         assert!(woken, "should have been woken by signal");
         thread_handle.join().unwrap();
     }
@@ -3027,9 +3047,7 @@ mod tests {
         let notify = AuditNotify::new();
 
         let start = Instant::now();
-        let woken = rt.block_on(async {
-            notify.wait_or_timeout(Duration::from_millis(50)).await
-        });
+        let woken = rt.block_on(async { notify.wait_or_timeout(Duration::from_millis(50)).await });
         assert!(!woken, "should have timed out without signal");
         assert!(
             start.elapsed() >= Duration::from_millis(40),

@@ -246,7 +246,7 @@ Then wrapped agent clients must present `OPAQUE_SESSION_TOKEN` in the daemon han
 ./target/release/opaque exec --profile dev -- echo "hello from sandbox"
 ```
 
-`sandbox.exec` currently captures and returns stdout/stderr (and the CLI prints it). Treat this as sensitive output: avoid commands that print secrets, and do not allow it for agent clients by default.
+`sandbox.exec` captures process output but returns only metadata (`exit_code`, `stdout_length`, `stderr_length`, `truncated`) — raw stdout/stderr is not included in the response. Treat this as sensitive output: avoid commands that print secrets, and do not allow it for agent clients by default.
 
 ### GitHub Secrets
 

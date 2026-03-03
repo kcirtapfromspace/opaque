@@ -589,7 +589,11 @@ impl OperationHandler for AwsHandler {
 // Tests
 // ---------------------------------------------------------------------------
 
+// Tests use a std::sync::Mutex to serialise env-var access across async
+// test functions.  The guard is held across `.await` but this is safe in
+// test-only code that runs single-threaded on tokio's current-thread runtime.
 #[cfg(test)]
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use opaque_core::audit::InMemoryAuditEmitter;

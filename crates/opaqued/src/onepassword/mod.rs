@@ -308,6 +308,7 @@ impl OperationHandler for OnePasswordHandler {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use opaque_core::audit::InMemoryAuditEmitter;
