@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -79,7 +80,7 @@ enum Cmd {
         /// Overwrite existing config file.
         #[arg(long, default_value_t = false)]
         force: bool,
-        /// Apply a policy preset (e.g. "safe-demo", "github-secrets", "sandbox-human").
+        /// Apply a policy preset (e.g. "starter", "github-secrets", "sandbox-human").
         #[arg(long)]
         preset: Option<String>,
         /// Initialize a repo-scoped policy in .opaque/ at the repo root.
@@ -156,8 +157,12 @@ enum Cmd {
     },
     /// Diagnose your Opaque installation and report issues.
     Doctor,
-    /// One-step onboarding: init with safe-demo preset, check daemon, run diagnostics.
-    Quickstart,
+    /// Guided onboarding: choose a preset, start daemon, connect AI tool, set up repo policy.
+    Quickstart {
+        /// Policy preset to use (e.g. "starter", "github-secrets"). Skips interactive menu.
+        #[arg(long)]
+        preset: Option<String>,
+    },
     /// Register the opaque MCP server with an AI coding tool (claude, cursor, codex).
     Connect {
         /// Tool name: "claude", "cursor", "codex", or "auto" (detect automatically).
@@ -227,7 +232,7 @@ enum PolicyAction {
     },
     /// Apply a policy preset to your configuration.
     Preset {
-        /// Preset name (e.g. "safe-demo", "github-secrets", "sandbox-human").
+        /// Preset name (e.g. "starter", "github-secrets", "sandbox-human").
         name: String,
     },
     /// Dry-run a request against the policy to see what would happen.
@@ -1962,8 +1967,8 @@ async fn main() {
             run_doctor().await;
             return;
         }
-        Cmd::Quickstart => {
-            run_quickstart().await;
+        Cmd::Quickstart { preset } => {
+            run_quickstart(preset.clone()).await;
             return;
         }
         Cmd::Connect { tool } => {
@@ -2497,7 +2502,7 @@ async fn main() {
         | Cmd::Setup { .. }
         | Cmd::Service { .. }
         | Cmd::Doctor
-        | Cmd::Quickstart
+        | Cmd::Quickstart { .. }
         | Cmd::Secrets { .. }
         | Cmd::Connect { .. } => {
             unreachable!()
@@ -3279,6 +3284,8 @@ fn dirs_or_home() -> PathBuf {
 // ---------------------------------------------------------------------------
 
 /// Embedded policy preset files.
+const PRESET_STARTER: &str = include_str!("presets/starter.toml");
+#[allow(dead_code)] // Kept for backward compat: safe-demo.toml is still shipped
 const PRESET_SAFE_DEMO: &str = include_str!("presets/safe-demo.toml");
 const PRESET_GITHUB_SECRETS: &str = include_str!("presets/github-secrets.toml");
 const PRESET_GITLAB_VARIABLES: &str = include_str!("presets/gitlab-variables.toml");
@@ -3290,9 +3297,9 @@ const PRESET_CODEX_AGENT: &str = include_str!("presets/codex-agent.toml");
 fn available_presets() -> Vec<(&'static str, &'static str, &'static str)> {
     vec![
         (
-            "safe-demo",
-            "Try Opaque risk-free — allows only test.noop, no real secrets",
-            PRESET_SAFE_DEMO,
+            "starter",
+            "Get started risk-free — allows only test.noop, no real secrets",
+            PRESET_STARTER,
         ),
         (
             "github-secrets",
@@ -3322,11 +3329,12 @@ fn available_presets() -> Vec<(&'static str, &'static str, &'static str)> {
     ]
 }
 
-/// Get preset content by name.
+/// Get preset content by name. Supports "safe-demo" as a backward-compat alias for "starter".
 fn get_preset(name: &str) -> Option<&'static str> {
+    let resolved = if name == "safe-demo" { "starter" } else { name };
     available_presets()
         .into_iter()
-        .find(|(n, _, _)| *n == name)
+        .find(|(n, _, _)| *n == resolved)
         .map(|(_, _, content)| content)
 }
 
@@ -3421,8 +3429,8 @@ fn policy_apply_preset(name: &str) -> Result<(), String> {
 fn run_init(force: bool, preset: Option<&str>) -> Result<(), String> {
     let base = default_opaque_dir();
 
-    // Determine config content. Default to safe-demo if no preset specified.
-    let effective_preset = preset.unwrap_or("safe-demo");
+    // Determine config content. Default to starter if no preset specified.
+    let effective_preset = preset.unwrap_or("starter");
     let config_content = get_preset(effective_preset).ok_or_else(|| {
         format!(
             "unknown preset '{effective_preset}'. Available: {}",
@@ -3437,7 +3445,7 @@ fn run_init(force: bool, preset: Option<&str>) -> Result<(), String> {
     if preset.is_none() {
         ui::info(&format!(
             "Using default preset '{}'. Use --preset <name> to choose a different one.",
-            style("safe-demo").bold()
+            style("starter").bold()
         ));
         println!();
     }
@@ -3520,33 +3528,128 @@ fn run_init_at(base: &Path, force: bool, config_content: &str) -> Result<(), Str
 /// Perform the init portion of quickstart at the given base path.
 ///
 /// If config already exists, this is a no-op (skip gracefully).
-/// Otherwise, initializes with the safe-demo preset.
+/// Otherwise, initializes with the given preset content (defaults to starter).
 ///
 /// Returns `true` if init was performed, `false` if skipped.
-fn run_quickstart_at(base: &Path) -> Result<bool, String> {
+fn run_quickstart_at(base: &Path, preset_content: &str) -> Result<bool, String> {
     let config_path = base.join("config.toml");
     if config_path.exists() {
         return Ok(false);
     }
 
-    run_init_at(base, false, PRESET_SAFE_DEMO)?;
+    run_init_at(base, false, preset_content)?;
     Ok(true)
 }
 
+/// Interactive preset choices for quickstart menu.
+fn quickstart_preset_choices() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("github-secrets", "GitHub Actions secrets"),
+        ("gitlab-variables", "GitLab CI/CD variables"),
+        ("sandbox-human", "Sandbox command execution"),
+        ("starter", "Just exploring (test.noop only)"),
+    ]
+}
+
+/// Contextual "try it out" hint for a given preset.
+fn preset_try_hint(preset_name: &str) -> &'static str {
+    match preset_name {
+        "github-secrets" => "Try: opaque secrets add github-token   then ask your AI to set a secret",
+        "gitlab-variables" => "Try: opaque secrets add gitlab-token   then ask your AI to set a variable",
+        "sandbox-human" => "Try: opaque exec --profile default -- echo hello",
+        _ => "Try: ask your AI tool to run test.noop through Opaque",
+    }
+}
+
+/// Detect the preset name from a config file by reading its first comment line.
+#[allow(dead_code)]
+fn detect_preset_from_config(path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let first_line = content.lines().next()?;
+    let trimmed = first_line.strip_prefix("# Opaque preset: ")?;
+    Some(trimmed.trim().to_string())
+}
+
+/// Extract org/repo name from the git remote in a given directory.
+fn extract_repo_name(repo_root: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(repo_root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let cleaned = url.trim_end_matches(".git").trim_end_matches('/');
+    if let Some(colon_idx) = cleaned.rfind(':') {
+        let after_colon = &cleaned[colon_idx + 1..];
+        if !after_colon.is_empty()
+            && !after_colon.starts_with("//")
+            && !after_colon.chars().next().unwrap_or(' ').is_ascii_digit()
+        {
+            return Some(after_colon.to_string());
+        }
+    }
+    Some(extract_last_two_segments(cleaned))
+}
+
 /// Run the full quickstart flow with styled output.
-async fn run_quickstart() {
+async fn run_quickstart(cli_preset: Option<String>) {
     let base = default_opaque_dir();
 
     ui::header("Opaque Quickstart");
     println!();
 
-    // Step 1: Init with safe-demo preset (if needed).
-    match run_quickstart_at(&base) {
+    // Step 1: Choose preset — interactive menu, --preset flag, or default.
+    let preset_name: String = if let Some(ref name) = cli_preset {
+        // Explicit --preset flag: validate and use.
+        if get_preset(name).is_none() {
+            ui::error(&format!(
+                "Unknown preset '{}'. Available: {}",
+                name,
+                available_presets()
+                    .iter()
+                    .map(|(n, _, _)| *n)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            std::process::exit(1);
+        }
+        name.clone()
+    } else if std::io::stdin().is_terminal() {
+        // Interactive TTY: show menu.
+        let choices = quickstart_preset_choices();
+        let labels: Vec<String> = choices
+            .iter()
+            .map(|(_, label)| label.to_string())
+            .collect();
+
+        println!("  {}", style("What will you use Opaque for?").bold());
+        println!();
+
+        let selection = dialoguer::Select::new()
+            .items(&labels)
+            .default(3) // "Just exploring"
+            .interact_opt();
+
+        match selection {
+            Ok(Some(idx)) => choices[idx].0.to_string(),
+            _ => "starter".to_string(),
+        }
+    } else {
+        // Non-interactive: default to starter.
+        "starter".to_string()
+    };
+
+    let preset_content = get_preset(&preset_name).unwrap_or(PRESET_STARTER);
+
+    match run_quickstart_at(&base, preset_content) {
         Ok(true) => {
             ui::init_step(&format!(
                 "Initialized {} with {} preset",
                 style(base.display()).cyan(),
-                style("safe-demo").bold()
+                style(&preset_name).bold()
             ));
         }
         Ok(false) => {
@@ -3635,29 +3738,82 @@ async fn run_quickstart() {
     }
 
     // Step 3: Connect to AI coding tool (auto-detect).
-    if let Some(tool_name) = detect_mcp_connection() {
+    let mcp_tool = if let Some(tool_name) = detect_mcp_connection() {
         ui::init_step(&format!(
             "MCP already connected to {}",
-            style(tool_name).cyan()
+            style(&tool_name).cyan()
         ));
+        Some(tool_name)
     } else {
         match find_opaque_mcp_path() {
             Some(opaque_mcp) => match connect_tool_at(&opaque_mcp) {
                 Ok(()) => {
                     ui::init_step("Connected to detected AI coding tool");
+                    detect_mcp_connection()
                 }
                 Err(e) => {
                     ui::warn(&format!("MCP connect failed: {e}"));
                     ui::info("Run 'opaque connect claude' to configure manually.");
+                    None
                 }
             },
             None => {
                 ui::info("opaque-mcp not found — run 'opaque connect' after installation.");
+                None
+            }
+        }
+    };
+
+    // Step 4: Repo-scoped policy (if in a git repo).
+    let mut repo_setup = false;
+    let repo_root = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim().to_string()));
+
+    if let Some(ref root) = repo_root {
+        let policy_path = root.join(".opaque").join("policy.toml");
+        if policy_path.exists() {
+            ui::init_step(&format!(
+                "Repo policy already exists at {}",
+                style(policy_path.display()).cyan()
+            ));
+            repo_setup = true;
+        } else if std::io::stdin().is_terminal() {
+            let repo_name =
+                extract_repo_name(root).unwrap_or_else(|| root.display().to_string());
+            let should_init = dialoguer::Confirm::new()
+                .with_prompt(format!(
+                    "Set up repo-scoped policy for {}?",
+                    style(&repo_name).cyan()
+                ))
+                .default(true)
+                .interact()
+                .unwrap_or(false);
+
+            if should_init {
+                match run_init_repo_at(root, None) {
+                    Ok(_) => {
+                        ui::init_step(&format!(
+                            "Created {} scoped to {}",
+                            style(".opaque/policy.toml").cyan(),
+                            style(&repo_name).bold()
+                        ));
+                        repo_setup = true;
+                    }
+                    Err(e) => {
+                        ui::warn(&format!("Repo init failed: {e}"));
+                    }
+                }
+            } else {
+                ui::info("Skipped repo policy (run 'opaque init --repo' later)");
             }
         }
     }
 
-    // Step 4: Execute test.noop to verify end-to-end.
+    // Step 5: Execute test.noop to verify end-to-end.
     ui::info("Testing end-to-end with test.noop operation...");
     let test_params = serde_json::json!({
         "operation": "test.noop",
@@ -3691,30 +3847,59 @@ async fn run_quickstart() {
         }
     }
 
-    // Step 5: Print success summary.
+    // Step 6: Print structured summary.
     println!();
     ui::success("Quickstart complete!");
     println!();
-    ui::info("Useful commands:");
+
+    // Summary table.
     println!(
-        "    {}           {}",
+        "    {:<14} {}",
+        style("Preset:").dim(),
+        style(&preset_name).cyan().bold()
+    );
+    if daemon_running {
+        println!(
+            "    {:<14} {}",
+            style("Daemon:").dim(),
+            style("running").green()
+        );
+    }
+    if let Some(ref tool) = mcp_tool {
+        println!(
+            "    {:<14} {}",
+            style("AI tool:").dim(),
+            style(tool).cyan()
+        );
+    }
+    if let Some(ref root) = repo_root
+        && repo_setup
+    {
+        let name = extract_repo_name(root).unwrap_or_else(|| root.display().to_string());
+        println!(
+            "    {:<14} {}",
+            style("Repo:").dim(),
+            style(name).cyan()
+        );
+    }
+
+    // Contextual "try it out" hint.
+    println!();
+    println!(
+        "  {} {}",
+        style(">>").green().bold(),
+        style(preset_try_hint(&preset_name)).bold()
+    );
+    println!();
+    println!(
+        "    {}      {}",
         style("opaque doctor").cyan().bold(),
         style("# run full diagnostics").dim()
     );
     println!(
         "    {}  {}",
-        style("opaque init --repo").cyan().bold(),
-        style("# add per-repo policy (in a git repo)").dim()
-    );
-    println!(
-        "    {}  {}",
         style("opaque policy presets").cyan().bold(),
         style("# explore other policy presets").dim()
-    );
-    println!(
-        "    {}  {}",
-        style("opaque secrets add <name>").cyan().bold(),
-        style("# store a secret in the OS keychain").dim()
     );
     println!(
         "    {}      {}",
@@ -4023,13 +4208,11 @@ async fn run_status() {
         println!("    {}", style("opaque quickstart").cyan().bold());
         println!();
         println!("  This will:");
-        println!(
-            "    1. Create {} with a safe demo policy",
-            style("~/.opaque/").cyan()
-        );
+        println!("    1. Choose a starter policy preset");
         println!("    2. Install and start the daemon service");
         println!("    3. Connect to your AI coding tool (Claude, Cursor)");
-        println!("    4. Verify everything works end-to-end");
+        println!("    4. Set up a repo-scoped policy (if in a git repo)");
+        println!("    5. Verify everything works end-to-end");
         println!();
         println!("  {}", style("Other commands:").dim());
         println!(
@@ -5570,7 +5753,7 @@ lease_ttl = 0
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join(".opaque");
 
-        let result = run_init_at(&base, false, PRESET_SAFE_DEMO);
+        let result = run_init_at(&base, false, PRESET_STARTER);
         assert!(result.is_ok(), "expected Ok, got: {result:?}");
 
         assert!(base.exists());
@@ -5578,7 +5761,7 @@ lease_ttl = 0
         assert!(base.join("config.toml").exists());
 
         let content = fs::read_to_string(base.join("config.toml")).unwrap();
-        assert!(content.contains("safe-demo"));
+        assert!(content.contains("starter"));
     }
 
     #[test]
@@ -5588,7 +5771,7 @@ lease_ttl = 0
         fs::create_dir_all(&base).unwrap();
         fs::write(base.join("config.toml"), "existing").unwrap();
 
-        let result = run_init_at(&base, false, PRESET_SAFE_DEMO);
+        let result = run_init_at(&base, false, PRESET_STARTER);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already exists"));
     }
@@ -5600,11 +5783,11 @@ lease_ttl = 0
         fs::create_dir_all(&base).unwrap();
         fs::write(base.join("config.toml"), "old content").unwrap();
 
-        let result = run_init_at(&base, true, PRESET_SAFE_DEMO);
+        let result = run_init_at(&base, true, PRESET_STARTER);
         assert!(result.is_ok(), "expected Ok, got: {result:?}");
 
         let content = fs::read_to_string(base.join("config.toml")).unwrap();
-        assert!(content.contains("safe-demo"));
+        assert!(content.contains("starter"));
         // Old content should be replaced
         assert!(!content.contains("old content"));
     }
@@ -5614,16 +5797,18 @@ lease_ttl = 0
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join(".opaque");
 
-        let result = run_init_at(&base, false, PRESET_SAFE_DEMO);
+        let result = run_init_at(&base, false, PRESET_STARTER);
         assert!(result.is_ok(), "expected Ok, got: {result:?}");
 
         let content = fs::read_to_string(base.join("config.toml")).unwrap();
-        assert!(content.contains("safe-demo"));
+        assert!(content.contains("starter"));
         assert!(content.contains("test.noop"));
     }
 
     #[test]
     fn preset_lookup() {
+        assert!(get_preset("starter").is_some());
+        // Backward compat: "safe-demo" alias resolves to starter content
         assert!(get_preset("safe-demo").is_some());
         assert!(get_preset("github-secrets").is_some());
         assert!(get_preset("gitlab-variables").is_some());
@@ -5715,7 +5900,7 @@ factors = []
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join(".opaque");
 
-        run_init_at(&base, false, PRESET_SAFE_DEMO).unwrap();
+        run_init_at(&base, false, PRESET_STARTER).unwrap();
 
         #[cfg(unix)]
         {
@@ -5951,7 +6136,7 @@ BAZ=
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join(".opaque");
 
-        let result = run_quickstart_at(&base);
+        let result = run_quickstart_at(&base, PRESET_STARTER);
         assert!(result.is_ok(), "expected Ok, got: {result:?}");
 
         // Should have created the directory structure
@@ -5965,22 +6150,22 @@ BAZ=
     }
 
     #[test]
-    fn quickstart_uses_safe_demo_preset() {
+    fn quickstart_uses_starter_preset() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join(".opaque");
 
-        let result = run_quickstart_at(&base);
+        let result = run_quickstart_at(&base, PRESET_STARTER);
         assert!(result.is_ok(), "expected Ok, got: {result:?}");
 
         let content = fs::read_to_string(base.join("config.toml")).unwrap();
-        // safe-demo preset contains test.noop rule
+        // starter preset contains test.noop rule
         assert!(
             content.contains("test.noop"),
-            "config should contain test.noop from safe-demo preset"
+            "config should contain test.noop from starter preset"
         );
         assert!(
-            content.contains("safe-demo"),
-            "config should reference safe-demo preset"
+            content.contains("starter"),
+            "config should reference starter preset"
         );
     }
 
@@ -5990,7 +6175,7 @@ BAZ=
         let base = dir.path().join(".opaque");
 
         // First run — creates config
-        let result = run_quickstart_at(&base);
+        let result = run_quickstart_at(&base, PRESET_STARTER);
         assert!(result.is_ok(), "first run should succeed: {result:?}");
 
         // Write custom content so we can verify it's not overwritten
@@ -5998,7 +6183,7 @@ BAZ=
         fs::write(&config_path, "# custom config\n").unwrap();
 
         // Second run — should skip init, not error
-        let result = run_quickstart_at(&base);
+        let result = run_quickstart_at(&base, PRESET_STARTER);
         assert!(result.is_ok(), "second run should succeed: {result:?}");
 
         // Config should NOT be overwritten
@@ -6016,33 +6201,33 @@ BAZ=
 
         // Run three times — should all succeed
         for i in 0..3 {
-            let result = run_quickstart_at(&base);
+            let result = run_quickstart_at(&base, PRESET_STARTER);
             assert!(result.is_ok(), "run {i} should succeed: {result:?}");
         }
 
-        // Config should still be the safe-demo preset from first run
+        // Config should still be the starter preset from first run
         let content = fs::read_to_string(base.join("config.toml")).unwrap();
         assert!(content.contains("test.noop"));
     }
 
     #[test]
-    fn quickstart_init_equivalent_to_init_preset_safe_demo() {
-        // quickstart init should produce the same config as `init --preset safe-demo`
+    fn quickstart_init_equivalent_to_init_preset_starter() {
+        // quickstart init should produce the same config as `init --preset starter`
         let qs_dir = tempfile::tempdir().unwrap();
         let qs_base = qs_dir.path().join(".opaque");
 
         let init_dir = tempfile::tempdir().unwrap();
         let init_base = init_dir.path().join(".opaque");
 
-        run_quickstart_at(&qs_base).unwrap();
-        run_init_at(&init_base, false, PRESET_SAFE_DEMO).unwrap();
+        run_quickstart_at(&qs_base, PRESET_STARTER).unwrap();
+        run_init_at(&init_base, false, PRESET_STARTER).unwrap();
 
         let qs_config = fs::read_to_string(qs_base.join("config.toml")).unwrap();
         let init_config = fs::read_to_string(init_base.join("config.toml")).unwrap();
 
         assert_eq!(
             qs_config, init_config,
-            "quickstart config should match init --preset safe-demo"
+            "quickstart config should match init --preset starter"
         );
     }
 
@@ -6051,7 +6236,7 @@ BAZ=
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join(".opaque");
 
-        run_quickstart_at(&base).unwrap();
+        run_quickstart_at(&base, PRESET_STARTER).unwrap();
 
         #[cfg(unix)]
         {
@@ -6062,6 +6247,62 @@ BAZ=
             let run_mode = fs::metadata(base.join("run")).unwrap().permissions().mode() & 0o777;
             assert_eq!(run_mode, 0o700, "run dir should be 0700, got {run_mode:o}");
         }
+    }
+
+    #[test]
+    fn safe_demo_alias_resolves_to_starter() {
+        let starter = get_preset("starter").unwrap();
+        let safe_demo = get_preset("safe-demo").unwrap();
+        assert_eq!(
+            starter, safe_demo,
+            "safe-demo alias should resolve to same content as starter"
+        );
+    }
+
+    #[test]
+    fn quickstart_with_specific_preset() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join(".opaque");
+
+        // Use github-secrets preset instead of default starter
+        let result = run_quickstart_at(&base, PRESET_GITHUB_SECRETS);
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+
+        let content = fs::read_to_string(base.join("config.toml")).unwrap();
+        assert!(
+            content.contains("github"),
+            "config should contain github-secrets preset content"
+        );
+    }
+
+    #[test]
+    fn detect_preset_from_config_finds_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        // Write starter preset
+        fs::write(&path, PRESET_STARTER).unwrap();
+        assert_eq!(
+            detect_preset_from_config(&path).as_deref(),
+            Some("starter"),
+            "should detect 'starter' from config comment"
+        );
+
+        // Write github-secrets preset
+        fs::write(&path, PRESET_GITHUB_SECRETS).unwrap();
+        assert_eq!(
+            detect_preset_from_config(&path).as_deref(),
+            Some("github-secrets"),
+            "should detect 'github-secrets' from config comment"
+        );
+
+        // Non-preset config
+        fs::write(&path, "# random comment\n[[rules]]").unwrap();
+        assert_eq!(
+            detect_preset_from_config(&path),
+            None,
+            "should return None for non-preset config"
+        );
     }
 
     // -----------------------------------------------------------------------

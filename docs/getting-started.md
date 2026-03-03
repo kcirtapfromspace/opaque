@@ -35,7 +35,7 @@ Binaries:
 Or initialize with a policy preset:
 
 ```bash
-./target/release/opaque init --preset safe-demo       # test.noop only
+./target/release/opaque init --preset starter          # test.noop only
 ./target/release/opaque init --preset github-secrets   # GitHub secret sync
 ./target/release/opaque init --preset gitlab-variables # GitLab CI variable sync
 ./target/release/opaque init --preset sandbox-human    # sandbox for humans only

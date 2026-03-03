@@ -195,7 +195,7 @@ Get started quickly with built-in presets:
 
 ```bash
 opaque policy presets                        # list available presets
-opaque init --preset safe-demo               # test.noop only (safe to experiment)
+opaque init --preset starter                 # test.noop only (safe to experiment)
 opaque init --preset github-secrets          # GitHub secret sync for agents
 opaque init --preset gitlab-variables        # GitLab CI variable sync for agents
 opaque init --preset sandbox-human           # sandbox exec for humans only
