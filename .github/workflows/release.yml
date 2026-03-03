@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag label for archive names (for dry-run validation, e.g. v0.0.0-rc1)'
+        description: 'Tag label for archive names (e.g. v0.1.0)'
         required: false
         type: string
         default: 'v0.0.0-dryrun'
@@ -40,7 +40,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -65,12 +65,12 @@ jobs:
 
       - name: Resolve release tag
         id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ inputs.tag }}"
-            if [ -z "$TAG" ]; then
-              TAG="v0.0.0-dryrun"
-            fi
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="${INPUT_TAG:-v0.0.0-dryrun}"
           else
             TAG="${GITHUB_REF#refs/tags/}"
           fi
@@ -78,37 +78,23 @@ jobs:
 
       - name: Strip binaries
         run: |
-          for bin in opaqued opaque opaque-mcp opaque-approve-helper opaque-web; do
-            strip "target/${{ matrix.target }}/release/$bin" 2>/dev/null || true
-          done
-
-      - name: Validate macOS signing secrets
-        if: contains(matrix.target, 'apple-darwin') && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: |
-          missing=0
-          for key in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_TEAM_ID; do
-            if [ -z "${!key}" ]; then
-              echo "::error::Missing required secret: $key"
-              missing=1
-            fi
-          done
-          if [ "$missing" -ne 0 ]; then
-            echo "::error::Configure Apple signing secrets before publishing tag releases."
-            exit 1
+          TARGET="${{ matrix.target }}"
+          if [ "$TARGET" = "aarch64-unknown-linux-gnu" ]; then
+            STRIP=aarch64-linux-gnu-strip
+          else
+            STRIP=strip
           fi
+          for bin in opaqued opaque opaque-mcp opaque-approve-helper opaque-web; do
+            "$STRIP" "target/${TARGET}/release/$bin" 2>/dev/null || true
+          done
 
       - name: Codesign macOS binaries
-        if: contains(matrix.target, 'apple-darwin') && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
+        if: contains(matrix.target, 'apple-darwin') && secrets.APPLE_CERTIFICATE != ''
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          # Import certificate to keychain
           KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
           CERTIFICATE_PATH=$RUNNER_TEMP/certificate.p12
           echo -n "$APPLE_CERTIFICATE" | base64 --decode -o "$CERTIFICATE_PATH"
@@ -119,7 +105,6 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -k "" "$KEYCHAIN_PATH"
           security list-keychain -d user -s "$KEYCHAIN_PATH"
 
-          # Sign each binary
           for bin in opaqued opaque opaque-mcp opaque-approve-helper opaque-web; do
             codesign --force --options runtime --sign "$APPLE_TEAM_ID" \
               "target/${{ matrix.target }}/release/$bin"
@@ -129,14 +114,15 @@ jobs:
         id: tarball
         run: |
           TAG="${{ steps.meta.outputs.tag }}"
-          ARCHIVE="opaque-${TAG}-${{ matrix.target }}.tar.gz"
+          VERSION="${TAG#v}"
+          ARCHIVE="opaque-${VERSION}-${{ matrix.target }}.tar.gz"
           tar czf "$ARCHIVE" \
             -C "target/${{ matrix.target }}/release" \
             opaqued opaque opaque-mcp opaque-approve-helper opaque-web
           echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
 
       - name: Notarize macOS tarball
-        if: contains(matrix.target, 'apple-darwin') && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
+        if: contains(matrix.target, 'apple-darwin') && secrets.APPLE_ID != ''
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
@@ -149,10 +135,15 @@ jobs:
             --wait
 
       - name: Generate SHA256 checksum
-        run: shasum -a 256 "${{ steps.tarball.outputs.archive }}" > "${{ steps.tarball.outputs.archive }}.sha256"
+        run: |
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${{ steps.tarball.outputs.archive }}" > "${{ steps.tarball.outputs.archive }}.sha256"
+          else
+            shasum -a 256 "${{ steps.tarball.outputs.archive }}" > "${{ steps.tarball.outputs.archive }}.sha256"
+          fi
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         with:
           name: opaque-${{ matrix.target }}
           path: |
@@ -162,13 +153,27 @@ jobs:
   release:
     name: Create release
     needs: build
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
       id-token: write
     steps:
+      - name: Resolve release tag
+        id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="${INPUT_TAG:-v0.0.0-dryrun}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
       - name: Download artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
@@ -183,9 +188,9 @@ jobs:
           done
 
       - name: Create GitHub Release
-        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.meta.outputs.tag }}
           generate_release_notes: true
           files: |
             artifacts/*.tar.gz

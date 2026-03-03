@@ -1,6 +1,6 @@
 #!/bin/sh
 # install.sh — download and install Opaque binaries
-# Usage: curl -fsSL https://raw.githubusercontent.com/kcirtapfromspace/opaque/main/install.sh | sh
+# Usage: curl -fsSL https://opaque.info/install.sh | sh
 #   or:  sh install.sh [--no-verify]
 #
 # Flags:

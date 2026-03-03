@@ -8,9 +8,9 @@
 <meta property="og:title" content="Opaque — Zero-Knowledge Secrets Broker for AI Agents">
 <meta property="og:description" content="Local approval-gated secrets broker for AI coding tools. LLMs get operations, never plaintext values.">
 <meta property="og:type" content="website">
-<meta property="og:url" content="https://opaque.dev">
+<meta property="og:url" content="https://opaque.info">
 <meta name="twitter:card" content="summary_large_image">
-<link rel="canonical" href="https://opaque.dev">
+<link rel="canonical" href="https://opaque.info">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -306,7 +306,7 @@ footer .container { display: flex; align-items: center; justify-content: space-b
       <a href="#get-started" class="btn btn-primary"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg> Get Started</a>
       <a href="https://github.com/kcirtapfromspace/opaque" class="btn btn-ghost" target="_blank" rel="noopener"><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg> GitHub</a>
     </div>
-    <div class="install-cmd fade-up" onclick="copyInstall()" id="install-cmd"><span class="prompt mono">$</span><code>curl -fsSL https://opaque.dev/install.sh | sh</code><svg class="copy-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg></div>
+    <div class="install-cmd fade-up" onclick="copyInstall()" id="install-cmd"><span class="prompt mono">$</span><code>curl -fsSL https://opaque.info/install.sh | sh</code><svg class="copy-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg></div>
     <div class="hero-visual fade-up">
       <div class="pipeline-viz stagger" id="pipeline">
         <div class="pipeline-step"><div class="pipeline-icon pi-policy"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg></div><span class="pipeline-label">Policy</span></div>
@@ -445,7 +445,7 @@ footer .container { display: flex; align-items: center; justify-content: space-b
     </div>
     <div class="code-block fade-up"><div class="code-header"><div class="code-dots"><span></span><span></span><span></span></div><span>terminal</span></div>
 <pre><code><span class="hl-cm"># Install Opaque</span>
-<span class="hl-fn">$</span> curl -fsSL https://opaque.dev/install.sh | sh
+<span class="hl-fn">$</span> curl -fsSL https://opaque.info/install.sh | sh
 
 <span class="hl-cm"># Initialize configuration</span>
 <span class="hl-fn">$</span> opaque init
@@ -498,7 +498,7 @@ footer .container { display: flex; align-items: center; justify-content: space-b
 <script>
 const nav = document.getElementById('nav');
 window.addEventListener('scroll', () => { nav.classList.toggle('scrolled', window.scrollY > 40); }, { passive: true });
-function copyInstall() { const cmd = 'curl -fsSL https://opaque.dev/install.sh | sh'; navigator.clipboard.writeText(cmd).then(() => { const el = document.getElementById('install-cmd'); el.querySelector('code').textContent = 'Copied to clipboard!'; setTimeout(() => { el.querySelector('code').textContent = cmd; }, 1500); }); }
+function copyInstall() { const cmd = 'curl -fsSL https://opaque.info/install.sh | sh'; navigator.clipboard.writeText(cmd).then(() => { const el = document.getElementById('install-cmd'); el.querySelector('code').textContent = 'Copied to clipboard!'; setTimeout(() => { el.querySelector('code').textContent = cmd; }, 1500); }); }
 const observer = new IntersectionObserver((entries) => { entries.forEach((entry) => { if (entry.isIntersecting) entry.target.classList.add('visible'); }); }, { threshold: 0.12, rootMargin: '0px 0px -40px 0px' });
 document.querySelectorAll('.fade-up, .stagger').forEach((el) => { observer.observe(el); });
 document.querySelectorAll('a[href^="#"]').forEach(anchor => { anchor.addEventListener('click', (e) => { const target = document.querySelector(anchor.getAttribute('href')); if (target) { e.preventDefault(); target.scrollIntoView({ behavior: 'smooth', block: 'start' }); } }); });
