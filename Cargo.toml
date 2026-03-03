@@ -8,6 +8,7 @@ members = [
   "crates/opaque-mcp",
   "crates/opaque-web",
 ]
+exclude = ["fuzz"]
 
 [workspace.package]
 license = "BUSL-1.1"
@@ -47,7 +48,7 @@ zeroize = { version = "1.8", features = ["derive"] }
 console = "0.15"
 dialoguer = "0.11"
 indicatif = "0.17"
-jsonwebtoken = "9"
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 wiremock = "0.6"
 p256 = { version = "0.13", features = ["ecdsa"] }
 chrono = { version = "0.4", features = ["serde"] }
