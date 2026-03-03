@@ -88,8 +88,27 @@ jobs:
             "$STRIP" "target/${TARGET}/release/$bin" 2>/dev/null || true
           done
 
+      - name: Check macOS signing secrets
+        id: signing
+        if: contains(matrix.target, 'apple-darwin')
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+        run: |
+          if [ -n "$APPLE_CERTIFICATE" ]; then
+            echo "codesign=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "codesign=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Apple signing secrets not configured — skipping codesign"
+          fi
+          if [ -n "$APPLE_ID" ]; then
+            echo "notarize=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "notarize=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Codesign macOS binaries
-        if: contains(matrix.target, 'apple-darwin') && secrets.APPLE_CERTIFICATE != ''
+        if: steps.signing.outputs.codesign == 'true'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -122,7 +141,7 @@ jobs:
           echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
 
       - name: Notarize macOS tarball
-        if: contains(matrix.target, 'apple-darwin') && secrets.APPLE_ID != ''
+        if: steps.signing.outputs.notarize == 'true'
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
