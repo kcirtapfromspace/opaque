@@ -110,8 +110,8 @@ Opaque is a Rust workspace that builds three binaries: `opaqued` (daemon),
 # Build from source
 cargo build --release
 
-# Initialize with a safe demo preset
-opaque init --preset safe-demo
+# Initialize with the starter preset
+opaque init --preset starter
 
 # Start the daemon
 opaqued
