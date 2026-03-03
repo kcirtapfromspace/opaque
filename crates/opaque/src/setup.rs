@@ -106,6 +106,8 @@ pub fn generate_config(answers: &SetupAnswers) -> String {
                     factors,
                     answers.lease_ttl,
                 );
+                // Reveal op: policy-configured for v2 readiness, hard-blocked
+                // by enclave safety check in v1.
                 write_rule(
                     &mut out,
                     "allow-onepassword-read-field",

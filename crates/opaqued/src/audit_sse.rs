@@ -328,8 +328,7 @@ mod tests {
 
         // Emit an event.
         sink.emit(
-            AuditEvent::new(AuditEventKind::RequestReceived)
-                .with_operation("test.poll_fallback"),
+            AuditEvent::new(AuditEventKind::RequestReceived).with_operation("test.poll_fallback"),
         );
         tokio::time::sleep(Duration::from_millis(150)).await;
 
@@ -367,7 +366,10 @@ mod tests {
         .await
         .unwrap_or(false);
 
-        assert!(found, "events should arrive via polling even without notify");
+        assert!(
+            found,
+            "events should arrive via polling even without notify"
+        );
 
         handle.abort();
     }

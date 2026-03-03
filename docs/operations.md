@@ -54,13 +54,11 @@ Result:
 - `duration_ms`: u64
 - `stdout_length`: u64
 - `stderr_length`: u64
-- `stdout`: string (captured; may be empty)
-- `stderr`: string (captured; may be empty)
 - `truncated`: bool (true when capture was capped)
 
 Notes:
 
-- The current implementation **returns captured stdout/stderr** (and the CLI prints it). Treat this as `SENSITIVE_OUTPUT`: agent clients should not be allowed by default, and sandboxed commands must not print secret material.
+- Raw stdout/stderr content is not returned; only byte lengths are included. Treat this as `SENSITIVE_OUTPUT`: agent clients should not be allowed by default, and sandboxed commands must not print secret material.
 
 ### `github.set_actions_secret` (`SAFE`)
 

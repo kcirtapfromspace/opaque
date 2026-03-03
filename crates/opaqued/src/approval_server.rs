@@ -125,7 +125,7 @@ pub struct HealthResponse {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
-struct ServerState {
+pub(crate) struct ServerState {
     pending: Mutex<HashMap<String, PendingApproval>>,
     device_tokens: HashMap<String, String>,
     timeout: Duration,

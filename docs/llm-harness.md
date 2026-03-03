@@ -107,4 +107,4 @@ Use:
 
 - `opaque exec --profile <name> -- <command...>`
 
-Opaque can inject secrets into the sandboxed process environment. **However**, `sandbox.exec` currently captures and returns stdout/stderr (and the CLI prints it), so an agent can receive any secret that is printed. Treat sandbox output as `SENSITIVE_OUTPUT` and avoid commands that echo secret material.
+Opaque can inject secrets into the sandboxed process environment. **However**, `sandbox.exec` captures process output but does NOT return raw stdout/stderr to callers — only byte lengths are included. Treat sandbox output as `SENSITIVE_OUTPUT` and avoid commands that echo secret material.

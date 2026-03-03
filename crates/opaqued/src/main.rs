@@ -697,6 +697,17 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         })
         .expect("failed to register azure.list_certificates");
 
+    // -----------------------------------------------------------------------
+    // Reveal operations — registered for v2 readiness.
+    //
+    // These 7 operations (azure.get_secret, gcp.access_secret_version,
+    // onepassword.read_field, bitwarden.read_secret, vault.read_secret,
+    // aws.get_secret_value, infisical.get_secret) have full handler
+    // implementations but are hard-blocked by check_safety_constraints()
+    // in enclave.rs for ALL clients in v1.  They are registered here so
+    // the operation registry, policy rules, and MCP tool list are ready
+    // when the block lifts in a future release.
+    // -----------------------------------------------------------------------
     registry
         .register(OperationDef {
             name: "azure.get_secret".into(),
@@ -1389,7 +1400,8 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         let sts_url = format!("https://sts.{aws_region}.amazonaws.com");
         let sm_url = format!("https://secretsmanager.{aws_region}.amazonaws.com");
         let ssm_url = format!("https://ssm.{aws_region}.amazonaws.com");
-        let aws_client = aws::client::AwsClient::new(&sts_url, &sm_url, &ssm_url);
+        let aws_client = aws::client::AwsClient::new(&sts_url, &sm_url, &ssm_url)
+            .expect("AWS service URLs are always https");
 
         let aws_ops = [
             "aws.get_caller_identity",

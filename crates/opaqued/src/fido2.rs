@@ -572,7 +572,6 @@ mod tests {
     use p256::ecdsa::SigningKey;
     use p256::ecdsa::signature::Signer;
     use p256::elliptic_curve::rand_core::OsRng;
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
     use std::sync::{Arc, Mutex};
 
     // -----------------------------------------------------------------------
@@ -796,7 +795,7 @@ mod tests {
         let cred = manager.register("testuser", "key1").unwrap();
 
         let challenge = manager
-            .authentication_challenge(&[cred.credential_id.clone()])
+            .authentication_challenge(std::slice::from_ref(&cred.credential_id))
             .unwrap();
         assert_eq!(challenge.rp_id, "opaque.local");
         assert_eq!(challenge.allowed_credentials.len(), 1);

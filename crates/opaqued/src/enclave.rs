@@ -876,6 +876,11 @@ impl Enclave {
         // REVEAL operations are hard-blocked for ALL clients in v1.
         // This is a defense-in-depth measure: even if policy somehow allows it,
         // the safety check prevents plaintext secret disclosure.
+        //
+        // Affected operations (all registered with full handlers for v2):
+        //   azure.get_secret, gcp.access_secret_version,
+        //   onepassword.read_field, bitwarden.read_secret,
+        //   vault.read_secret, aws.get_secret_value, infisical.get_secret
         if op_def.safety == OperationSafety::Reveal {
             return Err(EnclaveError::SafetyViolation(
                 "REVEAL operations are not permitted in v1".into(),

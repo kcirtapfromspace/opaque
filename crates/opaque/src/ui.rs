@@ -198,27 +198,8 @@ fn format_operation_result(result: &serde_json::Value) {
         return;
     }
 
-    // sandbox.exec returns stdout/stderr + exit code.
+    // sandbox.exec returns metadata (exit_code, lengths, truncated).
     if let Some(exit_code) = obj.get("exit_code").and_then(|v| v.as_i64()) {
-        // Print captured stdout directly (not styled — preserve command output).
-        if let Some(stdout) = obj.get("stdout").and_then(|v| v.as_str())
-            && !stdout.is_empty()
-        {
-            print!("{stdout}");
-            if !stdout.ends_with('\n') {
-                println!();
-            }
-        }
-        // Print captured stderr to stderr.
-        if let Some(stderr) = obj.get("stderr").and_then(|v| v.as_str())
-            && !stderr.is_empty()
-        {
-            eprint!("{stderr}");
-            if !stderr.ends_with('\n') {
-                eprintln!();
-            }
-        }
-
         // Show truncation warning if output was capped.
         if obj
             .get("truncated")

@@ -342,7 +342,8 @@ impl CompositeResolver {
         let sm_url = format!("https://secretsmanager.{aws_region}.amazonaws.com");
         let ssm_url = format!("https://ssm.{aws_region}.amazonaws.com");
         let aws = Some(crate::aws::resolve::AwsResolver::new(
-            crate::aws::client::AwsClient::new(&sts_url, &sm_url, &ssm_url),
+            crate::aws::client::AwsClient::new(&sts_url, &sm_url, &ssm_url)
+                .expect("AWS service URLs are always https"),
         ));
 
         // Vault backend: available if URL scheme is valid.
