@@ -45,7 +45,7 @@ LLMs get **operations** (e.g., "set this GitHub secret"), never plaintext values
 === "Linux / macOS (shell script)"
 
     ```sh
-    curl -sSfL https://raw.githubusercontent.com/kcirtapfromspace/opaque/main/install.sh | sh
+    curl -fsSL https://opaque.info/install.sh | sh
     ```
 
 === "From Source"
