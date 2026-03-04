@@ -351,17 +351,15 @@ pub fn seccomp_restrict_network(network_blocked: bool) -> bool {
     let target_arch = match TargetArch::try_from(std::env::consts::ARCH) {
         Ok(arch) => arch,
         Err(e) => {
-            warn!("unsupported seccomp target architecture {}: {e}", std::env::consts::ARCH);
+            warn!(
+                "unsupported seccomp target architecture {}: {e}",
+                std::env::consts::ARCH
+            );
             return false;
         }
     };
 
-    let filter = match SeccompFilter::new(
-        rules,
-        default_action,
-        block_action,
-        target_arch,
-    ) {
+    let filter = match SeccompFilter::new(rules, default_action, block_action, target_arch) {
         Ok(f) => f,
         Err(e) => {
             warn!("seccomp filter construction failed: {e}");

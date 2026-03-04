@@ -32,8 +32,17 @@ const DAEMON_TOKEN_FILENAME: &str = "daemon.token";
 /// Baseline environment variable keys forwarded to agent child processes
 /// when running in secure-by-default mode (i.e. without `--inherit-env`).
 const BASELINE_ENV_KEYS: &[&str] = &[
-    "PATH", "HOME", "USER", "SHELL", "TERM", "LANG", "LC_ALL",
-    "TMPDIR", "XDG_RUNTIME_DIR", "COLORTERM", "SSH_AUTH_SOCK",
+    "PATH",
+    "HOME",
+    "USER",
+    "SHELL",
+    "TERM",
+    "LANG",
+    "LC_ALL",
+    "TMPDIR",
+    "XDG_RUNTIME_DIR",
+    "COLORTERM",
+    "SSH_AUTH_SOCK",
 ];
 
 #[derive(Debug, Parser)]
@@ -1934,8 +1943,15 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        match run_agent_wrapped(&sock, command, *ttl_secs, *inherit_env, pass_env, json_output)
-            .await
+        match run_agent_wrapped(
+            &sock,
+            command,
+            *ttl_secs,
+            *inherit_env,
+            pass_env,
+            json_output,
+        )
+        .await
         {
             Ok(code) => std::process::exit(code),
             Err(e) => {
