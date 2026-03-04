@@ -27,7 +27,7 @@ clap = { version = "4.5.60", features = ["derive"] }
 futures-util = { version = "0.3.30", features = ["sink"] }
 getrandom = "0.3"
 glob-match = "0.2.1"
-jsonschema = "0.28"
+jsonschema = "0.44"
 libc = "0.2.182"
 regex = "1.11"
 serde = { version = "1.0.217", features = ["derive"] }
