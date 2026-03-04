@@ -6,9 +6,21 @@ updates:
       interval: "weekly"
     labels: ["dependencies"]
     open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      rust-patch:
+        update-types: ["patch"]
+      rust-minor:
+        update-types: ["minor"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
     labels: ["dependencies"]
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      actions-minor:
+        update-types: ["minor", "patch"]
