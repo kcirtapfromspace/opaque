@@ -47,7 +47,7 @@ crypto_box = { version = "0.9", features = ["seal"] }
 zeroize = { version = "1.8", features = ["derive"] }
 console = "0.16"
 dialoguer = "0.12"
-indicatif = "0.17"
+indicatif = "0.18"
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 wiremock = "0.6"
 p256 = { version = "0.13", features = ["ecdsa"] }
