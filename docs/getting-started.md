@@ -160,6 +160,8 @@ Run an agent with a session-scoped token managed by Opaque:
 ./target/release/opaque agent run -- codex
 ```
 
+By default, the child process receives only a baseline set of environment variables (e.g. `PATH`, `HOME`, `SHELL`) plus `OPAQUE_*` session vars. Use `--pass-env KEY` to forward additional variables, or `--inherit-env` to pass the full parent environment.
+
 Inspect and revoke active wrapper sessions:
 
 ```bash

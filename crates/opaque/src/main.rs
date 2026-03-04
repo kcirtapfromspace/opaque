@@ -29,6 +29,13 @@ const fn version_string() -> &'static str {
 /// Name of the daemon token file expected next to the socket.
 const DAEMON_TOKEN_FILENAME: &str = "daemon.token";
 
+/// Baseline environment variable keys forwarded to agent child processes
+/// when running in secure-by-default mode (i.e. without `--inherit-env`).
+const BASELINE_ENV_KEYS: &[&str] = &[
+    "PATH", "HOME", "USER", "SHELL", "TERM", "LANG", "LC_ALL",
+    "TMPDIR", "XDG_RUNTIME_DIR", "COLORTERM", "SSH_AUTH_SOCK",
+];
+
 #[derive(Debug, Parser)]
 #[command(name = "opaque", version = version_string())]
 struct Cli {
@@ -264,8 +271,17 @@ enum AgentAction {
         #[arg(long)]
         ttl_secs: Option<u64>,
 
-        /// Start the child with a reduced baseline environment.
+        /// Pass an additional environment variable to the child process.
+        /// Repeatable. Ignored when --inherit-env is set.
+        #[arg(long, value_name = "KEY")]
+        pass_env: Vec<String>,
+
+        /// Inherit the full parent environment instead of the secure baseline.
         #[arg(long, default_value_t = false)]
+        inherit_env: bool,
+
+        /// Deprecated: clean-env filtering is now the default.
+        #[arg(long, default_value_t = false, hide = true)]
         clean_env: bool,
 
         /// Agent command and args to run.
@@ -1292,7 +1308,8 @@ async fn run_agent_wrapped(
     sock: &PathBuf,
     command: &[String],
     ttl_secs: Option<u64>,
-    clean_env: bool,
+    inherit_env: bool,
+    pass_env: &[String],
     json_output: bool,
 ) -> Result<i32, String> {
     if command.is_empty() {
@@ -1342,9 +1359,14 @@ async fn run_agent_wrapped(
         child.args(&command[1..]);
     }
 
-    if clean_env {
+    if !inherit_env {
         child.env_clear();
-        for key in ["PATH", "HOME", "USER", "SHELL", "TERM", "LANG", "LC_ALL"] {
+        for key in BASELINE_ENV_KEYS {
+            if let Ok(val) = std::env::var(key) {
+                child.env(key, val);
+            }
+        }
+        for key in pass_env {
             if let Ok(val) = std::env::var(key) {
                 child.env(key, val);
             }
@@ -1896,12 +1918,25 @@ async fn main() {
         action:
             AgentAction::Run {
                 ttl_secs,
+                pass_env,
+                inherit_env,
                 clean_env,
                 command,
             },
     } = &cmd
     {
-        match run_agent_wrapped(&sock, command, *ttl_secs, *clean_env, json_output).await {
+        if *clean_env && !json_output {
+            ui::warn("--clean-env is deprecated; clean-env filtering is now the default");
+        }
+        for key in pass_env {
+            if !is_valid_env_name(key) {
+                ui::error(&format!("--pass-env '{key}': invalid env var name"));
+                std::process::exit(1);
+            }
+        }
+        match run_agent_wrapped(&sock, command, *ttl_secs, *inherit_env, pass_env, json_output)
+            .await
+        {
             Ok(code) => std::process::exit(code),
             Err(e) => {
                 ui::error(&e);

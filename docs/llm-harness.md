@@ -30,6 +30,20 @@ For stronger local isolation, launch the agent via wrapper mode:
 
 - `opaque agent run -- <agent-command ...>`
 
+By default, the agent wrapper starts the child process with a **clean environment** containing only a baseline set of variables (`PATH`, `HOME`, `USER`, `SHELL`, `TERM`, `LANG`, `LC_ALL`, `TMPDIR`, `XDG_RUNTIME_DIR`, `COLORTERM`, `SSH_AUTH_SOCK`) plus the `OPAQUE_*` session variables. This prevents secrets like `ANTHROPIC_API_KEY` or `DATABASE_URL` from leaking into the agent process.
+
+To pass additional environment variables selectively:
+
+```bash
+opaque agent run --pass-env EDITOR --pass-env VISUAL -- <agent-command ...>
+```
+
+To inherit the full parent environment (opt-in):
+
+```bash
+opaque agent run --inherit-env -- <agent-command ...>
+```
+
 This injects a session token used by Opaque handshakes. If `enforce_agent_sessions = true` is enabled in daemon config, non-session agent calls are rejected.
 
 ## Secret Inputs: Refs, Not Values
