@@ -29,11 +29,11 @@ pub fn peer_info_from_fd(fd: RawFd) -> io::Result<PeerInfo> {
         if rc != 0 {
             return Err(io::Error::last_os_error());
         }
-        return Ok(PeerInfo {
+        Ok(PeerInfo {
             pid: Some(ucred.pid),
             uid: ucred.uid,
             gid: ucred.gid,
-        });
+        })
     }
 
     #[cfg(target_os = "macos")]

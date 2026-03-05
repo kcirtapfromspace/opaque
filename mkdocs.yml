@@ -87,9 +87,7 @@ nav:
       - Security Assessment: security-assessment.md
       - Adversarial Review: adversarial-security-review-2026-02-14.md
       - Audit Analytics: audit-analytics.md
-      - Critique & Hardening: critique-prd-hardening.md
   - Architecture:
       - Design Notes: architecture.md
-      - Roadmap (Deferred): roadmap-deferred.md
   - Blog:
       - Why We Built Opaque: blog/why-we-built-opaque.md
