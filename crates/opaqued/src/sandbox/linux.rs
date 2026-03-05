@@ -42,6 +42,7 @@ pub enum SandboxError {
     Io(#[from] std::io::Error),
 
     #[error("namespace setup failed: {0}")]
+    #[allow(dead_code)]
     Namespace(String),
 }
 
@@ -121,15 +122,11 @@ fn detect_landlock() -> bool {
     // this will fail gracefully.
     let result = Ruleset::default()
         .handle_access(AccessFs::from_all(ABI::V3))
-        .map(|rs| {
+        .map(|_rs| {
             // We just need to check if creation succeeds; don't restrict anything.
-            drop(rs);
             true
         });
-    match result {
-        Ok(true) => true,
-        _ => false,
-    }
+    matches!(result, Ok(true))
 }
 
 /// Check if seccomp-bpf is available. On any remotely modern Linux (3.5+) it is.
@@ -174,6 +171,7 @@ fn protected_paths() -> Vec<PathBuf> {
 /// - No access to protected directories (~/.opaque, ~/.ssh, ~/.gnupg)
 ///
 /// Returns `true` if Landlock was successfully applied, `false` if not supported.
+#[allow(dead_code)]
 pub fn landlock_restrict(project_dir: &Path, extra_read_paths: &[PathBuf]) -> bool {
     use landlock::{
         ABI, Access, AccessFs, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
@@ -269,19 +267,19 @@ pub fn landlock_restrict(project_dir: &Path, extra_read_paths: &[PathBuf]) -> bo
 /// Build a Landlock ruleset configuration for inspection (used in tests).
 ///
 /// Returns the list of (path, writable) pairs that would be configured.
+#[allow(dead_code)]
 pub fn landlock_ruleset_paths(
     project_dir: &Path,
     extra_read_paths: &[PathBuf],
 ) -> Vec<(PathBuf, bool)> {
-    let mut paths = Vec::new();
-
-    // Global read-only.
-    paths.push((PathBuf::from("/"), false));
-
-    // Writable paths.
-    paths.push((project_dir.to_path_buf(), true));
-    paths.push((PathBuf::from("/tmp"), true));
-    paths.push((PathBuf::from("/var/tmp"), true));
+    let mut paths = vec![
+        // Global read-only.
+        (PathBuf::from("/"), false),
+        // Writable paths.
+        (project_dir.to_path_buf(), true),
+        (PathBuf::from("/tmp"), true),
+        (PathBuf::from("/var/tmp"), true),
+    ];
 
     // Extra read paths.
     for p in extra_read_paths {
@@ -302,6 +300,7 @@ pub fn landlock_ruleset_paths(
 /// Always blocks ptrace and io_uring syscalls.
 ///
 /// Returns `true` if the filter was applied, `false` if not available.
+#[allow(dead_code)]
 pub fn seccomp_restrict_network(network_blocked: bool) -> bool {
     use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, SeccompRule, TargetArch};
     use std::collections::BTreeMap;
@@ -389,6 +388,7 @@ pub fn seccomp_restrict_network(network_blocked: bool) -> bool {
 
 /// Build a list of syscalls that would be blocked for the given configuration.
 /// Used in tests to verify filter construction without actually applying it.
+#[allow(dead_code)]
 pub fn seccomp_blocked_syscalls(network_blocked: bool) -> Vec<i64> {
     let mut blocked = vec![
         libc::SYS_ptrace,
@@ -442,7 +442,7 @@ pub fn try_bubblewrap(config: &LinuxSandboxConfig) -> Option<tokio::process::Com
 ///
 /// This is separated from `try_bubblewrap` so it can be tested independently.
 pub fn build_bubblewrap_args(config: &LinuxSandboxConfig) -> Vec<String> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    let _home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
     let protected = protected_paths();
 
     let mut args: Vec<String> = Vec::new();

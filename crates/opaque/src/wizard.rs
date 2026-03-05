@@ -986,6 +986,17 @@ fn register_mcp_codex(config_file: &Path, opaque_mcp_path: &Path) -> Result<(), 
     Ok(())
 }
 
+/// Check whether config already exists (helper extracted for testability).
+fn check_existing_config(config_path: &Path, force: bool) -> Result<(), String> {
+    if config_path.exists() && !force {
+        return Err(format!(
+            "config already exists at {} (use --force to overwrite)",
+            config_path.display()
+        ));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1748,15 +1759,4 @@ mod tests {
     fn test_provider_type_all_covered() {
         assert_eq!(ProviderType::ALL.len(), 6);
     }
-}
-
-/// Check whether config already exists (helper extracted for testability).
-fn check_existing_config(config_path: &Path, force: bool) -> Result<(), String> {
-    if config_path.exists() && !force {
-        return Err(format!(
-            "config already exists at {} (use --force to overwrite)",
-            config_path.display()
-        ));
-    }
-    Ok(())
 }

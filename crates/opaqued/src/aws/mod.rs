@@ -590,6 +590,7 @@ impl OperationHandler for AwsHandler {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use opaque_core::audit::InMemoryAuditEmitter;

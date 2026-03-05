@@ -155,12 +155,12 @@ fn launch_approve_helper(reason: &str) -> Result<bool, ApprovalError> {
 #[cfg(target_os = "linux")]
 fn find_approve_helper() -> Result<std::path::PathBuf, ApprovalError> {
     // Next to the daemon binary (works during development and standard installs).
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let helper = dir.join("opaque-approve-helper");
-            if helper.exists() {
-                return Ok(helper);
-            }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let helper = dir.join("opaque-approve-helper");
+        if helper.exists() {
+            return Ok(helper);
         }
     }
 

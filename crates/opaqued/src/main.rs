@@ -1389,7 +1389,7 @@ fn build_client_identity(peer: Option<&opaque_core::peer::PeerInfo>) -> ClientId
 fn exe_path_for_pid(pid: i32) -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
-        return std::fs::read_link(format!("/proc/{pid}/exe")).ok();
+        std::fs::read_link(format!("/proc/{pid}/exe")).ok()
     }
 
     #[cfg(target_os = "macos")]
@@ -1456,7 +1456,7 @@ fn safe_command(bin: &str) -> std::process::Command {
 fn read_client_cwd(pid: i32) -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
-        return std::fs::read_link(format!("/proc/{pid}/cwd")).ok();
+        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
     }
 
     #[cfg(target_os = "macos")]
