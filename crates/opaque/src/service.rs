@@ -467,20 +467,18 @@ pub fn query_status() -> ServiceStatus {
                 "--property=ActiveState,MainPID",
             ])
             .output()
+        && output.status.success()
     {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                if let Some(state) = line.strip_prefix("ActiveState=") {
-                    running = state == "active";
-                }
-                if let Some(pid_str) = line.strip_prefix("MainPID=")
-                    && let Ok(p) = pid_str.parse::<u32>()
-                {
-                    if p > 0 {
-                        pid = Some(p);
-                    }
-                }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            if let Some(state) = line.strip_prefix("ActiveState=") {
+                running = state == "active";
+            }
+            if let Some(pid_str) = line.strip_prefix("MainPID=")
+                && let Ok(p) = pid_str.parse::<u32>()
+                && p > 0
+            {
+                pid = Some(p);
             }
         }
     }
