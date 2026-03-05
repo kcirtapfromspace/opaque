@@ -24,7 +24,7 @@ strip = true
 bytes = "1.10.1"
 clap = { version = "4.5.30", features = ["derive"] }
 futures-util = { version = "0.3.30", features = ["sink"] }
-getrandom = "0.3"
+getrandom = "0.4"
 glob-match = "0.2.1"
 jsonschema = "0.28"
 libc = "0.2.170"
