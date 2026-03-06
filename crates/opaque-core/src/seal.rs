@@ -105,7 +105,20 @@ pub fn verify_seal(config_bytes: &[u8], seal_file: &Path) -> Result<SealStatus, 
         };
     }
 
-    // Fall back to file.
+    verify_against_file(&actual, seal_file)
+}
+
+/// Verify config bytes against the seal file only (no keychain).
+///
+/// Use this when you need verification isolated from system keychain state,
+/// e.g. in tests or when operating on config files outside the default location.
+pub fn verify_seal_from_file(config_bytes: &[u8], seal_file: &Path) -> Result<SealStatus, SealError> {
+    let actual = compute_seal(config_bytes);
+    verify_against_file(&actual, seal_file)
+}
+
+/// Check computed hash against the seal file.
+fn verify_against_file(actual: &str, seal_file: &Path) -> Result<SealStatus, SealError> {
     if seal_file.exists() {
         let expected = std::fs::read_to_string(seal_file)
             .map(|s| s.trim().to_string())
@@ -113,10 +126,13 @@ pub fn verify_seal(config_bytes: &[u8], seal_file: &Path) -> Result<SealStatus, 
                 SealError::IoError(format!("failed to read {}: {e}", seal_file.display()))
             })?;
 
-        return if expected == actual {
+        return if expected == *actual {
             Ok(SealStatus::Verified)
         } else {
-            Ok(SealStatus::Tampered { expected, actual })
+            Ok(SealStatus::Tampered {
+                expected,
+                actual: actual.to_string(),
+            })
         };
     }
 

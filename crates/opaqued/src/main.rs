@@ -244,6 +244,9 @@ fn verify_config_seal(require_seal: bool, allow_unsealed: bool) -> std::io::Resu
 }
 
 /// Core seal-check logic, separated from env-var resolution for testability.
+///
+/// Uses keychain + file verification in production. Tests should call
+/// `check_seal_file_only` to avoid dependence on system keychain state.
 fn check_seal(
     config_path: &Path,
     seal_file: &Path,
@@ -276,6 +279,56 @@ fn check_seal(
                 warn!("config is unsealed — continuing because --allow-unsealed was passed");
             } else {
                 warn!("config is unsealed — run 'opaque setup --seal' to protect it");
+            }
+        }
+        Ok(SealStatus::Tampered { .. }) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "config seal broken — config.toml was modified after sealing. \
+                 Run 'opaque setup --reset' to unseal, then reconfigure.",
+            ));
+        }
+        Err(e) => {
+            return Err(std::io::Error::other(format!(
+                "config seal check failed: {e}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// File-only variant of `check_seal` for testing.
+///
+/// Skips the OS keychain lookup so tests are not affected by stale keychain
+/// entries from real `opaque setup --seal` runs on this machine.
+#[cfg(test)]
+fn check_seal_file_only(
+    config_path: &Path,
+    seal_file: &Path,
+    require_seal: bool,
+    allow_unsealed: bool,
+) -> std::io::Result<()> {
+    use opaque_core::seal::{self, SealStatus};
+
+    if !config_path.exists() {
+        return Ok(());
+    }
+
+    let config_bytes = std::fs::read(config_path)?;
+
+    match seal::verify_seal_from_file(&config_bytes, seal_file) {
+        Ok(SealStatus::Verified) => {
+            info!("config seal verified (file-only)");
+        }
+        Ok(SealStatus::Unsealed) => {
+            if require_seal && !allow_unsealed {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "config is unsealed but require_seal is enabled. \
+                     Seal your config with 'opaque setup --seal' or \
+                     start the daemon with '--allow-unsealed' for development use.",
+                ));
             }
         }
         Ok(SealStatus::Tampered { .. }) => {
@@ -4274,7 +4327,7 @@ exe_sha256 = "deadbeef"
     #[test]
     fn seal_require_true_and_sealed_succeeds() {
         let (_dir, config_path, seal_file) = setup_seal_test("[daemon]\n", true);
-        let result = check_seal(&config_path, &seal_file, true, false);
+        let result = check_seal_file_only(&config_path, &seal_file, true, false);
         assert!(
             result.is_ok(),
             "sealed config with require_seal=true should succeed"
@@ -4284,7 +4337,7 @@ exe_sha256 = "deadbeef"
     #[test]
     fn seal_require_true_and_unsealed_fails() {
         let (_dir, config_path, seal_file) = setup_seal_test("[daemon]\n", false);
-        let result = check_seal(&config_path, &seal_file, true, false);
+        let result = check_seal_file_only(&config_path, &seal_file, true, false);
         assert!(
             result.is_err(),
             "unsealed config with require_seal=true should fail"
@@ -4309,7 +4362,7 @@ exe_sha256 = "deadbeef"
     #[test]
     fn seal_require_true_allow_unsealed_succeeds() {
         let (_dir, config_path, seal_file) = setup_seal_test("[daemon]\n", false);
-        let result = check_seal(&config_path, &seal_file, true, true);
+        let result = check_seal_file_only(&config_path, &seal_file, true, true);
         assert!(
             result.is_ok(),
             "unsealed config with require_seal=true + allow_unsealed should succeed"
@@ -4319,7 +4372,7 @@ exe_sha256 = "deadbeef"
     #[test]
     fn seal_require_false_default_unsealed_succeeds() {
         let (_dir, config_path, seal_file) = setup_seal_test("[daemon]\n", false);
-        let result = check_seal(&config_path, &seal_file, false, false);
+        let result = check_seal_file_only(&config_path, &seal_file, false, false);
         assert!(
             result.is_ok(),
             "unsealed config with require_seal=false should succeed (backward compat)"
@@ -4369,12 +4422,12 @@ exe_sha256 = "deadbeef"
         std::fs::write(&config_path, "[daemon]\nrequire_seal = true\n").unwrap();
 
         // Should fail with require_seal=false.
-        let result = check_seal(&config_path, &seal_file, false, false);
+        let result = check_seal_file_only(&config_path, &seal_file, false, false);
         assert!(result.is_err(), "tampered config should always fail");
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
 
         // Should fail even with allow_unsealed=true.
-        let result = check_seal(&config_path, &seal_file, false, true);
+        let result = check_seal_file_only(&config_path, &seal_file, false, true);
         assert!(
             result.is_err(),
             "tampered config should fail even with allow_unsealed"
@@ -4388,7 +4441,7 @@ exe_sha256 = "deadbeef"
         let seal_file = dir.path().join("config.seal");
 
         // Even with require_seal=true, if there's no config file it's OK.
-        let result = check_seal(&config_path, &seal_file, true, false);
+        let result = check_seal_file_only(&config_path, &seal_file, true, false);
         assert!(
             result.is_ok(),
             "missing config file should not cause seal failure"

@@ -11,14 +11,125 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
+use tracing::{info, warn};
 
 use opaque_core::proto::{ExecFrame, ExecStream};
 
 /// Maximum output chunk size sent per frame (16 KB).
 const OUTPUT_CHUNK_SIZE: usize = 16 * 1024;
+
+// ---------------------------------------------------------------------------
+// Sandbox capability detection (mirrors Linux SandboxCapabilities pattern)
+// ---------------------------------------------------------------------------
+
+/// Detected macOS sandbox capabilities, cached for process lifetime.
+#[derive(Debug, Clone)]
+pub struct MacOSSandboxCapabilities {
+    /// Darwin major version (e.g. 24 for macOS 15, 25 for macOS 26).
+    pub darwin_major: Option<u32>,
+    /// Whether `sandbox-exec` works on this system.
+    pub sandbox_exec_works: bool,
+}
+
+/// Cached capabilities — computed once, reused for the process lifetime.
+static CAPABILITIES: OnceLock<MacOSSandboxCapabilities> = OnceLock::new();
+
+impl MacOSSandboxCapabilities {
+    /// Detect macOS sandbox capabilities (cached after first call).
+    pub fn detect() -> &'static Self {
+        CAPABILITIES.get_or_init(|| {
+            let darwin_major = detect_darwin_major();
+            let sandbox_exec_works = probe_sandbox_exec();
+            let caps = Self {
+                darwin_major,
+                sandbox_exec_works,
+            };
+            caps.log_capabilities();
+            caps
+        })
+    }
+
+    /// Log detected capabilities at info level.
+    fn log_capabilities(&self) {
+        info!(
+            darwin_major = ?self.darwin_major,
+            sandbox_exec_works = self.sandbox_exec_works,
+            "macOS sandbox capabilities detected"
+        );
+    }
+}
+
+/// Parse the Darwin major version from `uname -r` output (e.g. "25.1.0" → 25).
+fn detect_darwin_major() -> Option<u32> {
+    let output = std::process::Command::new("uname")
+        .arg("-r")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let version = String::from_utf8_lossy(&output.stdout);
+    version.trim().split('.').next()?.parse().ok()
+}
+
+/// Probe whether `sandbox-exec` actually works by running a trivial command.
+///
+/// On macOS 26 (Darwin 25.x), `sandbox-exec` returns exit code 65 for ALL
+/// commands due to Apple changing seatbelt internals.
+pub fn probe_sandbox_exec() -> bool {
+    // Write a trivial seatbelt profile.
+    let profile_content = "(version 1)\n(allow default)\n";
+    let dir = std::env::temp_dir();
+    let profile_path = dir.join(format!("opaque-sandbox-probe-{}.sb", std::process::id()));
+
+    if std::fs::write(&profile_path, profile_content).is_err() {
+        return false;
+    }
+
+    let result = std::process::Command::new("sandbox-exec")
+        .args(["-f", &profile_path.to_string_lossy()])
+        .arg("--")
+        .args(["/bin/echo", "probe"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    let _ = std::fs::remove_file(&profile_path);
+
+    match result {
+        Ok(status) => {
+            if status.success() {
+                true
+            } else {
+                let code = status.code().unwrap_or(-1);
+                if code == 65 {
+                    warn!(
+                        "sandbox-exec returned exit code 65 — Apple seatbelt internals \
+                         changed in this macOS version, falling back to direct execution"
+                    );
+                } else {
+                    warn!(
+                        exit_code = code,
+                        "sandbox-exec probe failed with unexpected exit code"
+                    );
+                }
+                false
+            }
+        }
+        Err(e) => {
+            warn!("sandbox-exec not found or cannot execute: {e}");
+            false
+        }
+    }
+}
 
 /// Errors from macOS sandbox execution.
 #[derive(Debug, thiserror::Error)]
@@ -136,6 +247,10 @@ fn escape_seatbelt_string(s: &str) -> String {
 
 /// Execute a command inside a macOS sandbox.
 ///
+/// Probes sandbox-exec availability first. If sandbox-exec is broken (e.g.
+/// macOS 26 / Darwin 25.x returning exit code 65), falls back to
+/// `execute_direct()` for environment-sanitized but unsandboxed execution.
+///
 /// Sends streaming `ExecFrame` messages through the provided channel.
 /// Returns the child's exit code.
 pub async fn execute(
@@ -144,6 +259,24 @@ pub async fn execute(
 ) -> Result<i32, SandboxError> {
     if config.command.is_empty() {
         return Err(SandboxError::Setup("empty command".into()));
+    }
+
+    // Probe sandbox-exec availability (cached).
+    let caps = MacOSSandboxCapabilities::detect();
+    if !caps.sandbox_exec_works {
+        info!(
+            darwin_major = ?caps.darwin_major,
+            "sandbox-exec unavailable, falling back to direct execution"
+        );
+        return super::execute_direct(
+            &config.command,
+            config.env,
+            config.timeout_secs,
+            config.max_output_bytes,
+            tx,
+        )
+        .await
+        .map_err(|e| SandboxError::Setup(format!("direct execution fallback failed: {e}")));
     }
 
     // Generate and write the Seatbelt profile to a temp file.
@@ -431,5 +564,30 @@ mod tests {
         let result = execute(config, tx).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("empty command"));
+    }
+
+    #[test]
+    fn detect_darwin_major_returns_a_number() {
+        // On macOS, this should always return Some with a reasonable value.
+        let version = detect_darwin_major();
+        assert!(version.is_some(), "should detect Darwin major version");
+        let major = version.unwrap();
+        // Darwin major version should be reasonable (20+ for macOS 11+).
+        assert!(major >= 20, "Darwin major {major} seems too low");
+    }
+
+    #[test]
+    fn capabilities_detect_is_deterministic() {
+        // Calling detect() multiple times returns the same cached result.
+        let caps1 = MacOSSandboxCapabilities::detect();
+        let caps2 = MacOSSandboxCapabilities::detect();
+        assert_eq!(caps1.darwin_major, caps2.darwin_major);
+        assert_eq!(caps1.sandbox_exec_works, caps2.sandbox_exec_works);
+    }
+
+    #[test]
+    fn probe_sandbox_exec_returns_bool() {
+        // Should not panic regardless of macOS version.
+        let _works = probe_sandbox_exec();
     }
 }

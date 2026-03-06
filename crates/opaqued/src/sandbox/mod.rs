@@ -34,6 +34,16 @@ use crate::enclave::OperationHandler;
 use crate::secret::SecretValue;
 use resolve::{CompositeResolver, resolve_all};
 
+/// Errors from direct (unsandboxed) execution.
+#[derive(Debug, thiserror::Error)]
+pub enum DirectExecError {
+    #[error("configuration error: {0}")]
+    Configuration(String),
+
+    #[error("execution error: {0}")]
+    Execution(String),
+}
+
 /// The sandbox executor handles `sandbox.exec` operations.
 ///
 /// It loads profiles, resolves secrets, dispatches to the platform sandbox,
@@ -235,13 +245,162 @@ impl OperationHandler for SandboxExecutor {
     }
 }
 
+/// Execute a command without platform sandbox, but with environment sanitization.
+///
+/// Clears inherited environment, sets restricted PATH and HOME, injects only
+/// the profile's env vars, and enforces timeouts. OPAQUE_SOCK is never set.
+pub async fn execute_direct(
+    command: &[String],
+    env: HashMap<String, String>,
+    timeout_secs: u64,
+    max_output_bytes: usize,
+    tx: mpsc::Sender<ExecFrame>,
+) -> Result<i32, DirectExecError> {
+    use tokio::io::AsyncReadExt;
+    use tokio::process::Command;
+
+    if command.is_empty() {
+        return Err(DirectExecError::Configuration("empty command".into()));
+    }
+
+    let mut cmd = Command::new(&command[0]);
+    cmd.args(&command[1..]);
+
+    // Clear environment completely.
+    cmd.env_clear();
+
+    // Restricted PATH — no user-specific dirs.
+    cmd.env("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin");
+    cmd.env("HOME", "/tmp");
+
+    // Inject profile env vars, but never OPAQUE_SOCK.
+    for (k, v) in &env {
+        if k != "OPAQUE_SOCK" {
+            cmd.env(k, v);
+        }
+    }
+
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| DirectExecError::Execution(format!("spawn failed: {e}")))?;
+
+    let pid = child.id().unwrap_or(0);
+    let _ = tx.send(ExecFrame::ExecStarted { pid }).await;
+
+    let start = std::time::Instant::now();
+    let mut total_bytes = 0usize;
+
+    let mut stdout = child.stdout.take().expect("stdout piped");
+    let mut stderr = child.stderr.take().expect("stderr piped");
+
+    let timeout = tokio::time::Duration::from_secs(timeout_secs);
+    let mut stdout_buf = vec![0u8; 16384];
+    let mut stderr_buf = vec![0u8; 16384];
+    let mut stdout_done = false;
+    let mut stderr_done = false;
+
+    let exit_code = loop {
+        tokio::select! {
+            result = stdout.read(&mut stdout_buf), if !stdout_done => {
+                match result {
+                    Ok(0) => stdout_done = true,
+                    Ok(n) => {
+                        total_bytes += n;
+                        if total_bytes <= max_output_bytes {
+                            if let Ok(s) = String::from_utf8(stdout_buf[..n].to_vec()) {
+                                let _ = tx.send(ExecFrame::Output {
+                                    stream: opaque_core::proto::ExecStream::Stdout,
+                                    data: s,
+                                }).await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("stdout read error: {e}");
+                        stdout_done = true;
+                    }
+                }
+            }
+            result = stderr.read(&mut stderr_buf), if !stderr_done => {
+                match result {
+                    Ok(0) => stderr_done = true,
+                    Ok(n) => {
+                        total_bytes += n;
+                        if total_bytes <= max_output_bytes {
+                            if let Ok(s) = String::from_utf8(stderr_buf[..n].to_vec()) {
+                                let _ = tx.send(ExecFrame::Output {
+                                    stream: opaque_core::proto::ExecStream::Stderr,
+                                    data: s,
+                                }).await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("stderr read error: {e}");
+                        stderr_done = true;
+                    }
+                }
+            }
+            _ = tokio::time::sleep(timeout), if !stdout_done || !stderr_done => {
+                tracing::warn!("execute_direct: timeout after {timeout_secs}s, killing process");
+                let _ = child.kill().await;
+                let duration_ms = start.elapsed().as_millis() as u64;
+                let _ = tx.send(ExecFrame::ExecCompleted {
+                    exit_code: -1,
+                    duration_ms,
+                }).await;
+                return Ok(-1);
+            }
+            status = child.wait(), if stdout_done && stderr_done => {
+                match status {
+                    Ok(s) => break s.code().unwrap_or(-1),
+                    Err(e) => return Err(DirectExecError::Execution(format!("wait failed: {e}"))),
+                }
+            }
+        }
+    };
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+    let _ = tx
+        .send(ExecFrame::ExecCompleted {
+            exit_code,
+            duration_ms,
+        })
+        .await;
+
+    Ok(exit_code)
+}
+
 /// Dispatch to the platform-specific sandbox executor.
+///
+/// When `profile.sandbox` is `false`, bypasses the platform sandbox and uses
+/// `execute_direct()` instead (environment sanitization only).
 async fn execute_platform_sandbox(
     profile: &ExecProfile,
     command: Vec<String>,
     env: HashMap<String, String>,
     tx: mpsc::Sender<ExecFrame>,
 ) -> Result<i32, String> {
+    // Bypass platform sandbox when the profile disables it.
+    if !profile.sandbox {
+        tracing::info!(
+            profile = %profile.name,
+            "sandbox disabled for profile, using direct execution"
+        );
+        return execute_direct(
+            &command,
+            env,
+            profile.limits.timeout_secs,
+            profile.limits.max_output_bytes,
+            tx,
+        )
+        .await
+        .map_err(|e| format!("direct execution failed: {e}"));
+    }
+
     #[cfg(target_os = "linux")]
     {
         let config = linux::LinuxSandboxConfig {
@@ -298,6 +457,7 @@ mod tests {
         ExecProfile {
             name: "test".into(),
             description: None,
+            sandbox: true,
             project_dir: PathBuf::from("/tmp"),
             extra_read_paths: vec![],
             network: opaque_core::profile::NetworkConfig { allow: vec![] },

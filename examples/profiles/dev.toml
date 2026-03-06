@@ -6,6 +6,7 @@
 [profile]
 name = "dev"
 description = "Development sandbox example"
+# sandbox = true  # Set to false to disable platform sandbox (macOS seatbelt / Linux bubblewrap)
 project_dir = "/home/user/src/myproject"
 extra_read_paths = []
 

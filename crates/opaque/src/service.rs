@@ -166,6 +166,8 @@ fn generate_service_file(opaqued_path: &Path) -> String {
     // Ensure log directory exists.
     let _ = std::fs::create_dir_all(&log_dir);
 
+    let daemon_path = detect_daemon_path();
+
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -189,6 +191,8 @@ fn generate_service_file(opaqued_path: &Path) -> String {
     <dict>
         <key>RUST_LOG</key>
         <string>info</string>
+        <key>PATH</key>
+        <string>{}</string>
     </dict>
 </dict>
 </plist>
@@ -196,6 +200,7 @@ fn generate_service_file(opaqued_path: &Path) -> String {
         opaqued_path.display(),
         log_dir.display(),
         log_dir.display(),
+        daemon_path,
     )
 }
 
@@ -358,6 +363,8 @@ fn service_file_path() -> PathBuf {
 
 #[cfg(target_os = "linux")]
 fn generate_service_file(opaqued_path: &Path) -> String {
+    let daemon_path = detect_daemon_path();
+
     format!(
         r#"[Unit]
 Description=Opaque Daemon
@@ -370,11 +377,13 @@ ExecStart={}
 Restart=on-failure
 RestartSec=5
 Environment=RUST_LOG=info
+Environment=PATH={}
 
 [Install]
 WantedBy=default.target
 "#,
-        opaqued_path.display()
+        opaqued_path.display(),
+        daemon_path,
     )
 }
 
@@ -561,6 +570,33 @@ fn show_logs() -> Result<(), String> {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Build a PATH string for the daemon that includes common tool directories.
+///
+/// Probes for existing directories and appends them to the standard system PATH.
+fn detect_daemon_path() -> String {
+    let extra_dirs = [
+        "/opt/homebrew/bin",                 // Homebrew on Apple Silicon
+        "/opt/homebrew/sbin",                // Homebrew sbin on Apple Silicon
+        "/usr/local/bin",                    // Homebrew on Intel / manual installs
+        "/opt/local/bin",                    // MacPorts
+        "/opt/local/sbin",                   // MacPorts sbin
+        "/nix/var/nix/profiles/default/bin", // Nix
+    ];
+
+    let base = "/usr/bin:/bin:/usr/sbin:/sbin";
+
+    let mut parts: Vec<&str> = Vec::new();
+    for dir in &extra_dirs {
+        if std::path::Path::new(dir).is_dir() {
+            parts.push(dir);
+        }
+    }
+    // Always include base paths
+    parts.push(base);
+
+    parts.join(":")
+}
+
 /// Find the `opaqued` binary. Checks:
 /// 1. Same directory as the current executable (cargo build layout)
 /// 2. `which opaqued` on PATH
@@ -645,6 +681,43 @@ mod tests {
         // the current exe. In test context, this may or may not find it
         // depending on the build state. We just verify it doesn't panic.
         let _ = find_opaqued();
+    }
+
+    #[test]
+    fn detect_daemon_path_includes_base_paths() {
+        let path = detect_daemon_path();
+        assert!(
+            path.contains("/usr/bin:/bin"),
+            "expected /usr/bin:/bin in daemon PATH, got: {path}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn generate_plist_contains_path_env() {
+        let content = generate_service_file(Path::new("/usr/local/bin/opaqued"));
+        assert!(
+            content.contains("<key>PATH</key>"),
+            "expected PATH key in plist"
+        );
+        assert!(
+            content.contains("/usr/bin:/bin"),
+            "expected base PATH directories in plist"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn generate_unit_contains_path_env() {
+        let content = generate_service_file(Path::new("/usr/local/bin/opaqued"));
+        assert!(
+            content.contains("Environment=PATH="),
+            "expected Environment=PATH= in systemd unit"
+        );
+        assert!(
+            content.contains("/usr/bin:/bin"),
+            "expected base PATH directories in systemd unit"
+        );
     }
 
     #[test]

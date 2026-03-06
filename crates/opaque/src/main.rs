@@ -3595,6 +3595,57 @@ fn run_setup(seal_only: bool, reset: bool, verify: bool) -> Result<(), String> {
     run_setup_wizard(&base, &config_path, &seal_file)
 }
 
+/// Discover all installed opaque binary paths for human client registration.
+///
+/// Checks: current exe (canonicalized), well-known install locations, and PATH lookup.
+/// Returns deduplicated list of (display_name, canonical_path) pairs.
+fn discover_opaque_paths() -> Vec<(String, PathBuf)> {
+    let mut seen = HashSet::new();
+    let mut results = Vec::new();
+
+    // 1. Current executable (canonicalized)
+    if let Ok(exe) = std::env::current_exe() {
+        if let Ok(canonical) = exe.canonicalize() {
+            if canonical.exists() && seen.insert(canonical.clone()) {
+                let name = if canonical.to_string_lossy().contains("target/") {
+                    "opaque-cli (debug build)"
+                } else {
+                    "opaque-cli"
+                };
+                results.push((name.to_string(), canonical));
+            }
+        }
+    }
+
+    // 2. Well-known install locations
+    let well_known = ["/usr/local/bin/opaque", "/opt/homebrew/bin/opaque"];
+    for path_str in &well_known {
+        let path = PathBuf::from(path_str);
+        if let Ok(canonical) = path.canonicalize() {
+            if canonical.exists() && seen.insert(canonical.clone()) {
+                results.push(("opaque-cli".to_string(), canonical));
+            }
+        }
+    }
+
+    // 3. PATH lookup via `which`
+    if let Ok(output) = std::process::Command::new("which").arg("opaque").output() {
+        if output.status.success() {
+            let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path_str.is_empty() {
+                let path = PathBuf::from(&path_str);
+                if let Ok(canonical) = path.canonicalize() {
+                    if canonical.exists() && seen.insert(canonical.clone()) {
+                        results.push(("opaque-cli".to_string(), canonical));
+                    }
+                }
+            }
+        }
+    }
+
+    results
+}
+
 /// Interactive onboarding wizard.
 fn run_setup_wizard(base: &Path, config_path: &Path, seal_file: &Path) -> Result<(), String> {
     use dialoguer::{Confirm, Input, MultiSelect};
@@ -3617,14 +3668,14 @@ fn run_setup_wizard(base: &Path, config_path: &Path, seal_file: &Path) -> Result
     // Step 1: Human Clients
     println!("  {}", style("Step 1: Human Clients").bold().underlined());
 
-    let current_exe = std::env::current_exe()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default();
-
+    let discovered = discover_opaque_paths();
     let mut clients: Vec<setup::HumanClientConfig> = Vec::new();
 
-    if !current_exe.is_empty() {
-        println!("  Detected: {}", style(&current_exe).cyan());
+    if discovered.is_empty() {
+        println!("  No opaque binaries detected automatically.");
+    } else if discovered.len() == 1 {
+        let (name, path) = &discovered[0];
+        println!("  Detected: {}", style(path.display()).cyan());
         let register = Confirm::new()
             .with_prompt("  Register this binary as a trusted human client?")
             .default(true)
@@ -3633,9 +3684,52 @@ fn run_setup_wizard(base: &Path, config_path: &Path, seal_file: &Path) -> Result
 
         if register {
             clients.push(setup::HumanClientConfig {
-                name: "opaque-cli".into(),
-                exe_path: current_exe,
+                name: name.clone(),
+                exe_path: path.to_string_lossy().into_owned(),
             });
+        }
+    } else {
+        println!("  Found opaque binaries:");
+        for (i, (name, path)) in discovered.iter().enumerate() {
+            let label = if name.contains("debug") {
+                format!("{} (debug build)", path.display())
+            } else {
+                format!("{}", path.display())
+            };
+            println!("    [{}] {}", i + 1, style(&label).cyan());
+        }
+        println!();
+
+        let register_all = Confirm::new()
+            .with_prompt("  Register all found paths as trusted clients?")
+            .default(true)
+            .interact()
+            .map_err(|e| format!("input error: {e}"))?;
+
+        if register_all {
+            for (name, path) in &discovered {
+                clients.push(setup::HumanClientConfig {
+                    name: name.clone(),
+                    exe_path: path.to_string_lossy().into_owned(),
+                });
+            }
+        } else {
+            // Let user pick individually
+            for (name, path) in &discovered {
+                let prompt = format!("  Register {}?", path.display());
+                let register = Confirm::new()
+                    .with_prompt(&prompt)
+                    .default(true)
+                    .interact()
+                    .map_err(|e| format!("input error: {e}"))?;
+
+                if register {
+                    clients.push(setup::HumanClientConfig {
+                        name: name.clone(),
+                        exe_path: path.to_string_lossy().into_owned(),
+                    });
+                }
+            }
         }
     }
 
@@ -4338,6 +4432,87 @@ async fn run_doctor() {
         doctor_info("No audit database (created on first daemon run)");
     }
 
+    // 12. Sandbox probe (macOS)
+    #[cfg(target_os = "macos")]
+    {
+        // Probe sandbox-exec the same way the daemon does at runtime.
+        let sandbox_works = doctor_probe_sandbox_exec();
+        if sandbox_works {
+            doctor_pass("sandbox-exec is functional on this macOS version");
+            pass_count += 1;
+        } else {
+            doctor_warn(
+                "sandbox-exec is broken on this macOS version — profiles with sandbox = true \
+                 will fall back to unsandboxed execution. Set sandbox = false in profiles to \
+                 suppress the fallback warning",
+            );
+            warn_count += 1;
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        doctor_skip("Sandbox probe (macOS only)");
+    }
+
+    // 13. Service file PATH check
+    {
+        let svc_status = service::query_status();
+        if svc_status.installed && svc_status.service_file.exists() {
+            match std::fs::read_to_string(&svc_status.service_file) {
+                Ok(contents) => {
+                    // Check for PATH in the service file (plist or systemd unit).
+                    let has_path = if cfg!(target_os = "macos") {
+                        contents.contains("<key>PATH</key>")
+                    } else {
+                        contents.contains("Environment=PATH=")
+                    };
+                    if has_path {
+                        doctor_pass("Service file includes PATH environment variable");
+                        pass_count += 1;
+                    } else {
+                        doctor_warn(
+                            "Service file missing PATH — run 'opaque service uninstall && \
+                             opaque service install' to regenerate",
+                        );
+                        warn_count += 1;
+                    }
+                }
+                Err(e) => {
+                    doctor_warn(&format!("Cannot read service file: {e}"));
+                    warn_count += 1;
+                }
+            }
+        } else {
+            doctor_skip("Service file PATH check (service not installed)");
+        }
+    }
+
+    // 14. known_human_clients match
+    if config_path.exists() {
+        if let Ok(contents) = std::fs::read_to_string(&config_path) {
+            let current_exe = std::env::current_exe().ok();
+            let canonical_exe = current_exe.as_ref().and_then(|p| p.canonicalize().ok());
+            if let Some(exe) = &canonical_exe {
+                let exe_str = exe.to_string_lossy();
+                if contents.contains(&*exe_str) {
+                    doctor_pass("Current binary is registered in known_human_clients");
+                    pass_count += 1;
+                } else {
+                    doctor_warn(&format!(
+                        "Current binary ({}) not found in known_human_clients — \
+                         run 'opaque setup' to register",
+                        exe.display()
+                    ));
+                    warn_count += 1;
+                }
+            } else {
+                doctor_skip("known_human_clients match (cannot determine current exe)");
+            }
+        }
+    } else {
+        doctor_skip("known_human_clients match (no config file)");
+    }
+
     // Summary
     println!();
     println!("  {}", style("────────────────────────────────").dim());
@@ -4507,6 +4682,35 @@ fn parse_version_from_output(output: &str, binary_name: &str) -> Option<String> 
         }
     }
     None
+}
+
+/// Probe whether sandbox-exec works on this macOS version.
+///
+/// Mirrors the probe in `opaqued::sandbox::macos::probe_sandbox_exec()`.
+#[cfg(target_os = "macos")]
+fn doctor_probe_sandbox_exec() -> bool {
+    let profile_content = "(version 1)\n(allow default)\n";
+    let dir = std::env::temp_dir();
+    let profile_path = dir.join(format!(
+        "opaque-doctor-probe-{}.sb",
+        std::process::id()
+    ));
+
+    if std::fs::write(&profile_path, profile_content).is_err() {
+        return false;
+    }
+
+    let result = std::process::Command::new("sandbox-exec")
+        .args(["-f", &profile_path.to_string_lossy()])
+        .arg("--")
+        .args(["/bin/echo", "probe"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    let _ = std::fs::remove_file(&profile_path);
+
+    matches!(result, Ok(status) if status.success())
 }
 
 fn doctor_pass(msg: &str) {
@@ -6420,6 +6624,30 @@ BAZ=
         assert!(
             content.contains("[\"local_bio\"]"),
             "should require local_bio factor"
+        );
+    }
+
+    #[test]
+    fn discover_opaque_paths_finds_current_exe() {
+        let paths = discover_opaque_paths();
+        assert!(
+            !paths.is_empty(),
+            "discover_opaque_paths should find at least the current executable"
+        );
+        // The first entry should always be the current exe
+        let (_name, path) = &paths[0];
+        assert!(path.exists(), "discovered path should exist: {}", path.display());
+    }
+
+    #[test]
+    fn discover_opaque_paths_returns_canonical_deduplicated() {
+        let paths = discover_opaque_paths();
+        let canonical_paths: Vec<_> = paths.iter().map(|(_, p)| p.clone()).collect();
+        let unique: HashSet<_> = canonical_paths.iter().collect();
+        assert_eq!(
+            canonical_paths.len(),
+            unique.len(),
+            "discovered paths should be deduplicated"
         );
     }
 }

@@ -25,6 +25,12 @@ pub struct ExecProfile {
     #[serde(default)]
     pub description: Option<String>,
 
+    /// Whether to use platform sandbox (macOS seatbelt / Linux bubblewrap).
+    /// Defaults to `true`. Set to `false` to run with environment sanitization
+    /// only (restricted PATH, cleared env, no OPAQUE_SOCK).
+    #[serde(default = "default_sandbox")]
+    pub sandbox: bool,
+
     /// Project directory to bind-mount read-only inside the sandbox.
     pub project_dir: PathBuf,
 
@@ -48,6 +54,10 @@ pub struct ExecProfile {
     /// Resource limits for the sandbox.
     #[serde(default)]
     pub limits: LimitsConfig,
+}
+
+fn default_sandbox() -> bool {
+    true
 }
 
 /// Network access configuration for a sandbox.
@@ -130,6 +140,8 @@ struct ProfileSection {
     name: String,
     #[serde(default)]
     description: Option<String>,
+    #[serde(default = "default_sandbox")]
+    sandbox: bool,
     project_dir: PathBuf,
     #[serde(default)]
     extra_read_paths: Vec<PathBuf>,
@@ -202,6 +214,7 @@ pub fn load_profile(
     let profile = ExecProfile {
         name: parsed.profile.name,
         description: parsed.profile.description,
+        sandbox: parsed.profile.sandbox,
         project_dir: parsed.profile.project_dir,
         extra_read_paths: parsed.profile.extra_read_paths,
         network: parsed.network,
@@ -404,6 +417,29 @@ project_dir = "/tmp/project"
         assert!(profile.network.allow.is_empty());
         assert_eq!(profile.limits.timeout_secs, 3600);
         assert_eq!(profile.limits.max_output_bytes, 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn sandbox_defaults_to_true() {
+        let toml = r#"
+[profile]
+name = "defaults"
+project_dir = "/tmp/project"
+"#;
+        let profile = load_profile(toml, Some("defaults")).unwrap();
+        assert!(profile.sandbox, "sandbox should default to true");
+    }
+
+    #[test]
+    fn sandbox_false_parsed() {
+        let toml = r#"
+[profile]
+name = "no-sandbox"
+sandbox = false
+project_dir = "/tmp/project"
+"#;
+        let profile = load_profile(toml, Some("no-sandbox")).unwrap();
+        assert!(!profile.sandbox, "sandbox should be false when explicitly set");
     }
 
     #[test]
