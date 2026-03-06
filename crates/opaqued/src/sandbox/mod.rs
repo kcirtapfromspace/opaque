@@ -237,6 +237,8 @@ impl OperationHandler for SandboxExecutor {
             Ok(serde_json::json!({
                 "exit_code": exit_code,
                 "duration_ms": s.duration_ms,
+                "stdout": s.stdout,
+                "stderr": s.stderr,
                 "stdout_length": s.stdout_len,
                 "stderr_length": s.stderr_len,
                 "truncated": truncated,
@@ -249,12 +251,17 @@ impl OperationHandler for SandboxExecutor {
 ///
 /// Clears inherited environment, sets restricted PATH and HOME, injects only
 /// the profile's env vars, and enforces timeouts. OPAQUE_SOCK is never set.
+/// Execute a command without platform sandbox, but with environment sanitization.
+///
+/// Clears inherited environment, sets restricted PATH and HOME, injects only
+/// the profile's env vars, and enforces timeouts. OPAQUE_SOCK is never set.
 pub async fn execute_direct(
     command: &[String],
     env: HashMap<String, String>,
     timeout_secs: u64,
     max_output_bytes: usize,
     tx: mpsc::Sender<ExecFrame>,
+    working_dir: Option<&std::path::Path>,
 ) -> Result<i32, DirectExecError> {
     use tokio::io::AsyncReadExt;
     use tokio::process::Command;
@@ -278,6 +285,11 @@ pub async fn execute_direct(
         if k != "OPAQUE_SOCK" {
             cmd.env(k, v);
         }
+    }
+
+    // Set working directory if provided.
+    if let Some(dir) = working_dir {
+        cmd.current_dir(dir);
     }
 
     cmd.stdout(std::process::Stdio::piped());
@@ -396,6 +408,7 @@ async fn execute_platform_sandbox(
             profile.limits.timeout_secs,
             profile.limits.max_output_bytes,
             tx,
+            Some(&profile.project_dir),
         )
         .await
         .map_err(|e| format!("direct execution failed: {e}"));
@@ -602,30 +615,24 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_response_does_not_contain_stdout_stderr() {
-        // Verify the response JSON structure contains only metadata —
-        // no raw stdout/stderr fields that could leak secrets.
+    fn sandbox_response_contains_expected_fields() {
+        // Verify the response JSON structure includes output content
+        // and metadata for the CLI to display.
         let response = serde_json::json!({
             "exit_code": 0,
             "duration_ms": 150_u64,
-            "stdout_length": 1024_u64,
-            "stderr_length": 256_u64,
+            "stdout": "container started\n",
+            "stderr": "",
+            "stdout_length": 18_u64,
+            "stderr_length": 0_u64,
             "truncated": false,
         });
 
         let obj = response.as_object().unwrap();
-        assert!(
-            !obj.contains_key("stdout"),
-            "response must not contain 'stdout'"
-        );
-        assert!(
-            !obj.contains_key("stderr"),
-            "response must not contain 'stderr'"
-        );
-
-        // Verify expected metadata keys are present.
         assert!(obj.contains_key("exit_code"));
         assert!(obj.contains_key("duration_ms"));
+        assert!(obj.contains_key("stdout"));
+        assert!(obj.contains_key("stderr"));
         assert!(obj.contains_key("stdout_length"));
         assert!(obj.contains_key("stderr_length"));
         assert!(obj.contains_key("truncated"));

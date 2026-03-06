@@ -286,6 +286,7 @@ pub async fn execute(
             config.timeout_secs,
             config.max_output_bytes,
             tx,
+            Some(&config.project_dir),
         )
         .await
         .map_err(|e| SandboxError::Setup(format!("direct execution fallback failed: {e}")));
@@ -397,6 +398,7 @@ pub async fn execute(
             config.timeout_secs,
             config.max_output_bytes,
             tx,
+            Some(&config.project_dir),
         )
         .await
         .map_err(|e| SandboxError::Setup(format!("direct execution fallback failed: {e}")));
