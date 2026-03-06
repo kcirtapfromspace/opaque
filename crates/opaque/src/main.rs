@@ -4494,7 +4494,23 @@ async fn run_doctor() {
             let canonical_exe = current_exe.as_ref().and_then(|p| p.canonicalize().ok());
             if let Some(exe) = &canonical_exe {
                 let exe_str = exe.to_string_lossy();
-                if contents.contains(&*exe_str) {
+                // Parse exe_path patterns from config and glob-match against current binary.
+                let matched = contents
+                    .parse::<toml_edit::DocumentMut>()
+                    .ok()
+                    .and_then(|doc| {
+                        let clients = doc.get("known_human_clients")?.as_array_of_tables()?;
+                        for entry in clients.iter() {
+                            if let Some(pattern) = entry.get("exe_path").and_then(|v| v.as_str()) {
+                                if glob_match::glob_match(pattern, &exe_str) {
+                                    return Some(true);
+                                }
+                            }
+                        }
+                        Some(false)
+                    })
+                    .unwrap_or(false);
+                if matched {
                     doctor_pass("Current binary is registered in known_human_clients");
                     pass_count += 1;
                 } else {

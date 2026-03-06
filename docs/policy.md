@@ -43,7 +43,7 @@ Example:
 ```toml
 [[known_human_clients]]
 name = "Opaque CLI"
-exe_path = "*/target/release/opaque"
+exe_path = "**/opaque"
 ```
 
 ## Rule Schema

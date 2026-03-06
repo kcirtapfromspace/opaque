@@ -434,7 +434,7 @@ pub fn generate_config(providers: &[DetectedProvider], options: &WizardOptions) 
     out.push_str("# ---- Known human clients ----\n\n");
     out.push_str("[[known_human_clients]]\n");
     out.push_str("name = \"opaque-cli\"\n");
-    out.push_str("exe_path = \"*/opaque\"\n\n");
+    out.push_str("exe_path = \"**/opaque\"\n\n");
 
     // Agent reveal deny rule.
     if options.block_agent_reveal {

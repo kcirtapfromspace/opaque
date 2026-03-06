@@ -19,6 +19,7 @@ serde = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 toml_edit = { workspace = true }
+glob-match = { workspace = true }
 uuid = { workspace = true }
 console = { workspace = true }
 dialoguer = { workspace = true }

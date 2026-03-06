@@ -13,7 +13,7 @@ agent_session_ttl_secs = 3600
 
 [[known_human_clients]]
 name = "opaque-cli"
-exe_path = "*/opaque"
+exe_path = "**/opaque"
 
 [[rules]]
 name = "allow-github-actions-secret"
