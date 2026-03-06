@@ -477,7 +477,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
     registry
         .register(OperationDef {
             name: "sandbox.exec".into(),
-            safety: OperationSafety::SensitiveOutput,
+            safety: OperationSafety::Safe,
             default_approval: ApprovalRequirement::Always,
             default_factors: vec![ApprovalFactor::LocalBio],
             description: "Execute a command in a sandboxed environment".into(),

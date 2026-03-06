@@ -4487,46 +4487,57 @@ async fn run_doctor() {
         }
     }
 
-    // 14. known_human_clients match
+    // 14. known_human_clients check
     if config_path.exists() {
         if let Ok(contents) = std::fs::read_to_string(&config_path) {
-            let current_exe = std::env::current_exe().ok();
-            let canonical_exe = current_exe.as_ref().and_then(|p| p.canonicalize().ok());
-            if let Some(exe) = &canonical_exe {
-                let exe_str = exe.to_string_lossy();
-                // Parse exe_path patterns from config and glob-match against current binary.
-                let matched = contents
-                    .parse::<toml_edit::DocumentMut>()
-                    .ok()
-                    .and_then(|doc| {
-                        let clients = doc.get("known_human_clients")?.as_array_of_tables()?;
-                        for entry in clients.iter() {
-                            if let Some(pattern) = entry.get("exe_path").and_then(|v| v.as_str()) {
-                                if glob_match::glob_match(pattern, &exe_str) {
-                                    return Some(true);
-                                }
-                            }
-                        }
-                        Some(false)
-                    })
-                    .unwrap_or(false);
-                if matched {
-                    doctor_pass("Current binary is registered in known_human_clients");
-                    pass_count += 1;
-                } else {
-                    doctor_warn(&format!(
-                        "Current binary ({}) not found in known_human_clients — \
-                         run 'opaque setup' to register",
-                        exe.display()
-                    ));
-                    warn_count += 1;
-                }
+            // Parse known_human_clients entries from config.
+            let entries: Vec<String> = contents
+                .parse::<toml_edit::DocumentMut>()
+                .ok()
+                .and_then(|doc| {
+                    let clients = doc.get("known_human_clients")?.as_array_of_tables()?;
+                    Some(
+                        clients
+                            .iter()
+                            .filter_map(|e| {
+                                e.get("exe_path").and_then(|v| v.as_str()).map(String::from)
+                            })
+                            .collect(),
+                    )
+                })
+                .unwrap_or_default();
+
+            if entries.is_empty() {
+                // No known_human_clients — all clients default to Agent.
+                // This is a valid configuration for agent-only setups.
+                doctor_pass("All clients classified as Agent (no known_human_clients)");
+                pass_count += 1;
             } else {
-                doctor_skip("known_human_clients match (cannot determine current exe)");
+                let current_exe = std::env::current_exe().ok();
+                let canonical_exe = current_exe.as_ref().and_then(|p| p.canonicalize().ok());
+                if let Some(exe) = &canonical_exe {
+                    let exe_str = exe.to_string_lossy();
+                    let matched = entries
+                        .iter()
+                        .any(|pattern| glob_match::glob_match(pattern, &exe_str));
+                    if matched {
+                        doctor_pass("Current binary is registered in known_human_clients");
+                        pass_count += 1;
+                    } else {
+                        doctor_warn(&format!(
+                            "Current binary ({}) not found in known_human_clients — \
+                             run 'opaque setup' to register, or leave empty for agent-only",
+                            exe.display()
+                        ));
+                        warn_count += 1;
+                    }
+                } else {
+                    doctor_skip("known_human_clients match (cannot determine current exe)");
+                }
             }
         }
     } else {
-        doctor_skip("known_human_clients match (no config file)");
+        doctor_skip("known_human_clients check (no config file)");
     }
 
     // Summary
