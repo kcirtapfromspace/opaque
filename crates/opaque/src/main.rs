@@ -4705,7 +4705,18 @@ fn parse_version_from_output(output: &str, binary_name: &str) -> Option<String> 
 /// Mirrors the probe in `opaqued::sandbox::macos::probe_sandbox_exec()`.
 #[cfg(target_os = "macos")]
 fn doctor_probe_sandbox_exec() -> bool {
-    let profile_content = "(version 1)\n(allow default)\n";
+    // Use a restrictive (deny default) profile matching real execution, not
+    // (allow default), so the probe detects macOS versions where Apple broke
+    // seatbelt support for restrictive profiles.
+    let profile_content = "\
+        (version 1)\n\
+        (deny default)\n\
+        (allow file-read*)\n\
+        (allow process-exec)\n\
+        (allow process-fork)\n\
+        (allow process-info-pidinfo)\n\
+        (allow sysctl-read)\n\
+        (allow mach-lookup)\n";
     let dir = std::env::temp_dir();
     let profile_path = dir.join(format!(
         "opaque-doctor-probe-{}.sb",
@@ -4721,12 +4732,23 @@ fn doctor_probe_sandbox_exec() -> bool {
         .arg("--")
         .args(["/bin/echo", "probe"])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+        .stderr(std::process::Stdio::piped())
+        .output();
 
     let _ = std::fs::remove_file(&profile_path);
 
-    matches!(result, Ok(status) if status.success())
+    match result {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            let code = output.status.code().unwrap_or(-1);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.is_empty() {
+                eprintln!("  sandbox-exec stderr (exit {code}): {}", stderr.trim());
+            }
+            false
+        }
+        Err(_) => false,
+    }
 }
 
 fn doctor_pass(msg: &str) {

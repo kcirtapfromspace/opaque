@@ -80,13 +80,22 @@ fn detect_darwin_major() -> Option<u32> {
     version.trim().split('.').next()?.parse().ok()
 }
 
-/// Probe whether `sandbox-exec` actually works by running a trivial command.
+/// Probe whether `sandbox-exec` actually works with a restrictive profile.
 ///
-/// On macOS 26 (Darwin 25.x), `sandbox-exec` returns exit code 65 for ALL
-/// commands due to Apple changing seatbelt internals.
+/// Uses a `(deny default)` profile similar to real execution profiles to
+/// detect macOS versions where Apple changed seatbelt internals (e.g.
+/// macOS 26 / Darwin 25.x returns exit code 65 for restrictive profiles).
 pub fn probe_sandbox_exec() -> bool {
-    // Write a trivial seatbelt profile.
-    let profile_content = "(version 1)\n(allow default)\n";
+    // Use a restrictive profile matching real execution, not a permissive one.
+    let profile_content = "\
+        (version 1)\n\
+        (deny default)\n\
+        (allow file-read*)\n\
+        (allow process-exec)\n\
+        (allow process-fork)\n\
+        (allow process-info-pidinfo)\n\
+        (allow sysctl-read)\n\
+        (allow mach-lookup)\n";
     let dir = std::env::temp_dir();
     let profile_path = dir.join(format!("opaque-sandbox-probe-{}.sb", std::process::id()));
 
@@ -98,26 +107,29 @@ pub fn probe_sandbox_exec() -> bool {
         .args(["-f", &profile_path.to_string_lossy()])
         .arg("--")
         .args(["/bin/echo", "probe"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output();
 
     let _ = std::fs::remove_file(&profile_path);
 
     match result {
-        Ok(status) => {
-            if status.success() {
+        Ok(output) => {
+            if output.status.success() {
                 true
             } else {
-                let code = status.code().unwrap_or(-1);
+                let code = output.status.code().unwrap_or(-1);
+                let stderr = String::from_utf8_lossy(&output.stderr);
                 if code == 65 {
                     warn!(
+                        stderr = %stderr.trim(),
                         "sandbox-exec returned exit code 65 — Apple seatbelt internals \
                          changed in this macOS version, falling back to direct execution"
                     );
                 } else {
                     warn!(
                         exit_code = code,
+                        stderr = %stderr.trim(),
                         "sandbox-exec probe failed with unexpected exit code"
                     );
                 }
@@ -363,15 +375,39 @@ pub async fn execute(
     let exit_code = exit_status.code().unwrap_or(-1);
     let duration_ms = start.elapsed().as_millis() as u64;
 
+    // Clean up temp profile file.
+    let _ = std::fs::remove_file(&profile_path);
+
+    // Detect sandbox-exec exit code 65 at runtime — the cached probe may have
+    // passed with a different profile variant. Fall back to direct execution.
+    if exit_code == 65 {
+        warn!(
+            "sandbox-exec returned exit code 65 at runtime — seatbelt profile \
+             rejected by this macOS version, retrying with direct execution"
+        );
+        let _ = tx
+            .send(ExecFrame::Output {
+                stream: ExecStream::Stderr,
+                data: "sandbox-exec failed (exit 65), retrying without sandbox\n".into(),
+            })
+            .await;
+        return super::execute_direct(
+            &config.command,
+            config.env,
+            config.timeout_secs,
+            config.max_output_bytes,
+            tx,
+        )
+        .await
+        .map_err(|e| SandboxError::Setup(format!("direct execution fallback failed: {e}")));
+    }
+
     let _ = tx
         .send(ExecFrame::ExecCompleted {
             exit_code,
             duration_ms,
         })
         .await;
-
-    // Clean up temp profile file.
-    let _ = std::fs::remove_file(&profile_path);
 
     Ok(exit_code)
 }
