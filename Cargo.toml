@@ -56,7 +56,7 @@ ed25519-dalek = { version = "2.1", features = ["rand_core", "serde"] }
 rand = "0.8"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
-rcgen = { version = "0.13", features = ["pem"] }
+rcgen = { version = "0.14", features = ["pem"] }
 tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
 mdns-sd = "0.12"
