@@ -7,12 +7,13 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{error, info};
 
 use crate::approval_server::ApprovalChallenge;
 
@@ -65,6 +66,15 @@ pub struct ApnsConfig {
     pub topic: String,
     /// Use sandbox APNs endpoint (for development).
     pub sandbox: bool,
+}
+
+/// JWT claims for APNs authentication.
+#[derive(Debug, Serialize, Deserialize)]
+struct ApnsJwtClaims {
+    /// Issuer (Apple Developer Team ID).
+    iss: String,
+    /// Issued at (current timestamp).
+    iat: u64,
 }
 
 /// The APNs notification payload for an approval request.
@@ -178,45 +188,98 @@ impl PushManager {
         challenge: &ApprovalChallenge,
     ) -> Result<(), PushError> {
         let push_token = device.push_token.as_ref().ok_or(PushError::NoToken)?;
-
         let config = self.apns_config.as_ref().ok_or(PushError::NoToken)?;
 
         let payload = Self::format_payload(challenge);
         let payload_json =
             serde_json::to_string(&payload).map_err(|e| PushError::ApnsError(e.to_string()))?;
 
-        // TODO: Implement actual APNs HTTP/2 request.
-        // This requires:
-        // 1. Generate JWT with ES256 using the team key
-        // 2. POST to https://api.push.apple.com/3/device/{token}
-        //    (or https://api.sandbox.push.apple.com/3/device/{token})
-        // 3. Include headers: authorization, apns-topic, apns-push-type
-        let _endpoint = if config.sandbox {
+        // Generate JWT for authentication
+        let jwt = sign_apns_jwt(&config.team_id, &config.key_id, &config.private_key_pem)?;
+
+        // Build the APNs endpoint URL
+        let endpoint = if config.sandbox {
             format!("https://api.sandbox.push.apple.com/3/device/{push_token}")
         } else {
             format!("https://api.push.apple.com/3/device/{push_token}")
         };
 
-        // TODO: Sign JWT with ES256 key.
-        // let jwt = sign_apns_jwt(&config.team_id, &config.key_id, &config.private_key_pem)?;
+        // Send the notification with retry logic (1 retry)
+        let mut last_error = None;
+        for attempt in 0..2 {
+            match send_apns_request(&endpoint, &jwt, &payload_json, &config.topic).await {
+                Ok(_) => {
+                    info!(
+                        device_id = %device.device_id,
+                        request_id = %challenge.request_id,
+                        "APNs push notification sent successfully"
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    error!(
+                        device_id = %device.device_id,
+                        request_id = %challenge.request_id,
+                        attempt = attempt + 1,
+                        error = ?e,
+                        "APNs request failed"
+                    );
+                    last_error = Some(e);
+                }
+            }
+        }
 
-        info!(
-            device_id = %device.device_id,
-            request_id = %challenge.request_id,
-            payload_size = payload_json.len(),
-            "APNs push notification would be sent (TODO: implement HTTP/2 delivery)"
-        );
-
-        // For now, return an error indicating this is not yet implemented.
-        // In production, this would make the HTTP/2 request to APNs.
-        Err(PushError::ApnsError(
-            "APNs delivery not yet implemented".into(),
-        ))
+        // All retries failed
+        Err(last_error.unwrap_or_else(|| {
+            PushError::ApnsError("APNs request failed after retries".into())
+        }))
     }
 }
 
 // ---------------------------------------------------------------------------
-// APNs JWT signing (scaffold)
+// APNs HTTP/2 request
+// ---------------------------------------------------------------------------
+
+/// Send an HTTP/2 POST request to APNs with the given payload.
+///
+/// Uses Bearer token authentication with the signed JWT.
+async fn send_apns_request(
+    endpoint: &str,
+    jwt: &str,
+    payload: &str,
+    topic: &str,
+) -> Result<(), PushError> {
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(endpoint)
+        .header("authorization", format!("bearer {jwt}"))
+        .header("apns-topic", topic)
+        .header("apns-push-type", "alert")
+        .header("content-type", "application/json")
+        .timeout(Duration::from_secs(30))
+        .body(payload.to_string())
+        .send()
+        .await
+        .map_err(|e| PushError::NetworkError(e.to_string()))?;
+
+    let status = response.status();
+    if status.is_success() {
+        Ok(())
+    } else {
+        let status_code = status.as_u16();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<no response body>".into());
+        Err(PushError::ApnsError(format!(
+            "APNs returned {status_code}: {body}"
+        )))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// APNs JWT signing
 // ---------------------------------------------------------------------------
 
 /// Generate a JWT for APNs token-based authentication.
@@ -225,28 +288,33 @@ impl PushManager {
 ///
 /// Header: { "alg": "ES256", "kid": "<key_id>" }
 /// Claims: { "iss": "<team_id>", "iat": <timestamp> }
-///
-/// TODO: Implement actual ES256 signing with the private key.
-#[allow(dead_code)]
 fn sign_apns_jwt(
-    _team_id: &str,
-    _key_id: &str,
-    _private_key_pem: &str,
+    team_id: &str,
+    key_id: &str,
+    private_key_pem: &str,
 ) -> Result<String, PushError> {
-    // TODO: Use `jsonwebtoken` crate to sign with ES256.
-    // let header = jsonwebtoken::Header {
-    //     alg: jsonwebtoken::Algorithm::ES256,
-    //     kid: Some(key_id.to_string()),
-    //     ..Default::default()
-    // };
-    // let claims = ApnsJwtClaims {
-    //     iss: team_id.to_string(),
-    //     iat: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
-    // };
-    // jsonwebtoken::encode(&header, &claims, &encoding_key)
-    Err(PushError::JwtError(
-        "JWT signing not yet implemented".into(),
-    ))
+    // Parse the private key in PEM format
+    let encoding_key = EncodingKey::from_ec_pem(private_key_pem.as_bytes())
+        .map_err(|e| PushError::JwtError(format!("failed to parse private key: {e}")))?;
+
+    // Create JWT header with key ID
+    let mut header = Header::new(Algorithm::ES256);
+    header.kid = Some(key_id.to_string());
+
+    // Create JWT claims
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| PushError::JwtError(format!("system time error: {e}")))?
+        .as_secs();
+
+    let claims = ApnsJwtClaims {
+        iss: team_id.to_string(),
+        iat: now,
+    };
+
+    // Encode and sign the JWT
+    encode(&header, &claims, &encoding_key)
+        .map_err(|e| PushError::JwtError(format!("JWT encoding failed: {e}")))
 }
 
 // ---------------------------------------------------------------------------

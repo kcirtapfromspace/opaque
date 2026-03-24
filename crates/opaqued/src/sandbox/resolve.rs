@@ -333,15 +333,19 @@ impl CompositeResolver {
             }
         };
 
-        // AWS backend: always available (uses configured or default region URLs).
+        // AWS backend: available if URL scheme is valid.
         let aws_region = std::env::var(crate::aws::client::AWS_REGION_ENV)
             .unwrap_or_else(|_| crate::aws::client::DEFAULT_REGION.to_owned());
         let sts_url = format!("https://sts.{aws_region}.amazonaws.com");
         let sm_url = format!("https://secretsmanager.{aws_region}.amazonaws.com");
         let ssm_url = format!("https://ssm.{aws_region}.amazonaws.com");
-        let aws = Some(crate::aws::resolve::AwsResolver::new(
-            crate::aws::client::AwsClient::new(&sts_url, &sm_url, &ssm_url),
-        ));
+        let aws = match crate::aws::client::AwsClient::new(&sts_url, &sm_url, &ssm_url) {
+            Ok(client) => Some(crate::aws::resolve::AwsResolver::new(client)),
+            Err(e) => {
+                tracing::warn!("AWS client disabled: {e}");
+                None
+            }
+        };
 
         // Vault backend: available if URL scheme is valid.
         let vault = match crate::vault::client::VaultClient::new() {

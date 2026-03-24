@@ -170,8 +170,9 @@ impl GitLabClient {
 
         let http = reqwest::Client::builder()
             .user_agent(Self::user_agent())
+            .timeout(std::time::Duration::from_secs(30))
             .build()
-            .expect("failed to build reqwest client");
+            .map_err(GitLabApiError::Network)?;
 
         Ok(Self { http, base_url })
     }
@@ -181,6 +182,7 @@ impl GitLabClient {
     pub fn with_base_url(base_url: String) -> Self {
         let http = reqwest::Client::builder()
             .user_agent(Self::user_agent())
+            .timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("failed to build reqwest client");
         Self { http, base_url }

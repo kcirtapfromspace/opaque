@@ -537,17 +537,18 @@ fn build_unshare_command(config: &LinuxSandboxConfig) -> tokio::process::Command
 fn build_sandbox_command(
     config: &LinuxSandboxConfig,
     caps: &SandboxCapabilities,
-) -> tokio::process::Command {
+) -> Result<tokio::process::Command, SandboxError> {
     if caps.bubblewrap {
         info!("sandbox strategy: bubblewrap + landlock + seccomp");
-        // try_bubblewrap always returns Some when caps.bubblewrap is true.
-        try_bubblewrap(config).expect("bubblewrap was detected but command construction failed")
+        try_bubblewrap(config).ok_or_else(|| {
+            SandboxError::Setup("bubblewrap was detected but command construction failed".into())
+        })
     } else if caps.user_namespaces {
         info!("sandbox strategy: unshare + landlock + seccomp (bwrap not available)");
-        build_unshare_command(config)
+        Ok(build_unshare_command(config))
     } else {
         warn!("sandbox strategy: unshare only (no bwrap, no user namespace support confirmed)");
-        build_unshare_command(config)
+        Ok(build_unshare_command(config))
     }
 }
 
@@ -586,7 +587,7 @@ pub async fn execute(
     info!(strategy, "executing sandbox command");
 
     // Build the sandboxed command using the layered strategy.
-    let mut cmd = build_sandbox_command(&config, &caps);
+    let mut cmd = build_sandbox_command(&config, &caps)?;
 
     // Clear all environment and inject only allowed vars.
     cmd.env_clear();
@@ -649,8 +650,14 @@ pub async fn execute(
     let start = std::time::Instant::now();
 
     // Stream stdout and stderr concurrently.
-    let stdout = child.stdout.take().expect("stdout was piped");
-    let stderr = child.stderr.take().expect("stderr was piped");
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| SandboxError::Spawn("stdout not piped".into()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| SandboxError::Spawn("stderr not piped".into()))?;
 
     let tx_out = tx.clone();
     let tx_err = tx.clone();

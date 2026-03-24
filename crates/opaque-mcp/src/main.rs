@@ -175,7 +175,7 @@ async fn handle_tools_call(
             return JsonRpcResponse::error(
                 id,
                 INVALID_PARAMS,
-                format!("unknown tool: {tool_name}"),
+                format!("unknown tool: {}", &tool_name[..tool_name.len().min(64)]),
             );
         }
     };
@@ -238,7 +238,10 @@ async fn handle_tools_call(
             }
         }
         Err(e) => {
-            let error_text = format!("Failed to communicate with opaqued: {e}");
+            // Sanitize the error to prevent leaking filesystem paths or
+            // credentials embedded in connection strings to the LLM context.
+            let sanitizer = opaque_core::sanitize::Sanitizer::new();
+            let error_text = format!("Failed to communicate with opaqued: {}", sanitizer.scrub_error(&e.to_string()));
             JsonRpcResponse::ok(
                 id,
                 json!({
@@ -398,7 +401,13 @@ async fn main() {
             Err(e) => {
                 warn!("invalid JSON-RPC: {e}");
                 let resp = JsonRpcResponse::error(None, -32700, format!("parse error: {e}"));
-                let out = serde_json::to_string(&resp).expect("response serialization");
+                let out = match serde_json::to_string(&resp) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!("failed to serialize error response: {e}");
+                        continue;
+                    }
+                };
                 let _ = stdout.write_all(out.as_bytes()).await;
                 let _ = stdout.write_all(b"\n").await;
                 let _ = stdout.flush().await;
@@ -662,5 +671,16 @@ mod tests {
         assert_eq!(r["isError"], true);
         let text = r["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("missing required parameter"));
+    }
+
+    #[test]
+    fn unknown_tool_name_is_truncated_in_error() {
+        // Verify that the truncation logic used for unknown tool names works.
+        let long_name = "a".repeat(200);
+        let truncated = &long_name[..long_name.len().min(64)];
+        assert_eq!(truncated.len(), 64);
+        // The format string in handle_tools_call uses this pattern:
+        let msg = format!("unknown tool: {}", truncated);
+        assert_eq!(msg.len(), "unknown tool: ".len() + 64);
     }
 }

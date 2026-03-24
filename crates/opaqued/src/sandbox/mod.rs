@@ -305,8 +305,14 @@ pub async fn execute_direct(
     let start = std::time::Instant::now();
     let mut total_bytes = 0usize;
 
-    let mut stdout = child.stdout.take().expect("stdout piped");
-    let mut stderr = child.stderr.take().expect("stderr piped");
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| DirectExecError::Execution("stdout not piped".into()))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| DirectExecError::Execution("stderr not piped".into()))?;
 
     let timeout = tokio::time::Duration::from_secs(timeout_secs);
     let mut stdout_buf = vec![0u8; 16384];

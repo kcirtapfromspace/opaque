@@ -602,7 +602,7 @@ mod tests {
         ];
         for tool in &tools {
             let method = tool_to_daemon_method(tool.name)
-                .unwrap_or_else(|| panic!("no daemon method mapping for {}", tool.name));
+                .expect("all tools in safe_tools() must have daemon method mapping");
             assert!(
                 allowed_methods.contains(&method),
                 "tool {} maps to unexpected daemon method '{}'",

@@ -586,19 +586,21 @@ impl EnclaveBuilder {
         self
     }
 
-    /// Build the enclave. Panics if required components are missing.
-    pub fn build(self) -> Enclave {
-        Enclave {
+    /// Build the enclave. Returns an error if required components are missing.
+    pub fn build(self) -> Result<Enclave, String> {
+        Ok(Enclave {
             registry: self.registry,
             policy: self.policy,
             handlers: self.handlers,
-            approval_gate: self.approval_gate.expect("approval gate is required"),
-            audit: self.audit.expect("audit sink is required"),
+            approval_gate: self
+                .approval_gate
+                .ok_or("approval gate is required")?,
+            audit: self.audit.ok_or("audit sink is required")?,
             sanitizer: self.sanitizer,
             approval_semaphore: Semaphore::new(1),
             rate_limiter: ApprovalRateLimiter::new(3, Duration::from_secs(60)),
             lease_cache: LeaseCache::new(),
-        }
+        })
     }
 }
 
@@ -1467,7 +1469,7 @@ mod tests {
             )
             .approval_gate(gate)
             .audit(audit)
-            .build()
+            .build().unwrap()
     }
 
     #[tokio::test]
@@ -1543,7 +1545,7 @@ mod tests {
             )
             .approval_gate(Box::new(AlwaysApproveGate))
             .audit(audit.clone())
-            .build();
+            .build().unwrap();
 
         let req = test_request("secret.reveal", ClientType::Agent);
         let resp = enclave.execute(req).await;
@@ -1592,7 +1594,7 @@ mod tests {
             )
             .approval_gate(Box::new(AlwaysApproveGate))
             .audit(audit.clone())
-            .build();
+            .build().unwrap();
 
         // Human client should ALSO be blocked from REVEAL in v1.
         let req = test_request("secret.reveal", ClientType::Human);
@@ -1649,7 +1651,7 @@ mod tests {
             )
             .approval_gate(Box::new(AlwaysApproveGate))
             .audit(audit.clone())
-            .build();
+            .build().unwrap();
 
         let req = test_request("github.set_actions_secret", ClientType::Agent);
         let resp = enclave.execute(req).await;
@@ -1681,7 +1683,7 @@ mod tests {
             )
             .approval_gate(Box::new(AlwaysApproveGate))
             .audit(audit.clone())
-            .build();
+            .build().unwrap();
 
         let req = test_request("github.set_actions_secret", ClientType::Agent);
         let resp = enclave.execute(req).await;
@@ -1975,7 +1977,7 @@ mod tests {
             )
             .approval_gate(gate)
             .audit(audit)
-            .build()
+            .build().unwrap()
     }
 
     #[tokio::test]
@@ -2307,7 +2309,7 @@ mod tests {
             )
             .approval_gate(Box::new(gate))
             .audit(audit.clone())
-            .build();
+            .build().unwrap();
 
         let req = test_request("github.set_actions_secret", ClientType::Agent);
         let resp = enclave.execute(req).await;
@@ -2384,7 +2386,7 @@ mod tests {
                 )
                 .approval_gate(Box::new(gate))
                 .audit(audit.clone())
-                .build(),
+                .build().unwrap(),
         );
 
         // Fire 3 concurrent requests with different targets (so no lease hits).
@@ -2461,7 +2463,7 @@ mod tests {
             )
             .approval_gate(Box::new(AlwaysApproveGate))
             .audit(audit.clone())
-            .build();
+            .build().unwrap();
 
         // Request with allowed keys → success.
         let mut req = test_request("restricted.op", ClientType::Human);
@@ -2534,7 +2536,7 @@ mod tests {
             )
             .approval_gate(Box::new(AlwaysApproveGate))
             .audit(audit.clone())
-            .build();
+            .build().unwrap();
 
         // Valid params → success.
         let mut req = test_request("schema.op", ClientType::Human);
@@ -2603,7 +2605,7 @@ mod tests {
             )
             .approval_gate(Box::new(AlwaysApproveGate))
             .audit(audit.clone())
-            .build();
+            .build().unwrap();
 
         // Request without workspace → denied (rule requires workspace).
         let req = test_request("github.set_actions_secret", ClientType::Agent);
@@ -2683,7 +2685,7 @@ mod tests {
             )
             .approval_gate(Box::new(AlwaysApproveGate))
             .audit(audit.clone())
-            .build();
+            .build().unwrap();
 
         // Request with allowed secret name → success.
         let req = test_request("github.set_actions_secret", ClientType::Agent);
@@ -2782,7 +2784,7 @@ mod tests {
             )
             .approval_gate(Box::new(AlwaysApproveGate))
             .audit(audit.clone())
-            .build();
+            .build().unwrap();
 
         let mut req = test_request("github.set_actions_secret", ClientType::Agent);
         let request_id = req.request_id;
@@ -2895,7 +2897,7 @@ mod tests {
             )
             .approval_gate(Box::new(gate))
             .audit(audit.clone())
-            .build();
+            .build().unwrap();
 
         // list_secrets: no approval.
         let req = test_request("github.list_secrets", ClientType::Agent);
@@ -2967,7 +2969,7 @@ mod tests {
             )
             .approval_gate(Box::new(AlwaysApproveGate))
             .audit(audit.clone())
-            .build();
+            .build().unwrap();
 
         // First: fails.
         let req = test_request("github.set_actions_secret", ClientType::Agent);
@@ -3159,7 +3161,7 @@ mod tests {
             )
             .approval_gate(Box::new(AlwaysApproveGate))
             .audit(audit.clone())
-            .build();
+            .build().unwrap();
 
         // Agent client → blocked by enclave safety check (defense-in-depth).
         let req = test_request("ecr.get_auth_token", ClientType::Agent);
@@ -3279,7 +3281,7 @@ mod tests {
             )
             .approval_gate(Box::new(AlwaysApproveGate))
             .audit(audit.clone())
-            .build();
+            .build().unwrap();
 
         // Client tries to LIE about secret_ref_names — claims "ADMIN_KEY"
         // but params actually reference "env:MY_TOKEN".

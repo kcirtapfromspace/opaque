@@ -194,7 +194,7 @@ impl AzureKeyVaultClient {
             .user_agent(Self::user_agent())
             .timeout(Duration::from_secs(30))
             .build()
-            .expect("failed to build reqwest client");
+            .map_err(AzureApiError::HttpError)?;
 
         Ok(Self {
             http,

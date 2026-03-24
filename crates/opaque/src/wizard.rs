@@ -685,7 +685,16 @@ fn write_rule(
 /// It performs provider detection, user selection, config generation,
 /// AI tool detection, and MCP registration.
 pub fn run_interactive(base_dir: &Path, force: bool) -> Result<(), String> {
+    use crate::ui;
+
     let env = RealEnvironment;
+    let total_steps = 5;
+
+    // Banner
+    ui::banner(
+        "Opaque Interactive Setup",
+        "Detect providers, generate config, register MCP",
+    );
 
     // Step 0: Check for existing config.
     let config_path = base_dir.join("config.toml");
@@ -697,8 +706,7 @@ pub fn run_interactive(base_dir: &Path, force: bool) -> Result<(), String> {
     }
 
     // Step 1: Detect providers.
-    println!();
-    println!("  Detecting available secret providers...");
+    ui::step(1, total_steps, "Detecting secret providers...");
     println!();
     let all_providers = detect_providers(&env);
     print_detection_results(&all_providers);
@@ -709,12 +717,12 @@ pub fn run_interactive(base_dir: &Path, force: bool) -> Result<(), String> {
         .collect();
 
     if ready_or_partial.is_empty() {
-        println!("  No providers detected. The generated config will contain");
-        println!("  only the test.noop operation.");
+        ui::warn("No providers detected. Config will contain only test.noop.");
         println!();
     }
 
     // Step 2: Ask which providers to configure.
+    ui::step(2, total_steps, "Selecting providers...");
     let selected = if ready_or_partial.is_empty() {
         Vec::new()
     } else {
@@ -722,11 +730,40 @@ pub fn run_interactive(base_dir: &Path, force: bool) -> Result<(), String> {
     };
 
     // Step 3: Generate config.
+    ui::step(3, total_steps, "Generating configuration...");
     println!();
-    println!("  Generating configuration...");
     let options = WizardOptions::default();
     let selected_providers: Vec<DetectedProvider> = selected.into_iter().cloned().collect();
     let config_content = generate_config(&selected_providers, &options);
+
+    // Show summary before writing.
+    let summary_lines: Vec<String> = vec![
+        format!(
+            "Providers:  {}",
+            if selected_providers.is_empty() {
+                "none (test.noop only)".to_string()
+            } else {
+                selected_providers
+                    .iter()
+                    .map(|p| p.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        ),
+        format!(
+            "Biometric:  {}",
+            if options.require_biometric { "required (first_use)" } else { "disabled" }
+        ),
+        format!("Lease TTL:  {}s", options.lease_ttl),
+        format!(
+            "Agent reveal: {}",
+            if options.block_agent_reveal { "blocked" } else { "allowed" }
+        ),
+        format!("Config path: {}", config_path.display()),
+    ];
+    let summary_refs: Vec<&str> = summary_lines.iter().map(|s| s.as_str()).collect();
+    ui::section_box("Configuration Summary", &summary_refs);
+    println!();
 
     // Write config.
     super::create_dir_0700(base_dir)?;
@@ -734,50 +771,62 @@ pub fn run_interactive(base_dir: &Path, force: bool) -> Result<(), String> {
     super::create_dir_0700(&base_dir.join("profiles"))?;
     std::fs::write(&config_path, &config_content)
         .map_err(|e| format!("failed to write {}: {e}", config_path.display()))?;
-    crate::ui::success(&format!("Wrote {}", config_path.display()));
+    ui::success(&format!("Wrote {}", config_path.display()));
 
-    // Step 4: Detect AI tools.
+    // Step 4: Detect AI tools & MCP registration.
+    ui::step(4, total_steps, "Detecting AI coding tools...");
     println!();
-    println!("  Detecting AI coding tools...");
     let ai_tools = detect_ai_tools(&env);
     if ai_tools.is_empty() {
-        println!("  No AI coding tools detected (Claude Code, Cursor, Codex).");
+        println!(
+            "  {}  No AI coding tools detected (Claude Code, Cursor, Codex).",
+            ui::status_badge("SKIP", ui::BadgeState::Warn),
+        );
     } else {
         for tool in &ai_tools {
-            println!("    Found: {} ({})", tool.name, tool.config_dir.display());
+            println!(
+                "  {}  {} ({})",
+                ui::status_badge("FOUND", ui::BadgeState::Ok),
+                tool.name,
+                console::style(tool.config_dir.display()).dim(),
+            );
         }
     }
+    println!();
 
-    // Step 5: Offer MCP registration.
+    // Offer MCP registration.
     let opaque_mcp_path = find_opaque_mcp_binary();
     if let Some(ref mcp_path) = opaque_mcp_path {
         for tool in &ai_tools {
-            println!();
             print!("  Register MCP server with {}? [Y/n] ", tool.name);
             let answer = read_line_trimmed();
             if answer.is_empty() || answer.starts_with('y') || answer.starts_with('Y') {
                 match register_mcp(tool, mcp_path) {
                     Ok(()) => {
-                        crate::ui::success(&format!("Registered opaque MCP with {}", tool.name));
+                        ui::success(&format!("Registered opaque MCP with {}", tool.name));
                     }
                     Err(e) => {
-                        crate::ui::warn(&format!("Could not register with {}: {e}", tool.name));
+                        ui::warn(&format!("Could not register with {}: {e}", tool.name));
                     }
                 }
             }
         }
     } else if !ai_tools.is_empty() {
-        crate::ui::warn("opaque-mcp binary not found; skipping MCP registration.");
+        ui::warn("opaque-mcp binary not found; skipping MCP registration.");
         println!("  Install opaque-mcp and run 'opaque init --interactive' again,");
         println!("  or manually configure the MCP server.");
     }
 
-    // Step 6: Daemon start hint.
+    // Step 5: Next steps.
     println!();
-    crate::ui::info("Next steps:");
-    println!("    1. Start the daemon:  opaque service install");
-    println!("    2. Seal your config:  opaque setup --seal");
-    println!("    3. Test the setup:    opaque ping");
+    ui::step(5, total_steps, "Setup complete!");
+    println!();
+    ui::divider();
+    println!();
+    ui::info("Next steps:");
+    ui::step(1, 3, &format!("Start the daemon:  {}", console::style("opaque service install").cyan()));
+    ui::step(2, 3, &format!("Seal your config:  {}", console::style("opaque setup --seal").cyan()));
+    ui::step(3, 3, &format!("Test the setup:    {}", console::style("opaque ping").cyan()));
     println!();
 
     Ok(())
@@ -785,43 +834,51 @@ pub fn run_interactive(base_dir: &Path, force: bool) -> Result<(), String> {
 
 /// Run detection only and print results (for `opaque init --detect`).
 pub fn run_detect_only() {
+    use crate::ui;
+
     let env = RealEnvironment;
 
-    println!();
-    println!("  Detecting available secret providers...");
+    ui::banner("Opaque Environment Detection", "Scanning for providers and AI tools");
+
+    ui::step(1, 2, "Detecting secret providers...");
     println!();
     let providers = detect_providers(&env);
     print_detection_results(&providers);
 
-    println!("  Detecting AI coding tools...");
+    ui::step(2, 2, "Detecting AI coding tools...");
     let ai_tools = detect_ai_tools(&env);
     if ai_tools.is_empty() {
-        println!("    No AI coding tools detected.");
+        println!(
+            "  {}  No AI coding tools detected.",
+            ui::status_badge("NONE", ui::BadgeState::Warn),
+        );
     } else {
         for tool in &ai_tools {
-            println!("    Found: {} ({})", tool.name, tool.config_dir.display());
+            println!(
+                "  {}  {} ({})",
+                ui::status_badge("FOUND", ui::BadgeState::Ok),
+                tool.name,
+                console::style(tool.config_dir.display()).dim(),
+            );
         }
     }
     println!();
 }
 
 fn print_detection_results(providers: &[DetectedProvider]) {
+    use crate::ui;
+
+    let mut rows: Vec<Vec<String>> = Vec::new();
     for p in providers {
-        let status_label = match p.status {
-            DetectionStatus::Ready => "ready",
-            DetectionStatus::Partial => "partial",
-            DetectionStatus::NotFound => "not found",
+        let badge = match p.status {
+            DetectionStatus::Ready => ui::status_badge("READY", ui::BadgeState::Ok),
+            DetectionStatus::Partial => ui::status_badge("PARTIAL", ui::BadgeState::Warn),
+            DetectionStatus::NotFound => ui::status_badge("NOT FOUND", ui::BadgeState::Info),
         };
-        let icon = match p.status {
-            DetectionStatus::Ready => console::style("*").green(),
-            DetectionStatus::Partial => console::style("~").yellow(),
-            DetectionStatus::NotFound => console::style("-").dim(),
-        };
-        println!("    {} {:<20} [{}]", icon, p.name, status_label);
-        for hint in &p.config_hints {
-            println!("      {}", console::style(hint).dim());
-        }
+        let hints = p.config_hints.join("; ");
+        rows.push(vec![p.name.clone(), badge, hints]);
     }
+    ui::table(&["PROVIDER", "STATUS", "DETAILS"], &rows);
     println!();
 }
 

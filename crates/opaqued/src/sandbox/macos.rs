@@ -339,8 +339,14 @@ pub async fn execute(
     let start = std::time::Instant::now();
 
     // Stream stdout and stderr concurrently.
-    let stdout = child.stdout.take().expect("stdout was piped");
-    let stderr = child.stderr.take().expect("stderr was piped");
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| SandboxError::Spawn("stdout not piped".into()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| SandboxError::Spawn("stderr not piped".into()))?;
 
     let tx_out = tx.clone();
     let tx_err = tx.clone();

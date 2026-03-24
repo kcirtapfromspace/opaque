@@ -2,11 +2,66 @@
 //!
 //! Provides colored output, spinners, and structured formatting
 //! that degrades gracefully on non-TTY terminals.
+//!
+//! ## Design System
+//!
+//! **Color palette:**
+//! - Success: green (bold for headline, normal for details)
+//! - Error: red (bold for message, dim for code/details)
+//! - Warning: yellow
+//! - Info/accent: cyan
+//! - Metadata/secondary: dim/grey
+//! - Key names/identifiers: yellow bold
+//! - Paths/URLs: cyan underlined
+//!
+//! **Typography hierarchy:**
+//! - Bold: headers, key messages, identifiers
+//! - Normal: body text, values
+//! - Dim: metadata, timestamps, secondary info
+//!
+//! **Layout:**
+//! - 2-space indent for nested content
+//! - 6-space indent for sub-details
+//! - Box-drawing characters for bordered sections
+//! - Consistent column alignment in tables
 
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
-use console::{Emoji, style};
+use console::{Emoji, Term, style};
 use indicatif::{ProgressBar, ProgressStyle};
+
+// ---------------------------------------------------------------------------
+// Verbosity control
+// ---------------------------------------------------------------------------
+
+/// Global verbosity level (0 = normal, 1 = quiet, 2 = verbose).
+static VERBOSITY: AtomicU8 = AtomicU8::new(0);
+
+const VERBOSITY_NORMAL: u8 = 0;
+const VERBOSITY_QUIET: u8 = 1;
+const VERBOSITY_VERBOSE: u8 = 2;
+
+/// Set the global verbosity level. Call once at startup from main().
+pub fn set_verbosity(quiet: bool, verbose: bool) {
+    if quiet {
+        VERBOSITY.store(VERBOSITY_QUIET, Ordering::Relaxed);
+    } else if verbose {
+        VERBOSITY.store(VERBOSITY_VERBOSE, Ordering::Relaxed);
+    } else {
+        VERBOSITY.store(VERBOSITY_NORMAL, Ordering::Relaxed);
+    }
+}
+
+/// Returns true if quiet mode is active (--quiet or --json).
+pub fn is_quiet() -> bool {
+    VERBOSITY.load(Ordering::Relaxed) == VERBOSITY_QUIET
+}
+
+/// Returns true if verbose mode is active (--verbose).
+pub fn is_verbose() -> bool {
+    VERBOSITY.load(Ordering::Relaxed) == VERBOSITY_VERBOSE
+}
 
 // ---------------------------------------------------------------------------
 // Emoji constants (fallback text for non-emoji terminals)
@@ -22,41 +77,387 @@ pub static PAPER: Emoji<'_, '_> = Emoji("📄 ", "   ");
 pub static LINK: Emoji<'_, '_> = Emoji("🔗 ", "-> ");
 
 // ---------------------------------------------------------------------------
+// Box-drawing characters (with ASCII fallback for non-TTY)
+// ---------------------------------------------------------------------------
+
+/// Returns whether the terminal likely supports unicode box-drawing characters.
+fn supports_unicode() -> bool {
+    // console crate's Term handles TTY detection; if we can get a terminal
+    // that is not dumb, assume unicode works.
+    Term::stdout().is_term()
+        && std::env::var("TERM")
+            .map(|t| t != "dumb")
+            .unwrap_or(true)
+}
+
+pub struct BoxChars {
+    pub tl: &'static str, // top-left
+    pub tr: &'static str, // top-right
+    pub bl: &'static str, // bottom-left
+    pub br: &'static str, // bottom-right
+    pub h: &'static str,  // horizontal
+    pub v: &'static str,  // vertical
+}
+
+pub fn box_chars() -> BoxChars {
+    if supports_unicode() {
+        BoxChars {
+            tl: "┌",
+            tr: "┐",
+            bl: "└",
+            br: "┘",
+            h: "─",
+            v: "│",
+        }
+    } else {
+        BoxChars {
+            tl: "+",
+            tr: "+",
+            bl: "+",
+            br: "+",
+            h: "-",
+            v: "|",
+        }
+    }
+}
+
+/// Terminal width, clamped to a sensible range.
+fn term_width() -> usize {
+    Term::stdout().size().1 as usize
+}
+
+// ---------------------------------------------------------------------------
 // Message helpers
 // ---------------------------------------------------------------------------
 
-/// Print a green success message.
+/// Print a green success message. Suppressed in quiet mode.
 pub fn success(msg: &str) {
+    if is_quiet() {
+        return;
+    }
     println!("{} {}", style(CHECK).green(), style(msg).green().bold());
 }
 
-/// Print a red error message to stderr.
+/// Print a red error message to stderr. Always prints (even in quiet mode).
 pub fn error(msg: &str) {
     eprintln!("{} {}", style(CROSS).red(), style(msg).red().bold());
 }
 
-/// Print a yellow warning message to stderr.
+/// Print a yellow warning message to stderr. Suppressed in quiet mode.
 pub fn warn(msg: &str) {
+    if is_quiet() {
+        return;
+    }
     eprintln!("{} {}", style(WARN_ICON).yellow(), style(msg).yellow());
 }
 
-/// Print a cyan info message.
+/// Print a cyan info message. Suppressed in quiet mode.
 pub fn info(msg: &str) {
+    if is_quiet() {
+        return;
+    }
     println!("{} {}", style(INFO_ICON).cyan(), msg);
+}
+
+/// Print a debug message (only in verbose mode) to stderr.
+pub fn debug(msg: &str) {
+    if !is_verbose() {
+        return;
+    }
+    eprintln!("  {} {}", style("debug:").dim(), style(msg).dim());
 }
 
 // ---------------------------------------------------------------------------
 // Structured output
 // ---------------------------------------------------------------------------
 
-/// Print a section header.
+/// Print a section header. Suppressed in quiet mode.
 pub fn header(title: &str) {
+    if is_quiet() {
+        return;
+    }
     println!("\n{}", style(title).bold().underlined());
 }
 
-/// Print a key-value pair with styled key.
+/// Print a key-value pair with styled key. Suppressed in quiet mode.
 pub fn kv(key: &str, value: &str) {
+    if is_quiet() {
+        return;
+    }
     println!("  {:<16} {}", style(format!("{key}:")).dim(), value);
+}
+
+// ---------------------------------------------------------------------------
+// New design system components
+// ---------------------------------------------------------------------------
+
+/// Print a bordered section box with a title and content lines.
+///
+/// ```text
+///   ┌─ Title ──────────────────────┐
+///   │  line 1                      │
+///   │  line 2                      │
+///   └──────────────────────────────┘
+/// ```
+pub fn section_box(title: &str, content: &[&str]) {
+    if is_quiet() {
+        return;
+    }
+    let b = box_chars();
+    // Determine box width: fit content or terminal, whichever is smaller.
+    let min_content_width = content
+        .iter()
+        .map(|l| console::measure_text_width(l))
+        .max()
+        .unwrap_or(0);
+    let title_width = console::measure_text_width(title) + 4; // "─ Title ─"
+    let inner_width = min_content_width.max(title_width).max(20);
+    let tw = term_width();
+    // Leave room for "  │  " prefix (5) + " │" suffix (2) + 2 for outer indent
+    let max_inner = if tw > 9 { tw - 9 } else { 40 };
+    let inner_width = inner_width.min(max_inner);
+    let box_width = inner_width + 4; // 2 padding each side inside the box
+
+    // Top border: ┌─ Title ─────┐
+    let title_bar_remaining = if box_width > title_width + 2 {
+        box_width - title_width - 2
+    } else {
+        1
+    };
+    println!(
+        "  {}{} {} {}{}",
+        style(b.tl).dim(),
+        style(b.h).dim(),
+        style(title).bold(),
+        style(b.h.repeat(title_bar_remaining)).dim(),
+        style(b.tr).dim(),
+    );
+
+    // Content lines
+    for line in content {
+        let visible_len = console::measure_text_width(line);
+        let pad = if box_width > visible_len + 4 {
+            box_width - visible_len - 4
+        } else {
+            0
+        };
+        println!(
+            "  {}  {}{}  {}",
+            style(b.v).dim(),
+            line,
+            " ".repeat(pad),
+            style(b.v).dim(),
+        );
+    }
+
+    // Bottom border
+    println!(
+        "  {}{}{}",
+        style(b.bl).dim(),
+        style(b.h.repeat(box_width)).dim(),
+        style(b.br).dim(),
+    );
+}
+
+/// Status badge states.
+pub enum BadgeState {
+    Ok,
+    Fail,
+    Warn,
+    Info,
+}
+
+/// Print a colored inline status badge like `[OK]`, `[FAIL]`, `[WARN]`.
+///
+/// Returns the formatted string (does not print).
+pub fn status_badge(label: &str, state: BadgeState) -> String {
+    match state {
+        BadgeState::Ok => style(format!("[{label}]")).green().bold().to_string(),
+        BadgeState::Fail => style(format!("[{label}]")).red().bold().to_string(),
+        BadgeState::Warn => style(format!("[{label}]")).yellow().bold().to_string(),
+        BadgeState::Info => style(format!("[{label}]")).cyan().bold().to_string(),
+    }
+}
+
+/// Print a properly aligned table with header separator.
+///
+/// `headers` and each row in `rows` must have the same length.
+///
+/// ```text
+///   NAME             STATUS     UPDATED
+///   ───────────────  ─────────  ─────────────
+///   MY_SECRET        active     2024-03-15
+///   DB_PASSWORD      active     2024-03-14
+/// ```
+pub fn table(headers: &[&str], rows: &[Vec<String>]) {
+    if is_quiet() || headers.is_empty() {
+        return;
+    }
+
+    // Calculate column widths.
+    let col_count = headers.len();
+    let mut widths: Vec<usize> = headers.iter().map(|h| console::measure_text_width(h)).collect();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            if i < col_count {
+                widths[i] = widths[i].max(console::measure_text_width(cell));
+            }
+        }
+    }
+
+    // Print header.
+    let header_line: String = headers
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            let w = widths[i];
+            format!("{:<width$}", h, width = w)
+        })
+        .collect::<Vec<_>>()
+        .join("  ");
+    println!("  {}", style(header_line).dim().bold());
+
+    // Separator.
+    let sep: String = widths
+        .iter()
+        .map(|w| {
+            if supports_unicode() {
+                "─".repeat(*w)
+            } else {
+                "-".repeat(*w)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("  ");
+    println!("  {}", style(sep).dim());
+
+    // Rows.
+    for row in rows {
+        let line: String = row
+            .iter()
+            .enumerate()
+            .map(|(i, cell)| {
+                let w = if i < col_count { widths[i] } else { 0 };
+                let visible = console::measure_text_width(cell);
+                let pad = if w > visible { w - visible } else { 0 };
+                format!("{cell}{}", " ".repeat(pad))
+            })
+            .collect::<Vec<_>>()
+            .join("  ");
+        println!("  {line}");
+    }
+}
+
+/// Print a numbered step indicator.
+///
+/// ```text
+///   [2/5] Configuring providers...
+/// ```
+pub fn step(n: usize, total: usize, msg: &str) {
+    if is_quiet() {
+        return;
+    }
+    println!(
+        "  {} {}",
+        style(format!("[{n}/{total}]")).cyan().bold(),
+        msg,
+    );
+}
+
+/// Print a horizontal divider line.
+pub fn divider() {
+    if is_quiet() {
+        return;
+    }
+    let w = term_width().min(72);
+    let line = if supports_unicode() {
+        "─".repeat(w)
+    } else {
+        "-".repeat(w)
+    };
+    println!("  {}", style(line).dim());
+}
+
+/// Print an app banner with title and subtitle.
+///
+/// ```text
+///
+///   ┌──────────────────────────────────┐
+///   │  Opaque                    v0.1  │
+///   │  Approval-gated secrets broker   │
+///   └──────────────────────────────────┘
+///
+/// ```
+pub fn banner(title: &str, subtitle: &str) {
+    if is_quiet() {
+        return;
+    }
+    let b = box_chars();
+    let content_width = console::measure_text_width(title)
+        .max(console::measure_text_width(subtitle))
+        .max(30);
+    let box_width = content_width + 4; // 2 padding each side
+
+    println!();
+    println!(
+        "  {}{}{}",
+        style(b.tl).dim(),
+        style(b.h.repeat(box_width)).dim(),
+        style(b.tr).dim(),
+    );
+
+    // Title line, padded.
+    let title_pad = if box_width > console::measure_text_width(title) + 4 {
+        box_width - console::measure_text_width(title) - 4
+    } else {
+        0
+    };
+    println!(
+        "  {}  {}{}  {}",
+        style(b.v).dim(),
+        style(title).bold(),
+        " ".repeat(title_pad),
+        style(b.v).dim(),
+    );
+
+    // Subtitle line.
+    let sub_pad = if box_width > console::measure_text_width(subtitle) + 4 {
+        box_width - console::measure_text_width(subtitle) - 4
+    } else {
+        0
+    };
+    println!(
+        "  {}  {}{}  {}",
+        style(b.v).dim(),
+        style(subtitle).dim(),
+        " ".repeat(sub_pad),
+        style(b.v).dim(),
+    );
+
+    println!(
+        "  {}{}{}",
+        style(b.bl).dim(),
+        style(b.h.repeat(box_width)).dim(),
+        style(b.br).dim(),
+    );
+    println!();
+}
+
+/// Format a path for display (cyan, underlined).
+#[allow(dead_code)]
+pub fn path(p: &str) -> String {
+    style(p).cyan().underlined().to_string()
+}
+
+/// Format an identifier/key name (yellow, bold).
+#[allow(dead_code)]
+pub fn ident(name: &str) -> String {
+    style(name).yellow().bold().to_string()
+}
+
+/// Format secondary/metadata text (dim).
+pub fn dim(text: &str) -> String {
+    style(text).dim().to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -118,7 +519,11 @@ pub fn format_response(method: &str, result: &serde_json::Value) {
         }
         "version" => {
             if let Some(ver) = result.get("version").and_then(|v| v.as_str()) {
-                println!("  {} {}", style("opaqued").bold(), style(ver).cyan().bold());
+                println!(
+                    "  {} {}",
+                    style("opaqued").bold(),
+                    style(ver).cyan().bold()
+                );
             } else {
                 print_json(result);
             }
@@ -550,7 +955,72 @@ fn format_agent_session_end_result(result: &serde_json::Value) {
 pub fn format_error(err: &opaque_core::proto::ErrorObj) {
     error(&err.message);
     if !err.code.is_empty() {
-        println!("  {} {}", style("code:").dim(), style(&err.code).red());
+        println!(
+            "  {} {}",
+            style("code:").dim(),
+            style(&err.code).red().dim()
+        );
+    }
+
+    // Provide actionable hints based on error code
+    if !err.code.is_empty() {
+        println!();
+        match err.code.as_str() {
+            code if code.contains("denied") || code.contains("DENIED") => {
+                println!(
+                    "  {} This operation was denied by the security policy.",
+                    style("hint:").cyan().bold()
+                );
+                println!(
+                    "    • Check policy: {}",
+                    style("opaque policy show").yellow()
+                );
+                println!(
+                    "    • Request approval or check pending leases: {}",
+                    style("opaque leases").yellow()
+                );
+            }
+            code if code.contains("not_found") || code.contains("NOT_FOUND") => {
+                println!(
+                    "  {} Resource not found. Check that names and IDs are correct.",
+                    style("hint:").cyan().bold()
+                );
+                println!(
+                    "    • List available resources before trying again"
+                );
+            }
+            code if code.contains("invalid") || code.contains("INVALID") => {
+                println!(
+                    "  {} Check your input parameters for validity.",
+                    style("hint:").cyan().bold()
+                );
+                println!(
+                    "    • Run with {}  for more details",
+                    style("--json").yellow()
+                );
+            }
+            code if code.contains("config") || code.contains("CONFIG") => {
+                println!(
+                    "  {} Daemon configuration issue.",
+                    style("hint:").cyan().bold()
+                );
+                println!(
+                    "    • Verify config: {}",
+                    style("opaque policy check").yellow()
+                );
+                println!(
+                    "    • Run diagnostics: {}",
+                    style("opaque doctor").yellow()
+                );
+            }
+            _ => {
+                println!(
+                    "  {} Run '{}' for diagnostics",
+                    style("hint:").cyan().bold(),
+                    style("opaque doctor").yellow()
+                );
+            }
+        }
     }
 }
 
@@ -563,54 +1033,13 @@ pub fn print_json(value: &serde_json::Value) {
 }
 
 // ---------------------------------------------------------------------------
-// Audit formatting
-// ---------------------------------------------------------------------------
-
-/// Print an audit event row with colored columns.
-pub fn audit_row(timestamp: &str, kind: &str, operation: &str, outcome: &str, request_id: &str) {
-    let styled_outcome = match outcome {
-        "allowed" | "ok" | "success" => style(format!("{outcome:<8}")).green(),
-        "denied" | "error" | "failed" => style(format!("{outcome:<8}")).red(),
-        _ => style(format!("{outcome:<8}")).yellow(),
-    };
-
-    let styled_kind = match kind {
-        k if k.contains("denied") => style(format!("{kind:<24}")).red(),
-        k if k.contains("error") => style(format!("{kind:<24}")).red(),
-        k if k.contains("allowed") || k.contains("completed") => {
-            style(format!("{kind:<24}")).green()
-        }
-        _ => style(format!("{kind:<24}")).white(),
-    };
-
-    println!(
-        "  {} {} {} {} {}",
-        style(timestamp).dim(),
-        styled_kind,
-        style(format!("{operation:<30}")).cyan(),
-        styled_outcome,
-        style(request_id).dim(),
-    );
-}
-
-/// Print the audit log header row.
-pub fn audit_header() {
-    println!(
-        "  {} {} {} {} {}",
-        style(format!("{:<27}", "TIMESTAMP")).dim().bold(),
-        style(format!("{:<24}", "EVENT")).dim().bold(),
-        style(format!("{:<30}", "OPERATION")).dim().bold(),
-        style(format!("{:<8}", "OUTCOME")).dim().bold(),
-        style("REQUEST ID").dim().bold(),
-    );
-    println!("  {}", style("─".repeat(100)).dim());
-}
-
-// ---------------------------------------------------------------------------
 // Init formatting
 // ---------------------------------------------------------------------------
 
 /// Print a step during init with a green check.
 pub fn init_step(msg: &str) {
+    if is_quiet() {
+        return;
+    }
     println!("  {} {}", style(CHECK).green(), msg);
 }

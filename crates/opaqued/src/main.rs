@@ -359,7 +359,12 @@ fn generate_daemon_token() -> String {
 fn write_daemon_token(socket: &Path, token: &str) -> std::io::Result<PathBuf> {
     let token_path = socket
         .parent()
-        .expect("socket path should have a parent directory")
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "socket path has no parent directory",
+            )
+        })?
         .join(DAEMON_TOKEN_FILENAME);
     std::fs::write(&token_path, token.as_bytes())?;
     #[cfg(unix)]
@@ -418,7 +423,12 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
     // Acquire PID file lock before anything else.
     let pid_path = socket
         .parent()
-        .expect("socket path should have a parent directory")
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "socket path has no parent directory",
+            )
+        })?
         .join("opaqued.pid");
     let _pid_guard = PidFileGuard::acquire(pid_path)?;
 
@@ -472,7 +482,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec![],
             secret_ref_param_keys: vec![],
         })
-        .expect("failed to register test.noop");
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     registry
         .register(OperationDef {
@@ -485,7 +495,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["profile".into(), "command".into()],
             secret_ref_param_keys: vec!["profile".into()],
         })
-        .expect("failed to register sandbox.exec");
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     registry
         .register(OperationDef {
@@ -508,7 +518,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["repo".into()],
             secret_ref_param_keys: vec!["value_ref".into(), "github_token_ref".into()],
         })
-        .expect("failed to register github.set_actions_secret");
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     registry
         .register(OperationDef {
@@ -531,7 +541,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["repo".into()],
             secret_ref_param_keys: vec!["value_ref".into(), "github_token_ref".into()],
         })
-        .expect("failed to register github.set_codespaces_secret");
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     registry
         .register(OperationDef {
@@ -553,7 +563,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["repo".into()],
             secret_ref_param_keys: vec!["value_ref".into(), "github_token_ref".into()],
         })
-        .expect("failed to register github.set_dependabot_secret");
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     registry
         .register(OperationDef {
@@ -577,7 +587,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["org".into()],
             secret_ref_param_keys: vec!["value_ref".into(), "github_token_ref".into()],
         })
-        .expect("failed to register github.set_org_secret");
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     registry
         .register(OperationDef {
@@ -599,7 +609,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["repo".into(), "org".into()],
             secret_ref_param_keys: vec!["github_token_ref".into()],
         })
-        .expect("failed to register github.list_secrets");
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     registry
         .register(OperationDef {
@@ -623,7 +633,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["repo".into(), "org".into()],
             secret_ref_param_keys: vec!["github_token_ref".into()],
         })
-        .expect("failed to register github.delete_secret");
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     registry
         .register(OperationDef {
@@ -650,7 +660,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["project".into(), "key".into()],
             secret_ref_param_keys: vec!["value_ref".into(), "gitlab_token_ref".into()],
         })
-        .expect("failed to register gitlab.set_ci_variable");
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     registry
         .register(OperationDef {
@@ -663,7 +673,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec![],
             secret_ref_param_keys: vec![],
         })
-        .expect("failed to register onepassword.list_vaults");
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     registry
         .register(OperationDef {
@@ -684,7 +694,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["vault".into(), "item".into()],
             secret_ref_param_keys: vec!["onepassword:{vault}/{item}/{field}".into()],
         })
-        .expect("failed to register onepassword.read_field");
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     registry
         .register(OperationDef {
@@ -701,7 +711,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["vault".into()],
             secret_ref_param_keys: vec![],
         })
-        .expect("failed to register onepassword.list_items");
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     registry
         .register(OperationDef {
@@ -714,7 +724,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec![],
             secret_ref_param_keys: vec![],
         })
-        .expect("failed to register bitwarden.list_projects");
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     registry
         .register(OperationDef {
@@ -730,7 +740,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["project".into()],
             secret_ref_param_keys: vec![],
         })
-        .expect("failed to register bitwarden.list_secrets");
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     registry
         .register(OperationDef {
@@ -747,7 +757,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["secret_id".into()],
             secret_ref_param_keys: vec!["secret_id".into()],
         })
-        .expect("failed to register bitwarden.read_secret");
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     // AWS STS operations
     registry
@@ -761,7 +771,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec![],
             secret_ref_param_keys: vec![],
         })
-        .expect("failed to register aws.get_caller_identity");
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     registry
         .register(OperationDef {
@@ -781,7 +791,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["role_arn".into()],
             secret_ref_param_keys: vec![],
         })
-        .expect("failed to register aws.assume_role");
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     // AWS Secrets Manager operations
     registry
@@ -795,7 +805,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec![],
             secret_ref_param_keys: vec![],
         })
-        .expect("failed to register aws.list_secrets");
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     registry
         .register(OperationDef {
@@ -812,7 +822,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["secret_id".into()],
             secret_ref_param_keys: vec!["secret_id".into()],
         })
-        .expect("failed to register aws.get_secret_value");
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     registry
         .register(OperationDef {
@@ -833,7 +843,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["name".into()],
             secret_ref_param_keys: vec!["value".into()],
         })
-        .expect("failed to register aws.create_secret");
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     registry
         .register(OperationDef {
@@ -853,7 +863,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["secret_id".into()],
             secret_ref_param_keys: vec!["value".into()],
         })
-        .expect("failed to register aws.put_secret_value");
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     registry
         .register(OperationDef {
@@ -870,7 +880,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["secret_id".into()],
             secret_ref_param_keys: vec![],
         })
-        .expect("failed to register aws.delete_secret");
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     // AWS SSM Parameter Store operations
     registry
@@ -888,7 +898,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["name".into()],
             secret_ref_param_keys: vec!["name".into()],
         })
-        .expect("failed to register aws.get_parameter");
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     registry
         .register(OperationDef {
@@ -910,7 +920,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["name".into()],
             secret_ref_param_keys: vec!["value".into()],
         })
-        .expect("failed to register aws.put_parameter");
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     registry
         .register(OperationDef {
@@ -930,7 +940,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["path".into()],
             secret_ref_param_keys: vec![],
         })
-        .expect("failed to register aws.get_parameters_by_path");
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     registry
         .register(OperationDef {
@@ -947,7 +957,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["name".into()],
             secret_ref_param_keys: vec![],
         })
-        .expect("failed to register aws.delete_parameter");
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     // Sandbox execve policy hook operations.
     registry
@@ -961,7 +971,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec![],
             secret_ref_param_keys: vec![],
         })
-        .expect("failed to register sandbox.execve_check");
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     registry
         .register(OperationDef {
@@ -974,7 +984,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec![],
             secret_ref_param_keys: vec![],
         })
-        .expect("failed to register sandbox.execve_approve");
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     let policy = PolicyEngine::with_rules(config.rules.clone());
     info!("policy engine loaded with {} rules", policy.rule_count());
@@ -985,8 +995,12 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         .join("audit.db");
     let retention_days = config.audit_retention_days.unwrap_or(90);
     let sqlite_sink: Arc<dyn AuditSink> = Arc::new(
-        SqliteAuditSink::new(audit_db_path.clone(), retention_days)
-            .expect("failed to open audit database"),
+        SqliteAuditSink::new(audit_db_path.clone(), retention_days).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("failed to open audit database: {e}"),
+            )
+        })?,
     );
     info!(
         "audit database at {} (retention: {} days)",
@@ -1010,20 +1024,20 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
     let (execve_check_handler, execve_approve_handler) =
         sandbox::execve_hook::create_execve_handlers(audit.clone(), execve_mapper);
 
-    let github_actions_handler =
-        github::GitHubHandler::new(audit.clone()).expect("invalid GitHub API URL scheme");
-    let github_codespaces_handler =
-        github::GitHubHandler::new(audit.clone()).expect("invalid GitHub API URL scheme");
-    let github_dependabot_handler =
-        github::GitHubHandler::new(audit.clone()).expect("invalid GitHub API URL scheme");
-    let github_org_handler =
-        github::GitHubHandler::new(audit.clone()).expect("invalid GitHub API URL scheme");
-    let github_list_handler =
-        github::GitHubHandler::new(audit.clone()).expect("invalid GitHub API URL scheme");
-    let github_delete_handler =
-        github::GitHubHandler::new(audit.clone()).expect("invalid GitHub API URL scheme");
-    let gitlab_handler =
-        gitlab::GitLabHandler::new(audit.clone()).expect("invalid GitLab API URL scheme");
+    let github_actions_handler = github::GitHubHandler::new(audit.clone())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let github_codespaces_handler = github::GitHubHandler::new(audit.clone())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let github_dependabot_handler = github::GitHubHandler::new(audit.clone())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let github_org_handler = github::GitHubHandler::new(audit.clone())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let github_list_handler = github::GitHubHandler::new(audit.clone())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let github_delete_handler = github::GitHubHandler::new(audit.clone())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let gitlab_handler = gitlab::GitLabHandler::new(audit.clone())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     // 1Password handler: prefer Connect Server URL, fall back to `op` CLI.
     let onepassword_connect_url =
@@ -1124,7 +1138,8 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         let sts_url = format!("https://sts.{aws_region}.amazonaws.com");
         let sm_url = format!("https://secretsmanager.{aws_region}.amazonaws.com");
         let ssm_url = format!("https://ssm.{aws_region}.amazonaws.com");
-        let aws_client = aws::client::AwsClient::new(&sts_url, &sm_url, &ssm_url);
+        let aws_client = aws::client::AwsClient::new(&sts_url, &sm_url, &ssm_url)
+            .expect("invalid AWS service URL scheme");
 
         let aws_ops = [
             "aws.get_caller_identity",
@@ -1149,7 +1164,8 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
     let enclave = enclave_builder
         .approval_gate(Box::new(NativeApprovalGate::new()))
         .audit(audit.clone())
-        .build();
+        .build()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     let state = Arc::new(DaemonState {
         enclave: Arc::new(enclave),
@@ -1221,6 +1237,16 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+/// Truncate a client-supplied string before echoing it in an error message.
+/// Prevents secret-length content from being reflected back in error responses.
+fn truncate_for_error(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_owned()
+    } else {
+        format!("{}...", &s[..max_len])
+    }
 }
 
 fn lock_down_socket_path(path: &Path) -> std::io::Result<()> {
@@ -2653,7 +2679,8 @@ async fn handle_request(
                         Some(req.id),
                         "bad_request",
                         format!(
-                            "unknown scope '{unknown}' (expected: repo_actions, env_actions, codespaces_user, codespaces_repo, dependabot, org_actions)"
+                            "unknown scope '{}' (expected: repo_actions, env_actions, codespaces_user, codespaces_repo, dependabot, org_actions)",
+                            truncate_for_error(unknown, 64)
                         ),
                     );
                 }
@@ -2708,7 +2735,7 @@ async fn handle_request(
                 return Response::err(
                     Some(req.id),
                     "bad_request",
-                    format!("unknown action '{action}' (expected: set_ci_variable)"),
+                    format!("unknown action '{}' (expected: set_ci_variable)", truncate_for_error(&action, 64)),
                 );
             }
 
@@ -2916,7 +2943,8 @@ async fn handle_request(
                         Some(req.id),
                         "bad_request",
                         format!(
-                            "unknown action '{unknown}' (expected: list_vaults, list_items, read_field)"
+                            "unknown action '{}' (expected: list_vaults, list_items, read_field)",
+                            truncate_for_error(unknown, 64)
                         ),
                     );
                 }
@@ -3044,7 +3072,8 @@ async fn handle_request(
                         Some(req.id),
                         "bad_request",
                         format!(
-                            "unknown action '{unknown}' (expected: list_projects, list_secrets, read_secret)"
+                            "unknown action '{}' (expected: list_projects, list_secrets, read_secret)",
+                            truncate_for_error(unknown, 64)
                         ),
                     );
                 }
@@ -4286,7 +4315,8 @@ exe_sha256 = "deadbeef"
             .policy(policy)
             .approval_gate(Box::new(NativeApprovalGate::new()))
             .audit(audit.clone())
-            .build();
+            .build()
+            .unwrap();
         DaemonState {
             enclave: Arc::new(enclave),
             audit,
@@ -4446,5 +4476,24 @@ exe_sha256 = "deadbeef"
             result.is_ok(),
             "missing config file should not cause seal failure"
         );
+    }
+
+    #[test]
+    fn truncate_for_error_short_string() {
+        assert_eq!(truncate_for_error("abc", 64), "abc");
+    }
+
+    #[test]
+    fn truncate_for_error_exact_length() {
+        let s = "a".repeat(64);
+        assert_eq!(truncate_for_error(&s, 64), s);
+    }
+
+    #[test]
+    fn truncate_for_error_long_string() {
+        let s = "a".repeat(100);
+        let result = truncate_for_error(&s, 64);
+        assert_eq!(result.len(), 67); // 64 + "..."
+        assert!(result.ends_with("..."));
     }
 }

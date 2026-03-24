@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use bytes::Bytes;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::generate;
 use console::style;
 use futures_util::{SinkExt, StreamExt};
 use opaque_core::audit::{AuditEventKind, AuditFilter, query_audit_db};
@@ -45,6 +46,41 @@ const BASELINE_ENV_KEYS: &[&str] = &[
     "SSH_AUTH_SOCK",
 ];
 
+// ---------------------------------------------------------------------------
+// Exit codes
+// ---------------------------------------------------------------------------
+
+/// Success exit code.
+#[allow(dead_code)]
+const EXIT_SUCCESS: i32 = 0;
+
+/// General error exit code.
+const EXIT_ERROR: i32 = 1;
+
+/// Invalid input or arguments.
+const EXIT_USAGE: i32 = 2;
+
+/// Daemon connection or response error.
+const EXIT_DAEMON: i32 = 3;
+
+/// Authentication or approval failure.
+const EXIT_AUTH: i32 = 4;
+
+/// Prompt the user to confirm a destructive action.
+///
+/// Returns `true` if the action should proceed. Skips the prompt and returns
+/// `true` when `--yes` or `--json` is active (scripting context).
+fn confirm_destructive(message: &str, skip: bool) -> bool {
+    if skip {
+        return true;
+    }
+    dialoguer::Confirm::new()
+        .with_prompt(message)
+        .default(false)
+        .interact()
+        .unwrap_or(false)
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "opaque", version = version_string())]
 struct Cli {
@@ -55,6 +91,22 @@ struct Cli {
     /// Output raw JSON instead of styled text (useful for scripting).
     #[arg(long, global = true)]
     json: bool,
+
+    /// Disable colored output and emoji (respect NO_COLOR env var).
+    #[arg(long, global = true)]
+    plain: bool,
+
+    /// Skip confirmation prompts (useful for scripting).
+    #[arg(long, short = 'y', global = true)]
+    yes: bool,
+
+    /// Verbose output (show extra details, debug info).
+    #[arg(long, short = 'v', global = true, conflicts_with = "quiet")]
+    verbose: bool,
+
+    /// Minimal output (suppress non-essential messages). Useful for scripting.
+    #[arg(long, short = 'q', global = true, conflicts_with = "verbose")]
+    quiet: bool,
 
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -176,6 +228,12 @@ enum Cmd {
     Secrets {
         #[command(subcommand)]
         action: SecretsAction,
+    },
+    /// Generate shell completions for bash, zsh, or fish.
+    Completions {
+        /// Shell to generate completions for.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
     },
 }
 
@@ -1567,7 +1625,8 @@ fn run_secrets_add(name: &str) {
 
     if value.is_empty() {
         ui::error("Secret value must not be empty");
-        std::process::exit(1);
+        eprintln!("\n  {} Provide a non-empty secret value", style("hint:").cyan().bold());
+        std::process::exit(EXIT_USAGE);
     }
 
     let os = detect_keychain_os();
@@ -1701,13 +1760,36 @@ fn run_secrets_remove(name: &str) {
 async fn main() {
     let cli = Cli::parse();
 
+    // Respect NO_COLOR environment variable and --plain flag.
+    if cli.plain || std::env::var("NO_COLOR").is_ok() {
+        console::set_colors_enabled(false);
+    }
+
     let json_output = cli.json;
+    let verbose = cli.verbose;
+    let quiet = cli.quiet || cli.json;
+    let skip_confirm = cli.yes || cli.json;
+
+    // Set global verbosity for ui module output gating.
+    ui::set_verbosity(quiet, verbose);
+
+    // In verbose mode, initialize tracing at debug level.
+    if verbose {
+        use tracing_subscriber::EnvFilter;
+        let filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("opaque=debug"));
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .with_writer(std::io::stderr)
+            .init();
+    }
 
     // No subcommand → show smart status dashboard instead of silent ping.
     let cmd = match cli.cmd {
         Some(c) => c,
         None => {
-            run_status().await;
+            run_status(json_output).await;
             return;
         }
     };
@@ -1720,7 +1802,7 @@ async fn main() {
                     Ok(msg) => ui::success(&msg),
                     Err(e) => {
                         ui::error(&e);
-                        std::process::exit(1);
+                        std::process::exit(EXIT_ERROR);
                     }
                 }
                 return;
@@ -1730,7 +1812,7 @@ async fn main() {
                     Ok(()) => {}
                     Err(e) => {
                         ui::error(&e);
-                        std::process::exit(1);
+                        std::process::exit(EXIT_ERROR);
                     }
                 }
                 return;
@@ -1741,7 +1823,7 @@ async fn main() {
                         Ok(()) => {}
                         Err(e) => {
                             ui::error(&e);
-                            std::process::exit(1);
+                            std::process::exit(EXIT_ERROR);
                         }
                     },
                     None => policy_list_presets(),
@@ -1753,7 +1835,7 @@ async fn main() {
                     Ok(()) => {}
                     Err(e) => {
                         ui::error(&e);
-                        std::process::exit(1);
+                        std::process::exit(EXIT_ERROR);
                     }
                 }
                 return;
@@ -1775,12 +1857,17 @@ async fn main() {
                     Ok(()) => {}
                     Err(e) => {
                         ui::error(&e);
-                        std::process::exit(1);
+                        std::process::exit(EXIT_ERROR);
                     }
                 }
                 return;
             }
         },
+        Cmd::Completions { shell } => {
+            let mut cmd = Cli::command();
+            generate(*shell, &mut cmd, "opaque", &mut std::io::stdout());
+            return;
+        }
         Cmd::Init {
             force,
             preset,
@@ -1795,7 +1882,7 @@ async fn main() {
                 Ok(()) => {}
                 Err(e) => {
                     ui::error(&e);
-                    std::process::exit(1);
+                    std::process::exit(EXIT_ERROR);
                 }
             }
             return;
@@ -1846,6 +1933,15 @@ async fn main() {
             reset,
             verify,
         } => {
+            if *reset
+                && !confirm_destructive(
+                    "Are you sure you want to remove the config seal? This allows reconfiguration",
+                    skip_confirm,
+                )
+            {
+                ui::info("Aborted.");
+                return;
+            }
             match run_setup(*seal, *reset, *verify) {
                 Ok(()) => {}
                 Err(e) => {
@@ -1874,6 +1970,15 @@ async fn main() {
             return;
         }
         Cmd::Service { action } => {
+            if matches!(action, ServiceAction::Uninstall)
+                && !confirm_destructive(
+                    "Are you sure you want to uninstall the daemon service?",
+                    skip_confirm,
+                )
+            {
+                ui::info("Aborted.");
+                return;
+            }
             let op = match action {
                 ServiceAction::Install => service::ServiceOp::Install,
                 ServiceAction::Uninstall => service::ServiceOp::Uninstall,
@@ -1914,7 +2019,16 @@ async fn main() {
             match action {
                 SecretsAction::Add { name } => run_secrets_add(name),
                 SecretsAction::List => run_secrets_list(),
-                SecretsAction::Remove { name } => run_secrets_remove(name),
+                SecretsAction::Remove { name } => {
+                    if !confirm_destructive(
+                        &format!("Are you sure you want to remove secret 'opaque/{name}' from the keychain?"),
+                        skip_confirm,
+                    ) {
+                        ui::info("Aborted.");
+                        return;
+                    }
+                    run_secrets_remove(name);
+                }
             }
             return;
         }
@@ -1940,7 +2054,9 @@ async fn main() {
         for key in pass_env {
             if !is_valid_env_name(key) {
                 ui::error(&format!("--pass-env '{key}': invalid env var name"));
-                std::process::exit(1);
+                eprintln!("\n  {} Environment variable names must start with A-Z/a-z/_ and contain only alphanumerics and _",
+                    style("hint:").cyan().bold());
+                std::process::exit(EXIT_USAGE);
             }
         }
         match run_agent_wrapped(
@@ -2035,6 +2151,25 @@ async fn main() {
                     std::process::exit(1);
                 }
             }
+            return;
+        }
+    }
+
+    // Confirm destructive daemon operations before dispatching.
+    if let Cmd::Github {
+        action:
+            GithubAction::DeleteSecret {
+                ref secret_name,
+                ref scope,
+                ..
+            },
+    } = cmd
+    {
+        if !confirm_destructive(
+            &format!("Are you sure you want to delete {scope} secret '{secret_name}'?"),
+            skip_confirm,
+        ) {
+            ui::info("Aborted.");
             return;
         }
     }
@@ -2305,19 +2440,31 @@ async fn main() {
         | Cmd::Doctor
         | Cmd::Quickstart
         | Cmd::Secrets { .. }
-        | Cmd::Connect { .. } => {
+        | Cmd::Connect { .. }
+        | Cmd::Completions { .. } => {
             unreachable!()
         }
     };
 
-    let sp = if json_output {
+    // Verbose: show what we're about to call.
+    ui::debug(&format!("method={method} socket={}", sock.display()));
+    if verbose {
+        if let Ok(params_json) = serde_json::to_string(&params) {
+            ui::debug(&format!("params={params_json}"));
+        }
+    }
+
+    let sp = if json_output || quiet {
         None
     } else {
         Some(ui::spinner(&format!("Calling {method}...")))
     };
 
+    let call_start = std::time::Instant::now();
     match call(&sock, method, params).await {
         Ok(resp) => {
+            let elapsed = call_start.elapsed();
+            ui::debug(&format!("response received in {elapsed:.1?}"));
             if let Some(ref sp) = sp {
                 sp.finish_and_clear();
             }
@@ -2328,54 +2475,89 @@ async fn main() {
                     serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_string());
                 println!("{output}");
                 if resp.error.is_some() {
-                    std::process::exit(1);
+                    std::process::exit(EXIT_DAEMON);
                 }
             } else {
                 if let Some(err) = &resp.error {
                     ui::format_error(err);
-                    std::process::exit(1);
+                    // Use EXIT_AUTH for policy denials, EXIT_DAEMON for other daemon errors
+                    let exit_code = if err.code.contains("denied") || err.code.contains("DENIED") {
+                        EXIT_AUTH
+                    } else {
+                        EXIT_DAEMON
+                    };
+                    std::process::exit(exit_code);
                 }
                 if let Some(result) = &resp.result {
-                    ui::format_response(method, result);
-                } else {
+                    if quiet {
+                        // Quiet mode: only show essential output (no decorative formatting).
+                        // For methods that have data, print minimal JSON.
+                        match method {
+                            "ping" => {} // Silence — success is implicit (exit 0).
+                            "version" => {
+                                if let Some(ver) = result.get("version").and_then(|v| v.as_str()) {
+                                    println!("{ver}");
+                                }
+                            }
+                            _ => {
+                                // Fall back to compact JSON for other methods in quiet mode.
+                                if let Ok(json) = serde_json::to_string(result) {
+                                    println!("{json}");
+                                }
+                            }
+                        }
+                    } else {
+                        ui::format_response(method, result);
+                    }
+                } else if !quiet {
                     ui::success("Done (no result payload)");
                 }
             }
         }
         Err(e) => {
+            let elapsed = call_start.elapsed();
+            ui::debug(&format!("call failed after {elapsed:.1?}: {e}"));
             if json_output {
                 let err = serde_json::json!({"error": e.to_string()});
                 println!("{}", serde_json::to_string_pretty(&err).unwrap_or_default());
             } else if let Some(ref sp) = sp {
+                let err_str = e.to_string();
+                let hint = if err_str.contains("No such file") || err_str.contains("not found") || err_str.contains("Connection refused") {
+                    Some("Is the daemon running? Try: opaque service start")
+                } else {
+                    None
+                };
                 ui::spinner_error(sp, &format!("Connection failed: {e}"));
+                if let Some(h) = hint {
+                    eprintln!("\n  {} {}", style("hint:").cyan().bold(), style(h).cyan());
+                }
             } else {
                 ui::error(&format!("Connection failed: {e}"));
-            }
-            // Show actionable hints for common connection errors.
-            if !json_output {
-                let err_str = e.to_string();
-                if err_str.contains("No such file")
-                    || err_str.contains("not found")
-                    || err_str.contains("Connection refused")
-                {
-                    eprintln!();
-                    eprintln!(
-                        "  {} The daemon doesn't appear to be running.",
-                        style("hint:").cyan().bold()
-                    );
-                    eprintln!(
-                        "        {}  {}",
-                        style("opaque service install").cyan(),
-                        style("# install & auto-start on login").dim()
-                    );
-                    eprintln!(
-                        "        {}  {}",
-                        style("opaque quickstart").cyan(),
-                        style("# or run the full setup wizard").dim()
-                    );
+                if !json_output {
+                    let err_str = e.to_string();
+                    if err_str.contains("No such file")
+                        || err_str.contains("not found")
+                        || err_str.contains("Connection refused")
+                    {
+                        eprintln!();
+                        eprintln!(
+                            "  {} The daemon doesn't appear to be running.",
+                            style("hint:").cyan().bold()
+                        );
+                        eprintln!(
+                            "        {}  {}",
+                            style("opaque service install").cyan(),
+                            style("# install & auto-start on login").dim()
+                        );
+                        eprintln!(
+                            "        {}  {}",
+                            style("opaque quickstart").cyan(),
+                            style("# or run the full setup wizard").dim()
+                        );
+                    }
                 }
             }
-            std::process::exit(1);
+            std::process::exit(EXIT_DAEMON);
         }
     }
 }
@@ -2628,23 +2810,20 @@ fn run_audit_tail(
     let events = query_audit_db(&db_path, &filter).map_err(|e| format!("query failed: {e}"))?;
 
     if json_output {
-        let json_events: Vec<serde_json::Value> = events
-            .iter()
-            .map(|e| {
-                serde_json::json!({
-                    "event_id": e.event_id.to_string(),
-                    "ts_utc_ms": e.ts_utc_ms,
-                    "kind": e.kind.to_string(),
-                    "operation": e.operation,
-                    "outcome": e.outcome,
-                    "request_id": e.request_id.map(|u| u.to_string()),
-                })
-            })
-            .collect();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json_events).unwrap_or_else(|_| "[]".to_string())
-        );
+        // Output newline-delimited JSON for better streaming support
+        for event in &events {
+            let json = serde_json::json!({
+                "event_id": event.event_id.to_string(),
+                "ts_utc_ms": event.ts_utc_ms,
+                "kind": event.kind.to_string(),
+                "operation": event.operation,
+                "outcome": event.outcome,
+                "request_id": event.request_id.map(|u| u.to_string()),
+            });
+            if let Ok(json_str) = serde_json::to_string(&json) {
+                println!("{json_str}");
+            }
+        }
         return Ok(());
     }
 
@@ -2653,19 +2832,54 @@ fn run_audit_tail(
         return Ok(());
     }
 
-    ui::header(&format!("{} audit event(s)", events.len()));
-    ui::audit_header();
+    // Build table with headers and rows
+    let headers = vec!["WHEN", "EVENT", "OPERATION", "OUTCOME", "REQUEST ID"];
+    let mut rows = Vec::new();
 
     for event in &events {
-        let ts = chrono_format_ms(event.ts_utc_ms);
+        let relative = format_relative_time(event.ts_utc_ms);
+        let absolute = chrono_format_ms(event.ts_utc_ms);
+        let when = format!("{}\n{}", relative, format!("{}", style(absolute).dim()));
+
         let kind = event.kind.to_string();
-        let op = event.operation.as_deref().unwrap_or("-");
-        let outcome = event.outcome.as_deref().unwrap_or("-");
+
+        let op = event.operation.as_deref().unwrap_or("-").to_string();
+
+        let outcome_label = event.outcome.as_deref().unwrap_or("unknown");
+        let outcome_badge = ui::status_badge(
+            outcome_label,
+            match outcome_label {
+                "allowed" | "ok" | "success" => ui::BadgeState::Ok,
+                "denied" | "error" | "failed" => ui::BadgeState::Fail,
+                _ => ui::BadgeState::Warn,
+            },
+        );
+
         let rid = event
             .request_id
             .map(|u| u.to_string())
             .unwrap_or_else(|| "-".into());
-        ui::audit_row(&ts, &kind, op, outcome, &rid);
+
+        rows.push(vec![when, kind, op, outcome_badge, rid]);
+    }
+
+    // Display table with summary
+    ui::header(&format!("Audit log — {} event(s)", events.len()));
+    ui::table(&headers, &rows);
+
+    // Summary footer
+    println!();
+    if events.len() < limit {
+        ui::info(&format!(
+            "Showing all {} event(s)",
+            events.len()
+        ));
+    } else {
+        ui::info(&format!(
+            "Showing {} of many events. Use --limit {} to see more.",
+            events.len(),
+            limit + 10
+        ));
     }
 
     Ok(())
@@ -2717,6 +2931,32 @@ fn chrono_format_ms(ms: i64) -> String {
     // Approximate date from days since epoch (good enough for display).
     let (year, month, day) = days_to_ymd(days);
     format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z")
+}
+
+/// Format a millisecond timestamp as a relative human-readable string (e.g., "2m ago", "1h ago").
+fn format_relative_time(event_ts_ms: i64) -> String {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
+    let age_ms = (now_ms - event_ts_ms).max(0);
+    let age_secs = age_ms / 1000;
+
+    if age_secs < 60 {
+        format!("{}s ago", age_secs)
+    } else if age_secs < 3600 {
+        format!("{}m ago", age_secs / 60)
+    } else if age_secs < 86400 {
+        format!("{}h ago", age_secs / 3600)
+    } else {
+        let days = age_secs / 86400;
+        if days == 1 {
+            "yesterday".to_string()
+        } else {
+            format!("{}d ago", days)
+        }
+    }
 }
 
 /// Convert days since Unix epoch to (year, month, day).
@@ -3266,27 +3506,11 @@ fn run_init(force: bool, preset: Option<&str>) -> Result<(), String> {
         style(effective_preset).bold()
     ));
     println!();
-    println!("  Next steps:");
-    println!(
-        "    1. {}   {}",
-        style("opaque service install").bold(),
-        style("# install & start daemon").dim()
-    );
-    println!(
-        "    2. {}      {}",
-        style("opaque connect auto").bold(),
-        style("# connect to Claude/Cursor").dim()
-    );
-    println!(
-        "    3. {}             {}",
-        style("opaque ping").bold(),
-        style("# verify daemon is alive").dim()
-    );
-    println!(
-        "    4. {}           {}",
-        style("opaque doctor").bold(),
-        style("# full diagnostic check").dim()
-    );
+    println!("  {}", style("Next steps:").bold());
+    ui::step(1, 4, &format!("{} {}", style("opaque service install").cyan().bold(), ui::dim("# install & start daemon")));
+    ui::step(2, 4, &format!("{} {}", style("opaque connect auto").cyan().bold(), ui::dim("# connect to Claude/Cursor")));
+    ui::step(3, 4, &format!("{} {}", style("opaque ping").cyan().bold(), ui::dim("# verify daemon is alive")));
+    ui::step(4, 4, &format!("{} {}", style("opaque doctor").cyan().bold(), ui::dim("# full diagnostic check")));
     println!();
     ui::info("Or run 'opaque quickstart' to do all of the above automatically.");
     Ok(())
@@ -3343,8 +3567,7 @@ fn run_quickstart_at(base: &Path) -> Result<bool, String> {
 async fn run_quickstart() {
     let base = default_opaque_dir();
 
-    ui::header("Opaque Quickstart");
-    println!();
+    ui::banner("Opaque Quickstart", "One-step onboarding");
 
     // Step 1: Init with safe-demo preset (if needed).
     match run_quickstart_at(&base) {
@@ -3501,32 +3724,13 @@ async fn run_quickstart() {
     println!();
     ui::success("Quickstart complete!");
     println!();
-    ui::info("Useful commands:");
-    println!(
-        "    {}           {}",
-        style("opaque doctor").cyan().bold(),
-        style("# run full diagnostics").dim()
-    );
-    println!(
-        "    {}  {}",
-        style("opaque init --repo").cyan().bold(),
-        style("# add per-repo policy (in a git repo)").dim()
-    );
-    println!(
-        "    {}  {}",
-        style("opaque policy presets").cyan().bold(),
-        style("# explore other policy presets").dim()
-    );
-    println!(
-        "    {}  {}",
-        style("opaque secrets add <name>").cyan().bold(),
-        style("# store a secret in the OS keychain").dim()
-    );
-    println!(
-        "    {}      {}",
-        style("opaque setup --seal").cyan().bold(),
-        style("# seal config to prevent tampering").dim()
-    );
+    ui::section_box("Useful commands", &[
+        &format!("{:<28}{}", style("opaque doctor").cyan().bold(), ui::dim("# run full diagnostics")),
+        &format!("{:<28}{}", style("opaque init --repo").cyan().bold(), ui::dim("# add per-repo policy (in a git repo)")),
+        &format!("{:<28}{}", style("opaque policy presets").cyan().bold(), ui::dim("# explore other policy presets")),
+        &format!("{:<28}{}", style("opaque secrets add <name>").cyan().bold(), ui::dim("# store a secret in the OS keychain")),
+        &format!("{:<28}{}", style("opaque setup --seal").cyan().bold(), ui::dim("# seal config to prevent tampering")),
+    ]);
 }
 
 // ---------------------------------------------------------------------------
@@ -3652,21 +3856,18 @@ fn run_setup_wizard(base: &Path, config_path: &Path, seal_file: &Path) -> Result
     use opaque_core::seal;
 
     println!();
-    println!("  {}", style("Opaque Setup").bold());
-    println!("  {}", style("════════════").dim());
+    ui::banner("Setup", "Configure your security policy");
     println!();
-    println!("  This wizard configures your security policy and seals it.");
-    println!(
-        "  Once sealed, config cannot be modified without '{}'.",
-        style("opaque setup --reset").cyan()
-    );
+    println!("  This wizard configures who can use Opaque and what they can access.");
+    println!("  Your policy will be sealed and protected from accidental changes.");
     println!();
 
     // Ensure base directory exists.
     create_dir_0700(base)?;
 
     // Step 1: Human Clients
-    println!("  {}", style("Step 1: Human Clients").bold().underlined());
+    ui::step(1, 4, "Human Clients");
+    println!();
 
     let discovered = discover_opaque_paths();
     let mut clients: Vec<setup::HumanClientConfig> = Vec::new();
@@ -3749,12 +3950,23 @@ fn run_setup_wizard(base: &Path, config_path: &Path, seal_file: &Path) -> Result
             .interact_text()
             .map_err(|e| format!("input error: {e}"))?;
 
+        if path.trim().is_empty() {
+            ui::warn("Path cannot be empty, skipping.");
+            continue;
+        }
+
         let name: String = Input::new()
             .with_prompt("  Client name")
             .default("custom-client".into())
             .interact_text()
             .map_err(|e| format!("input error: {e}"))?;
 
+        if name.trim().is_empty() {
+            ui::warn("Name cannot be empty, skipping.");
+            continue;
+        }
+
+        ui::init_step(&format!("Added: {} ({})", style(&name).cyan(), style(&path).dim()));
         clients.push(setup::HumanClientConfig {
             name,
             exe_path: path,
@@ -3764,7 +3976,8 @@ fn run_setup_wizard(base: &Path, config_path: &Path, seal_file: &Path) -> Result
     println!();
 
     // Step 2: Operations
-    println!("  {}", style("Step 2: Operations").bold().underlined());
+    ui::step(2, 4, "Operations");
+    println!();
 
     let op_labels: Vec<&str> = setup::EnabledOperation::ALL
         .iter()
@@ -3785,16 +3998,30 @@ fn run_setup_wizard(base: &Path, config_path: &Path, seal_file: &Path) -> Result
         .map(|&i| setup::EnabledOperation::ALL[i])
         .collect();
 
+    if !enabled_ops.is_empty() {
+        ui::init_step(&format!("Enabled {} operation(s)",
+            style(enabled_ops.len()).cyan()));
+    } else {
+        ui::warn("No operations enabled — clients will have minimal access.");
+    }
+
     println!();
 
     // Step 3: Approval Policy
-    println!("  {}", style("Step 3: Approval Policy").bold().underlined());
+    ui::step(3, 4, "Approval Policy");
+    println!();
 
     let require_bio = Confirm::new()
         .with_prompt("  Require biometric approval for sensitive operations?")
         .default(true)
         .interact()
         .map_err(|e| format!("input error: {e}"))?;
+
+    if require_bio {
+        ui::init_step("Biometric approval required");
+    } else {
+        ui::warn("Biometric approval disabled — policy will be permissive.");
+    }
 
     let lease_ttl: u64 = if require_bio {
         Input::new()
@@ -3819,20 +4046,45 @@ fn run_setup_wizard(base: &Path, config_path: &Path, seal_file: &Path) -> Result
     let config_content = setup::generate_config(&answers);
 
     // Step 4: Review & Confirm
-    println!(
-        "  {}",
-        style("Step 4: Review & Confirm").bold().underlined()
-    );
+    ui::step(4, 4, "Review & Confirm");
     println!();
+
+    // Show summary in a section box.
+    let client_count = answers.human_clients.len().max(1).to_string();
+    let op_count = answers.enabled_operations.len().max(1).to_string();
+    let bio_label = if answers.require_biometric {
+        "required (first_use)"
+    } else {
+        "disabled"
+    };
+    let lease_label = if answers.require_biometric && answers.lease_ttl > 0 {
+        format!("{}s", answers.lease_ttl)
+    } else {
+        "n/a".to_string()
+    };
+    let summary_lines: Vec<String> = vec![
+        format!("Trusted clients:  {}", client_count),
+        format!("Operations:       {}", op_count),
+        format!("Biometric:        {}", bio_label),
+        format!("Lease TTL:        {}", lease_label),
+        format!("Config path:      {}", config_path.display()),
+    ];
+    let summary_refs: Vec<&str> = summary_lines.iter().map(|s| s.as_str()).collect();
+    ui::section_box("Policy Summary", &summary_refs);
+    println!();
+
+    // Show the generated config.
+    let b = ui::box_chars();
     println!(
-        "  {} {}",
-        style("┌─").dim(),
+        "  {}{} {}",
+        style(b.tl).dim(),
+        style(b.h).dim(),
         style(config_path.display()).cyan()
     );
     for line in config_content.lines() {
-        println!("  {} {}", style("│").dim(), line);
+        println!("  {} {}", style(b.v).dim(), line);
     }
-    println!("  {}", style("└─").dim());
+    println!("  {}{}", style(b.bl).dim(), style(b.h).dim());
     println!();
 
     let confirm = Confirm::new()
@@ -3875,8 +4127,36 @@ fn run_setup_wizard(base: &Path, config_path: &Path, seal_file: &Path) -> Result
     ui::init_step(&format!("Config sealed (SHA-256: {}...)", &hash[..16]));
 
     println!();
-    ui::success("Setup complete!");
-    ui::info("Run 'opaque service install' to start the daemon automatically on login.");
+    ui::success("Setup complete! Your policy is now sealed.");
+    println!();
+    ui::divider();
+    println!();
+    ui::info("Next steps:");
+    ui::step(
+        1,
+        3,
+        &format!(
+            "Start the daemon:       {}",
+            style("opaque service install").cyan()
+        ),
+    );
+    ui::step(
+        2,
+        3,
+        &format!(
+            "Verify installation:    {}",
+            style("opaque status").cyan()
+        ),
+    );
+    ui::step(
+        3,
+        3,
+        &format!(
+            "Register with AI tool:  {}",
+            style("opaque init --register").cyan()
+        ),
+    );
+    println!();
 
     Ok(())
 }
@@ -3885,19 +4165,65 @@ fn run_setup_wizard(base: &Path, config_path: &Path, seal_file: &Path) -> Result
 // status (default when no subcommand)
 // ---------------------------------------------------------------------------
 
+/// Machine-readable JSON status output for scripting.
+async fn run_status_json() {
+    let base = default_opaque_dir();
+    let config_path = base.join("config.toml");
+    let sock = socket_path();
+
+    // Detect status
+    let config_exists = config_path.exists();
+    let service_status = service::query_status();
+    let daemon_reachable = if sock.exists() {
+        tokio::time::timeout(Duration::from_secs(2), try_ping(&sock))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .is_some()
+    } else {
+        false
+    };
+
+    let mcp_connected = detect_mcp_connection();
+
+    let status = serde_json::json!({
+        "version": version_string(),
+        "config": {
+            "exists": config_exists,
+            "path": config_path.display().to_string(),
+        },
+        "daemon": {
+            "reachable": daemon_reachable,
+            "socket_path": sock.display().to_string(),
+        },
+        "service": {
+            "installed": service_status.installed,
+            "running": service_status.running,
+            "pid": service_status.pid,
+        },
+        "mcp": {
+            "connected": mcp_connected.is_some(),
+            "tool": mcp_connected,
+        },
+    });
+
+    println!("{}", serde_json::to_string_pretty(&status).unwrap_or_default());
+}
+
 /// Smart welcome screen shown when `opaque` is invoked with no subcommand.
 ///
 /// Detects installation state and shows either a first-run guide or a status
 /// dashboard, making the next action obvious.
-async fn run_status() {
-    println!();
-    println!(
-        "  {} {}",
-        style("Opaque").bold(),
-        style(version_string()).dim()
+async fn run_status(json_output: bool) {
+    if json_output {
+        run_status_json().await;
+        return;
+    }
+
+    ui::banner(
+        &format!("Opaque {}", version_string()),
+        "Approval-gated secrets broker for AI coding tools",
     );
-    println!("  {}", style("─────────────────────────────").dim());
-    println!();
 
     let base = default_opaque_dir();
     let config_path = base.join("config.toml");
@@ -3918,34 +4244,51 @@ async fn run_status() {
 
     if !config_exists {
         // ── First-time user ─────────────────────────────────────────
-        println!("  {}", style("Get started in 60 seconds:").bold());
-        println!();
-        println!("    {}", style("opaque quickstart").cyan().bold());
-        println!();
-        println!("  This will:");
         println!(
-            "    1. Create {} with a safe demo policy",
-            style("~/.opaque/").cyan()
+            "  {} {}",
+            style("Get started in 60 seconds:").bold(),
+            style("opaque quickstart").cyan().bold(),
         );
-        println!("    2. Install and start the daemon service");
-        println!("    3. Connect to your AI coding tool (Claude, Cursor)");
-        println!("    4. Verify everything works end-to-end");
+        println!();
+
+        ui::step(
+            1,
+            4,
+            &format!(
+                "Create {} with a safe demo policy",
+                style("~/.opaque/").cyan()
+            ),
+        );
+        ui::step(2, 4, "Install and start the daemon service");
+        ui::step(
+            3,
+            4,
+            &format!(
+                "Connect to your AI coding tool ({}, {})",
+                style("Claude").cyan(),
+                style("Cursor").cyan()
+            ),
+        );
+        ui::step(4, 4, "Verify everything works end-to-end");
+
+        println!();
+        ui::divider();
         println!();
         println!("  {}", style("Other commands:").dim());
         println!(
-            "    {}        {}",
+            "    {:<24} {}",
             style("opaque init").cyan(),
-            style("# initialize config only").dim()
+            ui::dim("# initialize config only")
         );
         println!(
-            "    {}      {}",
+            "    {:<24} {}",
             style("opaque doctor").cyan(),
-            style("# diagnose an existing install").dim()
+            ui::dim("# diagnose an existing install")
         );
         println!(
-            "    {}      {}",
+            "    {:<24} {}",
             style("opaque --help").cyan(),
-            style("# see all commands").dim()
+            ui::dim("# see all commands")
         );
     } else {
         // ── Returning user: status dashboard ────────────────────────
@@ -3963,133 +4306,103 @@ async fn run_status() {
                 .ok()
                 .and_then(|bytes| seal::verify_seal(&bytes, &seal_file).ok())
                 .map(|s| match s {
-                    SealStatus::Verified => style("sealed").green().to_string(),
-                    SealStatus::Unsealed => style("unsealed").yellow().to_string(),
-                    SealStatus::Tampered { .. } => style("TAMPERED").red().bold().to_string(),
+                    SealStatus::Verified => ui::status_badge("SEALED", ui::BadgeState::Ok),
+                    SealStatus::Unsealed => ui::status_badge("UNSEALED", ui::BadgeState::Warn),
+                    SealStatus::Tampered { .. } => {
+                        ui::status_badge("TAMPERED", ui::BadgeState::Fail)
+                    }
                 })
-                .unwrap_or_else(|| style("unknown").dim().to_string())
+                .unwrap_or_else(|| ui::status_badge("UNKNOWN", ui::BadgeState::Info))
         };
 
-        println!("  {}", style("Status").bold());
-
-        // Daemon
+        // Build status rows for the table.
+        let daemon_badge;
+        let daemon_detail: String;
         if daemon_reachable {
-            let pid_info = if service_status.running {
+            daemon_badge = ui::status_badge("OK", ui::BadgeState::Ok);
+            daemon_detail = if service_status.running {
                 service_status
                     .pid
-                    .map(|p| format!(" (PID {p})"))
-                    .unwrap_or_default()
+                    .map(|p| format!("running (PID {p})"))
+                    .unwrap_or_else(|| "running".into())
             } else {
-                String::new()
+                "running".into()
             };
-            println!(
-                "    {:<14} {} {}",
-                style("daemon").dim(),
-                style("running").green(),
-                style(pid_info).dim()
-            );
         } else if service_status.installed {
-            println!(
-                "    {:<14} {}",
-                style("daemon").dim(),
-                style("installed but not responding").yellow()
-            );
+            daemon_badge = ui::status_badge("WARN", ui::BadgeState::Warn);
+            daemon_detail = "installed but not responding".into();
         } else {
-            println!(
-                "    {:<14} {}",
-                style("daemon").dim(),
-                style("not running").red()
-            );
-        }
+            daemon_badge = ui::status_badge("FAIL", ui::BadgeState::Fail);
+            daemon_detail = "not running".into();
+        };
 
-        // Config
-        println!(
-            "    {:<14} {} rule(s), {}",
-            style("config").dim(),
-            rule_count,
-            seal_status
-        );
-
-        // Service
+        let service_badge;
+        let service_detail: String;
         if service_status.installed {
             if service_status.running {
-                println!(
-                    "    {:<14} {}",
-                    style("service").dim(),
-                    style("installed, running").green()
-                );
+                service_badge = ui::status_badge("OK", ui::BadgeState::Ok);
+                service_detail = "installed, running".into();
             } else {
-                println!(
-                    "    {:<14} {}",
-                    style("service").dim(),
-                    style("installed, stopped").yellow()
-                );
+                service_badge = ui::status_badge("WARN", ui::BadgeState::Warn);
+                service_detail = "installed, stopped".into();
             }
         } else {
-            println!(
-                "    {:<14} {}",
-                style("service").dim(),
-                style("not installed").dim()
-            );
-        }
+            service_badge = ui::status_badge("--", ui::BadgeState::Info);
+            service_detail = "not installed".into();
+        };
 
-        // MCP connection
         let mcp_connected = detect_mcp_connection();
+        let mcp_badge;
+        let mcp_detail: String;
         if let Some(ref tool_name) = mcp_connected {
-            println!(
-                "    {:<14} {}",
-                style("MCP").dim(),
-                style(format!("connected to {tool_name}")).green()
-            );
+            mcp_badge = ui::status_badge("OK", ui::BadgeState::Ok);
+            mcp_detail = format!("connected to {tool_name}");
         } else {
-            println!(
-                "    {:<14} {}",
-                style("MCP").dim(),
-                style("not connected").dim()
-            );
-        }
+            mcp_badge = ui::status_badge("--", ui::BadgeState::Info);
+            mcp_detail = "not connected".into();
+        };
+
+        ui::table(
+            &["COMPONENT", "STATUS", "DETAILS"],
+            &[
+                vec!["Daemon".into(), daemon_badge, daemon_detail],
+                vec![
+                    "Config".into(),
+                    seal_status,
+                    format!("{rule_count} rule(s)"),
+                ],
+                vec!["Service".into(), service_badge, service_detail],
+                vec!["MCP".into(), mcp_badge, mcp_detail],
+            ],
+        );
 
         println!();
 
         // Context-sensitive next actions.
         if !daemon_reachable && !service_status.installed {
-            println!("  {}", style("Next step:").bold());
-            println!(
-                "    {}  {}",
+            ui::section_box("Next step", &[&format!(
+                "{:<28}{}",
                 style("opaque service install").cyan().bold(),
-                style("# install and start daemon").dim()
-            );
+                ui::dim("# install and start daemon")
+            )]);
         } else if !daemon_reachable && service_status.installed {
-            println!("  {}", style("Next step:").bold());
-            println!(
-                "    {}    {}",
+            ui::section_box("Next step", &[&format!(
+                "{:<28}{}",
                 style("opaque service start").cyan().bold(),
-                style("# start the daemon").dim()
-            );
+                ui::dim("# start the daemon")
+            )]);
         } else if mcp_connected.is_none() {
-            println!("  {}", style("Next step:").bold());
-            println!(
-                "    {}   {}",
+            ui::section_box("Next step", &[&format!(
+                "{:<28}{}",
                 style("opaque connect auto").cyan().bold(),
-                style("# connect to your AI coding tool").dim()
-            );
+                ui::dim("# connect to your AI coding tool")
+            )]);
         } else {
-            println!("  {}", style("Quick actions:").dim());
-            println!(
-                "    {}           {}",
-                style("opaque doctor").cyan(),
-                style("# run diagnostics").dim()
-            );
-            println!(
-                "    {}  {}",
-                style("opaque policy presets").cyan(),
-                style("# explore policy presets").dim()
-            );
-            println!(
-                "    {}       {}",
-                style("opaque audit tail").cyan(),
-                style("# view recent audit events").dim()
-            );
+            ui::section_box("Quick actions", &[
+                &format!("{:<28}{}", style("opaque doctor").cyan(), ui::dim("# run diagnostics")),
+                &format!("{:<28}{}", style("opaque policy presets").cyan(), ui::dim("# explore policy presets")),
+                &format!("{:<28}{}", style("opaque audit tail").cyan(), ui::dim("# view recent audit events")),
+            ]);
         }
     }
 
@@ -4105,10 +4418,7 @@ async fn run_status() {
 /// Checks each component of the Opaque installation and reports its status.
 /// Uses a pass/warn/fail pattern similar to `brew doctor` or `npm doctor`.
 async fn run_doctor() {
-    println!();
-    println!("  {}", style("Opaque Doctor").bold());
-    println!("  {}", style("═════════════").dim());
-    println!();
+    ui::banner("Opaque Doctor", "Checking your installation...");
 
     let mut pass_count = 0u32;
     let mut warn_count = 0u32;
@@ -4542,7 +4852,7 @@ async fn run_doctor() {
 
     // Summary
     println!();
-    println!("  {}", style("────────────────────────────────").dim());
+    ui::divider();
     let summary = format!("{pass_count} passed, {warn_count} warnings, {fail_count} errors");
     if fail_count > 0 {
         println!(
@@ -4581,7 +4891,16 @@ async fn try_ping(sock: &Path) -> Result<(), String> {
     // Connect.
     let stream = UnixStream::connect(sock)
         .await
-        .map_err(|e| format!("connect failed: {e}"))?;
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound || e.kind() == std::io::ErrorKind::ConnectionRefused {
+                format!(
+                    "daemon not found at {}. Is the daemon running? Try: opaque service start",
+                    sock.display()
+                )
+            } else {
+                format!("connect failed: {e}")
+            }
+        })?;
 
     let codec = LengthDelimitedCodec::builder()
         .max_frame_length(opaque_core::MAX_FRAME_LENGTH)
@@ -4624,8 +4943,11 @@ async fn try_ping(sock: &Path) -> Result<(), String> {
     let resp: Response =
         serde_json::from_slice(&frame).map_err(|e| format!("parse response: {e}"))?;
 
-    if resp.error.is_some() {
-        return Err("daemon returned an error".to_string());
+    if let Some(err) = resp.error {
+        return Err(format!(
+            "daemon error ({}): {}. Run 'opaque doctor' for diagnostics",
+            err.code, err.message
+        ));
     }
     Ok(())
 }

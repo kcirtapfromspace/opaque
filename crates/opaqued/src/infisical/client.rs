@@ -113,7 +113,7 @@ impl InfisicalClient {
             .user_agent(Self::user_agent())
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .expect("failed to build reqwest client");
+            .map_err(InfisicalApiError::HttpError)?;
 
         Ok(Self {
             http,

@@ -160,27 +160,27 @@ pub struct GetParametersByPathResponse {
 }
 
 /// Validate that a URL uses `https://`, allowing `http://` only for localhost.
-fn validate_url_scheme(url: &str) {
+fn validate_url_scheme(url: &str) -> Result<(), AwsApiError> {
     if url.starts_with("https://") {
-        return;
+        return Ok(());
     }
     if url.starts_with("http://") {
         if let Some(host_part) = url.strip_prefix("http://") {
             let host = host_part.split('/').next().unwrap_or("");
             let host_no_port = host.split(':').next().unwrap_or("");
             if host_no_port == "localhost" || host_no_port == "127.0.0.1" {
-                return;
+                return Ok(());
             }
         }
-        panic!(
+        return Err(AwsApiError::BadRequest(format!(
             "insecure HTTP URL rejected: {url}. \
              Only https:// URLs are allowed (http:// is permitted for localhost/127.0.0.1 only)"
-        );
+        )));
     }
-    panic!(
+    Err(AwsApiError::BadRequest(format!(
         "unsupported URL scheme: {url}. \
          Only https:// URLs are allowed (http:// is permitted for localhost/127.0.0.1 only)"
-    );
+    )))
 }
 
 /// Map an HTTP status code to an appropriate error.
@@ -222,31 +222,31 @@ impl AwsClient {
 
     /// Create a new client with separate service URLs.
     ///
-    /// Panics if any URL uses `http://` for a non-localhost host.
-    pub fn new(sts_url: &str, secretsmanager_url: &str, ssm_url: &str) -> Self {
-        validate_url_scheme(sts_url);
-        validate_url_scheme(secretsmanager_url);
-        validate_url_scheme(ssm_url);
+    /// Returns an error if any URL uses an unsupported scheme.
+    pub fn new(sts_url: &str, secretsmanager_url: &str, ssm_url: &str) -> Result<Self, AwsApiError> {
+        validate_url_scheme(sts_url)?;
+        validate_url_scheme(secretsmanager_url)?;
+        validate_url_scheme(ssm_url)?;
 
         let http = reqwest::Client::builder()
             .user_agent(Self::user_agent())
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .expect("failed to build reqwest client");
+            .map_err(AwsApiError::Network)?;
 
-        Self {
+        Ok(Self {
             http,
             sts_url: sts_url.trim_end_matches('/').to_owned(),
             secretsmanager_url: secretsmanager_url.trim_end_matches('/').to_owned(),
             ssm_url: ssm_url.trim_end_matches('/').to_owned(),
-        }
+        })
     }
 
     /// Create a client where all services point at the same base URL.
     /// Useful for testing with a single mock server.
     #[cfg(test)]
     pub fn new_single(base_url: &str) -> Self {
-        Self::new(base_url, base_url, base_url)
+        Self::new(base_url, base_url, base_url).expect("invalid URL scheme in test")
     }
 
     // -----------------------------------------------------------------------
@@ -863,7 +863,8 @@ mod tests {
             "http://localhost:8080/",
             "http://localhost:8081/",
             "http://localhost:8082/",
-        );
+        )
+        .unwrap();
         assert_eq!(client.sts_url, "http://localhost:8080");
         assert_eq!(client.secretsmanager_url, "http://localhost:8081");
         assert_eq!(client.ssm_url, "http://localhost:8082");
@@ -899,25 +900,25 @@ mod tests {
 
     #[test]
     fn validate_url_scheme_accepts_https() {
-        validate_url_scheme("https://sts.amazonaws.com");
+        validate_url_scheme("https://sts.amazonaws.com").unwrap();
     }
 
     #[test]
     fn validate_url_scheme_accepts_localhost_http() {
-        validate_url_scheme("http://localhost:8080");
-        validate_url_scheme("http://127.0.0.1:9000");
+        validate_url_scheme("http://localhost:8080").unwrap();
+        validate_url_scheme("http://127.0.0.1:9000").unwrap();
     }
 
     #[test]
-    #[should_panic(expected = "insecure HTTP URL rejected")]
     fn validate_url_scheme_rejects_remote_http() {
-        validate_url_scheme("http://sts.amazonaws.com");
+        let err = validate_url_scheme("http://sts.amazonaws.com").unwrap_err();
+        assert!(err.to_string().contains("insecure HTTP URL rejected"));
     }
 
     #[test]
-    #[should_panic(expected = "unsupported URL scheme")]
     fn validate_url_scheme_rejects_ftp() {
-        validate_url_scheme("ftp://example.com/file");
+        let err = validate_url_scheme("ftp://example.com/file").unwrap_err();
+        assert!(err.to_string().contains("unsupported URL scheme"));
     }
 
     // -----------------------------------------------------------------------
