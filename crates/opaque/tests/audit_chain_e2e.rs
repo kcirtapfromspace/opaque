@@ -140,3 +140,26 @@ fn verify_detects_flipped_outcome() {
     );
     assert_eq!(json["ok"], false);
 }
+
+#[test]
+fn verify_detects_tail_truncation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = seed_audit_db(tmp.path());
+
+    // Attacker deletes the newest record to hide the most recent activity.
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "DELETE FROM audit_events WHERE rowid = (SELECT MAX(rowid) FROM audit_events)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let (code, json) = run_verify(tmp.path());
+    assert_eq!(
+        code, 2,
+        "tail truncation must fail verification; json={json}"
+    );
+    assert_eq!(json["ok"], false);
+}

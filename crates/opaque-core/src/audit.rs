@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use hmac::{Hmac, Mac};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use uuid::Uuid;
@@ -836,6 +837,22 @@ fn canon_from_row(row: &rusqlite::Row, base: usize) -> rusqlite::Result<String> 
 
 /// Compute the chain for rows that lack a `record_hash` (e.g. a database created
 /// before the chain existed), in rowid (insertion) order.
+/// Record the chain head (tail anchor) so verification can detect truncation of
+/// the newest records. Stored in the same database and written inside the insert
+/// transaction, so it stays consistent with the committed rows.
+fn set_chain_head(
+    conn: &rusqlite::Connection,
+    last_hash: &str,
+    last_sequence: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO chain_head (id, last_hash, last_sequence) VALUES (0, ?1, ?2)
+         ON CONFLICT(id) DO UPDATE SET last_hash = ?1, last_sequence = ?2",
+        rusqlite::params![last_hash, last_sequence],
+    )?;
+    Ok(())
+}
+
 fn backfill_chain(conn: &rusqlite::Connection, key: &[u8; 32]) -> Result<(), rusqlite::Error> {
     let sql = format!("SELECT rowid, {CHAIN_COLUMNS} FROM audit_events ORDER BY rowid ASC");
     let pending: Vec<(i64, String)> = {
@@ -857,6 +874,20 @@ fn backfill_chain(conn: &rusqlite::Connection, key: &[u8; 32]) -> Result<(), rus
         )?;
         prev = h;
     }
+    // Re-anchor the head to the new tail (or clear it if the log is now empty).
+    match conn
+        .query_row(
+            "SELECT record_hash, sequence_number FROM audit_events ORDER BY rowid DESC LIMIT 1",
+            [],
+            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .optional()?
+    {
+        Some((Some(h), seq)) => set_chain_head(conn, &h, seq)?,
+        _ => {
+            conn.execute("DELETE FROM chain_head", [])?;
+        }
+    }
     Ok(())
 }
 
@@ -876,13 +907,14 @@ pub struct ChainVerification {
 /// Verify the tamper-evident hash chain over the audit log at `db_path`.
 ///
 /// Recomputes the chain in insertion order and reports the first record whose
-/// stored hash does not match. This catches any edit, reordering, or deletion of a
-/// record that has later records after it, by anyone who does not hold the chain key.
+/// stored hash does not match — catching any edit, reordering, or deletion of a
+/// record by anyone who does not hold the chain key. It then compares the recorded
+/// head anchor (`chain_head`) against the actual tail, so truncation of the newest
+/// records is detected too.
 ///
-/// LIMITATION: truncating the newest records ("tail truncation") leaves a shorter
-/// but still-valid chain and is NOT detected here. Closing that requires anchoring
-/// the head (record count + last hash) in a trusted store — a follow-up that
-/// becomes a hard guarantee once the daemon runs under a dedicated service account.
+/// At a shared uid this is tamper-evidence (an adversary who also holds the key and
+/// can rewrite the database can still defeat it); it becomes a hard guarantee once
+/// the daemon runs under a dedicated service account that owns the database.
 pub fn verify_audit_chain(db_path: &Path) -> Result<ChainVerification, AuditError> {
     let key = load_or_create_hmac_key(db_path)?;
     let conn =
@@ -915,6 +947,38 @@ pub fn verify_audit_chain(db_path: &Path) -> Result<ChainVerification, AuditErro
             }
         }
     }
+
+    // Tail-truncation check: the recorded head anchor must match the actual tail.
+    // Detects deletion of the newest records, which a chain walk alone cannot
+    // (a truncated prefix is itself a valid chain).
+    if let Some((head_hash, head_seq)) = conn
+        .query_row(
+            "SELECT last_hash, last_sequence FROM chain_head WHERE id = 0",
+            [],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .optional()?
+    {
+        let actual_tail: Option<String> = conn
+            .query_row(
+                "SELECT record_hash FROM audit_events ORDER BY rowid DESC LIMIT 1",
+                [],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        if actual_tail.as_deref() != Some(head_hash.as_str()) {
+            return Ok(ChainVerification {
+                ok: false,
+                records_checked: count,
+                first_bad_sequence: Some(head_seq.max(0) as u64),
+                detail: Some(format!(
+                    "audit log truncated: the newest record(s) up to sequence {head_seq} are missing"
+                )),
+            });
+        }
+    }
+
     Ok(ChainVerification {
         ok: true,
         records_checked: count,
@@ -968,6 +1032,11 @@ END;
 CREATE TRIGGER IF NOT EXISTS audit_events_ad AFTER DELETE ON audit_events BEGIN
     DELETE FROM audit_events_fts WHERE rowid = old.rowid;
 END;
+CREATE TABLE IF NOT EXISTS chain_head (
+    id INTEGER PRIMARY KEY CHECK (id = 0),
+    last_hash TEXT NOT NULL,
+    last_sequence INTEGER NOT NULL
+);
 ";
 
 #[cfg(test)]
@@ -1044,6 +1113,28 @@ impl SqliteAuditSink {
         let deleted = Self::run_retention_cleanup(&conn, retention_days)?;
         if migrated || deleted > 0 {
             backfill_chain(&conn, &hmac_key)?;
+        }
+
+        // Establish the tail-anchor baseline if this database has never had one
+        // (e.g. upgraded from a build without chain_head). A first-time baseline
+        // cannot mask a prior truncation — there is no earlier anchor to contradict —
+        // and thereafter the anchor is only advanced by the writer.
+        let has_head = conn
+            .query_row("SELECT COUNT(*) FROM chain_head", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .map(|c| c > 0)
+            .unwrap_or(false);
+        if !has_head
+            && let Some((Some(h), seq)) = conn
+                .query_row(
+                    "SELECT record_hash, sequence_number FROM audit_events ORDER BY rowid DESC LIMIT 1",
+                    [],
+                    |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?)),
+                )
+                .optional()?
+        {
+            set_chain_head(&conn, &h, seq)?;
         }
         conn.execute(
             "INSERT OR IGNORE INTO audit_events_fts(rowid, search_text)
@@ -1339,6 +1430,7 @@ impl SqliteAuditSink {
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             )?;
 
+            let mut last_seq: Option<i64> = None;
             for event in events {
                 let client_json = event
                     .client
@@ -1412,7 +1504,13 @@ impl SqliteAuditSink {
                 // duplicate event_id is IGNOREd and must not shift the chain).
                 if changed > 0 {
                     *last_hash = record_hash;
+                    last_seq = Some(event.sequence_number as i64);
                 }
+            }
+            // Record the tail anchor in the same transaction so verification can
+            // detect truncation of the newest records.
+            if let Some(seq) = last_seq {
+                set_chain_head(&tx, last_hash, seq)?;
             }
         }
         tx.commit()?;
@@ -2379,6 +2477,37 @@ mod tests {
         assert!(
             verify_audit_chain(&db_path).unwrap().ok,
             "re-anchoring after retention must restore a valid chain"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(hmac_key_path(&db_path));
+    }
+
+    #[test]
+    fn audit_chain_detects_tail_truncation() {
+        // Deleting the newest records leaves a valid shorter chain, which the chain
+        // walk alone cannot catch — the head anchor detects it.
+        let db_path = temp_db_path();
+        {
+            let sink = SqliteAuditSink::new(db_path.clone(), 90).unwrap();
+            sink.emit(make_test_event(AuditEventKind::RequestReceived));
+            sink.emit(make_test_event(AuditEventKind::OperationStarted));
+            sink.emit(make_test_event(AuditEventKind::OperationSucceeded));
+            drop(sink);
+        }
+        // Attacker truncates the newest record.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute(
+                "DELETE FROM audit_events WHERE rowid = (SELECT MAX(rowid) FROM audit_events)",
+                [],
+            )
+            .unwrap();
+        }
+        let v = verify_audit_chain(&db_path).unwrap();
+        assert!(
+            !v.ok,
+            "tail truncation must be detected via the head anchor"
         );
 
         let _ = std::fs::remove_file(&db_path);
