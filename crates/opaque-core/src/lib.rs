@@ -1,5 +1,6 @@
 pub mod audit;
 pub mod execve_map;
+pub mod identity;
 pub mod operation;
 pub mod peer;
 pub mod policy;
