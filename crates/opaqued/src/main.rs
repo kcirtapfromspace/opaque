@@ -60,6 +60,7 @@ mod pairing;
 mod push;
 mod sandbox;
 pub mod secret;
+mod trust_domain;
 mod vault;
 
 use std::future::Future;
@@ -120,6 +121,50 @@ struct DaemonConfig {
     /// announces itself with an Error-level audit event).
     #[serde(default)]
     approval_backend: Option<String>,
+
+    /// Trust-domain enforcement (`[trust_domain]`): the service-account split
+    /// that turns the audit/seal/delegation guarantees from tamper-evidence
+    /// into tamper-prevention. Absent = shared-uid developer mode (audited,
+    /// not enforced).
+    #[serde(default)]
+    trust_domain: TrustDomainConfig,
+}
+
+/// `[trust_domain]` — settings for running the daemon as a principal distinct
+/// from the agents it polices.
+#[derive(Debug, Clone, Deserialize, Default)]
+struct TrustDomainConfig {
+    /// When true the daemon fails closed at startup unless every custody file
+    /// (audit db + chain key, identity db + signing key, config + seal,
+    /// pairing store, profiles) is exclusively owned by the daemon's own uid,
+    /// and refuses connections from peers running *as* the daemon uid
+    /// (nothing legitimate runs as the service account except the daemon).
+    #[serde(default)]
+    enforce: bool,
+
+    /// Drop privileges to this user at startup when launched as root (the
+    /// non-systemd path; under systemd prefer `User=`/`Group=` in the unit).
+    #[serde(default)]
+    run_as: Option<String>,
+
+    /// Group granted connect access to the socket + read access to the
+    /// daemon token in enforce mode. Clients must be members. Without it the
+    /// socket keeps owner-only permissions, which at a split uid means no
+    /// client can connect — so enforce mode requires it.
+    #[serde(default)]
+    socket_group: Option<String>,
+
+    /// Explicit socket path for split deployments (e.g. `/run/opaque/opaqued.sock`).
+    /// Trusted because it comes from the sealed, custody-verified config —
+    /// unlike `$OPAQUE_SOCK`, which the daemon deliberately ignores.
+    #[serde(default)]
+    socket_path: Option<PathBuf>,
+
+    /// Permit running enforce mode as uid 0. Off by default: a root daemon
+    /// cannot be protected from a root agent, and the split loses meaning.
+    /// Container entrypoints that cannot set a runAsUser may opt in.
+    #[serde(default)]
+    allow_root: bool,
 }
 
 /// A single entry in the known human clients allowlist.
@@ -190,16 +235,55 @@ struct SessionDelegation {
 // Entry point
 // ---------------------------------------------------------------------------
 
-#[tokio::main]
-async fn main() {
+fn main() {
     init_tracing();
 
-    // Daemon never trusts OPAQUE_SOCK env var.
-    let path = socket_path_for_client(false);
-    if let Err(e) = run(path).await {
+    // Config is loaded before the async runtime starts because two decisions
+    // depend on it while the process is still genuinely single-threaded: the
+    // privilege drop (setuid + env repoint must not race other threads) and
+    // the socket path for split deployments.
+    let config_path = resolve_config_path();
+    let config = load_config(&config_path);
+
+    if let Some(user) = config.trust_domain.run_as.clone() {
+        if unsafe { libc::geteuid() } == 0 {
+            if let Err(e) = trust_domain::drop_privileges(&user) {
+                eprintln!("opaqued: privilege drop failed: {e}");
+                std::process::exit(1);
+            }
+        } else {
+            info!("trust_domain.run_as set but not starting as root — already dropped, ignoring");
+        }
+    }
+
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("opaqued: failed to start runtime: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = runtime.block_on(run(config, config_path)) {
         eprintln!("opaqued: {e}");
         std::process::exit(1);
     }
+}
+
+/// Resolve the daemon config path.
+///
+/// `$OPAQUE_CONFIG` wins when set. Otherwise root reads the system location
+/// `/etc/opaque/config.toml` (a root launch precedes a `run_as` drop, and the
+/// service account's config must not live in root's home), and a normal user
+/// reads `~/.opaque/config.toml`.
+fn resolve_config_path() -> PathBuf {
+    if let Ok(p) = std::env::var("OPAQUE_CONFIG") {
+        return PathBuf::from(p);
+    }
+    if unsafe { libc::geteuid() } == 0 {
+        return PathBuf::from("/etc/opaque/config.toml");
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join(".opaque").join("config.toml")
 }
 
 fn init_tracing() {
@@ -208,16 +292,9 @@ fn init_tracing() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
-/// Load daemon config from `~/.opaque/config.toml` or `$OPAQUE_CONFIG`.
-fn load_config() -> DaemonConfig {
-    let path = std::env::var("OPAQUE_CONFIG")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            PathBuf::from(home).join(".opaque").join("config.toml")
-        });
-
-    match std::fs::read_to_string(&path) {
+/// Load daemon config from the resolved config path (see [`resolve_config_path`]).
+fn load_config(path: &Path) -> DaemonConfig {
+    match std::fs::read_to_string(path) {
         Ok(contents) => match toml_edit::de::from_str::<DaemonConfig>(&contents) {
             Ok(mut config) => {
                 // Filter out empty human client entries that would match everything.
@@ -275,21 +352,29 @@ fn load_config() -> DaemonConfig {
 
 /// Verify the config seal on daemon startup.
 ///
-/// - **Verified**: config matches seal — proceed normally.
-/// - **Unsealed**: no seal found — warn and continue (backward compatible).
+/// - **Verified** (keyed): proceed normally.
+/// - **VerifiedLegacy** (unkeyed): forgeable by anyone who can write the seal
+///   file — warn in shared-uid mode, hard stop under `trust_domain.enforce`.
+/// - **Unsealed**: no seal found — warn and continue (backward compatible),
+///   unless `require_seal` demands one.
+/// - **KeyMissing**: keyed seal whose key vanished — hard stop (custody break).
 /// - **Tampered**: seal exists but doesn't match — hard stop.
-fn verify_config_seal(require_seal: bool, allow_unsealed: bool) -> std::io::Result<()> {
-    let config_path = std::env::var("OPAQUE_CONFIG")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            PathBuf::from(home).join(".opaque").join("config.toml")
-        });
-
+fn verify_config_seal(
+    config_path: &Path,
+    require_seal: bool,
+    allow_unsealed: bool,
+    enforce: bool,
+) -> std::io::Result<()> {
     let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
     let seal_file = config_dir.join("config.seal");
 
-    check_seal(&config_path, &seal_file, require_seal, allow_unsealed)
+    check_seal(
+        config_path,
+        &seal_file,
+        require_seal,
+        allow_unsealed,
+        enforce,
+    )
 }
 
 /// Core seal-check logic, separated from env-var resolution for testability.
@@ -301,21 +386,69 @@ fn check_seal(
     seal_file: &Path,
     require_seal: bool,
     allow_unsealed: bool,
+    enforce: bool,
 ) -> std::io::Result<()> {
-    use opaque_core::seal::{self, SealStatus};
-
     // If config doesn't exist, nothing to verify (load_config handles defaults).
     if !config_path.exists() {
         return Ok(());
     }
 
     let config_bytes = std::fs::read(config_path)?;
+    let status = opaque_core::seal::verify_seal(&config_bytes, seal_file)
+        .map_err(|e| std::io::Error::other(format!("config seal check failed: {e}")))?;
+    evaluate_seal_status(status, require_seal, allow_unsealed, enforce)
+}
 
-    match seal::verify_seal(&config_bytes, seal_file) {
-        Ok(SealStatus::Verified) => {
-            info!("config seal verified");
+/// File-only variant of `check_seal` for testing.
+///
+/// Skips the OS keychain lookup so tests are not affected by stale keychain
+/// entries from real `opaque setup --seal` runs on this machine.
+#[cfg(test)]
+fn check_seal_file_only(
+    config_path: &Path,
+    seal_file: &Path,
+    require_seal: bool,
+    allow_unsealed: bool,
+    enforce: bool,
+) -> std::io::Result<()> {
+    if !config_path.exists() {
+        return Ok(());
+    }
+
+    let config_bytes = std::fs::read(config_path)?;
+    let status = opaque_core::seal::verify_seal_from_file(&config_bytes, seal_file)
+        .map_err(|e| std::io::Error::other(format!("config seal check failed: {e}")))?;
+    evaluate_seal_status(status, require_seal, allow_unsealed, enforce)
+}
+
+/// Shared policy over a seal verification outcome (see [`verify_config_seal`]).
+fn evaluate_seal_status(
+    status: opaque_core::seal::SealStatus,
+    require_seal: bool,
+    allow_unsealed: bool,
+    enforce: bool,
+) -> std::io::Result<()> {
+    use opaque_core::seal::SealStatus;
+
+    match status {
+        SealStatus::Verified => {
+            info!("config seal verified (keyed)");
         }
-        Ok(SealStatus::Unsealed) => {
+        SealStatus::VerifiedLegacy => {
+            if enforce {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "config carries a legacy UNKEYED seal, which any config writer can \
+                     forge — trust_domain.enforce requires the keyed seal. \
+                     Re-seal with 'opaque setup --seal'.",
+                ));
+            }
+            warn!(
+                "config seal is the legacy unkeyed format (drift detection only) — \
+                 re-seal with 'opaque setup --seal' to upgrade to the keyed seal"
+            );
+        }
+        SealStatus::Unsealed => {
             if require_seal && !allow_unsealed {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
@@ -330,67 +463,20 @@ fn check_seal(
                 warn!("config is unsealed — run 'opaque setup --seal' to protect it");
             }
         }
-        Ok(SealStatus::Tampered { .. }) => {
+        SealStatus::KeyMissing => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "config has a keyed seal but the seal key (config.seal.key) is missing — \
+                 the custody of the seal is broken. Restore the key, or re-seal with \
+                 'opaque setup --reset' then 'opaque setup --seal'.",
+            ));
+        }
+        SealStatus::Tampered { .. } => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "config seal broken — config.toml was modified after sealing. \
                  Run 'opaque setup --reset' to unseal, then reconfigure.",
             ));
-        }
-        Err(e) => {
-            return Err(std::io::Error::other(format!(
-                "config seal check failed: {e}"
-            )));
-        }
-    }
-
-    Ok(())
-}
-
-/// File-only variant of `check_seal` for testing.
-///
-/// Skips the OS keychain lookup so tests are not affected by stale keychain
-/// entries from real `opaque setup --seal` runs on this machine.
-#[cfg(test)]
-fn check_seal_file_only(
-    config_path: &Path,
-    seal_file: &Path,
-    require_seal: bool,
-    allow_unsealed: bool,
-) -> std::io::Result<()> {
-    use opaque_core::seal::{self, SealStatus};
-
-    if !config_path.exists() {
-        return Ok(());
-    }
-
-    let config_bytes = std::fs::read(config_path)?;
-
-    match seal::verify_seal_from_file(&config_bytes, seal_file) {
-        Ok(SealStatus::Verified) => {
-            info!("config seal verified (file-only)");
-        }
-        Ok(SealStatus::Unsealed) => {
-            if require_seal && !allow_unsealed {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "config is unsealed but require_seal is enabled. \
-                     Seal your config with 'opaque setup --seal' or \
-                     start the daemon with '--allow-unsealed' for development use.",
-                ));
-            }
-        }
-        Ok(SealStatus::Tampered { .. }) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "config seal broken — config.toml was modified after sealing. \
-                 Run 'opaque setup --reset' to unseal, then reconfigure.",
-            ));
-        }
-        Err(e) => {
-            return Err(std::io::Error::other(format!(
-                "config seal check failed: {e}"
-            )));
         }
     }
 
@@ -465,8 +551,59 @@ fn init_memory_safety() {
     }
 }
 
-async fn run(socket: PathBuf) -> std::io::Result<()> {
+async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> {
     init_memory_safety();
+
+    // --- Trust domain: verify custody BEFORE opening or creating any state ---
+    let td = &config.trust_domain;
+    if td.enforce {
+        if unsafe { libc::geteuid() } == 0 && !td.allow_root {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "trust_domain.enforce with euid 0: a root daemon cannot be protected from a \
+                 root agent. Run as a dedicated service account (systemd User=, run_as, or a \
+                 container runAsUser) — or set trust_domain.allow_root = true to override.",
+            ));
+        }
+        if td.socket_group.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "trust_domain.enforce requires trust_domain.socket_group: with the socket \
+                 owner-only and the daemon under its own uid, no client could ever connect. \
+                 Create a client group (e.g. groupadd opaque-clients) and name it here.",
+            ));
+        }
+    }
+    // Resolve the client group before touching the filesystem so a typo'd
+    // group name fails the startup, not the post-bind chgrp.
+    let socket_gid = td
+        .socket_group
+        .as_deref()
+        .map(trust_domain::resolve_gid)
+        .transpose()?;
+
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+    let custody_violations = trust_domain::startup_custody_check(td.enforce, &home, &config_path)?;
+
+    // Check if --allow-unsealed was passed on the command line.
+    let allow_unsealed = std::env::args().any(|a| a == "--allow-unsealed");
+
+    // Verify config seal before proceeding.
+    verify_config_seal(
+        &config_path,
+        config.require_seal,
+        allow_unsealed,
+        td.enforce,
+    )?;
+
+    // --- Socket surface ---
+    // Split deployments name an explicit socket path in the sealed config
+    // (e.g. /run/opaque/opaqued.sock); the daemon still never trusts
+    // $OPAQUE_SOCK from the environment.
+    let socket = td
+        .socket_path
+        .clone()
+        .unwrap_or_else(|| socket_path_for_client(false));
     ensure_socket_parent_dir(&socket)?;
 
     // Acquire PID file lock before anything else.
@@ -508,15 +645,19 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
     let token_path = write_daemon_token(&socket, &daemon_token)?;
     info!("daemon token written to {}", token_path.display());
 
+    // Open the cross-domain surface last: everything above was created
+    // owner-only, and only now does the client group gain access to exactly
+    // the socket dir (0750), the socket (0660), and the token (0640).
+    if let Some(gid) = socket_gid {
+        let socket_dir = socket.parent().expect("checked above");
+        trust_domain::apply_socket_group(socket_dir, &socket, &token_path, gid)?;
+        info!(
+            "socket surface opened to group {} (gid {gid})",
+            td.socket_group.as_deref().unwrap_or("?"),
+        );
+    }
+
     info!("listening on {}", socket.display());
-
-    let config = load_config();
-
-    // Check if --allow-unsealed was passed on the command line.
-    let allow_unsealed = std::env::args().any(|a| a == "--allow-unsealed");
-
-    // Verify config seal before proceeding.
-    verify_config_seal(config.require_seal, allow_unsealed)?;
 
     // Build enclave with registered operations and policy from config.
     let mut registry = OperationRegistry::new();
@@ -1077,6 +1218,40 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         }
     }
     let audit: Arc<dyn AuditSink> = Arc::new(MultiAuditSink::new(vec![tracing_sink, sqlite_sink]));
+
+    // Record the trust-domain posture in the tamper-evident chain itself, so
+    // "was the split enforced at the time?" is answerable from the audit log.
+    {
+        let enforced = config.trust_domain.enforce;
+        let detail = if custody_violations.is_empty() {
+            format!(
+                "trust domain {}: custody clean",
+                if enforced { "ENFORCED" } else { "not enforced" }
+            )
+        } else {
+            format!(
+                "trust domain not enforced: {} custody violation(s) — {}",
+                custody_violations.len(),
+                custody_violations
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        };
+        let level = if enforced && custody_violations.is_empty() {
+            opaque_core::audit::AuditLevel::Info
+        } else {
+            opaque_core::audit::AuditLevel::Warn
+        };
+        audit.emit(
+            AuditEvent::new(AuditEventKind::TrustDomainPosture)
+                .with_operation("daemon_startup")
+                .with_outcome(if enforced { "enforced" } else { "shared_uid" })
+                .with_level(level)
+                .with_detail(detail),
+        );
+    }
 
     // Identity substrate (Phase 1): initialize when `[identity]` is present.
     // A broken identity config fails the daemon only when `required = true`
@@ -1955,23 +2130,6 @@ async fn verify_workspace(
 // Connection handler
 // ---------------------------------------------------------------------------
 
-/// Verify that the peer UID matches the daemon's own UID.
-///
-/// Rejects connections from other users, which could be confused-deputy
-/// or privilege-escalation attempts in multi-user environments.
-fn verify_peer_uid(peer: &opaque_core::peer::PeerInfo) -> bool {
-    #[cfg(unix)]
-    {
-        let my_uid = unsafe { libc::getuid() };
-        peer.uid == my_uid
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = peer;
-        true
-    }
-}
-
 async fn handle_conn(
     state: Arc<DaemonState>,
     stream: UnixStream,
@@ -1980,17 +2138,28 @@ async fn handle_conn(
     let fd = stream.as_raw_fd();
     let peer = peer_info_from_fd(fd).ok();
 
-    // Verify peer UID matches daemon UID. Reject if unavailable or mismatched.
+    // Peer-uid gate, mode-aware. Shared-uid mode admits only the daemon's own
+    // uid (multi-user protection). The enforced split refuses exactly that
+    // uid: nothing legitimate runs as the service account except the daemon,
+    // so a same-uid peer inside the trust domain is a breach, and everyone
+    // else is gated by socket-group membership + the daemon token.
     match &peer {
         None => {
             warn!("peer credentials unavailable, rejecting connection");
             return Ok(());
         }
         Some(info) => {
-            if !verify_peer_uid(info) {
+            let daemon_uid = unsafe { libc::getuid() };
+            let enforce = state.config.trust_domain.enforce;
+            if !trust_domain::peer_uid_allowed(info.uid, daemon_uid, enforce) {
                 warn!(
-                    "peer UID {} does not match daemon UID, rejecting connection",
-                    info.uid
+                    "peer uid {} refused ({}), rejecting connection",
+                    info.uid,
+                    if enforce {
+                        "runs as the daemon's own service account"
+                    } else {
+                        "does not match daemon uid"
+                    }
                 );
                 return Ok(());
             }
@@ -4681,28 +4850,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn verify_peer_uid_same_uid() {
-        let my_uid = unsafe { libc::getuid() };
-        let peer = opaque_core::peer::PeerInfo {
-            uid: my_uid,
-            gid: 20,
-            pid: Some(1234),
-        };
-        assert!(verify_peer_uid(&peer));
-    }
-
-    #[test]
-    fn verify_peer_uid_different_uid() {
-        let my_uid = unsafe { libc::getuid() };
-        let other_uid = if my_uid == 0 { 1000 } else { my_uid + 1 };
-        let peer = opaque_core::peer::PeerInfo {
-            uid: other_uid,
-            gid: 20,
-            pid: Some(1234),
-        };
-        assert!(!verify_peer_uid(&peer));
-    }
+    // Peer-uid gating (both modes) is covered by trust_domain::peer_uid_allowed
+    // unit tests; the connection-level wiring is exercised by the daemon e2e
+    // tests, which connect from the same uid in shared mode.
 
     #[test]
     fn constant_time_eq_works() {
@@ -5857,7 +6007,8 @@ exe_sha256 = "deadbeef"
     // Seal enforcement tests
     // -----------------------------------------------------------------------
 
-    /// Helper: create a temp dir with a config.toml and optionally a seal file.
+    /// Helper: create a temp dir with a config.toml and optionally a (keyed,
+    /// current-format) seal + key beside it.
     fn setup_seal_test(
         config_content: &str,
         sealed: bool,
@@ -5868,8 +6019,9 @@ exe_sha256 = "deadbeef"
         let seal_file = dir.path().join("config.seal");
         std::fs::write(&config_path, config_content).unwrap();
         if sealed {
-            let seal_hash = seal::compute_seal(config_content.as_bytes());
-            std::fs::write(&seal_file, &seal_hash).unwrap();
+            let key = seal::load_or_create_seal_key(&seal_file).unwrap();
+            let value = seal::compute_seal_keyed(config_content.as_bytes(), &key);
+            std::fs::write(&seal_file, &value).unwrap();
         }
         (dir, config_path, seal_file)
     }
@@ -5877,17 +6029,64 @@ exe_sha256 = "deadbeef"
     #[test]
     fn seal_require_true_and_sealed_succeeds() {
         let (_dir, config_path, seal_file) = setup_seal_test("[daemon]\n", true);
-        let result = check_seal_file_only(&config_path, &seal_file, true, false);
+        // The keyed seal satisfies both shared-uid and enforce mode.
+        let result = check_seal_file_only(&config_path, &seal_file, true, false, false);
         assert!(
             result.is_ok(),
             "sealed config with require_seal=true should succeed"
+        );
+        let result = check_seal_file_only(&config_path, &seal_file, true, false, true);
+        assert!(
+            result.is_ok(),
+            "keyed seal should satisfy trust_domain.enforce too"
+        );
+    }
+
+    #[test]
+    fn seal_legacy_unkeyed_warns_in_shared_mode_but_fails_enforce() {
+        use opaque_core::seal;
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let seal_file = dir.path().join("config.seal");
+        let content = "[daemon]\n";
+        std::fs::write(&config_path, content).unwrap();
+        // Legacy bare-hex seal, as written by pre-trust-domain builds.
+        std::fs::write(&seal_file, seal::compute_seal(content.as_bytes())).unwrap();
+
+        let result = check_seal_file_only(&config_path, &seal_file, true, false, false);
+        assert!(
+            result.is_ok(),
+            "legacy seal remains accepted in shared mode"
+        );
+
+        let result = check_seal_file_only(&config_path, &seal_file, true, false, true);
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            err.to_string().contains("UNKEYED"),
+            "enforce-mode refusal must explain the legacy seal problem: {err}"
+        );
+    }
+
+    #[test]
+    fn seal_keyed_with_missing_key_fails_closed() {
+        use opaque_core::seal;
+        let (_dir, config_path, seal_file) = setup_seal_test("[daemon]\n", true);
+        std::fs::remove_file(seal::seal_key_path(&seal_file)).unwrap();
+
+        let result = check_seal_file_only(&config_path, &seal_file, false, false, false);
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("seal key"),
+            "key-missing refusal must name the missing key: {err}"
         );
     }
 
     #[test]
     fn seal_require_true_and_unsealed_fails() {
         let (_dir, config_path, seal_file) = setup_seal_test("[daemon]\n", false);
-        let result = check_seal_file_only(&config_path, &seal_file, true, false);
+        let result = check_seal_file_only(&config_path, &seal_file, true, false, false);
         assert!(
             result.is_err(),
             "unsealed config with require_seal=true should fail"
@@ -5912,7 +6111,7 @@ exe_sha256 = "deadbeef"
     #[test]
     fn seal_require_true_allow_unsealed_succeeds() {
         let (_dir, config_path, seal_file) = setup_seal_test("[daemon]\n", false);
-        let result = check_seal_file_only(&config_path, &seal_file, true, true);
+        let result = check_seal_file_only(&config_path, &seal_file, true, true, false);
         assert!(
             result.is_ok(),
             "unsealed config with require_seal=true + allow_unsealed should succeed"
@@ -5922,7 +6121,7 @@ exe_sha256 = "deadbeef"
     #[test]
     fn seal_require_false_default_unsealed_succeeds() {
         let (_dir, config_path, seal_file) = setup_seal_test("[daemon]\n", false);
-        let result = check_seal_file_only(&config_path, &seal_file, false, false);
+        let result = check_seal_file_only(&config_path, &seal_file, false, false, false);
         assert!(
             result.is_ok(),
             "unsealed config with require_seal=false should succeed (backward compat)"
@@ -5972,12 +6171,12 @@ exe_sha256 = "deadbeef"
         std::fs::write(&config_path, "[daemon]\nrequire_seal = true\n").unwrap();
 
         // Should fail with require_seal=false.
-        let result = check_seal_file_only(&config_path, &seal_file, false, false);
+        let result = check_seal_file_only(&config_path, &seal_file, false, false, false);
         assert!(result.is_err(), "tampered config should always fail");
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
 
         // Should fail even with allow_unsealed=true.
-        let result = check_seal_file_only(&config_path, &seal_file, false, true);
+        let result = check_seal_file_only(&config_path, &seal_file, false, true, false);
         assert!(
             result.is_err(),
             "tampered config should fail even with allow_unsealed"
@@ -5991,7 +6190,7 @@ exe_sha256 = "deadbeef"
         let seal_file = dir.path().join("config.seal");
 
         // Even with require_seal=true, if there's no config file it's OK.
-        let result = check_seal_file_only(&config_path, &seal_file, true, false);
+        let result = check_seal_file_only(&config_path, &seal_file, true, false, false);
         assert!(
             result.is_ok(),
             "missing config file should not cause seal failure"

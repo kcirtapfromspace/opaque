@@ -9,6 +9,7 @@ pub mod proto;
 pub mod sanitize;
 pub mod seal;
 pub mod socket;
+pub mod trust_domain;
 pub mod validate;
 
 pub const API_VERSION: u32 = 1;

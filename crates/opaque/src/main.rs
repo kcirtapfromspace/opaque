@@ -4139,13 +4139,24 @@ fn run_setup(seal_only: bool, reset: bool, verify: bool) -> Result<(), String> {
             .map_err(|e| format!("seal check failed: {e}"))?;
         match status {
             SealStatus::Verified => {
-                ui::success("Config seal verified — integrity OK");
+                ui::success("Config seal verified — integrity OK (keyed)");
+            }
+            SealStatus::VerifiedLegacy => {
+                ui::warn(
+                    "Config seal verified, but it is the legacy UNKEYED format \
+                     (drift detection only — any config writer can forge it).",
+                );
+                ui::info("Run 'opaque setup --seal' to upgrade to the keyed seal.");
             }
             SealStatus::Tampered { expected, actual } => {
                 ui::error("Config seal BROKEN — config.toml was modified after sealing");
                 ui::kv("expected", &expected);
                 ui::kv("actual", &actual);
                 ui::info("Run 'opaque setup --reset' to unseal, then reconfigure.");
+            }
+            SealStatus::KeyMissing => {
+                ui::error("Config has a keyed seal but the seal key (config.seal.key) is missing.");
+                ui::info("Restore the key, or 'opaque setup --reset' then 'opaque setup --seal'.");
             }
             SealStatus::Unsealed => {
                 ui::warn("Config is unsealed — run 'opaque setup --seal' to protect it.");
@@ -4170,9 +4181,9 @@ fn run_setup(seal_only: bool, reset: bool, verify: bool) -> Result<(), String> {
         }
         let config_bytes = std::fs::read(&config_path)
             .map_err(|e| format!("failed to read {}: {e}", config_path.display()))?;
-        let hash = seal::compute_seal(&config_bytes);
-        seal::store_seal(&hash, &seal_file).map_err(|e| format!("failed to store seal: {e}"))?;
-        ui::success(&format!("Config sealed (SHA-256: {}...)", &hash[..16]));
+        seal::store_seal_keyed(&config_bytes, &seal_file)
+            .map_err(|e| format!("failed to store seal: {e}"))?;
+        ui::success("Config sealed (keyed HMAC; key at config.seal.key, mode 0600)");
         return Ok(());
     }
 
@@ -4510,10 +4521,10 @@ fn run_setup_wizard(base: &Path, config_path: &Path, seal_file: &Path) -> Result
     ));
 
     // Seal
-    let hash = seal::compute_seal(config_content.as_bytes());
-    seal::store_seal(&hash, seal_file).map_err(|e| format!("failed to store seal: {e}"))?;
+    seal::store_seal_keyed(config_content.as_bytes(), seal_file)
+        .map_err(|e| format!("failed to store seal: {e}"))?;
 
-    ui::init_step(&format!("Config sealed (SHA-256: {}...)", &hash[..16]));
+    ui::init_step("Config sealed (keyed HMAC; key at config.seal.key)");
 
     println!();
     ui::success("Setup complete! Your policy is now sealed.");
@@ -4696,10 +4707,14 @@ async fn run_status(json_output: bool) {
                 .and_then(|bytes| seal::verify_seal(&bytes, &seal_file).ok())
                 .map(|s| match s {
                     SealStatus::Verified => ui::status_badge("SEALED", ui::BadgeState::Ok),
+                    SealStatus::VerifiedLegacy => {
+                        ui::status_badge("SEALED (legacy)", ui::BadgeState::Warn)
+                    }
                     SealStatus::Unsealed => ui::status_badge("UNSEALED", ui::BadgeState::Warn),
                     SealStatus::Tampered { .. } => {
                         ui::status_badge("TAMPERED", ui::BadgeState::Fail)
                     }
+                    SealStatus::KeyMissing => ui::status_badge("KEY MISSING", ui::BadgeState::Fail),
                 })
                 .unwrap_or_else(|| ui::status_badge("UNKNOWN", ui::BadgeState::Info))
         };
@@ -4902,8 +4917,15 @@ async fn run_doctor() {
             match std::fs::read(&config_path) {
                 Ok(config_bytes) => match seal::verify_seal(&config_bytes, &seal_file) {
                     Ok(SealStatus::Verified) => {
-                        doctor_pass("Config seal verified");
+                        doctor_pass("Config seal verified (keyed)");
                         pass_count += 1;
+                    }
+                    Ok(SealStatus::VerifiedLegacy) => {
+                        doctor_warn(
+                            "Config seal is the legacy unkeyed format — \
+                             run 'opaque setup --seal' to upgrade",
+                        );
+                        warn_count += 1;
                     }
                     Ok(SealStatus::Unsealed) => {
                         doctor_warn("Config is unsealed — run 'opaque setup --seal'");
@@ -4912,6 +4934,13 @@ async fn run_doctor() {
                     Ok(SealStatus::Tampered { .. }) => {
                         doctor_fail(
                             "Config seal BROKEN — run 'opaque setup --reset' then reconfigure",
+                        );
+                        fail_count += 1;
+                    }
+                    Ok(SealStatus::KeyMissing) => {
+                        doctor_fail(
+                            "Config has a keyed seal but config.seal.key is missing — \
+                             restore it or re-seal",
                         );
                         fail_count += 1;
                     }

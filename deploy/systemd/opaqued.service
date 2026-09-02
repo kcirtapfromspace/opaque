@@ -1,0 +1,58 @@
+# opaqued as a system service under its own trust domain.
+#
+# Setup (once):
+#   sudo useradd --system --home-dir /var/lib/opaque --shell /usr/sbin/nologin opaque
+#   sudo groupadd opaque-clients
+#   sudo usermod -aG opaque-clients <each user or agent account that may talk to opaqued>
+#   sudo install -d -o opaque -g opaque -m 0700 /var/lib/opaque /etc/opaque
+#   sudo install -o opaque -g opaque -m 0600 config.toml /etc/opaque/config.toml
+#     (config must set: [trust_domain] enforce = true,
+#      socket_group = "opaque-clients", socket_path = "/run/opaque/opaqued.sock")
+#   sudo systemctl enable --now opaqued
+#
+# The daemon fails closed at startup unless every custody file (audit chain,
+# identity keys, config + seal, pairing store) is exclusively owned by the
+# `opaque` account — see docs/deployment.md.
+
+[Unit]
+Description=Opaque secrets broker daemon (trust-domain enforced)
+Documentation=https://github.com/kcirtapfromspace/opaque
+After=network.target
+
+[Service]
+Type=simple
+User=opaque
+Group=opaque
+Environment=HOME=/var/lib/opaque
+Environment=OPAQUE_CONFIG=/etc/opaque/config.toml
+ExecStart=/usr/local/bin/opaqued
+Restart=on-failure
+RestartSec=2
+
+# /run/opaque — created fresh each start, owned by the service account. Mode
+# 0750 lets opaque-clients traverse; the daemon itself opens the socket (0660)
+# and token (0640) to that group after binding.
+RuntimeDirectory=opaque
+RuntimeDirectoryMode=0750
+StateDirectory=opaque
+StateDirectoryMode=0700
+
+# Hardening. NoNewPrivileges is required context for the seccomp/Landlock
+# sandbox the daemon applies to its exec children.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/opaque
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

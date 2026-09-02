@@ -1,0 +1,35 @@
+# Example daemon config for a trust-domain-enforced (service account) deployment.
+#
+# With this shape the audit chain, config seal, and delegation keys stop being
+# merely tamper-EVIDENT (detectable after the fact) and become tamper-PREVENTED:
+# the agent's uid cannot read or write them, and the daemon refuses to start if
+# that ever stops being true.
+
+require_seal = true
+
+[trust_domain]
+# Fail closed at startup unless every custody file is exclusively owned by the
+# daemon's own (service) account; refuse connections from the daemon's own uid.
+enforce = true
+
+# Group whose members may connect to the daemon (socket 0660, token 0640).
+# Membership is the coarse transport gate; identity + policy decide per
+# principal after that.
+socket_group = "opaque-clients"
+
+# Where to bind. Comes from this (sealed) config — the daemon never trusts the
+# OPAQUE_SOCK environment variable.
+socket_path = "/run/opaque/opaqued.sock"
+
+# Only needed when launching as root WITHOUT systemd/launchd user switching
+# (e.g. a container entrypoint): drop to this account before touching state.
+# Under systemd prefer User=opaque in the unit instead.
+# run_as = "opaque"
+
+[identity]
+# Identity is what makes cross-uid clients attributable — strongly recommended
+# alongside the split. See docs/identity.md.
+# issuer = "https://accounts.google.com"
+# client_id = "…"
+# allowed_email_domains = ["example.com"]
+# required = true

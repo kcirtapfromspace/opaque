@@ -64,7 +64,10 @@ jobs:
       - name: Kernel capability probe (landlock + seccomp must be enforceable)
         run: ./scripts/linux-harness.sh probe
 
-      # Stages S1+ append their suites here (isolation, sandbox enforcement,
+      - name: Multi-uid isolation suite (custody + privilege drop, as root)
+        run: ./scripts/linux-harness.sh isolation
+
+      # Later stages append their suites here (sandbox enforcement,
       # trust-domain e2e) via the same harness entry points.
 
   supply-chain:

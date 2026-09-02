@@ -110,6 +110,10 @@ pub enum AuditEventKind {
 
     /// A delegation was revoked before expiry.
     DelegationRevoked,
+
+    /// Startup report of the daemon's trust-domain posture: whether the
+    /// service-account split is enforced and what custody violations exist.
+    TrustDomainPosture,
 }
 
 impl fmt::Display for AuditEventKind {
@@ -142,6 +146,7 @@ impl fmt::Display for AuditEventKind {
             Self::IdentityRoleChanged => "identity.role.changed",
             Self::DelegationIssued => "delegation.issued",
             Self::DelegationRevoked => "delegation.revoked",
+            Self::TrustDomainPosture => "trust_domain.posture",
         };
         write!(f, "{s}")
     }
@@ -179,6 +184,7 @@ impl std::str::FromStr for AuditEventKind {
             "identity.role.changed" => Ok(Self::IdentityRoleChanged),
             "delegation.issued" => Ok(Self::DelegationIssued),
             "delegation.revoked" => Ok(Self::DelegationRevoked),
+            "trust_domain.posture" => Ok(Self::TrustDomainPosture),
             _ => Err(format!("unknown audit event kind: {s}")),
         }
     }

@@ -34,6 +34,7 @@ in_docker() {
         -v "$REPO_ROOT:/work" \
         -v opaque-linux-target:/ctarget \
         -v opaque-linux-cargo-registry:/usr/local/cargo/registry \
+        -v opaque-linux-rustup:/usr/local/rustup \
         -e CARGO_TARGET_DIR=/ctarget \
         -w /work \
         "$IMAGE" \
@@ -66,13 +67,38 @@ gate() {
 isolation() {
     # Multi-uid custody/ownership tests: the daemon principal must own the
     # custody files and the agent principal must be unable to read or write
-    # them. Requires root (creates throwaway uids). Stages S1+ populate this.
+    # them. Requires root (chown + seteuid across throwaway uids). In the
+    # container we already are root; on a CI runner, re-run cargo under sudo
+    # with the toolchain env carried across.
+    local prefix=()
     if [ "$(id -u)" -ne 0 ]; then
-        echo "isolation suite needs root (it creates throwaway uids)" >&2
-        exit 1
+        if command -v sudo >/dev/null 2>&1; then
+            prefix=(sudo -E env "PATH=$PATH" "HOME=$HOME"
+                "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}"
+                "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}")
+        else
+            echo "isolation suite needs root (it creates throwaway uids)" >&2
+            exit 1
+        fi
     fi
-    echo "isolation: no suites registered yet (stage S1 adds the first)" >&2
-    exit 1
+
+    # Each invocation greps for its own non-vacuous pass: a renamed/filtered-out
+    # test must fail the harness, never silently pass (repo convention).
+    run_exact() {
+        local pkg="$1" target_flag="$2" test_path="$3"
+        "${prefix[@]}" cargo test -p "$pkg" $target_flag "$test_path" \
+            -- --ignored --exact 2>&1 | tee /tmp/isolation-run.out
+        grep -q "test result: ok. 1 passed" /tmp/isolation-run.out || {
+            echo "isolation: $test_path did not actually run+pass" >&2
+            exit 1
+        }
+    }
+
+    run_exact opaque-core --lib trust_domain::tests::root_multi_uid_custody_matrix \
+        || exit 1
+    run_exact opaqued "--bin opaqued" trust_domain::tests::root_enforce_blocks_foreign_custody_then_privileges_drop \
+        || exit 1
+    echo "isolation suite: all suites ran as root and passed"
 }
 
 case "$CMD" in

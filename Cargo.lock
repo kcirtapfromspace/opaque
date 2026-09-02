@@ -1778,6 +1778,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "ed25519-dalek",
+ "getrandom 0.4.1",
  "glob-match",
  "hmac",
  "jsonschema",

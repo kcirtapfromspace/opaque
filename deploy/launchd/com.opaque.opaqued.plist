@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  opaqued as a macOS launch daemon under its own trust domain.
+
+  Setup (once):
+    sudo sysadminctl -addUser _opaque -home /var/lib/opaque -shell /usr/bin/false -roleAccount
+    sudo dscl . -create /Groups/opaque-clients gid 799
+    sudo dscl . -append /Groups/opaque-clients GroupMembership <each client user>
+    sudo install -d -o _opaque -g _opaque -m 0700 /var/lib/opaque /etc/opaque
+    sudo install -o _opaque -g _opaque -m 0600 config.toml /etc/opaque/config.toml
+      (config must set: [trust_domain] enforce = true,
+       socket_group = "opaque-clients", socket_path = "/var/run/opaque/opaqued.sock")
+    sudo install -d -o _opaque -g opaque-clients -m 0750 /var/run/opaque
+    sudo cp com.opaque.opaqued.plist /Library/LaunchDaemons/
+    sudo launchctl bootstrap system /Library/LaunchDaemons/com.opaque.opaqued.plist
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.opaque.opaqued</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/opaqued</string>
+    </array>
+    <key>UserName</key>
+    <string>_opaque</string>
+    <key>GroupName</key>
+    <string>_opaque</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/var/lib/opaque</string>
+        <key>OPAQUE_CONFIG</key>
+        <string>/etc/opaque/config.toml</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

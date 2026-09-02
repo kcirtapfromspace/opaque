@@ -4,9 +4,65 @@ Packaging model, supported platforms, and approval architecture requirements for
 
 ---
 
-## Fundamental Constraint
+## Two Deployment Modes
 
-The daemon (`opaqued`) **must run inside an interactive GUI session**. Both approval backends — macOS `LocalAuthentication` and Linux polkit — require a display server and a user session to present authentication dialogs. Headless, SSH, CI, and container environments are unsupported and will fail closed.
+Opaque runs in one of two trust configurations, and everything else in this
+guide is scoped by which one you choose:
+
+| | **Session mode** (default) | **Trust-domain split** |
+|---|---|---|
+| Daemon runs as | your own user, in your GUI session | a dedicated service account (`opaque`), as a system service |
+| Integrity posture | tamper-**evident** — an agent sharing your uid can read the audit chain key and rewrite state; you detect it after the fact | tamper-**prevented** — custody files are unreadable/unwritable at the agent's uid, verified at every startup (fail closed) |
+| Approval factors | local biometric (macOS `LocalAuthentication`), polkit — both need your GUI session | out-of-band factors that don't need the daemon to own a session: paired second device, FIDO2 key, passkey |
+| Service manager | LaunchAgent / systemd **user** service | LaunchDaemon / systemd **system** service (`deploy/`) |
+| Config | `~/.opaque/config.toml` | `/etc/opaque/config.toml` with `[trust_domain] enforce = true` (see `deploy/config.trust-domain.example.toml`) |
+
+**Session-mode constraint:** the daemon must run inside an interactive GUI
+session, because `LocalAuthentication` and polkit present dialogs there.
+Headless, SSH, CI, and container environments fail closed *in session mode* —
+they are exactly what the trust-domain split is for.
+
+---
+
+## Trust-Domain Split (Service-Account Mode)
+
+The split moves `opaqued` under a principal the agent can never be: a
+dedicated service account that exclusively owns every custody file — the
+audit database and its chain key, the identity store and delegation signing
+key, the config and its seal, the pairing store, and the profiles directory.
+
+What enforcement means concretely (`[trust_domain] enforce = true`):
+
+1. **Startup fails closed** unless every custody file that exists is owned by
+   the daemon's own uid with no group/other permission bits and no symlinks
+   substituted anywhere. The refusal names each violating path and the fix.
+   Loose modes on files the daemon *does* own are self-healed (tightened),
+   not fatal.
+2. **Connections from the daemon's own uid are refused.** Nothing legitimate
+   runs as the service account except the daemon; in session mode the same
+   check points the other way (only your own uid may connect).
+3. **The cross-domain surface is exactly three inodes:** the socket directory
+   (0750), the socket (0660), and the daemon token (0640), all group-owned by
+   `trust_domain.socket_group`. Group membership is the coarse transport
+   gate; identity + policy decide per principal after that.
+4. **The posture is recorded in the audit chain** at every startup
+   (`trust_domain.posture` event), so "was the split enforced at the time?"
+   is answerable from the log itself.
+
+Setup on Linux (systemd) and macOS (LaunchDaemon) is scripted in the headers
+of `deploy/systemd/opaqued.service` and `deploy/launchd/com.opaque.opaqued.plist`.
+Container deployments (separate daemon/agent containers sharing only the
+socket volume) are covered by the compose/k8s manifests in `deploy/`.
+
+Clients discover a split daemon automatically: when no per-user socket
+exists, the CLI/MCP try `/run/opaque/opaqued.sock` and verify the split's
+shape (daemon-owned socket, no world access, unwritable socket directory)
+before connecting.
+
+> **Approval factors in split mode:** the daemon no longer owns a GUI session,
+> so session-bound prompts (LocalBio, polkit) cannot fire from it. Configure
+> an out-of-band factor — paired second device, FIDO2 hardware key, or
+> passkey — so approvals carry a cryptographic approver signature instead.
 
 ---
 
@@ -67,14 +123,19 @@ Use `SMAppService.agent(plistName:)` (macOS 13+) to register the LaunchAgent fro
 | `ProcessType` | `Interactive` | Tells macOS the process presents approval dialogs. Prevents aggressive process throttling. |
 | `KeepAlive.SuccessfulExit` | `false` | Restarts on crash. Does not restart on clean exit (allows `opaque shutdown` to stick). |
 
-### Why LaunchAgent, Never LaunchDaemon
+### Why LaunchAgent, Never LaunchDaemon (session mode)
 
 `LocalAuthentication` (`LAContext`) requires:
 - An active Aqua GUI session (access to the WindowServer)
 - The user's Secure Enclave key (Touch ID) or fallback password dialog
 - The user's login keychain
 
-A LaunchDaemon runs as root with no GUI session. Touch ID is unreachable. `canEvaluatePolicy` would fail on every request. **LaunchDaemon is architecturally incompatible with Opaque.**
+A LaunchDaemon runs with no GUI session. Touch ID is unreachable.
+`canEvaluatePolicy` would fail on every request. **LaunchDaemon is
+architecturally incompatible with session mode.** The trust-domain split
+(`deploy/launchd/com.opaque.opaqued.plist`) *is* a LaunchDaemon — under a
+dedicated non-root account — and pairs with out-of-band approval factors
+instead of `LocalAuthentication`.
 
 ### Code Signing Requirements
 

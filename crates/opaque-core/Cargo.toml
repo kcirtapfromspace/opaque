@@ -11,6 +11,7 @@ homepage.workspace = true
 [dependencies]
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
+getrandom = { workspace = true }
 glob-match = { workspace = true }
 hmac = "0.12"
 jsonschema = { workspace = true }
