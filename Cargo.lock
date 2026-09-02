@@ -1869,6 +1869,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "ring",
+ "rusqlite",
  "rustls",
  "seccompiler",
  "serde",

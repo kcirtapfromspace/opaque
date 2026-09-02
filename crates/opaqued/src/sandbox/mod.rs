@@ -539,6 +539,7 @@ mod tests {
         let executor = SandboxExecutor::new(audit);
 
         let request = OperationRequest {
+            principal: None,
             request_id: Uuid::new_v4(),
             client_identity: ClientIdentity {
                 uid: 501,
@@ -569,6 +570,7 @@ mod tests {
         let executor = SandboxExecutor::new(audit);
 
         let request = OperationRequest {
+            principal: None,
             request_id: Uuid::new_v4(),
             client_identity: ClientIdentity {
                 uid: 501,
@@ -599,6 +601,7 @@ mod tests {
         let executor = SandboxExecutor::new(audit);
 
         let request = OperationRequest {
+            principal: None,
             request_id: Uuid::new_v4(),
             client_identity: ClientIdentity {
                 uid: 501,

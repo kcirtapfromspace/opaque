@@ -964,6 +964,7 @@ impl Enclave {
         // Synthetic request: the gate needs only identity + description for the
         // local biometric factor; classification is audit-only.
         let synth = OperationRequest {
+            principal: None,
             request_id: approval_id,
             client_identity: identity.clone(),
             client_type,
@@ -1560,6 +1561,7 @@ mod tests {
 
     fn test_request(operation: &str, client_type: ClientType) -> OperationRequest {
         OperationRequest {
+            principal: None,
             request_id: Uuid::new_v4(),
             client_identity: test_identity(),
             client_type,
@@ -1620,6 +1622,7 @@ mod tests {
 
     fn test_policy() -> PolicyEngine {
         PolicyEngine::with_rules(vec![PolicyRule {
+            identity: Default::default(),
             name: "allow-claude-github".into(),
             client: ClientMatch {
                 uid: Some(501),
@@ -1702,6 +1705,7 @@ mod tests {
         // Add a policy rule for secret.reveal to test safety enforcement.
         let mut policy = test_policy();
         policy.add_rule(PolicyRule {
+            identity: Default::default(),
             name: "allow-reveal".into(),
             client: ClientMatch::default(),
             operation_pattern: "secret.*".into(),
@@ -1751,6 +1755,7 @@ mod tests {
         let audit = Arc::new(InMemoryAuditEmitter::new());
         let mut policy = test_policy();
         policy.add_rule(PolicyRule {
+            identity: Default::default(),
             name: "allow-reveal".into(),
             client: ClientMatch::default(),
             operation_pattern: "secret.*".into(),
@@ -2124,6 +2129,7 @@ mod tests {
     /// Build a policy with a FirstUse rule for github.set_actions_secret.
     fn test_first_use_policy(lease_ttl: Option<Duration>, one_time: bool) -> PolicyEngine {
         PolicyEngine::with_rules(vec![PolicyRule {
+            identity: Default::default(),
             name: "allow-claude-github-first-use".into(),
             client: ClientMatch {
                 uid: Some(501),
@@ -2219,6 +2225,7 @@ mod tests {
         // Need a policy that also matches the second target.
         let mut policy_engine = policy;
         policy_engine.add_rule(PolicyRule {
+            identity: Default::default(),
             name: "allow-claude-github-other".into(),
             client: ClientMatch {
                 uid: Some(501),
@@ -2462,6 +2469,7 @@ mod tests {
         let (gate, count) = CountingApproveGate::new();
 
         let policy = PolicyEngine::with_rules(vec![PolicyRule {
+            identity: Default::default(),
             name: "allow-no-approval".into(),
             client: ClientMatch {
                 uid: Some(501),
@@ -2538,6 +2546,7 @@ mod tests {
         let mut policy = test_first_use_policy(Some(Duration::from_secs(300)), false);
         // Add a second target rule.
         policy.add_rule(PolicyRule {
+            identity: Default::default(),
             name: "allow-other".into(),
             client: ClientMatch {
                 uid: Some(501),
@@ -2626,6 +2635,7 @@ mod tests {
             .unwrap();
 
         let policy = PolicyEngine::with_rules(vec![PolicyRule {
+            identity: Default::default(),
             name: "allow-restricted".into(),
             client: ClientMatch::default(),
             operation_pattern: "restricted.*".into(),
@@ -2699,6 +2709,7 @@ mod tests {
             .unwrap();
 
         let policy = PolicyEngine::with_rules(vec![PolicyRule {
+            identity: Default::default(),
             name: "allow-schema".into(),
             client: ClientMatch::default(),
             operation_pattern: "schema.*".into(),
@@ -2754,6 +2765,7 @@ mod tests {
         let audit = Arc::new(InMemoryAuditEmitter::new());
 
         let policy = PolicyEngine::with_rules(vec![PolicyRule {
+            identity: Default::default(),
             name: "allow-main-only".into(),
             client: ClientMatch {
                 uid: Some(501),
@@ -2836,6 +2848,7 @@ mod tests {
         let audit = Arc::new(InMemoryAuditEmitter::new());
 
         let policy = PolicyEngine::with_rules(vec![PolicyRule {
+            identity: Default::default(),
             name: "allow-jwt-only".into(),
             client: ClientMatch {
                 uid: Some(501),
@@ -3016,6 +3029,7 @@ mod tests {
         let policy = PolicyEngine::with_rules(vec![
             // list_secrets: no approval needed.
             PolicyRule {
+                identity: Default::default(),
                 name: "allow-list".into(),
                 client: ClientMatch {
                     uid: Some(501),
@@ -3043,6 +3057,7 @@ mod tests {
             },
             // set_actions_secret: Always approval.
             PolicyRule {
+                identity: Default::default(),
                 name: "allow-set".into(),
                 client: ClientMatch {
                     uid: Some(501),
@@ -3315,6 +3330,7 @@ mod tests {
         // Policy sets approval to "never"; the enclave clamp must still force
         // mandatory approval because the op is SensitiveOutput.
         let policy = PolicyEngine::with_rules(vec![PolicyRule {
+            identity: Default::default(),
             name: "allow-ecr".into(),
             client: ClientMatch {
                 uid: Some(501),
@@ -3439,6 +3455,7 @@ mod tests {
 
         // Policy that restricts to specific secret names.
         let policy = PolicyEngine::with_rules(vec![PolicyRule {
+            identity: Default::default(),
             name: "allow-only-specific-secrets".into(),
             client: ClientMatch {
                 uid: Some(501),

@@ -598,6 +598,7 @@ mod tests {
 
     fn make_request(operation: &str, params: serde_json::Value) -> OperationRequest {
         OperationRequest {
+            principal: None,
             request_id: uuid::Uuid::new_v4(),
             client_identity: ClientIdentity {
                 uid: 501,

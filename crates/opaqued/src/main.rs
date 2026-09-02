@@ -46,6 +46,7 @@ mod fido2;
 mod gcp;
 mod github;
 mod gitlab;
+mod identity;
 #[allow(dead_code)]
 mod infisical;
 mod onepassword;
@@ -103,6 +104,11 @@ struct DaemonConfig {
     /// Default decision for execve requests that do not match any rule.
     #[serde(default)]
     execve_default: ExecveDefault,
+
+    /// Identity substrate (`[identity]`): OIDC login, principals, roles.
+    /// Absent = identity features disabled (Phase 0 behavior).
+    #[serde(default)]
+    identity: Option<identity::IdentityConfig>,
 }
 
 /// A single entry in the known human clients allowlist.
@@ -141,6 +147,8 @@ struct DaemonState {
     agent_sessions: Arc<tokio::sync::RwLock<HashMap<String, AgentSession>>>,
     /// Semaphore to limit maximum concurrent connections.
     connection_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Identity runtime, present when `[identity]` is configured.
+    identity: Option<Arc<identity::IdentityRuntime>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1033,6 +1041,35 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
     }
     let audit: Arc<dyn AuditSink> = Arc::new(MultiAuditSink::new(vec![tracing_sink, sqlite_sink]));
 
+    // Identity substrate (Phase 1): initialize when `[identity]` is present.
+    // A broken identity config fails the daemon only when `required = true`
+    // (fail closed where identity gates operations); otherwise it degrades to
+    // identity-disabled with a loud warning.
+    let identity_runtime = match config.identity.clone() {
+        None => None,
+        Some(id_config) => {
+            let required = id_config.required;
+            let state_dir = audit_db_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."));
+            match identity::IdentityRuntime::initialize(id_config, &state_dir) {
+                Ok(rt) => Some(Arc::new(rt)),
+                Err(e) if required => {
+                    return Err(std::io::Error::other(format!(
+                        "identity is required but failed to initialize: {e}"
+                    )));
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "identity disabled: failed to initialize identity runtime: {e}"
+                    );
+                    None
+                }
+            }
+        }
+    };
+
     let sandbox_executor = sandbox::SandboxExecutor::new(audit.clone());
 
     // Execve policy hook handlers.
@@ -1227,6 +1264,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         daemon_token,
         agent_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         connection_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+        identity: identity_runtime,
     });
 
     // Shutdown coordination: watch channel + active connection counter.
@@ -2088,25 +2126,257 @@ async fn handle_request(
             serde_json::json!({ "version": state.version, "api_version": opaque_core::API_VERSION }),
         ),
         "whoami" => {
+            let identity_required = state
+                .identity
+                .as_ref()
+                .is_some_and(|rt| rt.config.required);
             // Agent clients get minimal info to prevent reconnaissance.
-            // Human clients get the full dump for debugging identity matching.
+            // Human clients get the full dump for debugging identity matching,
+            // plus the logged-in principal when a login session is active.
             let payload = match client_type {
-                ClientType::Human => serde_json::json!({
-                    "uid": identity.uid,
-                    "gid": identity.gid,
-                    "pid": identity.pid,
-                    "exe_path": identity.exe_path.as_ref().map(|p| p.display().to_string()),
-                    "exe_sha256": identity.exe_sha256,
-                    "client_type": client_type,
-                    "agent_session_id": session_id,
-                }),
+                ClientType::Human => {
+                    let logged_in = state
+                        .identity
+                        .as_ref()
+                        .and_then(|rt| rt.current_identity_json());
+                    serde_json::json!({
+                        "uid": identity.uid,
+                        "gid": identity.gid,
+                        "pid": identity.pid,
+                        "exe_path": identity.exe_path.as_ref().map(|p| p.display().to_string()),
+                        "exe_sha256": identity.exe_sha256,
+                        "client_type": client_type,
+                        "agent_session_id": session_id,
+                        "identity": logged_in,
+                        "identity_required": identity_required,
+                    })
+                }
                 ClientType::Agent => serde_json::json!({
                     "uid": identity.uid,
                     "client_type": client_type,
                     "agent_session_id": session_id,
+                    "identity_required": identity_required,
                 }),
             };
             Response::ok(req.id, payload)
+        }
+        "identity.login_start" => {
+            let Some(rt) = state.identity.as_ref() else {
+                return Response::err(
+                    Some(req.id),
+                    "identity_not_configured",
+                    "no [identity] section in the daemon config",
+                );
+            };
+            match rt.login_start().await {
+                Ok(started) => Response::ok(
+                    req.id,
+                    serde_json::json!({
+                        "attempt_id": started.attempt_id,
+                        "auth_url": started.auth_url,
+                        "expires_in_secs": started.expires_in_secs,
+                    }),
+                ),
+                Err(e) => {
+                    warn!("identity.login_start failed: {e}");
+                    Response::err(
+                        Some(req.id),
+                        "login_failed",
+                        "could not start a login attempt (is the identity provider reachable?)",
+                    )
+                }
+            }
+        }
+        "identity.login_status" => {
+            let Some(rt) = state.identity.as_ref() else {
+                return Response::err(
+                    Some(req.id),
+                    "identity_not_configured",
+                    "no [identity] section in the daemon config",
+                );
+            };
+            let attempt_id = req.params.get("attempt_id").and_then(|v| v.as_str());
+            let Some(attempt_id) = attempt_id.and_then(|s| Uuid::parse_str(s).ok()) else {
+                return Response::err(
+                    Some(req.id),
+                    "invalid_params",
+                    "attempt_id must be a UUID",
+                );
+            };
+            match rt.login_status(&attempt_id.to_string()) {
+                None => Response::err(
+                    Some(req.id),
+                    "unknown_attempt",
+                    "unknown or expired login attempt",
+                ),
+                Some(identity::login::AttemptOutcome::Pending) => {
+                    Response::ok(req.id, serde_json::json!({ "status": "pending" }))
+                }
+                Some(identity::login::AttemptOutcome::Done { .. }) => Response::ok(
+                    req.id,
+                    serde_json::json!({
+                        "status": "complete",
+                        "identity": rt.current_identity_json(),
+                    }),
+                ),
+                Some(identity::login::AttemptOutcome::Failed { reason }) => Response::ok(
+                    req.id,
+                    serde_json::json!({ "status": "failed", "reason": reason }),
+                ),
+            }
+        }
+        "identity.logout" => {
+            let Some(rt) = state.identity.as_ref() else {
+                return Response::err(
+                    Some(req.id),
+                    "identity_not_configured",
+                    "no [identity] section in the daemon config",
+                );
+            };
+            match rt.store.revoke_all_human_sessions() {
+                Ok(revoked) => {
+                    info!("identity.logout revoked {revoked} human session(s)");
+                    Response::ok(req.id, serde_json::json!({ "revoked": revoked }))
+                }
+                Err(e) => {
+                    warn!("identity.logout failed: {e}");
+                    Response::err(Some(req.id), "internal", "failed to revoke sessions")
+                }
+            }
+        }
+        "identity.principal_list" => {
+            let Some(rt) = state.identity.as_ref() else {
+                return Response::err(
+                    Some(req.id),
+                    "identity_not_configured",
+                    "no [identity] section in the daemon config",
+                );
+            };
+            // Once any human is registered, listing requires an active login
+            // session (bootstrap-phase listing stays open so the first login
+            // can be verified). Client classification is NOT a gate here.
+            let humans = rt.store.count_humans().unwrap_or(0);
+            if humans > 0 && rt.current_human_principal().is_none() {
+                return Response::err(
+                    Some(req.id),
+                    "not_authorized",
+                    "an active login session is required (run `opaque login`)",
+                );
+            }
+            match rt.store.list_principals() {
+                Ok(principals) => {
+                    let list: Vec<serde_json::Value> = principals
+                        .iter()
+                        .map(|p| {
+                            serde_json::json!({
+                                "id": p.id.as_str(),
+                                "kind": match &p.kind {
+                                    opaque_core::identity::PrincipalKind::Human { .. } => "human",
+                                    opaque_core::identity::PrincipalKind::Agent { .. } => "agent",
+                                    opaque_core::identity::PrincipalKind::Service { .. } => "service",
+                                },
+                                "label": p.display_label(),
+                                "roles": p.roles.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
+                                "disabled": p.disabled,
+                                "created_at": p.created_at,
+                                "last_seen": p.last_seen,
+                            })
+                        })
+                        .collect();
+                    Response::ok(req.id, serde_json::json!({ "principals": list }))
+                }
+                Err(e) => {
+                    warn!("identity.principal_list failed: {e}");
+                    Response::err(Some(req.id), "internal", "failed to list principals")
+                }
+            }
+        }
+        "identity.role_set" => {
+            let Some(rt) = state.identity.as_ref() else {
+                return Response::err(
+                    Some(req.id),
+                    "identity_not_configured",
+                    "no [identity] section in the daemon config",
+                );
+            };
+            // Role management requires an active admin login session.
+            if !rt.current_human_has_role(opaque_core::identity::Role::Admin) {
+                return Response::err(
+                    Some(req.id),
+                    "not_authorized",
+                    "role changes require an active admin login session",
+                );
+            }
+            let principal_id = req
+                .params
+                .get("principal_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| opaque_core::identity::PrincipalId::parse(s).ok());
+            let Some(principal_id) = principal_id else {
+                return Response::err(
+                    Some(req.id),
+                    "invalid_params",
+                    "principal_id must be a valid principal id",
+                );
+            };
+            let roles_param = req.params.get("roles").and_then(|v| v.as_array());
+            let Some(roles_param) = roles_param else {
+                return Response::err(
+                    Some(req.id),
+                    "invalid_params",
+                    "roles must be an array of role names",
+                );
+            };
+            let roles_csv = roles_param
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            let roles = match opaque_core::identity::roles_from_string(&roles_csv) {
+                Ok(r) => r,
+                Err(e) => {
+                    return Response::err(Some(req.id), "invalid_params", e.to_string());
+                }
+            };
+            // Refuse to drop the last enabled admin (lockout guard).
+            let target = rt.store.get_principal(&principal_id).ok().flatten();
+            let target_is_admin = target
+                .as_ref()
+                .is_some_and(|p| !p.disabled && p.has_role(opaque_core::identity::Role::Admin));
+            if target_is_admin
+                && !roles.contains(&opaque_core::identity::Role::Admin)
+                && rt
+                    .store
+                    .count_with_role(opaque_core::identity::Role::Admin)
+                    .unwrap_or(0)
+                    <= 1
+            {
+                return Response::err(
+                    Some(req.id),
+                    "last_admin",
+                    "cannot remove the admin role from the last admin",
+                );
+            }
+            match rt.store.set_roles(&principal_id, &roles) {
+                Ok(()) => {
+                    info!(
+                        "roles updated for {principal_id}: [{}]",
+                        opaque_core::identity::roles_to_string(&roles)
+                    );
+                    match rt.store.get_principal(&principal_id) {
+                        Ok(Some(p)) => Response::ok(
+                            req.id,
+                            serde_json::json!({
+                                "id": p.id.as_str(),
+                                "label": p.display_label(),
+                                "roles": p.roles.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
+                            }),
+                        ),
+                        _ => Response::ok(req.id, serde_json::json!({ "updated": true })),
+                    }
+                }
+                Err(e) => Response::err(Some(req.id), "invalid_params", e),
+            }
         }
         "agent_session_start" => {
             let default_ttl = state.config.agent_session_ttl_secs.unwrap_or(3600);
@@ -2462,6 +2732,7 @@ async fn handle_request(
             }
 
             let op_req = OperationRequest {
+                principal: None,
                 request_id: Uuid::new_v4(),
                 client_identity: identity.clone(),
                 client_type,
@@ -2750,6 +3021,7 @@ async fn handle_request(
             }
 
             let op_req = OperationRequest {
+                principal: None,
                 request_id: Uuid::new_v4(),
                 client_identity: identity.clone(),
                 client_type,
@@ -2887,6 +3159,7 @@ async fn handle_request(
             }
 
             let op_req = OperationRequest {
+                principal: None,
                 request_id: Uuid::new_v4(),
                 client_identity: identity.clone(),
                 client_type,
@@ -3033,6 +3306,7 @@ async fn handle_request(
             };
 
             let op_req = OperationRequest {
+                principal: None,
                 request_id: Uuid::new_v4(),
                 client_identity: identity.clone(),
                 client_type,
@@ -3157,6 +3431,7 @@ async fn handle_request(
             };
 
             let op_req = OperationRequest {
+                principal: None,
                 request_id: Uuid::new_v4(),
                 client_identity: identity.clone(),
                 client_type,
@@ -3217,6 +3492,7 @@ async fn handle_request(
                 .unwrap_or_default();
 
             let op_req = OperationRequest {
+                principal: None,
                 request_id: Uuid::new_v4(),
                 client_identity: identity.clone(),
                 client_type,
@@ -3304,6 +3580,7 @@ async fn handle_github_list_secrets(
     };
 
     let op_req = OperationRequest {
+        principal: None,
         request_id: Uuid::new_v4(),
         client_identity: identity.clone(),
         client_type,
@@ -3379,6 +3656,7 @@ async fn handle_github_delete_secret(
     };
 
     let op_req = OperationRequest {
+        principal: None,
         request_id: Uuid::new_v4(),
         client_identity: identity.clone(),
         client_type,
@@ -4419,6 +4697,7 @@ exe_sha256 = "deadbeef"
             daemon_token: "test_token".into(),
             agent_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             connection_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+            identity: None,
         }
     }
 
@@ -4433,6 +4712,277 @@ exe_sha256 = "deadbeef"
     fn make_test_state() -> DaemonState {
         let audit: Arc<dyn AuditSink> = Arc::new(TracingAuditEmitter::new());
         make_test_state_with_audit(audit)
+    }
+
+    /// Test state with an identity runtime (no live IdP — discovery is lazy).
+    fn make_test_state_with_identity() -> (tempfile::TempDir, DaemonState) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = identity::IdentityConfig {
+            issuer: "https://idp.example.com".into(),
+            client_id: "opaque-cli".into(),
+            audience: None,
+            redirect_port: None,
+            session_ttl_secs: None,
+            allowed_email_domains: vec![],
+            required: false,
+            service_principals: vec![],
+        };
+        let runtime = identity::IdentityRuntime::initialize(config, dir.path()).unwrap();
+        let mut state = make_test_state();
+        state.identity = Some(Arc::new(runtime));
+        (dir, state)
+    }
+
+    // -----------------------------------------------------------------------
+    // Identity method tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn identity_methods_error_when_not_configured() {
+        let state = make_test_state();
+        for method in [
+            "identity.login_start",
+            "identity.login_status",
+            "identity.logout",
+            "identity.principal_list",
+            "identity.role_set",
+        ] {
+            let req = Request {
+                id: 1,
+                method: method.into(),
+                params: serde_json::json!({}),
+            };
+            let resp =
+                handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+            assert_eq!(
+                resp.error.expect("error expected").code,
+                "identity_not_configured",
+                "method {method}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn whoami_reports_identity_absent_when_unconfigured() {
+        let state = make_test_state();
+        let req = Request {
+            id: 1,
+            method: "whoami".into(),
+            params: serde_json::Value::Null,
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        let result = resp.result.unwrap();
+        assert_eq!(result["identity"], serde_json::Value::Null);
+        assert_eq!(result["identity_required"], false);
+    }
+
+    #[tokio::test]
+    async fn whoami_reports_logged_in_identity() {
+        let (_dir, state) = make_test_state_with_identity();
+        let rt = state.identity.as_ref().unwrap();
+        let principal = rt
+            .store
+            .upsert_human(
+                "https://idp.example.com",
+                "u-1",
+                Some("dev@example.com"),
+                None,
+                &std::collections::BTreeSet::from([
+                    opaque_core::identity::Role::Admin,
+                    opaque_core::identity::Role::Operator,
+                ]),
+            )
+            .unwrap();
+        rt.store
+            .create_human_session(&principal.id, 3600, "https://idp.example.com")
+            .unwrap();
+
+        let req = Request {
+            id: 1,
+            method: "whoami".into(),
+            params: serde_json::Value::Null,
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        let result = resp.result.unwrap();
+        assert_eq!(result["identity"]["email"], "dev@example.com");
+        assert_eq!(result["identity"]["principal_id"], principal.id.as_str());
+
+        // Agent whoami stays reduced: no identity object, but the flag is there.
+        let req = Request {
+            id: 2,
+            method: "whoami".into(),
+            params: serde_json::Value::Null,
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Agent, None).await;
+        let result = resp.result.unwrap();
+        assert!(result.get("identity").is_none());
+        assert_eq!(result["identity_required"], false);
+        assert!(result.get("exe_path").is_none());
+    }
+
+    #[tokio::test]
+    async fn principal_list_open_during_bootstrap_then_session_gated() {
+        let (_dir, state) = make_test_state_with_identity();
+
+        // Bootstrap phase (no humans yet): listing is allowed.
+        let req = Request {
+            id: 1,
+            method: "identity.principal_list".into(),
+            params: serde_json::json!({}),
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        assert!(resp.error.is_none());
+
+        // Register a human but no active session → gated.
+        let rt = state.identity.as_ref().unwrap();
+        rt.store
+            .upsert_human(
+                "https://idp.example.com",
+                "u-1",
+                None,
+                None,
+                &std::collections::BTreeSet::new(),
+            )
+            .unwrap();
+        let req = Request {
+            id: 2,
+            method: "identity.principal_list".into(),
+            params: serde_json::json!({}),
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        assert_eq!(resp.error.expect("gated").code, "not_authorized");
+    }
+
+    #[tokio::test]
+    async fn role_set_requires_admin_session_and_guards_last_admin() {
+        let (_dir, state) = make_test_state_with_identity();
+        let rt = state.identity.as_ref().unwrap().clone();
+        let admin = rt
+            .store
+            .upsert_human(
+                "https://idp.example.com",
+                "u-admin",
+                Some("admin@example.com"),
+                None,
+                &std::collections::BTreeSet::from([
+                    opaque_core::identity::Role::Admin,
+                    opaque_core::identity::Role::Operator,
+                ]),
+            )
+            .unwrap();
+
+        // No active session → not authorized.
+        let req = Request {
+            id: 1,
+            method: "identity.role_set".into(),
+            params: serde_json::json!({
+                "principal_id": admin.id.as_str(),
+                "roles": ["operator"],
+            }),
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        assert_eq!(resp.error.expect("gated").code, "not_authorized");
+
+        // With an admin session: dropping the last admin's admin role fails.
+        rt.store
+            .create_human_session(&admin.id, 3600, "https://idp.example.com")
+            .unwrap();
+        let req = Request {
+            id: 2,
+            method: "identity.role_set".into(),
+            params: serde_json::json!({
+                "principal_id": admin.id.as_str(),
+                "roles": ["operator"],
+            }),
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        assert_eq!(resp.error.expect("guarded").code, "last_admin");
+
+        // Granting roles to a second principal works and is visible.
+        let second = rt
+            .store
+            .upsert_human(
+                "https://idp.example.com",
+                "u-2",
+                None,
+                None,
+                &std::collections::BTreeSet::new(),
+            )
+            .unwrap();
+        let req = Request {
+            id: 3,
+            method: "identity.role_set".into(),
+            params: serde_json::json!({
+                "principal_id": second.id.as_str(),
+                "roles": ["approver", "operator"],
+            }),
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+        let roles = resp.result.unwrap()["roles"].clone();
+        let roles: Vec<String> = serde_json::from_value(roles).unwrap();
+        assert_eq!(roles, vec!["approver".to_string(), "operator".to_string()]);
+
+        // Unknown role name rejected.
+        let req = Request {
+            id: 4,
+            method: "identity.role_set".into(),
+            params: serde_json::json!({
+                "principal_id": second.id.as_str(),
+                "roles": ["root"],
+            }),
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        assert_eq!(resp.error.expect("invalid role").code, "invalid_params");
+    }
+
+    #[tokio::test]
+    async fn logout_revokes_sessions() {
+        let (_dir, state) = make_test_state_with_identity();
+        let rt = state.identity.as_ref().unwrap();
+        let p = rt
+            .store
+            .upsert_human(
+                "https://idp.example.com",
+                "u-1",
+                None,
+                None,
+                &std::collections::BTreeSet::new(),
+            )
+            .unwrap();
+        rt.store
+            .create_human_session(&p.id, 3600, "https://idp.example.com")
+            .unwrap();
+        assert!(rt.current_identity_json().is_some());
+
+        let req = Request {
+            id: 1,
+            method: "identity.logout".into(),
+            params: serde_json::json!({}),
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        assert_eq!(resp.result.unwrap()["revoked"], 1);
+        assert!(rt.current_identity_json().is_none());
+    }
+
+    #[tokio::test]
+    async fn login_status_requires_uuid_attempt_id() {
+        let (_dir, state) = make_test_state_with_identity();
+        let req = Request {
+            id: 1,
+            method: "identity.login_status".into(),
+            params: serde_json::json!({ "attempt_id": "../../etc/passwd" }),
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        assert_eq!(resp.error.expect("rejected").code, "invalid_params");
+
+        let req = Request {
+            id: 2,
+            method: "identity.login_status".into(),
+            params: serde_json::json!({ "attempt_id": Uuid::new_v4().to_string() }),
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        assert_eq!(resp.error.expect("unknown").code, "unknown_attempt");
     }
 
     // -----------------------------------------------------------------------
