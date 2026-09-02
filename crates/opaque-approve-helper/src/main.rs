@@ -41,13 +41,47 @@ fn main() -> ExitCode {
 
     // Step 2: Polkit authentication (password / biometric).
     match polkit_authenticate() {
-        Ok(true) => ExitCode::from(EXIT_APPROVED),
+        Ok(true) => {
+            report_account();
+            ExitCode::from(EXIT_APPROVED)
+        }
         Ok(false) => ExitCode::from(EXIT_DENIED),
         Err(e) => {
             eprintln!("opaque-approve-helper: polkit auth failed: {e}");
             ExitCode::from(EXIT_UNAVAILABLE)
         }
     }
+}
+
+/// Report the polkit-authenticated account to the daemon on stdout, so the
+/// approval is attributed to a named account instead of an anonymous pass.
+/// The decision itself rides the exit code alone — this line is attribution
+/// only, and the daemon ignores it if malformed. Usernames outside the safe
+/// charset are skipped rather than escaped (no injection surface at all).
+fn report_account() {
+    // std-only uid lookup (this crate deliberately has no dependencies):
+    // the second field of the Uid: line is the effective uid.
+    let Some(uid) = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("Uid:"))
+                .and_then(|l| l.split_whitespace().nth(2))
+                .and_then(|v| v.parse::<u32>().ok())
+        })
+    else {
+        return;
+    };
+    let username = std::env::var("USER").unwrap_or_default();
+    if username.is_empty()
+        || username.len() > 256
+        || !username
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return;
+    }
+    println!("{{\"account\":{{\"uid\":{uid},\"username\":\"{username}\"}}}}");
 }
 
 /// Parse `--reason <text>` from command-line arguments.

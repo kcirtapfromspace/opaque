@@ -4,6 +4,12 @@
 //! send approval requests via Apple Push Notification service (APNs).
 //! This module handles payload formatting, device token storage, and
 //! the fallback logic from local server to push delivery.
+//!
+//! NOT YET WIRED: the LAN approval server (`approval_server`) is the live
+//! second-device transport; this relay activates when an `[approval.apns]`
+//! config surface lands (it needs Apple credentials to be usable at all).
+//! Kept compiled + unit-tested so the payload format can't rot.
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::sync::Arc;

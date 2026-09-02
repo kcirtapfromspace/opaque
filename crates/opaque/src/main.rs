@@ -215,6 +215,11 @@ enum Cmd {
         #[command(subcommand)]
         action: IdentityAction,
     },
+    /// Manage paired approver devices (second-device approval factor).
+    Device {
+        #[command(subcommand)]
+        action: DeviceAction,
+    },
     /// Interactive setup wizard — configure and seal your security policy.
     Setup {
         /// Seal the current config.toml without running the wizard.
@@ -406,6 +411,33 @@ enum IdentityAction {
     },
     /// List delegation records (agent sessions bound to principals).
     Delegations,
+}
+
+#[derive(Debug, Subcommand)]
+enum DeviceAction {
+    /// Begin pairing a new approver device (approval-gated; prints the QR
+    /// payload for the companion app).
+    #[command(long_about = "Begin pairing a new approver device.\n\n\
+        Requires an out-of-band approval to start. The printed payload is scanned\n\
+        by the companion app, which completes pairing over the approval server.\n\
+        The new device stays QUARANTINED (no approval authority) until you run\n\
+        `opaque device confirm <device-id>` and match its key fingerprint against\n\
+        what the device itself displays.")]
+    Pair,
+    /// List paired devices with confirmation and revocation state.
+    Ls,
+    /// Confirm a paired device's key fingerprint (approval-gated) — this is
+    /// what grants it approval authority.
+    Confirm {
+        /// Device id as shown by `opaque device ls`.
+        device_id: String,
+    },
+    /// Revoke a paired device immediately (not approval-gated: removing an
+    /// approver never waits on an approver).
+    Revoke {
+        /// Device id as shown by `opaque device ls`.
+        device_id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2696,6 +2728,18 @@ async fn main() {
                 }),
             ),
             IdentityAction::Delegations => ("identity.delegation_list", serde_json::Value::Null),
+        },
+        Cmd::Device { action } => match action {
+            DeviceAction::Pair => ("device_pair_start", serde_json::Value::Null),
+            DeviceAction::Ls => ("device_list", serde_json::Value::Null),
+            DeviceAction::Confirm { device_id } => (
+                "device_pair_confirm",
+                serde_json::json!({ "device_id": device_id }),
+            ),
+            DeviceAction::Revoke { device_id } => (
+                "device_revoke",
+                serde_json::json!({ "device_id": device_id }),
+            ),
         },
         Cmd::Agent { action } => match action {
             AgentAction::Run { .. } => unreachable!(),
@@ -7519,6 +7563,42 @@ BAZ=
                 action: IdentityAction::Delegations
             })
         ));
+    }
+
+    #[test]
+    fn device_commands_parse() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["opaque", "device", "pair"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Device {
+                action: DeviceAction::Pair
+            })
+        ));
+        let cli = Cli::try_parse_from(["opaque", "device", "ls"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Device {
+                action: DeviceAction::Ls
+            })
+        ));
+        let cli = Cli::try_parse_from(["opaque", "device", "confirm", "dev-1"]).unwrap();
+        match cli.cmd {
+            Some(Cmd::Device {
+                action: DeviceAction::Confirm { device_id },
+            }) => assert_eq!(device_id, "dev-1"),
+            other => panic!("unexpected parse: {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["opaque", "device", "revoke", "dev-2"]).unwrap();
+        match cli.cmd {
+            Some(Cmd::Device {
+                action: DeviceAction::Revoke { device_id },
+            }) => assert_eq!(device_id, "dev-2"),
+            other => panic!("unexpected parse: {other:?}"),
+        }
+        // confirm/revoke require the device id.
+        assert!(Cli::try_parse_from(["opaque", "device", "confirm"]).is_err());
+        assert!(Cli::try_parse_from(["opaque", "device", "revoke"]).is_err());
     }
 
     #[test]

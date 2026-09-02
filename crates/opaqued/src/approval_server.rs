@@ -2,16 +2,29 @@
 //!
 //! The server listens on localhost with a self-signed TLS certificate
 //! and advertises itself via mDNS (Bonjour) as `_opaque-approval._tcp`.
-//! Paired iOS devices connect to submit approval decisions for pending
-//! operation challenges.
+//! Paired devices connect to fetch pending approval challenges and submit
+//! signed decisions; new devices complete pairing here.
+//!
+//! Trust model:
+//! - **Pairing** (`POST /pair`): authenticated by the one-time nonce from the
+//!   QR payload (5-minute TTL, single use). Returns the device id plus a
+//!   per-device bearer token (shown once; stored hashed).
+//! - **Transport auth**: every other authenticated route requires
+//!   `Authorization: Bearer <token>` + `X-Opaque-Device: <device_id>`, and
+//!   the token must match THAT device's stored hash. This is coarse gating
+//!   only — it decides who may see and submit, never who approved.
+//! - **Decisions** (`POST /approvals/{id}/respond`): the Ed25519 signature
+//!   over the challenge + decision tag is verified against the pairing store
+//!   BEFORE anything is relayed. What crosses into the daemon is the
+//!   VERIFIED device record, never client-supplied identity.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::Router;
-use axum::extract::{Json, Path, State};
+use axum::extract::{Json, Path as AxumPath, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -19,10 +32,14 @@ use rcgen::{CertificateParams, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use thiserror::Error;
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
+
+use crate::pairing::PairingManager;
+use crate::pairing::store::PairedDevice;
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -58,11 +75,11 @@ pub struct ApprovalServerConfig {
     pub tls_key_der: Vec<u8>,
     /// Approval timeout in seconds (default: 60).
     pub timeout_secs: u64,
-    /// Device session tokens (device_id -> token).
-    pub device_tokens: HashMap<String, String>,
 }
 
-/// A challenge submitted for approval by a paired device.
+/// A challenge shown to a paired device. `challenge_data` carries the JSON of
+/// the `pairing::challenge::ApprovalChallenge` the device must sign (together
+/// with its decision tag — see `pairing::challenge::decision_bytes`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalChallenge {
     pub request_id: String,
@@ -72,15 +89,6 @@ pub struct ApprovalChallenge {
     pub created_at: u64,
     pub expires_at: u64,
     pub challenge_data: String,
-}
-
-/// Response from a device approving or rejecting a challenge.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApprovalResponse {
-    pub request_id: String,
-    pub decision: ApprovalDecision,
-    pub device_id: String,
-    pub signature: String,
 }
 
 /// The decision on an approval challenge.
@@ -95,15 +103,47 @@ pub enum ApprovalDecision {
 #[derive(Debug, Deserialize)]
 pub struct RespondBody {
     pub decision: ApprovalDecision,
+    /// Ed25519 signature over the decision bytes, hex-encoded.
     pub signature: String,
     pub device_id: String,
+}
+
+/// Body submitted on the pair endpoint.
+#[derive(Debug, Deserialize)]
+pub struct PairBody {
+    /// One-time nonce from the QR payload.
+    pub nonce: String,
+    /// Device's Ed25519 public key, hex-encoded (32 bytes).
+    pub device_public_key: String,
+    /// Human-readable device name.
+    pub device_name: String,
+}
+
+/// Response to a successful pairing.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PairResponse {
+    pub device_id: String,
+    pub server_id: String,
+    /// Per-device bearer token — shown exactly once, stored hashed.
+    pub token: String,
+}
+
+/// A decision whose signature HAS been verified against the pairing store.
+/// The only thing the server ever relays inward.
+#[derive(Debug, Clone)]
+pub struct VerifiedDeviceDecision {
+    pub approve: bool,
+    pub device: PairedDevice,
 }
 
 /// Pending approval entry (internal).
 #[derive(Debug)]
 struct PendingApproval {
     challenge: ApprovalChallenge,
-    response_tx: oneshot::Sender<ApprovalResponse>,
+    /// The signable form of the challenge, kept server-side so verification
+    /// uses exactly what was issued (never client-echoed fields).
+    pairing_challenge: crate::pairing::challenge::ApprovalChallenge,
+    response_tx: oneshot::Sender<VerifiedDeviceDecision>,
     created_at: Instant,
     timeout: Duration,
 }
@@ -124,15 +164,71 @@ pub struct HealthResponse {
 // Shared state
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
 pub(crate) struct ServerState {
     pending: Mutex<HashMap<String, PendingApproval>>,
-    device_tokens: HashMap<String, String>,
+    pairing: Arc<PairingManager>,
     timeout: Duration,
 }
 
+impl std::fmt::Debug for ServerState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerState")
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}
+
+/// Cloneable handle for submitting challenges to a running (or about to run)
+/// approval server. Held by the paired-device factor verifier.
+#[derive(Clone, Debug)]
+pub struct ApprovalServerHandle {
+    state: Arc<ServerState>,
+}
+
+impl ApprovalServerHandle {
+    /// Submit a challenge for approval and get a receiver for the VERIFIED
+    /// response. The challenge expires after the configured timeout.
+    pub async fn submit_challenge(
+        &self,
+        challenge: ApprovalChallenge,
+        pairing_challenge: crate::pairing::challenge::ApprovalChallenge,
+    ) -> oneshot::Receiver<VerifiedDeviceDecision> {
+        let (tx, rx) = oneshot::channel();
+        let entry = PendingApproval {
+            challenge: challenge.clone(),
+            pairing_challenge,
+            response_tx: tx,
+            created_at: Instant::now(),
+            timeout: self.state.timeout,
+        };
+        let mut pending = self.state.pending.lock().await;
+        pending.insert(challenge.request_id.clone(), entry);
+        rx
+    }
+
+    /// The configured approval timeout.
+    pub fn timeout(&self) -> Duration {
+        self.state.timeout
+    }
+}
+
+/// Test hook: pop one pending approval, handing back its signable challenge
+/// and response sender — what the HTTP respond path does, minus HTTP.
+#[cfg(test)]
+pub(crate) async fn test_take_pending(
+    handle: &ApprovalServerHandle,
+) -> Option<(
+    crate::pairing::challenge::ApprovalChallenge,
+    oneshot::Sender<VerifiedDeviceDecision>,
+)> {
+    let mut pending = handle.state.pending.lock().await;
+    let key = pending.keys().next()?.clone();
+    let entry = pending.remove(&key)?;
+    Some((entry.pairing_challenge, entry.response_tx))
+}
+
 // ---------------------------------------------------------------------------
-// TLS certificate generation
+// TLS certificate generation + persistence
 // ---------------------------------------------------------------------------
 
 /// Generated TLS identity with the certificate fingerprint for pairing.
@@ -181,10 +277,76 @@ pub fn generate_self_signed_cert() -> Result<TlsIdentity, ServerError> {
     })
 }
 
+/// Load the persisted TLS identity from `<dir>/approval_server.{key,cert}`,
+/// creating it on first use.
+///
+/// Persistence is not an optimization: paired devices pin the certificate
+/// fingerprint from the QR payload, so a regenerated-per-start certificate
+/// would break every existing pairing on restart. Both files live in the
+/// daemon's custody set.
+pub fn load_or_create_tls_identity(dir: &Path) -> Result<TlsIdentity, ServerError> {
+    let key_path = dir.join("approval_server.key");
+    let cert_path = dir.join("approval_server.cert");
+
+    if key_path.exists() && cert_path.exists() {
+        let key_der = std::fs::read(&key_path)
+            .map_err(|e| ServerError::TlsSetup(format!("read {}: {e}", key_path.display())))?;
+        let cert_der = std::fs::read(&cert_path)
+            .map_err(|e| ServerError::TlsSetup(format!("read {}: {e}", cert_path.display())))?;
+        let mut hasher = Sha256::new();
+        hasher.update(&cert_der);
+        let fingerprint = hex::encode(hasher.finalize());
+        return Ok(TlsIdentity {
+            cert_der,
+            key_der,
+            fingerprint,
+            cert_pem: String::new(), // only needed at generation time
+        });
+    }
+
+    let identity = generate_self_signed_cert()?;
+    write_private(&key_path, &identity.key_der)
+        .map_err(|e| ServerError::TlsSetup(format!("write {}: {e}", key_path.display())))?;
+    write_private(&cert_path, &identity.cert_der)
+        .map_err(|e| ServerError::TlsSetup(format!("write {}: {e}", cert_path.display())))?;
+    Ok(identity)
+}
+
+#[cfg(unix)]
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(bytes)
+}
+
+#[cfg(not(unix))]
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, bytes)
+}
+
 // Inline hex encoding to avoid adding a `hex` dependency.
 mod hex {
     pub fn encode(bytes: impl AsRef<[u8]>) -> String {
         bytes.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    pub fn decode(s: &str) -> Result<Vec<u8>, String> {
+        if !s.len().is_multiple_of(2) {
+            return Err("odd-length hex string".into());
+        }
+        (0..s.len())
+            .step_by(2)
+            .map(|i| {
+                u8::from_str_radix(&s[i..i + 2], 16)
+                    .map_err(|e| format!("invalid hex at position {i}: {e}"))
+            })
+            .collect()
     }
 }
 
@@ -199,15 +361,25 @@ pub struct ApprovalServer {
 }
 
 impl ApprovalServer {
-    /// Create a new approval server with the given configuration.
-    pub fn new(config: ApprovalServerConfig) -> Result<Self, ServerError> {
+    /// Create a new approval server bound to the given pairing manager.
+    pub fn new(
+        config: ApprovalServerConfig,
+        pairing: Arc<PairingManager>,
+    ) -> Result<Self, ServerError> {
         let state = Arc::new(ServerState {
             pending: Mutex::new(HashMap::new()),
-            device_tokens: config.device_tokens.clone(),
+            pairing,
             timeout: Duration::from_secs(config.timeout_secs),
         });
 
         Ok(Self { state, config })
+    }
+
+    /// Handle for submitting challenges (usable before and after `start`).
+    pub fn handle(&self) -> ApprovalServerHandle {
+        ApprovalServerHandle {
+            state: self.state.clone(),
+        }
     }
 
     /// Start the server in a background task. Returns the join handle and the
@@ -277,24 +449,6 @@ impl ApprovalServer {
         Ok((handle, local_addr))
     }
 
-    /// Submit a challenge for approval and get a receiver for the response.
-    /// The challenge will expire after the configured timeout.
-    pub async fn submit_challenge(
-        &self,
-        challenge: ApprovalChallenge,
-    ) -> oneshot::Receiver<ApprovalResponse> {
-        let (tx, rx) = oneshot::channel();
-        let entry = PendingApproval {
-            challenge: challenge.clone(),
-            response_tx: tx,
-            created_at: Instant::now(),
-            timeout: self.state.timeout,
-        };
-        let mut pending = self.state.pending.lock().await;
-        pending.insert(challenge.request_id.clone(), entry);
-        rx
-    }
-
     /// Get a reference to the shared state (for testing).
     #[cfg(test)]
     pub(crate) fn state(&self) -> &Arc<ServerState> {
@@ -323,6 +477,7 @@ fn build_tls_config(cert_der: &[u8], key_der: &[u8]) -> Result<rustls::ServerCon
 fn build_router(state: Arc<ServerState>) -> Router {
     Router::new()
         .route("/health", get(health_handler))
+        .route("/pair", post(pair_handler))
         .route("/approvals/pending", get(pending_handler))
         .route("/approvals/{request_id}/respond", post(respond_handler))
         .with_state(state)
@@ -336,6 +491,43 @@ async fn health_handler() -> impl IntoResponse {
     Json(HealthResponse {
         status: "ok".into(),
     })
+}
+
+/// Complete a pairing. Authenticated by the one-time QR nonce, not a bearer
+/// token (the device has no token yet — this is where it gets one).
+async fn pair_handler(
+    State(state): State<Arc<ServerState>>,
+    Json(body): Json<PairBody>,
+) -> Result<Json<PairResponse>, StatusCode> {
+    let key_bytes = hex::decode(&body.device_public_key).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    // Attribution rides the pairing SESSION (captured when the ceremony was
+    // started by an authenticated human), never completion time.
+    let (device, token) = state
+        .pairing
+        .complete_pairing(&body.nonce, &key_bytes, &body.device_name)
+        .map_err(|e| {
+            warn!("pairing attempt failed: {e}");
+            match e {
+                crate::pairing::PairingError::Expired => StatusCode::GONE,
+                crate::pairing::PairingError::InvalidNonce
+                | crate::pairing::PairingError::SessionConsumed => StatusCode::UNAUTHORIZED,
+                _ => StatusCode::BAD_REQUEST,
+            }
+        })?;
+
+    info!(
+        device_id = %device.device_id,
+        device_name = %device.name,
+        paired_by = device.paired_by.as_deref().unwrap_or("(no identity)"),
+        "device paired"
+    );
+
+    Ok(Json(PairResponse {
+        device_id: device.device_id,
+        server_id: state.pairing.server_id().to_owned(),
+        token,
+    }))
 }
 
 async fn pending_handler(
@@ -353,28 +545,61 @@ async fn pending_handler(
 async fn respond_handler(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
-    Path(request_id): Path<String>,
+    AxumPath(request_id): AxumPath<String>,
     Json(body): Json<RespondBody>,
 ) -> Result<StatusCode, StatusCode> {
-    validate_auth(&state, &headers)?;
+    let auth_device = validate_auth(&state, &headers)?;
 
-    let mut pending = state.pending.lock().await;
-    let entry = pending.remove(&request_id).ok_or(StatusCode::NOT_FOUND)?;
-
-    // Check if expired.
-    if entry.created_at.elapsed() > entry.timeout {
-        return Err(StatusCode::GONE);
+    // The transport identity and the claimed signer must agree — a device
+    // may not submit under another device's name even with a valid token.
+    if auth_device != body.device_id {
+        return Err(StatusCode::FORBIDDEN);
     }
 
-    let response = ApprovalResponse {
-        request_id,
-        decision: body.decision,
-        device_id: body.device_id,
-        signature: body.signature,
+    let approve = matches!(body.decision, ApprovalDecision::Approve);
+    let signature = hex::decode(&body.signature).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    // Verify FIRST, against the server-side copy of the challenge, without
+    // consuming the pending entry: a garbage signature must not burn the
+    // approval for the legitimate responder.
+    let pairing_challenge = {
+        let pending = state.pending.lock().await;
+        let entry = pending.get(&request_id).ok_or(StatusCode::NOT_FOUND)?;
+        if entry.created_at.elapsed() > entry.timeout {
+            return Err(StatusCode::GONE);
+        }
+        entry.pairing_challenge.clone()
     };
 
-    // Send response through the channel; ignore error if receiver dropped.
-    let _ = entry.response_tx.send(response);
+    let device = state
+        .pairing
+        .verify_approval(&pairing_challenge, &signature, &body.device_id, approve)
+        .map_err(|e| {
+            warn!(
+                device_id = %body.device_id,
+                request_id = %request_id,
+                "approval response REJECTED: signature did not verify: {e}"
+            );
+            StatusCode::FORBIDDEN
+        })?;
+
+    // Only now consume the entry and relay the verified decision.
+    let entry = {
+        let mut pending = state.pending.lock().await;
+        pending.remove(&request_id).ok_or(StatusCode::NOT_FOUND)?
+    };
+
+    info!(
+        device_id = %device.device_id,
+        device_name = %device.name,
+        request_id = %request_id,
+        approve,
+        "device decision verified"
+    );
+
+    let _ = entry
+        .response_tx
+        .send(VerifiedDeviceDecision { approve, device });
 
     Ok(StatusCode::OK)
 }
@@ -383,7 +608,8 @@ async fn respond_handler(
 // Auth validation
 // ---------------------------------------------------------------------------
 
-fn validate_auth(state: &ServerState, headers: &HeaderMap) -> Result<(), StatusCode> {
+/// Validate the per-device bearer token. Returns the authenticated device id.
+fn validate_auth(state: &ServerState, headers: &HeaderMap) -> Result<String, StatusCode> {
     let auth = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -393,12 +619,16 @@ fn validate_auth(state: &ServerState, headers: &HeaderMap) -> Result<(), StatusC
         .strip_prefix("Bearer ")
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
-    // Check if the token matches any known device token.
-    if !state.device_tokens.values().any(|t| t == token) {
+    let device_id = headers
+        .get("x-opaque-device")
+        .and_then(|v| v.to_str().ok())
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    if !state.pairing.verify_device_token(device_id, token) {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    Ok(())
+    Ok(device_id.to_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -452,24 +682,74 @@ pub fn advertise_mdns(port: u16, fingerprint: &str) -> Result<mdns_sd::ServiceDa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pairing::challenge::decision_bytes;
+    use crate::pairing::store::DeviceStore;
+    use ed25519_dalek::{Signer, SigningKey};
     use std::net::{IpAddr, Ipv4Addr};
 
-    /// Helper: generate a test config with a self-signed cert and auto port.
-    fn test_config() -> (ApprovalServerConfig, TlsIdentity) {
-        // Install the ring crypto provider for rustls (idempotent — ok to call multiple times).
+    /// A paired device driven by the test: real Ed25519 key, real token.
+    struct TestDevice {
+        device_id: String,
+        token: String,
+        signing_key: SigningKey,
+    }
+
+    struct TestRig {
+        server: ApprovalServer,
+        identity: TlsIdentity,
+        pairing: Arc<PairingManager>,
+        device: TestDevice,
+        _dir: tempfile::TempDir,
+    }
+
+    /// Build a server over a REAL pairing manager with one REALLY paired
+    /// device — tests exercise the exact verification path production uses.
+    fn test_rig() -> TestRig {
+        test_rig_with_timeout(60)
+    }
+
+    fn test_rig_with_timeout(timeout_secs: u64) -> TestRig {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let identity = generate_self_signed_cert().unwrap();
-        let mut device_tokens = HashMap::new();
-        device_tokens.insert("device-1".into(), "test-token-abc".into());
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = DeviceStore::new(dir.path().join("devices.json"), vec![7u8; 32]);
+        let server_key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let pairing = Arc::new(PairingManager::new(
+            "server-test-1".into(),
+            server_key,
+            0,
+            store,
+        ));
+
+        let (_qr, nonce) = pairing.generate_qr_payload(Some("hum_pairer".into()));
+        let device_key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let (device, token) = pairing
+            .complete_pairing(&nonce, device_key.verifying_key().as_bytes(), "Test iPhone")
+            .unwrap();
+        // Complete the fingerprint-confirmation ceremony the rig's tests
+        // assume; the pre-confirmation quarantine has its own test.
+        pairing.confirm_device(&device.device_id).unwrap();
 
         let config = ApprovalServerConfig {
             bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             tls_cert_der: identity.cert_der.clone(),
             tls_key_der: identity.key_der.clone(),
-            timeout_secs: 60,
-            device_tokens,
+            timeout_secs,
         };
-        (config, identity)
+        let server = ApprovalServer::new(config, pairing.clone()).unwrap();
+
+        TestRig {
+            server,
+            identity,
+            pairing,
+            device: TestDevice {
+                device_id: device.device_id,
+                token,
+                signing_key: device_key,
+            },
+            _dir: dir,
+        }
     }
 
     /// Build a reqwest client that accepts the self-signed cert.
@@ -482,25 +762,46 @@ mod tests {
             .unwrap()
     }
 
-    // -----------------------------------------------------------------------
-    // Test: server binds to localhost
-    // -----------------------------------------------------------------------
+    /// Submit a wire+pairing challenge pair for `request_id`.
+    async fn submit(
+        rig: &TestRig,
+        request_id: &str,
+    ) -> (
+        oneshot::Receiver<VerifiedDeviceDecision>,
+        crate::pairing::challenge::ApprovalChallenge,
+    ) {
+        let pairing_challenge = rig.pairing.create_challenge(request_id, "test operation");
+        let wire = ApprovalChallenge {
+            request_id: request_id.into(),
+            operation: "github.set_actions_secret".into(),
+            target: "org/repo".into(),
+            client_identity: "test-client".into(),
+            created_at: 1000,
+            expires_at: 2000,
+            challenge_data: serde_json::to_string(&pairing_challenge).unwrap(),
+        };
+        let rx = rig
+            .server
+            .handle()
+            .submit_challenge(wire, pairing_challenge.clone())
+            .await;
+        (rx, pairing_challenge)
+    }
+
+    fn hex_encode(data: &[u8]) -> String {
+        data.iter().map(|b| format!("{b:02x}")).collect()
+    }
 
     #[tokio::test]
     async fn test_server_binds_to_localhost() {
-        let (config, _identity) = test_config();
-        let server = ApprovalServer::new(config).unwrap();
-        let (_handle, addr) = server.start().await.unwrap();
+        let rig = test_rig();
+        let (_handle, addr) = rig.server.start().await.unwrap();
 
         assert!(
             addr.ip().is_loopback(),
             "server must bind to loopback, got {addr}"
         );
     }
-
-    // -----------------------------------------------------------------------
-    // Test: server uses self-signed TLS
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_server_uses_self_signed_tls() {
@@ -517,39 +818,44 @@ mod tests {
         assert!(!identity.cert_der.is_empty());
     }
 
-    // -----------------------------------------------------------------------
-    // Test: GET /approvals/pending returns current pending request
-    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_tls_identity_persists_for_fingerprint_stability() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = load_or_create_tls_identity(dir.path()).unwrap();
+        let second = load_or_create_tls_identity(dir.path()).unwrap();
+        assert_eq!(
+            first.fingerprint, second.fingerprint,
+            "paired devices pin the fingerprint — it must survive restarts"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join("approval_server.key"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
 
     #[tokio::test]
     async fn test_pending_approval_endpoint() {
-        let (config, identity) = test_config();
-        let server = ApprovalServer::new(config).unwrap();
+        let rig = test_rig();
+        let (_rx, _pc) = submit(&rig, "req-1").await;
 
-        // Submit a challenge before starting.
-        let challenge = ApprovalChallenge {
-            request_id: "req-1".into(),
-            operation: "github.set_actions_secret".into(),
-            target: "org/repo".into(),
-            client_identity: "test-client".into(),
-            created_at: 1000,
-            expires_at: 2000,
-            challenge_data: base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                b"challenge-bytes",
-            ),
-        };
-        let _rx = server.submit_challenge(challenge.clone()).await;
-
-        let (_handle, addr) = server.start().await.unwrap();
-        let client = test_client(&identity);
+        let (device_id, token) = (rig.device.device_id.clone(), rig.device.token.clone());
+        let (_handle, addr) = rig.server.start().await.unwrap();
+        let client = test_client(&rig.identity);
 
         let resp = client
             .get(format!(
                 "https://127.0.0.1:{}/approvals/pending",
                 addr.port()
             ))
-            .header("Authorization", "Bearer test-token-abc")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Opaque-Device", &device_id)
             .send()
             .await
             .unwrap();
@@ -559,42 +865,33 @@ mod tests {
         let body: PendingApprovalsResponse = resp.json().await.unwrap();
         assert_eq!(body.approvals.len(), 1);
         assert_eq!(body.approvals[0].request_id, "req-1");
-        assert_eq!(body.approvals[0].operation, "github.set_actions_secret");
+        // The challenge_data carries the signable pairing challenge.
+        let pc: crate::pairing::challenge::ApprovalChallenge =
+            serde_json::from_str(&body.approvals[0].challenge_data).unwrap();
+        assert_eq!(pc.request_id, "req-1");
     }
 
-    // -----------------------------------------------------------------------
-    // Test: POST /approvals/{id}/approve via respond endpoint
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
-    async fn test_submit_approval_endpoint() {
-        let (config, identity) = test_config();
-        let server = ApprovalServer::new(config).unwrap();
+    async fn test_signed_approve_is_verified_and_relayed() {
+        let rig = test_rig();
+        let (rx, pc) = submit(&rig, "req-approve").await;
 
-        let challenge = ApprovalChallenge {
-            request_id: "req-approve".into(),
-            operation: "github.set_actions_secret".into(),
-            target: "org/repo".into(),
-            client_identity: "test-client".into(),
-            created_at: 1000,
-            expires_at: 2000,
-            challenge_data: "Y2hhbGxlbmdl".into(),
-        };
-        let rx = server.submit_challenge(challenge).await;
-
-        let (_handle, addr) = server.start().await.unwrap();
-        let client = test_client(&identity);
+        let sig = rig.device.signing_key.sign(&decision_bytes(&pc, true));
+        let (device_id, token) = (rig.device.device_id.clone(), rig.device.token.clone());
+        let (_handle, addr) = rig.server.start().await.unwrap();
+        let client = test_client(&rig.identity);
 
         let resp = client
             .post(format!(
                 "https://127.0.0.1:{}/approvals/req-approve/respond",
                 addr.port()
             ))
-            .header("Authorization", "Bearer test-token-abc")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Opaque-Device", &device_id)
             .json(&serde_json::json!({
                 "decision": "approve",
-                "signature": "c2lnbmF0dXJl",
-                "device_id": "device-1"
+                "signature": hex_encode(&sig.to_bytes()),
+                "device_id": device_id,
             }))
             .send()
             .await
@@ -602,85 +899,150 @@ mod tests {
 
         assert_eq!(resp.status(), 200);
 
-        let approval = rx.await.unwrap();
-        assert_eq!(approval.decision, ApprovalDecision::Approve);
-        assert_eq!(approval.device_id, "device-1");
-        assert_eq!(approval.request_id, "req-approve");
+        let verified = rx.await.unwrap();
+        assert!(verified.approve);
+        assert_eq!(verified.device.device_id, device_id);
+        assert_eq!(verified.device.paired_by.as_deref(), Some("hum_pairer"));
     }
 
-    // -----------------------------------------------------------------------
-    // Test: POST /approvals/{id}/reject via respond endpoint
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
-    async fn test_reject_approval_endpoint() {
-        let (config, identity) = test_config();
-        let server = ApprovalServer::new(config).unwrap();
+    async fn test_forged_signature_is_rejected_and_entry_survives() {
+        let rig = test_rig();
+        let (rx, pc) = submit(&rig, "req-forged").await;
 
-        let challenge = ApprovalChallenge {
-            request_id: "req-reject".into(),
-            operation: "github.set_actions_secret".into(),
-            target: "org/repo".into(),
-            client_identity: "test-client".into(),
-            created_at: 1000,
-            expires_at: 2000,
-            challenge_data: "Y2hhbGxlbmdl".into(),
-        };
-        let rx = server.submit_challenge(challenge).await;
+        // Signature from a key that was never paired.
+        let interloper = SigningKey::generate(&mut rand::rngs::OsRng);
+        let sig = interloper.sign(&decision_bytes(&pc, true));
 
-        let (_handle, addr) = server.start().await.unwrap();
-        let client = test_client(&identity);
+        let (device_id, token) = (rig.device.device_id.clone(), rig.device.token.clone());
+        let (_handle, addr) = rig.server.start().await.unwrap();
+        let client = test_client(&rig.identity);
 
         let resp = client
             .post(format!(
-                "https://127.0.0.1:{}/approvals/req-reject/respond",
+                "https://127.0.0.1:{}/approvals/req-forged/respond",
                 addr.port()
             ))
-            .header("Authorization", "Bearer test-token-abc")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Opaque-Device", &device_id)
             .json(&serde_json::json!({
-                "decision": "reject",
-                "signature": "c2lnbmF0dXJl",
-                "device_id": "device-1"
+                "decision": "approve",
+                "signature": hex_encode(&sig.to_bytes()),
+                "device_id": device_id,
             }))
             .send()
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.status(), 403, "forged signature must be refused");
 
-        let approval = rx.await.unwrap();
-        assert_eq!(approval.decision, ApprovalDecision::Reject);
+        // The pending entry survives a forged attempt: the legitimate device
+        // can still respond.
+        let good = rig.device.signing_key.sign(&decision_bytes(&pc, true));
+        let resp = client
+            .post(format!(
+                "https://127.0.0.1:{}/approvals/req-forged/respond",
+                addr.port()
+            ))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Opaque-Device", &device_id)
+            .json(&serde_json::json!({
+                "decision": "approve",
+                "signature": hex_encode(&good.to_bytes()),
+                "device_id": device_id,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(rx.await.unwrap().approve);
     }
 
-    // -----------------------------------------------------------------------
-    // Test: unauthenticated request rejected
-    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_signed_reject_cannot_be_flipped_to_approve() {
+        let rig = test_rig();
+        let (rx, pc) = submit(&rig, "req-flip").await;
+
+        // The device signs a REJECT…
+        let reject_sig = rig.device.signing_key.sign(&decision_bytes(&pc, false));
+        let (device_id, token) = (rig.device.device_id.clone(), rig.device.token.clone());
+        let (_handle, addr) = rig.server.start().await.unwrap();
+        let client = test_client(&rig.identity);
+
+        // …and a relay tries to submit that signature as an APPROVE.
+        let resp = client
+            .post(format!(
+                "https://127.0.0.1:{}/approvals/req-flip/respond",
+                addr.port()
+            ))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Opaque-Device", &device_id)
+            .json(&serde_json::json!({
+                "decision": "approve",
+                "signature": hex_encode(&reject_sig.to_bytes()),
+                "device_id": device_id,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403, "decision flip must fail verification");
+
+        // Submitted honestly as the reject it is, it verifies and relays.
+        let resp = client
+            .post(format!(
+                "https://127.0.0.1:{}/approvals/req-flip/respond",
+                addr.port()
+            ))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Opaque-Device", &device_id)
+            .json(&serde_json::json!({
+                "decision": "reject",
+                "signature": hex_encode(&reject_sig.to_bytes()),
+                "device_id": device_id,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(!rx.await.unwrap().approve);
+    }
 
     #[tokio::test]
     async fn test_unauthenticated_request_rejected() {
-        let (config, identity) = test_config();
-        let server = ApprovalServer::new(config).unwrap();
-        let (_handle, addr) = server.start().await.unwrap();
-        let client = test_client(&identity);
+        let rig = test_rig();
+        let (device_id, token) = (rig.device.device_id.clone(), rig.device.token.clone());
+        let (_handle, addr) = rig.server.start().await.unwrap();
+        let client = test_client(&rig.identity);
+        let url = format!("https://127.0.0.1:{}/approvals/pending", addr.port());
 
         // No Authorization header.
+        let resp = client.get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), 401);
+
+        // Valid header shape but wrong token.
         let resp = client
-            .get(format!(
-                "https://127.0.0.1:{}/approvals/pending",
-                addr.port()
-            ))
+            .get(&url)
+            .header("Authorization", "Bearer wrong-token")
+            .header("X-Opaque-Device", &device_id)
             .send()
             .await
             .unwrap();
         assert_eq!(resp.status(), 401);
 
-        // Invalid token.
+        // Right token but no device header (token belongs to no one).
         let resp = client
-            .get(format!(
-                "https://127.0.0.1:{}/approvals/pending",
-                addr.port()
-            ))
-            .header("Authorization", "Bearer wrong-token")
+            .get(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+
+        // Right token, WRONG device id: per-device binding must hold.
+        let resp = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Opaque-Device", "some-other-device")
             .send()
             .await
             .unwrap();
@@ -688,51 +1050,97 @@ mod tests {
 
         // Malformed header (no Bearer prefix).
         let resp = client
-            .get(format!(
-                "https://127.0.0.1:{}/approvals/pending",
-                addr.port()
-            ))
-            .header("Authorization", "test-token-abc")
+            .get(&url)
+            .header("Authorization", token)
+            .header("X-Opaque-Device", &device_id)
             .send()
             .await
             .unwrap();
         assert_eq!(resp.status(), 401);
     }
 
-    // -----------------------------------------------------------------------
-    // Test: approval timeout
-    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_pair_endpoint_pairs_and_returns_token() {
+        let rig = test_rig();
+        let (nonce_qr, nonce) = rig.pairing.generate_qr_payload(None);
+        assert_eq!(nonce_qr.nonce, nonce);
+
+        let new_device_key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let (_handle, addr) = rig.server.start().await.unwrap();
+        let client = test_client(&rig.identity);
+
+        let resp = client
+            .post(format!("https://127.0.0.1:{}/pair", addr.port()))
+            .json(&serde_json::json!({
+                "nonce": nonce,
+                "device_public_key": hex_encode(new_device_key.verifying_key().as_bytes()),
+                "device_name": "Second Phone",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let pair: PairResponse = resp.json().await.unwrap();
+        assert_eq!(pair.server_id, "server-test-1");
+        assert!(!pair.token.is_empty());
+
+        // QUARANTINE: completing /pair proves only nonce possession, so the
+        // fresh token must NOT authenticate until a human confirms the key
+        // fingerprint out-of-band.
+        let resp = client
+            .get(format!(
+                "https://127.0.0.1:{}/approvals/pending",
+                addr.port()
+            ))
+            .header("Authorization", format!("Bearer {}", pair.token))
+            .header("X-Opaque-Device", &pair.device_id)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            401,
+            "unconfirmed device must not authenticate"
+        );
+
+        rig.pairing.confirm_device(&pair.device_id).unwrap();
+
+        // Confirmed: the token now works for authenticated routes.
+        let resp = client
+            .get(format!(
+                "https://127.0.0.1:{}/approvals/pending",
+                addr.port()
+            ))
+            .header("Authorization", format!("Bearer {}", pair.token))
+            .header("X-Opaque-Device", &pair.device_id)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        // A replayed nonce is refused.
+        let resp = client
+            .post(format!("https://127.0.0.1:{}/pair", addr.port()))
+            .json(&serde_json::json!({
+                "nonce": nonce,
+                "device_public_key": hex_encode(new_device_key.verifying_key().as_bytes()),
+                "device_name": "Sneaky Re-pair",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+    }
 
     #[tokio::test]
     async fn test_approval_timeout() {
-        let identity = generate_self_signed_cert().unwrap();
-        let mut device_tokens = HashMap::new();
-        device_tokens.insert("device-1".into(), "test-token-abc".into());
-
         // Very short timeout: 1 second.
-        let config = ApprovalServerConfig {
-            bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-            tls_cert_der: identity.cert_der.clone(),
-            tls_key_der: identity.key_der.clone(),
-            timeout_secs: 1,
-            device_tokens,
-        };
+        let rig = test_rig_with_timeout(1);
+        let (_rx, _pc) = submit(&rig, "req-timeout").await;
 
-        let server = ApprovalServer::new(config).unwrap();
-
-        let challenge = ApprovalChallenge {
-            request_id: "req-timeout".into(),
-            operation: "test.op".into(),
-            target: "target".into(),
-            client_identity: "client".into(),
-            created_at: 1000,
-            expires_at: 1001,
-            challenge_data: "data".into(),
-        };
-        let _rx = server.submit_challenge(challenge).await;
-
-        let (_handle, addr) = server.start().await.unwrap();
-        let client = test_client(&identity);
+        let (device_id, token) = (rig.device.device_id.clone(), rig.device.token.clone());
+        let (_handle, addr) = rig.server.start().await.unwrap();
+        let client = test_client(&rig.identity);
 
         // Wait for the challenge to expire.
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -743,7 +1151,8 @@ mod tests {
                 "https://127.0.0.1:{}/approvals/pending",
                 addr.port()
             ))
-            .header("Authorization", "Bearer test-token-abc")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Opaque-Device", &device_id)
             .send()
             .await
             .unwrap();
@@ -755,32 +1164,22 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Test: concurrent approvals handled correctly
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
     async fn test_concurrent_approvals() {
-        let (config, identity) = test_config();
-        let server = ApprovalServer::new(config).unwrap();
+        let rig = test_rig();
 
-        // Submit multiple challenges.
         let mut receivers = Vec::new();
+        let mut pairing_challenges = Vec::new();
         for i in 0..5 {
-            let challenge = ApprovalChallenge {
-                request_id: format!("req-{i}"),
-                operation: "test.op".into(),
-                target: format!("target-{i}"),
-                client_identity: "client".into(),
-                created_at: 1000,
-                expires_at: 2000,
-                challenge_data: "data".into(),
-            };
-            receivers.push(server.submit_challenge(challenge).await);
+            let (rx, pc) = submit(&rig, &format!("req-{i}")).await;
+            receivers.push(rx);
+            pairing_challenges.push(pc);
         }
 
-        let (_handle, addr) = server.start().await.unwrap();
-        let client = test_client(&identity);
+        let (device_id, token) = (rig.device.device_id.clone(), rig.device.token.clone());
+        let signing_key = rig.device.signing_key.clone();
+        let (_handle, addr) = rig.server.start().await.unwrap();
+        let client = test_client(&rig.identity);
 
         // Verify all are pending.
         let resp = client
@@ -788,41 +1187,45 @@ mod tests {
                 "https://127.0.0.1:{}/approvals/pending",
                 addr.port()
             ))
-            .header("Authorization", "Bearer test-token-abc")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Opaque-Device", &device_id)
             .send()
             .await
             .unwrap();
-
         let body: PendingApprovalsResponse = resp.json().await.unwrap();
         assert_eq!(body.approvals.len(), 5);
 
-        // Approve one, reject another.
+        // Approve req-0, reject req-1, each properly signed.
+        let approve_sig = signing_key.sign(&decision_bytes(&pairing_challenges[0], true));
         let resp = client
             .post(format!(
                 "https://127.0.0.1:{}/approvals/req-0/respond",
                 addr.port()
             ))
-            .header("Authorization", "Bearer test-token-abc")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Opaque-Device", &device_id)
             .json(&serde_json::json!({
                 "decision": "approve",
-                "signature": "sig",
-                "device_id": "device-1"
+                "signature": hex_encode(&approve_sig.to_bytes()),
+                "device_id": device_id,
             }))
             .send()
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
 
+        let reject_sig = signing_key.sign(&decision_bytes(&pairing_challenges[1], false));
         let resp = client
             .post(format!(
                 "https://127.0.0.1:{}/approvals/req-1/respond",
                 addr.port()
             ))
-            .header("Authorization", "Bearer test-token-abc")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Opaque-Device", &device_id)
             .json(&serde_json::json!({
                 "decision": "reject",
-                "signature": "sig",
-                "device_id": "device-1"
+                "signature": hex_encode(&reject_sig.to_bytes()),
+                "device_id": device_id,
             }))
             .send()
             .await
@@ -835,24 +1238,20 @@ mod tests {
                 "https://127.0.0.1:{}/approvals/pending",
                 addr.port()
             ))
-            .header("Authorization", "Bearer test-token-abc")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Opaque-Device", &device_id)
             .send()
             .await
             .unwrap();
-
         let body: PendingApprovalsResponse = resp.json().await.unwrap();
         assert_eq!(body.approvals.len(), 3);
 
         // Verify the responses.
         let r0 = receivers.remove(0).await.unwrap();
-        assert_eq!(r0.decision, ApprovalDecision::Approve);
+        assert!(r0.approve);
         let r1 = receivers.remove(0).await.unwrap();
-        assert_eq!(r1.decision, ApprovalDecision::Reject);
+        assert!(!r1.approve);
     }
-
-    // -----------------------------------------------------------------------
-    // Test: mDNS advertisement
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_mdns_advertisement() {
@@ -876,18 +1275,10 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Test: port selection (auto port with 0)
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
     async fn test_port_selection() {
-        let (config, _identity) = test_config();
-        // Config uses port 0, so the OS should assign a free port.
-        assert_eq!(config.bind_addr.port(), 0);
-
-        let server = ApprovalServer::new(config).unwrap();
-        let (_handle, addr) = server.start().await.unwrap();
+        let rig = test_rig();
+        let (_handle, addr) = rig.server.start().await.unwrap();
 
         // The assigned port should be non-zero.
         assert_ne!(addr.port(), 0, "OS should have assigned a real port");
@@ -896,16 +1287,11 @@ mod tests {
         assert!(addr.ip().is_loopback());
     }
 
-    // -----------------------------------------------------------------------
-    // Test: health endpoint (no auth required)
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
     async fn test_health_endpoint() {
-        let (config, identity) = test_config();
-        let server = ApprovalServer::new(config).unwrap();
-        let (_handle, addr) = server.start().await.unwrap();
-        let client = test_client(&identity);
+        let rig = test_rig();
+        let (_handle, addr) = rig.server.start().await.unwrap();
+        let client = test_client(&rig.identity);
 
         let resp = client
             .get(format!("https://127.0.0.1:{}/health", addr.port()))
@@ -918,32 +1304,49 @@ mod tests {
         assert_eq!(body.status, "ok");
     }
 
-    // -----------------------------------------------------------------------
-    // Test: respond to nonexistent request returns 404
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
     async fn test_respond_nonexistent_request() {
-        let (config, identity) = test_config();
-        let server = ApprovalServer::new(config).unwrap();
-        let (_handle, addr) = server.start().await.unwrap();
-        let client = test_client(&identity);
+        let rig = test_rig();
+        let (device_id, token) = (rig.device.device_id.clone(), rig.device.token.clone());
+        let (_handle, addr) = rig.server.start().await.unwrap();
+        let client = test_client(&rig.identity);
 
         let resp = client
             .post(format!(
                 "https://127.0.0.1:{}/approvals/nonexistent/respond",
                 addr.port()
             ))
-            .header("Authorization", "Bearer test-token-abc")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Opaque-Device", &device_id)
             .json(&serde_json::json!({
                 "decision": "approve",
-                "signature": "sig",
-                "device_id": "device-1"
+                "signature": "00",
+                "device_id": device_id,
             }))
             .send()
             .await
             .unwrap();
 
         assert_eq!(resp.status(), 404);
+    }
+
+    #[test]
+    fn state_debug_does_not_leak() {
+        // ServerState's Debug must not print tokens or keys.
+        let dir = tempfile::tempdir().unwrap();
+        let store = DeviceStore::new(dir.path().join("d.json"), vec![1u8; 32]);
+        let pairing = Arc::new(PairingManager::new(
+            "s".into(),
+            SigningKey::generate(&mut rand::rngs::OsRng),
+            0,
+            store,
+        ));
+        let state = ServerState {
+            pending: Mutex::new(HashMap::new()),
+            pairing,
+            timeout: Duration::from_secs(60),
+        };
+        let dbg = format!("{state:?}");
+        assert!(dbg.contains("timeout"));
     }
 }

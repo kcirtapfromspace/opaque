@@ -26,6 +26,20 @@ socket_path = "/run/opaque/opaqued.sock"
 # Under systemd prefer User=opaque in the unit instead.
 # run_as = "opaque"
 
+[approval]
+# In split mode the daemon owns no GUI session, so the local biometric prompt
+# cannot fire — an out-of-band factor is what approves operations. The
+# second-device factor starts a local HTTPS approval server where paired
+# phones fetch and sign challenges (Ed25519, decision-bound, verified against
+# the pairing store before anything is trusted). Pair with `opaque device pair`;
+# a new device holds NO approval authority until you confirm its key
+# fingerprint with `opaque device confirm <id>`.
+second_device = true
+# The default bind is loopback (safe, but a phone on the LAN cannot reach it).
+# For real second-device use, bind a LAN-reachable address:
+# server_bind = "0.0.0.0:7381"
+# timeout_secs = 60
+
 [identity]
 # Identity is what makes cross-uid clients attributable — strongly recommended
 # alongside the split. See docs/identity.md.

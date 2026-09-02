@@ -989,23 +989,26 @@ impl Enclave {
 
     /// Run a standalone out-of-band approval not tied to a registered operation.
     ///
-    /// Used for privileged control-plane actions such as minting an agent session
-    /// token: the act must be authorized by a fresh human approval (which an agent
-    /// cannot satisfy), never by client classification. Reuses the same rate
-    /// limiter, prompt serialization, and audit trail as operation approvals.
-    /// On success, returns the verified approver identity when the gate could
-    /// establish one (used to attribute the resulting delegation).
-    pub async fn request_session_approval(
+    /// Used for privileged control-plane actions — minting an agent session
+    /// token, starting or confirming a device pairing: the act must be
+    /// authorized by a fresh human approval (which an agent cannot satisfy),
+    /// never by client classification. Reuses the same rate limiter, prompt
+    /// serialization, and audit trail as operation approvals. On success,
+    /// returns the verified approver identity when the gate could establish
+    /// one.
+    pub async fn request_control_approval(
         &self,
         identity: &ClientIdentity,
         client_type: ClientType,
+        operation_label: &str,
+        action_description: &str,
         reason: &str,
     ) -> Result<Option<opaque_core::audit::ApproverIdentity>, EnclaveError> {
         let client_summary = ClientSummary::from((identity, client_type));
 
         if !self
             .rate_limiter
-            .check_and_record(identity.pid, "agent_session_start")
+            .check_and_record(identity.pid, operation_label)
         {
             return Err(EnclaveError::RateLimited(
                 "too many session approval requests".into(),
@@ -1017,7 +1020,7 @@ impl Enclave {
             AuditEvent::new(AuditEventKind::ApprovalRequired)
                 .with_approval_id(approval_id)
                 .with_client(client_summary.clone())
-                .with_operation("agent_session_start"),
+                .with_operation(operation_label),
         );
 
         // Serialize prompts to avoid races / approval stacking.
@@ -1034,7 +1037,7 @@ impl Enclave {
             request_id: approval_id,
             client_identity: identity.clone(),
             client_type,
-            operation: "agent_session_start".into(),
+            operation: operation_label.to_owned(),
             target: std::collections::HashMap::new(),
             secret_ref_names: vec![],
             created_at: std::time::SystemTime::now(),
@@ -1043,7 +1046,7 @@ impl Enclave {
             workspace: None,
         };
         let description = format!(
-            "Operation: Create an agent session token\n  {}\nClient: {}",
+            "Operation: {action_description}\n  {}\nClient: {}",
             sanitize_for_display(reason, 256),
             identity
         );
@@ -1052,7 +1055,7 @@ impl Enclave {
             AuditEvent::new(AuditEventKind::ApprovalPresented)
                 .with_approval_id(approval_id)
                 .with_client(client_summary.clone())
-                .with_operation("agent_session_start"),
+                .with_operation(operation_label),
         );
 
         let result = self
@@ -1070,7 +1073,7 @@ impl Enclave {
                 let mut granted = AuditEvent::new(AuditEventKind::ApprovalGranted)
                     .with_approval_id(approval_id)
                     .with_client(client_summary)
-                    .with_operation("agent_session_start")
+                    .with_operation(operation_label)
                     .with_outcome("granted");
                 if let Some(ref approver) = outcome.approver {
                     granted = granted.with_approver(approver.clone());
@@ -1083,19 +1086,19 @@ impl Enclave {
                     AuditEvent::new(AuditEventKind::ApprovalDenied)
                         .with_approval_id(approval_id)
                         .with_client(client_summary)
-                        .with_operation("agent_session_start")
+                        .with_operation(operation_label)
                         .with_outcome("denied"),
                 );
-                Err(EnclaveError::ApprovalNotGranted(
-                    "agent session creation was not approved".into(),
-                ))
+                Err(EnclaveError::ApprovalNotGranted(format!(
+                    "{operation_label} was not approved"
+                )))
             }
             Err(e) => {
                 self.audit.emit(
                     AuditEvent::new(AuditEventKind::ApprovalDenied)
                         .with_approval_id(approval_id)
                         .with_client(client_summary)
-                        .with_operation("agent_session_start")
+                        .with_operation(operation_label)
                         .with_outcome("error"),
                 );
                 Err(EnclaveError::ApprovalUnavailable(e))
@@ -1441,94 +1444,78 @@ impl Enclave {
 /// Native OS approval gate that delegates to the platform-specific
 /// approval prompt (macOS LocalAuthentication / Linux polkit).
 pub struct NativeApprovalGate {
-    pairing_manager: Option<Arc<crate::pairing::PairingManager>>,
-    approver_resolver: Option<ApproverResolver>,
+    registry: crate::factors::FactorRegistry,
 }
 
 impl std::fmt::Debug for NativeApprovalGate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NativeApprovalGate")
-            .field("has_pairing_manager", &self.pairing_manager.is_some())
-            .field("has_approver_resolver", &self.approver_resolver.is_some())
+            .field("registry", &self.registry)
             .finish()
     }
 }
 
 /// Resolves the approver identity to bind to a successful local-biometric
-/// approval — in production, the principal behind the daemon's current
-/// unexpired human login session (source `LocalBioSession`).
-pub type ApproverResolver =
-    Arc<dyn Fn() -> Option<opaque_core::audit::ApproverIdentity> + Send + Sync>;
+/// approval (re-exported from the factors module for wiring convenience).
+#[cfg(test)]
+pub type ApproverResolver = crate::factors::ApproverResolver;
 
 impl NativeApprovalGate {
-    /// Create a gate without iOS pairing support.
+    /// Create a gate over an explicit verifier registry (the daemon builds
+    /// one from its configured factors: local, paired device, FIDO2, …).
+    pub fn with_registry(registry: crate::factors::FactorRegistry) -> Self {
+        Self { registry }
+    }
+
+    /// Create a gate with only the local (biometric/polkit) factor — the
+    /// pre-registry shape, kept for tests.
+    #[cfg(test)]
     pub fn new() -> Self {
-        Self {
-            pairing_manager: None,
-            approver_resolver: None,
-        }
+        let mut registry = crate::factors::FactorRegistry::new();
+        registry.register(Arc::new(crate::factors::LocalBioVerifier::new(None)));
+        Self { registry }
     }
 
-    /// Create a gate backed by an existing [`PairingManager`].
-    #[allow(dead_code)]
-    pub fn with_pairing_manager(pm: Arc<crate::pairing::PairingManager>) -> Self {
-        Self {
-            pairing_manager: Some(pm),
-            approver_resolver: None,
-        }
-    }
-
-    /// Attach an approver resolver (identity runtime hook). Called only
-    /// AFTER the biometric prompt succeeds; a `None` result records the
-    /// approval honestly as identity-unbound rather than guessing.
-    pub fn with_approver_resolver(mut self, resolver: ApproverResolver) -> Self {
-        self.approver_resolver = Some(resolver);
-        self
+    /// Attach an approver resolver (identity runtime hook) to a default
+    /// local-only gate (test builder mirroring the daemon's wiring).
+    #[cfg(test)]
+    pub fn with_approver_resolver(self, resolver: ApproverResolver) -> Self {
+        let mut registry = crate::factors::FactorRegistry::new();
+        registry.register(Arc::new(crate::factors::LocalBioVerifier::new(Some(
+            resolver,
+        ))));
+        Self { registry }
     }
 }
 
 impl ApprovalGate for NativeApprovalGate {
     fn request_approval(
         &self,
-        _approval_id: Uuid,
-        _request: &OperationRequest,
-        _factors: &[ApprovalFactor],
+        approval_id: Uuid,
+        request: &OperationRequest,
+        factors: &[ApprovalFactor],
         description: &str,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<ApprovalOutcome, String>> + Send + '_>,
     > {
-        // Check whether any factor is IosFaceId and we have a pairing manager.
-        if _factors
-            .iter()
-            .any(|f| matches!(f, ApprovalFactor::IosFaceId))
-            && let Some(pm) = &self.pairing_manager
-            && let Ok(devices) = pm.list_devices()
-            && let Some(device) = devices.iter().find(|d| !d.revoked)
-        {
-            let challenge = pm.create_challenge(&_request.request_id.to_string(), description);
-            tracing::info!(
-                device_id = %device.device_id,
-                device_name = %device.name,
-                challenge_request_id = %challenge.request_id,
-                "iOS Face ID challenge created; awaiting device response"
-            );
-        }
-
-        let desc = description.to_owned();
-        let resolver = self.approver_resolver.clone();
+        let ctx = crate::factors::ApprovalContext {
+            approval_id,
+            request_id: request.request_id,
+            operation: request.operation.clone(),
+            client_label: sanitize_for_display(&request.client_identity.to_string(), 128),
+            description: description.to_owned(),
+            content_hash: request.content_hash(),
+        };
+        let factors = factors.to_vec();
         Box::pin(async move {
-            let approved = crate::approval::prompt(&desc)
-                .await
-                .map_err(|e| e.to_string())?;
-            if !approved {
-                return Ok(ApprovalOutcome::denied());
-            }
-            // Bind the approver AFTER the successful prompt: the biometric
-            // proves device-owner presence; the resolver names who holds the
-            // active login session at that moment.
-            Ok(match resolver.as_ref().and_then(|r| r()) {
-                Some(approver) => ApprovalOutcome::approved_by(approver),
-                None => ApprovalOutcome::approved_anonymous(),
+            let decision = self.registry.request_approval(&factors, &ctx).await?;
+            Ok(if !decision.approved {
+                ApprovalOutcome::denied()
+            } else {
+                match decision.approver {
+                    Some(approver) => ApprovalOutcome::approved_by(approver),
+                    None => ApprovalOutcome::approved_anonymous(),
+                }
             })
         })
     }
@@ -1603,7 +1590,7 @@ fn stricter_requirement(a: ApprovalRequirement, b: ApprovalRequirement) -> Appro
 /// and bidi isolates (U+2066-U+2069). Truncates to `max_len` chars.
 /// This is defense-in-depth: even if upstream validation is bypassed,
 /// the approval UI cannot be spoofed with control characters.
-fn sanitize_for_display(s: &str, max_len: usize) -> String {
+pub(crate) fn sanitize_for_display(s: &str, max_len: usize) -> String {
     let cleaned: String = s
         .chars()
         .filter(|&ch| {
@@ -1998,15 +1985,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_gate_binds_approver_from_resolver() {
+    async fn native_gate_registers_the_local_factor() {
+        use opaque_core::operation::ApprovalFactor;
+        // The prompt path isn't exercised here (no OS prompt in tests); the
+        // registry's dispatch semantics are covered in factors::tests. Assert
+        // the gate's construction shape: both variants serve LocalBio.
         let resolver: ApproverResolver = Arc::new(|| Some(approver("hum_session")));
         let gate = NativeApprovalGate::new().with_approver_resolver(resolver);
-        // The prompt path isn't exercised here (no OS prompt in tests); assert
-        // the resolver-shaped outcome via the auto-approve analog instead.
-        // Sanity: a gate with no resolver yields None.
+        assert_eq!(
+            gate.registry.available_factors(),
+            vec![ApprovalFactor::LocalBio]
+        );
         let bare = NativeApprovalGate::new();
-        assert!(bare.approver_resolver.is_none());
-        assert!(gate.approver_resolver.is_some());
+        assert_eq!(
+            bare.registry.available_factors(),
+            vec![ApprovalFactor::LocalBio]
+        );
     }
 
     #[tokio::test]

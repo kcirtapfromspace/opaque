@@ -571,9 +571,113 @@ pub fn format_response(method: &str, result: &serde_json::Value) {
         "identity.delegation_list" => {
             format_identity_delegation_list_result(result);
         }
+        "device_pair_start" => {
+            format_device_pair_start_result(result);
+        }
+        "device_list" => {
+            format_device_list_result(result);
+        }
+        "device_pair_confirm" => {
+            let name = result.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            success(&format!(
+                "Device \"{name}\" confirmed — it now holds approval authority."
+            ));
+        }
+        "device_revoke" => {
+            let id = result
+                .get("device_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            success(&format!(
+                "Device {id} revoked — approval authority removed."
+            ));
+        }
         _ => {
             print_json(result);
         }
+    }
+}
+
+/// Render the pairing payload + next steps.
+fn format_device_pair_start_result(result: &serde_json::Value) {
+    header("Device pairing started");
+    if let Some(addr) = result.get("server_addr").and_then(|v| v.as_str()) {
+        kv("approval server", addr);
+    }
+    if let Some(payload) = result.get("qr_payload") {
+        if let Some(expires) = payload.get("expires_at").and_then(|v| v.as_i64()) {
+            kv("pairing window ends", &format_epoch_seconds(expires));
+        }
+        println!();
+        info("Scan this payload with the companion app (JSON, single line):");
+        if let Ok(compact) = serde_json::to_string(payload) {
+            println!("{compact}");
+        }
+    }
+    println!();
+    info("After the app completes pairing, run `opaque device ls` to see the new");
+    info("device, then `opaque device confirm <device-id>` and MATCH the key");
+    info("fingerprint against what the device displays. Until confirmed, the");
+    info("device has no approval authority.");
+}
+
+/// Render the device table.
+fn format_device_list_result(result: &serde_json::Value) {
+    let empty = vec![];
+    let devices = result
+        .get("devices")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
+    if devices.is_empty() {
+        info("No paired devices.");
+        return;
+    }
+    header(&format!("{} paired device(s)", devices.len()));
+    for d in devices {
+        let name = d.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+        let id = d.get("device_id").and_then(|v| v.as_str()).unwrap_or("?");
+        let fp = d.get("fingerprint").and_then(|v| v.as_str()).unwrap_or("?");
+        let revoked = d.get("revoked").and_then(|v| v.as_bool()).unwrap_or(false);
+        let confirmed = d
+            .get("confirmed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let badge = if revoked {
+            status_badge("REVOKED", BadgeState::Fail)
+        } else if !confirmed {
+            status_badge("UNCONFIRMED", BadgeState::Warn)
+        } else {
+            status_badge("ACTIVE", BadgeState::Ok)
+        };
+        println!(
+            "  {badge} {}  {}",
+            style(name).yellow().bold(),
+            style(format!("fingerprint {fp}")).dim()
+        );
+        println!("      {}", style(format!("id {id}")).dim());
+        if let Some(paired_by) = d.get("paired_by").and_then(|v| v.as_str()) {
+            println!("      {}", style(format!("paired by {paired_by}")).dim());
+        }
+        if !confirmed && !revoked {
+            println!(
+                "      {}",
+                style(format!("confirm with: opaque device confirm {id}")).cyan()
+            );
+        }
+    }
+}
+
+/// Format a unix-seconds timestamp relative to now (no date dependency).
+fn format_epoch_seconds(secs: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let delta = secs - now;
+    if delta > 0 {
+        format!("in {delta}s")
+    } else {
+        format!("{}s ago", -delta)
     }
 }
 

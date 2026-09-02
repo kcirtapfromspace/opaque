@@ -45,6 +45,8 @@ mod bitwarden;
 mod doppler;
 mod enclave;
 #[allow(dead_code)]
+mod factors;
+#[allow(dead_code)]
 mod fido2;
 #[allow(dead_code)]
 mod gcp;
@@ -56,7 +58,6 @@ mod infisical;
 mod onepassword;
 #[allow(dead_code)]
 mod pairing;
-#[allow(dead_code)]
 mod push;
 mod sandbox;
 pub mod secret;
@@ -128,6 +129,29 @@ struct DaemonConfig {
     /// not enforced).
     #[serde(default)]
     trust_domain: TrustDomainConfig,
+
+    /// Approval factor settings (`[approval]`): which out-of-band factors are
+    /// live beyond the local prompt.
+    #[serde(default)]
+    approval: ApprovalFactorsConfig,
+}
+
+/// `[approval]` — out-of-band approval factor configuration.
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ApprovalFactorsConfig {
+    /// Enable the second-device factor: starts the local HTTPS approval
+    /// server (+ mDNS) where paired devices fetch and sign challenges.
+    #[serde(default)]
+    second_device: bool,
+
+    /// Bind address for the approval server. Defaults to `127.0.0.1:7381`;
+    /// `127.0.0.1:0` picks a free port.
+    #[serde(default)]
+    server_bind: Option<String>,
+
+    /// Seconds a device has to answer a challenge (default 60).
+    #[serde(default)]
+    timeout_secs: Option<u64>,
 }
 
 /// `[trust_domain]` — settings for running the daemon as a principal distinct
@@ -205,6 +229,10 @@ struct DaemonState {
     connection_semaphore: Arc<tokio::sync::Semaphore>,
     /// Identity runtime, present when `[identity]` is configured.
     identity: Option<Arc<identity::IdentityRuntime>>,
+    /// Pairing manager, present when `[approval] second_device` is enabled.
+    pairing: Option<Arc<pairing::PairingManager>>,
+    /// Bound address of the approval server, when running.
+    approval_server_addr: Option<std::net::SocketAddr>,
 }
 
 #[derive(Debug, Clone)]
@@ -1472,13 +1500,110 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         == Some("1");
     let backend = select_approval_backend(config.approval_backend.as_deref(), auto_approve_env)
         .map_err(std::io::Error::other)?;
+    // Second-device factor: pairing manager + approval server, when enabled.
+    // Constructed before the gate so the registry can hold the verifier, and
+    // stashed in DaemonState for the device_* control methods.
+    let mut pairing_manager: Option<Arc<pairing::PairingManager>> = None;
+    let mut approval_server_addr: Option<std::net::SocketAddr> = None;
+    let mut second_device_verifier: Option<(
+        Arc<pairing::PairingManager>,
+        approval_server::ApprovalServerHandle,
+    )> = None;
+    if config.approval.second_device {
+        let state_dir = audit_db_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        // Daemon pairing signing key (custody set) — server_id derives from
+        // its public key, so both are stable across restarts.
+        let pairing_key =
+            identity::keys::load_or_create_signing_key(&state_dir.join("pairing.key"))?;
+        let server_id = {
+            let pk = pairing_key.verifying_key();
+            let hex: String = pk.as_bytes()[..8]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            format!("opq-{hex}")
+        };
+
+        // Device store integrity key beside the store (custody set).
+        let store_path = pairing::store::DeviceStore::default_path();
+        if let Some(parent) = store_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let store_hmac =
+            opaque_core::keyfile::load_or_create_key_file(&store_path.with_extension("hmac"))?;
+
+        let bind: std::net::SocketAddr = config
+            .approval
+            .server_bind
+            .as_deref()
+            .unwrap_or("127.0.0.1:7381")
+            .parse()
+            .map_err(|e| std::io::Error::other(format!("approval.server_bind invalid: {e}")))?;
+
+        let store = pairing::store::DeviceStore::new(store_path, store_hmac.to_vec());
+        let pm = Arc::new(pairing::PairingManager::new(
+            server_id,
+            pairing_key,
+            bind.port(),
+            store,
+        ));
+
+        // TLS identity persists so paired devices' fingerprint pin survives
+        // restarts (custody set).
+        let tls = approval_server::load_or_create_tls_identity(&state_dir)
+            .map_err(std::io::Error::other)?;
+        let fingerprint = tls.fingerprint.clone();
+
+        let server = approval_server::ApprovalServer::new(
+            approval_server::ApprovalServerConfig {
+                bind_addr: bind,
+                tls_cert_der: tls.cert_der,
+                tls_key_der: tls.key_der,
+                timeout_secs: config.approval.timeout_secs.unwrap_or(60),
+            },
+            pm.clone(),
+        )
+        .map_err(std::io::Error::other)?;
+        let server_handle = server.handle();
+
+        let (_join, addr) = server
+            .start()
+            .await
+            .map_err(|e| std::io::Error::other(format!("approval server failed to start: {e}")))?;
+        pm.set_port(addr.port());
+        approval_server_addr = Some(addr);
+
+        // mDNS is convenience discovery — never fatal.
+        match approval_server::advertise_mdns(addr.port(), &fingerprint) {
+            Ok(mdns) => {
+                // Keep advertising for the daemon's lifetime.
+                std::mem::forget(mdns);
+            }
+            Err(e) => warn!("mDNS advertisement unavailable: {e}"),
+        }
+
+        info!(
+            "second-device approval factor live on {addr} (fingerprint {})",
+            &fingerprint[..16]
+        );
+        pairing_manager = Some(pm);
+
+        // Stash the handle for the verifier registration below.
+        second_device_verifier = Some((pairing_manager.clone().expect("just set"), server_handle));
+    }
+
     let approval_gate: Box<dyn enclave::ApprovalGate> = match backend {
         ApprovalBackendKind::Native => {
-            let mut gate = NativeApprovalGate::new();
-            if let Some(rt) = identity_runtime.clone() {
-                // Bind successful biometric approvals to the principal holding
-                // the active login session at approval time.
-                gate = gate.with_approver_resolver(Arc::new(move || {
+            let mut registry = factors::FactorRegistry::new();
+
+            // Local factor, with login-session approver binding when identity
+            // is configured.
+            let resolver = identity_runtime.clone().map(|rt| {
+                Arc::new(move || {
                     rt.current_human_principal()
                         .filter(|p| !p.disabled)
                         .map(|p| opaque_core::audit::ApproverIdentity {
@@ -1486,9 +1611,15 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
                             label: p.display_label(),
                             source: opaque_core::audit::ApproverSource::LocalBioSession,
                         })
-                }));
+                }) as factors::ApproverResolver
+            });
+            registry.register(Arc::new(factors::LocalBioVerifier::new(resolver)));
+
+            if let Some((pm, handle)) = second_device_verifier.clone() {
+                registry.register(Arc::new(factors::PairedDeviceVerifier::new(pm, handle)));
             }
-            Box::new(gate)
+
+            Box::new(NativeApprovalGate::with_registry(registry))
         }
         ApprovalBackendKind::InsecureAutoApprove => {
             tracing::error!(
@@ -1522,6 +1653,8 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         agent_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         connection_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
         identity: identity_runtime,
+        pairing: pairing_manager,
+        approval_server_addr,
     });
 
     // Shutdown coordination: watch channel + active connection counter.
@@ -3136,7 +3269,13 @@ async fn handle_request(
             }
             let session_approver = match state
                 .enclave
-                .request_session_approval(identity, client_type, &reason)
+                .request_control_approval(
+                    identity,
+                    client_type,
+                    "agent_session_start",
+                    "Create an agent session token",
+                    &reason,
+                )
                 .await
             {
                 Ok(approver) => approver,
@@ -3531,6 +3670,249 @@ async fn handle_request(
                     "leases": leases,
                 }),
             )
+        }
+        "device_pair_start" => {
+            let Some(pm) = &state.pairing else {
+                return Response::err(
+                    Some(req.id),
+                    "factor_disabled",
+                    "second-device approvals are not enabled — set [approval] \
+                     second_device = true in the daemon config",
+                );
+            };
+
+            // SECURITY: pairing begins the addition of a new APPROVER channel,
+            // so it needs a fresh out-of-band approval. The QR nonce this
+            // returns is deliberately weak authority: whatever completes /pair
+            // with it lands QUARANTINED until the fingerprint ceremony.
+            if let Err(e) = state
+                .enclave
+                .request_control_approval(
+                    identity,
+                    client_type,
+                    "device_pair_start",
+                    "Begin pairing a new approver device",
+                    "the paired device gains approval authority only after you \
+                     confirm its key fingerprint",
+                )
+                .await
+            {
+                emit_daemon_method_audit(
+                    state,
+                    AuditEventKind::OperationFailed,
+                    "device_pair_start",
+                    identity,
+                    client_type,
+                    "permission_denied",
+                    Some(format!("pairing start not approved: {e}")),
+                );
+                return Response::err(
+                    Some(req.id),
+                    "permission_denied",
+                    "starting a device pairing requires out-of-band approval",
+                );
+            }
+
+            // Attribution captured NOW, at ceremony start: this is the
+            // principal whose phone this is supposed to become, and the one
+            // SoD will treat as the device's approver identity.
+            let initiated_by = state.identity.as_ref().and_then(|rt| {
+                rt.current_human_principal()
+                    .filter(|p| !p.disabled)
+                    .map(|p| p.id.as_str().to_owned())
+            });
+            let (payload, _nonce) = pm.generate_qr_payload(initiated_by);
+            emit_daemon_method_audit(
+                state,
+                AuditEventKind::OperationSucceeded,
+                "device_pair_start",
+                identity,
+                client_type,
+                "pairing_session_created",
+                Some(format!("expires_at={}", payload.expires_at)),
+            );
+            Response::ok(
+                req.id,
+                serde_json::json!({
+                    "qr_payload": payload,
+                    "server_addr": state.approval_server_addr.map(|a| a.to_string()),
+                }),
+            )
+        }
+        "device_list" => {
+            let Some(pm) = &state.pairing else {
+                return Response::err(
+                    Some(req.id),
+                    "factor_disabled",
+                    "second-device approvals are not enabled",
+                );
+            };
+            match pm.list_devices() {
+                Ok(devices) => {
+                    let rows: Vec<serde_json::Value> = devices
+                        .iter()
+                        .map(|d| {
+                            serde_json::json!({
+                                "device_id": d.device_id,
+                                "name": d.name,
+                                "fingerprint": d.key_fingerprint(),
+                                "paired_at": d.paired_at,
+                                "last_seen": d.last_seen,
+                                "revoked": d.revoked,
+                                "confirmed": d.confirmed,
+                                "paired_by": d.paired_by,
+                            })
+                        })
+                        .collect();
+                    Response::ok(
+                        req.id,
+                        serde_json::json!({ "count": rows.len(), "devices": rows }),
+                    )
+                }
+                Err(e) => Response::err(
+                    Some(req.id),
+                    "internal",
+                    format!("device store unavailable: {e}"),
+                ),
+            }
+        }
+        "device_pair_confirm" => {
+            let Some(pm) = &state.pairing else {
+                return Response::err(
+                    Some(req.id),
+                    "factor_disabled",
+                    "second-device approvals are not enabled",
+                );
+            };
+            let device_id = req
+                .params
+                .get("device_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if device_id.is_empty() {
+                return Response::err(Some(req.id), "bad_request", "missing 'device_id'");
+            }
+            let device = match pm.list_devices() {
+                Ok(devices) => match devices.into_iter().find(|d| d.device_id == device_id) {
+                    Some(d) => d,
+                    None => {
+                        return Response::err(Some(req.id), "not_found", "no such device");
+                    }
+                },
+                Err(e) => {
+                    return Response::err(
+                        Some(req.id),
+                        "internal",
+                        format!("device store unavailable: {e}"),
+                    );
+                }
+            };
+
+            // SECURITY: this approval prompt IS the anti-hijack ceremony. The
+            // human compares the fingerprint below with the one their phone
+            // displays; a device paired by anything else (an agent racing the
+            // nonce with its own key) shows a fingerprint the phone does not.
+            let reason = format!(
+                "device \"{}\" key fingerprint {}  — CONFIRM ONLY IF YOUR DEVICE \
+                 SHOWS THE SAME FINGERPRINT",
+                enclave::sanitize_for_display(&device.name, 64),
+                device.key_fingerprint()
+            );
+            if let Err(e) = state
+                .enclave
+                .request_control_approval(
+                    identity,
+                    client_type,
+                    "device_pair_confirm",
+                    "Grant approval authority to a paired device",
+                    &reason,
+                )
+                .await
+            {
+                emit_daemon_method_audit(
+                    state,
+                    AuditEventKind::OperationFailed,
+                    "device_pair_confirm",
+                    identity,
+                    client_type,
+                    "permission_denied",
+                    Some(format!("device confirmation not approved: {e}")),
+                );
+                return Response::err(
+                    Some(req.id),
+                    "permission_denied",
+                    "confirming a device requires out-of-band approval",
+                );
+            }
+
+            match pm.confirm_device(device_id) {
+                Ok(confirmed) => {
+                    emit_daemon_method_audit(
+                        state,
+                        AuditEventKind::OperationSucceeded,
+                        "device_pair_confirm",
+                        identity,
+                        client_type,
+                        "device_confirmed",
+                        Some(format!(
+                            "device_id={} fingerprint={}",
+                            confirmed.device_id,
+                            confirmed.key_fingerprint()
+                        )),
+                    );
+                    Response::ok(
+                        req.id,
+                        serde_json::json!({
+                            "device_id": confirmed.device_id,
+                            "name": confirmed.name,
+                            "confirmed": true,
+                        }),
+                    )
+                }
+                Err(e) => Response::err(
+                    Some(req.id),
+                    "internal",
+                    format!("confirmation failed: {e}"),
+                ),
+            }
+        }
+        "device_revoke" => {
+            let Some(pm) = &state.pairing else {
+                return Response::err(
+                    Some(req.id),
+                    "factor_disabled",
+                    "second-device approvals are not enabled",
+                );
+            };
+            let device_id = req
+                .params
+                .get("device_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if device_id.is_empty() {
+                return Response::err(Some(req.id), "bad_request", "missing 'device_id'");
+            }
+            // Revocation removes approval authority — the safe direction, so
+            // it is not approval-gated (an emergency kill must never wait on
+            // the very factor being killed). Audited with the client identity.
+            match pm.revoke_device(device_id) {
+                Ok(()) => {
+                    emit_daemon_method_audit(
+                        state,
+                        AuditEventKind::OperationSucceeded,
+                        "device_revoke",
+                        identity,
+                        client_type,
+                        "device_revoked",
+                        Some(format!("device_id={device_id}")),
+                    );
+                    Response::ok(
+                        req.id,
+                        serde_json::json!({ "device_id": device_id, "revoked": true }),
+                    )
+                }
+                Err(e) => Response::err(Some(req.id), "not_found", format!("{e}")),
+            }
         }
         "execute" => {
             let operation = req
@@ -5608,6 +5990,8 @@ exe_sha256 = "deadbeef"
             agent_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             connection_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
             identity: None,
+            pairing: None,
+            approval_server_addr: None,
         }
     }
 

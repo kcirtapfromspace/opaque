@@ -263,11 +263,18 @@ pub enum ApproverSource {
     /// held the active login session. Presence is cryptographically proven
     /// (device owner); the *name* is session-bound, not signature-bound.
     LocalBioSession,
-    /// A paired device signed the approval. MUST only ever be recorded after
-    /// the device signature has actually been verified against the pairing
-    /// store — never from client-relayed, unverified device ids (the dormant
-    /// approval_server relays those unverified; do not trust it as a source).
+    /// A paired device's Ed25519 signature over the approval challenge was
+    /// verified against the pairing store. Signature-bound: only recorded by
+    /// the paired-device factor verifier, never from relayed, unverified
+    /// device ids.
     PairedDevice,
+    /// A FIDO2/WebAuthn assertion (hardware key or passkey) over the approval
+    /// challenge was verified against the stored credential. Signature-bound.
+    Fido2,
+    /// Linux polkit authorized the approval; the named account is the
+    /// authenticated session user reported by the approval helper.
+    /// Account-verified (polkit checked credentials), not signature-bound.
+    PolkitAccount,
     /// The insecure auto-approve test backend granted it. Never a person.
     InsecureAutoApprove,
 }
@@ -277,6 +284,8 @@ impl fmt::Display for ApproverSource {
         match self {
             Self::LocalBioSession => write!(f, "local_bio_session"),
             Self::PairedDevice => write!(f, "paired_device"),
+            Self::Fido2 => write!(f, "fido2"),
+            Self::PolkitAccount => write!(f, "polkit_account"),
             Self::InsecureAutoApprove => write!(f, "insecure_auto_approve"),
         }
     }

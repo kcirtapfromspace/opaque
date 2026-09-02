@@ -121,58 +121,14 @@ pub fn seal_key_path(seal_file: &Path) -> PathBuf {
 
 /// Load the seal key if present. `Ok(None)` means no key file exists.
 pub fn load_seal_key(seal_file: &Path) -> Result<Option<[u8; 32]>, SealError> {
-    let path = seal_key_path(seal_file);
-    match std::fs::read(&path) {
-        Ok(bytes) if bytes.len() == 32 => {
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&bytes);
-            Ok(Some(key))
-        }
-        Ok(_) => Err(SealError::IoError(format!(
-            "seal key {} is corrupt (wrong length)",
-            path.display()
-        ))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(SealError::IoError(format!(
-            "failed to read seal key {}: {e}",
-            path.display()
-        ))),
-    }
+    crate::keyfile::load_key_file(&seal_key_path(seal_file))
+        .map_err(|e| SealError::IoError(e.to_string()))
 }
 
 /// Load the seal key, creating it (0600, CSPRNG) on first use.
 pub fn load_or_create_seal_key(seal_file: &Path) -> Result<[u8; 32], SealError> {
-    if let Some(key) = load_seal_key(seal_file)? {
-        return Ok(key);
-    }
-    let mut key = [0u8; 32];
-    getrandom::fill(&mut key)
-        .map_err(|e| SealError::IoError(format!("failed to generate seal key: {e}")))?;
-    let path = seal_key_path(seal_file);
-    write_key_file(&path, &key)?;
-    Ok(key)
-}
-
-#[cfg(unix)]
-fn write_key_file(path: &Path, key: &[u8; 32]) -> Result<(), SealError> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| SealError::IoError(format!("failed to create {}: {e}", path.display())))?;
-    f.write_all(key)
-        .map_err(|e| SealError::IoError(format!("failed to write {}: {e}", path.display())))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_key_file(path: &Path, key: &[u8; 32]) -> Result<(), SealError> {
-    std::fs::write(path, key)
-        .map_err(|e| SealError::IoError(format!("failed to write {}: {e}", path.display())))
+    crate::keyfile::load_or_create_key_file(&seal_key_path(seal_file))
+        .map_err(|e| SealError::IoError(e.to_string()))
 }
 
 /// Seal config bytes with the keyed format, creating the seal key on first

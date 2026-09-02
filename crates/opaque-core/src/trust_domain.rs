@@ -284,6 +284,21 @@ pub fn default_custody_set(home: &Path, config_path: &Path) -> Vec<CustodyPath> 
             label: "profiles directory",
         },
         CustodyPath {
+            path: state.join("pairing.key"),
+            kind: PathKind::File,
+            label: "device pairing signing key",
+        },
+        CustodyPath {
+            path: state.join("approval_server.key"),
+            kind: PathKind::File,
+            label: "approval server TLS key",
+        },
+        CustodyPath {
+            path: state.join("approval_server.cert"),
+            kind: PathKind::File,
+            label: "approval server TLS certificate",
+        },
+        CustodyPath {
             path: home.join(".config").join("opaque"),
             kind: PathKind::Dir,
             label: "pairing config directory",
@@ -295,6 +310,22 @@ pub fn default_custody_set(home: &Path, config_path: &Path) -> Vec<CustodyPath> 
                 .join("paired_devices.json"),
             kind: PathKind::File,
             label: "paired device store",
+        },
+        CustodyPath {
+            path: home
+                .join(".config")
+                .join("opaque")
+                .join("paired_devices.hmac"),
+            kind: PathKind::File,
+            label: "paired device store integrity key",
+        },
+        CustodyPath {
+            path: home
+                .join(".config")
+                .join("opaque")
+                .join("fido2_credentials.json"),
+            kind: PathKind::File,
+            label: "FIDO2 credential store",
         },
     ]
 }
@@ -515,8 +546,13 @@ mod tests {
             "/var/lib/opaque/.opaque/identity.db",
             "/var/lib/opaque/.opaque/identity.key",
             "/var/lib/opaque/.opaque/profiles",
+            "/var/lib/opaque/.opaque/pairing.key",
+            "/var/lib/opaque/.opaque/approval_server.key",
+            "/var/lib/opaque/.opaque/approval_server.cert",
             "/var/lib/opaque/.config/opaque",
             "/var/lib/opaque/.config/opaque/paired_devices.json",
+            "/var/lib/opaque/.config/opaque/paired_devices.hmac",
+            "/var/lib/opaque/.config/opaque/fido2_credentials.json",
         ] {
             assert!(paths.contains(&expected.to_string()), "missing {expected}");
         }
