@@ -754,12 +754,20 @@ pub fn run_interactive(base_dir: &Path, force: bool) -> Result<(), String> {
         ),
         format!(
             "Biometric:  {}",
-            if options.require_biometric { "required (first_use)" } else { "disabled" }
+            if options.require_biometric {
+                "required (first_use)"
+            } else {
+                "disabled"
+            }
         ),
         format!("Lease TTL:  {}s", options.lease_ttl),
         format!(
             "Agent reveal: {}",
-            if options.block_agent_reveal { "blocked" } else { "allowed" }
+            if options.block_agent_reveal {
+                "blocked"
+            } else {
+                "allowed"
+            }
         ),
         format!("Config path: {}", config_path.display()),
     ];
@@ -826,9 +834,30 @@ pub fn run_interactive(base_dir: &Path, force: bool) -> Result<(), String> {
     ui::divider();
     println!();
     ui::info("Next steps:");
-    ui::step(1, 3, &format!("Start the daemon:  {}", console::style("opaque service install").cyan()));
-    ui::step(2, 3, &format!("Seal your config:  {}", console::style("opaque setup --seal").cyan()));
-    ui::step(3, 3, &format!("Test the setup:    {}", console::style("opaque ping").cyan()));
+    ui::step(
+        1,
+        3,
+        &format!(
+            "Start the daemon:  {}",
+            console::style("opaque service install").cyan()
+        ),
+    );
+    ui::step(
+        2,
+        3,
+        &format!(
+            "Seal your config:  {}",
+            console::style("opaque setup --seal").cyan()
+        ),
+    );
+    ui::step(
+        3,
+        3,
+        &format!(
+            "Test the setup:    {}",
+            console::style("opaque ping").cyan()
+        ),
+    );
     println!();
 
     Ok(())
@@ -840,7 +869,10 @@ pub fn run_detect_only() {
 
     let env = RealEnvironment;
 
-    ui::banner("Opaque Environment Detection", "Scanning for providers and AI tools");
+    ui::banner(
+        "Opaque Environment Detection",
+        "Scanning for providers and AI tools",
+    );
 
     ui::step(1, 2, "Detecting secret providers...");
     println!();

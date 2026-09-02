@@ -112,7 +112,10 @@ pub fn verify_seal(config_bytes: &[u8], seal_file: &Path) -> Result<SealStatus, 
 ///
 /// Use this when you need verification isolated from system keychain state,
 /// e.g. in tests or when operating on config files outside the default location.
-pub fn verify_seal_from_file(config_bytes: &[u8], seal_file: &Path) -> Result<SealStatus, SealError> {
+pub fn verify_seal_from_file(
+    config_bytes: &[u8],
+    seal_file: &Path,
+) -> Result<SealStatus, SealError> {
     let actual = compute_seal(config_bytes);
     verify_against_file(&actual, seal_file)
 }

@@ -531,7 +531,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec![],
             secret_ref_param_keys: vec![],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -547,7 +547,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["profile".into(), "command".into()],
             secret_ref_param_keys: vec!["profile".into()],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -570,7 +570,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["repo".into()],
             secret_ref_param_keys: vec!["value_ref".into(), "github_token_ref".into()],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -593,7 +593,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["repo".into()],
             secret_ref_param_keys: vec!["value_ref".into(), "github_token_ref".into()],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -615,7 +615,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["repo".into()],
             secret_ref_param_keys: vec!["value_ref".into(), "github_token_ref".into()],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -639,7 +639,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["org".into()],
             secret_ref_param_keys: vec!["value_ref".into(), "github_token_ref".into()],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -661,7 +661,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["repo".into(), "org".into()],
             secret_ref_param_keys: vec!["github_token_ref".into()],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -685,7 +685,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["repo".into(), "org".into()],
             secret_ref_param_keys: vec!["github_token_ref".into()],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -712,7 +712,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["project".into(), "key".into()],
             secret_ref_param_keys: vec!["value_ref".into(), "gitlab_token_ref".into()],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -725,7 +725,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec![],
             secret_ref_param_keys: vec![],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -746,7 +746,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["vault".into(), "item".into()],
             secret_ref_param_keys: vec!["onepassword:{vault}/{item}/{field}".into()],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -763,7 +763,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["vault".into()],
             secret_ref_param_keys: vec![],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -776,7 +776,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec![],
             secret_ref_param_keys: vec![],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -792,7 +792,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["project".into()],
             secret_ref_param_keys: vec![],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -809,7 +809,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["secret_id".into()],
             secret_ref_param_keys: vec!["secret_id".into()],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     // AWS STS operations
     registry
@@ -823,7 +823,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec![],
             secret_ref_param_keys: vec![],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -843,7 +843,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["role_arn".into()],
             secret_ref_param_keys: vec![],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     // AWS Secrets Manager operations
     registry
@@ -857,7 +857,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec![],
             secret_ref_param_keys: vec![],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -874,7 +874,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["secret_id".into()],
             secret_ref_param_keys: vec!["secret_id".into()],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -895,7 +895,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["name".into()],
             secret_ref_param_keys: vec!["value".into()],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -915,7 +915,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["secret_id".into()],
             secret_ref_param_keys: vec!["value".into()],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -932,7 +932,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["secret_id".into()],
             secret_ref_param_keys: vec![],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     // AWS SSM Parameter Store operations
     registry
@@ -950,7 +950,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["name".into()],
             secret_ref_param_keys: vec!["name".into()],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -972,7 +972,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["name".into()],
             secret_ref_param_keys: vec!["value".into()],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -992,7 +992,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["path".into()],
             secret_ref_param_keys: vec![],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -1009,7 +1009,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["name".into()],
             secret_ref_param_keys: vec![],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     // Sandbox execve policy hook operations.
     registry
@@ -1023,7 +1023,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec![],
             secret_ref_param_keys: vec![],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -1036,7 +1036,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec![],
             secret_ref_param_keys: vec![],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     let policy = PolicyEngine::with_rules(config.rules.clone());
     info!("policy engine loaded with {} rules", policy.rule_count());
@@ -1047,12 +1047,8 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         .join("audit.db");
     let retention_days = config.audit_retention_days.unwrap_or(90);
     let sqlite_sink: Arc<dyn AuditSink> = Arc::new(
-        SqliteAuditSink::new(audit_db_path.clone(), retention_days).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("failed to open audit database: {e}"),
-            )
-        })?,
+        SqliteAuditSink::new(audit_db_path.clone(), retention_days)
+            .map_err(|e| std::io::Error::other(format!("failed to open audit database: {e}")))?,
     );
     info!(
         "audit database at {} (retention: {} days)",
@@ -1126,20 +1122,20 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
     let (execve_check_handler, execve_approve_handler) =
         sandbox::execve_hook::create_execve_handlers(audit.clone(), execve_mapper);
 
-    let github_actions_handler = github::GitHubHandler::new(audit.clone())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let github_codespaces_handler = github::GitHubHandler::new(audit.clone())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let github_dependabot_handler = github::GitHubHandler::new(audit.clone())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let github_org_handler = github::GitHubHandler::new(audit.clone())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let github_list_handler = github::GitHubHandler::new(audit.clone())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let github_delete_handler = github::GitHubHandler::new(audit.clone())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let gitlab_handler = gitlab::GitLabHandler::new(audit.clone())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let github_actions_handler =
+        github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
+    let github_codespaces_handler =
+        github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
+    let github_dependabot_handler =
+        github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
+    let github_org_handler =
+        github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
+    let github_list_handler =
+        github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
+    let github_delete_handler =
+        github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
+    let gitlab_handler =
+        gitlab::GitLabHandler::new(audit.clone()).map_err(std::io::Error::other)?;
 
     // 1Password handler: prefer Connect Server URL, fall back to `op` CLI.
     let onepassword_connect_url =
@@ -1340,7 +1336,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         .approval_gate(approval_gate)
         .audit(audit.clone())
         .build()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     let state = Arc::new(DaemonState {
         enclave: Arc::new(enclave),

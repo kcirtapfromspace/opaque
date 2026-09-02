@@ -223,7 +223,11 @@ impl AwsClient {
     /// Create a new client with separate service URLs.
     ///
     /// Returns an error if any URL uses an unsupported scheme.
-    pub fn new(sts_url: &str, secretsmanager_url: &str, ssm_url: &str) -> Result<Self, AwsApiError> {
+    pub fn new(
+        sts_url: &str,
+        secretsmanager_url: &str,
+        ssm_url: &str,
+    ) -> Result<Self, AwsApiError> {
         validate_url_scheme(sts_url)?;
         validate_url_scheme(secretsmanager_url)?;
         validate_url_scheme(ssm_url)?;

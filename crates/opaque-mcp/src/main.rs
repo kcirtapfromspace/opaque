@@ -241,7 +241,10 @@ async fn handle_tools_call(
             // Sanitize the error to prevent leaking filesystem paths or
             // credentials embedded in connection strings to the LLM context.
             let sanitizer = opaque_core::sanitize::Sanitizer::new();
-            let error_text = format!("Failed to communicate with opaqued: {}", sanitizer.scrub_error(&e.to_string()));
+            let error_text = format!(
+                "Failed to communicate with opaqued: {}",
+                sanitizer.scrub_error(&e.to_string())
+            );
             JsonRpcResponse::ok(
                 id,
                 json!({

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -230,9 +230,8 @@ impl PushManager {
         }
 
         // All retries failed
-        Err(last_error.unwrap_or_else(|| {
-            PushError::ApnsError("APNs request failed after retries".into())
-        }))
+        Err(last_error
+            .unwrap_or_else(|| PushError::ApnsError("APNs request failed after retries".into())))
     }
 }
 
@@ -288,11 +287,7 @@ async fn send_apns_request(
 ///
 /// Header: { "alg": "ES256", "kid": "<key_id>" }
 /// Claims: { "iss": "<team_id>", "iat": <timestamp> }
-fn sign_apns_jwt(
-    team_id: &str,
-    key_id: &str,
-    private_key_pem: &str,
-) -> Result<String, PushError> {
+fn sign_apns_jwt(team_id: &str, key_id: &str, private_key_pem: &str) -> Result<String, PushError> {
     // Parse the private key in PEM format
     let encoding_key = EncodingKey::from_ec_pem(private_key_pem.as_bytes())
         .map_err(|e| PushError::JwtError(format!("failed to parse private key: {e}")))?;

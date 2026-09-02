@@ -439,7 +439,10 @@ sandbox = false
 project_dir = "/tmp/project"
 "#;
         let profile = load_profile(toml, Some("no-sandbox")).unwrap();
-        assert!(!profile.sandbox, "sandbox should be false when explicitly set");
+        assert!(
+            !profile.sandbox,
+            "sandbox should be false when explicitly set"
+        );
     }
 
     #[test]

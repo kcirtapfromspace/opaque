@@ -1,0 +1,2 @@
+# Pin the formatting style so a rustfmt upgrade can't silently reformat the tree.
+style_edition = "2024"

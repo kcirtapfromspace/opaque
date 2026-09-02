@@ -330,14 +330,13 @@ pub async fn execute_direct(
                     Ok(0) => stdout_done = true,
                     Ok(n) => {
                         total_bytes += n;
-                        if total_bytes <= max_output_bytes {
-                            if let Ok(s) = String::from_utf8(stdout_buf[..n].to_vec()) {
+                        if total_bytes <= max_output_bytes
+                            && let Ok(s) = String::from_utf8(stdout_buf[..n].to_vec()) {
                                 let _ = tx.send(ExecFrame::Output {
                                     stream: opaque_core::proto::ExecStream::Stdout,
                                     data: s,
                                 }).await;
                             }
-                        }
                     }
                     Err(e) => {
                         tracing::warn!("stdout read error: {e}");
@@ -350,14 +349,13 @@ pub async fn execute_direct(
                     Ok(0) => stderr_done = true,
                     Ok(n) => {
                         total_bytes += n;
-                        if total_bytes <= max_output_bytes {
-                            if let Ok(s) = String::from_utf8(stderr_buf[..n].to_vec()) {
+                        if total_bytes <= max_output_bytes
+                            && let Ok(s) = String::from_utf8(stderr_buf[..n].to_vec()) {
                                 let _ = tx.send(ExecFrame::Output {
                                     stream: opaque_core::proto::ExecStream::Stderr,
                                     data: s,
                                 }).await;
                             }
-                        }
                     }
                     Err(e) => {
                         tracing::warn!("stderr read error: {e}");

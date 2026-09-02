@@ -84,10 +84,7 @@ pub static LINK: Emoji<'_, '_> = Emoji("🔗 ", "-> ");
 fn supports_unicode() -> bool {
     // console crate's Term handles TTY detection; if we can get a terminal
     // that is not dumb, assume unicode works.
-    Term::stdout().is_term()
-        && std::env::var("TERM")
-            .map(|t| t != "dumb")
-            .unwrap_or(true)
+    Term::stdout().is_term() && std::env::var("TERM").map(|t| t != "dumb").unwrap_or(true)
 }
 
 pub struct BoxChars {
@@ -296,7 +293,10 @@ pub fn table(headers: &[&str], rows: &[Vec<String>]) {
 
     // Calculate column widths.
     let col_count = headers.len();
-    let mut widths: Vec<usize> = headers.iter().map(|h| console::measure_text_width(h)).collect();
+    let mut widths: Vec<usize> = headers
+        .iter()
+        .map(|h| console::measure_text_width(h))
+        .collect();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
             if i < col_count {
@@ -339,7 +339,7 @@ pub fn table(headers: &[&str], rows: &[Vec<String>]) {
             .map(|(i, cell)| {
                 let w = if i < col_count { widths[i] } else { 0 };
                 let visible = console::measure_text_width(cell);
-                let pad = if w > visible { w - visible } else { 0 };
+                let pad = w.saturating_sub(visible);
                 format!("{cell}{}", " ".repeat(pad))
             })
             .collect::<Vec<_>>()
@@ -519,11 +519,7 @@ pub fn format_response(method: &str, result: &serde_json::Value) {
         }
         "version" => {
             if let Some(ver) = result.get("version").and_then(|v| v.as_str()) {
-                println!(
-                    "  {} {}",
-                    style("opaqued").bold(),
-                    style(ver).cyan().bold()
-                );
+                println!("  {} {}", style("opaqued").bold(), style(ver).cyan().bold());
             } else {
                 print_json(result);
             }
@@ -1263,9 +1259,7 @@ pub fn format_error(err: &opaque_core::proto::ErrorObj) {
                     "  {} Resource not found. Check that names and IDs are correct.",
                     style("hint:").cyan().bold()
                 );
-                println!(
-                    "    • List available resources before trying again"
-                );
+                println!("    • List available resources before trying again");
             }
             code if code.contains("invalid") || code.contains("INVALID") => {
                 println!(
@@ -1286,10 +1280,7 @@ pub fn format_error(err: &opaque_core::proto::ErrorObj) {
                     "    • Verify config: {}",
                     style("opaque policy check").yellow()
                 );
-                println!(
-                    "    • Run diagnostics: {}",
-                    style("opaque doctor").yellow()
-                );
+                println!("    • Run diagnostics: {}", style("opaque doctor").yellow());
             }
             _ => {
                 println!(
