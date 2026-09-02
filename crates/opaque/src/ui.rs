@@ -571,6 +571,36 @@ pub fn format_response(method: &str, result: &serde_json::Value) {
         "identity.delegation_list" => {
             format_identity_delegation_list_result(result);
         }
+        "fido2_list" => {
+            let empty = vec![];
+            let creds = result
+                .get("credentials")
+                .and_then(|v| v.as_array())
+                .unwrap_or(&empty);
+            if creds.is_empty() {
+                info("No FIDO2 credentials registered.");
+                return;
+            }
+            header(&format!("{} FIDO2 credential(s)", creds.len()));
+            for c in creds {
+                let label = c.get("label").and_then(|v| v.as_str()).unwrap_or("?");
+                let id = c
+                    .get("credential_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let created = c.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+                println!(
+                    "  {} {}  {}",
+                    style(KEY).dim(),
+                    style(label).yellow().bold(),
+                    style(format!("(registered {created})")).dim()
+                );
+                println!("      {}", style(format!("id {id}")).dim());
+            }
+        }
+        "fido2_remove" => {
+            success("Credential removed — approval authority revoked.");
+        }
         "device_pair_start" => {
             format_device_pair_start_result(result);
         }

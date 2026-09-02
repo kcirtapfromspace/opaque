@@ -40,6 +40,13 @@ second_device = true
 # server_bind = "0.0.0.0:7381"
 # timeout_secs = 60
 
+# FIDO2 hardware keys / platform passkeys as approvers. The daemon verifies
+# assertions (challenge-bound, counter-checked); the authenticator ceremony
+# runs in the client driving the key. Register with an approval-gated
+# ceremony (fido2_register_start/complete); inspect with `opaque key ls`.
+fido2 = true
+# fido2_rp_id = "opaque.local"
+
 [identity]
 # Identity is what makes cross-uid clients attributable — strongly recommended
 # alongside the split. See docs/identity.md.

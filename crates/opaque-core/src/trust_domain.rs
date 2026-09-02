@@ -327,6 +327,14 @@ pub fn default_custody_set(home: &Path, config_path: &Path) -> Vec<CustodyPath> 
             kind: PathKind::File,
             label: "FIDO2 credential store",
         },
+        CustodyPath {
+            path: home
+                .join(".config")
+                .join("opaque")
+                .join("fido2_credentials.hmac"),
+            kind: PathKind::File,
+            label: "FIDO2 credential store integrity key",
+        },
     ]
 }
 

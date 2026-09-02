@@ -152,6 +152,17 @@ struct ApprovalFactorsConfig {
     /// Seconds a device has to answer a challenge (default 60).
     #[serde(default)]
     timeout_secs: Option<u64>,
+
+    /// Enable the FIDO2/passkey factor: hardware keys and platform passkeys
+    /// registered with the daemon can approve operations. Assertion
+    /// verification is daemon-side; the authenticator ceremony runs in the
+    /// client that drives the key.
+    #[serde(default)]
+    fido2: bool,
+
+    /// WebAuthn relying-party id for FIDO2 (default "opaque.local").
+    #[serde(default)]
+    fido2_rp_id: Option<String>,
 }
 
 /// `[trust_domain]` — settings for running the daemon as a principal distinct
@@ -233,6 +244,8 @@ struct DaemonState {
     pairing: Option<Arc<pairing::PairingManager>>,
     /// Bound address of the approval server, when running.
     approval_server_addr: Option<std::net::SocketAddr>,
+    /// FIDO2 approval coordination, present when `[approval] fido2` is enabled.
+    fido2: Option<Arc<factors::Fido2Approvals>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1596,6 +1609,34 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         second_device_verifier = Some((pairing_manager.clone().expect("just set"), server_handle));
     }
 
+    // FIDO2/passkey factor: daemon-side verification over the socket; the
+    // authenticator ceremony runs in whatever client drives the key.
+    let mut fido2_approvals: Option<Arc<factors::Fido2Approvals>> = None;
+    if config.approval.fido2 {
+        let store_path = fido2::Fido2CredentialStore::default_path();
+        if let Some(parent) = store_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let store_hmac =
+            opaque_core::keyfile::load_or_create_key_file(&store_path.with_extension("hmac"))?;
+        let store = fido2::Fido2CredentialStore::new(store_path, store_hmac.to_vec());
+        let rp_id = config
+            .approval
+            .fido2_rp_id
+            .clone()
+            .unwrap_or_else(|| "opaque.local".into());
+        let manager = fido2::Fido2Manager::new(store, Box::new(fido2::NoLocalTransport), rp_id);
+        let approvals = Arc::new(factors::Fido2Approvals::new(
+            manager,
+            std::time::Duration::from_secs(config.approval.timeout_secs.unwrap_or(60)),
+        ));
+        info!(
+            "FIDO2/passkey approval factor enabled ({} credential(s) registered)",
+            approvals.list_credentials().map(|c| c.len()).unwrap_or(0)
+        );
+        fido2_approvals = Some(approvals);
+    }
+
     let approval_gate: Box<dyn enclave::ApprovalGate> = match backend {
         ApprovalBackendKind::Native => {
             let mut registry = factors::FactorRegistry::new();
@@ -1617,6 +1658,10 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
 
             if let Some((pm, handle)) = second_device_verifier.clone() {
                 registry.register(Arc::new(factors::PairedDeviceVerifier::new(pm, handle)));
+            }
+
+            if let Some(approvals) = fido2_approvals.clone() {
+                registry.register(Arc::new(factors::Fido2Verifier::new(approvals)));
             }
 
             Box::new(NativeApprovalGate::with_registry(registry))
@@ -1655,6 +1700,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         identity: identity_runtime,
         pairing: pairing_manager,
         approval_server_addr,
+        fido2: fido2_approvals,
     });
 
     // Shutdown coordination: watch channel + active connection counter.
@@ -3914,6 +3960,283 @@ async fn handle_request(
                 Err(e) => Response::err(Some(req.id), "not_found", format!("{e}")),
             }
         }
+        "fido2_register_start" => {
+            let Some(f2) = &state.fido2 else {
+                return Response::err(
+                    Some(req.id),
+                    "factor_disabled",
+                    "FIDO2 approvals are not enabled — set [approval] fido2 = true",
+                );
+            };
+            // Registering a credential adds an APPROVER — approval-gated,
+            // like device pairing. (This simplified flow verifies UP + RP +
+            // key, not attestation chains; the human approval here is the
+            // authorization anchor for the new credential.)
+            if let Err(e) = state
+                .enclave
+                .request_control_approval(
+                    identity,
+                    client_type,
+                    "fido2_register_start",
+                    "Register a FIDO2 hardware key / passkey as an approver",
+                    "the credential completing this registration will be able to \
+                     approve operations",
+                )
+                .await
+            {
+                emit_daemon_method_audit(
+                    state,
+                    AuditEventKind::OperationFailed,
+                    "fido2_register_start",
+                    identity,
+                    client_type,
+                    "permission_denied",
+                    Some(format!("registration not approved: {e}")),
+                );
+                return Response::err(
+                    Some(req.id),
+                    "permission_denied",
+                    "registering a FIDO2 credential requires out-of-band approval",
+                );
+            }
+            match f2.register_begin() {
+                Ok((challenge, rp_id)) => {
+                    emit_daemon_method_audit(
+                        state,
+                        AuditEventKind::OperationSucceeded,
+                        "fido2_register_start",
+                        identity,
+                        client_type,
+                        "registration_challenge_issued",
+                        None,
+                    );
+                    Response::ok(
+                        req.id,
+                        serde_json::json!({ "challenge": challenge, "rp_id": rp_id }),
+                    )
+                }
+                Err(e) => Response::err(Some(req.id), "internal", e),
+            }
+        }
+        "fido2_register_complete" => {
+            let Some(f2) = &state.fido2 else {
+                return Response::err(
+                    Some(req.id),
+                    "factor_disabled",
+                    "FIDO2 approvals are not enabled",
+                );
+            };
+            let label = req
+                .params
+                .get("label")
+                .and_then(|v| v.as_str())
+                .unwrap_or("hardware key");
+            let response: fido2::Fido2RegistrationResponse = match req
+                .params
+                .get("response")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+            {
+                Some(r) => r,
+                None => {
+                    return Response::err(
+                        Some(req.id),
+                        "bad_request",
+                        "missing or malformed 'response' (registration payload)",
+                    );
+                }
+            };
+            match f2.register_complete(&response, &enclave::sanitize_for_display(label, 64)) {
+                Ok(credential) => {
+                    emit_daemon_method_audit(
+                        state,
+                        AuditEventKind::OperationSucceeded,
+                        "fido2_register_complete",
+                        identity,
+                        client_type,
+                        "credential_registered",
+                        Some(format!(
+                            "credential_id={} label={}",
+                            credential
+                                .credential_id
+                                .chars()
+                                .take(12)
+                                .collect::<String>(),
+                            credential.label
+                        )),
+                    );
+                    Response::ok(
+                        req.id,
+                        serde_json::json!({
+                            "credential_id": credential.credential_id,
+                            "label": credential.label,
+                        }),
+                    )
+                }
+                Err(e) => {
+                    emit_daemon_method_audit(
+                        state,
+                        AuditEventKind::OperationFailed,
+                        "fido2_register_complete",
+                        identity,
+                        client_type,
+                        "registration_rejected",
+                        Some(e.clone()),
+                    );
+                    Response::err(Some(req.id), "invalid_registration", e)
+                }
+            }
+        }
+        "fido2_list" => {
+            let Some(f2) = &state.fido2 else {
+                return Response::err(
+                    Some(req.id),
+                    "factor_disabled",
+                    "FIDO2 approvals are not enabled",
+                );
+            };
+            match f2.list_credentials() {
+                Ok(creds) => {
+                    let rows: Vec<serde_json::Value> = creds
+                        .iter()
+                        .map(|c| {
+                            serde_json::json!({
+                                "credential_id": c.credential_id,
+                                "label": c.label,
+                                "created_at": c.created_at.to_rfc3339(),
+                                "counter": c.counter,
+                            })
+                        })
+                        .collect();
+                    Response::ok(
+                        req.id,
+                        serde_json::json!({ "count": rows.len(), "credentials": rows }),
+                    )
+                }
+                Err(e) => Response::err(
+                    Some(req.id),
+                    "internal",
+                    format!("credential store unavailable: {e}"),
+                ),
+            }
+        }
+        "fido2_remove" => {
+            let Some(f2) = &state.fido2 else {
+                return Response::err(
+                    Some(req.id),
+                    "factor_disabled",
+                    "FIDO2 approvals are not enabled",
+                );
+            };
+            let credential_id = req
+                .params
+                .get("credential_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if credential_id.is_empty() {
+                return Response::err(Some(req.id), "bad_request", "missing 'credential_id'");
+            }
+            // Like device_revoke: removing an approver is the safe direction.
+            match f2.remove_credential(credential_id) {
+                Ok(removed) => {
+                    emit_daemon_method_audit(
+                        state,
+                        AuditEventKind::OperationSucceeded,
+                        "fido2_remove",
+                        identity,
+                        client_type,
+                        "credential_removed",
+                        Some(format!("label={}", removed.label)),
+                    );
+                    Response::ok(
+                        req.id,
+                        serde_json::json!({ "credential_id": credential_id, "removed": true }),
+                    )
+                }
+                Err(e) => Response::err(Some(req.id), "not_found", format!("{e}")),
+            }
+        }
+        "fido2_pending" => {
+            let Some(f2) = &state.fido2 else {
+                return Response::err(
+                    Some(req.id),
+                    "factor_disabled",
+                    "FIDO2 approvals are not enabled",
+                );
+            };
+            let rounds: Vec<serde_json::Value> = f2
+                .pending_rounds()
+                .into_iter()
+                .map(|(request_id, challenge, rp_id, allowed)| {
+                    serde_json::json!({
+                        "request_id": request_id,
+                        "challenge": challenge,
+                        "rp_id": rp_id,
+                        "allowed_credentials": allowed,
+                    })
+                })
+                .collect();
+            Response::ok(
+                req.id,
+                serde_json::json!({ "count": rounds.len(), "rounds": rounds }),
+            )
+        }
+        "fido2_respond" => {
+            let Some(f2) = &state.fido2 else {
+                return Response::err(
+                    Some(req.id),
+                    "factor_disabled",
+                    "FIDO2 approvals are not enabled",
+                );
+            };
+            let request_id = req
+                .params
+                .get("request_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if request_id.is_empty() {
+                return Response::err(Some(req.id), "bad_request", "missing 'request_id'");
+            }
+            let assertion: fido2::Fido2Assertion = match req
+                .params
+                .get("assertion")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+            {
+                Some(a) => a,
+                None => {
+                    return Response::err(
+                        Some(req.id),
+                        "bad_request",
+                        "missing or malformed 'assertion'",
+                    );
+                }
+            };
+            match f2.respond(request_id, &assertion) {
+                Ok(verified) => {
+                    emit_daemon_method_audit(
+                        state,
+                        AuditEventKind::OperationSucceeded,
+                        "fido2_respond",
+                        identity,
+                        client_type,
+                        "assertion_verified",
+                        Some(format!("label={}", verified.credential.label)),
+                    );
+                    Response::ok(req.id, serde_json::json!({ "verified": true }))
+                }
+                Err(e) => {
+                    emit_daemon_method_audit(
+                        state,
+                        AuditEventKind::OperationFailed,
+                        "fido2_respond",
+                        identity,
+                        client_type,
+                        "assertion_rejected",
+                        Some(e.clone()),
+                    );
+                    Response::err(Some(req.id), "invalid_assertion", e)
+                }
+            }
+        }
         "execute" => {
             let operation = req
                 .params
@@ -5992,6 +6315,7 @@ exe_sha256 = "deadbeef"
             identity: None,
             pairing: None,
             approval_server_addr: None,
+            fido2: None,
         }
     }
 

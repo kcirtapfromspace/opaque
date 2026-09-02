@@ -220,6 +220,11 @@ enum Cmd {
         #[command(subcommand)]
         action: DeviceAction,
     },
+    /// Manage FIDO2 hardware keys / passkeys (approval factor).
+    Key {
+        #[command(subcommand)]
+        action: KeyAction,
+    },
     /// Interactive setup wizard — configure and seal your security policy.
     Setup {
         /// Seal the current config.toml without running the wizard.
@@ -411,6 +416,18 @@ enum IdentityAction {
     },
     /// List delegation records (agent sessions bound to principals).
     Delegations,
+}
+
+#[derive(Debug, Subcommand)]
+enum KeyAction {
+    /// List registered FIDO2 credentials.
+    Ls,
+    /// Remove a registered credential (removing an approver is never gated
+    /// on an approver).
+    Remove {
+        /// Credential id as shown by `opaque key ls`.
+        credential_id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2728,6 +2745,13 @@ async fn main() {
                 }),
             ),
             IdentityAction::Delegations => ("identity.delegation_list", serde_json::Value::Null),
+        },
+        Cmd::Key { action } => match action {
+            KeyAction::Ls => ("fido2_list", serde_json::Value::Null),
+            KeyAction::Remove { credential_id } => (
+                "fido2_remove",
+                serde_json::json!({ "credential_id": credential_id }),
+            ),
         },
         Cmd::Device { action } => match action {
             DeviceAction::Pair => ("device_pair_start", serde_json::Value::Null),
@@ -7599,6 +7623,26 @@ BAZ=
         // confirm/revoke require the device id.
         assert!(Cli::try_parse_from(["opaque", "device", "confirm"]).is_err());
         assert!(Cli::try_parse_from(["opaque", "device", "revoke"]).is_err());
+    }
+
+    #[test]
+    fn key_commands_parse() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["opaque", "key", "ls"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Key {
+                action: KeyAction::Ls
+            })
+        ));
+        let cli = Cli::try_parse_from(["opaque", "key", "remove", "cred-1"]).unwrap();
+        match cli.cmd {
+            Some(Cmd::Key {
+                action: KeyAction::Remove { credential_id },
+            }) => assert_eq!(credential_id, "cred-1"),
+            other => panic!("unexpected parse: {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["opaque", "key", "remove"]).is_err());
     }
 
     #[test]
