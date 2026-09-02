@@ -2232,6 +2232,7 @@ mod tests {
             approval_requirement: ApprovalRequirement::Never,
             lease_ttl: None,
             one_time: false,
+            require_distinct_approver: false,
             matched_rule: Some("deny-rule".into()),
             denial_reason: Some("denied".into()),
         };

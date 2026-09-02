@@ -521,10 +521,9 @@ pub(crate) mod tests {
         let token = sign_id_token(base_claims(&server.uri(), "n"), "test-key-1");
         let mut parts: Vec<&str> = token.split('.').collect();
         let sig = parts[2].to_owned();
-        let flipped = if sig.starts_with('A') {
-            format!("B{}", &sig[1..])
-        } else {
-            format!("A{}", &sig[1..])
+        let flipped = match sig.strip_prefix('A') {
+            Some(rest) => format!("B{rest}"),
+            None => format!("A{}", &sig[1..]),
         };
         parts[2] = &flipped;
         let tampered = parts.join(".");

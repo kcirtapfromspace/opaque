@@ -113,6 +113,13 @@ struct DaemonConfig {
     /// Absent = identity features disabled (Phase 0 behavior).
     #[serde(default)]
     identity: Option<identity::IdentityConfig>,
+
+    /// Approval backend: `"native"` (default — OS biometric/polkit prompt) or
+    /// `"insecure_auto_approve"` (tests/e2e ONLY; additionally requires the
+    /// environment variable `OPAQUE_INSECURE_AUTO_APPROVE=1` at startup, and
+    /// announces itself with an Error-level audit event).
+    #[serde(default)]
+    approval_backend: Option<String>,
 }
 
 /// A single entry in the known human clients allowlist.
@@ -1088,7 +1095,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| PathBuf::from("."));
             match identity::IdentityRuntime::initialize(id_config, &state_dir) {
-                Ok(rt) => Some(Arc::new(rt)),
+                Ok(rt) => Some(Arc::new(rt.with_audit(audit.clone()))),
                 Err(e) if required => {
                     return Err(std::io::Error::other(format!(
                         "identity is required but failed to initialize: {e}"
@@ -1284,8 +1291,53 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         );
     }
 
+    // Approval backend selection. The insecure auto-approve backend exists
+    // only so e2e tests can run headless: it demands BOTH the config value and
+    // an explicit environment marker, refuses to start on a partial attempt
+    // (no silent fallback in either direction), and announces itself loudly.
+    let auto_approve_env = std::env::var("OPAQUE_INSECURE_AUTO_APPROVE")
+        .ok()
+        .as_deref()
+        == Some("1");
+    let backend = select_approval_backend(config.approval_backend.as_deref(), auto_approve_env)
+        .map_err(std::io::Error::other)?;
+    let approval_gate: Box<dyn enclave::ApprovalGate> = match backend {
+        ApprovalBackendKind::Native => {
+            let mut gate = NativeApprovalGate::new();
+            if let Some(rt) = identity_runtime.clone() {
+                // Bind successful biometric approvals to the principal holding
+                // the active login session at approval time.
+                gate = gate.with_approver_resolver(Arc::new(move || {
+                    rt.current_human_principal()
+                        .filter(|p| !p.disabled)
+                        .map(|p| opaque_core::audit::ApproverIdentity {
+                            principal_id: p.id.as_str().to_owned(),
+                            label: p.display_label(),
+                            source: opaque_core::audit::ApproverSource::LocalBioSession,
+                        })
+                }));
+            }
+            Box::new(gate)
+        }
+        ApprovalBackendKind::InsecureAutoApprove => {
+            tracing::error!(
+                "INSECURE AUTO-APPROVE BACKEND ACTIVE — every approval will be granted \
+                 without human interaction. Test use only."
+            );
+            audit.emit(
+                AuditEvent::new(AuditEventKind::ApprovalGranted)
+                    .with_operation("daemon_startup")
+                    .with_outcome("insecure_backend_active")
+                    .with_level(opaque_core::audit::AuditLevel::Error)
+                    .with_approver(enclave::InsecureAutoApproveGate::approver())
+                    .with_detail("INSECURE AUTO-APPROVE BACKEND ACTIVE \u{2014} test use only"),
+            );
+            Box::new(enclave::InsecureAutoApproveGate)
+        }
+    };
+
     let enclave = enclave_builder
-        .approval_gate(Box::new(NativeApprovalGate::new()))
+        .approval_gate(approval_gate)
         .audit(audit.clone())
         .build()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -2223,6 +2275,49 @@ async fn validate_agent_session_token(
 /// Methods that build an `OperationRequest` and enter the enclave. These are
 /// the requests that carry (and, under `identity.required`, must carry) a
 /// verified principal context. Introspection and identity methods are exempt.
+/// Which approval backend the daemon should use, or a hard startup error.
+///
+/// The insecure auto-approve backend demands BOTH the config value and the
+/// `OPAQUE_INSECURE_AUTO_APPROVE=1` environment marker; every partial or
+/// mismatched combination is a loud refusal, never a silent fallback.
+#[derive(Debug, PartialEq, Eq)]
+enum ApprovalBackendKind {
+    Native,
+    InsecureAutoApprove,
+}
+
+fn select_approval_backend(
+    config_backend: Option<&str>,
+    auto_approve_env: bool,
+) -> Result<ApprovalBackendKind, String> {
+    match config_backend.unwrap_or("native") {
+        "native" => {
+            if auto_approve_env {
+                return Err(
+                    "OPAQUE_INSECURE_AUTO_APPROVE=1 is set but approval_backend is not \
+                     'insecure_auto_approve' — refusing to start with a half-enabled insecure \
+                     backend; unset the variable or set approval_backend"
+                        .into(),
+                );
+            }
+            Ok(ApprovalBackendKind::Native)
+        }
+        "insecure_auto_approve" => {
+            if !auto_approve_env {
+                return Err(
+                    "approval_backend = 'insecure_auto_approve' additionally requires \
+                     OPAQUE_INSECURE_AUTO_APPROVE=1 in the daemon environment — refusing to start"
+                        .into(),
+                );
+            }
+            Ok(ApprovalBackendKind::InsecureAutoApprove)
+        }
+        other => Err(format!(
+            "unknown approval_backend {other:?} (expected 'native' or 'insecure_auto_approve')"
+        )),
+    }
+}
+
 fn is_operation_method(method: &str) -> bool {
     matches!(
         method,
@@ -2480,9 +2575,21 @@ async fn handle_request(
                     "no [identity] section in the daemon config",
                 );
             };
+            // Capture who is logging out BEFORE revoking their session.
+            let label = rt
+                .current_human_principal()
+                .map(|p| p.display_label())
+                .unwrap_or_else(|| "none".into());
             match rt.store.revoke_all_human_sessions() {
                 Ok(revoked) => {
                     info!("identity.logout revoked {revoked} human session(s)");
+                    state.audit.emit(
+                        AuditEvent::new(AuditEventKind::IdentityLogout)
+                            .with_operation("identity.logout")
+                            .with_client(ClientSummary::from((identity, client_type)))
+                            .with_outcome("ok")
+                            .with_detail(format!("revoked={revoked} current_principal={label}")),
+                    );
                     Response::ok(req.id, serde_json::json!({ "revoked": revoked }))
                 }
                 Err(e) => {
@@ -2604,11 +2711,29 @@ async fn handle_request(
                     "cannot remove the admin role from the last admin",
                 );
             }
+            let old_roles = target
+                .as_ref()
+                .map(|p| opaque_core::identity::roles_to_string(&p.roles))
+                .unwrap_or_default();
             match rt.store.set_roles(&principal_id, &roles) {
                 Ok(()) => {
                     info!(
                         "roles updated for {principal_id}: [{}]",
                         opaque_core::identity::roles_to_string(&roles)
+                    );
+                    let acting_admin = rt
+                        .current_human_principal()
+                        .map(|p| p.display_label())
+                        .unwrap_or_else(|| "bootstrap".into());
+                    state.audit.emit(
+                        AuditEvent::new(AuditEventKind::IdentityRoleChanged)
+                            .with_operation("identity.role_set")
+                            .with_client(ClientSummary::from((identity, client_type)))
+                            .with_outcome("ok")
+                            .with_detail(format!(
+                                "principal={principal_id} roles: [{old_roles}] -> [{}] by={acting_admin}",
+                                opaque_core::identity::roles_to_string(&roles)
+                            )),
                     );
                     match rt.store.get_principal(&principal_id) {
                         Ok(Some(p)) => Response::ok(
@@ -2844,26 +2969,29 @@ async fn handle_request(
                     sub.display_label()
                 ));
             }
-            if let Err(e) = state
+            let session_approver = match state
                 .enclave
                 .request_session_approval(identity, client_type, &reason)
                 .await
             {
-                emit_daemon_method_audit(
-                    state,
-                    AuditEventKind::OperationFailed,
-                    "agent_session_start",
-                    identity,
-                    client_type,
-                    "permission_denied",
-                    Some(format!("session creation not approved: {e}")),
-                );
-                return Response::err(
-                    Some(req.id),
-                    "permission_denied",
-                    "creating an agent session requires out-of-band approval",
-                );
-            }
+                Ok(approver) => approver,
+                Err(e) => {
+                    emit_daemon_method_audit(
+                        state,
+                        AuditEventKind::OperationFailed,
+                        "agent_session_start",
+                        identity,
+                        client_type,
+                        "permission_denied",
+                        Some(format!("session creation not approved: {e}")),
+                    );
+                    return Response::err(
+                        Some(req.id),
+                        "permission_denied",
+                        "creating an agent session requires out-of-band approval",
+                    );
+                }
+            };
 
             let session_id = Uuid::new_v4().to_string();
             let expires_at = SystemTime::now()
@@ -2932,7 +3060,11 @@ async fn handle_request(
                             act_principal: act.id.clone(),
                             mode,
                             human_session_id: human_session_id.clone(),
-                            approved_by: None,
+                            // Attribute the delegation to the principal who
+                            // approved its minting, when the gate named one.
+                            approved_by: session_approver
+                                .as_ref()
+                                .and_then(|a| PrincipalId::parse(&a.principal_id).ok()),
                             created_at: now,
                             expires_at: now + ttl_secs as i64,
                             revoked_at: None,
@@ -3012,15 +3144,19 @@ async fn handle_request(
                         jti: d.jti.clone(),
                         human_session_id: d.human_session_id.clone(),
                     };
-                    state.audit.emit(
-                        AuditEvent::new(AuditEventKind::DelegationIssued)
+                    state.audit.emit({
+                        let mut ev = AuditEvent::new(AuditEventKind::DelegationIssued)
                             .with_operation("agent_session_start")
                             .with_client(
                                 ClientSummary::from((identity, client_type)).with_principal(&ctx),
                             )
                             .with_outcome("issued")
-                            .with_detail(detail),
-                    );
+                            .with_detail(detail);
+                        if let Some(ref approver) = session_approver {
+                            ev = ev.with_approver(approver.clone());
+                        }
+                        ev
+                    });
                 }
                 None => emit_daemon_method_audit(
                     state,
@@ -5289,10 +5425,21 @@ exe_sha256 = "deadbeef"
             _request: &opaque_core::operation::OperationRequest,
             _factors: &[opaque_core::operation::ApprovalFactor],
             _description: &str,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>>
-        {
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::enclave::ApprovalOutcome, String>>
+                    + Send
+                    + '_,
+            >,
+        > {
             let approve = self.approve;
-            Box::pin(async move { Ok(approve) })
+            Box::pin(async move {
+                Ok(if approve {
+                    crate::enclave::ApprovalOutcome::approved_anonymous()
+                } else {
+                    crate::enclave::ApprovalOutcome::denied()
+                })
+            })
         }
     }
 
@@ -5333,6 +5480,17 @@ exe_sha256 = "deadbeef"
 
     /// Test state with an identity runtime (no live IdP — discovery is lazy).
     fn make_test_state_with_identity() -> (tempfile::TempDir, DaemonState) {
+        let (dir, state, _audit) = make_test_state_with_identity_audit();
+        (dir, state)
+    }
+
+    /// As above, but the daemon audit sink AND the identity runtime share an
+    /// in-memory emitter so lifecycle events can be asserted.
+    fn make_test_state_with_identity_audit() -> (
+        tempfile::TempDir,
+        DaemonState,
+        Arc<opaque_core::audit::InMemoryAuditEmitter>,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let config = identity::IdentityConfig {
             issuer: "https://idp.example.com".into(),
@@ -5344,10 +5502,108 @@ exe_sha256 = "deadbeef"
             required: false,
             service_principals: vec![],
         };
-        let runtime = identity::IdentityRuntime::initialize(config, dir.path()).unwrap();
-        let mut state = make_test_state();
+        let emitter = Arc::new(opaque_core::audit::InMemoryAuditEmitter::new());
+        let runtime = identity::IdentityRuntime::initialize(config, dir.path())
+            .unwrap()
+            .with_audit(emitter.clone());
+        let mut state = build_test_state(emitter.clone(), true);
         state.identity = Some(Arc::new(runtime));
-        (dir, state)
+        (dir, state, emitter)
+    }
+
+    #[test]
+    fn approval_backend_selection_fails_closed() {
+        use ApprovalBackendKind::*;
+        // Default and explicit native without the env marker.
+        assert_eq!(select_approval_backend(None, false).unwrap(), Native);
+        assert_eq!(
+            select_approval_backend(Some("native"), false).unwrap(),
+            Native
+        );
+        // Env marker set but backend not selected → refuse.
+        assert!(select_approval_backend(None, true).is_err());
+        assert!(select_approval_backend(Some("native"), true).is_err());
+        // Insecure backend requested without the env marker → refuse.
+        assert!(select_approval_backend(Some("insecure_auto_approve"), false).is_err());
+        // Both present → activate.
+        assert_eq!(
+            select_approval_backend(Some("insecure_auto_approve"), true).unwrap(),
+            InsecureAutoApprove
+        );
+        // Unknown value → refuse.
+        assert!(select_approval_backend(Some("nope"), false).is_err());
+    }
+
+    #[tokio::test]
+    async fn logout_emits_identity_logout_event() {
+        let (_dir, state, audit) = make_test_state_with_identity_audit();
+        let rt = state.identity.as_ref().unwrap();
+        // Bootstrap a human + active session.
+        let p = rt
+            .store
+            .upsert_human(
+                "https://idp.example.com",
+                "u1",
+                Some("dev@example.com"),
+                None,
+                &Default::default(),
+            )
+            .unwrap();
+        rt.store
+            .create_human_session(&p.id, 3600, "https://idp.example.com")
+            .unwrap();
+        let req = Request {
+            id: 1,
+            method: "identity.logout".into(),
+            params: serde_json::json!({}),
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        assert!(resp.error.is_none());
+        assert!(
+            audit
+                .events()
+                .iter()
+                .any(|e| e.kind == AuditEventKind::IdentityLogout),
+            "logout must emit an IdentityLogout audit event"
+        );
+    }
+
+    #[tokio::test]
+    async fn role_set_emits_role_changed_event() {
+        let (_dir, state, audit) = make_test_state_with_identity_audit();
+        let rt = state.identity.as_ref().unwrap();
+        // Bootstrap admin with an active session, plus a target principal.
+        let admin = rt
+            .store
+            .upsert_human(
+                "https://idp.example.com",
+                "admin",
+                Some("admin@example.com"),
+                None,
+                &[opaque_core::identity::Role::Admin].into_iter().collect(),
+            )
+            .unwrap();
+        rt.store
+            .create_human_session(&admin.id, 3600, "https://idp.example.com")
+            .unwrap();
+        let target = rt.store.upsert_service("ci").unwrap();
+        let req = Request {
+            id: 1,
+            method: "identity.role_set".into(),
+            params: serde_json::json!({
+                "principal_id": target.id.as_str(),
+                "roles": ["operator"],
+            }),
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        assert!(resp.error.is_none(), "role_set failed: {:?}", resp.error);
+        assert!(
+            audit
+                .events()
+                .iter()
+                .any(|e| e.kind == AuditEventKind::IdentityRoleChanged),
+            "role_set must emit an IdentityRoleChanged audit event"
+        );
     }
 
     // -----------------------------------------------------------------------

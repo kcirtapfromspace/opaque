@@ -344,6 +344,14 @@ pub struct ApprovalConfig {
     /// If true, the approval is consumed after a single use.
     #[serde(default)]
     pub one_time: bool,
+
+    /// Break-glass segregation of duties: the approver must be a different
+    /// principal than the one the operation is performed on behalf of
+    /// (`sub`). Fails closed when the request carries no principal context
+    /// or the approver identity is unknown. Requires an approval mode other
+    /// than `never` — the enclave rejects the combination as misconfigured.
+    #[serde(default)]
+    pub require_distinct_approver: bool,
 }
 
 impl Default for ApprovalConfig {
@@ -353,6 +361,7 @@ impl Default for ApprovalConfig {
             factors: vec![],
             lease_ttl: None,
             one_time: false,
+            require_distinct_approver: false,
         }
     }
 }
@@ -504,6 +513,10 @@ pub struct PolicyDecision {
     /// If true, the approval is consumed after one use.
     pub one_time: bool,
 
+    /// If true, the approver must differ from the request's `sub` principal.
+    #[serde(default)]
+    pub require_distinct_approver: bool,
+
     /// Name of the rule that matched (for audit).
     pub matched_rule: Option<String>,
 
@@ -520,6 +533,7 @@ impl PolicyDecision {
             approval_requirement: ApprovalRequirement::Never,
             lease_ttl: None,
             one_time: false,
+            require_distinct_approver: false,
             matched_rule: None,
             denial_reason: Some(reason.into()),
         }
@@ -604,6 +618,7 @@ impl PolicyEngine {
                         approval_requirement: ApprovalRequirement::Never,
                         lease_ttl: None,
                         one_time: false,
+                        require_distinct_approver: false,
                         matched_rule: Some(rule.name.clone()),
                         denial_reason: Some(format!("denied by rule: {}", rule.name)),
                     };
@@ -619,6 +634,7 @@ impl PolicyEngine {
                     approval_requirement: rule.approval.require,
                     lease_ttl: rule.approval.lease_ttl,
                     one_time: rule.approval.one_time,
+                    require_distinct_approver: rule.approval.require_distinct_approver,
                     matched_rule: Some(rule.name.clone()),
                     denial_reason: None,
                 };
@@ -705,6 +721,7 @@ mod tests {
                 factors: vec![ApprovalFactor::LocalBio],
                 lease_ttl: None,
                 one_time: true,
+                require_distinct_approver: false,
             },
         }
     }
@@ -800,6 +817,7 @@ mod tests {
             approval_requirement: ApprovalRequirement::Never,
             lease_ttl: None,
             one_time: false,
+            require_distinct_approver: false,
             matched_rule: Some("test-rule".into()),
             denial_reason: None,
         };
@@ -952,6 +970,7 @@ mod tests {
             approval_requirement: ApprovalRequirement::Never,
             lease_ttl: None,
             one_time: false,
+            require_distinct_approver: false,
             matched_rule: None,
             denial_reason: None,
         };
@@ -966,6 +985,7 @@ mod tests {
             approval_requirement: ApprovalRequirement::Never,
             lease_ttl: None,
             one_time: false,
+            require_distinct_approver: false,
             matched_rule: None,
             denial_reason: None,
         };
@@ -979,6 +999,7 @@ mod tests {
             factors: vec![ApprovalFactor::LocalBio],
             lease_ttl: Some(Duration::from_secs(300)),
             one_time: false,
+            require_distinct_approver: false,
         };
         let json = serde_json::to_string(&config).unwrap();
         let roundtripped: ApprovalConfig = serde_json::from_str(&json).unwrap();
@@ -992,6 +1013,7 @@ mod tests {
             factors: vec![],
             lease_ttl: None,
             one_time: true,
+            require_distinct_approver: false,
         };
         let json = serde_json::to_string(&config).unwrap();
         assert!(!json.contains("lease_ttl"));

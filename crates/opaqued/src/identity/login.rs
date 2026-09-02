@@ -156,7 +156,8 @@ impl IdentityRuntime {
             )
             .await;
             if result.is_err() {
-                runtime.attempts.set_outcome(
+                finish_attempt(
+                    &runtime,
                     &task_attempt_id,
                     AttemptOutcome::Failed {
                         reason: "login timed out".into(),
@@ -209,7 +210,8 @@ async fn run_callback_listener(
             Ok(x) => x,
             Err(e) => {
                 warn!("login callback accept error: {e}");
-                runtime.attempts.set_outcome(
+                finish_attempt(
+                    &runtime,
                     &attempt_id,
                     AttemptOutcome::Failed {
                         reason: "callback listener failed".into(),
@@ -254,7 +256,8 @@ async fn run_callback_listener(
                 .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
                 .take(64)
                 .collect();
-            runtime.attempts.set_outcome(
+            finish_attempt(
+                &runtime,
                 &attempt_id,
                 AttemptOutcome::Failed {
                     reason: format!("identity provider reported: {code}"),
@@ -265,7 +268,8 @@ async fn run_callback_listener(
         }
 
         let Some(code) = params.get("code") else {
-            runtime.attempts.set_outcome(
+            finish_attempt(
+                &runtime,
                 &attempt_id,
                 AttemptOutcome::Failed {
                     reason: "callback missing authorization code".into(),
@@ -280,17 +284,58 @@ async fn run_callback_listener(
             AttemptOutcome::Done { .. } => (200, SUCCESS_PAGE),
             _ => (200, ERROR_PAGE),
         };
-        runtime.attempts.set_outcome(&attempt_id, outcome);
+        finish_attempt(&runtime, &attempt_id, outcome);
         let _ = respond_html(&mut stream, status, page).await;
         return;
     }
 
-    runtime.attempts.set_outcome(
+    finish_attempt(
+        &runtime,
         &attempt_id,
         AttemptOutcome::Failed {
             reason: "too many stray requests on the callback listener".into(),
         },
     );
+}
+
+/// Record a terminal attempt outcome AND emit its identity audit event.
+/// All terminal login paths go through here so the audit trail can never
+/// disagree with what the CLI is told.
+fn finish_attempt(runtime: &Arc<IdentityRuntime>, attempt_id: &str, outcome: AttemptOutcome) {
+    use opaque_core::audit::{AuditEvent, AuditEventKind};
+    match &outcome {
+        AttemptOutcome::Done { session_id } => {
+            let label = runtime
+                .store
+                .get_human_session(session_id)
+                .ok()
+                .flatten()
+                .and_then(|s| runtime.store.get_principal(&s.principal_id).ok().flatten())
+                .map(|p| p.display_label())
+                .unwrap_or_else(|| "unknown".into());
+            runtime.emit_audit(
+                AuditEvent::new(AuditEventKind::IdentityLoginSucceeded)
+                    .with_operation("identity.login")
+                    .with_outcome("ok")
+                    .with_detail(format!(
+                        "principal={label} issuer={}",
+                        runtime.config.issuer
+                    )),
+            );
+        }
+        AttemptOutcome::Failed { reason } => {
+            // Reasons are already sanitized at their construction sites —
+            // never raw IdP/token material.
+            runtime.emit_audit(
+                AuditEvent::new(AuditEventKind::IdentityLoginFailed)
+                    .with_operation("identity.login")
+                    .with_outcome("failed")
+                    .with_detail(reason.clone()),
+            );
+        }
+        AttemptOutcome::Pending => {}
+    }
+    runtime.attempts.set_outcome(attempt_id, outcome);
 }
 
 /// Exchange + verify + persist. Returns the terminal outcome.

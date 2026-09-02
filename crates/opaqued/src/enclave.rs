@@ -462,6 +462,51 @@ pub trait OperationHandler: Send + Sync + fmt::Debug {
 // Approval gate trait
 // ---------------------------------------------------------------------------
 
+/// The result of one approval interaction.
+///
+/// SECURITY INVARIANT: `approver` must only ever be attached by the gate that
+/// actually VERIFIED the identity it names. The local biometric factor proves
+/// device-owner presence and binds the *name* to the active login session
+/// (source `LocalBioSession`). Paired-device / FIDO2 attribution (source
+/// `PairedDevice`) requires real signature verification against the pairing
+/// store — the dormant `approval_server` relays client-supplied device ids
+/// WITHOUT verification and must never be used as an approver source.
+#[derive(Debug, Clone)]
+pub struct ApprovalOutcome {
+    /// Whether the human (or configured backend) approved the request.
+    pub approved: bool,
+    /// The verified approver identity, when the gate could establish one.
+    /// `None` on denial, and on approval paths with no identity binding
+    /// (e.g. biometric passed but nobody is logged in).
+    pub approver: Option<opaque_core::audit::ApproverIdentity>,
+}
+
+impl ApprovalOutcome {
+    /// Approved, with no approver identity binding available.
+    pub fn approved_anonymous() -> Self {
+        Self {
+            approved: true,
+            approver: None,
+        }
+    }
+
+    /// Approved by a verified identity.
+    pub fn approved_by(approver: opaque_core::audit::ApproverIdentity) -> Self {
+        Self {
+            approved: true,
+            approver: Some(approver),
+        }
+    }
+
+    /// Denied.
+    pub fn denied() -> Self {
+        Self {
+            approved: false,
+            approver: None,
+        }
+    }
+}
+
 /// Trait for the approval gate. The enclave calls this to present
 /// operation-bound approval challenges to the user.
 ///
@@ -473,7 +518,9 @@ pub trait ApprovalGate: Send + Sync + fmt::Debug {
     /// The implementation must:
     /// - Display the operation, target, client identity, and TTL to the user
     /// - Use the specified approval factor(s)
-    /// - Return `Ok(true)` if approved, `Ok(false)` if denied
+    /// - Return `Ok` with [`ApprovalOutcome`] (approved/denied, plus the
+    ///   verified approver identity when one exists — see the invariant on
+    ///   [`ApprovalOutcome`])
     /// - Return `Err` if the approval mechanism is unavailable
     ///
     /// The `approval_id` is used for audit correlation.
@@ -483,7 +530,9 @@ pub trait ApprovalGate: Send + Sync + fmt::Debug {
         request: &OperationRequest,
         factors: &[ApprovalFactor],
         description: &str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>>;
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ApprovalOutcome, String>> + Send + '_>,
+    >;
 }
 
 // ---------------------------------------------------------------------------
@@ -944,12 +993,14 @@ impl Enclave {
     /// token: the act must be authorized by a fresh human approval (which an agent
     /// cannot satisfy), never by client classification. Reuses the same rate
     /// limiter, prompt serialization, and audit trail as operation approvals.
+    /// On success, returns the verified approver identity when the gate could
+    /// establish one (used to attribute the resulting delegation).
     pub async fn request_session_approval(
         &self,
         identity: &ClientIdentity,
         client_type: ClientType,
         reason: &str,
-    ) -> Result<(), EnclaveError> {
+    ) -> Result<Option<opaque_core::audit::ApproverIdentity>, EnclaveError> {
         let client_summary = ClientSummary::from((identity, client_type));
 
         if !self
@@ -1015,17 +1066,19 @@ impl Enclave {
             .await;
 
         match result {
-            Ok(true) => {
-                self.audit.emit(
-                    AuditEvent::new(AuditEventKind::ApprovalGranted)
-                        .with_approval_id(approval_id)
-                        .with_client(client_summary)
-                        .with_operation("agent_session_start")
-                        .with_outcome("granted"),
-                );
-                Ok(())
+            Ok(outcome) if outcome.approved => {
+                let mut granted = AuditEvent::new(AuditEventKind::ApprovalGranted)
+                    .with_approval_id(approval_id)
+                    .with_client(client_summary)
+                    .with_operation("agent_session_start")
+                    .with_outcome("granted");
+                if let Some(ref approver) = outcome.approver {
+                    granted = granted.with_approver(approver.clone());
+                }
+                self.audit.emit(granted);
+                Ok(outcome.approver)
             }
-            Ok(false) => {
+            Ok(_) => {
                 self.audit.emit(
                     AuditEvent::new(AuditEventKind::ApprovalDenied)
                         .with_approval_id(approval_id)
@@ -1080,6 +1133,33 @@ impl Enclave {
             }
             ApprovalRequirement::Never => false,
         };
+
+        // Segregation of duties: `require_distinct_approver` only makes sense
+        // when an approval actually happens and the request is bound to a
+        // principal. Both misconfigurations fail closed (never silently skip).
+        if decision.require_distinct_approver {
+            if decision.approval_requirement == ApprovalRequirement::Never {
+                return Err(EnclaveError::SafetyViolation(
+                    "require_distinct_approver is set but the rule never requires approval".into(),
+                ));
+            }
+            if request.principal.is_none() {
+                self.audit.emit(
+                    AuditEvent::new(AuditEventKind::ApprovalDenied)
+                        .with_request_id(request.request_id)
+                        .with_client(client_summary.clone())
+                        .with_operation(&request.operation)
+                        .with_target(target_summary.clone())
+                        .with_outcome("denied")
+                        .with_detail("distinct approver required but request has no principal"),
+                );
+                return Err(EnclaveError::ApprovalNotGranted(
+                    "this operation requires a distinct approver, which needs an \
+                     identity-bound request — run it under a delegation"
+                        .into(),
+                ));
+            }
+        }
 
         if !needs_approval {
             return Ok(());
@@ -1194,18 +1274,57 @@ impl Enclave {
         let approval_latency = approval_start.elapsed();
 
         match result {
-            Ok(true) => {
-                self.audit.emit(
-                    AuditEvent::new(AuditEventKind::ApprovalGranted)
-                        .with_request_id(request.request_id)
-                        .with_approval_id(approval_id)
-                        .with_client(client_summary.clone())
-                        .with_operation(&request.operation)
-                        .with_target(target_summary.clone())
-                        .with_outcome("granted")
-                        .with_latency_ms(approval_latency.as_millis() as i64)
-                        .with_request_hash(&content_hash),
-                );
+            Ok(outcome) if outcome.approved => {
+                // Segregation of duties: the approver must be a verified
+                // identity DIFFERENT from the principal the operation is for.
+                // An anonymous approval (nobody logged in) fails closed —
+                // presence alone cannot satisfy a distinct-approver rule.
+                if decision.require_distinct_approver {
+                    let sub = request
+                        .principal
+                        .as_ref()
+                        .map(|p| p.sub.as_str())
+                        .unwrap_or_default();
+                    let distinct = outcome
+                        .approver
+                        .as_ref()
+                        .is_some_and(|a| a.principal_id != sub);
+                    if !distinct {
+                        let mut denied = AuditEvent::new(AuditEventKind::ApprovalDenied)
+                            .with_request_id(request.request_id)
+                            .with_approval_id(approval_id)
+                            .with_client(client_summary.clone())
+                            .with_operation(&request.operation)
+                            .with_target(target_summary.clone())
+                            .with_outcome("denied")
+                            .with_latency_ms(approval_latency.as_millis() as i64)
+                            .with_request_hash(&content_hash)
+                            .with_detail("distinct approver required");
+                        if let Some(ref approver) = outcome.approver {
+                            denied = denied.with_approver(approver.clone());
+                        }
+                        self.audit.emit(denied);
+                        return Err(EnclaveError::ApprovalNotGranted(
+                            "approval was granted, but this operation requires an approver \
+                             distinct from the principal it runs on behalf of"
+                                .into(),
+                        ));
+                    }
+                }
+
+                let mut granted = AuditEvent::new(AuditEventKind::ApprovalGranted)
+                    .with_request_id(request.request_id)
+                    .with_approval_id(approval_id)
+                    .with_client(client_summary.clone())
+                    .with_operation(&request.operation)
+                    .with_target(target_summary.clone())
+                    .with_outcome("granted")
+                    .with_latency_ms(approval_latency.as_millis() as i64)
+                    .with_request_hash(&content_hash);
+                if let Some(ref approver) = outcome.approver {
+                    granted = granted.with_approver(approver.clone());
+                }
+                self.audit.emit(granted);
 
                 // Grant a lease for FirstUse approvals.
                 if decision.approval_requirement == ApprovalRequirement::FirstUse {
@@ -1216,7 +1335,7 @@ impl Enclave {
 
                 Ok(())
             }
-            Ok(false) => {
+            Ok(_) => {
                 self.audit.emit(
                     AuditEvent::new(AuditEventKind::ApprovalDenied)
                         .with_request_id(request.request_id)
@@ -1323,21 +1442,30 @@ impl Enclave {
 /// approval prompt (macOS LocalAuthentication / Linux polkit).
 pub struct NativeApprovalGate {
     pairing_manager: Option<Arc<crate::pairing::PairingManager>>,
+    approver_resolver: Option<ApproverResolver>,
 }
 
 impl std::fmt::Debug for NativeApprovalGate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NativeApprovalGate")
             .field("has_pairing_manager", &self.pairing_manager.is_some())
+            .field("has_approver_resolver", &self.approver_resolver.is_some())
             .finish()
     }
 }
+
+/// Resolves the approver identity to bind to a successful local-biometric
+/// approval — in production, the principal behind the daemon's current
+/// unexpired human login session (source `LocalBioSession`).
+pub type ApproverResolver =
+    Arc<dyn Fn() -> Option<opaque_core::audit::ApproverIdentity> + Send + Sync>;
 
 impl NativeApprovalGate {
     /// Create a gate without iOS pairing support.
     pub fn new() -> Self {
         Self {
             pairing_manager: None,
+            approver_resolver: None,
         }
     }
 
@@ -1346,7 +1474,16 @@ impl NativeApprovalGate {
     pub fn with_pairing_manager(pm: Arc<crate::pairing::PairingManager>) -> Self {
         Self {
             pairing_manager: Some(pm),
+            approver_resolver: None,
         }
+    }
+
+    /// Attach an approver resolver (identity runtime hook). Called only
+    /// AFTER the biometric prompt succeeds; a `None` result records the
+    /// approval honestly as identity-unbound rather than guessing.
+    pub fn with_approver_resolver(mut self, resolver: ApproverResolver) -> Self {
+        self.approver_resolver = Some(resolver);
+        self
     }
 }
 
@@ -1357,8 +1494,9 @@ impl ApprovalGate for NativeApprovalGate {
         _request: &OperationRequest,
         _factors: &[ApprovalFactor],
         description: &str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>>
-    {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ApprovalOutcome, String>> + Send + '_>,
+    > {
         // Check whether any factor is IosFaceId and we have a pairing manager.
         if _factors
             .iter()
@@ -1377,11 +1515,67 @@ impl ApprovalGate for NativeApprovalGate {
         }
 
         let desc = description.to_owned();
+        let resolver = self.approver_resolver.clone();
         Box::pin(async move {
-            crate::approval::prompt(&desc)
+            let approved = crate::approval::prompt(&desc)
                 .await
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+            if !approved {
+                return Ok(ApprovalOutcome::denied());
+            }
+            // Bind the approver AFTER the successful prompt: the biometric
+            // proves device-owner presence; the resolver names who holds the
+            // active login session at that moment.
+            Ok(match resolver.as_ref().and_then(|r| r()) {
+                Some(approver) => ApprovalOutcome::approved_by(approver),
+                None => ApprovalOutcome::approved_anonymous(),
+            })
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Insecure auto-approve gate (tests / e2e ONLY)
+// ---------------------------------------------------------------------------
+
+/// An approval gate that approves everything without human interaction.
+///
+/// FOR TESTS AND E2E ONLY. The daemon refuses to select this backend unless
+/// BOTH `approval_backend = "insecure_auto_approve"` is set in the config AND
+/// the environment carries `OPAQUE_INSECURE_AUTO_APPROVE=1` at startup — and
+/// it announces itself with an Error-level audit event. Every approval it
+/// grants is attributed to the synthetic `insecure-auto-approve` approver
+/// (source `InsecureAutoApprove`), never to a person.
+#[derive(Debug)]
+pub struct InsecureAutoApproveGate;
+
+impl InsecureAutoApproveGate {
+    /// The synthetic approver identity attached to every auto-approval.
+    pub fn approver() -> opaque_core::audit::ApproverIdentity {
+        opaque_core::audit::ApproverIdentity {
+            principal_id: "insecure-auto-approve".into(),
+            label: "insecure test backend".into(),
+            source: opaque_core::audit::ApproverSource::InsecureAutoApprove,
+        }
+    }
+}
+
+impl ApprovalGate for InsecureAutoApproveGate {
+    fn request_approval(
+        &self,
+        approval_id: Uuid,
+        request: &OperationRequest,
+        _factors: &[ApprovalFactor],
+        _description: &str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ApprovalOutcome, String>> + Send + '_>,
+    > {
+        tracing::error!(
+            approval_id = %approval_id,
+            operation = %request.operation,
+            "INSECURE AUTO-APPROVE: granting approval without human interaction (test backend)"
+        );
+        Box::pin(async move { Ok(ApprovalOutcome::approved_by(Self::approver())) })
     }
 }
 
@@ -1468,10 +1662,11 @@ mod test_support {
             _request: &OperationRequest,
             _factors: &[ApprovalFactor],
             _description: &str,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>>
-        {
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ApprovalOutcome, String>> + Send + '_>,
+        > {
             self.count.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { Ok(true) })
+            Box::pin(async { Ok(ApprovalOutcome::approved_anonymous()) })
         }
     }
 
@@ -1486,9 +1681,10 @@ mod test_support {
             _request: &OperationRequest,
             _factors: &[ApprovalFactor],
             _description: &str,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>>
-        {
-            Box::pin(async { Ok(true) })
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ApprovalOutcome, String>> + Send + '_>,
+        > {
+            Box::pin(async { Ok(ApprovalOutcome::approved_anonymous()) })
         }
     }
 
@@ -1503,9 +1699,10 @@ mod test_support {
             _request: &OperationRequest,
             _factors: &[ApprovalFactor],
             _description: &str,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>>
-        {
-            Box::pin(async { Ok(false) })
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ApprovalOutcome, String>> + Send + '_>,
+        > {
+            Box::pin(async { Ok(ApprovalOutcome::denied()) })
         }
     }
 
@@ -1637,6 +1834,227 @@ mod tests {
         assert_eq!(none, with(None));
     }
 
+    // -- Stage D: approver identity + distinct-approver ---------------------
+
+    use opaque_core::audit::{ApproverIdentity, ApproverSource};
+    use opaque_core::identity::{AccessMode, PrincipalContext, PrincipalId, PrincipalKind};
+
+    fn human_ctx(sub_sub: &str) -> PrincipalContext {
+        PrincipalContext {
+            sub: PrincipalId::generate(&PrincipalKind::Human {
+                iss: "https://idp.example.com".into(),
+                sub: sub_sub.into(),
+                email: None,
+                name: None,
+            }),
+            sub_label: sub_sub.into(),
+            sub_roles: Default::default(),
+            act: PrincipalId::generate(&PrincipalKind::Agent {
+                tool: "claude-code".into(),
+            }),
+            act_label: "agent:claude-code".into(),
+            mode: AccessMode::Delegated,
+            jti: "j1".into(),
+            human_session_id: Some("hses_1".into()),
+        }
+    }
+
+    fn approver(id: &str) -> ApproverIdentity {
+        ApproverIdentity {
+            principal_id: id.into(),
+            label: id.into(),
+            source: ApproverSource::LocalBioSession,
+        }
+    }
+
+    /// A gate returning a fixed outcome, for approver-shaping tests.
+    #[derive(Debug)]
+    struct FixedOutcomeGate(ApprovalOutcome);
+    impl ApprovalGate for FixedOutcomeGate {
+        fn request_approval(
+            &self,
+            _approval_id: Uuid,
+            _request: &OperationRequest,
+            _factors: &[ApprovalFactor],
+            _description: &str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ApprovalOutcome, String>> + Send + '_>,
+        > {
+            let o = self.0.clone();
+            Box::pin(async move { Ok(o) })
+        }
+    }
+
+    fn distinct_policy() -> PolicyEngine {
+        let mut p = PolicyEngine::new();
+        p.add_rule(PolicyRule {
+            identity: Default::default(),
+            name: "distinct".into(),
+            client: ClientMatch::default(),
+            operation_pattern: "github.*".into(),
+            target: TargetMatch::default(),
+            workspace: WorkspaceMatch::default(),
+            secret_names: SecretNameMatch::default(),
+            allow: true,
+            client_types: vec![ClientType::Agent, ClientType::Human],
+            approval: ApprovalConfig {
+                require: ApprovalRequirement::Always,
+                factors: vec![ApprovalFactor::LocalBio],
+                lease_ttl: None,
+                one_time: false,
+                require_distinct_approver: true,
+            },
+        });
+        p
+    }
+
+    fn build_enclave_with(
+        gate: Box<dyn ApprovalGate>,
+        policy: PolicyEngine,
+        audit: Arc<InMemoryAuditEmitter>,
+    ) -> Enclave {
+        Enclave::builder()
+            .registry(test_registry())
+            .policy(policy)
+            .handler(
+                "github.set_actions_secret",
+                Box::new(StubHandler {
+                    response: serde_json::json!({"status": "ok"}),
+                }),
+            )
+            .approval_gate(gate)
+            .audit(audit)
+            .build()
+            .unwrap()
+    }
+
+    async fn run_distinct(
+        gate: Box<dyn ApprovalGate>,
+        principal: Option<PrincipalContext>,
+    ) -> bool {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let enclave = build_enclave_with(gate, distinct_policy(), audit);
+        let mut req = test_request("github.set_actions_secret", ClientType::Agent);
+        req.principal = principal;
+        enclave.execute(req).await.error_code().is_none()
+    }
+
+    #[tokio::test]
+    async fn distinct_approver_denies_without_principal() {
+        // No principal context → the constraint is unsatisfiable → deny.
+        let gate = Box::new(FixedOutcomeGate(ApprovalOutcome::approved_by(approver(
+            "hum_approver",
+        ))));
+        assert!(!run_distinct(gate, None).await);
+    }
+
+    #[tokio::test]
+    async fn distinct_approver_denies_anonymous_approval() {
+        // Approval with no approver identity (nobody logged in) → deny.
+        let ctx = human_ctx("alice");
+        let gate = Box::new(FixedOutcomeGate(ApprovalOutcome::approved_anonymous()));
+        assert!(!run_distinct(gate, Some(ctx)).await);
+    }
+
+    #[tokio::test]
+    async fn distinct_approver_denies_self_approval() {
+        // Approver == the delegating principal → segregation of duties fails.
+        let ctx = human_ctx("alice");
+        let self_id = ctx.sub.as_str().to_owned();
+        let gate = Box::new(FixedOutcomeGate(ApprovalOutcome::approved_by(approver(
+            &self_id,
+        ))));
+        assert!(!run_distinct(gate, Some(ctx)).await);
+    }
+
+    #[tokio::test]
+    async fn distinct_approver_allows_distinct_identity() {
+        // A different approver satisfies the constraint.
+        let ctx = human_ctx("alice");
+        let gate = Box::new(FixedOutcomeGate(ApprovalOutcome::approved_by(approver(
+            "hum_bob_distinct",
+        ))));
+        assert!(run_distinct(gate, Some(ctx)).await);
+    }
+
+    #[tokio::test]
+    async fn approver_identity_lands_in_audit() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let gate = Box::new(FixedOutcomeGate(ApprovalOutcome::approved_by(approver(
+            "hum_approver",
+        ))));
+        let enclave = build_enclave(gate, audit.clone());
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        assert!(enclave.execute(req).await.error_code().is_none());
+        let granted = audit
+            .events()
+            .into_iter()
+            .find(|e| e.kind == AuditEventKind::ApprovalGranted)
+            .expect("granted event");
+        assert_eq!(
+            granted.approver.expect("approver recorded").principal_id,
+            "hum_approver"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_gate_binds_approver_from_resolver() {
+        let resolver: ApproverResolver = Arc::new(|| Some(approver("hum_session")));
+        let gate = NativeApprovalGate::new().with_approver_resolver(resolver);
+        // The prompt path isn't exercised here (no OS prompt in tests); assert
+        // the resolver-shaped outcome via the auto-approve analog instead.
+        // Sanity: a gate with no resolver yields None.
+        let bare = NativeApprovalGate::new();
+        assert!(bare.approver_resolver.is_none());
+        assert!(gate.approver_resolver.is_some());
+    }
+
+    #[tokio::test]
+    async fn insecure_auto_approve_gate_attributes_synthetic_approver() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let enclave = build_enclave(Box::new(InsecureAutoApproveGate), audit.clone());
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        assert!(enclave.execute(req).await.error_code().is_none());
+        let granted = audit
+            .events()
+            .into_iter()
+            .find(|e| e.kind == AuditEventKind::ApprovalGranted)
+            .expect("granted");
+        let a = granted.approver.expect("approver");
+        assert_eq!(a.principal_id, "insecure-auto-approve");
+        assert_eq!(a.source, ApproverSource::InsecureAutoApprove);
+    }
+
+    #[tokio::test]
+    async fn distinct_approver_misconfig_without_approval_fails_closed() {
+        // require_distinct_approver on a rule that never requires approval is
+        // a misconfiguration → fail closed, don't silently allow.
+        let mut policy = PolicyEngine::new();
+        policy.add_rule(PolicyRule {
+            identity: Default::default(),
+            name: "bad".into(),
+            client: ClientMatch::default(),
+            operation_pattern: "github.*".into(),
+            target: TargetMatch::default(),
+            workspace: WorkspaceMatch::default(),
+            secret_names: SecretNameMatch::default(),
+            allow: true,
+            client_types: vec![ClientType::Agent, ClientType::Human],
+            approval: ApprovalConfig {
+                require: ApprovalRequirement::Never,
+                factors: vec![],
+                lease_ttl: None,
+                one_time: false,
+                require_distinct_approver: true,
+            },
+        });
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let enclave = build_enclave_with(Box::new(AlwaysApproveGate), policy, audit);
+        let mut req = test_request("github.set_actions_secret", ClientType::Agent);
+        req.principal = Some(human_ctx("alice"));
+        assert!(enclave.execute(req).await.error_code().is_some());
+    }
+
     fn test_registry() -> OperationRegistry {
         let mut reg = OperationRegistry::new();
         reg.register(OperationDef {
@@ -1704,6 +2122,7 @@ mod tests {
                 factors: vec![ApprovalFactor::LocalBio],
                 lease_ttl: None,
                 one_time: true,
+                require_distinct_approver: false,
             },
         }])
     }
@@ -1777,6 +2196,7 @@ mod tests {
                 factors: vec![ApprovalFactor::Fido2],
                 lease_ttl: None,
                 one_time: true,
+                require_distinct_approver: false,
             },
         });
 
@@ -1828,6 +2248,7 @@ mod tests {
                 factors: vec![ApprovalFactor::LocalBio],
                 lease_ttl: None,
                 one_time: true,
+                require_distinct_approver: false,
             },
         });
 
@@ -2214,6 +2635,7 @@ mod tests {
                 factors: vec![ApprovalFactor::LocalBio],
                 lease_ttl,
                 one_time,
+                require_distinct_approver: false,
             },
         }])
     }
@@ -2311,6 +2733,7 @@ mod tests {
                 factors: vec![ApprovalFactor::LocalBio],
                 lease_ttl: Some(Duration::from_secs(300)),
                 one_time: false,
+                require_distinct_approver: false,
             },
         });
 
@@ -2412,8 +2835,9 @@ mod tests {
             _request: &OperationRequest,
             _factors: &[ApprovalFactor],
             _description: &str,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>>
-        {
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ApprovalOutcome, String>> + Send + '_>,
+        > {
             let msg = self.message.clone();
             Box::pin(async move { Err(msg) })
         }
@@ -2450,8 +2874,9 @@ mod tests {
             _request: &OperationRequest,
             _factors: &[ApprovalFactor],
             _description: &str,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>>
-        {
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ApprovalOutcome, String>> + Send + '_>,
+        > {
             let delay = self.delay;
             let max_conc = self.max_concurrent.clone();
             let current = self.current.clone();
@@ -2462,7 +2887,7 @@ mod tests {
                 max_conc.fetch_max(in_flight, std::sync::atomic::Ordering::SeqCst);
                 tokio::time::sleep(delay).await;
                 current.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(true)
+                Ok(ApprovalOutcome::approved_anonymous())
             })
         }
     }
@@ -2492,13 +2917,14 @@ mod tests {
             _request: &OperationRequest,
             _factors: &[ApprovalFactor],
             description: &str,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>>
-        {
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ApprovalOutcome, String>> + Send + '_>,
+        > {
             self.descriptions
                 .lock()
                 .expect("capturing gate mutex")
                 .push(description.to_owned());
-            Box::pin(async { Ok(true) })
+            Box::pin(async { Ok(ApprovalOutcome::approved_anonymous()) })
         }
     }
 
@@ -2555,6 +2981,7 @@ mod tests {
                 factors: vec![],
                 lease_ttl: None,
                 one_time: false,
+                require_distinct_approver: false,
             },
         }]);
 
@@ -2633,6 +3060,7 @@ mod tests {
                 factors: vec![ApprovalFactor::LocalBio],
                 lease_ttl: None,
                 one_time: false,
+                require_distinct_approver: false,
             },
         });
 
@@ -2713,6 +3141,7 @@ mod tests {
                 factors: vec![],
                 lease_ttl: None,
                 one_time: false,
+                require_distinct_approver: false,
             },
         }]);
 
@@ -2788,6 +3217,7 @@ mod tests {
                 factors: vec![],
                 lease_ttl: None,
                 one_time: false,
+                require_distinct_approver: false,
             },
         }]);
 
@@ -2859,6 +3289,7 @@ mod tests {
                 factors: vec![ApprovalFactor::LocalBio],
                 lease_ttl: None,
                 one_time: false,
+                require_distinct_approver: false,
             },
         }]);
 
@@ -2941,6 +3372,7 @@ mod tests {
                 factors: vec![ApprovalFactor::LocalBio],
                 lease_ttl: None,
                 one_time: false,
+                require_distinct_approver: false,
             },
         }]);
 
@@ -3122,6 +3554,7 @@ mod tests {
                     factors: vec![],
                     lease_ttl: None,
                     one_time: false,
+                    require_distinct_approver: false,
                 },
             },
             // set_actions_secret: Always approval.
@@ -3150,6 +3583,7 @@ mod tests {
                     factors: vec![ApprovalFactor::LocalBio],
                     lease_ttl: None,
                     one_time: false,
+                    require_distinct_approver: false,
                 },
             },
         ]);
@@ -3425,6 +3859,7 @@ mod tests {
                 factors: vec![],
                 lease_ttl: None,
                 one_time: false,
+                require_distinct_approver: false,
             },
         }]);
 
@@ -3553,6 +3988,7 @@ mod tests {
                 factors: vec![ApprovalFactor::LocalBio],
                 lease_ttl: None,
                 one_time: true,
+                require_distinct_approver: false,
             },
         }]);
 

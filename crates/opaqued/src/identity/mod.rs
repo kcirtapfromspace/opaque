@@ -127,6 +127,9 @@ pub struct IdentityRuntime {
     pub(crate) oidc: tokio::sync::Mutex<Option<Arc<OidcClient>>>,
     /// Pending browser-login attempts.
     pub(crate) attempts: LoginAttempts,
+    /// Audit sink for identity lifecycle events (login/logout/role changes).
+    /// `None` only in unit tests; the daemon always wires it.
+    pub(crate) audit: Option<Arc<dyn opaque_core::audit::AuditSink>>,
 }
 
 impl IdentityRuntime {
@@ -184,7 +187,21 @@ impl IdentityRuntime {
             http,
             oidc: tokio::sync::Mutex::new(None),
             attempts: LoginAttempts::default(),
+            audit: None,
         })
+    }
+
+    /// Attach the daemon's audit sink for identity lifecycle events.
+    pub fn with_audit(mut self, sink: Arc<dyn opaque_core::audit::AuditSink>) -> Self {
+        self.audit = Some(sink);
+        self
+    }
+
+    /// Emit an identity lifecycle audit event (no-op without a sink).
+    pub(crate) fn emit_audit(&self, event: opaque_core::audit::AuditEvent) {
+        if let Some(sink) = &self.audit {
+            sink.emit(event);
+        }
     }
 
     /// Discovery, cached after the first successful fetch.
