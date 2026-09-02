@@ -532,12 +532,18 @@ pub fn format_response(method: &str, result: &serde_json::Value) {
             header("Client Identity");
             if let Some(obj) = result.as_object() {
                 for (k, v) in obj {
+                    // The logged-in principal is rendered as its own
+                    // section below, not as a raw JSON blob.
+                    if k == "identity" || k == "identity_required" {
+                        continue;
+                    }
                     let val = match v {
                         serde_json::Value::String(s) => s.clone(),
                         other => other.to_string(),
                     };
                     kv(k, &val);
                 }
+                format_whoami_identity(obj);
             } else {
                 print_json(result);
             }
@@ -556,6 +562,18 @@ pub fn format_response(method: &str, result: &serde_json::Value) {
         }
         "agent_session_end" => {
             format_agent_session_end_result(result);
+        }
+        "identity.logout" => {
+            format_identity_logout_result(result);
+        }
+        "identity.principal_list" => {
+            format_identity_principal_list_result(result);
+        }
+        "identity.role_set" => {
+            format_identity_role_set_result(result);
+        }
+        "identity.delegation_list" => {
+            format_identity_delegation_list_result(result);
         }
         _ => {
             print_json(result);
@@ -953,6 +971,264 @@ fn format_agent_session_end_result(result: &serde_json::Value) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Identity substrate rendering (Phase 1)
+// ---------------------------------------------------------------------------
+
+/// Format a future epoch-ms timestamp as "in Xh Ym" (or "expired").
+fn format_expires_in(expires_at_ms: i64) -> String {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    let remaining_secs = (expires_at_ms - now_ms) / 1000;
+    if remaining_secs <= 0 {
+        return "expired".into();
+    }
+    if remaining_secs < 60 {
+        format!("in {remaining_secs}s")
+    } else if remaining_secs < 3600 {
+        format!("in {}m", remaining_secs / 60)
+    } else if remaining_secs < 86400 {
+        format!(
+            "in {}h {}m",
+            remaining_secs / 3600,
+            (remaining_secs % 3600) / 60
+        )
+    } else {
+        format!(
+            "in {}d {}h",
+            remaining_secs / 86400,
+            (remaining_secs % 86400) / 3600
+        )
+    }
+}
+
+/// Shorten a principal/session id for table display: `hum_0a1b2c3d…`.
+fn short_id(id: &str) -> String {
+    if id.chars().count() > 12 {
+        format!("{}…", id.chars().take(12).collect::<String>())
+    } else {
+        id.to_string()
+    }
+}
+
+fn roles_cell(roles: Option<&serde_json::Value>) -> String {
+    roles
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| r.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "-".into())
+}
+
+/// Render the logged-in principal summary (used by `opaque login` success
+/// and the whoami identity section).
+pub fn format_identity_summary(identity: &serde_json::Value) {
+    if is_quiet() || identity.is_null() {
+        return;
+    }
+    if let Some(label) = identity.get("label").and_then(|v| v.as_str()) {
+        kv("principal", label);
+    }
+    if let Some(id) = identity.get("principal_id").and_then(|v| v.as_str()) {
+        kv("id", &ident(id));
+    }
+    if let Some(email) = identity.get("email").and_then(|v| v.as_str()) {
+        kv("email", email);
+    }
+    let roles = roles_cell(identity.get("roles"));
+    if roles != "-" {
+        kv("roles", &style(roles).cyan().to_string());
+    }
+    if let Some(iss) = identity.get("issuer").and_then(|v| v.as_str()) {
+        kv("issuer", &dim(iss));
+    }
+    if let Some(exp) = identity
+        .get("session_expires_at_utc_ms")
+        .and_then(|v| v.as_i64())
+    {
+        kv("session", &format!("expires {}", format_expires_in(exp)));
+    }
+}
+
+/// Render the identity portion of a whoami response.
+fn format_whoami_identity(obj: &serde_json::Map<String, serde_json::Value>) {
+    let identity = obj.get("identity");
+    let required = obj
+        .get("identity_required")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // Older daemons don't send identity fields at all — print nothing.
+    if identity.is_none() && !required {
+        return;
+    }
+
+    header("Identity");
+    match identity {
+        Some(id_obj) if !id_obj.is_null() => {
+            format_identity_summary(id_obj);
+        }
+        _ => {
+            println!("  {}", dim("not signed in"));
+            if required {
+                println!(
+                    "  {} {}",
+                    style("hint:").cyan().bold(),
+                    style("this daemon requires identity — run `opaque login`").cyan()
+                );
+            }
+        }
+    }
+}
+
+fn format_identity_logout_result(result: &serde_json::Value) {
+    let revoked = result.get("revoked").and_then(|v| v.as_u64()).unwrap_or(0);
+    if revoked == 0 {
+        info("No active login sessions");
+    } else {
+        success(&format!("Revoked {revoked} login session(s)"));
+    }
+}
+
+fn format_identity_principal_list_result(result: &serde_json::Value) {
+    let principals = match result.get("principals").and_then(|v| v.as_array()) {
+        Some(p) => p,
+        None => {
+            print_json(result);
+            return;
+        }
+    };
+    if principals.is_empty() {
+        info("No principals registered — run `opaque login` to create the first one");
+        return;
+    }
+
+    header(&format!("{} principal(s)", principals.len()));
+    let rows: Vec<Vec<String>> = principals
+        .iter()
+        .map(|p| {
+            let id = p.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+            let kind = p.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
+            let label = p.get("label").and_then(|v| v.as_str()).unwrap_or("-");
+            let disabled = p.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false);
+            let last_seen = p
+                .get("last_seen")
+                .and_then(|v| v.as_i64())
+                .map(|secs| crate::format_relative_time(secs * 1000))
+                .unwrap_or_else(|| "-".into());
+            let status = if disabled {
+                status_badge("DISABLED", BadgeState::Fail)
+            } else {
+                status_badge("OK", BadgeState::Ok)
+            };
+            vec![
+                short_id(id),
+                kind.to_string(),
+                label.to_string(),
+                roles_cell(p.get("roles")),
+                last_seen,
+                status,
+            ]
+        })
+        .collect();
+    table(
+        &["ID", "KIND", "LABEL", "ROLES", "LAST SEEN", "STATUS"],
+        &rows,
+    );
+}
+
+fn format_identity_role_set_result(result: &serde_json::Value) {
+    let label = result
+        .get("label")
+        .and_then(|v| v.as_str())
+        .or_else(|| result.get("id").and_then(|v| v.as_str()))
+        .unwrap_or("principal");
+    success(&format!(
+        "Updated roles for {}: {}",
+        style(label).bold(),
+        style(roles_cell(result.get("roles"))).cyan()
+    ));
+}
+
+fn format_identity_delegation_list_result(result: &serde_json::Value) {
+    let delegations = match result.get("delegations").and_then(|v| v.as_array()) {
+        Some(d) => d,
+        None => {
+            print_json(result);
+            return;
+        }
+    };
+    if delegations.is_empty() {
+        info("No delegations recorded");
+        return;
+    }
+
+    header(&format!("{} delegation(s)", delegations.len()));
+    let rows: Vec<Vec<String>> = delegations
+        .iter()
+        .map(|d| {
+            let jti = d.get("jti").and_then(|v| v.as_str()).unwrap_or("?");
+            let mode = d.get("mode").and_then(|v| v.as_str()).unwrap_or("?");
+            let sub = d
+                .get("sub_label")
+                .or_else(|| d.get("sub"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let act = d
+                .get("act_label")
+                .or_else(|| d.get("act"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let approved_by = d
+                .get("approved_by")
+                .and_then(|v| v.as_str())
+                .map(short_id)
+                .unwrap_or_else(|| "-".into());
+            let state = if d.get("revoked_at").is_some_and(|v| !v.is_null()) {
+                status_badge("REVOKED", BadgeState::Warn)
+            } else {
+                match d.get("expires_at").and_then(|v| v.as_i64()) {
+                    // expires_at is unix seconds in delegation records.
+                    Some(exp) => {
+                        let human = format_expires_in(exp * 1000);
+                        if human == "expired" {
+                            status_badge("EXPIRED", BadgeState::Warn)
+                        } else {
+                            format!("expires {human}")
+                        }
+                    }
+                    None => "-".into(),
+                }
+            };
+            vec![
+                short_id(jti),
+                mode.to_string(),
+                sub.to_string(),
+                act.to_string(),
+                approved_by,
+                state,
+            ]
+        })
+        .collect();
+    table(
+        &[
+            "SESSION",
+            "MODE",
+            "ON BEHALF OF",
+            "AGENT",
+            "APPROVED BY",
+            "STATE",
+        ],
+        &rows,
+    );
+}
+
 /// Format a daemon error response.
 pub fn format_error(err: &opaque_core::proto::ErrorObj) {
     error(&err.message);
@@ -1044,4 +1320,52 @@ pub fn init_step(msg: &str) {
         return;
     }
     println!("  {} {}", style(CHECK).green(), msg);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64
+    }
+
+    #[test]
+    fn format_expires_in_past_is_expired() {
+        assert_eq!(format_expires_in(now_ms() - 5_000), "expired");
+        assert_eq!(format_expires_in(0), "expired");
+    }
+
+    #[test]
+    fn format_expires_in_future_buckets() {
+        let now = now_ms();
+        assert!(format_expires_in(now + 30_000).starts_with("in "));
+        let hours = format_expires_in(now + 2 * 3600 * 1000 + 90_000);
+        assert!(hours.starts_with("in 2h"), "got {hours}");
+        let days = format_expires_in(now + 3 * 86400 * 1000 + 3_600_000);
+        assert!(days.starts_with("in 3d"), "got {days}");
+    }
+
+    #[test]
+    fn short_id_truncates_long_ids_safely() {
+        let id = "hum_0123456789abcdef0123456789abcdef";
+        let short = short_id(id);
+        assert!(short.starts_with("hum_01234567"));
+        assert!(short.ends_with('…'));
+        assert_eq!(short_id("hum_short"), "hum_short");
+        // Multi-byte chars must not panic.
+        let _ = short_id("ééééééééééééééééé");
+    }
+
+    #[test]
+    fn roles_cell_renders_lists_and_dashes() {
+        let v = serde_json::json!(["admin", "operator"]);
+        assert_eq!(roles_cell(Some(&v)), "admin, operator");
+        let empty = serde_json::json!([]);
+        assert_eq!(roles_cell(Some(&empty)), "-");
+        assert_eq!(roles_cell(None), "-");
+    }
 }

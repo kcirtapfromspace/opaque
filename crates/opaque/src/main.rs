@@ -195,6 +195,26 @@ enum Cmd {
         #[command(subcommand)]
         action: AuditAction,
     },
+    /// Sign in as a human via your organization's identity provider (OIDC).
+    #[command(
+        long_about = "Sign in as a human via your organization's identity provider (OIDC).\n\n\
+        Opens your browser to the configured IdP. The browser step IS the identity\n\
+        proof: an agent driving this CLI cannot complete it — only the human at the\n\
+        IdP can. On success the daemon holds your login session; agent sessions can\n\
+        then be delegated on your behalf."
+    )]
+    Login {
+        /// Print the sign-in URL only; do not try to open a browser.
+        #[arg(long, default_value_t = false)]
+        no_browser: bool,
+    },
+    /// Sign out: revoke all active human login sessions in the daemon.
+    Logout,
+    /// Inspect principals, roles, and delegations (identity substrate).
+    Identity {
+        #[command(subcommand)]
+        action: IdentityAction,
+    },
     /// Interactive setup wizard — configure and seal your security policy.
     Setup {
         /// Seal the current config.toml without running the wizard.
@@ -368,6 +388,24 @@ enum AgentAction {
         #[arg(required_unless_present = "all")]
         session_id: Option<String>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum IdentityAction {
+    /// List known principals (humans, agents, service principals).
+    Ls,
+    /// Set the role list for a principal (requires the admin role).
+    Roles {
+        /// Principal id (hum_…, agt_…, svc_…) as shown by `opaque identity ls`.
+        principal_id: String,
+
+        /// Roles to assign: admin, approver, operator, auditor.
+        /// Space- or comma-separated. Replaces the current role list.
+        #[arg(required = true, num_args = 1..)]
+        roles: Vec<String>,
+    },
+    /// List delegation records (agent sessions bound to principals).
+    Delegations,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1366,6 +1404,202 @@ async fn run_github_publish_manifest(
     Ok(())
 }
 
+/// Flatten role arguments: accepts space-separated args and/or
+/// comma-separated lists within a single arg ("admin,operator approver").
+fn flatten_role_args(roles: &[String]) -> Vec<String> {
+    roles
+        .iter()
+        .flat_map(|r| r.split(','))
+        .map(|r| r.trim().to_ascii_lowercase())
+        .filter(|r| !r.is_empty())
+        .collect()
+}
+
+/// Try to open a URL in the default browser. Failure is non-fatal — the
+/// URL is always printed so the human can open it manually.
+fn open_browser(url: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    let cmd = "open";
+    #[cfg(target_os = "linux")]
+    let cmd = "xdg-open";
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    return false;
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    std::process::Command::new(cmd)
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .is_ok()
+}
+
+/// Run the interactive OIDC login flow: start an attempt with the daemon,
+/// hand the human the IdP URL, and poll until the daemon has verified the
+/// ID token and created a login session.
+///
+/// The auth code and tokens never pass through this CLI — the daemon owns
+/// the loopback redirect and the code exchange. This process only learns
+/// the outcome.
+async fn run_login(sock: &PathBuf, no_browser: bool, json_output: bool) -> Result<i32, String> {
+    let resp = call(sock, "identity.login_start", serde_json::Value::Null)
+        .await
+        .map_err(|e| format!("Connection failed: {e}"))?;
+
+    if let Some(err) = &resp.error {
+        if json_output {
+            let output = serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_string());
+            println!("{output}");
+            return Ok(EXIT_DAEMON);
+        }
+        if err.code == "identity_not_configured" {
+            ui::error("Identity is not configured in the daemon");
+            println!();
+            ui::section_box(
+                "Enable OIDC login",
+                &[
+                    "Add an [identity] section to ~/.opaque/config.toml:",
+                    "",
+                    "  [identity]",
+                    "  issuer = \"https://your-idp.example.com\"",
+                    "  client_id = \"opaque-cli\"",
+                    "  # session_ttl_secs = 43200",
+                    "  # allowed_email_domains = [\"example.com\"]",
+                    "",
+                    "Then restart the daemon (and re-seal if your config is sealed).",
+                ],
+            );
+        } else {
+            ui::format_error(err);
+        }
+        return Ok(EXIT_DAEMON);
+    }
+
+    let result = resp.result.unwrap_or(serde_json::Value::Null);
+    let attempt_id = result
+        .get("attempt_id")
+        .and_then(|v| v.as_str())
+        .ok_or("daemon returned no attempt_id")?
+        .to_string();
+    let auth_url = result
+        .get("auth_url")
+        .and_then(|v| v.as_str())
+        .ok_or("daemon returned no auth_url")?
+        .to_string();
+    let expires_in_secs = result
+        .get("expires_in_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(300);
+
+    if !json_output {
+        ui::header("Sign in with your identity provider");
+        println!();
+        println!("  {}", style(&auth_url).cyan().underlined());
+        println!();
+        if no_browser {
+            ui::info("Open the URL above in your browser to continue.");
+        } else if open_browser(&auth_url) {
+            ui::info("Opening your browser… complete the sign-in there.");
+        } else {
+            ui::warn("Could not open a browser — open the URL above manually.");
+        }
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(expires_in_secs);
+    let sp = if json_output {
+        None
+    } else {
+        Some(ui::spinner("Waiting for sign-in to complete..."))
+    };
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        if std::time::Instant::now() >= deadline {
+            if let Some(ref sp) = sp {
+                ui::spinner_error(sp, "Sign-in timed out");
+            }
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({"status": "failed", "reason": "timeout"})
+                );
+            }
+            return Ok(EXIT_AUTH);
+        }
+
+        let resp = call(
+            sock,
+            "identity.login_status",
+            serde_json::json!({ "attempt_id": attempt_id }),
+        )
+        .await
+        .map_err(|e| format!("Connection failed while waiting for sign-in: {e}"))?;
+
+        if let Some(err) = &resp.error {
+            if let Some(ref sp) = sp {
+                sp.finish_and_clear();
+            }
+            if json_output {
+                let output =
+                    serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_string());
+                println!("{output}");
+            } else {
+                ui::format_error(err);
+            }
+            return Ok(EXIT_DAEMON);
+        }
+
+        let status_obj = resp.result.unwrap_or(serde_json::Value::Null);
+        match status_obj.get("status").and_then(|v| v.as_str()) {
+            Some("pending") | None => continue,
+            Some("complete") => {
+                if let Some(ref sp) = sp {
+                    sp.finish_and_clear();
+                }
+                if json_output {
+                    let output = serde_json::to_string_pretty(&status_obj)
+                        .unwrap_or_else(|_| "{}".to_string());
+                    println!("{output}");
+                } else {
+                    let identity = status_obj
+                        .get("identity")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    let label = identity
+                        .get("label")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(unknown)");
+                    ui::success(&format!("Signed in as {}", style(label).green().bold()));
+                    ui::format_identity_summary(&identity);
+                }
+                return Ok(EXIT_SUCCESS);
+            }
+            Some("failed") => {
+                let reason = status_obj
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                if let Some(ref sp) = sp {
+                    ui::spinner_error(sp, &format!("Sign-in failed: {reason}"));
+                }
+                if json_output {
+                    let output = serde_json::to_string_pretty(&status_obj)
+                        .unwrap_or_else(|_| "{}".to_string());
+                    println!("{output}");
+                }
+                return Ok(EXIT_AUTH);
+            }
+            Some(other) => {
+                if let Some(ref sp) = sp {
+                    sp.finish_and_clear();
+                }
+                return Err(format!("unexpected login status: {other}"));
+            }
+        }
+    }
+}
+
 fn session_token_from_env() -> Option<String> {
     std::env::var("OPAQUE_SESSION_TOKEN")
         .ok()
@@ -2047,6 +2281,16 @@ async fn main() {
 
     let sock = cli.socket.unwrap_or_else(socket_path);
 
+    if let Cmd::Login { no_browser } = &cmd {
+        match run_login(&sock, *no_browser, json_output).await {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                ui::error(&e);
+                std::process::exit(EXIT_DAEMON);
+            }
+        }
+    }
+
     if let Cmd::Agent {
         action:
             AgentAction::Run {
@@ -2422,6 +2666,23 @@ async fn main() {
                 });
                 ("onepassword", params)
             }
+        },
+        // Handled in the async block above; unreachable.
+        Cmd::Login { .. } => unreachable!(),
+        Cmd::Logout => ("identity.logout", serde_json::Value::Null),
+        Cmd::Identity { action } => match action {
+            IdentityAction::Ls => ("identity.principal_list", serde_json::Value::Null),
+            IdentityAction::Roles {
+                principal_id,
+                roles,
+            } => (
+                "identity.role_set",
+                serde_json::json!({
+                    "principal_id": principal_id,
+                    "roles": flatten_role_args(&roles),
+                }),
+            ),
+            IdentityAction::Delegations => ("identity.delegation_list", serde_json::Value::Null),
         },
         Cmd::Agent { action } => match action {
             AgentAction::Run { .. } => unreachable!(),
@@ -3287,6 +3548,7 @@ fn policy_simulate(
         params: serde_json::Value::Object(serde_json::Map::new()),
         secret_ref_names: secret_refs.to_vec(),
         workspace: None,
+        principal: None,
         created_at: std::time::SystemTime::now(),
         expires_at: None,
     };
@@ -7070,5 +7332,78 @@ BAZ=
             unique.len(),
             "discovered paths should be deduplicated"
         );
+    }
+
+    // -- identity CLI (Phase 1) --------------------------------------------
+
+    #[test]
+    fn login_command_parses_with_and_without_no_browser() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["opaque", "login"]).unwrap();
+        assert!(matches!(cli.cmd, Some(Cmd::Login { no_browser: false })));
+
+        let cli = Cli::try_parse_from(["opaque", "login", "--no-browser"]).unwrap();
+        assert!(matches!(cli.cmd, Some(Cmd::Login { no_browser: true })));
+    }
+
+    #[test]
+    fn logout_command_parses() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["opaque", "logout"]).unwrap();
+        assert!(matches!(cli.cmd, Some(Cmd::Logout)));
+    }
+
+    #[test]
+    fn identity_subcommands_parse() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["opaque", "identity", "ls"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Identity {
+                action: IdentityAction::Ls
+            })
+        ));
+
+        let cli =
+            Cli::try_parse_from(["opaque", "identity", "roles", "hum_x", "admin", "operator"])
+                .unwrap();
+        match cli.cmd {
+            Some(Cmd::Identity {
+                action:
+                    IdentityAction::Roles {
+                        principal_id,
+                        roles,
+                    },
+            }) => {
+                assert_eq!(principal_id, "hum_x");
+                assert_eq!(roles, vec!["admin".to_string(), "operator".to_string()]);
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["opaque", "identity", "delegations"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Identity {
+                action: IdentityAction::Delegations
+            })
+        ));
+    }
+
+    #[test]
+    fn identity_roles_requires_at_least_one_role() {
+        use clap::Parser;
+        assert!(Cli::try_parse_from(["opaque", "identity", "roles", "hum_x"]).is_err());
+    }
+
+    #[test]
+    fn flatten_role_args_splits_commas_and_normalizes() {
+        let roles = vec!["Admin,operator".to_string(), " approver ".to_string()];
+        assert_eq!(
+            flatten_role_args(&roles),
+            vec!["admin", "operator", "approver"]
+        );
+        assert_eq!(flatten_role_args(&["admin,,".to_string()]), vec!["admin"]);
+        assert!(flatten_role_args(&[]).is_empty());
     }
 }
