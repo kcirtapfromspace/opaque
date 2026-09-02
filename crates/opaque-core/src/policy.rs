@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::identity::{AccessMode, PrincipalContext, Role};
 use crate::operation::{
     ApprovalFactor, ApprovalRequirement, ClientIdentity, ClientType, OperationRequest,
     OperationSafety, WorkspaceContext,
@@ -76,6 +77,88 @@ impl ClientMatch {
                 }
                 None => return false,
             }
+        }
+
+        true
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Identity match pattern (Phase 1 identity substrate)
+// ---------------------------------------------------------------------------
+
+/// Constraints on the verified principal/delegation context of a request.
+/// All absent (`None`) fields mean "any". If ANY constraint is set and the
+/// request carries no principal context, the rule does not match (fail
+/// closed) — an identity-constrained rule can never be satisfied by an
+/// unidentified request.
+///
+/// This is how "effective permission = agent ∩ human" is expressed: the
+/// `roles` constraint is checked against the DELEGATOR (`sub`) — the human
+/// (or service principal) the agent acts on behalf of — so an agent session
+/// can never exceed what its delegating principal holds.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IdentityMatch {
+    /// Require a verified principal context to be present at all.
+    pub require_principal: Option<bool>,
+
+    /// Delegating principal: exact principal id (`hum_…`/`svc_…`) or
+    /// case-insensitive display label (email for humans, `service:<name>`).
+    pub principal: Option<String>,
+
+    /// Roles the delegating principal must ALL hold (resolved from the
+    /// identity store at request time). Unknown role names never match.
+    pub roles: Option<Vec<String>>,
+
+    /// Access modes this rule applies to (delegated / autonomous / break_glass).
+    pub access_modes: Option<Vec<AccessMode>>,
+}
+
+impl IdentityMatch {
+    /// True when no identity constraint is configured.
+    pub fn is_empty(&self) -> bool {
+        self.require_principal.is_none()
+            && self.principal.is_none()
+            && self.roles.is_none()
+            && self.access_modes.is_none()
+    }
+
+    /// Returns `true` if the given principal context satisfies this pattern.
+    pub fn matches(&self, ctx: Option<&PrincipalContext>) -> bool {
+        if self.is_empty() {
+            return true;
+        }
+        // Any constraint present demands a verified context (fail closed).
+        // `require_principal = false` is "no requirement", not "must be absent".
+        let Some(ctx) = ctx else {
+            return self.require_principal == Some(false)
+                && self.principal.is_none()
+                && self.roles.is_none()
+                && self.access_modes.is_none();
+        };
+
+        if let Some(ref expected) = self.principal {
+            let id_match = ctx.sub.as_str() == expected;
+            let label_match = ctx.sub_label.eq_ignore_ascii_case(expected);
+            if !id_match && !label_match {
+                return false;
+            }
+        }
+
+        if let Some(ref required) = self.roles {
+            for name in required {
+                match name.parse::<Role>() {
+                    Ok(role) if ctx.sub_roles.contains(&role) => {}
+                    // Unknown role names and missing roles both fail closed.
+                    _ => return false,
+                }
+            }
+        }
+
+        if let Some(ref modes) = self.access_modes
+            && !modes.contains(&ctx.mode)
+        {
+            return false;
         }
 
         true
@@ -337,6 +420,11 @@ pub struct PolicyRule {
     #[serde(default)]
     pub client_types: Vec<ClientType>,
 
+    /// Principal/delegation constraints (Phase 1 identity substrate).
+    /// Defaults to "match any" when omitted.
+    #[serde(default)]
+    pub identity: IdentityMatch,
+
     /// Approval configuration (required factors, lease, one-time).
     /// Defaults to no approval required (suitable for deny rules).
     #[serde(default)]
@@ -357,6 +445,11 @@ impl PolicyRule {
 
         // Client identity match.
         if !self.client.matches(&request.client_identity) {
+            return false;
+        }
+
+        // Principal/delegation constraints.
+        if !self.identity.matches(request.principal.as_ref()) {
             return false;
         }
 
@@ -582,6 +675,7 @@ mod tests {
             expires_at: None,
             params: serde_json::Value::Null,
             workspace: None,
+            principal: None,
         }
     }
 
@@ -605,6 +699,7 @@ mod tests {
             secret_names: SecretNameMatch::default(),
             allow: true,
             client_types: vec![ClientType::Agent, ClientType::Human],
+            identity: IdentityMatch::default(),
             approval: ApprovalConfig {
                 require: ApprovalRequirement::Always,
                 factors: vec![ApprovalFactor::LocalBio],
@@ -1305,6 +1400,172 @@ mod tests {
         assert!(
             decision2.allowed,
             "no workspace constraints => None workspace ok"
+        );
+    }
+
+    // -- identity match (Phase 1) ------------------------------------------
+
+    use crate::identity::{AccessMode, PrincipalContext, PrincipalId, PrincipalKind, Role};
+    use std::collections::BTreeSet;
+
+    fn test_principal_ctx(mode: AccessMode, roles: &[Role]) -> PrincipalContext {
+        let sub = match mode {
+            AccessMode::Autonomous => {
+                PrincipalId::generate(&PrincipalKind::Service { name: "ci".into() })
+            }
+            _ => PrincipalId::generate(&PrincipalKind::Human {
+                iss: "https://idp.example.com".into(),
+                sub: "u1".into(),
+                email: Some("dev@example.com".into()),
+                name: None,
+            }),
+        };
+        PrincipalContext {
+            sub,
+            sub_label: "dev@example.com".into(),
+            sub_roles: roles.iter().copied().collect::<BTreeSet<_>>(),
+            act: PrincipalId::generate(&PrincipalKind::Agent {
+                tool: "claude-code".into(),
+            }),
+            act_label: "agent:claude-code".into(),
+            mode,
+            jti: "sess-1".into(),
+            human_session_id: Some("hses_x".into()),
+        }
+    }
+
+    #[test]
+    fn identity_match_empty_matches_anything() {
+        let m = IdentityMatch::default();
+        assert!(m.matches(None));
+        assert!(m.matches(Some(&test_principal_ctx(
+            AccessMode::Delegated,
+            &[Role::Operator]
+        ))));
+    }
+
+    #[test]
+    fn identity_constrained_rule_fails_closed_without_principal() {
+        let m = IdentityMatch {
+            require_principal: Some(true),
+            ..Default::default()
+        };
+        assert!(!m.matches(None));
+        assert!(m.matches(Some(&test_principal_ctx(AccessMode::Delegated, &[]))));
+
+        // Any other constraint also demands a context.
+        let m2 = IdentityMatch {
+            roles: Some(vec!["operator".into()]),
+            ..Default::default()
+        };
+        assert!(!m2.matches(None));
+    }
+
+    #[test]
+    fn identity_roles_require_all_and_unknown_fails_closed() {
+        let ctx = test_principal_ctx(AccessMode::Delegated, &[Role::Operator, Role::Approver]);
+        let ok = IdentityMatch {
+            roles: Some(vec!["operator".into(), "approver".into()]),
+            ..Default::default()
+        };
+        assert!(ok.matches(Some(&ctx)));
+
+        let missing = IdentityMatch {
+            roles: Some(vec!["operator".into(), "admin".into()]),
+            ..Default::default()
+        };
+        assert!(!missing.matches(Some(&ctx)));
+
+        let unknown = IdentityMatch {
+            roles: Some(vec!["root".into()]),
+            ..Default::default()
+        };
+        assert!(!unknown.matches(Some(&ctx)));
+    }
+
+    #[test]
+    fn identity_principal_matches_id_or_label() {
+        let ctx = test_principal_ctx(AccessMode::Delegated, &[Role::Operator]);
+        let by_id = IdentityMatch {
+            principal: Some(ctx.sub.as_str().to_string()),
+            ..Default::default()
+        };
+        assert!(by_id.matches(Some(&ctx)));
+
+        let by_label = IdentityMatch {
+            principal: Some("DEV@example.com".into()),
+            ..Default::default()
+        };
+        assert!(by_label.matches(Some(&ctx)));
+
+        let wrong = IdentityMatch {
+            principal: Some("other@example.com".into()),
+            ..Default::default()
+        };
+        assert!(!wrong.matches(Some(&ctx)));
+    }
+
+    #[test]
+    fn identity_access_mode_filter() {
+        let delegated = test_principal_ctx(AccessMode::Delegated, &[Role::Operator]);
+        let autonomous = test_principal_ctx(AccessMode::Autonomous, &[Role::Operator]);
+        let m = IdentityMatch {
+            access_modes: Some(vec![AccessMode::Delegated]),
+            ..Default::default()
+        };
+        assert!(m.matches(Some(&delegated)));
+        assert!(!m.matches(Some(&autonomous)));
+    }
+
+    #[test]
+    fn rule_with_identity_constraint_gates_requests() {
+        let mut rule = allow_rule();
+        rule.identity = IdentityMatch {
+            roles: Some(vec!["operator".into()]),
+            ..Default::default()
+        };
+        let engine = PolicyEngine::with_rules(vec![rule]);
+
+        // No principal context: identity-constrained rule can't match →
+        // default deny.
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        assert!(!engine.evaluate(&req, OperationSafety::Safe).allowed);
+
+        // Delegator holds the role → allowed.
+        let mut req2 = test_request("github.set_actions_secret", ClientType::Agent);
+        req2.principal = Some(test_principal_ctx(AccessMode::Delegated, &[Role::Operator]));
+        assert!(engine.evaluate(&req2, OperationSafety::Safe).allowed);
+
+        // Delegator lacks the role (agent ∩ human = ∅) → denied.
+        let mut req3 = test_request("github.set_actions_secret", ClientType::Agent);
+        req3.principal = Some(test_principal_ctx(AccessMode::Delegated, &[Role::Auditor]));
+        assert!(!engine.evaluate(&req3, OperationSafety::Safe).allowed);
+    }
+
+    #[test]
+    fn identity_match_toml_roundtrip_and_back_compat() {
+        // Existing policy TOML without an identity block still parses.
+        let toml = r#"
+            name = "legacy"
+            operation_pattern = "github.*"
+        "#;
+        let rule: PolicyRule = toml_edit::de::from_str(toml).unwrap();
+        assert!(rule.identity.is_empty());
+
+        // New identity block parses with typed access modes.
+        let toml2 = r#"
+            name = "identity-gated"
+            operation_pattern = "github.*"
+            [identity]
+            require_principal = true
+            roles = ["operator"]
+            access_modes = ["delegated", "break_glass"]
+        "#;
+        let rule2: PolicyRule = toml_edit::de::from_str(toml2).unwrap();
+        assert_eq!(rule2.identity.require_principal, Some(true));
+        assert_eq!(
+            rule2.identity.access_modes,
+            Some(vec![AccessMode::Delegated, AccessMode::BreakGlass])
         );
     }
 }

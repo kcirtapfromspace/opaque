@@ -546,6 +546,39 @@ pub fn verify_delegation_token(
     Ok(claims)
 }
 
+// ---------------------------------------------------------------------------
+// Principal context (attached to requests by the daemon)
+// ---------------------------------------------------------------------------
+
+/// The verified identity context the daemon attaches to an operation request
+/// after validating a delegation token against the identity store.
+///
+/// Populated exclusively from daemon-side state — never from client-supplied
+/// request fields. `sub_roles` is resolved fresh from the identity store on
+/// every request (not read from the token), so role edits and revocation take
+/// effect immediately.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrincipalContext {
+    /// The principal the operation is performed on behalf of.
+    pub sub: PrincipalId,
+    /// Display label for `sub` (email for humans, `service:<name>`).
+    pub sub_label: String,
+    /// Roles `sub` holds, resolved from the store at request time.
+    #[serde(default)]
+    pub sub_roles: BTreeSet<Role>,
+    /// The acting agent workload principal.
+    pub act: PrincipalId,
+    /// Display label for `act` (e.g. `agent:claude-code`).
+    pub act_label: String,
+    /// Access mode of the delegation.
+    pub mode: AccessMode,
+    /// Delegation session id (audit correlation key).
+    pub jti: String,
+    /// The human login session this delegation is bound to, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_session_id: Option<String>,
+}
+
 /// Current unix time in seconds (shared convention for identity timestamps).
 pub fn now_unix() -> i64 {
     SystemTime::now()
