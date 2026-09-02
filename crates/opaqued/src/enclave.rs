@@ -262,6 +262,13 @@ struct LeaseKey {
     secret_refs_canonical: String,
     /// SHA-256 of canonical JSON-serialized params.
     params_hash: String,
+    /// Delegation binding `(sub principal id, jti)` when the request runs
+    /// under a verified principal context; `None` for un-delegated requests.
+    ///
+    /// SECURITY: without this, a first-use lease granted to one principal
+    /// would be reused by a different principal (or a different delegation
+    /// session) at the same uid — leases must never cross principals.
+    delegation: Option<(String, String)>,
 }
 
 impl LeaseKey {
@@ -310,6 +317,10 @@ impl LeaseKey {
             target_canonical,
             secret_refs_canonical,
             params_hash,
+            delegation: request
+                .principal
+                .as_ref()
+                .map(|p| (p.sub.as_str().to_owned(), p.jti.clone())),
         }
     }
 }
@@ -592,9 +603,7 @@ impl EnclaveBuilder {
             registry: self.registry,
             policy: self.policy,
             handlers: self.handlers,
-            approval_gate: self
-                .approval_gate
-                .ok_or("approval gate is required")?,
+            approval_gate: self.approval_gate.ok_or("approval gate is required")?,
             audit: self.audit.ok_or("audit sink is required")?,
             sanitizer: self.sanitizer,
             approval_semaphore: Semaphore::new(1),
@@ -640,7 +649,13 @@ impl Enclave {
     pub async fn execute(&self, mut request: OperationRequest) -> SanitizedResponse<Sanitized> {
         let start = Instant::now();
         let request_id = request.request_id;
-        let client_summary = ClientSummary::from((&request.client_identity, request.client_type));
+        let mut client_summary =
+            ClientSummary::from((&request.client_identity, request.client_type));
+        // Attach the verified delegation context so every operation audit
+        // record attributes the request to its principal (on-behalf-of).
+        if let Some(ref ctx) = request.principal {
+            client_summary = client_summary.with_principal(ctx);
+        }
         let target_summary = TargetSummary::sanitized(&request.target);
 
         let workspace_summary = request.workspace.as_ref().map(WorkspaceSummary::sanitized);
@@ -1579,6 +1594,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn lease_key_isolates_principals_at_same_uid() {
+        use opaque_core::identity::{AccessMode, PrincipalContext, PrincipalId, PrincipalKind};
+
+        fn ctx(sub_sub: &str, jti: &str) -> PrincipalContext {
+            PrincipalContext {
+                sub: PrincipalId::generate(&PrincipalKind::Human {
+                    iss: "https://idp.example.com".into(),
+                    sub: sub_sub.into(),
+                    email: None,
+                    name: None,
+                }),
+                sub_label: "x".into(),
+                sub_roles: Default::default(),
+                act: PrincipalId::generate(&PrincipalKind::Agent {
+                    tool: "claude-code".into(),
+                }),
+                act_label: "agent:claude-code".into(),
+                mode: AccessMode::Delegated,
+                jti: jti.into(),
+                human_session_id: Some("hses_1".into()),
+            }
+        }
+        let with = |c: Option<PrincipalContext>| {
+            let mut r = test_request("github.set_actions_secret", ClientType::Agent);
+            r.principal = c;
+            LeaseKey::from_request(&r)
+        };
+
+        let none = with(None);
+        let a = with(Some(ctx("alice", "j1")));
+        let b = with(Some(ctx("bob", "j1")));
+        let a2 = with(Some(ctx("alice", "j2")));
+
+        // Different principals at the same uid → different lease keys.
+        assert_ne!(a, b);
+        // Same principal, different delegation session → different keys.
+        assert_ne!(a, a2);
+        // Un-delegated key differs from any delegated key but stays stable.
+        assert_ne!(none, a);
+        assert_eq!(none, with(None));
+    }
+
     fn test_registry() -> OperationRegistry {
         let mut reg = OperationRegistry::new();
         reg.register(OperationDef {
@@ -1739,7 +1797,8 @@ mod tests {
             )
             .approval_gate(Box::new(AlwaysApproveGate))
             .audit(audit.clone())
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         let req = test_request("secret.reveal", ClientType::Agent);
         let resp = enclave.execute(req).await;
@@ -1789,7 +1848,8 @@ mod tests {
             )
             .approval_gate(Box::new(AlwaysApproveGate))
             .audit(audit.clone())
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         // Human client should ALSO be blocked from REVEAL in v1.
         let req = test_request("secret.reveal", ClientType::Human);
@@ -1878,7 +1938,8 @@ mod tests {
             )
             .approval_gate(Box::new(AlwaysApproveGate))
             .audit(audit.clone())
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         let req = test_request("github.set_actions_secret", ClientType::Agent);
         let resp = enclave.execute(req).await;
@@ -2173,7 +2234,8 @@ mod tests {
             )
             .approval_gate(gate)
             .audit(audit)
-            .build().unwrap()
+            .build()
+            .unwrap()
     }
 
     #[tokio::test]
@@ -2507,7 +2569,8 @@ mod tests {
             )
             .approval_gate(Box::new(gate))
             .audit(audit.clone())
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         let req = test_request("test.noop", ClientType::Agent);
         let resp = enclave.execute(req).await;
@@ -2585,7 +2648,8 @@ mod tests {
                 )
                 .approval_gate(Box::new(gate))
                 .audit(audit.clone())
-                .build().unwrap(),
+                .build()
+                .unwrap(),
         );
 
         // Fire 3 concurrent requests with different targets (so no lease hits).
@@ -2663,7 +2727,8 @@ mod tests {
             )
             .approval_gate(Box::new(AlwaysApproveGate))
             .audit(audit.clone())
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         // Request with allowed keys → success.
         let mut req = test_request("restricted.op", ClientType::Human);
@@ -2737,7 +2802,8 @@ mod tests {
             )
             .approval_gate(Box::new(AlwaysApproveGate))
             .audit(audit.clone())
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         // Valid params → success.
         let mut req = test_request("schema.op", ClientType::Human);
@@ -2807,7 +2873,8 @@ mod tests {
             )
             .approval_gate(Box::new(AlwaysApproveGate))
             .audit(audit.clone())
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         // Request without workspace → denied (rule requires workspace).
         let req = test_request("github.set_actions_secret", ClientType::Agent);
@@ -2888,7 +2955,8 @@ mod tests {
             )
             .approval_gate(Box::new(AlwaysApproveGate))
             .audit(audit.clone())
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         // Request with allowed secret name → success.
         let req = test_request("github.set_actions_secret", ClientType::Agent);
@@ -2987,7 +3055,8 @@ mod tests {
             )
             .approval_gate(Box::new(AlwaysApproveGate))
             .audit(audit.clone())
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         let mut req = test_request("github.set_actions_secret", ClientType::Agent);
         let request_id = req.request_id;
@@ -3102,7 +3171,8 @@ mod tests {
             )
             .approval_gate(Box::new(gate))
             .audit(audit.clone())
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         // list_secrets: no approval.
         let req = test_request("github.list_secrets", ClientType::Agent);
@@ -3174,7 +3244,8 @@ mod tests {
             )
             .approval_gate(Box::new(AlwaysApproveGate))
             .audit(audit.clone())
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         // First: fails.
         let req = test_request("github.set_actions_secret", ClientType::Agent);
@@ -3368,7 +3439,8 @@ mod tests {
             )
             .approval_gate(Box::new(AlwaysApproveGate))
             .audit(audit.clone())
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         // Agent client: despite the "never" policy, the SensitiveOutput clamp
         // forces approval. With an approving gate the op then succeeds — and the
@@ -3498,7 +3570,8 @@ mod tests {
             )
             .approval_gate(Box::new(AlwaysApproveGate))
             .audit(audit.clone())
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         // Client tries to LIE about secret_ref_names — claims "ADMIN_KEY"
         // but params actually reference "env:MY_TOKEN".

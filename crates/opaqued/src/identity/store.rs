@@ -73,14 +73,11 @@ pub struct HumanSession {
     pub principal_id: PrincipalId,
     pub created_at: i64,
     pub expires_at: i64,
-    #[allow(dead_code)] // revocation state; read by Stage C enforcement
     pub revoked_at: Option<i64>,
     pub idp_issuer: String,
 }
 
 /// A delegation record (the audit-side trace of an agent session grant).
-/// Constructed by the Stage C delegation wiring.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct DelegationRecord {
     pub jti: String,
@@ -197,7 +194,6 @@ impl IdentityStore {
     }
 
     /// Upsert an agent workload principal by tool name.
-    #[allow(dead_code)] // consumed by Stage C delegation wiring
     pub fn upsert_agent(&self, tool: &str) -> Result<Principal, String> {
         let kind = PrincipalKind::Agent {
             tool: tool.to_owned(),
@@ -283,6 +279,20 @@ impl IdentityStore {
         self.get_principal_by_str(id.as_str())
     }
 
+    /// Look up a service principal by its configured name.
+    pub fn get_service_by_name(&self, name: &str) -> Result<Option<Principal>, String> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT id, kind, iss, sub, email, display_name, tool, service_name, \
+                    roles, created_at, last_seen, disabled \
+             FROM principals WHERE kind='service' AND service_name=?1",
+            params![name],
+            row_to_principal,
+        )
+        .optional()
+        .map_err(|e| e.to_string())
+    }
+
     fn get_principal_by_str(&self, id: &str) -> Result<Option<Principal>, String> {
         let conn = self.lock();
         conn.query_row(
@@ -311,6 +321,22 @@ impl IdentityStore {
             .map_err(|e| e.to_string())?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())
+    }
+
+    /// Enable or disable a principal (revocation switch).
+    #[cfg(test)]
+    pub fn set_disabled(&self, id: &PrincipalId, disabled: bool) -> Result<(), String> {
+        let conn = self.lock();
+        let n = conn
+            .execute(
+                "UPDATE principals SET disabled=?1 WHERE id=?2",
+                params![disabled as i64, id.as_str()],
+            )
+            .map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Err("no such principal".into());
+        }
+        Ok(())
     }
 
     /// Replace a principal's role set.
@@ -402,7 +428,6 @@ impl IdentityStore {
     }
 
     /// Fetch one session by id (regardless of state).
-    #[allow(dead_code)] // consumed by Stage C delegation wiring
     pub fn get_human_session(&self, id: &str) -> Result<Option<HumanSession>, String> {
         let conn = self.lock();
         conn.query_row(
@@ -430,7 +455,6 @@ impl IdentityStore {
     // -- delegations --------------------------------------------------------
 
     /// Record an issued delegation (Stage C mints the matching token).
-    #[allow(dead_code)] // consumed by Stage C delegation wiring
     pub fn record_delegation(&self, d: &DelegationRecord) -> Result<(), String> {
         let conn = self.lock();
         conn.execute(
@@ -454,7 +478,6 @@ impl IdentityStore {
         Ok(())
     }
 
-    #[allow(dead_code)] // consumed by Stage C delegation wiring
     pub fn get_delegation(&self, jti: &str) -> Result<Option<DelegationRecord>, String> {
         let conn = self.lock();
         conn.query_row(
@@ -469,7 +492,6 @@ impl IdentityStore {
     }
 
     /// Revoke one delegation; returns true if a live row was revoked.
-    #[allow(dead_code)] // consumed by Stage C delegation wiring
     pub fn revoke_delegation(&self, jti: &str) -> Result<bool, String> {
         let conn = self.lock();
         let n = conn
@@ -482,7 +504,6 @@ impl IdentityStore {
     }
 
     /// All delegation records, newest first.
-    #[allow(dead_code)] // consumed by Stage C delegation wiring
     pub fn list_delegations(&self) -> Result<Vec<DelegationRecord>, String> {
         let conn = self.lock();
         let mut stmt = conn
@@ -573,7 +594,6 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<HumanSession> {
     })
 }
 
-#[allow(dead_code)] // consumed by Stage C delegation wiring
 fn row_to_delegation(row: &rusqlite::Row<'_>) -> rusqlite::Result<DelegationRecord> {
     let conv_err = |idx: usize, e: String| {
         rusqlite::Error::FromSqlConversionFailure(idx, rusqlite::types::Type::Text, e.into())

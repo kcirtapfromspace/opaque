@@ -119,8 +119,7 @@ impl IdentityConfig {
 pub struct IdentityRuntime {
     pub config: IdentityConfig,
     pub store: IdentityStore,
-    /// Delegation-token signing key (consumed by Stage C).
-    #[allow(dead_code)]
+    /// Delegation-token signing key.
     pub signing: ed25519_dalek::SigningKey,
     /// Shared HTTP client for IdP traffic.
     pub http: reqwest::Client,

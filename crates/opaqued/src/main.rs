@@ -12,6 +12,10 @@ use opaque_core::audit::{
     TracingAuditEmitter,
 };
 use opaque_core::execve_map::{ExecveDefault, ExecveMapper, ExecveRule};
+use opaque_core::identity::{
+    AccessMode, DelegationClaims, PrincipalContext, PrincipalId, now_unix, sign_delegation_token,
+    verify_delegation_token,
+};
 use opaque_core::operation::{
     ApprovalFactor, ApprovalRequirement, ClientIdentity, ClientType, OperationDef,
     OperationRegistry, OperationRequest, OperationSafety,
@@ -158,6 +162,21 @@ struct AgentSession {
     created_by_uid: u32,
     expires_at: SystemTime,
     label: Option<String>,
+    /// Principal binding for this session when identity is configured.
+    /// `None` for legacy (pre-identity) hex-token sessions.
+    delegation: Option<SessionDelegation>,
+}
+
+/// The delegation a session token was minted under. The authoritative copy of
+/// these claims is the signed token + the `delegations` store row; this is the
+/// in-memory binding used to re-validate liveness on every request.
+#[derive(Debug, Clone)]
+struct SessionDelegation {
+    jti: String,
+    sub: PrincipalId,
+    act: PrincipalId,
+    mode: AccessMode,
+    human_session_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -211,6 +230,21 @@ fn load_config() -> DaemonConfig {
                 let filtered = before - config.known_human_clients.len();
                 if filtered > 0 {
                     warn!("{filtered} empty human client entries removed from config");
+                }
+                // Unknown role names in [rules.identity] never match (fail
+                // closed) — surface the typo instead of silently denying.
+                for rule in &config.rules {
+                    if let Some(roles) = &rule.identity.roles {
+                        for role in roles {
+                            if role.parse::<opaque_core::identity::Role>().is_err() {
+                                warn!(
+                                    "policy rule '{}' names unknown role {role:?} — \
+                                     this rule will never match",
+                                    rule.name
+                                );
+                            }
+                        }
+                    }
                 }
                 info!(
                     "loaded config from {} ({} known human clients, {} policy rules)",
@@ -1472,6 +1506,70 @@ fn compute_exe_hash(path: &Path) -> Option<String> {
 /// Instead, it matches the verified peer identity against the configured
 /// `known_human_clients` allowlist. If no entry matches, the client is
 /// classified as `Agent` (safer — more restrictive).
+/// Revoke delegation records for ended sessions and audit each revocation.
+/// Best-effort: the in-memory session is already gone (which alone kills the
+/// connection's access); the store row is the audit-side record.
+fn revoke_delegations(
+    state: &DaemonState,
+    identity: &ClientIdentity,
+    client_type: ClientType,
+    delegations: &[SessionDelegation],
+) {
+    let Some(rt) = state.identity.as_ref() else {
+        return;
+    };
+    for d in delegations {
+        match rt.store.revoke_delegation(&d.jti) {
+            Ok(true) => {
+                state.audit.emit(
+                    AuditEvent::new(AuditEventKind::DelegationRevoked)
+                        .with_operation("agent_session_end")
+                        .with_client(ClientSummary::from((identity, client_type)))
+                        .with_outcome("revoked")
+                        .with_detail(format!("jti={} mode={} sub={}", d.jti, d.mode, d.sub)),
+                );
+            }
+            Ok(false) => {}
+            Err(e) => warn!("failed to revoke delegation record: {e}"),
+        }
+    }
+}
+
+/// Derive an agent workload tool name for the `act` principal: prefer the
+/// client-supplied label, else the client executable's basename, else
+/// "agent" — sanitized to the identity charset (`[A-Za-z0-9._-]`, max 64).
+fn derive_agent_tool_name(label: Option<&str>, identity: &ClientIdentity) -> String {
+    let raw = label
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            identity
+                .exe_path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|f| f.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "agent".into());
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(64)
+        .collect();
+    let cleaned = cleaned.trim_matches('-');
+    if cleaned.is_empty() {
+        "agent".into()
+    } else {
+        cleaned.to_owned()
+    }
+}
+
 fn derive_client_type(identity: &ClientIdentity, config: &DaemonConfig) -> ClientType {
     for entry in &config.known_human_clients {
         if entry_matches(identity, entry) {
@@ -2093,6 +2191,19 @@ async fn validate_agent_session_token(
     token: &str,
     uid: u32,
 ) -> Option<String> {
+    // Delegation tokens carry signed claims: verify the signature and expiry
+    // BEFORE consulting the session table. A token that parses as a delegation
+    // token but fails verification is rejected outright — the constant-time
+    // store match below is the liveness check, not the authenticity check.
+    if token.starts_with("opqd1.") {
+        let rt = state.identity.as_ref()?;
+        let key = rt.signing.verifying_key();
+        if let Err(e) = verify_delegation_token(token, &key, now_unix()) {
+            warn!("delegation token rejected: {e}");
+            return None;
+        }
+    }
+
     let now = SystemTime::now();
     let mut sessions = state.agent_sessions.write().await;
     // Expire old sessions opportunistically.
@@ -2109,6 +2220,113 @@ async fn validate_agent_session_token(
     })
 }
 
+/// Methods that build an `OperationRequest` and enter the enclave. These are
+/// the requests that carry (and, under `identity.required`, must carry) a
+/// verified principal context. Introspection and identity methods are exempt.
+fn is_operation_method(method: &str) -> bool {
+    matches!(
+        method,
+        "execute" | "github" | "gitlab" | "onepassword" | "bitwarden" | "exec"
+    )
+}
+
+/// Re-validate the delegation behind an agent session and build the verified
+/// [`PrincipalContext`] for this request.
+///
+/// Runs on EVERY operation request (like the agent-session TTL re-check), so
+/// revocation, human-session expiry, and principal disablement take effect
+/// mid-connection:
+///
+/// - `Ok(None)` — the session carries no delegation (identity not configured,
+///   or a legacy hex-token session): nothing to attach.
+/// - `Ok(Some(ctx))` — the delegation is live; `sub_roles` are resolved fresh
+///   from the store so role edits apply immediately.
+/// - `Err(reason)` — the session HAS a delegation that is no longer valid
+///   (fail closed: the caller must reject operation requests).
+async fn resolve_principal_context(
+    state: &DaemonState,
+    session_id: Option<&str>,
+) -> Result<Option<PrincipalContext>, String> {
+    let Some(sid) = session_id else {
+        return Ok(None);
+    };
+    let delegation = {
+        let sessions = state.agent_sessions.read().await;
+        match sessions.get(sid) {
+            Some(s) => s.delegation.clone(),
+            None => return Err("agent session no longer exists".into()),
+        }
+    };
+    let Some(d) = delegation else {
+        return Ok(None);
+    };
+    let Some(rt) = state.identity.as_ref() else {
+        return Err("delegated session without an identity runtime".into());
+    };
+
+    let now = now_unix();
+
+    let row = rt
+        .store
+        .get_delegation(&d.jti)
+        .map_err(|e| format!("delegation lookup failed: {e}"))?
+        .ok_or("delegation record missing")?;
+    if row.revoked_at.is_some() {
+        return Err("delegation revoked".into());
+    }
+    if row.expires_at <= now {
+        return Err("delegation expired".into());
+    }
+
+    let sub_principal = rt
+        .store
+        .get_principal(&d.sub)
+        .map_err(|e| format!("principal lookup failed: {e}"))?
+        .ok_or("delegating principal missing")?;
+    if sub_principal.disabled {
+        return Err("delegating principal disabled".into());
+    }
+    let act_principal = rt
+        .store
+        .get_principal(&d.act)
+        .map_err(|e| format!("principal lookup failed: {e}"))?
+        .ok_or("agent principal missing")?;
+
+    // Delegated / break-glass access is only as alive as the human login
+    // session it was granted under.
+    if matches!(d.mode, AccessMode::Delegated | AccessMode::BreakGlass) {
+        let hs_id = d
+            .human_session_id
+            .as_deref()
+            .ok_or("delegation missing its human session binding")?;
+        let hs = rt
+            .store
+            .get_human_session(hs_id)
+            .map_err(|e| format!("session lookup failed: {e}"))?
+            .ok_or("human login session missing")?;
+        if hs.revoked_at.is_some() {
+            return Err("human login session revoked".into());
+        }
+        if hs.expires_at <= now {
+            return Err("human login session expired".into());
+        }
+        if hs.principal_id != d.sub {
+            return Err("human login session does not match the delegation".into());
+        }
+    }
+
+    Ok(Some(PrincipalContext {
+        sub: d.sub.clone(),
+        sub_label: sub_principal.display_label(),
+        sub_roles: sub_principal.roles.clone(),
+        act: d.act.clone(),
+        act_label: act_principal.display_label(),
+        mode: d.mode,
+        jti: d.jti.clone(),
+        human_session_id: d.human_session_id.clone(),
+    }))
+}
+
 async fn handle_request(
     state: &DaemonState,
     req: Request,
@@ -2116,6 +2334,42 @@ async fn handle_request(
     client_type: ClientType,
     session_id: Option<&str>,
 ) -> Response {
+    // Resolve the verified principal context for operation-executing requests.
+    // Fails closed: a session whose delegation has died (revoked, expired
+    // human login, disabled principal) can no longer execute anything, even
+    // though the connection itself stays up for introspection methods.
+    let principal_ctx = if is_operation_method(&req.method) {
+        match resolve_principal_context(state, session_id).await {
+            Ok(ctx) => ctx,
+            Err(reason) => {
+                warn!("rejecting {}: delegation invalid: {reason}", req.method);
+                return Response::err(
+                    Some(req.id),
+                    "delegation_invalid",
+                    "the delegation behind this agent session is no longer valid",
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    // `identity.required`: agent operations must carry a verified delegation.
+    // Enforced on operation methods only — introspection, login, and session
+    // management stay reachable so an agent can be pointed at `opaque login`.
+    if is_operation_method(&req.method)
+        && client_type == ClientType::Agent
+        && state.identity.as_ref().is_some_and(|rt| rt.config.required)
+        && principal_ctx.is_none()
+    {
+        return Response::err(
+            Some(req.id),
+            "identity_required",
+            "this daemon requires agent operations to run under a delegation — \
+             run `opaque login`, then wrap the agent with `opaque agent run`",
+        );
+    }
+
     match req.method.as_str() {
         "ping" => Response::ok(
             req.id,
@@ -2126,10 +2380,7 @@ async fn handle_request(
             serde_json::json!({ "version": state.version, "api_version": opaque_core::API_VERSION }),
         ),
         "whoami" => {
-            let identity_required = state
-                .identity
-                .as_ref()
-                .is_some_and(|rt| rt.config.required);
+            let identity_required = state.identity.as_ref().is_some_and(|rt| rt.config.required);
             // Agent clients get minimal info to prevent reconnaissance.
             // Human clients get the full dump for debugging identity matching,
             // plus the logged-in principal when a login session is active.
@@ -2197,11 +2448,7 @@ async fn handle_request(
             };
             let attempt_id = req.params.get("attempt_id").and_then(|v| v.as_str());
             let Some(attempt_id) = attempt_id.and_then(|s| Uuid::parse_str(s).ok()) else {
-                return Response::err(
-                    Some(req.id),
-                    "invalid_params",
-                    "attempt_id must be a UUID",
-                );
+                return Response::err(Some(req.id), "invalid_params", "attempt_id must be a UUID");
             };
             match rt.login_status(&attempt_id.to_string()) {
                 None => Response::err(
@@ -2378,6 +2625,63 @@ async fn handle_request(
                 Err(e) => Response::err(Some(req.id), "invalid_params", e),
             }
         }
+        "identity.delegation_list" => {
+            let Some(rt) = state.identity.as_ref() else {
+                return Response::err(
+                    Some(req.id),
+                    "identity_not_configured",
+                    "no [identity] section in the daemon config",
+                );
+            };
+            // Same shape as principal_list: open during bootstrap, then
+            // restricted to an active admin/auditor login session.
+            let humans = rt.store.count_humans().unwrap_or(0);
+            if humans > 0
+                && !(rt.current_human_has_role(opaque_core::identity::Role::Admin)
+                    || rt.current_human_has_role(opaque_core::identity::Role::Auditor))
+            {
+                return Response::err(
+                    Some(req.id),
+                    "not_authorized",
+                    "listing delegations requires an active admin or auditor login session",
+                );
+            }
+            match rt.store.list_delegations() {
+                Ok(delegations) => {
+                    let label_of = |id: &PrincipalId| -> String {
+                        rt.store
+                            .get_principal(id)
+                            .ok()
+                            .flatten()
+                            .map(|p| p.display_label())
+                            .unwrap_or_else(|| id.as_str().to_owned())
+                    };
+                    let list: Vec<serde_json::Value> = delegations
+                        .iter()
+                        .map(|d| {
+                            serde_json::json!({
+                                "jti": d.jti,
+                                "sub": d.sub_principal.as_str(),
+                                "sub_label": label_of(&d.sub_principal),
+                                "act": d.act_principal.as_str(),
+                                "act_label": label_of(&d.act_principal),
+                                "mode": d.mode.as_str(),
+                                "human_session_id": d.human_session_id,
+                                "approved_by": d.approved_by.as_ref().map(|p| p.as_str().to_owned()),
+                                "created_at": d.created_at,
+                                "expires_at": d.expires_at,
+                                "revoked_at": d.revoked_at,
+                            })
+                        })
+                        .collect();
+                    Response::ok(req.id, serde_json::json!({ "delegations": list }))
+                }
+                Err(e) => {
+                    warn!("identity.delegation_list failed: {e}");
+                    Response::err(Some(req.id), "internal", "failed to list delegations")
+                }
+            }
+        }
         "agent_session_start" => {
             let default_ttl = state.config.agent_session_ttl_secs.unwrap_or(3600);
             let ttl_secs = req
@@ -2393,14 +2697,153 @@ async fn handle_request(
                 .map(|s| s.to_owned());
             let label_for_audit = label.clone();
 
+            // --- Identity: resolve the delegation subject BEFORE burning a
+            // human approval, so malformed requests fail early and the
+            // approval prompt can name who the session would act for.
+            let mut delegation_plan: Option<(AccessMode, opaque_core::identity::Principal)> = None;
+            if let Some(rt) = state.identity.as_ref() {
+                let mode_s = req
+                    .params
+                    .get("mode")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("delegated");
+                let mode = match mode_s.parse::<AccessMode>() {
+                    Ok(m) => m,
+                    Err(_) => {
+                        return Response::err(
+                            Some(req.id),
+                            "invalid_params",
+                            "mode must be one of: delegated, autonomous, break_glass",
+                        );
+                    }
+                };
+                let sub = match mode {
+                    AccessMode::BreakGlass => {
+                        emit_daemon_method_audit(
+                            state,
+                            AuditEventKind::OperationFailed,
+                            "agent_session_start",
+                            identity,
+                            client_type,
+                            "break_glass_unavailable",
+                            Some(
+                                "break-glass session requested; no distinct-approver factor".into(),
+                            ),
+                        );
+                        return Response::err(
+                            Some(req.id),
+                            "break_glass_unavailable",
+                            "break-glass access requires a distinct-approver factor \
+                             (paired second device), which is not configured",
+                        );
+                    }
+                    AccessMode::Delegated => {
+                        let session = match rt.store.current_human_session() {
+                            Ok(Some(s)) => s,
+                            Ok(None) => {
+                                emit_daemon_method_audit(
+                                    state,
+                                    AuditEventKind::OperationFailed,
+                                    "agent_session_start",
+                                    identity,
+                                    client_type,
+                                    "login_required",
+                                    Some("delegated session requested with no active login".into()),
+                                );
+                                return Response::err(
+                                    Some(req.id),
+                                    "login_required",
+                                    "delegated agent sessions require an active human login — \
+                                     run `opaque login` first",
+                                );
+                            }
+                            Err(e) => {
+                                warn!("identity store error during session mint: {e}");
+                                return Response::err(
+                                    Some(req.id),
+                                    "internal",
+                                    "identity store unavailable",
+                                );
+                            }
+                        };
+                        match rt.store.get_principal(&session.principal_id) {
+                            Ok(Some(p)) if !p.disabled => p,
+                            Ok(_) => {
+                                return Response::err(
+                                    Some(req.id),
+                                    "login_required",
+                                    "the logged-in principal is missing or disabled",
+                                );
+                            }
+                            Err(e) => {
+                                warn!("identity store error during session mint: {e}");
+                                return Response::err(
+                                    Some(req.id),
+                                    "internal",
+                                    "identity store unavailable",
+                                );
+                            }
+                        }
+                    }
+                    AccessMode::Autonomous => {
+                        let Some(service) = req.params.get("service").and_then(|v| v.as_str())
+                        else {
+                            return Response::err(
+                                Some(req.id),
+                                "invalid_params",
+                                "autonomous mode requires a 'service' principal name",
+                            );
+                        };
+                        match rt.store.get_service_by_name(service) {
+                            Ok(Some(p)) if !p.disabled => p,
+                            Ok(_) => {
+                                emit_daemon_method_audit(
+                                    state,
+                                    AuditEventKind::OperationFailed,
+                                    "agent_session_start",
+                                    identity,
+                                    client_type,
+                                    "unknown_service_principal",
+                                    Some(format!(
+                                        "autonomous session requested for unknown service '{}'",
+                                        service.chars().take(64).collect::<String>()
+                                    )),
+                                );
+                                return Response::err(
+                                    Some(req.id),
+                                    "unknown_service_principal",
+                                    "no such service principal — declare it under \
+                                     [[identity.service_principals]] in the daemon config",
+                                );
+                            }
+                            Err(e) => {
+                                warn!("identity store error during session mint: {e}");
+                                return Response::err(
+                                    Some(req.id),
+                                    "internal",
+                                    "identity store unavailable",
+                                );
+                            }
+                        }
+                    }
+                };
+                delegation_plan = Some((mode, sub));
+            }
+
             // SECURITY (C1/software-first): minting a session token grants a wrapped
             // agent scoped access, so it must be authorized by a fresh out-of-band
             // human approval — not by client classification, which an agent can wear.
             // The agent cannot satisfy the approval, so it cannot mint its own session.
-            let reason = match &label {
+            let mut reason = match &label {
                 Some(l) => format!("ttl {ttl_secs}s, label \"{l}\""),
                 None => format!("ttl {ttl_secs}s"),
             };
+            if let Some((mode, ref sub)) = delegation_plan {
+                reason.push_str(&format!(
+                    ", mode {mode}, on behalf of {}",
+                    sub.display_label()
+                ));
+            }
             if let Err(e) = state
                 .enclave
                 .request_session_approval(identity, client_type, &reason)
@@ -2423,10 +2866,110 @@ async fn handle_request(
             }
 
             let session_id = Uuid::new_v4().to_string();
-            let session_token = generate_daemon_token();
             let expires_at = SystemTime::now()
                 .checked_add(std::time::Duration::from_secs(ttl_secs))
                 .unwrap_or(SystemTime::now());
+
+            // Mint the credential: a signed delegation token when identity is
+            // configured, the legacy opaque hex token otherwise.
+            let (session_token, delegation, mut extra) =
+                match (state.identity.as_ref(), delegation_plan) {
+                    (Some(rt), Some((mode, sub))) => {
+                        // Re-check the login session didn't expire while the
+                        // human was approving (delegated mode only).
+                        let human_session_id = if mode == AccessMode::Delegated {
+                            match rt.store.current_human_session() {
+                                Ok(Some(s)) if s.principal_id == sub.id => Some(s.id),
+                                _ => {
+                                    return Response::err(
+                                        Some(req.id),
+                                        "login_required",
+                                        "the human login session ended before the delegation \
+                                     could be issued — run `opaque login` again",
+                                    );
+                                }
+                            }
+                        } else {
+                            None
+                        };
+
+                        let tool = derive_agent_tool_name(label.as_deref(), identity);
+                        let act = match rt.store.upsert_agent(&tool) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                warn!("failed to upsert agent principal: {e}");
+                                return Response::err(
+                                    Some(req.id),
+                                    "internal",
+                                    "identity store unavailable",
+                                );
+                            }
+                        };
+
+                        let now = now_unix();
+                        let claims = DelegationClaims {
+                            jti: session_id.clone(),
+                            sub: sub.id.clone(),
+                            act: act.id.clone(),
+                            mode,
+                            iat: now,
+                            exp: now + ttl_secs as i64,
+                        };
+                        let token = match sign_delegation_token(&claims, &rt.signing) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                warn!("failed to sign delegation token: {e}");
+                                return Response::err(
+                                    Some(req.id),
+                                    "internal",
+                                    "could not mint a delegation token",
+                                );
+                            }
+                        };
+                        let record = identity::store::DelegationRecord {
+                            jti: session_id.clone(),
+                            sub_principal: sub.id.clone(),
+                            act_principal: act.id.clone(),
+                            mode,
+                            human_session_id: human_session_id.clone(),
+                            approved_by: None,
+                            created_at: now,
+                            expires_at: now + ttl_secs as i64,
+                            revoked_at: None,
+                        };
+                        if let Err(e) = rt.store.record_delegation(&record) {
+                            warn!("failed to record delegation: {e}");
+                            return Response::err(
+                                Some(req.id),
+                                "internal",
+                                "could not record the delegation",
+                            );
+                        }
+
+                        let extra = serde_json::json!({
+                            "mode": mode.as_str(),
+                            "on_behalf_of": sub.id.as_str(),
+                            "on_behalf_of_label": sub.display_label(),
+                        });
+                        (
+                            token,
+                            Some(SessionDelegation {
+                                jti: session_id.clone(),
+                                sub: sub.id.clone(),
+                                act: act.id.clone(),
+                                mode,
+                                human_session_id,
+                            }),
+                            extra,
+                        )
+                    }
+                    _ => (generate_daemon_token(), None, serde_json::json!({})),
+                };
+
+            let delegation_for_audit = delegation
+                .as_ref()
+                .map(|d| format!(" mode={} sub={}", d.mode, d.sub))
+                .unwrap_or_default();
 
             let session = AgentSession {
                 session_id: session_id.clone(),
@@ -2434,6 +2977,7 @@ async fn handle_request(
                 created_by_uid: identity.uid,
                 expires_at,
                 label,
+                delegation: delegation.clone(),
             };
             state
                 .agent_sessions
@@ -2441,30 +2985,64 @@ async fn handle_request(
                 .await
                 .insert(session_id.clone(), session);
 
-            emit_daemon_method_audit(
-                state,
-                AuditEventKind::OperationSucceeded,
-                "agent_session_start",
-                identity,
-                client_type,
-                "started",
-                Some(format!(
-                    "session_id={} ttl_secs={} label={}",
-                    session_id,
-                    ttl_secs,
-                    label_for_audit.as_deref().unwrap_or("")
-                )),
+            let detail = format!(
+                "session_id={} ttl_secs={} label={}{}",
+                session_id,
+                ttl_secs,
+                label_for_audit.as_deref().unwrap_or(""),
+                delegation_for_audit
             );
+            // A delegated/autonomous mint is a DelegationIssued event carrying
+            // the principal context; a legacy hex-token mint stays a plain
+            // session-start operation event.
+            match &delegation {
+                Some(d) => {
+                    let ctx = PrincipalContext {
+                        sub: d.sub.clone(),
+                        sub_label: state
+                            .identity
+                            .as_ref()
+                            .and_then(|rt| rt.store.get_principal(&d.sub).ok().flatten())
+                            .map(|p| p.display_label())
+                            .unwrap_or_default(),
+                        sub_roles: Default::default(),
+                        act: d.act.clone(),
+                        act_label: String::new(),
+                        mode: d.mode,
+                        jti: d.jti.clone(),
+                        human_session_id: d.human_session_id.clone(),
+                    };
+                    state.audit.emit(
+                        AuditEvent::new(AuditEventKind::DelegationIssued)
+                            .with_operation("agent_session_start")
+                            .with_client(
+                                ClientSummary::from((identity, client_type)).with_principal(&ctx),
+                            )
+                            .with_outcome("issued")
+                            .with_detail(detail),
+                    );
+                }
+                None => emit_daemon_method_audit(
+                    state,
+                    AuditEventKind::OperationSucceeded,
+                    "agent_session_start",
+                    identity,
+                    client_type,
+                    "started",
+                    Some(detail),
+                ),
+            }
 
-            Response::ok(
-                req.id,
-                serde_json::json!({
-                    "session_id": session_id,
-                    "session_token": session_token,
-                    "expires_at_utc_ms": system_time_to_unix_ms(expires_at),
-                    "ttl_secs": ttl_secs,
-                }),
-            )
+            let mut payload = serde_json::json!({
+                "session_id": session_id,
+                "session_token": session_token,
+                "expires_at_utc_ms": system_time_to_unix_ms(expires_at),
+                "ttl_secs": ttl_secs,
+            });
+            if let (Some(obj), Some(extra_obj)) = (payload.as_object_mut(), extra.as_object_mut()) {
+                obj.append(extra_obj);
+            }
+            Response::ok(req.id, payload)
         }
         "agent_session_end" => {
             let end_all = req
@@ -2494,8 +3072,15 @@ async fn handle_request(
             if end_all {
                 let mut sessions = state.agent_sessions.write().await;
                 let before = sessions.len();
+                let ended_delegations: Vec<SessionDelegation> = sessions
+                    .values()
+                    .filter(|s| s.created_by_uid == identity.uid)
+                    .filter_map(|s| s.delegation.clone())
+                    .collect();
                 sessions.retain(|_, s| s.created_by_uid != identity.uid);
                 let ended_count = before.saturating_sub(sessions.len());
+                drop(sessions);
+                revoke_delegations(state, identity, client_type, &ended_delegations);
                 emit_daemon_method_audit(
                     state,
                     AuditEventKind::OperationSucceeded,
@@ -2552,6 +3137,10 @@ async fn handle_request(
             }
 
             let removed = sessions.remove(session_id);
+            drop(sessions);
+            if let Some(d) = removed.as_ref().and_then(|s| s.delegation.clone()) {
+                revoke_delegations(state, identity, client_type, &[d]);
+            }
             let label = removed.as_ref().and_then(|s| s.label.clone());
             let status = if removed.is_some() {
                 "ended"
@@ -2732,7 +3321,7 @@ async fn handle_request(
             }
 
             let op_req = OperationRequest {
-                principal: None,
+                principal: principal_ctx.clone(),
                 request_id: Uuid::new_v4(),
                 client_identity: identity.clone(),
                 client_type,
@@ -2767,10 +3356,24 @@ async fn handle_request(
 
             // Route list_secrets and delete_secret to their own dispatch paths.
             if action == "list_secrets" {
-                return handle_github_list_secrets(&req, state, identity, client_type).await;
+                return handle_github_list_secrets(
+                    &req,
+                    state,
+                    identity,
+                    client_type,
+                    principal_ctx.as_ref(),
+                )
+                .await;
             }
             if action == "delete_secret" {
-                return handle_github_delete_secret(&req, state, identity, client_type).await;
+                return handle_github_delete_secret(
+                    &req,
+                    state,
+                    identity,
+                    client_type,
+                    principal_ctx.as_ref(),
+                )
+                .await;
             }
 
             let scope = req
@@ -3021,7 +3624,7 @@ async fn handle_request(
             }
 
             let op_req = OperationRequest {
-                principal: None,
+                principal: principal_ctx.clone(),
                 request_id: Uuid::new_v4(),
                 client_identity: identity.clone(),
                 client_type,
@@ -3053,7 +3656,10 @@ async fn handle_request(
                 return Response::err(
                     Some(req.id),
                     "bad_request",
-                    format!("unknown action '{}' (expected: set_ci_variable)", truncate_for_error(&action, 64)),
+                    format!(
+                        "unknown action '{}' (expected: set_ci_variable)",
+                        truncate_for_error(&action, 64)
+                    ),
                 );
             }
 
@@ -3159,7 +3765,7 @@ async fn handle_request(
             }
 
             let op_req = OperationRequest {
-                principal: None,
+                principal: principal_ctx.clone(),
                 request_id: Uuid::new_v4(),
                 client_identity: identity.clone(),
                 client_type,
@@ -3306,7 +3912,7 @@ async fn handle_request(
             };
 
             let op_req = OperationRequest {
-                principal: None,
+                principal: principal_ctx.clone(),
                 request_id: Uuid::new_v4(),
                 client_identity: identity.clone(),
                 client_type,
@@ -3431,7 +4037,7 @@ async fn handle_request(
             };
 
             let op_req = OperationRequest {
-                principal: None,
+                principal: principal_ctx.clone(),
                 request_id: Uuid::new_v4(),
                 client_identity: identity.clone(),
                 client_type,
@@ -3492,7 +4098,7 @@ async fn handle_request(
                 .unwrap_or_default();
 
             let op_req = OperationRequest {
-                principal: None,
+                principal: principal_ctx.clone(),
                 request_id: Uuid::new_v4(),
                 client_identity: identity.clone(),
                 client_type,
@@ -3546,6 +4152,7 @@ async fn handle_github_list_secrets(
     state: &DaemonState,
     identity: &ClientIdentity,
     client_type: ClientType,
+    principal_ctx: Option<&PrincipalContext>,
 ) -> opaque_core::proto::Response {
     let scope = req
         .params
@@ -3580,7 +4187,7 @@ async fn handle_github_list_secrets(
     };
 
     let op_req = OperationRequest {
-        principal: None,
+        principal: principal_ctx.cloned(),
         request_id: Uuid::new_v4(),
         client_identity: identity.clone(),
         client_type,
@@ -3608,6 +4215,7 @@ async fn handle_github_delete_secret(
     state: &DaemonState,
     identity: &ClientIdentity,
     client_type: ClientType,
+    principal_ctx: Option<&PrincipalContext>,
 ) -> opaque_core::proto::Response {
     let scope = req
         .params
@@ -3656,7 +4264,7 @@ async fn handle_github_delete_secret(
     };
 
     let op_req = OperationRequest {
-        principal: None,
+        principal: principal_ctx.cloned(),
         request_id: Uuid::new_v4(),
         client_identity: identity.clone(),
         client_type,
@@ -4311,6 +4919,7 @@ exe_sha256 = "deadbeef"
                 created_by_uid: 501,
                 expires_at: now + std::time::Duration::from_secs(600),
                 label: Some("own-active".into()),
+                delegation: None,
             },
         );
         state.agent_sessions.write().await.insert(
@@ -4321,6 +4930,7 @@ exe_sha256 = "deadbeef"
                 created_by_uid: 501,
                 expires_at: now - std::time::Duration::from_secs(1),
                 label: Some("own-expired".into()),
+                delegation: None,
             },
         );
         state.agent_sessions.write().await.insert(
@@ -4331,6 +4941,7 @@ exe_sha256 = "deadbeef"
                 created_by_uid: 777,
                 expires_at: now + std::time::Duration::from_secs(600),
                 label: Some("other-active".into()),
+                delegation: None,
             },
         );
 
@@ -4382,6 +4993,7 @@ exe_sha256 = "deadbeef"
                 created_by_uid: 501,
                 expires_at: now + std::time::Duration::from_secs(300),
                 label: Some("own-1".into()),
+                delegation: None,
             },
         );
         state.agent_sessions.write().await.insert(
@@ -4392,6 +5004,7 @@ exe_sha256 = "deadbeef"
                 created_by_uid: 501,
                 expires_at: now + std::time::Duration::from_secs(300),
                 label: Some("own-2".into()),
+                delegation: None,
             },
         );
         state.agent_sessions.write().await.insert(
@@ -4402,6 +5015,7 @@ exe_sha256 = "deadbeef"
                 created_by_uid: 777,
                 expires_at: now + std::time::Duration::from_secs(300),
                 label: Some("other".into()),
+                delegation: None,
             },
         );
 
@@ -4474,6 +5088,7 @@ exe_sha256 = "deadbeef"
                 created_by_uid: 501,
                 expires_at: SystemTime::now() + std::time::Duration::from_secs(300),
                 label: Some("own-1".into()),
+                delegation: None,
             },
         );
 
@@ -4501,6 +5116,7 @@ exe_sha256 = "deadbeef"
             created_by_uid: 501,
             expires_at: SystemTime::now() + std::time::Duration::from_secs(300),
             label: Some("test".into()),
+            delegation: None,
         };
         state
             .agent_sessions
@@ -4529,6 +5145,7 @@ exe_sha256 = "deadbeef"
                 created_by_uid: uid,
                 expires_at: SystemTime::now() + std::time::Duration::from_secs(60),
                 label: Some("test".into()),
+                delegation: None,
             },
         );
 
@@ -4752,8 +5369,7 @@ exe_sha256 = "deadbeef"
                 method: method.into(),
                 params: serde_json::json!({}),
             };
-            let resp =
-                handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+            let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
             assert_eq!(
                 resp.error.expect("error expected").code,
                 "identity_not_configured",
@@ -5147,5 +5763,420 @@ exe_sha256 = "deadbeef"
         let result = truncate_for_error(&s, 64);
         assert_eq!(result.len(), 67); // 64 + "..."
         assert!(result.ends_with("..."));
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage C: delegation minting + enforcement
+    // -----------------------------------------------------------------------
+
+    use opaque_core::identity::{AccessMode, Role};
+
+    /// Identity-enabled test state with `required` toggled and a logged-in
+    /// human (admin+operator) so delegated mints succeed by default.
+    fn identity_state(required: bool) -> (tempfile::TempDir, DaemonState) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = identity::IdentityConfig {
+            issuer: "https://idp.example.com".into(),
+            client_id: "opaque-cli".into(),
+            audience: None,
+            redirect_port: None,
+            session_ttl_secs: None,
+            allowed_email_domains: vec![],
+            required,
+            service_principals: vec![identity::ServicePrincipalConfig {
+                name: "ci".into(),
+                roles: vec!["operator".into()],
+            }],
+        };
+        let runtime = identity::IdentityRuntime::initialize(config, dir.path()).unwrap();
+        let mut state = make_test_state();
+        state.identity = Some(Arc::new(runtime));
+        (dir, state)
+    }
+
+    /// Log a human in (bootstrap admin) and return their principal id.
+    fn login_human(state: &DaemonState) -> PrincipalId {
+        let rt = state.identity.as_ref().unwrap();
+        let p = rt
+            .store
+            .upsert_human(
+                "https://idp.example.com",
+                "u-1",
+                Some("dev@example.com"),
+                Some("Dev"),
+                &std::collections::BTreeSet::from([Role::Admin, Role::Operator]),
+            )
+            .unwrap();
+        rt.store
+            .create_human_session(&p.id, 3600, "https://idp.example.com")
+            .unwrap();
+        p.id
+    }
+
+    async fn start_session(state: &DaemonState, params: serde_json::Value) -> Response {
+        let req = Request {
+            id: 1,
+            method: "agent_session_start".into(),
+            params,
+        };
+        handle_request(state, req, &test_identity(), ClientType::Agent, None).await
+    }
+
+    #[tokio::test]
+    async fn mint_delegated_happy_path_returns_principal_and_opqd1_token() {
+        let (_d, state) = identity_state(false);
+        login_human(&state);
+        let resp = start_session(&state, serde_json::json!({})).await;
+        assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+        let r = resp.result.unwrap();
+        assert!(
+            r["session_token"].as_str().unwrap().starts_with("opqd1."),
+            "expected a delegation token"
+        );
+        assert_eq!(r["mode"], "delegated");
+        assert_eq!(r["on_behalf_of_label"], "dev@example.com");
+        assert!(r["on_behalf_of"].as_str().unwrap().starts_with("hum_"));
+    }
+
+    #[tokio::test]
+    async fn mint_delegated_without_login_fails_closed() {
+        let (_d, state) = identity_state(false);
+        let resp = start_session(&state, serde_json::json!({})).await;
+        assert_eq!(resp.error.expect("should fail").code, "login_required");
+    }
+
+    #[tokio::test]
+    async fn mint_break_glass_unavailable() {
+        let (_d, state) = identity_state(false);
+        login_human(&state);
+        let resp = start_session(&state, serde_json::json!({ "mode": "break_glass" })).await;
+        assert_eq!(
+            resp.error.expect("should fail").code,
+            "break_glass_unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_autonomous_happy_and_unknown_service() {
+        let (_d, state) = identity_state(false);
+        // Known service principal (declared in identity_state config).
+        let ok = start_session(
+            &state,
+            serde_json::json!({ "mode": "autonomous", "service": "ci" }),
+        )
+        .await;
+        assert!(ok.error.is_none(), "unexpected: {:?}", ok.error);
+        let r = ok.result.unwrap();
+        assert_eq!(r["mode"], "autonomous");
+        assert!(r["on_behalf_of"].as_str().unwrap().starts_with("svc_"));
+
+        // Unknown service principal.
+        let bad = start_session(
+            &state,
+            serde_json::json!({ "mode": "autonomous", "service": "nope" }),
+        )
+        .await;
+        assert_eq!(
+            bad.error.expect("should fail").code,
+            "unknown_service_principal"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_autonomous_does_not_require_login() {
+        // Autonomous mode is for unattended operation — no human session.
+        let (_d, state) = identity_state(true);
+        let resp = start_session(
+            &state,
+            serde_json::json!({ "mode": "autonomous", "service": "ci" }),
+        )
+        .await;
+        assert!(resp.error.is_none(), "unexpected: {:?}", resp.error);
+    }
+
+    #[test]
+    fn agent_tool_name_sanitization() {
+        let id = test_identity();
+        // Label wins, sanitized to the identity charset.
+        assert_eq!(
+            derive_agent_tool_name(Some("Claude Code!!"), &id),
+            "Claude-Code"
+        );
+        // Empty/whitespace label → exe basename.
+        assert_eq!(derive_agent_tool_name(Some("   "), &id), "claude-code");
+        assert_eq!(derive_agent_tool_name(None, &id), "claude-code");
+        // No exe path and no label → "agent".
+        let bare = ClientIdentity {
+            uid: 1,
+            gid: 1,
+            pid: None,
+            exe_path: None,
+            exe_sha256: None,
+            codesign_team_id: None,
+        };
+        assert_eq!(derive_agent_tool_name(None, &bare), "agent");
+        // Pure punctuation label collapses to "agent", never empty.
+        assert_eq!(derive_agent_tool_name(Some("///"), &bare), "agent");
+    }
+
+    /// Drive a mint, then return (state, session_id, token) for enforcement tests.
+    async fn mint_delegated(state: &DaemonState) -> (String, String) {
+        let resp = start_session(state, serde_json::json!({})).await;
+        let r = resp.result.unwrap();
+        (
+            r["session_id"].as_str().unwrap().to_owned(),
+            r["session_token"].as_str().unwrap().to_owned(),
+        )
+    }
+
+    #[tokio::test]
+    async fn resolve_context_reflects_live_delegation() {
+        let (_d, state) = identity_state(false);
+        let sub = login_human(&state);
+        let (sid, _tok) = mint_delegated(&state).await;
+        let ctx = resolve_principal_context(&state, Some(&sid))
+            .await
+            .unwrap()
+            .expect("context expected");
+        assert_eq!(ctx.sub, sub);
+        assert_eq!(ctx.mode, AccessMode::Delegated);
+        assert!(ctx.sub_roles.contains(&Role::Operator));
+        assert_eq!(ctx.sub_label, "dev@example.com");
+    }
+
+    #[tokio::test]
+    async fn revoked_delegation_fails_closed() {
+        let (_d, state) = identity_state(false);
+        login_human(&state);
+        let (sid, _tok) = mint_delegated(&state).await;
+        state
+            .identity
+            .as_ref()
+            .unwrap()
+            .store
+            .revoke_delegation(&sid)
+            .unwrap();
+        let err = resolve_principal_context(&state, Some(&sid)).await;
+        assert!(err.is_err(), "revoked delegation must fail closed");
+    }
+
+    #[tokio::test]
+    async fn expired_human_session_kills_delegated_ops() {
+        let (_d, state) = identity_state(false);
+        login_human(&state);
+        let (sid, _tok) = mint_delegated(&state).await;
+        // Revoke the human session mid-flight.
+        state
+            .identity
+            .as_ref()
+            .unwrap()
+            .store
+            .revoke_all_human_sessions()
+            .unwrap();
+        let err = resolve_principal_context(&state, Some(&sid)).await;
+        assert!(
+            err.is_err(),
+            "delegated op must die when the human session ends"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_principal_fails_closed() {
+        let (_d, state) = identity_state(false);
+        let sub = login_human(&state);
+        let (sid, _tok) = mint_delegated(&state).await;
+        // Disable the delegating principal.
+        state
+            .identity
+            .as_ref()
+            .unwrap()
+            .store
+            .set_disabled(&sub, true)
+            .unwrap();
+        let err = resolve_principal_context(&state, Some(&sid)).await;
+        assert!(err.is_err(), "disabled principal must fail closed");
+    }
+
+    #[tokio::test]
+    async fn identity_required_blocks_undelegated_execute_but_not_ping() {
+        let (_d, state) = identity_state(true);
+        // Agent execute without a delegation → identity_required.
+        let exec = Request {
+            id: 1,
+            method: "execute".into(),
+            params: serde_json::json!({ "operation": "noop.test" }),
+        };
+        let resp = handle_request(&state, exec, &test_identity(), ClientType::Agent, None).await;
+        assert_eq!(resp.error.expect("blocked").code, "identity_required");
+
+        // ping is always reachable.
+        let ping = Request {
+            id: 2,
+            method: "ping".into(),
+            params: serde_json::Value::Null,
+        };
+        let resp = handle_request(&state, ping, &test_identity(), ClientType::Agent, None).await;
+        assert!(resp.error.is_none());
+
+        // whoami is reachable (so an agent can be told to log in).
+        let who = Request {
+            id: 3,
+            method: "whoami".into(),
+            params: serde_json::Value::Null,
+        };
+        let resp = handle_request(&state, who, &test_identity(), ClientType::Agent, None).await;
+        assert!(resp.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn identity_required_does_not_block_human() {
+        // Humans are not agents — identity.required targets agent workloads.
+        let (_d, state) = identity_state(true);
+        let exec = Request {
+            id: 1,
+            method: "execute".into(),
+            params: serde_json::json!({ "operation": "noop.test" }),
+        };
+        let resp = handle_request(&state, exec, &test_identity(), ClientType::Human, None).await;
+        // Reaches the enclave (unknown op → not identity_required).
+        assert!(
+            resp.error.is_none() || resp.error.as_ref().unwrap().code != "identity_required",
+            "human must not be identity-gated"
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_require_principal_gates_by_delegation() {
+        use opaque_core::operation::{
+            ApprovalRequirement, OperationDef, OperationRegistry, OperationSafety,
+        };
+        use opaque_core::policy::{IdentityMatch, PolicyEngine, PolicyRule};
+
+        // A rule that only allows delegated requests carrying a principal.
+        let rule = PolicyRule {
+            name: "delegated-only".into(),
+            client: Default::default(),
+            operation_pattern: "noop.*".into(),
+            target: Default::default(),
+            workspace: Default::default(),
+            secret_names: Default::default(),
+            allow: true,
+            client_types: vec![],
+            identity: IdentityMatch {
+                require_principal: Some(true),
+                ..Default::default()
+            },
+            approval: Default::default(),
+        };
+        let mut registry = OperationRegistry::new();
+        registry
+            .register(OperationDef {
+                name: "noop.test".into(),
+                safety: OperationSafety::Safe,
+                default_approval: ApprovalRequirement::Never,
+                default_factors: vec![],
+                description: "test".into(),
+                params_schema: None,
+                allowed_target_keys: vec![],
+                secret_ref_param_keys: vec![],
+            })
+            .unwrap();
+        let engine = PolicyEngine::with_rules(vec![rule]);
+
+        use opaque_core::identity::{PrincipalContext, PrincipalId, PrincipalKind};
+        let ctx = PrincipalContext {
+            sub: PrincipalId::generate(&PrincipalKind::Human {
+                iss: "https://idp.example.com".into(),
+                sub: "u".into(),
+                email: None,
+                name: None,
+            }),
+            sub_label: "u".into(),
+            sub_roles: Default::default(),
+            act: PrincipalId::generate(&PrincipalKind::Agent { tool: "x".into() }),
+            act_label: "agent:x".into(),
+            mode: AccessMode::Delegated,
+            jti: "j".into(),
+            human_session_id: None,
+        };
+
+        let mut req = OperationRequest {
+            principal: None,
+            request_id: Uuid::new_v4(),
+            client_identity: test_identity(),
+            client_type: ClientType::Agent,
+            operation: "noop.test".into(),
+            target: HashMap::new(),
+            secret_ref_names: vec![],
+            created_at: SystemTime::now(),
+            expires_at: None,
+            params: serde_json::Value::Null,
+            workspace: None,
+        };
+        // No principal → denied.
+        assert!(!engine.evaluate(&req, OperationSafety::Safe).allowed);
+        // With a verified principal → allowed.
+        req.principal = Some(ctx);
+        assert!(engine.evaluate(&req, OperationSafety::Safe).allowed);
+    }
+
+    #[tokio::test]
+    async fn delegation_list_gated_and_shaped() {
+        let (_d, state) = identity_state(false);
+        login_human(&state);
+        mint_delegated(&state).await;
+
+        let req = Request {
+            id: 1,
+            method: "identity.delegation_list".into(),
+            params: serde_json::Value::Null,
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        assert!(resp.error.is_none(), "unexpected: {:?}", resp.error);
+        let list = resp.result.unwrap();
+        let arr = list["delegations"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["mode"], "delegated");
+        assert_eq!(arr[0]["sub_label"], "dev@example.com");
+        assert!(arr[0]["jti"].is_string());
+    }
+
+    #[tokio::test]
+    async fn end_session_revokes_delegation() {
+        let (_d, state) = identity_state(false);
+        login_human(&state);
+        let (sid, _tok) = mint_delegated(&state).await;
+        let req = Request {
+            id: 1,
+            method: "agent_session_end".into(),
+            params: serde_json::json!({ "session_id": sid }),
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Agent, None).await;
+        assert!(resp.error.is_none());
+        // The store row is now revoked.
+        let rec = state
+            .identity
+            .as_ref()
+            .unwrap()
+            .store
+            .get_delegation(&sid)
+            .unwrap()
+            .unwrap();
+        assert!(rec.revoked_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn legacy_hex_token_path_unchanged_without_identity() {
+        // No [identity] configured: minting yields a hex token, no principal.
+        let state = make_test_state();
+        let resp = start_session(&state, serde_json::json!({})).await;
+        assert!(resp.error.is_none());
+        let r = resp.result.unwrap();
+        let tok = r["session_token"].as_str().unwrap();
+        assert!(
+            !tok.starts_with("opqd1."),
+            "legacy path must use hex tokens"
+        );
+        assert!(r.get("mode").is_none(), "no delegation metadata expected");
     }
 }
