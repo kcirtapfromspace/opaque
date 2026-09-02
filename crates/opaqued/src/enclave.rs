@@ -26,8 +26,8 @@ use opaque_core::audit::{
     WorkspaceSummary,
 };
 use opaque_core::operation::{
-    ApprovalFactor, ApprovalRequirement, ClientType, OperationDef, OperationRegistry,
-    OperationRequest, OperationSafety, validate_params,
+    ApprovalFactor, ApprovalRequirement, ClientIdentity, ClientType, OperationDef,
+    OperationRegistry, OperationRequest, OperationSafety, validate_params,
 };
 use opaque_core::policy::{PolicyDecision, PolicyEngine};
 use opaque_core::sanitize::{Sanitized, SanitizedResponse, Sanitizer, Unsanitized};
@@ -743,7 +743,7 @@ impl Enclave {
         }
 
         // --- Step 5: Evaluate policy ---
-        let decision = self.policy.evaluate(&request, op_def.safety);
+        let mut decision = self.policy.evaluate(&request, op_def.safety);
 
         if !decision.allowed {
             let reason = decision
@@ -767,6 +767,38 @@ impl Enclave {
                 request.operation, request.operation
             ));
             return self.error_to_sanitized(&err);
+        }
+
+        // --- Step 5b: Clamp the approval decision (defense-in-depth) ---
+        //
+        // SECURITY (H10 + software-first): the operation's `default_approval` is a
+        // floor a policy rule may raise but never lower, and a SensitiveOutput
+        // operation always requires out-of-band approval — presence is proven by
+        // the approval act, not by client classification (which is audit-only).
+        decision.approval_requirement =
+            stricter_requirement(op_def.default_approval, decision.approval_requirement);
+        if op_def.safety == OperationSafety::SensitiveOutput {
+            decision.approval_requirement = ApprovalRequirement::Always;
+        }
+        if decision.required_factors.is_empty() {
+            decision.required_factors = op_def.default_factors.clone();
+        }
+        if decision.approval_requirement != ApprovalRequirement::Never
+            && decision.required_factors.is_empty()
+        {
+            let err = EnclaveError::SafetyViolation(format!(
+                "operation '{}' requires approval but no approval factor is configured",
+                request.operation
+            ));
+            return self.emit_and_sanitize_error(
+                request_id,
+                &client_summary,
+                &request.operation,
+                &target_summary,
+                &request.secret_ref_names,
+                &err,
+                start,
+            );
         }
 
         // --- Step 6: Approval gate ---
@@ -872,28 +904,134 @@ impl Enclave {
     /// Check safety-class constraints before policy evaluation.
     fn check_safety_constraints(
         &self,
-        request: &OperationRequest,
+        _request: &OperationRequest,
         op_def: &OperationDef,
     ) -> Result<(), EnclaveError> {
-        // REVEAL operations are hard-blocked for ALL clients in v1.
-        // This is a defense-in-depth measure: even if policy somehow allows it,
-        // the safety check prevents plaintext secret disclosure.
+        // REVEAL operations are hard-blocked for ALL clients. Defense-in-depth:
+        // even if policy somehow allows it, this prevents plaintext disclosure.
         if op_def.safety == OperationSafety::Reveal {
             return Err(EnclaveError::SafetyViolation(
                 "REVEAL operations are not permitted in v1".into(),
             ));
         }
-        // SENSITIVE_OUTPUT operations are hard-blocked for agent clients.
-        // Policy already enforces this, but defense-in-depth at the enclave
-        // layer ensures no policy misconfiguration can leak sensitive output.
-        if op_def.safety == OperationSafety::SensitiveOutput
-            && request.client_type == ClientType::Agent
+        // NOTE (software-first, C1): SensitiveOutput is NOT gated on client
+        // classification here — classification is audit-only and cannot be a
+        // security boundary at a shared uid, where an agent drives the same signed
+        // CLI a human does. SensitiveOutput is instead gated on mandatory
+        // out-of-band approval, enforced by the approval clamp in `execute`: a
+        // human proves presence at the prompt; the agent cannot satisfy it.
+        Ok(())
+    }
+
+    /// Run a standalone out-of-band approval not tied to a registered operation.
+    ///
+    /// Used for privileged control-plane actions such as minting an agent session
+    /// token: the act must be authorized by a fresh human approval (which an agent
+    /// cannot satisfy), never by client classification. Reuses the same rate
+    /// limiter, prompt serialization, and audit trail as operation approvals.
+    pub async fn request_session_approval(
+        &self,
+        identity: &ClientIdentity,
+        client_type: ClientType,
+        reason: &str,
+    ) -> Result<(), EnclaveError> {
+        let client_summary = ClientSummary::from((identity, client_type));
+
+        if !self
+            .rate_limiter
+            .check_and_record(identity.pid, "agent_session_start")
         {
-            return Err(EnclaveError::SafetyViolation(
-                "SENSITIVE_OUTPUT operations are not permitted for agent clients".into(),
+            return Err(EnclaveError::RateLimited(
+                "too many session approval requests".into(),
             ));
         }
-        Ok(())
+
+        let approval_id = Uuid::new_v4();
+        self.audit.emit(
+            AuditEvent::new(AuditEventKind::ApprovalRequired)
+                .with_approval_id(approval_id)
+                .with_client(client_summary.clone())
+                .with_operation("agent_session_start"),
+        );
+
+        // Serialize prompts to avoid races / approval stacking.
+        let _permit = self
+            .approval_semaphore
+            .acquire()
+            .await
+            .map_err(|_| EnclaveError::ApprovalUnavailable("approval gate closed".into()))?;
+
+        // Synthetic request: the gate needs only identity + description for the
+        // local biometric factor; classification is audit-only.
+        let synth = OperationRequest {
+            request_id: approval_id,
+            client_identity: identity.clone(),
+            client_type,
+            operation: "agent_session_start".into(),
+            target: std::collections::HashMap::new(),
+            secret_ref_names: vec![],
+            created_at: std::time::SystemTime::now(),
+            expires_at: None,
+            params: serde_json::Value::Null,
+            workspace: None,
+        };
+        let description = format!(
+            "Operation: Create an agent session token\n  {}\nClient: {}",
+            sanitize_for_display(reason, 256),
+            identity
+        );
+
+        self.audit.emit(
+            AuditEvent::new(AuditEventKind::ApprovalPresented)
+                .with_approval_id(approval_id)
+                .with_client(client_summary.clone())
+                .with_operation("agent_session_start"),
+        );
+
+        let result = self
+            .approval_gate
+            .request_approval(
+                approval_id,
+                &synth,
+                &[ApprovalFactor::LocalBio],
+                &description,
+            )
+            .await;
+
+        match result {
+            Ok(true) => {
+                self.audit.emit(
+                    AuditEvent::new(AuditEventKind::ApprovalGranted)
+                        .with_approval_id(approval_id)
+                        .with_client(client_summary)
+                        .with_operation("agent_session_start")
+                        .with_outcome("granted"),
+                );
+                Ok(())
+            }
+            Ok(false) => {
+                self.audit.emit(
+                    AuditEvent::new(AuditEventKind::ApprovalDenied)
+                        .with_approval_id(approval_id)
+                        .with_client(client_summary)
+                        .with_operation("agent_session_start")
+                        .with_outcome("denied"),
+                );
+                Err(EnclaveError::ApprovalNotGranted(
+                    "agent session creation was not approved".into(),
+                ))
+            }
+            Err(e) => {
+                self.audit.emit(
+                    AuditEvent::new(AuditEventKind::ApprovalDenied)
+                        .with_approval_id(approval_id)
+                        .with_client(client_summary)
+                        .with_operation("agent_session_start")
+                        .with_outcome("error"),
+                );
+                Err(EnclaveError::ApprovalUnavailable(e))
+            }
+        }
     }
 
     /// Handle the approval gate if the policy decision requires it.
@@ -927,8 +1065,17 @@ impl Enclave {
             ApprovalRequirement::Never => false,
         };
 
-        if !needs_approval || decision.required_factors.is_empty() {
+        if !needs_approval {
             return Ok(());
+        }
+        // SECURITY (H10): a required approval with no configured factor must fail
+        // closed, never be silently skipped. `execute` clamps factors to the
+        // operation's defaults before this point, so an empty set here is a real
+        // misconfiguration rather than a valid "no approval needed" signal.
+        if decision.required_factors.is_empty() {
+            return Err(EnclaveError::SafetyViolation(
+                "approval required but no approval factor is configured".into(),
+            ));
         }
 
         // Rate limit check before presenting approval prompt.
@@ -963,6 +1110,21 @@ impl Enclave {
         // if upstream validation is bypassed, the prompt cannot be spoofed.
         let mut description = format!("Operation: {}", op_def.description);
         for (k, v) in &request.target {
+            // SECURITY (C3): the command is the security-critical field the approver
+            // must actually read, so render it in full (sanitized to a single line)
+            // with an explicit truncation marker — never silently cut it, which would
+            // let an attacker hide an exfil tail past a truncation limit. Other target
+            // fields are short identifiers and keep the conservative cap.
+            if k == "command" {
+                let full = sanitize_for_display(v, 4096);
+                let marker = if v.chars().count() > 4096 {
+                    " …(truncated)"
+                } else {
+                    ""
+                };
+                description.push_str(&format!("\n  command: {full}{marker}"));
+                continue;
+            }
             let v_safe = sanitize_for_display(v, 128);
             description.push_str(&format!("\n  {k}: {v_safe}"));
         }
@@ -1211,6 +1373,20 @@ impl ApprovalGate for NativeApprovalGate {
 // Approval display sanitization
 // ---------------------------------------------------------------------------
 
+/// Return the stricter of two approval requirements (Always > FirstUse > Never).
+/// Used to clamp a policy decision against an operation's `default_approval` floor,
+/// so a rule can only make approval stricter, never weaker (H10).
+fn stricter_requirement(a: ApprovalRequirement, b: ApprovalRequirement) -> ApprovalRequirement {
+    fn rank(r: ApprovalRequirement) -> u8 {
+        match r {
+            ApprovalRequirement::Always => 2,
+            ApprovalRequirement::FirstUse => 1,
+            ApprovalRequirement::Never => 0,
+        }
+    }
+    if rank(a) >= rank(b) { a } else { b }
+}
+
 /// Sanitize a string for display in the approval prompt.
 ///
 /// Strips control characters (0x00-0x1F), RTL overrides (U+202A-U+202E),
@@ -1406,9 +1582,23 @@ mod tests {
         reg.register(OperationDef {
             name: "github.set_actions_secret".into(),
             safety: OperationSafety::Safe,
-            default_approval: ApprovalRequirement::Always,
+            // FirstUse in the fixture so lease tests can exercise leasing; the
+            // approval clamp still raises this to Always under an Always policy.
+            default_approval: ApprovalRequirement::FirstUse,
             default_factors: vec![ApprovalFactor::LocalBio],
             description: "Set a GitHub Actions repository secret".into(),
+            params_schema: None,
+            allowed_target_keys: vec![],
+            secret_ref_param_keys: vec![],
+        })
+        .unwrap();
+        // A Never-approval op for exercising the "no approval needed" path.
+        reg.register(OperationDef {
+            name: "test.noop".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Never,
+            default_factors: vec![],
+            description: "No-op test operation".into(),
             params_schema: None,
             allowed_target_keys: vec![],
             secret_ref_param_keys: vec![],
@@ -2278,7 +2468,7 @@ mod tests {
                 exe_path: Some("/usr/bin/claude*".into()),
                 ..Default::default()
             },
-            operation_pattern: "github.*".into(),
+            operation_pattern: "test.noop".into(),
             target: TargetMatch {
                 fields: {
                     let mut m = HashMap::new();
@@ -2302,7 +2492,7 @@ mod tests {
             .registry(test_registry())
             .policy(policy)
             .handler(
-                "github.set_actions_secret",
+                "test.noop",
                 Box::new(StubHandler {
                     response: serde_json::json!({"status": "ok"}),
                 }),
@@ -2311,7 +2501,7 @@ mod tests {
             .audit(audit.clone())
             .build().unwrap();
 
-        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let req = test_request("test.noop", ClientType::Agent);
         let resp = enclave.execute(req).await;
 
         assert!(resp.error_code().is_none());
@@ -3102,10 +3292,10 @@ mod tests {
         }
     }
 
-    // -- SensitiveOutput safety enforcement through enclave --
+    // -- SensitiveOutput is gated on approval, not classification --
 
     #[tokio::test]
-    async fn sensitive_output_blocked_for_agent_without_explicit_allowance() {
+    async fn sensitive_output_requires_approval_not_classification() {
         let audit = Arc::new(InMemoryAuditEmitter::new());
 
         let mut registry = OperationRegistry::new();
@@ -3122,7 +3312,8 @@ mod tests {
             })
             .unwrap();
 
-        // Rule does NOT explicitly include Agent in client_types.
+        // Policy sets approval to "never"; the enclave clamp must still force
+        // mandatory approval because the op is SensitiveOutput.
         let policy = PolicyEngine::with_rules(vec![PolicyRule {
             name: "allow-ecr".into(),
             client: ClientMatch {
@@ -3141,10 +3332,10 @@ mod tests {
             workspace: WorkspaceMatch::default(),
             secret_names: SecretNameMatch::default(),
             allow: true,
-            client_types: vec![], // Empty = matches all for matching, but NOT for SENSITIVE_OUTPUT
+            client_types: vec![], // classification no longer gates SensitiveOutput
             approval: ApprovalConfig {
-                require: ApprovalRequirement::Always,
-                factors: vec![ApprovalFactor::LocalBio],
+                require: ApprovalRequirement::Never,
+                factors: vec![],
                 lease_ttl: None,
                 one_time: false,
             },
@@ -3163,12 +3354,21 @@ mod tests {
             .audit(audit.clone())
             .build().unwrap();
 
-        // Agent client → blocked by enclave safety check (defense-in-depth).
+        // Agent client: despite the "never" policy, the SensitiveOutput clamp
+        // forces approval. With an approving gate the op then succeeds — and the
+        // approval was genuinely required (proving presence, not classification,
+        // is the gate).
         let req = test_request("ecr.get_auth_token", ClientType::Agent);
         let resp = enclave.execute(req).await;
-        assert_eq!(resp.error_code(), Some("safety_violation"));
+        assert!(resp.error_code().is_none());
+        assert!(
+            !audit
+                .events_of_kind(AuditEventKind::ApprovalRequired)
+                .is_empty(),
+            "SensitiveOutput must require approval regardless of the policy's 'never'"
+        );
 
-        // Human client → allowed.
+        // Human client is treated identically — no free pass from classification.
         let req = test_request("ecr.get_auth_token", ClientType::Human);
         let resp = enclave.execute(req).await;
         assert!(resp.error_code().is_none());

@@ -1777,6 +1777,7 @@ name = "opaque-core"
 version = "0.1.0"
 dependencies = [
  "glob-match",
+ "hmac",
  "jsonschema",
  "libc",
  "regex",

@@ -702,6 +702,9 @@ enum AuditAction {
         #[arg(long = "query")]
         query: Option<String>,
     },
+
+    /// Verify the tamper-evident audit hash chain.
+    Verify,
 }
 
 fn parse_kv(s: &str) -> Result<(String, String), String> {
@@ -1925,6 +1928,13 @@ async fn main() {
                         }
                     }
                 }
+                AuditAction::Verify => match run_audit_verify(json_output) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        ui::error(&e);
+                        std::process::exit(1);
+                    }
+                },
             }
             return;
         }
@@ -2752,6 +2762,42 @@ async fn call_once(
 
 /// Run the `audit tail` subcommand: query the local SQLite audit DB.
 #[allow(clippy::too_many_arguments)]
+fn run_audit_verify(json_output: bool) -> Result<(), String> {
+    let db_path = default_opaque_dir().join("audit.db");
+    if !db_path.exists() {
+        return Err(format!(
+            "audit database not found at {} (is opaqued running?)",
+            db_path.display()
+        ));
+    }
+    let v = opaque_core::audit::verify_audit_chain(&db_path)
+        .map_err(|e| format!("failed to verify audit chain: {e}"))?;
+    if json_output {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": v.ok,
+                "records_checked": v.records_checked,
+                "first_bad_sequence": v.first_bad_sequence,
+                "detail": v.detail,
+            })
+        );
+    } else if v.ok {
+        ui::success(&format!(
+            "Audit chain intact \u{2014} {} records verified",
+            v.records_checked
+        ));
+    } else {
+        ui::error(&format!(
+            "Audit chain BROKEN \u{2014} {} ({} records verified before the break)",
+            v.detail.as_deref().unwrap_or("tampering detected"),
+            v.records_checked
+        ));
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
 fn run_audit_tail(
     limit: usize,
     kind: Option<&str>,

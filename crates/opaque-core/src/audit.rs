@@ -11,11 +11,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use uuid::Uuid;
 
 use crate::operation::{ClientIdentity, ClientType, OperationSafety};
 use crate::policy::PolicyDecision;
+
+type HmacSha256 = Hmac<Sha256>;
 
 // ---------------------------------------------------------------------------
 // Audit event kind
@@ -649,6 +653,271 @@ impl AuditSink for TracingAuditEmitter {
 // SQLite audit sink (persistent storage)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Tamper-evident hash chain
+// ---------------------------------------------------------------------------
+
+/// Genesis value the first audit record chains from.
+const CHAIN_GENESIS: &str = "opaque-audit-chain-genesis-v1";
+
+/// The persisted columns bound into each record's chain hash, in a fixed order.
+/// Insert, verify, and backfill all reference this list so the canonical form
+/// they hash is identical.
+const CHAIN_COLUMNS: &str = "event_id, sequence_number, ts_utc_ms, level, kind, \
+request_id, approval_id, client_json, operation, safety, target_json, outcome, \
+latency_ms, secret_names, policy_decision, detail, workspace_json, request_hash";
+
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Path to the HMAC key file that seals the audit chain, derived from the database
+/// path (sibling file with a `.hmac` extension).
+fn hmac_key_path(db_path: &Path) -> PathBuf {
+    db_path.with_extension("hmac")
+}
+
+/// Load the audit chain HMAC key, creating it (0600) on first use.
+///
+/// SECURITY: this key authenticates the tamper-evident chain. At rest it is a 0600
+/// file beside the database, so a process running as the daemon's own uid can read
+/// it. At a shared uid the chain is therefore tamper-*evident* (it detects casual,
+/// partial, or non-key-holder tampering) but not tamper-*proof* against an adversary
+/// that also reads the key. Running the daemon under a dedicated service account
+/// (so the key is not readable by the agent's uid), or moving the key into the OS
+/// keychain, closes that gap — see the integrity roadmap.
+fn load_or_create_hmac_key(db_path: &Path) -> Result<[u8; 32], AuditError> {
+    let path = hmac_key_path(db_path);
+    if let Ok(bytes) = std::fs::read(&path)
+        && bytes.len() == 32
+    {
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&bytes);
+        return Ok(key);
+    }
+    // Generate 32 bytes from two v4 UUIDs (crypto-random via getrandom).
+    let mut key = [0u8; 32];
+    key[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+    key[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+    write_key_file(&path, &key)?;
+    Ok(key)
+}
+
+#[cfg(unix)]
+fn write_key_file(path: &Path, key: &[u8; 32]) -> Result<(), AuditError> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(key)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_key_file(path: &Path, key: &[u8; 32]) -> Result<(), AuditError> {
+    std::fs::write(path, key)?;
+    Ok(())
+}
+
+/// Deterministic, order-fixed serialization of the persisted fields. `None` renders
+/// empty; the field count is fixed so empties are unambiguous. Unit separators
+/// (`0x1f`) prevent field-boundary ambiguity.
+#[allow(clippy::too_many_arguments)]
+fn canonical_record(
+    event_id: &str,
+    sequence_number: i64,
+    ts_utc_ms: i64,
+    level: &str,
+    kind: &str,
+    request_id: Option<&str>,
+    approval_id: Option<&str>,
+    client_json: Option<&str>,
+    operation: Option<&str>,
+    safety: Option<&str>,
+    target_json: Option<&str>,
+    outcome: Option<&str>,
+    latency_ms: Option<i64>,
+    secret_names: Option<&str>,
+    policy_decision: Option<&str>,
+    detail: Option<&str>,
+    workspace_json: Option<&str>,
+    request_hash: Option<&str>,
+) -> String {
+    let seq = sequence_number.to_string();
+    let ts = ts_utc_ms.to_string();
+    let lat = latency_ms.map(|v| v.to_string()).unwrap_or_default();
+    fn f(o: Option<&str>) -> &str {
+        o.unwrap_or("")
+    }
+    [
+        event_id,
+        &seq,
+        &ts,
+        level,
+        kind,
+        f(request_id),
+        f(approval_id),
+        f(client_json),
+        f(operation),
+        f(safety),
+        f(target_json),
+        f(outcome),
+        &lat,
+        f(secret_names),
+        f(policy_decision),
+        f(detail),
+        f(workspace_json),
+        f(request_hash),
+    ]
+    .join("\u{1f}")
+}
+
+/// `HMAC-SHA256(key, prev_hash ‖ RS ‖ canonical_record)`, hex-encoded.
+fn chain_hash(key: &[u8; 32], prev_hash: &str, canon: &str) -> String {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(prev_hash.as_bytes());
+    mac.update(b"\x1e");
+    mac.update(canon.as_bytes());
+    hex_encode(mac.finalize().into_bytes().as_slice())
+}
+
+/// Read the 18 chained fields from a row starting at column `base` and return the
+/// canonical record string.
+fn canon_from_row(row: &rusqlite::Row, base: usize) -> rusqlite::Result<String> {
+    let s = |i: usize| -> rusqlite::Result<Option<String>> { row.get(base + i) };
+    let event_id: String = row.get(base)?;
+    let sequence_number: i64 = row.get(base + 1)?;
+    let ts_utc_ms: i64 = row.get(base + 2)?;
+    let level: String = row.get(base + 3)?;
+    let kind: String = row.get(base + 4)?;
+    let request_id = s(5)?;
+    let approval_id = s(6)?;
+    let client_json = s(7)?;
+    let operation = s(8)?;
+    let safety = s(9)?;
+    let target_json = s(10)?;
+    let outcome = s(11)?;
+    let latency_ms: Option<i64> = row.get(base + 12)?;
+    let secret_names = s(13)?;
+    let policy_decision = s(14)?;
+    let detail = s(15)?;
+    let workspace_json = s(16)?;
+    let request_hash = s(17)?;
+    Ok(canonical_record(
+        &event_id,
+        sequence_number,
+        ts_utc_ms,
+        &level,
+        &kind,
+        request_id.as_deref(),
+        approval_id.as_deref(),
+        client_json.as_deref(),
+        operation.as_deref(),
+        safety.as_deref(),
+        target_json.as_deref(),
+        outcome.as_deref(),
+        latency_ms,
+        secret_names.as_deref(),
+        policy_decision.as_deref(),
+        detail.as_deref(),
+        workspace_json.as_deref(),
+        request_hash.as_deref(),
+    ))
+}
+
+/// Compute the chain for rows that lack a `record_hash` (e.g. a database created
+/// before the chain existed), in rowid (insertion) order.
+fn backfill_chain(conn: &rusqlite::Connection, key: &[u8; 32]) -> Result<(), rusqlite::Error> {
+    let sql = format!("SELECT rowid, {CHAIN_COLUMNS} FROM audit_events ORDER BY rowid ASC");
+    let pending: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare(&sql)?;
+        let mut q = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(r) = q.next()? {
+            let rowid: i64 = r.get(0)?;
+            out.push((rowid, canon_from_row(r, 1)?));
+        }
+        out
+    };
+    let mut prev = CHAIN_GENESIS.to_string();
+    for (rowid, canon) in pending {
+        let h = chain_hash(key, &prev, &canon);
+        conn.execute(
+            "UPDATE audit_events SET record_hash = ?1 WHERE rowid = ?2",
+            rusqlite::params![h, rowid],
+        )?;
+        prev = h;
+    }
+    Ok(())
+}
+
+/// Result of verifying the audit hash chain.
+#[derive(Debug, Clone)]
+pub struct ChainVerification {
+    /// True if every record's stored hash matches the recomputed chain.
+    pub ok: bool,
+    /// Number of records verified before a break (or the total, if `ok`).
+    pub records_checked: u64,
+    /// Sequence number of the first record whose hash did not match.
+    pub first_bad_sequence: Option<u64>,
+    /// Human-readable detail when the chain is broken.
+    pub detail: Option<String>,
+}
+
+/// Verify the tamper-evident hash chain over the audit log at `db_path`.
+///
+/// Recomputes the chain in insertion order and reports the first record whose
+/// stored hash does not match — which catches any edit, deletion, or reordering of
+/// rows by anyone who does not hold the chain key.
+pub fn verify_audit_chain(db_path: &Path) -> Result<ChainVerification, AuditError> {
+    let key = load_or_create_hmac_key(db_path)?;
+    let conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let sql = format!("SELECT {CHAIN_COLUMNS}, record_hash FROM audit_events ORDER BY rowid ASC");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    let mut prev = CHAIN_GENESIS.to_string();
+    let mut count = 0u64;
+    while let Some(row) = rows.next()? {
+        let canon = canon_from_row(row, 0)?;
+        let seq: i64 = row.get(1)?;
+        let stored: Option<String> = row.get(18)?;
+        let expected = chain_hash(&key, &prev, &canon);
+        match stored {
+            Some(h) if h == expected => {
+                prev = h;
+                count += 1;
+            }
+            _ => {
+                return Ok(ChainVerification {
+                    ok: false,
+                    records_checked: count,
+                    first_bad_sequence: Some(seq.max(0) as u64),
+                    detail: Some(format!(
+                        "audit chain broken at record {} (sequence {seq})",
+                        count + 1
+                    )),
+                });
+            }
+        }
+    }
+    Ok(ChainVerification {
+        ok: true,
+        records_checked: count,
+        first_bad_sequence: None,
+        detail: None,
+    })
+}
+
 const SCHEMA_SQL: &str = "\
 CREATE TABLE IF NOT EXISTS audit_events (
     event_id TEXT PRIMARY KEY,
@@ -668,7 +937,8 @@ CREATE TABLE IF NOT EXISTS audit_events (
     policy_decision TEXT,
     detail TEXT,
     workspace_json TEXT,
-    request_hash TEXT
+    request_hash TEXT,
+    record_hash TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_ts ON audit_events(ts_utc_ms);
 CREATE INDEX IF NOT EXISTS idx_kind ON audit_events(kind);
@@ -753,6 +1023,18 @@ impl SqliteAuditSink {
         // Open connection, create schema, run retention cleanup.
         let conn = rusqlite::Connection::open(&db_path)?;
         conn.execute_batch(SCHEMA_SQL)?;
+
+        // Tamper-evident chain: load the key and migrate databases created before
+        // the chain existed (add the column, then backfill hashes once).
+        let hmac_key = load_or_create_hmac_key(&db_path)?;
+        let has_record_hash = conn
+            .prepare("SELECT record_hash FROM audit_events LIMIT 0")
+            .is_ok();
+        if !has_record_hash {
+            conn.execute("ALTER TABLE audit_events ADD COLUMN record_hash TEXT", [])?;
+            backfill_chain(&conn, &hmac_key)?;
+        }
+
         Self::run_retention_cleanup(&conn, retention_days)?;
         conn.execute(
             "INSERT OR IGNORE INTO audit_events_fts(rowid, search_text)
@@ -779,10 +1061,17 @@ impl SqliteAuditSink {
         let writer_pause_clone = writer_pause.clone();
 
         let writer_path = db_path.clone();
+        let writer_key = hmac_key;
         let writer_handle = std::thread::Builder::new()
             .name("audit-writer".into())
             .spawn(move || {
-                Self::writer_loop(&writer_path, receiver, &writer_pause_clone, retention_days);
+                Self::writer_loop(
+                    &writer_path,
+                    receiver,
+                    &writer_pause_clone,
+                    retention_days,
+                    writer_key,
+                );
             })
             .map_err(|e| AuditError::Other(format!("failed to spawn writer thread: {e}")))?;
 
@@ -900,6 +1189,7 @@ impl SqliteAuditSink {
         receiver: std::sync::mpsc::Receiver<AuditEvent>,
         pause: &std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
         retention_days: u64,
+        key: [u8; 32],
     ) {
         let conn = match rusqlite::Connection::open(db_path) {
             Ok(c) => c,
@@ -911,6 +1201,17 @@ impl SqliteAuditSink {
 
         // WAL mode for better concurrent read performance.
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
+
+        // Chain head: the last written record's hash, or genesis for an empty log.
+        let mut last_hash: String = conn
+            .query_row(
+                "SELECT record_hash FROM audit_events ORDER BY rowid DESC LIMIT 1",
+                [],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| CHAIN_GENESIS.to_string());
 
         let mut batch = Vec::with_capacity(64);
         let mut next_retention_cleanup = std::time::Instant::now() + RETENTION_CLEANUP_INTERVAL;
@@ -938,7 +1239,7 @@ impl SqliteAuditSink {
                         }
                     }
 
-                    if let Err(e) = Self::insert_batch(&conn, &batch) {
+                    if let Err(e) = Self::insert_batch(&conn, &batch, &key, &mut last_hash) {
                         tracing::error!("audit writer insert failed: {e}");
                     }
                     batch.clear();
@@ -979,6 +1280,12 @@ impl SqliteAuditSink {
         conn: &rusqlite::Connection,
         retention_days: u64,
     ) -> Result<usize, rusqlite::Error> {
+        // SECURITY (M23): retention_days = 0 means "keep forever", never "delete
+        // everything". Guard against a config value (user-writable) that would
+        // otherwise wipe the entire audit trail at startup.
+        if retention_days == 0 {
+            return Ok(0);
+        }
         let cutoff_ms = Self::retention_cutoff_ms(retention_days);
         conn.execute(
             "DELETE FROM audit_events WHERE ts_utc_ms < ?1",
@@ -990,6 +1297,8 @@ impl SqliteAuditSink {
     fn insert_batch(
         conn: &rusqlite::Connection,
         events: &[AuditEvent],
+        key: &[u8; 32],
+        last_hash: &mut String,
     ) -> Result<(), rusqlite::Error> {
         let tx = conn.unchecked_transaction()?;
         {
@@ -998,8 +1307,8 @@ impl SqliteAuditSink {
                     event_id, sequence_number, ts_utc_ms, level, kind,
                     request_id, approval_id, client_json, operation, safety,
                     target_json, outcome, latency_ms, secret_names,
-                    policy_decision, detail, workspace_json, request_hash
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                    policy_decision, detail, workspace_json, request_hash, record_hash
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             )?;
 
             for event in events {
@@ -1022,14 +1331,42 @@ impl SqliteAuditSink {
                     .as_ref()
                     .and_then(|w| serde_json::to_string(w).ok());
 
-                stmt.execute(rusqlite::params![
-                    event.event_id.to_string(),
+                // Chain this record to the current head over its canonical form.
+                let event_id = event.event_id.to_string();
+                let level = event.level.to_string();
+                let kind = event.kind.to_string();
+                let request_id = event.request_id.map(|u| u.to_string());
+                let approval_id = event.approval_id.map(|u| u.to_string());
+                let canon = canonical_record(
+                    &event_id,
+                    event.sequence_number as i64,
+                    event.ts_utc_ms,
+                    &level,
+                    &kind,
+                    request_id.as_deref(),
+                    approval_id.as_deref(),
+                    client_json.as_deref(),
+                    event.operation.as_deref(),
+                    safety_str.as_deref(),
+                    target_json.as_deref(),
+                    event.outcome.as_deref(),
+                    event.latency_ms,
+                    secret_names_str.as_deref(),
+                    event.policy_decision.as_deref(),
+                    event.detail.as_deref(),
+                    workspace_json.as_deref(),
+                    event.request_hash.as_deref(),
+                );
+                let record_hash = chain_hash(key, last_hash, &canon);
+
+                let changed = stmt.execute(rusqlite::params![
+                    event_id,
                     event.sequence_number,
                     event.ts_utc_ms,
-                    event.level.to_string(),
-                    event.kind.to_string(),
-                    event.request_id.map(|u| u.to_string()),
-                    event.approval_id.map(|u| u.to_string()),
+                    level,
+                    kind,
+                    request_id,
+                    approval_id,
                     client_json,
                     event.operation,
                     safety_str,
@@ -1041,7 +1378,13 @@ impl SqliteAuditSink {
                     event.detail,
                     workspace_json,
                     event.request_hash,
+                    record_hash,
                 ])?;
+                // Only advance the head if the row was actually inserted (a
+                // duplicate event_id is IGNOREd and must not shift the chain).
+                if changed > 0 {
+                    *last_hash = record_hash;
+                }
             }
         }
         tx.commit()?;
@@ -1868,6 +2211,104 @@ mod tests {
         let events = query_audit_db(&db_path, &filter).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, AuditEventKind::PolicyDenied);
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    // -- Tamper-evident hash chain --
+
+    #[test]
+    fn audit_chain_verifies_clean_log() {
+        let db_path = temp_db_path();
+        let sink = SqliteAuditSink::new(db_path.clone(), 90).unwrap();
+        sink.emit(make_test_event(AuditEventKind::RequestReceived));
+        sink.emit(make_test_event(AuditEventKind::OperationStarted));
+        sink.emit(make_test_event(AuditEventKind::OperationSucceeded));
+        drop(sink); // flush + join writer
+
+        let v = verify_audit_chain(&db_path).unwrap();
+        assert!(v.ok, "clean log should verify: {:?}", v.detail);
+        assert_eq!(v.records_checked, 3);
+        assert!(v.first_bad_sequence.is_none());
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(hmac_key_path(&db_path));
+    }
+
+    #[test]
+    fn audit_chain_detects_row_tamper() {
+        let db_path = temp_db_path();
+        let sink = SqliteAuditSink::new(db_path.clone(), 90).unwrap();
+        sink.emit(make_test_event(AuditEventKind::RequestReceived).with_outcome("ok"));
+        sink.emit(make_test_event(AuditEventKind::PolicyDenied).with_outcome("denied"));
+        sink.emit(make_test_event(AuditEventKind::OperationSucceeded).with_outcome("ok"));
+        drop(sink);
+
+        // Tamper: rewrite a denial to look successful, leaving record_hash untouched.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE audit_events SET outcome = 'ok' WHERE outcome = 'denied'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let v = verify_audit_chain(&db_path).unwrap();
+        assert!(!v.ok, "tampered log must fail verification");
+        assert!(v.first_bad_sequence.is_some());
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(hmac_key_path(&db_path));
+    }
+
+    #[test]
+    fn audit_chain_detects_row_deletion() {
+        let db_path = temp_db_path();
+        let sink = SqliteAuditSink::new(db_path.clone(), 90).unwrap();
+        sink.emit(make_test_event(AuditEventKind::RequestReceived));
+        sink.emit(make_test_event(AuditEventKind::PolicyDenied));
+        sink.emit(make_test_event(AuditEventKind::OperationSucceeded));
+        drop(sink);
+
+        // Delete the middle record — the following record no longer chains.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute("DELETE FROM audit_events WHERE kind = 'policy.denied'", [])
+                .unwrap();
+        }
+
+        let v = verify_audit_chain(&db_path).unwrap();
+        assert!(!v.ok, "deletion must be detected");
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(hmac_key_path(&db_path));
+    }
+
+    #[test]
+    fn retention_zero_keeps_all() {
+        let db_path = temp_db_path();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        // Insert an ancient row directly.
+        conn.execute(
+            "INSERT INTO audit_events (event_id, sequence_number, ts_utc_ms, level, kind)
+             VALUES ('e1', 1, 1, 'info', 'request.received')",
+            [],
+        )
+        .unwrap();
+
+        // M23: retention_days = 0 means keep forever, never wipe everything.
+        let deleted = SqliteAuditSink::run_retention_cleanup(&conn, 0).unwrap();
+        assert_eq!(deleted, 0);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM audit_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "retention_days=0 must not delete anything");
+
+        // A positive retention with an ancient cutoff still removes the old row.
+        let deleted = SqliteAuditSink::run_retention_cleanup(&conn, 1).unwrap();
+        assert_eq!(deleted, 1);
 
         let _ = std::fs::remove_file(&db_path);
     }

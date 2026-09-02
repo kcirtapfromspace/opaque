@@ -603,25 +603,27 @@ fn format_operation_result(result: &serde_json::Value) {
         return;
     }
 
-    // sandbox.exec returns stdout/stderr + exit code.
+    // sandbox.exec returns exit code + output lengths (never content).
     if let Some(exit_code) = obj.get("exit_code").and_then(|v| v.as_i64()) {
-        // Print captured stdout directly (not styled — preserve command output).
-        if let Some(stdout) = obj.get("stdout").and_then(|v| v.as_str())
-            && !stdout.is_empty()
-        {
-            print!("{stdout}");
-            if !stdout.ends_with('\n') {
-                println!();
-            }
-        }
-        // Print captured stderr to stderr.
-        if let Some(stderr) = obj.get("stderr").and_then(|v| v.as_str())
-            && !stderr.is_empty()
-        {
-            eprint!("{stderr}");
-            if !stderr.ends_with('\n') {
-                eprintln!();
-            }
+        // SECURITY (C2): the daemon does not return stdout/stderr content — a
+        // command's output may contain secrets. Only lengths are surfaced here; a
+        // human-only live-output view is tracked as separate follow-up work.
+        let stdout_len = obj
+            .get("stdout_length")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let stderr_len = obj
+            .get("stderr_length")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if stdout_len > 0 || stderr_len > 0 {
+            println!(
+                "  {}",
+                style(format!(
+                    "output withheld (stdout: {stdout_len} bytes, stderr: {stderr_len} bytes)"
+                ))
+                .dim()
+            );
         }
 
         // Show truncation warning if output was capped.

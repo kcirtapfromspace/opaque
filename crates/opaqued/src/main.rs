@@ -487,7 +487,10 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
     registry
         .register(OperationDef {
             name: "sandbox.exec".into(),
-            safety: OperationSafety::Safe,
+            // SECURITY (C2): SensitiveOutput re-engages the enclave + policy gates
+            // that deny agent access unless a rule explicitly allows it. Restored
+            // after 2fd20b8 re-added stdout/stderr without restoring the class.
+            safety: OperationSafety::SensitiveOutput,
             default_approval: ApprovalRequirement::Always,
             default_factors: vec![ApprovalFactor::LocalBio],
             description: "Execute a command in a sandboxed environment".into(),
@@ -1007,6 +1010,27 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         audit_db_path.display(),
         retention_days
     );
+
+    // Integrity (H8): verify the tamper-evident audit chain at startup. A break
+    // means the log was altered while the daemon was down — alert loudly. This is
+    // detection, not prevention: at a shared uid the chain key is agent-readable;
+    // running the daemon under a dedicated service account makes it a hard guarantee.
+    match opaque_core::audit::verify_audit_chain(&audit_db_path) {
+        Ok(v) if v.ok => {
+            info!("audit chain verified ({} records)", v.records_checked);
+        }
+        Ok(v) => {
+            tracing::error!(
+                records_checked = v.records_checked,
+                first_bad_sequence = ?v.first_bad_sequence,
+                "AUDIT CHAIN INTEGRITY FAILURE \u{2014} the audit log was tampered with: {}",
+                v.detail.as_deref().unwrap_or("chain mismatch")
+            );
+        }
+        Err(e) => {
+            warn!("could not verify audit chain at startup: {e}");
+        }
+    }
     let audit: Arc<dyn AuditSink> = Arc::new(MultiAuditSink::new(vec![tracing_sink, sqlite_sink]));
 
     let sandbox_executor = sandbox::SandboxExecutor::new(audit.clone());
@@ -1131,34 +1155,62 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         info!("Bitwarden handler enabled ({})", bitwarden_url);
     }
 
-    // AWS handler: construct per-region service URLs.
-    {
+    // AWS handler.
+    //
+    // SECURITY (C6): the current AWS client sends the access key + secret key as
+    // plaintext headers (SigV4 is not yet implemented), which both fails against
+    // real AWS and would exfiltrate the long-lived secret key to whatever host the
+    // endpoint resolves to. It is therefore DISABLED unless the operator explicitly
+    // opts in via OPAQUE_AWS_ALLOW_INSECURE=1 (intended for mock/testing only). The
+    // region is also validated to close a host-injection vector — an unvalidated
+    // value like "foo@evil.com/" would rewrite the request host.
+    if std::env::var("OPAQUE_AWS_ALLOW_INSECURE").as_deref() == Ok("1") {
         let aws_region = std::env::var(aws::client::AWS_REGION_ENV)
             .unwrap_or_else(|_| aws::client::DEFAULT_REGION.to_owned());
-        let sts_url = format!("https://sts.{aws_region}.amazonaws.com");
-        let sm_url = format!("https://secretsmanager.{aws_region}.amazonaws.com");
-        let ssm_url = format!("https://ssm.{aws_region}.amazonaws.com");
-        let aws_client = aws::client::AwsClient::new(&sts_url, &sm_url, &ssm_url)
-            .expect("invalid AWS service URL scheme");
+        if aws_region.is_empty()
+            || !aws_region
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        {
+            warn!(
+                "AWS handler disabled: invalid region {:?} (must match [a-z0-9-]+)",
+                aws_region
+            );
+        } else {
+            let sts_url = format!("https://sts.{aws_region}.amazonaws.com");
+            let sm_url = format!("https://secretsmanager.{aws_region}.amazonaws.com");
+            let ssm_url = format!("https://ssm.{aws_region}.amazonaws.com");
+            let aws_client = aws::client::AwsClient::new(&sts_url, &sm_url, &ssm_url)
+                .expect("invalid AWS service URL scheme");
 
-        let aws_ops = [
-            "aws.get_caller_identity",
-            "aws.assume_role",
-            "aws.list_secrets",
-            "aws.get_secret_value",
-            "aws.create_secret",
-            "aws.put_secret_value",
-            "aws.delete_secret",
-            "aws.get_parameter",
-            "aws.put_parameter",
-            "aws.get_parameters_by_path",
-            "aws.delete_parameter",
-        ];
-        for op in aws_ops {
-            let handler = aws::AwsHandler::new(audit.clone(), aws_client.clone());
-            enclave_builder = enclave_builder.handler(op, Box::new(handler));
+            let aws_ops = [
+                "aws.get_caller_identity",
+                "aws.assume_role",
+                "aws.list_secrets",
+                "aws.get_secret_value",
+                "aws.create_secret",
+                "aws.put_secret_value",
+                "aws.delete_secret",
+                "aws.get_parameter",
+                "aws.put_parameter",
+                "aws.get_parameters_by_path",
+                "aws.delete_parameter",
+            ];
+            for op in aws_ops {
+                let handler = aws::AwsHandler::new(audit.clone(), aws_client.clone());
+                enclave_builder = enclave_builder.handler(op, Box::new(handler));
+            }
+            warn!(
+                "AWS handler enabled in INSECURE mode (region: {}) — plaintext key \
+                 headers, no SigV4. Do not use with real AWS credentials.",
+                aws_region
+            );
         }
-        info!("AWS handler enabled (region: {})", aws_region);
+    } else {
+        info!(
+            "AWS handler disabled (set OPAQUE_AWS_ALLOW_INSECURE=1 to enable the \
+             insecure mock client; SigV4 support is pending)"
+        );
     }
 
     let enclave = enclave_builder
@@ -2057,23 +2109,6 @@ async fn handle_request(
             Response::ok(req.id, payload)
         }
         "agent_session_start" => {
-            if state.config.enforce_agent_sessions && client_type != ClientType::Human {
-                emit_daemon_method_audit(
-                    state,
-                    AuditEventKind::OperationFailed,
-                    "agent_session_start",
-                    identity,
-                    client_type,
-                    "permission_denied",
-                    Some("enforce_agent_sessions requires human client".into()),
-                );
-                return Response::err(
-                    Some(req.id),
-                    "permission_denied",
-                    "only human clients can start agent sessions when enforce_agent_sessions is enabled",
-                );
-            }
-
             let default_ttl = state.config.agent_session_ttl_secs.unwrap_or(3600);
             let ttl_secs = req
                 .params
@@ -2087,6 +2122,35 @@ async fn handle_request(
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_owned());
             let label_for_audit = label.clone();
+
+            // SECURITY (C1/software-first): minting a session token grants a wrapped
+            // agent scoped access, so it must be authorized by a fresh out-of-band
+            // human approval — not by client classification, which an agent can wear.
+            // The agent cannot satisfy the approval, so it cannot mint its own session.
+            let reason = match &label {
+                Some(l) => format!("ttl {ttl_secs}s, label \"{l}\""),
+                None => format!("ttl {ttl_secs}s"),
+            };
+            if let Err(e) = state
+                .enclave
+                .request_session_approval(identity, client_type, &reason)
+                .await
+            {
+                emit_daemon_method_audit(
+                    state,
+                    AuditEventKind::OperationFailed,
+                    "agent_session_start",
+                    identity,
+                    client_type,
+                    "permission_denied",
+                    Some(format!("session creation not approved: {e}")),
+                );
+                return Response::err(
+                    Some(req.id),
+                    "permission_denied",
+                    "creating an agent session requires out-of-band approval",
+                );
+            }
 
             let session_id = Uuid::new_v4().to_string();
             let session_token = generate_daemon_token();
@@ -2244,23 +2308,10 @@ async fn handle_request(
             )
         }
         "agent_session_list" => {
-            if client_type != ClientType::Human {
-                emit_daemon_method_audit(
-                    state,
-                    AuditEventKind::OperationFailed,
-                    "agent_session_list",
-                    identity,
-                    client_type,
-                    "permission_denied",
-                    Some("only human clients can list sessions".into()),
-                );
-                return Response::err(
-                    Some(req.id),
-                    "permission_denied",
-                    "only human clients can list agent sessions",
-                );
-            }
-
+            // NOTE (software-first): no longer gated on client classification, which
+            // is audit-only at a shared uid. The listing is already scoped to the
+            // caller's own uid and hides tokens; restricting it from a co-resident
+            // agent soundly requires the separate-uid split (Lever B).
             let now = SystemTime::now();
             let mut sessions = state.agent_sessions.write().await;
             // Expire old sessions opportunistically.
@@ -2309,14 +2360,9 @@ async fn handle_request(
             )
         }
         "leases" => {
-            // Only human clients can inspect active leases.
-            if client_type != ClientType::Human {
-                return Response::err(
-                    Some(req.id),
-                    "permission_denied",
-                    "only human clients can list active leases",
-                );
-            }
+            // NOTE (software-first): no longer gated on client classification
+            // (audit-only at a shared uid). Read-only lease metadata; a sound
+            // restriction from a co-resident agent needs the separate-uid split.
             let leases = state.enclave.active_leases();
             Response::ok(
                 req.id,
@@ -3175,7 +3221,27 @@ async fn handle_request(
                 client_identity: identity.clone(),
                 client_type,
                 operation: "sandbox.exec".into(),
-                target: HashMap::from([("profile".into(), profile.clone())]),
+                // SECURITY (C3): include the command in `target` so it is rendered
+                // in the approval prompt, covered by allowed_target_keys, and bound
+                // into the content hash and lease key — the approver authorizes the
+                // exact argv, not just the profile name.
+                target: {
+                    let cmd_display = command
+                        .iter()
+                        .map(|a| {
+                            if a.is_empty() || a.chars().any(|c| c.is_whitespace() || c == '"') {
+                                format!("{a:?}")
+                            } else {
+                                a.clone()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    HashMap::from([
+                        ("profile".into(), profile.clone()),
+                        ("command".into(), cmd_display),
+                    ])
+                },
                 secret_ref_names,
                 created_at: SystemTime::now(),
                 expires_at: None,
@@ -3901,7 +3967,9 @@ exe_sha256 = "deadbeef"
     }
 
     #[tokio::test]
-    async fn agent_session_start_allowed_for_agent_when_not_enforced() {
+    async fn agent_session_start_succeeds_with_approval() {
+        // Software-first: session creation is gated on out-of-band approval, not on
+        // client classification — an agent whose request is approved succeeds.
         let state = make_test_state();
         let req = Request {
             id: 4,
@@ -3921,9 +3989,11 @@ exe_sha256 = "deadbeef"
     }
 
     #[tokio::test]
-    async fn agent_session_start_denied_for_agent_when_enforced() {
-        let mut state = make_test_state();
-        state.config.enforce_agent_sessions = true;
+    async fn agent_session_start_denied_without_approval() {
+        // When approval is not granted (no human present, or an agent that cannot
+        // satisfy it), session creation is denied regardless of classification —
+        // this is what stops an agent minting its own session.
+        let state = make_denying_test_state();
         let req = Request {
             id: 5,
             method: "agent_session_start".into(),
@@ -3935,7 +4005,9 @@ exe_sha256 = "deadbeef"
     }
 
     #[tokio::test]
-    async fn agent_session_list_denied_for_agents() {
+    async fn agent_session_list_allowed_for_local_callers() {
+        // Software-first: listing is no longer gated on classification (audit-only
+        // at a shared uid); it is scoped to the caller's own uid and hides tokens.
         let state = make_test_state();
         let req = Request {
             id: 6,
@@ -3943,8 +4015,9 @@ exe_sha256 = "deadbeef"
             params: serde_json::Value::Null,
         };
         let resp = handle_request(&state, req, &test_identity(), ClientType::Agent, None).await;
-        let err = resp.error.expect("expected permission denial");
-        assert_eq!(err.code, "permission_denied");
+        assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+        let result = resp.result.expect("result expected");
+        assert!(result.get("sessions").and_then(|v| v.as_array()).is_some());
     }
 
     #[tokio::test]
@@ -4307,13 +4380,34 @@ exe_sha256 = "deadbeef"
     // Test helpers
     // -----------------------------------------------------------------------
 
-    fn make_test_state_with_audit(audit: Arc<dyn AuditSink>) -> DaemonState {
+    /// Test approval gate returning a fixed decision, so session-approval paths can
+    /// be exercised without a real biometric prompt.
+    #[derive(Debug)]
+    struct TestApprovalGate {
+        approve: bool,
+    }
+
+    impl crate::enclave::ApprovalGate for TestApprovalGate {
+        fn request_approval(
+            &self,
+            _approval_id: uuid::Uuid,
+            _request: &opaque_core::operation::OperationRequest,
+            _factors: &[opaque_core::operation::ApprovalFactor],
+            _description: &str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>>
+        {
+            let approve = self.approve;
+            Box::pin(async move { Ok(approve) })
+        }
+    }
+
+    fn build_test_state(audit: Arc<dyn AuditSink>, approve: bool) -> DaemonState {
         let registry = OperationRegistry::new();
         let policy = PolicyEngine::with_rules(vec![]);
         let enclave = Enclave::builder()
             .registry(registry)
             .policy(policy)
-            .approval_gate(Box::new(NativeApprovalGate::new()))
+            .approval_gate(Box::new(TestApprovalGate { approve }))
             .audit(audit.clone())
             .build()
             .unwrap();
@@ -4326,6 +4420,14 @@ exe_sha256 = "deadbeef"
             agent_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             connection_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
         }
+    }
+
+    fn make_test_state_with_audit(audit: Arc<dyn AuditSink>) -> DaemonState {
+        build_test_state(audit, true)
+    }
+
+    fn make_denying_test_state() -> DaemonState {
+        build_test_state(Arc::new(TracingAuditEmitter::new()), false)
     }
 
     fn make_test_state() -> DaemonState {

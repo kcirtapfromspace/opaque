@@ -516,17 +516,10 @@ impl PolicyEngine {
                     };
                 }
 
-                // For SENSITIVE_OUTPUT with agent clients, the rule must
-                // explicitly include Agent in client_types to allow it.
-                if request.client_type == ClientType::Agent
-                    && safety == OperationSafety::SensitiveOutput
-                    && !rule.client_types.contains(&ClientType::Agent)
-                {
-                    return PolicyDecision::deny(
-                        "SENSITIVE_OUTPUT operations require explicit agent client allowance in policy",
-                    );
-                }
-
+                // NOTE (software-first, C1): SensitiveOutput is no longer gated on
+                // client classification here. Classification is audit-only; the
+                // enclave clamps SensitiveOutput to mandatory out-of-band approval
+                // instead — a sound presence signal at a shared uid.
                 return PolicyDecision {
                     allowed: true,
                     required_factors: rule.approval.factors.clone(),
@@ -650,14 +643,18 @@ mod tests {
     }
 
     #[test]
-    fn sensitive_output_requires_explicit_agent_allowance() {
-        // Rule without explicit Agent client type.
+    fn sensitive_output_not_gated_on_classification_in_policy() {
+        // Software-first (C1): SensitiveOutput is no longer denied at the policy
+        // layer for a caller merely because of its classification. A matching allow
+        // rule permits it here; the enclave separately clamps SensitiveOutput to
+        // mandatory out-of-band approval (enclave::execute), which is the sound
+        // presence signal at a shared uid.
         let mut rule = allow_rule();
-        rule.client_types = vec![]; // empty means "applies to all" for matching, but not for SENSITIVE_OUTPUT gate
+        rule.client_types = vec![]; // applies to all classifications
         let engine = PolicyEngine::with_rules(vec![rule]);
         let req = test_request("github.set_actions_secret", ClientType::Agent);
         let decision = engine.evaluate(&req, OperationSafety::SensitiveOutput);
-        assert!(!decision.allowed);
+        assert!(decision.allowed);
     }
 
     #[test]

@@ -430,11 +430,13 @@ pub fn generate_config(providers: &[DetectedProvider], options: &WizardOptions) 
     out.push_str("# Rules are evaluated in order; the first matching rule wins.\n");
     out.push_str("# Default behavior is deny-all (no rules = nothing is permitted).\n\n");
 
-    // Known human clients — detect common shells.
-    out.push_str("# ---- Known human clients ----\n\n");
-    out.push_str("[[known_human_clients]]\n");
-    out.push_str("name = \"opaque-cli\"\n");
-    out.push_str("exe_path = \"**/opaque\"\n\n");
+    // Known human clients: none are added by default. Client classification is
+    // audit-only — an agent drives the same signed CLI a human does, so a human
+    // entry only labels audit records; it grants no bypass. Operators may add
+    // known-human-client entries manually if they want that labeling.
+    out.push_str("# ---- Known human clients ----\n");
+    out.push_str("# None by default: classification is audit-only, not a security\n");
+    out.push_str("# boundary. Add a known-human-client entry only for audit labeling.\n\n");
 
     // Agent reveal deny rule.
     if options.block_agent_reveal {
@@ -1467,10 +1469,11 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_config_has_known_human_clients() {
+    fn test_generate_config_adds_no_auto_human_clients() {
+        // Software-first: nothing is auto-classified Human; the default config must
+        // not ship a [[known_human_clients]] entry (only an explanatory comment).
         let config = generate_config(&[], &WizardOptions::default());
-        assert!(config.contains("[[known_human_clients]]"));
-        assert!(config.contains("name = \"opaque-cli\""));
+        assert!(!config.contains("[[known_human_clients]]"));
     }
 
     #[test]

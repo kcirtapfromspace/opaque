@@ -10,6 +10,7 @@ homepage.workspace = true
 
 [dependencies]
 glob-match = { workspace = true }
+hmac = "0.12"
 jsonschema = { workspace = true }
 libc = { workspace = true }
 regex = { workspace = true }

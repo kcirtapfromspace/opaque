@@ -234,11 +234,14 @@ impl OperationHandler for SandboxExecutor {
             let truncated =
                 s.stdout.len() < s.stdout_len as usize || s.stderr.len() < s.stderr_len as usize;
 
+            // SECURITY (C2): never return captured stdout/stderr *content* to the
+            // caller. The child runs with plaintext secrets in its environment and
+            // the caller chooses argv, so any secret it prints would leak straight
+            // to the client (and thus the LLM). Only lengths and metadata are
+            // returned. A human-only live-output view is tracked as follow-up work.
             Ok(serde_json::json!({
                 "exit_code": exit_code,
                 "duration_ms": s.duration_ms,
-                "stdout": s.stdout,
-                "stderr": s.stderr,
                 "stdout_length": s.stdout_len,
                 "stderr_length": s.stderr_len,
                 "truncated": truncated,
@@ -621,14 +624,14 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_response_contains_expected_fields() {
-        // Verify the response JSON structure includes output content
-        // and metadata for the CLI to display.
+    fn sandbox_response_omits_output_content() {
+        // SECURITY (C2): the daemon response must carry only lengths + metadata,
+        // never stdout/stderr *content* — returning content would leak secrets the
+        // command printed to the calling client. This mirrors the response built in
+        // execute_platform_sandbox above; keep the two in sync.
         let response = serde_json::json!({
             "exit_code": 0,
             "duration_ms": 150_u64,
-            "stdout": "container started\n",
-            "stderr": "",
             "stdout_length": 18_u64,
             "stderr_length": 0_u64,
             "truncated": false,
@@ -637,8 +640,14 @@ mod tests {
         let obj = response.as_object().unwrap();
         assert!(obj.contains_key("exit_code"));
         assert!(obj.contains_key("duration_ms"));
-        assert!(obj.contains_key("stdout"));
-        assert!(obj.contains_key("stderr"));
+        assert!(
+            !obj.contains_key("stdout"),
+            "stdout content must never be returned to the caller"
+        );
+        assert!(
+            !obj.contains_key("stderr"),
+            "stderr content must never be returned to the caller"
+        );
         assert!(obj.contains_key("stdout_length"));
         assert!(obj.contains_key("stderr_length"));
         assert!(obj.contains_key("truncated"));

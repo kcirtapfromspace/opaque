@@ -6,9 +6,8 @@
 # Usage:
 #   opaque policy preset gitlab-variables
 
-[[known_human_clients]]
-name = "opaque-cli"
-exe_path = "**/opaque"
+# Client classification is audit-only (an agent drives the same signed CLI a human
+# does); operations are gated on out-of-band approval, not classification.
 
 [[rules]]
 name = "allow-gitlab-set-ci-variable"
