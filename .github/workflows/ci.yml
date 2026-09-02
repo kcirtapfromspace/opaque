@@ -31,7 +31,12 @@ jobs:
         run: cargo test --workspace
 
       - name: Verify wrapper enforcement handshake test
-        run: cargo test -p opaqued enforce_agent_sessions_rejects_unwrapped_and_allows_session_token -- --exact
+        # --exact needs the full module path; a bare name matches 0 tests and
+        # passes vacuously. The grep guard fails the step if the test ever
+        # stops running (renamed/moved), instead of silently passing.
+        run: |
+          cargo test -p opaqued tests::enforce_agent_sessions_rejects_unwrapped_and_allows_session_token -- --exact 2>&1 | tee /tmp/wrapper-test.out
+          grep -q "test result: ok. 1 passed" /tmp/wrapper-test.out
 
   supply-chain:
     runs-on: ubuntu-latest

@@ -1656,6 +1656,13 @@ async fn run_agent_wrapped(
         if let Some(expires) = result.get("expires_at_utc_ms").and_then(|v| v.as_i64()) {
             ui::kv("expires_at_utc_ms", &expires.to_string());
         }
+        // Present when the daemon minted a delegation (identity configured).
+        if let Some(mode) = result.get("mode").and_then(|v| v.as_str()) {
+            ui::kv("mode", mode);
+        }
+        if let Some(label) = result.get("on_behalf_of_label").and_then(|v| v.as_str()) {
+            ui::kv("on behalf of", label);
+        }
     }
 
     let mut child = tokio::process::Command::new(&command[0]);
