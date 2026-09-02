@@ -876,8 +876,13 @@ pub struct ChainVerification {
 /// Verify the tamper-evident hash chain over the audit log at `db_path`.
 ///
 /// Recomputes the chain in insertion order and reports the first record whose
-/// stored hash does not match — which catches any edit, deletion, or reordering of
-/// rows by anyone who does not hold the chain key.
+/// stored hash does not match. This catches any edit, reordering, or deletion of a
+/// record that has later records after it, by anyone who does not hold the chain key.
+///
+/// LIMITATION: truncating the newest records ("tail truncation") leaves a shorter
+/// but still-valid chain and is NOT detected here. Closing that requires anchoring
+/// the head (record count + last hash) in a trusted store — a follow-up that
+/// becomes a hard guarantee once the daemon runs under a dedicated service account.
 pub fn verify_audit_chain(db_path: &Path) -> Result<ChainVerification, AuditError> {
     let key = load_or_create_hmac_key(db_path)?;
     let conn =
@@ -1024,18 +1029,22 @@ impl SqliteAuditSink {
         let conn = rusqlite::Connection::open(&db_path)?;
         conn.execute_batch(SCHEMA_SQL)?;
 
-        // Tamper-evident chain: load the key and migrate databases created before
-        // the chain existed (add the column, then backfill hashes once).
+        // Tamper-evident chain: load the key, migrate databases created before the
+        // chain existed, and (re)build the chain if the column was just added or
+        // retention removed rows from the front — otherwise the remaining rows would
+        // be chained from a now-deleted predecessor and verification would wrongly
+        // report tampering.
         let hmac_key = load_or_create_hmac_key(&db_path)?;
-        let has_record_hash = conn
+        let migrated = conn
             .prepare("SELECT record_hash FROM audit_events LIMIT 0")
-            .is_ok();
-        if !has_record_hash {
+            .is_err();
+        if migrated {
             conn.execute("ALTER TABLE audit_events ADD COLUMN record_hash TEXT", [])?;
+        }
+        let deleted = Self::run_retention_cleanup(&conn, retention_days)?;
+        if migrated || deleted > 0 {
             backfill_chain(&conn, &hmac_key)?;
         }
-
-        Self::run_retention_cleanup(&conn, retention_days)?;
         conn.execute(
             "INSERT OR IGNORE INTO audit_events_fts(rowid, search_text)
              SELECT
@@ -1257,6 +1266,25 @@ impl SqliteAuditSink {
                                 retention_days,
                                 "audit retention cleanup removed expired rows"
                             );
+                            // Retention removed rows from the front of the chain;
+                            // re-anchor the remaining rows and reset the head so the
+                            // next write chains correctly (and verify does not report
+                            // a false-positive break).
+                            if let Err(e) = backfill_chain(&conn, &key) {
+                                tracing::error!(
+                                    "audit chain re-anchor after retention failed: {e}"
+                                );
+                            } else {
+                                last_hash = conn
+                                    .query_row(
+                                        "SELECT record_hash FROM audit_events ORDER BY rowid DESC LIMIT 1",
+                                        [],
+                                        |r| r.get::<_, Option<String>>(0),
+                                    )
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or_else(|| CHAIN_GENESIS.to_string());
+                            }
                         }
                     }
                     Err(e) => {
@@ -2311,6 +2339,50 @@ mod tests {
         assert_eq!(deleted, 1);
 
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn retention_front_deletion_breaks_then_rechain_restores() {
+        // A chain is written, then the oldest row is removed (as retention does).
+        // Front-deletion breaks verification (so an attacker's front-deletion is
+        // caught); re-anchoring — what the writer does after retention — restores a
+        // valid chain so retention itself does not raise a false positive.
+        let db_path = temp_db_path();
+        {
+            let sink = SqliteAuditSink::new(db_path.clone(), 90).unwrap();
+            sink.emit(make_test_event(AuditEventKind::RequestReceived));
+            sink.emit(make_test_event(AuditEventKind::OperationStarted));
+            sink.emit(make_test_event(AuditEventKind::OperationSucceeded));
+            drop(sink);
+        }
+        let key = load_or_create_hmac_key(&db_path).unwrap();
+
+        // Simulate retention deleting the oldest row (front of the chain).
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute(
+                "DELETE FROM audit_events WHERE rowid = (SELECT MIN(rowid) FROM audit_events)",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(
+            !verify_audit_chain(&db_path).unwrap().ok,
+            "front-deletion without re-anchor must break the chain"
+        );
+
+        // Re-anchor (as the writer does after retention) restores validity.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            backfill_chain(&conn, &key).unwrap();
+        }
+        assert!(
+            verify_audit_chain(&db_path).unwrap().ok,
+            "re-anchoring after retention must restore a valid chain"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(hmac_key_path(&db_path));
     }
 
     #[test]

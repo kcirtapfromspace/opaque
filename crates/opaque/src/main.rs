@@ -2793,6 +2793,10 @@ fn run_audit_verify(json_output: bool) -> Result<(), String> {
             v.detail.as_deref().unwrap_or("tampering detected"),
             v.records_checked
         ));
+    }
+    // Non-zero exit on a broken chain, in both text and JSON modes, so callers
+    // (CI, monitoring) can gate on it.
+    if !v.ok {
         std::process::exit(2);
     }
     Ok(())
