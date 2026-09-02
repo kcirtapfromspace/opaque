@@ -40,6 +40,33 @@ jobs:
           cargo test -p opaqued tests::enforce_agent_sessions_rejects_unwrapped_and_allows_session_token -- --exact 2>&1 | tee /tmp/wrapper-test.out
           grep -q "test result: ok. 1 passed" /tmp/wrapper-test.out
 
+  # Verifies the Linux-only trust-domain guarantees (separate-uid custody,
+  # Landlock, seccomp). The probe runs FIRST and fails the job if the runner
+  # kernel can't enforce Landlock/seccomp — so the enforcement tests that later
+  # steps run can never green-skip on an incapable kernel. Locally the same
+  # entry points run via `scripts/linux-harness.sh` (Docker on macOS; note
+  # Docker Desktop's linuxkit kernel lacks Landlock, so Landlock enforcement
+  # is verified here and only here).
+  trust-domain-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        # Keep in sync with rust-toolchain.toml (the action's RUSTUP_TOOLCHAIN
+        # export outranks the file).
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Kernel capability probe (landlock + seccomp must be enforceable)
+        run: ./scripts/linux-harness.sh probe
+
+      # Stages S1+ append their suites here (isolation, sandbox enforcement,
+      # trust-domain e2e) via the same harness entry points.
+
   supply-chain:
     runs-on: ubuntu-latest
     steps:
