@@ -95,8 +95,15 @@ pub fn startup_custody_check(
     Ok(violations)
 }
 
-/// Resolve a group name to its gid.
+/// Resolve a group name (or numeric gid) to its gid.
+///
+/// The numeric form exists for containers, which typically have no named
+/// groups at all — compose/k8s grant the agent the gid via `group_add` /
+/// `supplementalGroups` without an /etc/group entry anywhere.
 pub fn resolve_gid(group: &str) -> io::Result<libc::gid_t> {
+    if let Ok(gid) = group.parse::<libc::gid_t>() {
+        return Ok(gid);
+    }
     let c_name = CString::new(group)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "group name contains NUL"))?;
     let mut grp: libc::group = unsafe { std::mem::zeroed() };
@@ -232,6 +239,30 @@ pub fn drop_privileges(user: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Check that this process can actually assign `gid` to files it owns:
+/// POSIX lets a non-root owner chgrp only to groups in its own supplementary
+/// set. Enforce mode verifies this up front so the failure is a clear
+/// startup message, not an EPERM crashloop at the post-bind chgrp.
+pub fn require_socket_group_membership(gid: libc::gid_t, group_label: &str) -> io::Result<()> {
+    if unsafe { libc::geteuid() } == 0 {
+        return Ok(()); // root may chgrp to anything
+    }
+    if unsafe { libc::getegid() } == gid {
+        return Ok(());
+    }
+    let mut groups = [0 as libc::gid_t; 64];
+    let n = unsafe { libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()) };
+    if n >= 0 && groups[..n as usize].contains(&gid) {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "the daemon is not a member of socket_group {group_label} (gid {gid}), so it              cannot hand the socket to that group. Add the membership where the daemon              runs: systemd `SupplementaryGroups=`, compose/k8s `group_add` /              `supplementalGroups`, or usermod -aG."
+        ),
+    ))
+}
+
 /// Grant `gid` access to the socket surface for the enforced split:
 /// socket dir `0750`, socket `0660`, daemon token `0640`. Everything else the
 /// daemon owns stays owner-only; this is the *entire* cross-domain surface.
@@ -246,12 +277,20 @@ pub fn apply_socket_group(
     for (path, mode) in [(socket_dir, 0o750u32), (socket, 0o660), (token_path, 0o640)] {
         let c_path = CString::new(path.as_os_str().as_encoded_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))?;
+        // Skip the chown when the group is already right (idempotent restarts,
+        // setgid-inherited directories).
+        let already = std::fs::metadata(path)
+            .map(|m| {
+                use std::os::unix::fs::MetadataExt;
+                m.gid() == gid
+            })
+            .unwrap_or(false);
         // chown(uid = -1) leaves the owner untouched; only the group changes.
-        if unsafe { libc::chown(c_path.as_ptr(), libc::uid_t::MAX, gid) } != 0 {
+        if !already && unsafe { libc::chown(c_path.as_ptr(), libc::uid_t::MAX, gid) } != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(
-                    "cannot set group on {}: {}",
+                    "cannot set group on {}: {} — a non-root owner can chgrp only to                      groups in its supplementary set (see trust_domain.socket_group docs)",
                     path.display(),
                     io::Error::last_os_error()
                 ),
@@ -300,6 +339,31 @@ mod tests {
     fn resolve_gid_unknown_group_is_not_found() {
         let err = resolve_gid("opaque-no-such-group-c9d2").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn resolve_gid_accepts_numeric_gid() {
+        // Containers have no named groups; a numeric gid resolves directly.
+        assert_eq!(resolve_gid("7999").unwrap(), 7999);
+        assert_eq!(resolve_gid("0").unwrap(), 0);
+    }
+
+    #[test]
+    fn socket_group_membership_check() {
+        // Own egid always passes.
+        let my_gid = unsafe { libc::getegid() };
+        require_socket_group_membership(my_gid, "own-gid").unwrap();
+
+        if unsafe { libc::geteuid() } == 0 {
+            // Root may chgrp to anything — any gid passes.
+            require_socket_group_membership(54_321, "any").unwrap();
+        } else {
+            // A gid we can't possibly hold fails with the diagnostic that
+            // names the deployment fixes.
+            let err = require_socket_group_membership(u32::MAX - 7, "ghost-group").unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+            assert!(err.to_string().contains("SupplementaryGroups"), "{err}");
+        }
     }
 
     #[test]

@@ -51,8 +51,36 @@ What enforcement means concretely (`[trust_domain] enforce = true`):
 
 Setup on Linux (systemd) and macOS (LaunchDaemon) is scripted in the headers
 of `deploy/systemd/opaqued.service` and `deploy/launchd/com.opaque.opaqued.plist`.
-Container deployments (separate daemon/agent containers sharing only the
-socket volume) are covered by the compose/k8s manifests in `deploy/`.
+
+### Containers (compose / Kubernetes)
+
+In containers the split gets stronger: the daemon and the agent run in
+separate containers that share ONLY the socket volume, so the custody files
+have no path inside the agent container at all — not merely unreadable,
+nonexistent.
+
+- **Compose:** `deploy/docker/compose.yaml` + `bootstrap.sh` (one-shot root
+  init that seeds and SEALS the config under the daemon account).
+  `scripts/compose-smoke.sh` builds the Linux binaries and verifies the whole
+  stack end to end: sealed bootstrap, enforced custody at startup,
+  cross-container ping, custody invisibility from the agent, the exact
+  0750/0660/0640 socket surface, and refusal of a daemon-uid client.
+- **Kubernetes:** `deploy/k8s/opaque.yaml` — separate ServiceAccounts (the
+  agent container automounts no API token), runAsUser split (7381/7382),
+  socket via a memory emptyDir with `supplementalGroups: [7999]`, custody on
+  a PVC mounted only by the daemon container, read-only root filesystems,
+  all capabilities dropped.
+- **Group mechanics that bite:** a non-root daemon can chgrp the socket
+  surface only to a group in its own supplementary set — grant it via
+  `group_add` (compose), `supplementalGroups` (k8s), or
+  `SupplementaryGroups=` (systemd). `trust_domain.socket_group` accepts a
+  numeric gid for container environments with no named groups.
+- **Key custody in containers:** the default keyfile backend keeps the seal
+  and signing keys on the daemon-only volume. For higher assurance, mount a
+  KMS/CSI secret or exchange a SPIFFE/SPIRE SVID into the daemon container
+  only; the release policy on that KMS/SPIRE seam is also where
+  remote-attestation-before-trust (verify the daemon's measured identity
+  before handing it keys) belongs.
 
 Clients discover a split daemon automatically: when no per-user socket
 exists, the CLI/MCP try `/run/opaque/opaqued.sock` and verify the split's

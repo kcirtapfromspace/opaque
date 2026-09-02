@@ -1,0 +1,71 @@
+# Trust-domain split as two containers: the daemon exclusively owns its
+# custody volume; the agent container shares NOTHING with it except the
+# socket volume. The custody files are not merely unreadable at the agent's
+# uid — they have no path inside the agent container at all.
+#
+#   uid 7381 = opaqued service account (runs only the daemon)
+#   uid 7382 = agent workload
+#   gid 7999 = socket group (numeric — no /etc/group entry needed anywhere;
+#              the daemon config names it as socket_group = "7999")
+#
+# Bring-up (scripts/compose-smoke.sh automates all of this + assertions):
+#   1. build linux binaries into deploy/docker/bin/ (the smoke script uses
+#      the same cargo container/volumes as scripts/linux-harness.sh)
+#   2. docker compose run --rm init     # seed + chown + SEAL the config
+#   3. docker compose up -d opaqued
+#   4. docker compose run --rm agent opaque ping
+
+volumes:
+  # Custody: mounted by the daemon (and the root init, once) — never the agent.
+  opaque-state:
+  opaque-config:
+  # The entire cross-domain surface: socket + daemon token.
+  opaque-socket:
+
+services:
+  # One-shot bootstrap (root): seed /etc/opaque with the sealed config owned
+  # by the daemon account. Root here plays the operator's part; the daemon
+  # and agent never run privileged.
+  init:
+    image: debian:bookworm-slim
+    user: "0:0"
+    volumes:
+      - opaque-config:/etc/opaque
+      - opaque-state:/var/lib/opaque
+      - opaque-socket:/run/opaque
+      - ./bin:/opt/opaque:ro
+      - ./config.toml:/seed/config.toml:ro
+    entrypoint: ["/bin/sh", "/opt/opaque/bootstrap.sh"]
+
+  opaqued:
+    image: debian:bookworm-slim
+    user: "7381:7381"
+    # Membership in the socket group lets the daemon chgrp the socket surface
+    # to it (POSIX: a non-root owner may assign only its own groups).
+    group_add:
+      - "7999"
+    environment:
+      HOME: /var/lib/opaque
+      OPAQUE_CONFIG: /etc/opaque/config.toml
+    volumes:
+      - opaque-state:/var/lib/opaque
+      - opaque-config:/etc/opaque
+      - opaque-socket:/run/opaque
+      - ./bin:/opt/opaque:ro
+    entrypoint: ["/opt/opaque/opaqued"]
+    init: true
+    restart: unless-stopped
+
+  agent:
+    image: debian:bookworm-slim
+    user: "7382:7382"
+    # Membership in the socket group is the agent's ONLY grant.
+    group_add:
+      - "7999"
+    environment:
+      HOME: /tmp
+    volumes:
+      - opaque-socket:/run/opaque
+      - ./bin:/opt/opaque:ro
+    entrypoint: ["/opt/opaque/opaque"]
+    command: ["ping"]

@@ -4192,7 +4192,13 @@ fn run_setup(seal_only: bool, reset: bool, verify: bool) -> Result<(), String> {
 
     let base = default_opaque_dir();
     let config_path = resolve_config_path(None);
-    let seal_file = base.join("config.seal");
+    // The seal lives BESIDE the config it seals — matching how the daemon
+    // verifies it. Deriving it from HOME instead would silently seal the
+    // wrong location for any $OPAQUE_CONFIG deployment (system /etc configs).
+    let seal_file = config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("config.seal");
 
     if verify {
         if !config_path.exists() {
@@ -4769,7 +4775,11 @@ async fn run_status(json_output: bool) {
 
         let seal_status = {
             use opaque_core::seal::{self, SealStatus};
-            let seal_file = base.join("config.seal");
+            // Beside the config, matching daemon verification.
+            let seal_file = config_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("config.seal");
             std::fs::read(&config_path)
                 .ok()
                 .and_then(|bytes| seal::verify_seal(&bytes, &seal_file).ok())
@@ -4980,7 +4990,11 @@ async fn run_doctor() {
     // 3. Config seal
     {
         use opaque_core::seal::{self, SealStatus};
-        let seal_file = base.join("config.seal");
+        // Beside the config, matching daemon verification.
+        let seal_file = config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("config.seal");
         if config_path.exists() {
             match std::fs::read(&config_path) {
                 Ok(config_bytes) => match seal::verify_seal(&config_bytes, &seal_file) {

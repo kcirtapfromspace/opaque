@@ -23,6 +23,9 @@ After=network.target
 Type=simple
 User=opaque
 Group=opaque
+# Required so the daemon can hand the socket surface to the client group
+# (a non-root owner may chgrp only to groups in its supplementary set).
+SupplementaryGroups=opaque-clients
 Environment=HOME=/var/lib/opaque
 Environment=OPAQUE_CONFIG=/etc/opaque/config.toml
 ExecStart=/usr/local/bin/opaqued

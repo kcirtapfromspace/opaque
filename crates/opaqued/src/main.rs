@@ -616,12 +616,17 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         }
     }
     // Resolve the client group before touching the filesystem so a typo'd
-    // group name fails the startup, not the post-bind chgrp.
+    // group name fails the startup, not the post-bind chgrp — and verify the
+    // daemon can actually assign it (non-root owners may chgrp only to their
+    // own supplementary groups).
     let socket_gid = td
         .socket_group
         .as_deref()
         .map(trust_domain::resolve_gid)
         .transpose()?;
+    if let (Some(gid), Some(label)) = (socket_gid, td.socket_group.as_deref()) {
+        trust_domain::require_socket_group_membership(gid, label)?;
+    }
 
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
     let custody_violations = trust_domain::startup_custody_check(td.enforce, &home, &config_path)?;
