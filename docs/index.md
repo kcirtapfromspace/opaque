@@ -7,7 +7,9 @@ hide:
 
 # Opaque
 
-**Local, approval-gated secrets broker for AI coding agents.** LLMs get
+**Secrets stay secret. Agents stay powerful.**
+
+A local, approval-gated secrets broker for AI coding agents. LLMs get
 operations, never plaintext values. Every operation passes through
 Policy → Approval → Execute → Sanitize → Audit.
 
