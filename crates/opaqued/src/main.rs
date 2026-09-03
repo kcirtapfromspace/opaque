@@ -45,6 +45,7 @@ mod bitwarden;
 mod doppler;
 mod enclave;
 #[allow(dead_code)]
+mod export;
 mod factors;
 mod federation;
 #[allow(dead_code)]
@@ -139,6 +140,10 @@ struct DaemonConfig {
     /// Federation (`[federation]`): signed policy bundles from an org.
     #[serde(default)]
     federation: federation::FederationConfig,
+
+    /// SIEM export (`[export]`): stream the audit chain off the box.
+    #[serde(default)]
+    export: export::ExportConfig,
 }
 
 /// `[approval]` — out-of-band approval factor configuration.
@@ -1691,6 +1696,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
                 registry.register(Arc::new(factors::Fido2Verifier::new(approvals)));
             }
 
+            info!(factors = ?registry.available_factors(), "approval factors registered");
             Box::new(NativeApprovalGate::with_registry(registry))
         }
         ApprovalBackendKind::InsecureAutoApprove => {
@@ -1716,6 +1722,23 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         .build()
         .map_err(std::io::Error::other)?;
     let enclave = Arc::new(enclave);
+
+    // --- SIEM export: stream the audit chain off the box ---
+    if config.export.configured() {
+        let pump = export::ExportPump::new(
+            config.export.clone(),
+            audit_db_path.clone(),
+            export::cursor_path(&home),
+            audit.clone(),
+        )
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("[export] configuration invalid (fail closed): {e}"),
+            )
+        })?;
+        tokio::spawn(pump.run());
+    }
 
     // --- Federation: signed policy bundles ---
     let federation_status = Arc::new(federation::FederationStatus::default());

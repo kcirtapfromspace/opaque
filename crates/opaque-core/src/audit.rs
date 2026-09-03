@@ -121,6 +121,11 @@ pub enum AuditEventKind {
     /// A federation bundle was refused (rollback, version reuse, bad
     /// signature at refresh time).
     FederationBundleRejected,
+
+    /// The export pump's independent detector flagged an integrity anomaly
+    /// (e.g. an operation succeeded without its required approval being
+    /// granted in the chain).
+    AuditAlert,
 }
 
 impl fmt::Display for AuditEventKind {
@@ -156,6 +161,7 @@ impl fmt::Display for AuditEventKind {
             Self::TrustDomainPosture => "trust_domain.posture",
             Self::FederationBundleApplied => "federation.bundle_applied",
             Self::FederationBundleRejected => "federation.bundle_rejected",
+            Self::AuditAlert => "audit.alert",
         };
         write!(f, "{s}")
     }
@@ -196,6 +202,7 @@ impl std::str::FromStr for AuditEventKind {
             "trust_domain.posture" => Ok(Self::TrustDomainPosture),
             "federation.bundle_applied" => Ok(Self::FederationBundleApplied),
             "federation.bundle_rejected" => Ok(Self::FederationBundleRejected),
+            "audit.alert" => Ok(Self::AuditAlert),
             _ => Err(format!("unknown audit event kind: {s}")),
         }
     }

@@ -33,9 +33,9 @@ pub struct ApprovalContext {
     /// Sanitized client label for display on remote approvers.
     pub client_label: String,
     /// Human-readable, sanitized description rendered to the approver.
+    /// Includes the request content hash (appended by the enclave), so
+    /// factor challenges derived from the description are content-bound.
     pub description: String,
-    /// Content hash binding the approval to the exact request.
-    pub content_hash: String,
 }
 
 /// A decision from a factor, with the verified identity that made it.
@@ -369,7 +369,6 @@ struct Fido2Round {
 }
 
 struct PendingRegistration {
-    challenge_b64: String,
     started: std::time::Instant,
     ttl: std::time::Duration,
 }
@@ -530,7 +529,6 @@ impl Fido2Approvals {
             .registration_challenge()
             .map_err(|e| format!("challenge generation failed: {e}"))?;
         *self.pending_registration.lock().expect("registration lock") = Some(PendingRegistration {
-            challenge_b64: challenge.challenge.clone(),
             started: std::time::Instant::now(),
             ttl: self.round_ttl,
         });
@@ -696,7 +694,6 @@ mod tests {
             operation: "test.noop".into(),
             client_label: "test-client".into(),
             description: "test".into(),
-            content_hash: "hash".into(),
         }
     }
 

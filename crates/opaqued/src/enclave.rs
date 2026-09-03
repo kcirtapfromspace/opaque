@@ -1527,7 +1527,6 @@ impl ApprovalGate for NativeApprovalGate {
             operation: request.operation.clone(),
             client_label: sanitize_for_display(&request.client_identity.to_string(), 128),
             description: description.to_owned(),
-            content_hash: request.content_hash(),
         };
         let factors = factors.to_vec();
         Box::pin(async move {

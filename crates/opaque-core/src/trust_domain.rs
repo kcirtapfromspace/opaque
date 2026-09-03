@@ -289,6 +289,11 @@ pub fn default_custody_set(home: &Path, config_path: &Path) -> Vec<CustodyPath> 
             label: "federation bundle anti-rollback state",
         },
         CustodyPath {
+            path: state.join("export.cursor"),
+            kind: PathKind::File,
+            label: "audit export cursors",
+        },
+        CustodyPath {
             path: state.join("pairing.key"),
             kind: PathKind::File,
             label: "device pairing signing key",
@@ -560,6 +565,7 @@ mod tests {
             "/var/lib/opaque/.opaque/identity.key",
             "/var/lib/opaque/.opaque/profiles",
             "/var/lib/opaque/.opaque/bundle.state",
+            "/var/lib/opaque/.opaque/export.cursor",
             "/var/lib/opaque/.opaque/pairing.key",
             "/var/lib/opaque/.opaque/approval_server.key",
             "/var/lib/opaque/.opaque/approval_server.cert",
