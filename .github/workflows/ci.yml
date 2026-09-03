@@ -64,18 +64,20 @@ jobs:
       - name: Kernel capability probe (landlock + seccomp must be enforceable)
         run: ./scripts/linux-harness.sh probe
 
+      - name: Federation e2e (signed bundles, chain-verifiable export, attestation)
+        # Runs BEFORE the root-gated suites on purpose: those invoke cargo
+        # under sudo and leave root-owned artifacts in target/, which a later
+        # non-root cargo cannot lock. The grep fails the step if the suite
+        # ever stops running (renamed/moved), instead of passing vacuously.
+        run: |
+          cargo test -p opaqued --test federation_e2e 2>&1 | tee /tmp/fed-e2e.out
+          grep -q "test result: ok. 3 passed" /tmp/fed-e2e.out
+
       - name: Multi-uid isolation suite (custody + privilege drop, as root)
         run: ./scripts/linux-harness.sh isolation
 
       - name: Trust-domain split e2e (real daemon, two uids, signed approver)
         run: ./scripts/linux-harness.sh e2e-split
-
-      - name: Federation e2e (signed bundles, chain-verifiable export, attestation)
-        # Not root-gated, but pinned here so a rename can't drop it silently:
-        # the grep fails the step if the suite stops running.
-        run: |
-          cargo test -p opaqued --test federation_e2e 2>&1 | tee /tmp/fed-e2e.out
-          grep -q "test result: ok. 3 passed" /tmp/fed-e2e.out
 
   supply-chain:
     runs-on: ubuntu-latest
