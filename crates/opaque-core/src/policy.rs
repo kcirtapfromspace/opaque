@@ -112,6 +112,12 @@ pub struct IdentityMatch {
 
     /// Access modes this rule applies to (delegated / autonomous / break_glass).
     pub access_modes: Option<Vec<AccessMode>>,
+
+    /// Team namespaces (from the applied federation bundle) the delegating
+    /// principal must belong to — ANY-of. Fails closed for requests without
+    /// a principal, and for principals in none of the listed teams (including
+    /// when no bundle is applied, since then nobody has teams).
+    pub teams: Option<Vec<String>>,
 }
 
 impl IdentityMatch {
@@ -121,6 +127,7 @@ impl IdentityMatch {
             && self.principal.is_none()
             && self.roles.is_none()
             && self.access_modes.is_none()
+            && self.teams.is_none()
     }
 
     /// Returns `true` if the given principal context satisfies this pattern.
@@ -134,7 +141,8 @@ impl IdentityMatch {
             return self.require_principal == Some(false)
                 && self.principal.is_none()
                 && self.roles.is_none()
-                && self.access_modes.is_none();
+                && self.access_modes.is_none()
+                && self.teams.is_none();
         };
 
         if let Some(ref expected) = self.principal {
@@ -159,6 +167,20 @@ impl IdentityMatch {
             && !modes.contains(&ctx.mode)
         {
             return false;
+        }
+
+        if let Some(ref teams) = self.teams {
+            // ANY-of: the delegator must sit in at least one listed team.
+            // An empty rule list can never match (a misconfigured constraint
+            // fails closed rather than waving everyone through).
+            let hit = teams.iter().any(|t| {
+                ctx.sub_teams
+                    .iter()
+                    .any(|have| have.eq_ignore_ascii_case(t))
+            });
+            if !hit {
+                return false;
+            }
         }
 
         true
@@ -1446,6 +1468,7 @@ mod tests {
             sub,
             sub_label: "dev@example.com".into(),
             sub_roles: roles.iter().copied().collect::<BTreeSet<_>>(),
+            sub_teams: vec![],
             act: PrincipalId::generate(&PrincipalKind::Agent {
                 tool: "claude-code".into(),
             }),
@@ -1525,6 +1548,39 @@ mod tests {
             ..Default::default()
         };
         assert!(!wrong.matches(Some(&ctx)));
+    }
+
+    #[test]
+    fn identity_teams_any_of_and_fail_closed() {
+        let m = IdentityMatch {
+            teams: Some(vec!["platform".into(), "ml-infra".into()]),
+            ..Default::default()
+        };
+
+        // No principal at all: fail closed.
+        assert!(!m.matches(None));
+
+        // Principal with no teams (no bundle applied): fail closed.
+        let ctx = test_principal_ctx(AccessMode::Delegated, &[Role::Operator]);
+        assert!(!m.matches(Some(&ctx)));
+
+        // Member of one listed team (ANY-of): match, case-insensitively.
+        let mut ctx_team = ctx.clone();
+        ctx_team.sub_teams = vec!["Platform".into()];
+        assert!(m.matches(Some(&ctx_team)));
+
+        // Member of only unlisted teams: no match.
+        let mut ctx_other = ctx.clone();
+        ctx_other.sub_teams = vec!["frontend".into()];
+        assert!(!m.matches(Some(&ctx_other)));
+
+        // An EMPTY rule team list can never match (misconfiguration fails
+        // closed rather than waving everyone through).
+        let empty = IdentityMatch {
+            teams: Some(vec![]),
+            ..Default::default()
+        };
+        assert!(!empty.matches(Some(&ctx_team)));
     }
 
     #[test]

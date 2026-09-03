@@ -547,8 +547,10 @@ pub struct Enclave {
     /// Operation registry (immutable after construction).
     registry: OperationRegistry,
 
-    /// Policy engine.
-    policy: PolicyEngine,
+    /// Policy engine. Behind an RwLock so a federation bundle refresh can
+    /// hot-swap the whole rule set without restarting the daemon; the read
+    /// path takes an uncontended read lock per evaluation.
+    policy: std::sync::RwLock<PolicyEngine>,
 
     /// Operation handlers, keyed by operation name.
     handlers: HashMap<String, Box<dyn OperationHandler>>,
@@ -576,7 +578,10 @@ impl fmt::Debug for Enclave {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Enclave")
             .field("registry_size", &self.registry.len())
-            .field("policy_rules", &self.policy.rule_count())
+            .field(
+                "policy_rules",
+                &self.policy.read().map(|p| p.rule_count()).unwrap_or(0),
+            )
             .field("handlers", &self.handlers.len())
             .finish()
     }
@@ -650,7 +655,7 @@ impl EnclaveBuilder {
     pub fn build(self) -> Result<Enclave, String> {
         Ok(Enclave {
             registry: self.registry,
-            policy: self.policy,
+            policy: std::sync::RwLock::new(self.policy),
             handlers: self.handlers,
             approval_gate: self.approval_gate.ok_or("approval gate is required")?,
             audit: self.audit.ok_or("audit sink is required")?,
@@ -677,6 +682,20 @@ impl Enclave {
     /// Return a snapshot of active (non-expired) approval leases.
     pub fn active_leases(&self) -> Vec<LeaseInfo> {
         self.lease_cache.active_leases()
+    }
+
+    /// Replace the policy engine in place (federation bundle hot-swap).
+    ///
+    /// Requests already past their policy evaluation finish under the old
+    /// rules; every evaluation after the swap sees the new set. Returns the
+    /// new rule count.
+    pub fn swap_policy(&self, policy: PolicyEngine) -> usize {
+        let count = policy.rule_count();
+        *self
+            .policy
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = policy;
+        count
     }
 
     /// Execute an operation request through the full enforcement funnel.
@@ -807,7 +826,11 @@ impl Enclave {
         }
 
         // --- Step 5: Evaluate policy ---
-        let mut decision = self.policy.evaluate(&request, op_def.safety);
+        let mut decision = self
+            .policy
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .evaluate(&request, op_def.safety);
 
         if !decision.allowed {
             let reason = decision
@@ -1792,6 +1815,7 @@ mod tests {
                 }),
                 sub_label: "x".into(),
                 sub_roles: Default::default(),
+                sub_teams: vec![],
                 act: PrincipalId::generate(&PrincipalKind::Agent {
                     tool: "claude-code".into(),
                 }),
@@ -1836,6 +1860,7 @@ mod tests {
             }),
             sub_label: sub_sub.into(),
             sub_roles: Default::default(),
+            sub_teams: vec![],
             act: PrincipalId::generate(&PrincipalKind::Agent {
                 tool: "claude-code".into(),
             }),

@@ -566,6 +566,11 @@ pub struct PrincipalContext {
     /// Roles `sub` holds, resolved from the store at request time.
     #[serde(default)]
     pub sub_roles: BTreeSet<Role>,
+    /// Team namespaces `sub` belongs to under the applied federation bundle
+    /// (empty when no bundle governs the daemon). Resolved daemon-side at
+    /// request time, never client-supplied.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sub_teams: Vec<String>,
     /// The acting agent workload principal.
     pub act: PrincipalId,
     /// Display label for `act` (e.g. `agent:claude-code`).

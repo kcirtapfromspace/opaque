@@ -46,6 +46,7 @@ mod doppler;
 mod enclave;
 #[allow(dead_code)]
 mod factors;
+mod federation;
 #[allow(dead_code)]
 mod fido2;
 #[allow(dead_code)]
@@ -134,6 +135,10 @@ struct DaemonConfig {
     /// live beyond the local prompt.
     #[serde(default)]
     approval: ApprovalFactorsConfig,
+
+    /// Federation (`[federation]`): signed policy bundles from an org.
+    #[serde(default)]
+    federation: federation::FederationConfig,
 }
 
 /// `[approval]` — out-of-band approval factor configuration.
@@ -246,6 +251,8 @@ struct DaemonState {
     approval_server_addr: Option<std::net::SocketAddr>,
     /// FIDO2 approval coordination, present when `[approval] fido2` is enabled.
     fido2: Option<Arc<factors::Fido2Approvals>>,
+    /// Applied federation bundle context (org, version, teams).
+    federation: Arc<federation::FederationStatus>,
 }
 
 #[derive(Debug, Clone)]
@@ -1708,9 +1715,70 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         .audit(audit.clone())
         .build()
         .map_err(std::io::Error::other)?;
+    let enclave = Arc::new(enclave);
+
+    // --- Federation: signed policy bundles ---
+    let federation_status = Arc::new(federation::FederationStatus::default());
+    if config.federation.configured() {
+        let fed = &config.federation;
+        let anchors = fed.anchors()?;
+        if anchors.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "[federation] has a bundle source but no trust_anchors — an unverifiable \
+                 bundle can never be applied",
+            ));
+        }
+        let applier = federation::BundleApplier {
+            anchors,
+            state_file: federation::state_path(&home),
+            enclave: enclave.clone(),
+            status: federation_status.clone(),
+            audit: audit.clone(),
+        };
+
+        // Initial load. Under require_bundle any failure (fetch, signature,
+        // rollback, expiry) refuses startup; otherwise the daemon starts on
+        // local [[rules]] and the refresh task keeps trying.
+        match applier.load_and_apply(fed, true).await {
+            Ok(()) => {}
+            Err(e) if fed.require_bundle => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "federation.require_bundle is on and no valid bundle could be \
+                         applied (fail closed): {e}"
+                    ),
+                ));
+            }
+            Err(e) => {
+                warn!(
+                    "federation bundle not applied at startup ({e}) — running on local \
+                     [[rules]] until a refresh succeeds"
+                );
+            }
+        }
+
+        // Refresh task (0 disables).
+        let refresh_secs = fed.refresh_secs.unwrap_or(300);
+        if refresh_secs > 0 {
+            let fed = fed.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(refresh_secs));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                tick.tick().await; // consume the immediate first tick
+                loop {
+                    tick.tick().await;
+                    if let Err(e) = applier.load_and_apply(&fed, false).await {
+                        warn!("federation refresh failed: {e}");
+                    }
+                }
+            });
+        }
+    }
 
     let state = Arc::new(DaemonState {
-        enclave: Arc::new(enclave),
+        enclave,
         audit: audit.clone(),
         config,
         version: version_string(),
@@ -1721,6 +1789,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         pairing: pairing_manager,
         approval_server_addr,
         fido2: fido2_approvals,
+        federation: federation_status,
     });
 
     // Shutdown coordination: watch channel + active connection counter.
@@ -2774,10 +2843,15 @@ async fn resolve_principal_context(
         }
     }
 
+    // Team membership comes from the applied federation bundle, resolved
+    // daemon-side per request (bundle refresh takes effect immediately).
+    let sub_teams = state.federation.teams_of(&sub_principal.display_label());
+
     Ok(Some(PrincipalContext {
         sub: d.sub.clone(),
         sub_label: sub_principal.display_label(),
         sub_roles: sub_principal.roles.clone(),
+        sub_teams,
         act: d.act.clone(),
         act_label: act_principal.display_label(),
         mode: d.mode,
@@ -2834,10 +2908,23 @@ async fn handle_request(
             req.id,
             serde_json::json!({ "ok": true, "api_version": opaque_core::API_VERSION }),
         ),
-        "version" => Response::ok(
-            req.id,
-            serde_json::json!({ "version": state.version, "api_version": opaque_core::API_VERSION }),
-        ),
+        "version" => {
+            let federation = state.federation.current().map(|a| {
+                serde_json::json!({
+                    "org": a.org,
+                    "bundle_version": a.version,
+                    "bundle_digest": &a.digest[..16.min(a.digest.len())],
+                })
+            });
+            Response::ok(
+                req.id,
+                serde_json::json!({
+                    "version": state.version,
+                    "api_version": opaque_core::API_VERSION,
+                    "federation": federation,
+                }),
+            )
+        }
         "whoami" => {
             let identity_required = state.identity.as_ref().is_some_and(|rt| rt.config.required);
             // Agent clients get minimal info to prevent reconnaissance.
@@ -3499,14 +3586,16 @@ async fn handle_request(
             // session-start operation event.
             match &delegation {
                 Some(d) => {
+                    let sub_label = state
+                        .identity
+                        .as_ref()
+                        .and_then(|rt| rt.store.get_principal(&d.sub).ok().flatten())
+                        .map(|p| p.display_label())
+                        .unwrap_or_default();
                     let ctx = PrincipalContext {
                         sub: d.sub.clone(),
-                        sub_label: state
-                            .identity
-                            .as_ref()
-                            .and_then(|rt| rt.store.get_principal(&d.sub).ok().flatten())
-                            .map(|p| p.display_label())
-                            .unwrap_or_default(),
+                        sub_teams: state.federation.teams_of(&sub_label),
+                        sub_label,
                         sub_roles: Default::default(),
                         act: d.act.clone(),
                         act_label: String::new(),
@@ -6336,6 +6425,7 @@ exe_sha256 = "deadbeef"
             pairing: None,
             approval_server_addr: None,
             fido2: None,
+            federation: Arc::new(federation::FederationStatus::default()),
         }
     }
 
@@ -7272,6 +7362,7 @@ exe_sha256 = "deadbeef"
             }),
             sub_label: "u".into(),
             sub_roles: Default::default(),
+            sub_teams: vec![],
             act: PrincipalId::generate(&PrincipalKind::Agent { tool: "x".into() }),
             act_label: "agent:x".into(),
             mode: AccessMode::Delegated,

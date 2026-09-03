@@ -114,6 +114,13 @@ pub enum AuditEventKind {
     /// Startup report of the daemon's trust-domain posture: whether the
     /// service-account split is enforced and what custody violations exist.
     TrustDomainPosture,
+
+    /// A signed federation policy bundle was verified and applied.
+    FederationBundleApplied,
+
+    /// A federation bundle was refused (rollback, version reuse, bad
+    /// signature at refresh time).
+    FederationBundleRejected,
 }
 
 impl fmt::Display for AuditEventKind {
@@ -147,6 +154,8 @@ impl fmt::Display for AuditEventKind {
             Self::DelegationIssued => "delegation.issued",
             Self::DelegationRevoked => "delegation.revoked",
             Self::TrustDomainPosture => "trust_domain.posture",
+            Self::FederationBundleApplied => "federation.bundle_applied",
+            Self::FederationBundleRejected => "federation.bundle_rejected",
         };
         write!(f, "{s}")
     }
@@ -185,6 +194,8 @@ impl std::str::FromStr for AuditEventKind {
             "delegation.issued" => Ok(Self::DelegationIssued),
             "delegation.revoked" => Ok(Self::DelegationRevoked),
             "trust_domain.posture" => Ok(Self::TrustDomainPosture),
+            "federation.bundle_applied" => Ok(Self::FederationBundleApplied),
+            "federation.bundle_rejected" => Ok(Self::FederationBundleRejected),
             _ => Err(format!("unknown audit event kind: {s}")),
         }
     }
@@ -235,6 +246,11 @@ pub struct PrincipalSummary {
     pub mode: String,
     /// Delegation session id.
     pub jti: String,
+    /// Team namespaces under the applied federation bundle (empty when no
+    /// bundle governs; omitted from JSON when empty so pre-federation records
+    /// keep their exact serialized shape).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sub_teams: Vec<String>,
 }
 
 impl From<&crate::identity::PrincipalContext> for PrincipalSummary {
@@ -251,6 +267,7 @@ impl From<&crate::identity::PrincipalContext> for PrincipalSummary {
             act_label: ctx.act_label.clone(),
             mode: ctx.mode.as_str().to_owned(),
             jti: ctx.jti.clone(),
+            sub_teams: ctx.sub_teams.clone(),
         }
     }
 }
@@ -3662,6 +3679,7 @@ mod tests {
             sub: PrincipalId::parse("hum_0123456789abcdef0123456789abcdef").unwrap(),
             sub_label: "dev@example.com".into(),
             sub_roles: [crate::identity::Role::Operator].into_iter().collect(),
+            sub_teams: vec![],
             act: PrincipalId::parse("agt_0123456789abcdef0123456789abcdef").unwrap(),
             act_label: "agent:claude-code".into(),
             mode: AccessMode::Delegated,
