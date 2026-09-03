@@ -6,6 +6,7 @@ on:
     paths:
       - 'docs/**'
       - 'mkdocs.yml'
+      - '.python-version'
   workflow_dispatch:
 
 permissions:
@@ -27,8 +28,11 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
-          python-version: '3.x'
-      - run: pip install mkdocs-material
+          python-version-file: '.python-version'
+      - uses: astral-sh/setup-uv@v7
+      # Versions are pinned in docs/requirements.txt, and --strict fails the
+      # deploy on a dead internal link rather than publishing one.
+      - run: uv pip install --system -r docs/requirements.txt
       - run: mkdocs build --strict
       - uses: actions/configure-pages@v6
       - uses: actions/upload-pages-artifact@v4
