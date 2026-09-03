@@ -28,7 +28,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust
         # Keep in sync with rust-toolchain.toml (the action's RUSTUP_TOOLCHAIN
@@ -110,7 +110,7 @@ jobs:
         run: shasum -a 256 "${{ steps.tarball.outputs.archive }}" > "${{ steps.tarball.outputs.archive }}.sha256"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: opaque-${{ matrix.target }}
           path: |
@@ -141,7 +141,7 @@ jobs:
           done
 
       - name: Checkout (for changelog)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
