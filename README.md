@@ -16,13 +16,15 @@ Opaque sits between your AI coding assistant and your secrets. LLMs get **operat
 ## Features
 
 - Deny-by-default policy engine with allowlist rules
+- **Trust-domain enforcement**: run the daemon as a dedicated service account (or separate container) that exclusively owns every key, database, and config — startup verifies custody and fails closed, turning tamper-evidence into tamper-prevention (`docs/deployment.md`)
+- **Signature-bound approvals**: pluggable factor registry — macOS Touch ID / Linux polkit, paired second device (Ed25519, decision-bound signatures), FIDO2 hardware keys and passkeys (challenge-bound, verified daemon-side); the audit chain records *who* approved, cryptographically
+- Identity substrate: daemon-owned OIDC login (PKCE), on-behalf-of delegation tokens, live-resolved roles, segregation of duties
+- Tamper-evident HMAC audit chain (SQLite) with `opaque audit verify`, restart-safe sequencing, and correlation IDs
+- Sandboxed execution: bubblewrap + Landlock + seccomp applied to every exec child; typestate-enforced response sanitization + secret-pattern scrubbing
 - Client identity from Unix peer creds + executable identity (path/hash, optional macOS Team ID)
-- Operation-bound native OS approvals (macOS Touch ID, Linux polkit)
-- Typestate-enforced response sanitization + secret-pattern scrubbing
-- Structured audit events (SQLite) with correlation IDs
 - MCP server for Claude Code integration
 - Providers: GitHub secrets, GitLab CI variables, 1Password, Bitwarden Secrets Manager, HashiCorp Vault, AWS Secrets Manager
-- Policy presets for common workflows
+- Policy presets for common workflows; deploy templates for systemd, launchd, docker-compose, and Kubernetes (`deploy/`)
 
 ## Install
 
