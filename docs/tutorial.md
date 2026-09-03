@@ -280,10 +280,13 @@ Now hand this capability to Claude Code. Add the MCP server to your config:
 }
 ```
 
+(Use the absolute path `which opaque-mcp` prints — Homebrew and the shell
+installer put it in different places.)
+
 Restart Claude Code and ask it, in plain language:
 
-> "Set the GitHub Actions secret TUTORIAL_KEY for YOUR_ORG/YOUR_REPO using my
-> keychain token."
+> "Set the GitHub Actions secret TUTORIAL_KEY for YOUR_ORG/YOUR_REPO from my
+> keychain."
 
 You will get the same approval prompt. The agent drove the operation; you
 authorized it; the secret never entered the model's context. Ask the agent to
