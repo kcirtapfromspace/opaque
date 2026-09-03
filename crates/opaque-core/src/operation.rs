@@ -384,13 +384,21 @@ pub struct OperationRequest {
     /// Git workspace context for scoped approvals.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceContext>,
+
+    /// Verified principal/delegation context (Phase 1 identity substrate).
+    /// Populated by the daemon from a validated delegation token — never
+    /// from client-supplied fields. `None` when identity is not configured
+    /// or the client presented no delegation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<crate::identity::PrincipalContext>,
 }
 
 impl OperationRequest {
     /// Compute a SHA-256 content hash over the canonical fields of this request.
     ///
     /// The hash covers: operation name, sorted target entries, sorted secret_ref_names,
-    /// params, client identity (uid, gid, pid), and workspace (remote_url, branch).
+    /// params, client identity (uid, gid, pid), workspace (remote_url, branch),
+    /// and — when present — the principal/delegation context (sub, act, mode, jti).
     ///
     /// Excludes: `request_id`, timestamps.
     ///
@@ -448,6 +456,22 @@ impl OperationRequest {
             hasher.update(b"\0");
         }
 
+        // Principal/delegation context — binds an approval to WHO the
+        // operation is for and WHICH delegation session carries it, so two
+        // different principals (or sessions) at the same uid can never
+        // produce interchangeable approval bindings.
+        if let Some(ref p) = self.principal {
+            hasher.update(b"principal\0");
+            hasher.update(p.sub.as_str().as_bytes());
+            hasher.update(b"\0");
+            hasher.update(p.act.as_str().as_bytes());
+            hasher.update(b"\0");
+            hasher.update(p.mode.as_str().as_bytes());
+            hasher.update(b"\0");
+            hasher.update(p.jti.as_bytes());
+            hasher.update(b"\0");
+        }
+
         let result = hasher.finalize();
         format!("{result:x}")
     }
@@ -465,6 +489,7 @@ impl fmt::Debug for OperationRequest {
             .field("secret_ref_names", &self.secret_ref_names)
             .field("created_at", &self.created_at)
             .field("expires_at", &self.expires_at)
+            .field("principal", &self.principal)
             // Deliberately omit params to avoid logging secret-adjacent data.
             .field("params", &"<redacted>")
             .field("workspace", &self.workspace)
@@ -696,6 +721,7 @@ mod tests {
             expires_at: None,
             params: serde_json::json!({"key": "value"}),
             workspace: None,
+            principal: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let roundtripped: OperationRequest = serde_json::from_str(&json).unwrap();
@@ -799,6 +825,7 @@ mod tests {
             expires_at: None,
             params: serde_json::json!({"secret": "super_secret_value"}),
             workspace: None,
+            principal: None,
         };
         let dbg = format!("{req:?}");
         assert!(!dbg.contains("super_secret_value"));
@@ -850,6 +877,7 @@ mod tests {
             expires_at: None,
             params: serde_json::json!({"key": "value"}),
             workspace: None,
+            principal: None,
         };
 
         // Same canonical fields (including params), different request_id and timestamps.
@@ -891,6 +919,7 @@ mod tests {
             expires_at: None,
             params: serde_json::Value::Null,
             workspace: None,
+            principal: None,
         };
 
         let mut req2 = req1.clone();
@@ -923,6 +952,7 @@ mod tests {
             expires_at: None,
             params: serde_json::Value::Null,
             workspace: None,
+            principal: None,
         };
 
         let mut req2 = req1.clone();
@@ -951,6 +981,7 @@ mod tests {
             expires_at: None,
             params: serde_json::Value::Null,
             workspace: None,
+            principal: None,
         };
         let hash = req.content_hash();
         assert_eq!(hash.len(), 64);
@@ -977,6 +1008,7 @@ mod tests {
             expires_at: None,
             params: serde_json::Value::Null,
             workspace: None,
+            principal: None,
         };
 
         let mut req_with_ws = req_no_ws.clone();
@@ -990,6 +1022,91 @@ mod tests {
         });
 
         assert_ne!(req_no_ws.content_hash(), req_with_ws.content_hash());
+    }
+
+    #[test]
+    fn content_hash_binds_principal_context() {
+        use crate::identity::{AccessMode, PrincipalContext, PrincipalId, PrincipalKind};
+
+        let base = OperationRequest {
+            request_id: Uuid::new_v4(),
+            client_identity: ClientIdentity {
+                uid: 501,
+                gid: 20,
+                pid: Some(1),
+                exe_path: None,
+                exe_sha256: None,
+                codesign_team_id: None,
+            },
+            client_type: ClientType::Agent,
+            operation: "test.op".into(),
+            target: HashMap::new(),
+            secret_ref_names: vec![],
+            created_at: SystemTime::now(),
+            expires_at: None,
+            params: serde_json::Value::Null,
+            workspace: None,
+            principal: None,
+        };
+
+        let human = PrincipalId::generate(&PrincipalKind::Human {
+            iss: "https://idp.example.com".into(),
+            sub: "u1".into(),
+            email: None,
+            name: None,
+        });
+        let agent = PrincipalId::generate(&PrincipalKind::Agent {
+            tool: "claude-code".into(),
+        });
+        let ctx = PrincipalContext {
+            sub: human,
+            sub_label: "dev@example.com".into(),
+            sub_roles: Default::default(),
+            act: agent,
+            act_label: "agent:claude-code".into(),
+            mode: AccessMode::Delegated,
+            jti: "sess-1".into(),
+            human_session_id: None,
+        };
+
+        let mut with_principal = base.clone();
+        with_principal.principal = Some(ctx.clone());
+
+        // Presence of a principal changes the binding.
+        assert_ne!(base.content_hash(), with_principal.content_hash());
+
+        // A different delegating principal changes the binding — approvals
+        // for two humans at the same uid are never interchangeable.
+        let mut other_sub = with_principal.clone();
+        let ctx2 = PrincipalContext {
+            sub: PrincipalId::generate(&PrincipalKind::Human {
+                iss: "https://idp.example.com".into(),
+                sub: "u2".into(),
+                email: None,
+                name: None,
+            }),
+            ..ctx.clone()
+        };
+        other_sub.principal = Some(ctx2);
+        assert_ne!(with_principal.content_hash(), other_sub.content_hash());
+
+        // A different delegation session (jti) also changes the binding.
+        let mut other_jti = with_principal.clone();
+        let ctx3 = PrincipalContext {
+            jti: "sess-2".into(),
+            ..ctx.clone()
+        };
+        other_jti.principal = Some(ctx3);
+        assert_ne!(with_principal.content_hash(), other_jti.content_hash());
+
+        // Roles/labels are display/eval data, NOT part of the binding.
+        let mut roles_differ = with_principal.clone();
+        let ctx4 = PrincipalContext {
+            sub_roles: [crate::identity::Role::Admin].into_iter().collect(),
+            ..ctx
+        };
+        roles_differ.principal = Some(ctx4);
+        assert_eq!(with_principal.content_hash(), roles_differ.content_hash());
     }
 
     #[test]
@@ -1019,6 +1136,7 @@ mod tests {
                 dirty: true,
                 workspace_verified: false,
             }),
+            principal: None,
         };
         let dbg = format!("{req:?}");
         assert!(dbg.contains("workspace"));

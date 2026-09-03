@@ -11,9 +11,9 @@
 enforce_agent_sessions = true
 agent_session_ttl_secs = 3600
 
-[[known_human_clients]]
-name = "opaque-cli"
-exe_path = "**/opaque"
+# Client classification is audit-only; enforce_agent_sessions gates agents behind
+# an approved session token (created via `opaque connect`, which prompts for
+# out-of-band approval).
 
 [[rules]]
 name = "allow-github-actions-secret"

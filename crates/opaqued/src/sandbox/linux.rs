@@ -114,19 +114,21 @@ fn detect_bubblewrap() -> bool {
         .is_ok()
 }
 
-/// Check if the kernel supports Landlock by attempting to create a minimal ruleset.
+/// Check if the kernel supports Landlock by actually creating a minimal
+/// ruleset — `create()` is what issues landlock_create_ruleset(2); merely
+/// configuring the builder never touches the kernel and reports true on
+/// kernels without Landlock at all. The probe demands HardRequirement:
+/// under the crate's default BestEffort compat, create() "succeeds" as a
+/// silent no-op on unsupported kernels, which is exactly the false positive
+/// a capability probe must not produce.
 fn detect_landlock() -> bool {
-    use landlock::{ABI, Access, AccessFs, Ruleset, RulesetAttr};
+    use landlock::{ABI, AccessFs, Compatible, Ruleset, RulesetAttr};
 
-    // Try to create a ruleset — if the kernel doesn't support Landlock,
-    // this will fail gracefully.
-    let result = Ruleset::default()
-        .handle_access(AccessFs::from_all(ABI::V3))
-        .map(|_rs| {
-            // We just need to check if creation succeeds; don't restrict anything.
-            true
-        });
-    matches!(result, Ok(true))
+    Ruleset::default()
+        .set_compatibility(landlock::CompatLevel::HardRequirement)
+        .handle_access(AccessFs::from_read(ABI::V1))
+        .and_then(|rs| rs.create())
+        .is_ok()
 }
 
 /// Check if seccomp-bpf is available. On any remotely modern Linux (3.5+) it is.
@@ -164,49 +166,44 @@ fn protected_paths() -> Vec<PathBuf> {
         .collect()
 }
 
-/// Apply Landlock filesystem restrictions.
+/// Build the Landlock ruleset for a sandbox child, PRE-FORK.
 ///
 /// - Global read-only access to `/`
-/// - Read-write access to: project_dir, /tmp, /var/tmp, /dev/null
-/// - No access to protected directories (~/.opaque, ~/.ssh, ~/.gnupg)
+/// - Read-write access to: project_dir, /tmp, /var/tmp
+/// - Protected directories (~/.opaque, ~/.ssh, ~/.gnupg) get no extra grant;
+///   the bubblewrap layer additionally masks them with tmpfs.
 ///
-/// Returns `true` if Landlock was successfully applied, `false` if not supported.
-#[allow(dead_code)]
-pub fn landlock_restrict(project_dir: &Path, extra_read_paths: &[PathBuf]) -> bool {
+/// Construction happens in the parent so path rules resolve against the
+/// parent's view (PathFd opens the directories now — fd-based rules are
+/// immune to the mount shuffling bubblewrap performs later) and so the
+/// post-fork child only has to issue restrict syscalls, never allocate.
+pub fn build_landlock_ruleset(
+    project_dir: &Path,
+    extra_read_paths: &[PathBuf],
+) -> Result<landlock::RulesetCreated, String> {
     use landlock::{
         ABI, Access, AccessFs, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
-        RulesetCreatedAttr, RulesetStatus,
+        RulesetCreatedAttr,
     };
-
-    // Set PR_SET_NO_NEW_PRIVS — required before Landlock and good security practice.
-    let nnp_result = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
-    if nnp_result != 0 {
-        warn!("failed to set PR_SET_NO_NEW_PRIVS, Landlock may not work");
-    }
 
     let read_access = AccessFs::from_read(ABI::V3);
     let readwrite_access = AccessFs::from_all(ABI::V3);
 
-    // Create the ruleset handling all filesystem access types.
-    let ruleset = match Ruleset::default().handle_access(readwrite_access) {
-        Ok(rs) => rs,
-        Err(e) => {
-            warn!("landlock ruleset creation failed (kernel too old?): {e}");
-            return false;
-        }
-    };
-
-    // Build the ruleset by setting best-effort compatibility.
-    let mut created = match ruleset
+    // Base ABI is a HARD requirement: on a kernel without Landlock this
+    // errors instead of silently building a no-op ruleset (BestEffort's
+    // failure mode) — the caller treats that as fail-closed. Newer ABI
+    // features degrade best-effort on older Landlock kernels.
+    let ruleset = Ruleset::default()
+        .set_compatibility(landlock::CompatLevel::HardRequirement)
+        .handle_access(AccessFs::from_all(ABI::V1))
+        .map_err(|e| format!("landlock base ABI unavailable: {e}"))?
         .set_compatibility(landlock::CompatLevel::BestEffort)
+        .handle_access(readwrite_access)
+        .map_err(|e| format!("landlock handle_access: {e}"))?;
+
+    let mut created = ruleset
         .create()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("landlock ruleset creation failed: {e}");
-            return false;
-        }
-    };
+        .map_err(|e| format!("landlock ruleset creation: {e}"))?;
 
     // Helper: add a rule if the path exists.
     let mut add_rule = |path: &Path, access| {
@@ -231,37 +228,12 @@ pub fn landlock_restrict(project_dir: &Path, extra_read_paths: &[PathBuf]) -> bo
         add_rule(path, read_access);
     }
 
-    // Restrict. Note: Landlock does not have an explicit "deny" primitive for
-    // sub-paths within an allowed tree. The protected paths are blocked because
-    // we only allow read on `/` globally, and the protected dirs are NOT given
-    // any additional access. For defense in depth, if the protected paths exist,
-    // we do NOT add any rule for them — they inherit only the global read-only
-    // access from `/`. The real blocking of writes to these dirs comes from the
-    // fact that they are not in the writable set.
-    //
-    // The bubblewrap layer handles the hard deny (no bind-mount) for these paths.
+    // Note: Landlock has no explicit "deny" primitive for sub-paths of an
+    // allowed tree. Protected dirs are blocked from WRITES because they are
+    // not in the writable set; the bubblewrap tmpfs mask is what hides their
+    // contents from reads.
 
-    match created.restrict_self() {
-        Ok(status) => {
-            match status.ruleset {
-                RulesetStatus::FullyEnforced => {
-                    info!("landlock: fully enforced");
-                }
-                RulesetStatus::PartiallyEnforced => {
-                    warn!("landlock: partially enforced (some rules not supported by kernel)");
-                }
-                RulesetStatus::NotEnforced => {
-                    warn!("landlock: not enforced (kernel does not support Landlock)");
-                    return false;
-                }
-            }
-            true
-        }
-        Err(e) => {
-            warn!("landlock: restrict_self failed: {e}");
-            false
-        }
-    }
+    Ok(created)
 }
 
 /// Build a Landlock ruleset configuration for inspection (used in tests).
@@ -293,15 +265,12 @@ pub fn landlock_ruleset_paths(
 // seccomp-BPF syscall filtering
 // ---------------------------------------------------------------------------
 
-/// Apply seccomp-BPF filters.
+/// Compile the seccomp-BPF program for a sandbox child, PRE-FORK.
 ///
-/// When `network_blocked` is true, blocks network syscalls (connect, bind, listen,
-/// accept, accept4, sendto, sendmsg, sendmmsg) with EPERM.
+/// When `network_blocked` is true, blocks network syscalls (connect, bind,
+/// listen, accept, accept4, sendto, sendmsg, sendmmsg) with EPERM.
 /// Always blocks ptrace and io_uring syscalls.
-///
-/// Returns `true` if the filter was applied, `false` if not available.
-#[allow(dead_code)]
-pub fn seccomp_restrict_network(network_blocked: bool) -> bool {
+pub fn build_seccomp_program(network_blocked: bool) -> Result<seccompiler::BpfProgram, String> {
     use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, SeccompRule, TargetArch};
     use std::collections::BTreeMap;
 
@@ -311,21 +280,12 @@ pub fn seccomp_restrict_network(network_blocked: bool) -> bool {
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
 
     // Always block ptrace (sandbox escape via debugging).
-    rules.insert(libc::SYS_ptrace, vec![SeccompRule::new(vec![]).unwrap()]);
+    rules.insert(libc::SYS_ptrace, vec![]);
 
     // Always block io_uring (bypass vector).
-    rules.insert(
-        libc::SYS_io_uring_setup,
-        vec![SeccompRule::new(vec![]).unwrap()],
-    );
-    rules.insert(
-        libc::SYS_io_uring_enter,
-        vec![SeccompRule::new(vec![]).unwrap()],
-    );
-    rules.insert(
-        libc::SYS_io_uring_register,
-        vec![SeccompRule::new(vec![]).unwrap()],
-    );
+    rules.insert(libc::SYS_io_uring_setup, vec![]);
+    rules.insert(libc::SYS_io_uring_enter, vec![]);
+    rules.insert(libc::SYS_io_uring_register, vec![]);
 
     // Block network syscalls when network is not allowed.
     if network_blocked {
@@ -343,46 +303,124 @@ pub fn seccomp_restrict_network(network_blocked: bool) -> bool {
             libc::SYS_sendmmsg,
         ];
         for syscall in network_syscalls {
-            rules.insert(syscall, vec![SeccompRule::new(vec![]).unwrap()]);
+            rules.insert(syscall, vec![]);
         }
     }
 
-    let target_arch = match TargetArch::try_from(std::env::consts::ARCH) {
-        Ok(arch) => arch,
-        Err(e) => {
-            warn!(
-                "unsupported seccomp target architecture {}: {e}",
-                std::env::consts::ARCH
-            );
-            return false;
-        }
+    let target_arch = TargetArch::try_from(std::env::consts::ARCH)
+        .map_err(|e| format!("unsupported seccomp arch {}: {e}", std::env::consts::ARCH))?;
+
+    let filter = SeccompFilter::new(rules, default_action, block_action, target_arch)
+        .map_err(|e| format!("seccomp filter construction: {e}"))?;
+
+    let bpf: BpfProgram = filter
+        .try_into()
+        .map_err(|e| format!("seccomp BPF compilation: {e}"))?;
+    Ok(bpf)
+}
+
+// ---------------------------------------------------------------------------
+// Child restriction application (pre_exec)
+// ---------------------------------------------------------------------------
+
+/// Restriction layers prepared in the parent, applied in the child between
+/// fork and exec. Both inherit across exec and into every descendant.
+#[derive(Debug)]
+pub struct PreparedRestrictions {
+    landlock: Option<landlock::RulesetCreated>,
+    seccomp: Option<seccompiler::BpfProgram>,
+}
+
+impl PreparedRestrictions {
+    pub fn landlock_prepared(&self) -> bool {
+        self.landlock.is_some()
+    }
+
+    pub fn seccomp_prepared(&self) -> bool {
+        self.seccomp.is_some()
+    }
+}
+
+/// Build the restriction layers for a child, keyed off detected capabilities.
+///
+/// FAIL CLOSED on the half that matters: a capability the kernel HAS but we
+/// cannot prepare is an error, never a silent skip. A capability the kernel
+/// lacks degrades gracefully (the namespace layer remains), matching the
+/// probing contract the harness verifies.
+pub fn prepare_child_restrictions(
+    caps: &SandboxCapabilities,
+    project_dir: &Path,
+    extra_read_paths: &[PathBuf],
+    network_blocked: bool,
+) -> Result<PreparedRestrictions, SandboxError> {
+    let landlock = if caps.landlock {
+        Some(
+            build_landlock_ruleset(project_dir, extra_read_paths)
+                .map_err(|e| SandboxError::Setup(format!("landlock detected but unusable: {e}")))?,
+        )
+    } else {
+        warn!("landlock: not available on this kernel, relying on namespace isolation");
+        None
     };
 
-    let filter = match SeccompFilter::new(rules, default_action, block_action, target_arch) {
-        Ok(f) => f,
-        Err(e) => {
-            warn!("seccomp filter construction failed: {e}");
-            return false;
-        }
+    let seccomp = if caps.seccomp {
+        Some(
+            build_seccomp_program(network_blocked)
+                .map_err(|e| SandboxError::Setup(format!("seccomp detected but unusable: {e}")))?,
+        )
+    } else {
+        warn!("seccomp: not available, skipping syscall filter");
+        None
     };
 
-    let bpf: BpfProgram = match filter.try_into() {
-        Ok(p) => p,
-        Err(e) => {
-            warn!("seccomp BPF compilation failed: {e}");
-            return false;
-        }
-    };
+    Ok(PreparedRestrictions { landlock, seccomp })
+}
 
-    match seccompiler::apply_filter(&bpf) {
-        Ok(()) => {
-            info!("seccomp-bpf filter applied");
-            true
-        }
-        Err(e) => {
-            warn!("seccomp filter application failed: {e}");
-            false
-        }
+/// Install the prepared restrictions as the command's pre_exec hook.
+///
+/// The hook runs in the forked child before exec: it sets NO_NEW_PRIVS,
+/// applies the Landlock ruleset, then loads the seccomp filter. Any failure
+/// aborts the exec — a child that cannot be restricted never runs. Only
+/// already-built objects are used (restrict/apply are raw syscalls), keeping
+/// the post-fork window allocation-free.
+pub fn apply_child_restrictions(cmd: &mut tokio::process::Command, prepared: PreparedRestrictions) {
+    use landlock::RulesetCreatedAttr;
+
+    let landlock = std::sync::Mutex::new(prepared.landlock);
+    let seccomp = prepared.seccomp;
+
+    unsafe {
+        cmd.pre_exec(move || {
+            // NO_NEW_PRIVS: required for unprivileged seccomp, sound for
+            // Landlock, and independently the right property for a sandbox
+            // child (no setuid re-escalation).
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+
+            if let Some(ruleset) = landlock
+                .lock()
+                .map_err(|_| std::io::Error::other("landlock ruleset lock poisoned"))?
+                .take()
+            {
+                let status = ruleset
+                    .set_no_new_privs(false) // already set above
+                    .restrict_self()
+                    .map_err(|e| std::io::Error::other(format!("landlock restrict: {e}")))?;
+                if matches!(status.ruleset, landlock::RulesetStatus::NotEnforced) {
+                    return Err(std::io::Error::other(
+                        "landlock restrict returned NOT ENFORCED — refusing to run the child",
+                    ));
+                }
+            }
+
+            if let Some(bpf) = &seccomp {
+                seccompiler::apply_filter(bpf)
+                    .map_err(|e| std::io::Error::other(format!("seccomp apply: {e}")))?;
+            }
+
+            Ok(())
+        });
     }
 }
 
@@ -616,29 +654,23 @@ pub async fn execute(
     cmd.stderr(std::process::Stdio::piped());
     cmd.stdin(std::process::Stdio::null());
 
-    // NOTE: Landlock and seccomp are applied by the child process, not here.
-    // In a production implementation, we would use a pre-exec hook or a
-    // wrapper binary that applies Landlock + seccomp before exec-ing the
-    // actual command. For now, we log what *would* be applied.
-    //
-    // The bubblewrap layer already provides strong mount-level isolation.
-    // Landlock and seccomp add defense-in-depth inside the namespace.
-    if caps.landlock {
-        info!(
-            "landlock: would restrict filesystem (project_dir={}, extra_read_paths={})",
-            config.project_dir.display(),
-            config.extra_read_paths.len()
-        );
-    } else {
-        warn!("landlock: not available on this kernel, skipping filesystem restriction");
-    }
-
-    if caps.seccomp {
-        let network_blocked = config.network_allow.is_empty();
-        info!(network_blocked, "seccomp: would apply syscall filter");
-    } else {
-        warn!("seccomp: not available, skipping syscall filter");
-    }
+    // Landlock + seccomp (C5): built pre-fork, applied in the child's
+    // pre_exec between fork and exec, inherited across exec by the whole
+    // sandboxed process tree. A child that cannot be restricted never runs.
+    let network_blocked = config.network_allow.is_empty();
+    let prepared = prepare_child_restrictions(
+        &caps,
+        &config.project_dir,
+        &config.extra_read_paths,
+        network_blocked,
+    )?;
+    info!(
+        landlock = prepared.landlock_prepared(),
+        seccomp = prepared.seccomp_prepared(),
+        network_blocked,
+        "child restriction layers prepared"
+    );
+    apply_child_restrictions(&mut cmd, prepared);
 
     let mut child = cmd
         .spawn()
@@ -1128,6 +1160,133 @@ mod tests {
         assert!(PROTECTED_DIRS.contains(&".opaque"));
         assert!(PROTECTED_DIRS.contains(&".ssh"));
         assert!(PROTECTED_DIRS.contains(&".gnupg"));
+    }
+
+    /// Run `sh -c <script>` with the given prepared restrictions applied,
+    /// returning (exit_success, stderr).
+    async fn run_restricted(script: &str, prepared: PreparedRestrictions) -> (bool, String) {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg(script);
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::piped());
+        cmd.stdin(std::process::Stdio::null());
+        apply_child_restrictions(&mut cmd, prepared);
+        let out = cmd.output().await.expect("child must spawn");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    fn seccomp_only(network_blocked: bool) -> PreparedRestrictions {
+        PreparedRestrictions {
+            landlock: None,
+            seccomp: Some(build_seccomp_program(network_blocked).expect("seccomp must build")),
+        }
+    }
+
+    /// ENFORCEMENT: with the network-blocking filter, connect(2) fails with
+    /// EPERM — and the control run without the block fails with connection
+    /// refused instead, proving the EPERM came from seccomp and not the
+    /// environment. Uses bash's /dev/tcp (a plain connect under the hood).
+    #[tokio::test]
+    async fn seccomp_enforcement_blocks_connect_with_eperm() {
+        if !detect_seccomp() {
+            eprintln!("SKIP: seccomp unavailable on this kernel");
+            return;
+        }
+        // Port 1 on loopback: nothing listens; the syscall outcome is what
+        // distinguishes the runs.
+        let script = "bash -c 'exec 3<>/dev/tcp/127.0.0.1/1' 2>&1; exit 1";
+
+        let (_ok, blocked_err) =
+            run_restricted("bash -c 'exec 3<>/dev/tcp/127.0.0.1/1'", seccomp_only(true)).await;
+        assert!(
+            blocked_err.to_lowercase().contains("not permitted"),
+            "blocked run must fail with EPERM, got: {blocked_err}"
+        );
+
+        let (_ok, control_err) = run_restricted(
+            "bash -c 'exec 3<>/dev/tcp/127.0.0.1/1'",
+            seccomp_only(false),
+        )
+        .await;
+        assert!(
+            control_err.to_lowercase().contains("refused"),
+            "control run must reach the network stack (ECONNREFUSED), got: {control_err}"
+        );
+        let _ = script;
+    }
+
+    /// ENFORCEMENT: a restricted child still runs normal programs (the
+    /// filter is a targeted blocklist, not a straitjacket).
+    #[tokio::test]
+    async fn seccomp_enforcement_leaves_normal_execution_alone() {
+        if !detect_seccomp() {
+            eprintln!("SKIP: seccomp unavailable on this kernel");
+            return;
+        }
+        let (ok, err) = run_restricted("echo hello && ls / > /dev/null", seccomp_only(true)).await;
+        assert!(ok, "benign child must run under the filter: {err}");
+    }
+
+    /// ENFORCEMENT (Landlock kernels only — the GitHub runners; Docker
+    /// Desktop's kernel lacks Landlock and this prints a loud skip there):
+    /// writes outside the writable set fail, writes inside the project
+    /// succeed, and the daemon's protected state stays unwritable.
+    #[tokio::test]
+    async fn landlock_enforcement_confines_writes_to_project() {
+        if !detect_landlock() {
+            eprintln!("SKIP: landlock unavailable on this kernel (verified in CI instead)");
+            return;
+        }
+        let project = tempfile::tempdir().expect("tempdir");
+        let ruleset = build_landlock_ruleset(project.path(), &[]).expect("ruleset must build");
+        let prepared = PreparedRestrictions {
+            landlock: Some(ruleset),
+            seccomp: None,
+        };
+
+        let inside = project.path().join("ok.txt");
+        let script = format!(
+            "echo denied > /usr/landlock-probe-{} 2>/dev/null && exit 7; echo fine > {} || exit 8; exit 0",
+            std::process::id(),
+            inside.display(),
+        );
+        let (ok, err) = run_restricted(&script, prepared).await;
+        assert!(
+            ok,
+            "outside-write must fail and inside-write must succeed: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&inside)
+                .expect("inside file")
+                .trim(),
+            "fine"
+        );
+    }
+
+    /// FAIL CLOSED: when the capability probe says Landlock exists but the
+    /// ruleset cannot be built, preparation errors — the child never spawns
+    /// unrestricted. (Only meaningful on kernels WITHOUT Landlock, where the
+    /// forced `landlock: true` capability is a lie.)
+    #[tokio::test]
+    async fn prepare_fails_closed_when_landlock_claimed_but_unusable() {
+        if detect_landlock() {
+            eprintln!("SKIP: kernel actually has landlock; the lie cannot be staged");
+            return;
+        }
+        let caps = SandboxCapabilities {
+            bubblewrap: false,
+            landlock: true,
+            seccomp: false,
+            user_namespaces: false,
+        };
+        let err = prepare_child_restrictions(&caps, Path::new("/tmp"), &[], true).unwrap_err();
+        assert!(
+            matches!(err, SandboxError::Setup(_)),
+            "must fail closed, got: {err:?}"
+        );
     }
 
     #[test]

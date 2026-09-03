@@ -195,6 +195,36 @@ enum Cmd {
         #[command(subcommand)]
         action: AuditAction,
     },
+    /// Sign in as a human via your organization's identity provider (OIDC).
+    #[command(
+        long_about = "Sign in as a human via your organization's identity provider (OIDC).\n\n\
+        Opens your browser to the configured IdP. The browser step IS the identity\n\
+        proof: an agent driving this CLI cannot complete it — only the human at the\n\
+        IdP can. On success the daemon holds your login session; agent sessions can\n\
+        then be delegated on your behalf."
+    )]
+    Login {
+        /// Print the sign-in URL only; do not try to open a browser.
+        #[arg(long, default_value_t = false)]
+        no_browser: bool,
+    },
+    /// Sign out: revoke all active human login sessions in the daemon.
+    Logout,
+    /// Inspect principals, roles, and delegations (identity substrate).
+    Identity {
+        #[command(subcommand)]
+        action: IdentityAction,
+    },
+    /// Manage paired approver devices (second-device approval factor).
+    Device {
+        #[command(subcommand)]
+        action: DeviceAction,
+    },
+    /// Manage FIDO2 hardware keys / passkeys (approval factor).
+    Key {
+        #[command(subcommand)]
+        action: KeyAction,
+    },
     /// Interactive setup wizard — configure and seal your security policy.
     Setup {
         /// Seal the current config.toml without running the wizard.
@@ -367,6 +397,63 @@ enum AgentAction {
         /// Required unless `--all` is set.
         #[arg(required_unless_present = "all")]
         session_id: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum IdentityAction {
+    /// List known principals (humans, agents, service principals).
+    Ls,
+    /// Set the role list for a principal (requires the admin role).
+    Roles {
+        /// Principal id (hum_…, agt_…, svc_…) as shown by `opaque identity ls`.
+        principal_id: String,
+
+        /// Roles to assign: admin, approver, operator, auditor.
+        /// Space- or comma-separated. Replaces the current role list.
+        #[arg(required = true, num_args = 1..)]
+        roles: Vec<String>,
+    },
+    /// List delegation records (agent sessions bound to principals).
+    Delegations,
+}
+
+#[derive(Debug, Subcommand)]
+enum KeyAction {
+    /// List registered FIDO2 credentials.
+    Ls,
+    /// Remove a registered credential (removing an approver is never gated
+    /// on an approver).
+    Remove {
+        /// Credential id as shown by `opaque key ls`.
+        credential_id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DeviceAction {
+    /// Begin pairing a new approver device (approval-gated; prints the QR
+    /// payload for the companion app).
+    #[command(long_about = "Begin pairing a new approver device.\n\n\
+        Requires an out-of-band approval to start. The printed payload is scanned\n\
+        by the companion app, which completes pairing over the approval server.\n\
+        The new device stays QUARANTINED (no approval authority) until you run\n\
+        `opaque device confirm <device-id>` and match its key fingerprint against\n\
+        what the device itself displays.")]
+    Pair,
+    /// List paired devices with confirmation and revocation state.
+    Ls,
+    /// Confirm a paired device's key fingerprint (approval-gated) — this is
+    /// what grants it approval authority.
+    Confirm {
+        /// Device id as shown by `opaque device ls`.
+        device_id: String,
+    },
+    /// Revoke a paired device immediately (not approval-gated: removing an
+    /// approver never waits on an approver).
+    Revoke {
+        /// Device id as shown by `opaque device ls`.
+        device_id: String,
     },
 }
 
@@ -702,6 +789,9 @@ enum AuditAction {
         #[arg(long = "query")]
         query: Option<String>,
     },
+
+    /// Verify the tamper-evident audit hash chain.
+    Verify,
 }
 
 fn parse_kv(s: &str) -> Result<(String, String), String> {
@@ -1363,6 +1453,202 @@ async fn run_github_publish_manifest(
     Ok(())
 }
 
+/// Flatten role arguments: accepts space-separated args and/or
+/// comma-separated lists within a single arg ("admin,operator approver").
+fn flatten_role_args(roles: &[String]) -> Vec<String> {
+    roles
+        .iter()
+        .flat_map(|r| r.split(','))
+        .map(|r| r.trim().to_ascii_lowercase())
+        .filter(|r| !r.is_empty())
+        .collect()
+}
+
+/// Try to open a URL in the default browser. Failure is non-fatal — the
+/// URL is always printed so the human can open it manually.
+fn open_browser(url: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    let cmd = "open";
+    #[cfg(target_os = "linux")]
+    let cmd = "xdg-open";
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    return false;
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    std::process::Command::new(cmd)
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .is_ok()
+}
+
+/// Run the interactive OIDC login flow: start an attempt with the daemon,
+/// hand the human the IdP URL, and poll until the daemon has verified the
+/// ID token and created a login session.
+///
+/// The auth code and tokens never pass through this CLI — the daemon owns
+/// the loopback redirect and the code exchange. This process only learns
+/// the outcome.
+async fn run_login(sock: &PathBuf, no_browser: bool, json_output: bool) -> Result<i32, String> {
+    let resp = call(sock, "identity.login_start", serde_json::Value::Null)
+        .await
+        .map_err(|e| format!("Connection failed: {e}"))?;
+
+    if let Some(err) = &resp.error {
+        if json_output {
+            let output = serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_string());
+            println!("{output}");
+            return Ok(EXIT_DAEMON);
+        }
+        if err.code == "identity_not_configured" {
+            ui::error("Identity is not configured in the daemon");
+            println!();
+            ui::section_box(
+                "Enable OIDC login",
+                &[
+                    "Add an [identity] section to ~/.opaque/config.toml:",
+                    "",
+                    "  [identity]",
+                    "  issuer = \"https://your-idp.example.com\"",
+                    "  client_id = \"opaque-cli\"",
+                    "  # session_ttl_secs = 43200",
+                    "  # allowed_email_domains = [\"example.com\"]",
+                    "",
+                    "Then restart the daemon (and re-seal if your config is sealed).",
+                ],
+            );
+        } else {
+            ui::format_error(err);
+        }
+        return Ok(EXIT_DAEMON);
+    }
+
+    let result = resp.result.unwrap_or(serde_json::Value::Null);
+    let attempt_id = result
+        .get("attempt_id")
+        .and_then(|v| v.as_str())
+        .ok_or("daemon returned no attempt_id")?
+        .to_string();
+    let auth_url = result
+        .get("auth_url")
+        .and_then(|v| v.as_str())
+        .ok_or("daemon returned no auth_url")?
+        .to_string();
+    let expires_in_secs = result
+        .get("expires_in_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(300);
+
+    if !json_output {
+        ui::header("Sign in with your identity provider");
+        println!();
+        println!("  {}", style(&auth_url).cyan().underlined());
+        println!();
+        if no_browser {
+            ui::info("Open the URL above in your browser to continue.");
+        } else if open_browser(&auth_url) {
+            ui::info("Opening your browser… complete the sign-in there.");
+        } else {
+            ui::warn("Could not open a browser — open the URL above manually.");
+        }
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(expires_in_secs);
+    let sp = if json_output {
+        None
+    } else {
+        Some(ui::spinner("Waiting for sign-in to complete..."))
+    };
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        if std::time::Instant::now() >= deadline {
+            if let Some(ref sp) = sp {
+                ui::spinner_error(sp, "Sign-in timed out");
+            }
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({"status": "failed", "reason": "timeout"})
+                );
+            }
+            return Ok(EXIT_AUTH);
+        }
+
+        let resp = call(
+            sock,
+            "identity.login_status",
+            serde_json::json!({ "attempt_id": attempt_id }),
+        )
+        .await
+        .map_err(|e| format!("Connection failed while waiting for sign-in: {e}"))?;
+
+        if let Some(err) = &resp.error {
+            if let Some(ref sp) = sp {
+                sp.finish_and_clear();
+            }
+            if json_output {
+                let output =
+                    serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_string());
+                println!("{output}");
+            } else {
+                ui::format_error(err);
+            }
+            return Ok(EXIT_DAEMON);
+        }
+
+        let status_obj = resp.result.unwrap_or(serde_json::Value::Null);
+        match status_obj.get("status").and_then(|v| v.as_str()) {
+            Some("pending") | None => continue,
+            Some("complete") => {
+                if let Some(ref sp) = sp {
+                    sp.finish_and_clear();
+                }
+                if json_output {
+                    let output = serde_json::to_string_pretty(&status_obj)
+                        .unwrap_or_else(|_| "{}".to_string());
+                    println!("{output}");
+                } else {
+                    let identity = status_obj
+                        .get("identity")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    let label = identity
+                        .get("label")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(unknown)");
+                    ui::success(&format!("Signed in as {}", style(label).green().bold()));
+                    ui::format_identity_summary(&identity);
+                }
+                return Ok(EXIT_SUCCESS);
+            }
+            Some("failed") => {
+                let reason = status_obj
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                if let Some(ref sp) = sp {
+                    ui::spinner_error(sp, &format!("Sign-in failed: {reason}"));
+                }
+                if json_output {
+                    let output = serde_json::to_string_pretty(&status_obj)
+                        .unwrap_or_else(|_| "{}".to_string());
+                    println!("{output}");
+                }
+                return Ok(EXIT_AUTH);
+            }
+            Some(other) => {
+                if let Some(ref sp) = sp {
+                    sp.finish_and_clear();
+                }
+                return Err(format!("unexpected login status: {other}"));
+            }
+        }
+    }
+}
+
 fn session_token_from_env() -> Option<String> {
     std::env::var("OPAQUE_SESSION_TOKEN")
         .ok()
@@ -1418,6 +1704,13 @@ async fn run_agent_wrapped(
         ui::kv("session_id", &session_id);
         if let Some(expires) = result.get("expires_at_utc_ms").and_then(|v| v.as_i64()) {
             ui::kv("expires_at_utc_ms", &expires.to_string());
+        }
+        // Present when the daemon minted a delegation (identity configured).
+        if let Some(mode) = result.get("mode").and_then(|v| v.as_str()) {
+            ui::kv("mode", mode);
+        }
+        if let Some(label) = result.get("on_behalf_of_label").and_then(|v| v.as_str()) {
+            ui::kv("on behalf of", label);
         }
     }
 
@@ -1625,7 +1918,10 @@ fn run_secrets_add(name: &str) {
 
     if value.is_empty() {
         ui::error("Secret value must not be empty");
-        eprintln!("\n  {} Provide a non-empty secret value", style("hint:").cyan().bold());
+        eprintln!(
+            "\n  {} Provide a non-empty secret value",
+            style("hint:").cyan().bold()
+        );
         std::process::exit(EXIT_USAGE);
     }
 
@@ -1776,8 +2072,8 @@ async fn main() {
     // In verbose mode, initialize tracing at debug level.
     if verbose {
         use tracing_subscriber::EnvFilter;
-        let filter = EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new("opaque=debug"));
+        let filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("opaque=debug"));
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_target(false)
@@ -1925,6 +2221,13 @@ async fn main() {
                         }
                     }
                 }
+                AuditAction::Verify => match run_audit_verify(json_output) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        ui::error(&e);
+                        std::process::exit(1);
+                    }
+                },
             }
             return;
         }
@@ -2021,7 +2324,9 @@ async fn main() {
                 SecretsAction::List => run_secrets_list(),
                 SecretsAction::Remove { name } => {
                     if !confirm_destructive(
-                        &format!("Are you sure you want to remove secret 'opaque/{name}' from the keychain?"),
+                        &format!(
+                            "Are you sure you want to remove secret 'opaque/{name}' from the keychain?"
+                        ),
                         skip_confirm,
                     ) {
                         ui::info("Aborted.");
@@ -2036,6 +2341,16 @@ async fn main() {
     }
 
     let sock = cli.socket.unwrap_or_else(socket_path);
+
+    if let Cmd::Login { no_browser } = &cmd {
+        match run_login(&sock, *no_browser, json_output).await {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                ui::error(&e);
+                std::process::exit(EXIT_DAEMON);
+            }
+        }
+    }
 
     if let Cmd::Agent {
         action:
@@ -2054,8 +2369,10 @@ async fn main() {
         for key in pass_env {
             if !is_valid_env_name(key) {
                 ui::error(&format!("--pass-env '{key}': invalid env var name"));
-                eprintln!("\n  {} Environment variable names must start with A-Z/a-z/_ and contain only alphanumerics and _",
-                    style("hint:").cyan().bold());
+                eprintln!(
+                    "\n  {} Environment variable names must start with A-Z/a-z/_ and contain only alphanumerics and _",
+                    style("hint:").cyan().bold()
+                );
                 std::process::exit(EXIT_USAGE);
             }
         }
@@ -2164,14 +2481,13 @@ async fn main() {
                 ..
             },
     } = cmd
-    {
-        if !confirm_destructive(
+        && !confirm_destructive(
             &format!("Are you sure you want to delete {scope} secret '{secret_name}'?"),
             skip_confirm,
-        ) {
-            ui::info("Aborted.");
-            return;
-        }
+        )
+    {
+        ui::info("Aborted.");
+        return;
     }
 
     let (method, params) = match cmd {
@@ -2413,6 +2729,42 @@ async fn main() {
                 ("onepassword", params)
             }
         },
+        // Handled in the async block above; unreachable.
+        Cmd::Login { .. } => unreachable!(),
+        Cmd::Logout => ("identity.logout", serde_json::Value::Null),
+        Cmd::Identity { action } => match action {
+            IdentityAction::Ls => ("identity.principal_list", serde_json::Value::Null),
+            IdentityAction::Roles {
+                principal_id,
+                roles,
+            } => (
+                "identity.role_set",
+                serde_json::json!({
+                    "principal_id": principal_id,
+                    "roles": flatten_role_args(&roles),
+                }),
+            ),
+            IdentityAction::Delegations => ("identity.delegation_list", serde_json::Value::Null),
+        },
+        Cmd::Key { action } => match action {
+            KeyAction::Ls => ("fido2_list", serde_json::Value::Null),
+            KeyAction::Remove { credential_id } => (
+                "fido2_remove",
+                serde_json::json!({ "credential_id": credential_id }),
+            ),
+        },
+        Cmd::Device { action } => match action {
+            DeviceAction::Pair => ("device_pair_start", serde_json::Value::Null),
+            DeviceAction::Ls => ("device_list", serde_json::Value::Null),
+            DeviceAction::Confirm { device_id } => (
+                "device_pair_confirm",
+                serde_json::json!({ "device_id": device_id }),
+            ),
+            DeviceAction::Revoke { device_id } => (
+                "device_revoke",
+                serde_json::json!({ "device_id": device_id }),
+            ),
+        },
         Cmd::Agent { action } => match action {
             AgentAction::Run { .. } => unreachable!(),
             AgentAction::List => ("agent_session_list", serde_json::Value::Null),
@@ -2448,10 +2800,8 @@ async fn main() {
 
     // Verbose: show what we're about to call.
     ui::debug(&format!("method={method} socket={}", sock.display()));
-    if verbose {
-        if let Ok(params_json) = serde_json::to_string(&params) {
-            ui::debug(&format!("params={params_json}"));
-        }
+    if verbose && let Ok(params_json) = serde_json::to_string(&params) {
+        ui::debug(&format!("params={params_json}"));
     }
 
     let sp = if json_output || quiet {
@@ -2522,7 +2872,10 @@ async fn main() {
                 println!("{}", serde_json::to_string_pretty(&err).unwrap_or_default());
             } else if let Some(ref sp) = sp {
                 let err_str = e.to_string();
-                let hint = if err_str.contains("No such file") || err_str.contains("not found") || err_str.contains("Connection refused") {
+                let hint = if err_str.contains("No such file")
+                    || err_str.contains("not found")
+                    || err_str.contains("Connection refused")
+                {
                     Some("Is the daemon running? Try: opaque service start")
                 } else {
                     None
@@ -2752,6 +3105,49 @@ async fn call_once(
 
 /// Run the `audit tail` subcommand: query the local SQLite audit DB.
 #[allow(clippy::too_many_arguments)]
+fn run_audit_verify(json_output: bool) -> Result<(), String> {
+    let db_path = default_opaque_dir().join("audit.db");
+    if !db_path.exists() {
+        return Err(format!(
+            "audit database not found at {} (is opaqued running?)",
+            db_path.display()
+        ));
+    }
+    let v = opaque_core::audit::verify_audit_chain(&db_path)
+        .map_err(|e| format!("failed to verify audit chain: {e}"))?;
+    if json_output {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": v.ok,
+                "records_checked": v.records_checked,
+                "first_bad_sequence": v.first_bad_sequence,
+                "detail": v.detail,
+            })
+        );
+    } else if v.ok {
+        ui::success(&format!(
+            "Audit chain intact \u{2014} {} records verified",
+            v.records_checked
+        ));
+    } else {
+        ui::error(&format!(
+            "Audit chain BROKEN \u{2014} {} ({} records verified before the break)",
+            v.detail.as_deref().unwrap_or("tampering detected"),
+            v.records_checked
+        ));
+    }
+    // Non-zero exit on a broken chain, in both text and JSON modes, so callers
+    // (CI, monitoring) can gate on it.
+    if !v.ok {
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
+// Mirrors the clap-level `audit tail` flags one-to-one; a params struct here
+// would just duplicate the CLI surface.
+#[allow(clippy::too_many_arguments)]
 fn run_audit_tail(
     limit: usize,
     kind: Option<&str>,
@@ -2839,7 +3235,7 @@ fn run_audit_tail(
     for event in &events {
         let relative = format_relative_time(event.ts_utc_ms);
         let absolute = chrono_format_ms(event.ts_utc_ms);
-        let when = format!("{}\n{}", relative, format!("{}", style(absolute).dim()));
+        let when = format!("{}\n{}", relative, style(absolute).dim());
 
         let kind = event.kind.to_string();
 
@@ -2870,10 +3266,7 @@ fn run_audit_tail(
     // Summary footer
     println!();
     if events.len() < limit {
-        ui::info(&format!(
-            "Showing all {} event(s)",
-            events.len()
-        ));
+        ui::info(&format!("Showing all {} event(s)", events.len()));
     } else {
         ui::info(&format!(
             "Showing {} of many events. Use --limit {} to see more.",
@@ -3237,6 +3630,7 @@ fn policy_simulate(
         params: serde_json::Value::Object(serde_json::Map::new()),
         secret_ref_names: secret_refs.to_vec(),
         workspace: None,
+        principal: None,
         created_at: std::time::SystemTime::now(),
         expires_at: None,
     };
@@ -3507,10 +3901,42 @@ fn run_init(force: bool, preset: Option<&str>) -> Result<(), String> {
     ));
     println!();
     println!("  {}", style("Next steps:").bold());
-    ui::step(1, 4, &format!("{} {}", style("opaque service install").cyan().bold(), ui::dim("# install & start daemon")));
-    ui::step(2, 4, &format!("{} {}", style("opaque connect auto").cyan().bold(), ui::dim("# connect to Claude/Cursor")));
-    ui::step(3, 4, &format!("{} {}", style("opaque ping").cyan().bold(), ui::dim("# verify daemon is alive")));
-    ui::step(4, 4, &format!("{} {}", style("opaque doctor").cyan().bold(), ui::dim("# full diagnostic check")));
+    ui::step(
+        1,
+        4,
+        &format!(
+            "{} {}",
+            style("opaque service install").cyan().bold(),
+            ui::dim("# install & start daemon")
+        ),
+    );
+    ui::step(
+        2,
+        4,
+        &format!(
+            "{} {}",
+            style("opaque connect auto").cyan().bold(),
+            ui::dim("# connect to Claude/Cursor")
+        ),
+    );
+    ui::step(
+        3,
+        4,
+        &format!(
+            "{} {}",
+            style("opaque ping").cyan().bold(),
+            ui::dim("# verify daemon is alive")
+        ),
+    );
+    ui::step(
+        4,
+        4,
+        &format!(
+            "{} {}",
+            style("opaque doctor").cyan().bold(),
+            ui::dim("# full diagnostic check")
+        ),
+    );
     println!();
     ui::info("Or run 'opaque quickstart' to do all of the above automatically.");
     Ok(())
@@ -3724,13 +4150,36 @@ async fn run_quickstart() {
     println!();
     ui::success("Quickstart complete!");
     println!();
-    ui::section_box("Useful commands", &[
-        &format!("{:<28}{}", style("opaque doctor").cyan().bold(), ui::dim("# run full diagnostics")),
-        &format!("{:<28}{}", style("opaque init --repo").cyan().bold(), ui::dim("# add per-repo policy (in a git repo)")),
-        &format!("{:<28}{}", style("opaque policy presets").cyan().bold(), ui::dim("# explore other policy presets")),
-        &format!("{:<28}{}", style("opaque secrets add <name>").cyan().bold(), ui::dim("# store a secret in the OS keychain")),
-        &format!("{:<28}{}", style("opaque setup --seal").cyan().bold(), ui::dim("# seal config to prevent tampering")),
-    ]);
+    ui::section_box(
+        "Useful commands",
+        &[
+            &format!(
+                "{:<28}{}",
+                style("opaque doctor").cyan().bold(),
+                ui::dim("# run full diagnostics")
+            ),
+            &format!(
+                "{:<28}{}",
+                style("opaque init --repo").cyan().bold(),
+                ui::dim("# add per-repo policy (in a git repo)")
+            ),
+            &format!(
+                "{:<28}{}",
+                style("opaque policy presets").cyan().bold(),
+                ui::dim("# explore other policy presets")
+            ),
+            &format!(
+                "{:<28}{}",
+                style("opaque secrets add <name>").cyan().bold(),
+                ui::dim("# store a secret in the OS keychain")
+            ),
+            &format!(
+                "{:<28}{}",
+                style("opaque setup --seal").cyan().bold(),
+                ui::dim("# seal config to prevent tampering")
+            ),
+        ],
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3743,7 +4192,13 @@ fn run_setup(seal_only: bool, reset: bool, verify: bool) -> Result<(), String> {
 
     let base = default_opaque_dir();
     let config_path = resolve_config_path(None);
-    let seal_file = base.join("config.seal");
+    // The seal lives BESIDE the config it seals — matching how the daemon
+    // verifies it. Deriving it from HOME instead would silently seal the
+    // wrong location for any $OPAQUE_CONFIG deployment (system /etc configs).
+    let seal_file = config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("config.seal");
 
     if verify {
         if !config_path.exists() {
@@ -3758,13 +4213,24 @@ fn run_setup(seal_only: bool, reset: bool, verify: bool) -> Result<(), String> {
             .map_err(|e| format!("seal check failed: {e}"))?;
         match status {
             SealStatus::Verified => {
-                ui::success("Config seal verified — integrity OK");
+                ui::success("Config seal verified — integrity OK (keyed)");
+            }
+            SealStatus::VerifiedLegacy => {
+                ui::warn(
+                    "Config seal verified, but it is the legacy UNKEYED format \
+                     (drift detection only — any config writer can forge it).",
+                );
+                ui::info("Run 'opaque setup --seal' to upgrade to the keyed seal.");
             }
             SealStatus::Tampered { expected, actual } => {
                 ui::error("Config seal BROKEN — config.toml was modified after sealing");
                 ui::kv("expected", &expected);
                 ui::kv("actual", &actual);
                 ui::info("Run 'opaque setup --reset' to unseal, then reconfigure.");
+            }
+            SealStatus::KeyMissing => {
+                ui::error("Config has a keyed seal but the seal key (config.seal.key) is missing.");
+                ui::info("Restore the key, or 'opaque setup --reset' then 'opaque setup --seal'.");
             }
             SealStatus::Unsealed => {
                 ui::warn("Config is unsealed — run 'opaque setup --seal' to protect it.");
@@ -3789,9 +4255,9 @@ fn run_setup(seal_only: bool, reset: bool, verify: bool) -> Result<(), String> {
         }
         let config_bytes = std::fs::read(&config_path)
             .map_err(|e| format!("failed to read {}: {e}", config_path.display()))?;
-        let hash = seal::compute_seal(&config_bytes);
-        seal::store_seal(&hash, &seal_file).map_err(|e| format!("failed to store seal: {e}"))?;
-        ui::success(&format!("Config sealed (SHA-256: {}...)", &hash[..16]));
+        seal::store_seal_keyed(&config_bytes, &seal_file)
+            .map_err(|e| format!("failed to store seal: {e}"))?;
+        ui::success("Config sealed (keyed HMAC; key at config.seal.key, mode 0600)");
         return Ok(());
     }
 
@@ -3808,41 +4274,43 @@ fn discover_opaque_paths() -> Vec<(String, PathBuf)> {
     let mut results = Vec::new();
 
     // 1. Current executable (canonicalized)
-    if let Ok(exe) = std::env::current_exe() {
-        if let Ok(canonical) = exe.canonicalize() {
-            if canonical.exists() && seen.insert(canonical.clone()) {
-                let name = if canonical.to_string_lossy().contains("target/") {
-                    "opaque-cli (debug build)"
-                } else {
-                    "opaque-cli"
-                };
-                results.push((name.to_string(), canonical));
-            }
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Ok(canonical) = exe.canonicalize()
+        && canonical.exists()
+        && seen.insert(canonical.clone())
+    {
+        let name = if canonical.to_string_lossy().contains("target/") {
+            "opaque-cli (debug build)"
+        } else {
+            "opaque-cli"
+        };
+        results.push((name.to_string(), canonical));
     }
 
     // 2. Well-known install locations
     let well_known = ["/usr/local/bin/opaque", "/opt/homebrew/bin/opaque"];
     for path_str in &well_known {
         let path = PathBuf::from(path_str);
-        if let Ok(canonical) = path.canonicalize() {
-            if canonical.exists() && seen.insert(canonical.clone()) {
-                results.push(("opaque-cli".to_string(), canonical));
-            }
+        if let Ok(canonical) = path.canonicalize()
+            && canonical.exists()
+            && seen.insert(canonical.clone())
+        {
+            results.push(("opaque-cli".to_string(), canonical));
         }
     }
 
     // 3. PATH lookup via `which`
-    if let Ok(output) = std::process::Command::new("which").arg("opaque").output() {
-        if output.status.success() {
-            let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path_str.is_empty() {
-                let path = PathBuf::from(&path_str);
-                if let Ok(canonical) = path.canonicalize() {
-                    if canonical.exists() && seen.insert(canonical.clone()) {
-                        results.push(("opaque-cli".to_string(), canonical));
-                    }
-                }
+    if let Ok(output) = std::process::Command::new("which").arg("opaque").output()
+        && output.status.success()
+    {
+        let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path_str.is_empty() {
+            let path = PathBuf::from(&path_str);
+            if let Ok(canonical) = path.canonicalize()
+                && canonical.exists()
+                && seen.insert(canonical.clone())
+            {
+                results.push(("opaque-cli".to_string(), canonical));
             }
         }
     }
@@ -3966,7 +4434,11 @@ fn run_setup_wizard(base: &Path, config_path: &Path, seal_file: &Path) -> Result
             continue;
         }
 
-        ui::init_step(&format!("Added: {} ({})", style(&name).cyan(), style(&path).dim()));
+        ui::init_step(&format!(
+            "Added: {} ({})",
+            style(&name).cyan(),
+            style(&path).dim()
+        ));
         clients.push(setup::HumanClientConfig {
             name,
             exe_path: path,
@@ -3999,8 +4471,10 @@ fn run_setup_wizard(base: &Path, config_path: &Path, seal_file: &Path) -> Result
         .collect();
 
     if !enabled_ops.is_empty() {
-        ui::init_step(&format!("Enabled {} operation(s)",
-            style(enabled_ops.len()).cyan()));
+        ui::init_step(&format!(
+            "Enabled {} operation(s)",
+            style(enabled_ops.len()).cyan()
+        ));
     } else {
         ui::warn("No operations enabled — clients will have minimal access.");
     }
@@ -4121,10 +4595,10 @@ fn run_setup_wizard(base: &Path, config_path: &Path, seal_file: &Path) -> Result
     ));
 
     // Seal
-    let hash = seal::compute_seal(config_content.as_bytes());
-    seal::store_seal(&hash, seal_file).map_err(|e| format!("failed to store seal: {e}"))?;
+    seal::store_seal_keyed(config_content.as_bytes(), seal_file)
+        .map_err(|e| format!("failed to store seal: {e}"))?;
 
-    ui::init_step(&format!("Config sealed (SHA-256: {}...)", &hash[..16]));
+    ui::init_step("Config sealed (keyed HMAC; key at config.seal.key)");
 
     println!();
     ui::success("Setup complete! Your policy is now sealed.");
@@ -4143,10 +4617,7 @@ fn run_setup_wizard(base: &Path, config_path: &Path, seal_file: &Path) -> Result
     ui::step(
         2,
         3,
-        &format!(
-            "Verify installation:    {}",
-            style("opaque status").cyan()
-        ),
+        &format!("Verify installation:    {}", style("opaque status").cyan()),
     );
     ui::step(
         3,
@@ -4207,7 +4678,10 @@ async fn run_status_json() {
         },
     });
 
-    println!("{}", serde_json::to_string_pretty(&status).unwrap_or_default());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&status).unwrap_or_default()
+    );
 }
 
 /// Smart welcome screen shown when `opaque` is invoked with no subcommand.
@@ -4301,16 +4775,24 @@ async fn run_status(json_output: bool) {
 
         let seal_status = {
             use opaque_core::seal::{self, SealStatus};
-            let seal_file = base.join("config.seal");
+            // Beside the config, matching daemon verification.
+            let seal_file = config_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("config.seal");
             std::fs::read(&config_path)
                 .ok()
                 .and_then(|bytes| seal::verify_seal(&bytes, &seal_file).ok())
                 .map(|s| match s {
                     SealStatus::Verified => ui::status_badge("SEALED", ui::BadgeState::Ok),
+                    SealStatus::VerifiedLegacy => {
+                        ui::status_badge("SEALED (legacy)", ui::BadgeState::Warn)
+                    }
                     SealStatus::Unsealed => ui::status_badge("UNSEALED", ui::BadgeState::Warn),
                     SealStatus::Tampered { .. } => {
                         ui::status_badge("TAMPERED", ui::BadgeState::Fail)
                     }
+                    SealStatus::KeyMissing => ui::status_badge("KEY MISSING", ui::BadgeState::Fail),
                 })
                 .unwrap_or_else(|| ui::status_badge("UNKNOWN", ui::BadgeState::Info))
         };
@@ -4380,29 +4862,53 @@ async fn run_status(json_output: bool) {
 
         // Context-sensitive next actions.
         if !daemon_reachable && !service_status.installed {
-            ui::section_box("Next step", &[&format!(
-                "{:<28}{}",
-                style("opaque service install").cyan().bold(),
-                ui::dim("# install and start daemon")
-            )]);
+            ui::section_box(
+                "Next step",
+                &[&format!(
+                    "{:<28}{}",
+                    style("opaque service install").cyan().bold(),
+                    ui::dim("# install and start daemon")
+                )],
+            );
         } else if !daemon_reachable && service_status.installed {
-            ui::section_box("Next step", &[&format!(
-                "{:<28}{}",
-                style("opaque service start").cyan().bold(),
-                ui::dim("# start the daemon")
-            )]);
+            ui::section_box(
+                "Next step",
+                &[&format!(
+                    "{:<28}{}",
+                    style("opaque service start").cyan().bold(),
+                    ui::dim("# start the daemon")
+                )],
+            );
         } else if mcp_connected.is_none() {
-            ui::section_box("Next step", &[&format!(
-                "{:<28}{}",
-                style("opaque connect auto").cyan().bold(),
-                ui::dim("# connect to your AI coding tool")
-            )]);
+            ui::section_box(
+                "Next step",
+                &[&format!(
+                    "{:<28}{}",
+                    style("opaque connect auto").cyan().bold(),
+                    ui::dim("# connect to your AI coding tool")
+                )],
+            );
         } else {
-            ui::section_box("Quick actions", &[
-                &format!("{:<28}{}", style("opaque doctor").cyan(), ui::dim("# run diagnostics")),
-                &format!("{:<28}{}", style("opaque policy presets").cyan(), ui::dim("# explore policy presets")),
-                &format!("{:<28}{}", style("opaque audit tail").cyan(), ui::dim("# view recent audit events")),
-            ]);
+            ui::section_box(
+                "Quick actions",
+                &[
+                    &format!(
+                        "{:<28}{}",
+                        style("opaque doctor").cyan(),
+                        ui::dim("# run diagnostics")
+                    ),
+                    &format!(
+                        "{:<28}{}",
+                        style("opaque policy presets").cyan(),
+                        ui::dim("# explore policy presets")
+                    ),
+                    &format!(
+                        "{:<28}{}",
+                        style("opaque audit tail").cyan(),
+                        ui::dim("# view recent audit events")
+                    ),
+                ],
+            );
         }
     }
 
@@ -4484,13 +4990,24 @@ async fn run_doctor() {
     // 3. Config seal
     {
         use opaque_core::seal::{self, SealStatus};
-        let seal_file = base.join("config.seal");
+        // Beside the config, matching daemon verification.
+        let seal_file = config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("config.seal");
         if config_path.exists() {
             match std::fs::read(&config_path) {
                 Ok(config_bytes) => match seal::verify_seal(&config_bytes, &seal_file) {
                     Ok(SealStatus::Verified) => {
-                        doctor_pass("Config seal verified");
+                        doctor_pass("Config seal verified (keyed)");
                         pass_count += 1;
+                    }
+                    Ok(SealStatus::VerifiedLegacy) => {
+                        doctor_warn(
+                            "Config seal is the legacy unkeyed format — \
+                             run 'opaque setup --seal' to upgrade",
+                        );
+                        warn_count += 1;
                     }
                     Ok(SealStatus::Unsealed) => {
                         doctor_warn("Config is unsealed — run 'opaque setup --seal'");
@@ -4499,6 +5016,13 @@ async fn run_doctor() {
                     Ok(SealStatus::Tampered { .. }) => {
                         doctor_fail(
                             "Config seal BROKEN — run 'opaque setup --reset' then reconfigure",
+                        );
+                        fail_count += 1;
+                    }
+                    Ok(SealStatus::KeyMissing) => {
+                        doctor_fail(
+                            "Config has a keyed seal but config.seal.key is missing — \
+                             restore it or re-seal",
                         );
                         fail_count += 1;
                     }
@@ -4889,18 +5413,18 @@ async fn try_ping(sock: &Path) -> Result<(), String> {
     let daemon_token = read_daemon_token(sock).map_err(|e| format!("{e}"))?;
 
     // Connect.
-    let stream = UnixStream::connect(sock)
-        .await
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound || e.kind() == std::io::ErrorKind::ConnectionRefused {
-                format!(
-                    "daemon not found at {}. Is the daemon running? Try: opaque service start",
-                    sock.display()
-                )
-            } else {
-                format!("connect failed: {e}")
-            }
-        })?;
+    let stream = UnixStream::connect(sock).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound
+            || e.kind() == std::io::ErrorKind::ConnectionRefused
+        {
+            format!(
+                "daemon not found at {}. Is the daemon running? Try: opaque service start",
+                sock.display()
+            )
+        } else {
+            format!("connect failed: {e}")
+        }
+    })?;
 
     let codec = LengthDelimitedCodec::builder()
         .max_frame_length(opaque_core::MAX_FRAME_LENGTH)
@@ -5051,10 +5575,7 @@ fn doctor_probe_sandbox_exec() -> bool {
         (allow sysctl-read)\n\
         (allow mach-lookup)\n";
     let dir = std::env::temp_dir();
-    let profile_path = dir.join(format!(
-        "opaque-doctor-probe-{}.sb",
-        std::process::id()
-    ));
+    let profile_path = dir.join(format!("opaque-doctor-probe-{}.sb", std::process::id()));
 
     if std::fs::write(&profile_path, profile_content).is_err() {
         return false;
@@ -7007,7 +7528,11 @@ BAZ=
         );
         // The first entry should always be the current exe
         let (_name, path) = &paths[0];
-        assert!(path.exists(), "discovered path should exist: {}", path.display());
+        assert!(
+            path.exists(),
+            "discovered path should exist: {}",
+            path.display()
+        );
     }
 
     #[test]
@@ -7020,5 +7545,134 @@ BAZ=
             unique.len(),
             "discovered paths should be deduplicated"
         );
+    }
+
+    // -- identity CLI (Phase 1) --------------------------------------------
+
+    #[test]
+    fn login_command_parses_with_and_without_no_browser() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["opaque", "login"]).unwrap();
+        assert!(matches!(cli.cmd, Some(Cmd::Login { no_browser: false })));
+
+        let cli = Cli::try_parse_from(["opaque", "login", "--no-browser"]).unwrap();
+        assert!(matches!(cli.cmd, Some(Cmd::Login { no_browser: true })));
+    }
+
+    #[test]
+    fn logout_command_parses() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["opaque", "logout"]).unwrap();
+        assert!(matches!(cli.cmd, Some(Cmd::Logout)));
+    }
+
+    #[test]
+    fn identity_subcommands_parse() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["opaque", "identity", "ls"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Identity {
+                action: IdentityAction::Ls
+            })
+        ));
+
+        let cli =
+            Cli::try_parse_from(["opaque", "identity", "roles", "hum_x", "admin", "operator"])
+                .unwrap();
+        match cli.cmd {
+            Some(Cmd::Identity {
+                action:
+                    IdentityAction::Roles {
+                        principal_id,
+                        roles,
+                    },
+            }) => {
+                assert_eq!(principal_id, "hum_x");
+                assert_eq!(roles, vec!["admin".to_string(), "operator".to_string()]);
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["opaque", "identity", "delegations"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Identity {
+                action: IdentityAction::Delegations
+            })
+        ));
+    }
+
+    #[test]
+    fn device_commands_parse() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["opaque", "device", "pair"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Device {
+                action: DeviceAction::Pair
+            })
+        ));
+        let cli = Cli::try_parse_from(["opaque", "device", "ls"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Device {
+                action: DeviceAction::Ls
+            })
+        ));
+        let cli = Cli::try_parse_from(["opaque", "device", "confirm", "dev-1"]).unwrap();
+        match cli.cmd {
+            Some(Cmd::Device {
+                action: DeviceAction::Confirm { device_id },
+            }) => assert_eq!(device_id, "dev-1"),
+            other => panic!("unexpected parse: {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["opaque", "device", "revoke", "dev-2"]).unwrap();
+        match cli.cmd {
+            Some(Cmd::Device {
+                action: DeviceAction::Revoke { device_id },
+            }) => assert_eq!(device_id, "dev-2"),
+            other => panic!("unexpected parse: {other:?}"),
+        }
+        // confirm/revoke require the device id.
+        assert!(Cli::try_parse_from(["opaque", "device", "confirm"]).is_err());
+        assert!(Cli::try_parse_from(["opaque", "device", "revoke"]).is_err());
+    }
+
+    #[test]
+    fn key_commands_parse() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["opaque", "key", "ls"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Key {
+                action: KeyAction::Ls
+            })
+        ));
+        let cli = Cli::try_parse_from(["opaque", "key", "remove", "cred-1"]).unwrap();
+        match cli.cmd {
+            Some(Cmd::Key {
+                action: KeyAction::Remove { credential_id },
+            }) => assert_eq!(credential_id, "cred-1"),
+            other => panic!("unexpected parse: {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["opaque", "key", "remove"]).is_err());
+    }
+
+    #[test]
+    fn identity_roles_requires_at_least_one_role() {
+        use clap::Parser;
+        assert!(Cli::try_parse_from(["opaque", "identity", "roles", "hum_x"]).is_err());
+    }
+
+    #[test]
+    fn flatten_role_args_splits_commas_and_normalizes() {
+        let roles = vec!["Admin,operator".to_string(), " approver ".to_string()];
+        assert_eq!(
+            flatten_role_args(&roles),
+            vec!["admin", "operator", "approver"]
+        );
+        assert_eq!(flatten_role_args(&["admin,,".to_string()]), vec!["admin"]);
+        assert!(flatten_role_args(&[]).is_empty());
     }
 }

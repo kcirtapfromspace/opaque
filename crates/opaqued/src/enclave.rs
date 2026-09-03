@@ -26,8 +26,8 @@ use opaque_core::audit::{
     WorkspaceSummary,
 };
 use opaque_core::operation::{
-    ApprovalFactor, ApprovalRequirement, ClientType, OperationDef, OperationRegistry,
-    OperationRequest, OperationSafety, validate_params,
+    ApprovalFactor, ApprovalRequirement, ClientIdentity, ClientType, OperationDef,
+    OperationRegistry, OperationRequest, OperationSafety, validate_params,
 };
 use opaque_core::policy::{PolicyDecision, PolicyEngine};
 use opaque_core::sanitize::{Sanitized, SanitizedResponse, Sanitizer, Unsanitized};
@@ -262,6 +262,13 @@ struct LeaseKey {
     secret_refs_canonical: String,
     /// SHA-256 of canonical JSON-serialized params.
     params_hash: String,
+    /// Delegation binding `(sub principal id, jti)` when the request runs
+    /// under a verified principal context; `None` for un-delegated requests.
+    ///
+    /// SECURITY: without this, a first-use lease granted to one principal
+    /// would be reused by a different principal (or a different delegation
+    /// session) at the same uid — leases must never cross principals.
+    delegation: Option<(String, String)>,
 }
 
 impl LeaseKey {
@@ -310,6 +317,10 @@ impl LeaseKey {
             target_canonical,
             secret_refs_canonical,
             params_hash,
+            delegation: request
+                .principal
+                .as_ref()
+                .map(|p| (p.sub.as_str().to_owned(), p.jti.clone())),
         }
     }
 }
@@ -451,6 +462,51 @@ pub trait OperationHandler: Send + Sync + fmt::Debug {
 // Approval gate trait
 // ---------------------------------------------------------------------------
 
+/// The result of one approval interaction.
+///
+/// SECURITY INVARIANT: `approver` must only ever be attached by the gate that
+/// actually VERIFIED the identity it names. The local biometric factor proves
+/// device-owner presence and binds the *name* to the active login session
+/// (source `LocalBioSession`). Paired-device / FIDO2 attribution (source
+/// `PairedDevice`) requires real signature verification against the pairing
+/// store — the dormant `approval_server` relays client-supplied device ids
+/// WITHOUT verification and must never be used as an approver source.
+#[derive(Debug, Clone)]
+pub struct ApprovalOutcome {
+    /// Whether the human (or configured backend) approved the request.
+    pub approved: bool,
+    /// The verified approver identity, when the gate could establish one.
+    /// `None` on denial, and on approval paths with no identity binding
+    /// (e.g. biometric passed but nobody is logged in).
+    pub approver: Option<opaque_core::audit::ApproverIdentity>,
+}
+
+impl ApprovalOutcome {
+    /// Approved, with no approver identity binding available.
+    pub fn approved_anonymous() -> Self {
+        Self {
+            approved: true,
+            approver: None,
+        }
+    }
+
+    /// Approved by a verified identity.
+    pub fn approved_by(approver: opaque_core::audit::ApproverIdentity) -> Self {
+        Self {
+            approved: true,
+            approver: Some(approver),
+        }
+    }
+
+    /// Denied.
+    pub fn denied() -> Self {
+        Self {
+            approved: false,
+            approver: None,
+        }
+    }
+}
+
 /// Trait for the approval gate. The enclave calls this to present
 /// operation-bound approval challenges to the user.
 ///
@@ -462,7 +518,9 @@ pub trait ApprovalGate: Send + Sync + fmt::Debug {
     /// The implementation must:
     /// - Display the operation, target, client identity, and TTL to the user
     /// - Use the specified approval factor(s)
-    /// - Return `Ok(true)` if approved, `Ok(false)` if denied
+    /// - Return `Ok` with [`ApprovalOutcome`] (approved/denied, plus the
+    ///   verified approver identity when one exists — see the invariant on
+    ///   [`ApprovalOutcome`])
     /// - Return `Err` if the approval mechanism is unavailable
     ///
     /// The `approval_id` is used for audit correlation.
@@ -472,7 +530,9 @@ pub trait ApprovalGate: Send + Sync + fmt::Debug {
         request: &OperationRequest,
         factors: &[ApprovalFactor],
         description: &str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>>;
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ApprovalOutcome, String>> + Send + '_>,
+    >;
 }
 
 // ---------------------------------------------------------------------------
@@ -592,9 +652,7 @@ impl EnclaveBuilder {
             registry: self.registry,
             policy: self.policy,
             handlers: self.handlers,
-            approval_gate: self
-                .approval_gate
-                .ok_or("approval gate is required")?,
+            approval_gate: self.approval_gate.ok_or("approval gate is required")?,
             audit: self.audit.ok_or("audit sink is required")?,
             sanitizer: self.sanitizer,
             approval_semaphore: Semaphore::new(1),
@@ -640,7 +698,13 @@ impl Enclave {
     pub async fn execute(&self, mut request: OperationRequest) -> SanitizedResponse<Sanitized> {
         let start = Instant::now();
         let request_id = request.request_id;
-        let client_summary = ClientSummary::from((&request.client_identity, request.client_type));
+        let mut client_summary =
+            ClientSummary::from((&request.client_identity, request.client_type));
+        // Attach the verified delegation context so every operation audit
+        // record attributes the request to its principal (on-behalf-of).
+        if let Some(ref ctx) = request.principal {
+            client_summary = client_summary.with_principal(ctx);
+        }
         let target_summary = TargetSummary::sanitized(&request.target);
 
         let workspace_summary = request.workspace.as_ref().map(WorkspaceSummary::sanitized);
@@ -743,7 +807,7 @@ impl Enclave {
         }
 
         // --- Step 5: Evaluate policy ---
-        let decision = self.policy.evaluate(&request, op_def.safety);
+        let mut decision = self.policy.evaluate(&request, op_def.safety);
 
         if !decision.allowed {
             let reason = decision
@@ -767,6 +831,38 @@ impl Enclave {
                 request.operation, request.operation
             ));
             return self.error_to_sanitized(&err);
+        }
+
+        // --- Step 5b: Clamp the approval decision (defense-in-depth) ---
+        //
+        // SECURITY (H10 + software-first): the operation's `default_approval` is a
+        // floor a policy rule may raise but never lower, and a SensitiveOutput
+        // operation always requires out-of-band approval — presence is proven by
+        // the approval act, not by client classification (which is audit-only).
+        decision.approval_requirement =
+            stricter_requirement(op_def.default_approval, decision.approval_requirement);
+        if op_def.safety == OperationSafety::SensitiveOutput {
+            decision.approval_requirement = ApprovalRequirement::Always;
+        }
+        if decision.required_factors.is_empty() {
+            decision.required_factors = op_def.default_factors.clone();
+        }
+        if decision.approval_requirement != ApprovalRequirement::Never
+            && decision.required_factors.is_empty()
+        {
+            let err = EnclaveError::SafetyViolation(format!(
+                "operation '{}' requires approval but no approval factor is configured",
+                request.operation
+            ));
+            return self.emit_and_sanitize_error(
+                request_id,
+                &client_summary,
+                &request.operation,
+                &target_summary,
+                &request.secret_ref_names,
+                &err,
+                start,
+            );
         }
 
         // --- Step 6: Approval gate ---
@@ -872,28 +968,142 @@ impl Enclave {
     /// Check safety-class constraints before policy evaluation.
     fn check_safety_constraints(
         &self,
-        request: &OperationRequest,
+        _request: &OperationRequest,
         op_def: &OperationDef,
     ) -> Result<(), EnclaveError> {
-        // REVEAL operations are hard-blocked for ALL clients in v1.
-        // This is a defense-in-depth measure: even if policy somehow allows it,
-        // the safety check prevents plaintext secret disclosure.
+        // REVEAL operations are hard-blocked for ALL clients. Defense-in-depth:
+        // even if policy somehow allows it, this prevents plaintext disclosure.
         if op_def.safety == OperationSafety::Reveal {
             return Err(EnclaveError::SafetyViolation(
                 "REVEAL operations are not permitted in v1".into(),
             ));
         }
-        // SENSITIVE_OUTPUT operations are hard-blocked for agent clients.
-        // Policy already enforces this, but defense-in-depth at the enclave
-        // layer ensures no policy misconfiguration can leak sensitive output.
-        if op_def.safety == OperationSafety::SensitiveOutput
-            && request.client_type == ClientType::Agent
+        // NOTE (software-first, C1): SensitiveOutput is NOT gated on client
+        // classification here — classification is audit-only and cannot be a
+        // security boundary at a shared uid, where an agent drives the same signed
+        // CLI a human does. SensitiveOutput is instead gated on mandatory
+        // out-of-band approval, enforced by the approval clamp in `execute`: a
+        // human proves presence at the prompt; the agent cannot satisfy it.
+        Ok(())
+    }
+
+    /// Run a standalone out-of-band approval not tied to a registered operation.
+    ///
+    /// Used for privileged control-plane actions — minting an agent session
+    /// token, starting or confirming a device pairing: the act must be
+    /// authorized by a fresh human approval (which an agent cannot satisfy),
+    /// never by client classification. Reuses the same rate limiter, prompt
+    /// serialization, and audit trail as operation approvals. On success,
+    /// returns the verified approver identity when the gate could establish
+    /// one.
+    pub async fn request_control_approval(
+        &self,
+        identity: &ClientIdentity,
+        client_type: ClientType,
+        operation_label: &str,
+        action_description: &str,
+        reason: &str,
+    ) -> Result<Option<opaque_core::audit::ApproverIdentity>, EnclaveError> {
+        let client_summary = ClientSummary::from((identity, client_type));
+
+        if !self
+            .rate_limiter
+            .check_and_record(identity.pid, operation_label)
         {
-            return Err(EnclaveError::SafetyViolation(
-                "SENSITIVE_OUTPUT operations are not permitted for agent clients".into(),
+            return Err(EnclaveError::RateLimited(
+                "too many session approval requests".into(),
             ));
         }
-        Ok(())
+
+        let approval_id = Uuid::new_v4();
+        self.audit.emit(
+            AuditEvent::new(AuditEventKind::ApprovalRequired)
+                .with_approval_id(approval_id)
+                .with_client(client_summary.clone())
+                .with_operation(operation_label),
+        );
+
+        // Serialize prompts to avoid races / approval stacking.
+        let _permit = self
+            .approval_semaphore
+            .acquire()
+            .await
+            .map_err(|_| EnclaveError::ApprovalUnavailable("approval gate closed".into()))?;
+
+        // Synthetic request: the gate needs only identity + description for the
+        // local biometric factor; classification is audit-only.
+        let synth = OperationRequest {
+            principal: None,
+            request_id: approval_id,
+            client_identity: identity.clone(),
+            client_type,
+            operation: operation_label.to_owned(),
+            target: std::collections::HashMap::new(),
+            secret_ref_names: vec![],
+            created_at: std::time::SystemTime::now(),
+            expires_at: None,
+            params: serde_json::Value::Null,
+            workspace: None,
+        };
+        let description = format!(
+            "Operation: {action_description}\n  {}\nClient: {}",
+            sanitize_for_display(reason, 256),
+            identity
+        );
+
+        self.audit.emit(
+            AuditEvent::new(AuditEventKind::ApprovalPresented)
+                .with_approval_id(approval_id)
+                .with_client(client_summary.clone())
+                .with_operation(operation_label),
+        );
+
+        let result = self
+            .approval_gate
+            .request_approval(
+                approval_id,
+                &synth,
+                &[ApprovalFactor::LocalBio],
+                &description,
+            )
+            .await;
+
+        match result {
+            Ok(outcome) if outcome.approved => {
+                let mut granted = AuditEvent::new(AuditEventKind::ApprovalGranted)
+                    .with_approval_id(approval_id)
+                    .with_client(client_summary)
+                    .with_operation(operation_label)
+                    .with_outcome("granted");
+                if let Some(ref approver) = outcome.approver {
+                    granted = granted.with_approver(approver.clone());
+                }
+                self.audit.emit(granted);
+                Ok(outcome.approver)
+            }
+            Ok(_) => {
+                self.audit.emit(
+                    AuditEvent::new(AuditEventKind::ApprovalDenied)
+                        .with_approval_id(approval_id)
+                        .with_client(client_summary)
+                        .with_operation(operation_label)
+                        .with_outcome("denied"),
+                );
+                Err(EnclaveError::ApprovalNotGranted(format!(
+                    "{operation_label} was not approved"
+                )))
+            }
+            Err(e) => {
+                self.audit.emit(
+                    AuditEvent::new(AuditEventKind::ApprovalDenied)
+                        .with_approval_id(approval_id)
+                        .with_client(client_summary)
+                        .with_operation(operation_label)
+                        .with_outcome("error"),
+                );
+                Err(EnclaveError::ApprovalUnavailable(e))
+            }
+        }
     }
 
     /// Handle the approval gate if the policy decision requires it.
@@ -927,8 +1137,44 @@ impl Enclave {
             ApprovalRequirement::Never => false,
         };
 
-        if !needs_approval || decision.required_factors.is_empty() {
+        // Segregation of duties: `require_distinct_approver` only makes sense
+        // when an approval actually happens and the request is bound to a
+        // principal. Both misconfigurations fail closed (never silently skip).
+        if decision.require_distinct_approver {
+            if decision.approval_requirement == ApprovalRequirement::Never {
+                return Err(EnclaveError::SafetyViolation(
+                    "require_distinct_approver is set but the rule never requires approval".into(),
+                ));
+            }
+            if request.principal.is_none() {
+                self.audit.emit(
+                    AuditEvent::new(AuditEventKind::ApprovalDenied)
+                        .with_request_id(request.request_id)
+                        .with_client(client_summary.clone())
+                        .with_operation(&request.operation)
+                        .with_target(target_summary.clone())
+                        .with_outcome("denied")
+                        .with_detail("distinct approver required but request has no principal"),
+                );
+                return Err(EnclaveError::ApprovalNotGranted(
+                    "this operation requires a distinct approver, which needs an \
+                     identity-bound request — run it under a delegation"
+                        .into(),
+                ));
+            }
+        }
+
+        if !needs_approval {
             return Ok(());
+        }
+        // SECURITY (H10): a required approval with no configured factor must fail
+        // closed, never be silently skipped. `execute` clamps factors to the
+        // operation's defaults before this point, so an empty set here is a real
+        // misconfiguration rather than a valid "no approval needed" signal.
+        if decision.required_factors.is_empty() {
+            return Err(EnclaveError::SafetyViolation(
+                "approval required but no approval factor is configured".into(),
+            ));
         }
 
         // Rate limit check before presenting approval prompt.
@@ -963,6 +1209,21 @@ impl Enclave {
         // if upstream validation is bypassed, the prompt cannot be spoofed.
         let mut description = format!("Operation: {}", op_def.description);
         for (k, v) in &request.target {
+            // SECURITY (C3): the command is the security-critical field the approver
+            // must actually read, so render it in full (sanitized to a single line)
+            // with an explicit truncation marker — never silently cut it, which would
+            // let an attacker hide an exfil tail past a truncation limit. Other target
+            // fields are short identifiers and keep the conservative cap.
+            if k == "command" {
+                let full = sanitize_for_display(v, 4096);
+                let marker = if v.chars().count() > 4096 {
+                    " …(truncated)"
+                } else {
+                    ""
+                };
+                description.push_str(&format!("\n  command: {full}{marker}"));
+                continue;
+            }
             let v_safe = sanitize_for_display(v, 128);
             description.push_str(&format!("\n  {k}: {v_safe}"));
         }
@@ -1016,18 +1277,57 @@ impl Enclave {
         let approval_latency = approval_start.elapsed();
 
         match result {
-            Ok(true) => {
-                self.audit.emit(
-                    AuditEvent::new(AuditEventKind::ApprovalGranted)
-                        .with_request_id(request.request_id)
-                        .with_approval_id(approval_id)
-                        .with_client(client_summary.clone())
-                        .with_operation(&request.operation)
-                        .with_target(target_summary.clone())
-                        .with_outcome("granted")
-                        .with_latency_ms(approval_latency.as_millis() as i64)
-                        .with_request_hash(&content_hash),
-                );
+            Ok(outcome) if outcome.approved => {
+                // Segregation of duties: the approver must be a verified
+                // identity DIFFERENT from the principal the operation is for.
+                // An anonymous approval (nobody logged in) fails closed —
+                // presence alone cannot satisfy a distinct-approver rule.
+                if decision.require_distinct_approver {
+                    let sub = request
+                        .principal
+                        .as_ref()
+                        .map(|p| p.sub.as_str())
+                        .unwrap_or_default();
+                    let distinct = outcome
+                        .approver
+                        .as_ref()
+                        .is_some_and(|a| a.principal_id != sub);
+                    if !distinct {
+                        let mut denied = AuditEvent::new(AuditEventKind::ApprovalDenied)
+                            .with_request_id(request.request_id)
+                            .with_approval_id(approval_id)
+                            .with_client(client_summary.clone())
+                            .with_operation(&request.operation)
+                            .with_target(target_summary.clone())
+                            .with_outcome("denied")
+                            .with_latency_ms(approval_latency.as_millis() as i64)
+                            .with_request_hash(&content_hash)
+                            .with_detail("distinct approver required");
+                        if let Some(ref approver) = outcome.approver {
+                            denied = denied.with_approver(approver.clone());
+                        }
+                        self.audit.emit(denied);
+                        return Err(EnclaveError::ApprovalNotGranted(
+                            "approval was granted, but this operation requires an approver \
+                             distinct from the principal it runs on behalf of"
+                                .into(),
+                        ));
+                    }
+                }
+
+                let mut granted = AuditEvent::new(AuditEventKind::ApprovalGranted)
+                    .with_request_id(request.request_id)
+                    .with_approval_id(approval_id)
+                    .with_client(client_summary.clone())
+                    .with_operation(&request.operation)
+                    .with_target(target_summary.clone())
+                    .with_outcome("granted")
+                    .with_latency_ms(approval_latency.as_millis() as i64)
+                    .with_request_hash(&content_hash);
+                if let Some(ref approver) = outcome.approver {
+                    granted = granted.with_approver(approver.clone());
+                }
+                self.audit.emit(granted);
 
                 // Grant a lease for FirstUse approvals.
                 if decision.approval_requirement == ApprovalRequirement::FirstUse {
@@ -1038,7 +1338,7 @@ impl Enclave {
 
                 Ok(())
             }
-            Ok(false) => {
+            Ok(_) => {
                 self.audit.emit(
                     AuditEvent::new(AuditEventKind::ApprovalDenied)
                         .with_request_id(request.request_id)
@@ -1144,66 +1444,125 @@ impl Enclave {
 /// Native OS approval gate that delegates to the platform-specific
 /// approval prompt (macOS LocalAuthentication / Linux polkit).
 pub struct NativeApprovalGate {
-    pairing_manager: Option<Arc<crate::pairing::PairingManager>>,
+    registry: crate::factors::FactorRegistry,
 }
 
 impl std::fmt::Debug for NativeApprovalGate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NativeApprovalGate")
-            .field("has_pairing_manager", &self.pairing_manager.is_some())
+            .field("registry", &self.registry)
             .finish()
     }
 }
 
+/// Resolves the approver identity to bind to a successful local-biometric
+/// approval (re-exported from the factors module for wiring convenience).
+#[cfg(test)]
+pub type ApproverResolver = crate::factors::ApproverResolver;
+
 impl NativeApprovalGate {
-    /// Create a gate without iOS pairing support.
-    pub fn new() -> Self {
-        Self {
-            pairing_manager: None,
-        }
+    /// Create a gate over an explicit verifier registry (the daemon builds
+    /// one from its configured factors: local, paired device, FIDO2, …).
+    pub fn with_registry(registry: crate::factors::FactorRegistry) -> Self {
+        Self { registry }
     }
 
-    /// Create a gate backed by an existing [`PairingManager`].
-    #[allow(dead_code)]
-    pub fn with_pairing_manager(pm: Arc<crate::pairing::PairingManager>) -> Self {
-        Self {
-            pairing_manager: Some(pm),
-        }
+    /// Create a gate with only the local (biometric/polkit) factor — the
+    /// pre-registry shape, kept for tests.
+    #[cfg(test)]
+    pub fn new() -> Self {
+        let mut registry = crate::factors::FactorRegistry::new();
+        registry.register(Arc::new(crate::factors::LocalBioVerifier::new(None)));
+        Self { registry }
+    }
+
+    /// Attach an approver resolver (identity runtime hook) to a default
+    /// local-only gate (test builder mirroring the daemon's wiring).
+    #[cfg(test)]
+    pub fn with_approver_resolver(self, resolver: ApproverResolver) -> Self {
+        let mut registry = crate::factors::FactorRegistry::new();
+        registry.register(Arc::new(crate::factors::LocalBioVerifier::new(Some(
+            resolver,
+        ))));
+        Self { registry }
     }
 }
 
 impl ApprovalGate for NativeApprovalGate {
     fn request_approval(
         &self,
-        _approval_id: Uuid,
-        _request: &OperationRequest,
-        _factors: &[ApprovalFactor],
+        approval_id: Uuid,
+        request: &OperationRequest,
+        factors: &[ApprovalFactor],
         description: &str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>>
-    {
-        // Check whether any factor is IosFaceId and we have a pairing manager.
-        if _factors
-            .iter()
-            .any(|f| matches!(f, ApprovalFactor::IosFaceId))
-            && let Some(pm) = &self.pairing_manager
-            && let Ok(devices) = pm.list_devices()
-            && let Some(device) = devices.iter().find(|d| !d.revoked)
-        {
-            let challenge = pm.create_challenge(&_request.request_id.to_string(), description);
-            tracing::info!(
-                device_id = %device.device_id,
-                device_name = %device.name,
-                challenge_request_id = %challenge.request_id,
-                "iOS Face ID challenge created; awaiting device response"
-            );
-        }
-
-        let desc = description.to_owned();
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ApprovalOutcome, String>> + Send + '_>,
+    > {
+        let ctx = crate::factors::ApprovalContext {
+            approval_id,
+            request_id: request.request_id,
+            operation: request.operation.clone(),
+            client_label: sanitize_for_display(&request.client_identity.to_string(), 128),
+            description: description.to_owned(),
+            content_hash: request.content_hash(),
+        };
+        let factors = factors.to_vec();
         Box::pin(async move {
-            crate::approval::prompt(&desc)
-                .await
-                .map_err(|e| e.to_string())
+            let decision = self.registry.request_approval(&factors, &ctx).await?;
+            Ok(if !decision.approved {
+                ApprovalOutcome::denied()
+            } else {
+                match decision.approver {
+                    Some(approver) => ApprovalOutcome::approved_by(approver),
+                    None => ApprovalOutcome::approved_anonymous(),
+                }
+            })
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Insecure auto-approve gate (tests / e2e ONLY)
+// ---------------------------------------------------------------------------
+
+/// An approval gate that approves everything without human interaction.
+///
+/// FOR TESTS AND E2E ONLY. The daemon refuses to select this backend unless
+/// BOTH `approval_backend = "insecure_auto_approve"` is set in the config AND
+/// the environment carries `OPAQUE_INSECURE_AUTO_APPROVE=1` at startup — and
+/// it announces itself with an Error-level audit event. Every approval it
+/// grants is attributed to the synthetic `insecure-auto-approve` approver
+/// (source `InsecureAutoApprove`), never to a person.
+#[derive(Debug)]
+pub struct InsecureAutoApproveGate;
+
+impl InsecureAutoApproveGate {
+    /// The synthetic approver identity attached to every auto-approval.
+    pub fn approver() -> opaque_core::audit::ApproverIdentity {
+        opaque_core::audit::ApproverIdentity {
+            principal_id: "insecure-auto-approve".into(),
+            label: "insecure test backend".into(),
+            source: opaque_core::audit::ApproverSource::InsecureAutoApprove,
+        }
+    }
+}
+
+impl ApprovalGate for InsecureAutoApproveGate {
+    fn request_approval(
+        &self,
+        approval_id: Uuid,
+        request: &OperationRequest,
+        _factors: &[ApprovalFactor],
+        _description: &str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ApprovalOutcome, String>> + Send + '_>,
+    > {
+        tracing::error!(
+            approval_id = %approval_id,
+            operation = %request.operation,
+            "INSECURE AUTO-APPROVE: granting approval without human interaction (test backend)"
+        );
+        Box::pin(async move { Ok(ApprovalOutcome::approved_by(Self::approver())) })
     }
 }
 
@@ -1211,13 +1570,27 @@ impl ApprovalGate for NativeApprovalGate {
 // Approval display sanitization
 // ---------------------------------------------------------------------------
 
+/// Return the stricter of two approval requirements (Always > FirstUse > Never).
+/// Used to clamp a policy decision against an operation's `default_approval` floor,
+/// so a rule can only make approval stricter, never weaker (H10).
+fn stricter_requirement(a: ApprovalRequirement, b: ApprovalRequirement) -> ApprovalRequirement {
+    fn rank(r: ApprovalRequirement) -> u8 {
+        match r {
+            ApprovalRequirement::Always => 2,
+            ApprovalRequirement::FirstUse => 1,
+            ApprovalRequirement::Never => 0,
+        }
+    }
+    if rank(a) >= rank(b) { a } else { b }
+}
+
 /// Sanitize a string for display in the approval prompt.
 ///
 /// Strips control characters (0x00-0x1F), RTL overrides (U+202A-U+202E),
 /// and bidi isolates (U+2066-U+2069). Truncates to `max_len` chars.
 /// This is defense-in-depth: even if upstream validation is bypassed,
 /// the approval UI cannot be spoofed with control characters.
-fn sanitize_for_display(s: &str, max_len: usize) -> String {
+pub(crate) fn sanitize_for_display(s: &str, max_len: usize) -> String {
     let cleaned: String = s
         .chars()
         .filter(|&ch| {
@@ -1276,10 +1649,11 @@ mod test_support {
             _request: &OperationRequest,
             _factors: &[ApprovalFactor],
             _description: &str,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>>
-        {
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ApprovalOutcome, String>> + Send + '_>,
+        > {
             self.count.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { Ok(true) })
+            Box::pin(async { Ok(ApprovalOutcome::approved_anonymous()) })
         }
     }
 
@@ -1294,9 +1668,10 @@ mod test_support {
             _request: &OperationRequest,
             _factors: &[ApprovalFactor],
             _description: &str,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>>
-        {
-            Box::pin(async { Ok(true) })
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ApprovalOutcome, String>> + Send + '_>,
+        > {
+            Box::pin(async { Ok(ApprovalOutcome::approved_anonymous()) })
         }
     }
 
@@ -1311,9 +1686,10 @@ mod test_support {
             _request: &OperationRequest,
             _factors: &[ApprovalFactor],
             _description: &str,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>>
-        {
-            Box::pin(async { Ok(false) })
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ApprovalOutcome, String>> + Send + '_>,
+        > {
+            Box::pin(async { Ok(ApprovalOutcome::denied()) })
         }
     }
 
@@ -1384,6 +1760,7 @@ mod tests {
 
     fn test_request(operation: &str, client_type: ClientType) -> OperationRequest {
         OperationRequest {
+            principal: None,
             request_id: Uuid::new_v4(),
             client_identity: test_identity(),
             client_type,
@@ -1401,14 +1778,299 @@ mod tests {
         }
     }
 
+    #[test]
+    fn lease_key_isolates_principals_at_same_uid() {
+        use opaque_core::identity::{AccessMode, PrincipalContext, PrincipalId, PrincipalKind};
+
+        fn ctx(sub_sub: &str, jti: &str) -> PrincipalContext {
+            PrincipalContext {
+                sub: PrincipalId::generate(&PrincipalKind::Human {
+                    iss: "https://idp.example.com".into(),
+                    sub: sub_sub.into(),
+                    email: None,
+                    name: None,
+                }),
+                sub_label: "x".into(),
+                sub_roles: Default::default(),
+                act: PrincipalId::generate(&PrincipalKind::Agent {
+                    tool: "claude-code".into(),
+                }),
+                act_label: "agent:claude-code".into(),
+                mode: AccessMode::Delegated,
+                jti: jti.into(),
+                human_session_id: Some("hses_1".into()),
+            }
+        }
+        let with = |c: Option<PrincipalContext>| {
+            let mut r = test_request("github.set_actions_secret", ClientType::Agent);
+            r.principal = c;
+            LeaseKey::from_request(&r)
+        };
+
+        let none = with(None);
+        let a = with(Some(ctx("alice", "j1")));
+        let b = with(Some(ctx("bob", "j1")));
+        let a2 = with(Some(ctx("alice", "j2")));
+
+        // Different principals at the same uid → different lease keys.
+        assert_ne!(a, b);
+        // Same principal, different delegation session → different keys.
+        assert_ne!(a, a2);
+        // Un-delegated key differs from any delegated key but stays stable.
+        assert_ne!(none, a);
+        assert_eq!(none, with(None));
+    }
+
+    // -- Stage D: approver identity + distinct-approver ---------------------
+
+    use opaque_core::audit::{ApproverIdentity, ApproverSource};
+    use opaque_core::identity::{AccessMode, PrincipalContext, PrincipalId, PrincipalKind};
+
+    fn human_ctx(sub_sub: &str) -> PrincipalContext {
+        PrincipalContext {
+            sub: PrincipalId::generate(&PrincipalKind::Human {
+                iss: "https://idp.example.com".into(),
+                sub: sub_sub.into(),
+                email: None,
+                name: None,
+            }),
+            sub_label: sub_sub.into(),
+            sub_roles: Default::default(),
+            act: PrincipalId::generate(&PrincipalKind::Agent {
+                tool: "claude-code".into(),
+            }),
+            act_label: "agent:claude-code".into(),
+            mode: AccessMode::Delegated,
+            jti: "j1".into(),
+            human_session_id: Some("hses_1".into()),
+        }
+    }
+
+    fn approver(id: &str) -> ApproverIdentity {
+        ApproverIdentity {
+            principal_id: id.into(),
+            label: id.into(),
+            source: ApproverSource::LocalBioSession,
+        }
+    }
+
+    /// A gate returning a fixed outcome, for approver-shaping tests.
+    #[derive(Debug)]
+    struct FixedOutcomeGate(ApprovalOutcome);
+    impl ApprovalGate for FixedOutcomeGate {
+        fn request_approval(
+            &self,
+            _approval_id: Uuid,
+            _request: &OperationRequest,
+            _factors: &[ApprovalFactor],
+            _description: &str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ApprovalOutcome, String>> + Send + '_>,
+        > {
+            let o = self.0.clone();
+            Box::pin(async move { Ok(o) })
+        }
+    }
+
+    fn distinct_policy() -> PolicyEngine {
+        let mut p = PolicyEngine::new();
+        p.add_rule(PolicyRule {
+            identity: Default::default(),
+            name: "distinct".into(),
+            client: ClientMatch::default(),
+            operation_pattern: "github.*".into(),
+            target: TargetMatch::default(),
+            workspace: WorkspaceMatch::default(),
+            secret_names: SecretNameMatch::default(),
+            allow: true,
+            client_types: vec![ClientType::Agent, ClientType::Human],
+            approval: ApprovalConfig {
+                require: ApprovalRequirement::Always,
+                factors: vec![ApprovalFactor::LocalBio],
+                lease_ttl: None,
+                one_time: false,
+                require_distinct_approver: true,
+            },
+        });
+        p
+    }
+
+    fn build_enclave_with(
+        gate: Box<dyn ApprovalGate>,
+        policy: PolicyEngine,
+        audit: Arc<InMemoryAuditEmitter>,
+    ) -> Enclave {
+        Enclave::builder()
+            .registry(test_registry())
+            .policy(policy)
+            .handler(
+                "github.set_actions_secret",
+                Box::new(StubHandler {
+                    response: serde_json::json!({"status": "ok"}),
+                }),
+            )
+            .approval_gate(gate)
+            .audit(audit)
+            .build()
+            .unwrap()
+    }
+
+    async fn run_distinct(
+        gate: Box<dyn ApprovalGate>,
+        principal: Option<PrincipalContext>,
+    ) -> bool {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let enclave = build_enclave_with(gate, distinct_policy(), audit);
+        let mut req = test_request("github.set_actions_secret", ClientType::Agent);
+        req.principal = principal;
+        enclave.execute(req).await.error_code().is_none()
+    }
+
+    #[tokio::test]
+    async fn distinct_approver_denies_without_principal() {
+        // No principal context → the constraint is unsatisfiable → deny.
+        let gate = Box::new(FixedOutcomeGate(ApprovalOutcome::approved_by(approver(
+            "hum_approver",
+        ))));
+        assert!(!run_distinct(gate, None).await);
+    }
+
+    #[tokio::test]
+    async fn distinct_approver_denies_anonymous_approval() {
+        // Approval with no approver identity (nobody logged in) → deny.
+        let ctx = human_ctx("alice");
+        let gate = Box::new(FixedOutcomeGate(ApprovalOutcome::approved_anonymous()));
+        assert!(!run_distinct(gate, Some(ctx)).await);
+    }
+
+    #[tokio::test]
+    async fn distinct_approver_denies_self_approval() {
+        // Approver == the delegating principal → segregation of duties fails.
+        let ctx = human_ctx("alice");
+        let self_id = ctx.sub.as_str().to_owned();
+        let gate = Box::new(FixedOutcomeGate(ApprovalOutcome::approved_by(approver(
+            &self_id,
+        ))));
+        assert!(!run_distinct(gate, Some(ctx)).await);
+    }
+
+    #[tokio::test]
+    async fn distinct_approver_allows_distinct_identity() {
+        // A different approver satisfies the constraint.
+        let ctx = human_ctx("alice");
+        let gate = Box::new(FixedOutcomeGate(ApprovalOutcome::approved_by(approver(
+            "hum_bob_distinct",
+        ))));
+        assert!(run_distinct(gate, Some(ctx)).await);
+    }
+
+    #[tokio::test]
+    async fn approver_identity_lands_in_audit() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let gate = Box::new(FixedOutcomeGate(ApprovalOutcome::approved_by(approver(
+            "hum_approver",
+        ))));
+        let enclave = build_enclave(gate, audit.clone());
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        assert!(enclave.execute(req).await.error_code().is_none());
+        let granted = audit
+            .events()
+            .into_iter()
+            .find(|e| e.kind == AuditEventKind::ApprovalGranted)
+            .expect("granted event");
+        assert_eq!(
+            granted.approver.expect("approver recorded").principal_id,
+            "hum_approver"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_gate_registers_the_local_factor() {
+        use opaque_core::operation::ApprovalFactor;
+        // The prompt path isn't exercised here (no OS prompt in tests); the
+        // registry's dispatch semantics are covered in factors::tests. Assert
+        // the gate's construction shape: both variants serve LocalBio.
+        let resolver: ApproverResolver = Arc::new(|| Some(approver("hum_session")));
+        let gate = NativeApprovalGate::new().with_approver_resolver(resolver);
+        assert_eq!(
+            gate.registry.available_factors(),
+            vec![ApprovalFactor::LocalBio]
+        );
+        let bare = NativeApprovalGate::new();
+        assert_eq!(
+            bare.registry.available_factors(),
+            vec![ApprovalFactor::LocalBio]
+        );
+    }
+
+    #[tokio::test]
+    async fn insecure_auto_approve_gate_attributes_synthetic_approver() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let enclave = build_enclave(Box::new(InsecureAutoApproveGate), audit.clone());
+        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        assert!(enclave.execute(req).await.error_code().is_none());
+        let granted = audit
+            .events()
+            .into_iter()
+            .find(|e| e.kind == AuditEventKind::ApprovalGranted)
+            .expect("granted");
+        let a = granted.approver.expect("approver");
+        assert_eq!(a.principal_id, "insecure-auto-approve");
+        assert_eq!(a.source, ApproverSource::InsecureAutoApprove);
+    }
+
+    #[tokio::test]
+    async fn distinct_approver_misconfig_without_approval_fails_closed() {
+        // require_distinct_approver on a rule that never requires approval is
+        // a misconfiguration → fail closed, don't silently allow.
+        let mut policy = PolicyEngine::new();
+        policy.add_rule(PolicyRule {
+            identity: Default::default(),
+            name: "bad".into(),
+            client: ClientMatch::default(),
+            operation_pattern: "github.*".into(),
+            target: TargetMatch::default(),
+            workspace: WorkspaceMatch::default(),
+            secret_names: SecretNameMatch::default(),
+            allow: true,
+            client_types: vec![ClientType::Agent, ClientType::Human],
+            approval: ApprovalConfig {
+                require: ApprovalRequirement::Never,
+                factors: vec![],
+                lease_ttl: None,
+                one_time: false,
+                require_distinct_approver: true,
+            },
+        });
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let enclave = build_enclave_with(Box::new(AlwaysApproveGate), policy, audit);
+        let mut req = test_request("github.set_actions_secret", ClientType::Agent);
+        req.principal = Some(human_ctx("alice"));
+        assert!(enclave.execute(req).await.error_code().is_some());
+    }
+
     fn test_registry() -> OperationRegistry {
         let mut reg = OperationRegistry::new();
         reg.register(OperationDef {
             name: "github.set_actions_secret".into(),
             safety: OperationSafety::Safe,
-            default_approval: ApprovalRequirement::Always,
+            // FirstUse in the fixture so lease tests can exercise leasing; the
+            // approval clamp still raises this to Always under an Always policy.
+            default_approval: ApprovalRequirement::FirstUse,
             default_factors: vec![ApprovalFactor::LocalBio],
             description: "Set a GitHub Actions repository secret".into(),
+            params_schema: None,
+            allowed_target_keys: vec![],
+            secret_ref_param_keys: vec![],
+        })
+        .unwrap();
+        // A Never-approval op for exercising the "no approval needed" path.
+        reg.register(OperationDef {
+            name: "test.noop".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Never,
+            default_factors: vec![],
+            description: "No-op test operation".into(),
             params_schema: None,
             allowed_target_keys: vec![],
             secret_ref_param_keys: vec![],
@@ -1430,6 +2092,7 @@ mod tests {
 
     fn test_policy() -> PolicyEngine {
         PolicyEngine::with_rules(vec![PolicyRule {
+            identity: Default::default(),
             name: "allow-claude-github".into(),
             client: ClientMatch {
                 uid: Some(501),
@@ -1453,6 +2116,7 @@ mod tests {
                 factors: vec![ApprovalFactor::LocalBio],
                 lease_ttl: None,
                 one_time: true,
+                require_distinct_approver: false,
             },
         }])
     }
@@ -1512,6 +2176,7 @@ mod tests {
         // Add a policy rule for secret.reveal to test safety enforcement.
         let mut policy = test_policy();
         policy.add_rule(PolicyRule {
+            identity: Default::default(),
             name: "allow-reveal".into(),
             client: ClientMatch::default(),
             operation_pattern: "secret.*".into(),
@@ -1525,6 +2190,7 @@ mod tests {
                 factors: vec![ApprovalFactor::Fido2],
                 lease_ttl: None,
                 one_time: true,
+                require_distinct_approver: false,
             },
         });
 
@@ -1545,7 +2211,8 @@ mod tests {
             )
             .approval_gate(Box::new(AlwaysApproveGate))
             .audit(audit.clone())
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         let req = test_request("secret.reveal", ClientType::Agent);
         let resp = enclave.execute(req).await;
@@ -1561,6 +2228,7 @@ mod tests {
         let audit = Arc::new(InMemoryAuditEmitter::new());
         let mut policy = test_policy();
         policy.add_rule(PolicyRule {
+            identity: Default::default(),
             name: "allow-reveal".into(),
             client: ClientMatch::default(),
             operation_pattern: "secret.*".into(),
@@ -1574,6 +2242,7 @@ mod tests {
                 factors: vec![ApprovalFactor::LocalBio],
                 lease_ttl: None,
                 one_time: true,
+                require_distinct_approver: false,
             },
         });
 
@@ -1594,7 +2263,8 @@ mod tests {
             )
             .approval_gate(Box::new(AlwaysApproveGate))
             .audit(audit.clone())
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         // Human client should ALSO be blocked from REVEAL in v1.
         let req = test_request("secret.reveal", ClientType::Human);
@@ -1683,7 +2353,8 @@ mod tests {
             )
             .approval_gate(Box::new(AlwaysApproveGate))
             .audit(audit.clone())
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         let req = test_request("github.set_actions_secret", ClientType::Agent);
         let resp = enclave.execute(req).await;
@@ -1934,6 +2605,7 @@ mod tests {
     /// Build a policy with a FirstUse rule for github.set_actions_secret.
     fn test_first_use_policy(lease_ttl: Option<Duration>, one_time: bool) -> PolicyEngine {
         PolicyEngine::with_rules(vec![PolicyRule {
+            identity: Default::default(),
             name: "allow-claude-github-first-use".into(),
             client: ClientMatch {
                 uid: Some(501),
@@ -1957,6 +2629,7 @@ mod tests {
                 factors: vec![ApprovalFactor::LocalBio],
                 lease_ttl,
                 one_time,
+                require_distinct_approver: false,
             },
         }])
     }
@@ -1977,7 +2650,8 @@ mod tests {
             )
             .approval_gate(gate)
             .audit(audit)
-            .build().unwrap()
+            .build()
+            .unwrap()
     }
 
     #[tokio::test]
@@ -2029,6 +2703,7 @@ mod tests {
         // Need a policy that also matches the second target.
         let mut policy_engine = policy;
         policy_engine.add_rule(PolicyRule {
+            identity: Default::default(),
             name: "allow-claude-github-other".into(),
             client: ClientMatch {
                 uid: Some(501),
@@ -2052,6 +2727,7 @@ mod tests {
                 factors: vec![ApprovalFactor::LocalBio],
                 lease_ttl: Some(Duration::from_secs(300)),
                 one_time: false,
+                require_distinct_approver: false,
             },
         });
 
@@ -2153,8 +2829,9 @@ mod tests {
             _request: &OperationRequest,
             _factors: &[ApprovalFactor],
             _description: &str,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>>
-        {
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ApprovalOutcome, String>> + Send + '_>,
+        > {
             let msg = self.message.clone();
             Box::pin(async move { Err(msg) })
         }
@@ -2191,8 +2868,9 @@ mod tests {
             _request: &OperationRequest,
             _factors: &[ApprovalFactor],
             _description: &str,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>>
-        {
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ApprovalOutcome, String>> + Send + '_>,
+        > {
             let delay = self.delay;
             let max_conc = self.max_concurrent.clone();
             let current = self.current.clone();
@@ -2203,7 +2881,7 @@ mod tests {
                 max_conc.fetch_max(in_flight, std::sync::atomic::Ordering::SeqCst);
                 tokio::time::sleep(delay).await;
                 current.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(true)
+                Ok(ApprovalOutcome::approved_anonymous())
             })
         }
     }
@@ -2233,13 +2911,14 @@ mod tests {
             _request: &OperationRequest,
             _factors: &[ApprovalFactor],
             description: &str,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>>
-        {
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ApprovalOutcome, String>> + Send + '_>,
+        > {
             self.descriptions
                 .lock()
                 .expect("capturing gate mutex")
                 .push(description.to_owned());
-            Box::pin(async { Ok(true) })
+            Box::pin(async { Ok(ApprovalOutcome::approved_anonymous()) })
         }
     }
 
@@ -2272,13 +2951,14 @@ mod tests {
         let (gate, count) = CountingApproveGate::new();
 
         let policy = PolicyEngine::with_rules(vec![PolicyRule {
+            identity: Default::default(),
             name: "allow-no-approval".into(),
             client: ClientMatch {
                 uid: Some(501),
                 exe_path: Some("/usr/bin/claude*".into()),
                 ..Default::default()
             },
-            operation_pattern: "github.*".into(),
+            operation_pattern: "test.noop".into(),
             target: TargetMatch {
                 fields: {
                     let mut m = HashMap::new();
@@ -2295,6 +2975,7 @@ mod tests {
                 factors: vec![],
                 lease_ttl: None,
                 one_time: false,
+                require_distinct_approver: false,
             },
         }]);
 
@@ -2302,16 +2983,17 @@ mod tests {
             .registry(test_registry())
             .policy(policy)
             .handler(
-                "github.set_actions_secret",
+                "test.noop",
                 Box::new(StubHandler {
                     response: serde_json::json!({"status": "ok"}),
                 }),
             )
             .approval_gate(Box::new(gate))
             .audit(audit.clone())
-            .build().unwrap();
+            .build()
+            .unwrap();
 
-        let req = test_request("github.set_actions_secret", ClientType::Agent);
+        let req = test_request("test.noop", ClientType::Agent);
         let resp = enclave.execute(req).await;
 
         assert!(resp.error_code().is_none());
@@ -2348,6 +3030,7 @@ mod tests {
         let mut policy = test_first_use_policy(Some(Duration::from_secs(300)), false);
         // Add a second target rule.
         policy.add_rule(PolicyRule {
+            identity: Default::default(),
             name: "allow-other".into(),
             client: ClientMatch {
                 uid: Some(501),
@@ -2371,6 +3054,7 @@ mod tests {
                 factors: vec![ApprovalFactor::LocalBio],
                 lease_ttl: None,
                 one_time: false,
+                require_distinct_approver: false,
             },
         });
 
@@ -2386,7 +3070,8 @@ mod tests {
                 )
                 .approval_gate(Box::new(gate))
                 .audit(audit.clone())
-                .build().unwrap(),
+                .build()
+                .unwrap(),
         );
 
         // Fire 3 concurrent requests with different targets (so no lease hits).
@@ -2436,6 +3121,7 @@ mod tests {
             .unwrap();
 
         let policy = PolicyEngine::with_rules(vec![PolicyRule {
+            identity: Default::default(),
             name: "allow-restricted".into(),
             client: ClientMatch::default(),
             operation_pattern: "restricted.*".into(),
@@ -2449,6 +3135,7 @@ mod tests {
                 factors: vec![],
                 lease_ttl: None,
                 one_time: false,
+                require_distinct_approver: false,
             },
         }]);
 
@@ -2463,7 +3150,8 @@ mod tests {
             )
             .approval_gate(Box::new(AlwaysApproveGate))
             .audit(audit.clone())
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         // Request with allowed keys → success.
         let mut req = test_request("restricted.op", ClientType::Human);
@@ -2509,6 +3197,7 @@ mod tests {
             .unwrap();
 
         let policy = PolicyEngine::with_rules(vec![PolicyRule {
+            identity: Default::default(),
             name: "allow-schema".into(),
             client: ClientMatch::default(),
             operation_pattern: "schema.*".into(),
@@ -2522,6 +3211,7 @@ mod tests {
                 factors: vec![],
                 lease_ttl: None,
                 one_time: false,
+                require_distinct_approver: false,
             },
         }]);
 
@@ -2536,7 +3226,8 @@ mod tests {
             )
             .approval_gate(Box::new(AlwaysApproveGate))
             .audit(audit.clone())
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         // Valid params → success.
         let mut req = test_request("schema.op", ClientType::Human);
@@ -2564,6 +3255,7 @@ mod tests {
         let audit = Arc::new(InMemoryAuditEmitter::new());
 
         let policy = PolicyEngine::with_rules(vec![PolicyRule {
+            identity: Default::default(),
             name: "allow-main-only".into(),
             client: ClientMatch {
                 uid: Some(501),
@@ -2591,6 +3283,7 @@ mod tests {
                 factors: vec![ApprovalFactor::LocalBio],
                 lease_ttl: None,
                 one_time: false,
+                require_distinct_approver: false,
             },
         }]);
 
@@ -2605,7 +3298,8 @@ mod tests {
             )
             .approval_gate(Box::new(AlwaysApproveGate))
             .audit(audit.clone())
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         // Request without workspace → denied (rule requires workspace).
         let req = test_request("github.set_actions_secret", ClientType::Agent);
@@ -2646,6 +3340,7 @@ mod tests {
         let audit = Arc::new(InMemoryAuditEmitter::new());
 
         let policy = PolicyEngine::with_rules(vec![PolicyRule {
+            identity: Default::default(),
             name: "allow-jwt-only".into(),
             client: ClientMatch {
                 uid: Some(501),
@@ -2671,6 +3366,7 @@ mod tests {
                 factors: vec![ApprovalFactor::LocalBio],
                 lease_ttl: None,
                 one_time: false,
+                require_distinct_approver: false,
             },
         }]);
 
@@ -2685,7 +3381,8 @@ mod tests {
             )
             .approval_gate(Box::new(AlwaysApproveGate))
             .audit(audit.clone())
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         // Request with allowed secret name → success.
         let req = test_request("github.set_actions_secret", ClientType::Agent);
@@ -2784,7 +3481,8 @@ mod tests {
             )
             .approval_gate(Box::new(AlwaysApproveGate))
             .audit(audit.clone())
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         let mut req = test_request("github.set_actions_secret", ClientType::Agent);
         let request_id = req.request_id;
@@ -2826,6 +3524,7 @@ mod tests {
         let policy = PolicyEngine::with_rules(vec![
             // list_secrets: no approval needed.
             PolicyRule {
+                identity: Default::default(),
                 name: "allow-list".into(),
                 client: ClientMatch {
                     uid: Some(501),
@@ -2849,10 +3548,12 @@ mod tests {
                     factors: vec![],
                     lease_ttl: None,
                     one_time: false,
+                    require_distinct_approver: false,
                 },
             },
             // set_actions_secret: Always approval.
             PolicyRule {
+                identity: Default::default(),
                 name: "allow-set".into(),
                 client: ClientMatch {
                     uid: Some(501),
@@ -2876,6 +3577,7 @@ mod tests {
                     factors: vec![ApprovalFactor::LocalBio],
                     lease_ttl: None,
                     one_time: false,
+                    require_distinct_approver: false,
                 },
             },
         ]);
@@ -2897,7 +3599,8 @@ mod tests {
             )
             .approval_gate(Box::new(gate))
             .audit(audit.clone())
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         // list_secrets: no approval.
         let req = test_request("github.list_secrets", ClientType::Agent);
@@ -2969,7 +3672,8 @@ mod tests {
             )
             .approval_gate(Box::new(AlwaysApproveGate))
             .audit(audit.clone())
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         // First: fails.
         let req = test_request("github.set_actions_secret", ClientType::Agent);
@@ -3102,10 +3806,10 @@ mod tests {
         }
     }
 
-    // -- SensitiveOutput safety enforcement through enclave --
+    // -- SensitiveOutput is gated on approval, not classification --
 
     #[tokio::test]
-    async fn sensitive_output_blocked_for_agent_without_explicit_allowance() {
+    async fn sensitive_output_requires_approval_not_classification() {
         let audit = Arc::new(InMemoryAuditEmitter::new());
 
         let mut registry = OperationRegistry::new();
@@ -3122,8 +3826,10 @@ mod tests {
             })
             .unwrap();
 
-        // Rule does NOT explicitly include Agent in client_types.
+        // Policy sets approval to "never"; the enclave clamp must still force
+        // mandatory approval because the op is SensitiveOutput.
         let policy = PolicyEngine::with_rules(vec![PolicyRule {
+            identity: Default::default(),
             name: "allow-ecr".into(),
             client: ClientMatch {
                 uid: Some(501),
@@ -3141,12 +3847,13 @@ mod tests {
             workspace: WorkspaceMatch::default(),
             secret_names: SecretNameMatch::default(),
             allow: true,
-            client_types: vec![], // Empty = matches all for matching, but NOT for SENSITIVE_OUTPUT
+            client_types: vec![], // classification no longer gates SensitiveOutput
             approval: ApprovalConfig {
-                require: ApprovalRequirement::Always,
-                factors: vec![ApprovalFactor::LocalBio],
+                require: ApprovalRequirement::Never,
+                factors: vec![],
                 lease_ttl: None,
                 one_time: false,
+                require_distinct_approver: false,
             },
         }]);
 
@@ -3161,14 +3868,24 @@ mod tests {
             )
             .approval_gate(Box::new(AlwaysApproveGate))
             .audit(audit.clone())
-            .build().unwrap();
+            .build()
+            .unwrap();
 
-        // Agent client → blocked by enclave safety check (defense-in-depth).
+        // Agent client: despite the "never" policy, the SensitiveOutput clamp
+        // forces approval. With an approving gate the op then succeeds — and the
+        // approval was genuinely required (proving presence, not classification,
+        // is the gate).
         let req = test_request("ecr.get_auth_token", ClientType::Agent);
         let resp = enclave.execute(req).await;
-        assert_eq!(resp.error_code(), Some("safety_violation"));
+        assert!(resp.error_code().is_none());
+        assert!(
+            !audit
+                .events_of_kind(AuditEventKind::ApprovalRequired)
+                .is_empty(),
+            "SensitiveOutput must require approval regardless of the policy's 'never'"
+        );
 
-        // Human client → allowed.
+        // Human client is treated identically — no free pass from classification.
         let req = test_request("ecr.get_auth_token", ClientType::Human);
         let resp = enclave.execute(req).await;
         assert!(resp.error_code().is_none());
@@ -3239,6 +3956,7 @@ mod tests {
 
         // Policy that restricts to specific secret names.
         let policy = PolicyEngine::with_rules(vec![PolicyRule {
+            identity: Default::default(),
             name: "allow-only-specific-secrets".into(),
             client: ClientMatch {
                 uid: Some(501),
@@ -3264,6 +3982,7 @@ mod tests {
                 factors: vec![ApprovalFactor::LocalBio],
                 lease_ttl: None,
                 one_time: true,
+                require_distinct_approver: false,
             },
         }]);
 
@@ -3281,7 +4000,8 @@ mod tests {
             )
             .approval_gate(Box::new(AlwaysApproveGate))
             .audit(audit.clone())
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         // Client tries to LIE about secret_ref_names — claims "ADMIN_KEY"
         // but params actually reference "env:MY_TOKEN".

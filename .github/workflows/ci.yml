@@ -14,7 +14,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        # The action exports RUSTUP_TOOLCHAIN, which outranks rust-toolchain.toml,
+        # so the version here must match the pin in rust-toolchain.toml.
+        uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: clippy, rustfmt
 
@@ -31,7 +33,42 @@ jobs:
         run: cargo test --workspace
 
       - name: Verify wrapper enforcement handshake test
-        run: cargo test -p opaqued enforce_agent_sessions_rejects_unwrapped_and_allows_session_token -- --exact
+        # --exact needs the full module path; a bare name matches 0 tests and
+        # passes vacuously. The grep guard fails the step if the test ever
+        # stops running (renamed/moved), instead of silently passing.
+        run: |
+          cargo test -p opaqued tests::enforce_agent_sessions_rejects_unwrapped_and_allows_session_token -- --exact 2>&1 | tee /tmp/wrapper-test.out
+          grep -q "test result: ok. 1 passed" /tmp/wrapper-test.out
+
+  # Verifies the Linux-only trust-domain guarantees (separate-uid custody,
+  # Landlock, seccomp). The probe runs FIRST and fails the job if the runner
+  # kernel can't enforce Landlock/seccomp — so the enforcement tests that later
+  # steps run can never green-skip on an incapable kernel. Locally the same
+  # entry points run via `scripts/linux-harness.sh` (Docker on macOS; note
+  # Docker Desktop's linuxkit kernel lacks Landlock, so Landlock enforcement
+  # is verified here and only here).
+  trust-domain-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        # Keep in sync with rust-toolchain.toml (the action's RUSTUP_TOOLCHAIN
+        # export outranks the file).
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Kernel capability probe (landlock + seccomp must be enforceable)
+        run: ./scripts/linux-harness.sh probe
+
+      - name: Multi-uid isolation suite (custody + privilege drop, as root)
+        run: ./scripts/linux-harness.sh isolation
+
+      - name: Trust-domain split e2e (real daemon, two uids, signed approver)
+        run: ./scripts/linux-harness.sh e2e-split
 
   supply-chain:
     runs-on: ubuntu-latest

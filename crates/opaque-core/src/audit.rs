@@ -11,11 +11,16 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
+use hmac::{Hmac, Mac};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use uuid::Uuid;
 
 use crate::operation::{ClientIdentity, ClientType, OperationSafety};
 use crate::policy::PolicyDecision;
+
+type HmacSha256 = Hmac<Sha256>;
 
 // ---------------------------------------------------------------------------
 // Audit event kind
@@ -87,6 +92,28 @@ pub enum AuditEventKind {
 
     /// An execve requires human approval before proceeding.
     ExecvePrompted,
+
+    /// A human completed OIDC login and a login session was created.
+    IdentityLoginSucceeded,
+
+    /// An OIDC login attempt failed (bad token, domain not allowed, …).
+    IdentityLoginFailed,
+
+    /// A human login session was revoked by logout.
+    IdentityLogout,
+
+    /// A principal's role assignments were changed.
+    IdentityRoleChanged,
+
+    /// A delegation (agent session bound to a principal) was issued.
+    DelegationIssued,
+
+    /// A delegation was revoked before expiry.
+    DelegationRevoked,
+
+    /// Startup report of the daemon's trust-domain posture: whether the
+    /// service-account split is enforced and what custody violations exist.
+    TrustDomainPosture,
 }
 
 impl fmt::Display for AuditEventKind {
@@ -113,6 +140,13 @@ impl fmt::Display for AuditEventKind {
             Self::ExecveAllowed => "execve.allowed",
             Self::ExecveDenied => "execve.denied",
             Self::ExecvePrompted => "execve.prompted",
+            Self::IdentityLoginSucceeded => "identity.login.succeeded",
+            Self::IdentityLoginFailed => "identity.login.failed",
+            Self::IdentityLogout => "identity.logout",
+            Self::IdentityRoleChanged => "identity.role.changed",
+            Self::DelegationIssued => "delegation.issued",
+            Self::DelegationRevoked => "delegation.revoked",
+            Self::TrustDomainPosture => "trust_domain.posture",
         };
         write!(f, "{s}")
     }
@@ -144,6 +178,13 @@ impl std::str::FromStr for AuditEventKind {
             "execve.allowed" => Ok(Self::ExecveAllowed),
             "execve.denied" => Ok(Self::ExecveDenied),
             "execve.prompted" => Ok(Self::ExecvePrompted),
+            "identity.login.succeeded" => Ok(Self::IdentityLoginSucceeded),
+            "identity.login.failed" => Ok(Self::IdentityLoginFailed),
+            "identity.logout" => Ok(Self::IdentityLogout),
+            "identity.role.changed" => Ok(Self::IdentityRoleChanged),
+            "delegation.issued" => Ok(Self::DelegationIssued),
+            "delegation.revoked" => Ok(Self::DelegationRevoked),
+            "trust_domain.posture" => Ok(Self::TrustDomainPosture),
             _ => Err(format!("unknown audit event kind: {s}")),
         }
     }
@@ -170,6 +211,98 @@ pub enum AuditError {
 // Client summary (safe for audit)
 // ---------------------------------------------------------------------------
 
+/// Audit-safe snapshot of the verified principal/delegation context attached
+/// to a request (Phase 1 identity substrate).
+///
+/// Plain strings by design: audit rows are historical records, stable across
+/// releases. `sub_roles` is the role set the delegating principal held AT THE
+/// TIME of the request (roles are mutable; the snapshot preserves why a
+/// decision was made).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrincipalSummary {
+    /// Principal the operation was performed on behalf of.
+    pub sub: String,
+    /// Display label for `sub` (email for humans, `service:<name>`).
+    pub sub_label: String,
+    /// Roles `sub` held at request time.
+    #[serde(default)]
+    pub sub_roles: Vec<String>,
+    /// Acting agent workload principal.
+    pub act: String,
+    /// Display label for `act` (e.g. `agent:claude-code`).
+    pub act_label: String,
+    /// Access mode of the delegation (delegated / autonomous / break_glass).
+    pub mode: String,
+    /// Delegation session id.
+    pub jti: String,
+}
+
+impl From<&crate::identity::PrincipalContext> for PrincipalSummary {
+    fn from(ctx: &crate::identity::PrincipalContext) -> Self {
+        Self {
+            sub: ctx.sub.as_str().to_owned(),
+            sub_label: ctx.sub_label.clone(),
+            sub_roles: ctx
+                .sub_roles
+                .iter()
+                .map(|r| r.as_str().to_owned())
+                .collect(),
+            act: ctx.act.as_str().to_owned(),
+            act_label: ctx.act_label.clone(),
+            mode: ctx.mode.as_str().to_owned(),
+            jti: ctx.jti.clone(),
+        }
+    }
+}
+
+/// How an approval's approver identity was established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApproverSource {
+    /// Local OS biometric/password prompt passed while the named principal
+    /// held the active login session. Presence is cryptographically proven
+    /// (device owner); the *name* is session-bound, not signature-bound.
+    LocalBioSession,
+    /// A paired device's Ed25519 signature over the approval challenge was
+    /// verified against the pairing store. Signature-bound: only recorded by
+    /// the paired-device factor verifier, never from relayed, unverified
+    /// device ids.
+    PairedDevice,
+    /// A FIDO2/WebAuthn assertion (hardware key or passkey) over the approval
+    /// challenge was verified against the stored credential. Signature-bound.
+    Fido2,
+    /// Linux polkit authorized the approval; the named account is the
+    /// authenticated session user reported by the approval helper.
+    /// Account-verified (polkit checked credentials), not signature-bound.
+    PolkitAccount,
+    /// The insecure auto-approve test backend granted it. Never a person.
+    InsecureAutoApprove,
+}
+
+impl fmt::Display for ApproverSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LocalBioSession => write!(f, "local_bio_session"),
+            Self::PairedDevice => write!(f, "paired_device"),
+            Self::Fido2 => write!(f, "fido2"),
+            Self::PolkitAccount => write!(f, "polkit_account"),
+            Self::InsecureAutoApprove => write!(f, "insecure_auto_approve"),
+        }
+    }
+}
+
+/// The identity that confirmed an out-of-band approval, recorded in the audit
+/// chain (`approver_json` column, covered by the record HMAC).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApproverIdentity {
+    /// Approving principal id (`hum_…`), or a device id for paired devices.
+    pub principal_id: String,
+    /// Display label at approval time.
+    pub label: String,
+    /// How this identity was established.
+    pub source: ApproverSource,
+}
+
 /// A summary of the client identity, safe for inclusion in audit events.
 /// Does not contain secrets or full hashes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,6 +316,19 @@ pub struct ClientSummary {
     pub exe_sha256_prefix: Option<String>,
     pub codesign_team_id: Option<String>,
     pub client_type: ClientType,
+    /// Verified principal/delegation context, when the request carried one.
+    /// `skip_serializing_if` keeps identity-less rows byte-identical to
+    /// pre-Phase-1 rows, so existing chain hashes keep verifying.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<PrincipalSummary>,
+}
+
+impl ClientSummary {
+    /// Attach the verified principal context to this summary.
+    pub fn with_principal(mut self, ctx: &crate::identity::PrincipalContext) -> Self {
+        self.principal = Some(PrincipalSummary::from(ctx));
+        self
+    }
 }
 
 impl From<(&ClientIdentity, ClientType)> for ClientSummary {
@@ -201,6 +347,7 @@ impl From<(&ClientIdentity, ClientType)> for ClientSummary {
             }),
             codesign_team_id: id.codesign_team_id.clone(),
             client_type: ct,
+            principal: None,
         }
     }
 }
@@ -327,6 +474,10 @@ pub struct AuditEvent {
     /// SHA-256 content hash of the operation request (for approval binding).
     /// Not secret — safe for display and audit.
     pub request_hash: Option<String>,
+
+    /// Who confirmed the approval (approval events only). Persisted in its
+    /// own chained column so tampering with attribution is detectable.
+    pub approver: Option<ApproverIdentity>,
 }
 
 // Custom Debug to avoid any accidental leakage.
@@ -395,12 +546,19 @@ impl AuditEvent {
             detail: None,
             workspace: None,
             request_hash: None,
+            approver: None,
         }
     }
 
     /// Set the sequence number.
     pub fn with_sequence_number(mut self, seq: u64) -> Self {
         self.sequence_number = seq;
+        self
+    }
+
+    /// Set the approver identity (approval events).
+    pub fn with_approver(mut self, approver: ApproverIdentity) -> Self {
+        self.approver = Some(approver);
         self
     }
 
@@ -496,6 +654,7 @@ fn default_level_for_kind(kind: AuditEventKind) -> AuditLevel {
         | AuditEventKind::ApprovalDenied
         | AuditEventKind::RateLimited
         | AuditEventKind::AuditDropped
+        | AuditEventKind::IdentityLoginFailed
         | AuditEventKind::ExecveDenied => AuditLevel::Warn,
         AuditEventKind::OperationFailed => AuditLevel::Error,
         _ => AuditLevel::Info,
@@ -649,6 +808,389 @@ impl AuditSink for TracingAuditEmitter {
 // SQLite audit sink (persistent storage)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Tamper-evident hash chain
+// ---------------------------------------------------------------------------
+
+/// Genesis value the first audit record chains from.
+const CHAIN_GENESIS: &str = "opaque-audit-chain-genesis-v1";
+
+/// The persisted columns bound into each record's chain hash, in a fixed order.
+/// Insert, verify, and backfill all reference this list so the canonical form
+/// they hash is identical.
+const CHAIN_COLUMNS: &str = "event_id, sequence_number, ts_utc_ms, level, kind, \
+request_id, approval_id, client_json, operation, safety, target_json, outcome, \
+latency_ms, secret_names, policy_decision, detail, workspace_json, request_hash";
+
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Path to the HMAC key file that seals the audit chain, derived from the database
+/// path (sibling file with a `.hmac` extension).
+fn hmac_key_path(db_path: &Path) -> PathBuf {
+    db_path.with_extension("hmac")
+}
+
+/// Load the audit chain HMAC key, creating it (0600) on first use.
+///
+/// SECURITY: this key authenticates the tamper-evident chain. At rest it is a 0600
+/// file beside the database, so a process running as the daemon's own uid can read
+/// it. At a shared uid the chain is therefore tamper-*evident* (it detects casual,
+/// partial, or non-key-holder tampering) but not tamper-*proof* against an adversary
+/// that also reads the key. Under the trust-domain split
+/// (`[trust_domain] enforce = true`), the key is part of the daemon's custody set —
+/// unreadable at the agent's uid and ownership-verified at every startup — which
+/// closes that gap; see docs/deployment.md.
+fn load_or_create_hmac_key(db_path: &Path) -> Result<[u8; 32], AuditError> {
+    let path = hmac_key_path(db_path);
+    if let Ok(bytes) = std::fs::read(&path)
+        && bytes.len() == 32
+    {
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&bytes);
+        return Ok(key);
+    }
+    // Generate 32 bytes from two v4 UUIDs (crypto-random via getrandom).
+    let mut key = [0u8; 32];
+    key[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+    key[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+    write_key_file(&path, &key)?;
+    Ok(key)
+}
+
+#[cfg(unix)]
+fn write_key_file(path: &Path, key: &[u8; 32]) -> Result<(), AuditError> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(key)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_key_file(path: &Path, key: &[u8; 32]) -> Result<(), AuditError> {
+    std::fs::write(path, key)?;
+    Ok(())
+}
+
+/// Deterministic, order-fixed serialization of the persisted fields. `None` renders
+/// empty; the field count is fixed so empties are unambiguous. Unit separators
+/// (`0x1f`) prevent field-boundary ambiguity.
+#[allow(clippy::too_many_arguments)]
+fn canonical_record(
+    event_id: &str,
+    sequence_number: i64,
+    ts_utc_ms: i64,
+    level: &str,
+    kind: &str,
+    request_id: Option<&str>,
+    approval_id: Option<&str>,
+    client_json: Option<&str>,
+    operation: Option<&str>,
+    safety: Option<&str>,
+    target_json: Option<&str>,
+    outcome: Option<&str>,
+    latency_ms: Option<i64>,
+    secret_names: Option<&str>,
+    policy_decision: Option<&str>,
+    detail: Option<&str>,
+    workspace_json: Option<&str>,
+    request_hash: Option<&str>,
+) -> String {
+    let seq = sequence_number.to_string();
+    let ts = ts_utc_ms.to_string();
+    let lat = latency_ms.map(|v| v.to_string()).unwrap_or_default();
+    fn f(o: Option<&str>) -> &str {
+        o.unwrap_or("")
+    }
+    [
+        event_id,
+        &seq,
+        &ts,
+        level,
+        kind,
+        f(request_id),
+        f(approval_id),
+        f(client_json),
+        f(operation),
+        f(safety),
+        f(target_json),
+        f(outcome),
+        &lat,
+        f(secret_names),
+        f(policy_decision),
+        f(detail),
+        f(workspace_json),
+        f(request_hash),
+    ]
+    .join("\u{1f}")
+}
+
+/// Presence-versioned canon extension (Phase 1): fields added AFTER the
+/// original 18 are appended to the canonical record ONLY when non-empty.
+///
+/// - Pre-Phase-1 rows (field absent/NULL) keep their original 18-field canon,
+///   so their stored `record_hash` values keep verifying with NO backfill —
+///   and therefore no window in which a re-anchor could absorb prior
+///   tampering.
+/// - Any tampering permutation still changes the canon and is detected:
+///   setting the field on an old row appends a 19th segment; NULLing it on a
+///   new row removes one; editing it changes the bytes.
+/// - Unambiguous by construction: the 18th field (`request_hash`) is
+///   hex-or-empty and can never contain the `0x1f` separator, so an 18-field
+///   canon can never collide with a 19-field one.
+fn append_optional_chained_field(canon: &mut String, value: Option<&str>) {
+    if let Some(v) = value
+        && !v.is_empty()
+    {
+        canon.push('\u{1f}');
+        canon.push_str(v);
+    }
+}
+
+/// `HMAC-SHA256(key, prev_hash ‖ RS ‖ canonical_record)`, hex-encoded.
+fn chain_hash(key: &[u8; 32], prev_hash: &str, canon: &str) -> String {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(prev_hash.as_bytes());
+    mac.update(b"\x1e");
+    mac.update(canon.as_bytes());
+    hex_encode(mac.finalize().into_bytes().as_slice())
+}
+
+/// Read the chained fields from a row starting at column `base` and return the
+/// canonical record string. `has_approver` says whether the caller's SELECT
+/// included the `approver_json` column at position `base + 18` (databases
+/// created before Phase 1 don't have it).
+fn canon_from_row(
+    row: &rusqlite::Row,
+    base: usize,
+    has_approver: bool,
+) -> rusqlite::Result<String> {
+    let s = |i: usize| -> rusqlite::Result<Option<String>> { row.get(base + i) };
+    let event_id: String = row.get(base)?;
+    let sequence_number: i64 = row.get(base + 1)?;
+    let ts_utc_ms: i64 = row.get(base + 2)?;
+    let level: String = row.get(base + 3)?;
+    let kind: String = row.get(base + 4)?;
+    let request_id = s(5)?;
+    let approval_id = s(6)?;
+    let client_json = s(7)?;
+    let operation = s(8)?;
+    let safety = s(9)?;
+    let target_json = s(10)?;
+    let outcome = s(11)?;
+    let latency_ms: Option<i64> = row.get(base + 12)?;
+    let secret_names = s(13)?;
+    let policy_decision = s(14)?;
+    let detail = s(15)?;
+    let workspace_json = s(16)?;
+    let request_hash = s(17)?;
+    // Column 18 (approver_json) exists only on migrated/new databases; the
+    // caller's SELECT list says whether it is present.
+    let approver_json = if has_approver { s(18)? } else { None };
+    let mut canon = canonical_record(
+        &event_id,
+        sequence_number,
+        ts_utc_ms,
+        &level,
+        &kind,
+        request_id.as_deref(),
+        approval_id.as_deref(),
+        client_json.as_deref(),
+        operation.as_deref(),
+        safety.as_deref(),
+        target_json.as_deref(),
+        outcome.as_deref(),
+        latency_ms,
+        secret_names.as_deref(),
+        policy_decision.as_deref(),
+        detail.as_deref(),
+        workspace_json.as_deref(),
+        request_hash.as_deref(),
+    );
+    append_optional_chained_field(&mut canon, approver_json.as_deref());
+    Ok(canon)
+}
+
+/// Compute the chain for rows that lack a `record_hash` (e.g. a database created
+/// before the chain existed), in rowid (insertion) order.
+/// Record the chain head (tail anchor) so verification can detect truncation of
+/// the newest records. Stored in the same database and written inside the insert
+/// transaction, so it stays consistent with the committed rows.
+fn set_chain_head(
+    conn: &rusqlite::Connection,
+    last_hash: &str,
+    last_sequence: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO chain_head (id, last_hash, last_sequence) VALUES (0, ?1, ?2)
+         ON CONFLICT(id) DO UPDATE SET last_hash = ?1, last_sequence = ?2",
+        rusqlite::params![last_hash, last_sequence],
+    )?;
+    Ok(())
+}
+
+fn backfill_chain(conn: &rusqlite::Connection, key: &[u8; 32]) -> Result<(), rusqlite::Error> {
+    // Only ever called from the sink, after the schema (incl. approver_json)
+    // is in place — so the column is always selectable here.
+    let sql = format!(
+        "SELECT rowid, {CHAIN_COLUMNS}, approver_json FROM audit_events ORDER BY rowid ASC"
+    );
+    let pending: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare(&sql)?;
+        let mut q = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(r) = q.next()? {
+            let rowid: i64 = r.get(0)?;
+            out.push((rowid, canon_from_row(r, 1, true)?));
+        }
+        out
+    };
+    let mut prev = CHAIN_GENESIS.to_string();
+    for (rowid, canon) in pending {
+        let h = chain_hash(key, &prev, &canon);
+        conn.execute(
+            "UPDATE audit_events SET record_hash = ?1 WHERE rowid = ?2",
+            rusqlite::params![h, rowid],
+        )?;
+        prev = h;
+    }
+    // Re-anchor the head to the new tail (or clear it if the log is now empty).
+    match conn
+        .query_row(
+            "SELECT record_hash, sequence_number FROM audit_events ORDER BY rowid DESC LIMIT 1",
+            [],
+            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .optional()?
+    {
+        Some((Some(h), seq)) => set_chain_head(conn, &h, seq)?,
+        _ => {
+            conn.execute("DELETE FROM chain_head", [])?;
+        }
+    }
+    Ok(())
+}
+
+/// Result of verifying the audit hash chain.
+#[derive(Debug, Clone)]
+pub struct ChainVerification {
+    /// True if every record's stored hash matches the recomputed chain.
+    pub ok: bool,
+    /// Number of records verified before a break (or the total, if `ok`).
+    pub records_checked: u64,
+    /// Sequence number of the first record whose hash did not match.
+    pub first_bad_sequence: Option<u64>,
+    /// Human-readable detail when the chain is broken.
+    pub detail: Option<String>,
+}
+
+/// Verify the tamper-evident hash chain over the audit log at `db_path`.
+///
+/// Recomputes the chain in insertion order and reports the first record whose
+/// stored hash does not match — catching any edit, reordering, or deletion of a
+/// record by anyone who does not hold the chain key. It then compares the recorded
+/// head anchor (`chain_head`) against the actual tail, so truncation of the newest
+/// records is detected too.
+///
+/// At a shared uid this is tamper-evidence (an adversary who also holds the key and
+/// can rewrite the database can still defeat it); it becomes a hard guarantee once
+/// the daemon runs under a dedicated service account that owns the database.
+pub fn verify_audit_chain(db_path: &Path) -> Result<ChainVerification, AuditError> {
+    let key = load_or_create_hmac_key(db_path)?;
+    let conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    // Databases created before Phase 1 lack approver_json; verification is
+    // read-only and must handle them without migrating.
+    let has_approver = conn
+        .prepare("SELECT approver_json FROM audit_events LIMIT 0")
+        .is_ok();
+    let sql = if has_approver {
+        format!(
+            "SELECT {CHAIN_COLUMNS}, approver_json, record_hash FROM audit_events ORDER BY rowid ASC"
+        )
+    } else {
+        format!("SELECT {CHAIN_COLUMNS}, record_hash FROM audit_events ORDER BY rowid ASC")
+    };
+    let stored_idx = if has_approver { 19 } else { 18 };
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    let mut prev = CHAIN_GENESIS.to_string();
+    let mut count = 0u64;
+    while let Some(row) = rows.next()? {
+        let canon = canon_from_row(row, 0, has_approver)?;
+        let seq: i64 = row.get(1)?;
+        let stored: Option<String> = row.get(stored_idx)?;
+        let expected = chain_hash(&key, &prev, &canon);
+        match stored {
+            Some(h) if h == expected => {
+                prev = h;
+                count += 1;
+            }
+            _ => {
+                return Ok(ChainVerification {
+                    ok: false,
+                    records_checked: count,
+                    first_bad_sequence: Some(seq.max(0) as u64),
+                    detail: Some(format!(
+                        "audit chain broken at record {} (sequence {seq})",
+                        count + 1
+                    )),
+                });
+            }
+        }
+    }
+
+    // Tail-truncation check: the recorded head anchor must match the actual tail.
+    // Detects deletion of the newest records, which a chain walk alone cannot
+    // (a truncated prefix is itself a valid chain).
+    if let Some((head_hash, head_seq)) = conn
+        .query_row(
+            "SELECT last_hash, last_sequence FROM chain_head WHERE id = 0",
+            [],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .optional()?
+    {
+        let actual_tail: Option<String> = conn
+            .query_row(
+                "SELECT record_hash FROM audit_events ORDER BY rowid DESC LIMIT 1",
+                [],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        if actual_tail.as_deref() != Some(head_hash.as_str()) {
+            return Ok(ChainVerification {
+                ok: false,
+                records_checked: count,
+                first_bad_sequence: Some(head_seq.max(0) as u64),
+                detail: Some(format!(
+                    "audit log truncated: the newest record(s) up to sequence {head_seq} are missing"
+                )),
+            });
+        }
+    }
+
+    Ok(ChainVerification {
+        ok: true,
+        records_checked: count,
+        first_bad_sequence: None,
+        detail: None,
+    })
+}
+
 const SCHEMA_SQL: &str = "\
 CREATE TABLE IF NOT EXISTS audit_events (
     event_id TEXT PRIMARY KEY,
@@ -668,7 +1210,9 @@ CREATE TABLE IF NOT EXISTS audit_events (
     policy_decision TEXT,
     detail TEXT,
     workspace_json TEXT,
-    request_hash TEXT
+    request_hash TEXT,
+    approver_json TEXT,
+    record_hash TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_ts ON audit_events(ts_utc_ms);
 CREATE INDEX IF NOT EXISTS idx_kind ON audit_events(kind);
@@ -693,6 +1237,11 @@ END;
 CREATE TRIGGER IF NOT EXISTS audit_events_ad AFTER DELETE ON audit_events BEGIN
     DELETE FROM audit_events_fts WHERE rowid = old.rowid;
 END;
+CREATE TABLE IF NOT EXISTS chain_head (
+    id INTEGER PRIMARY KEY CHECK (id = 0),
+    last_hash TEXT NOT NULL,
+    last_sequence INTEGER NOT NULL
+);
 ";
 
 #[cfg(test)]
@@ -753,7 +1302,56 @@ impl SqliteAuditSink {
         // Open connection, create schema, run retention cleanup.
         let conn = rusqlite::Connection::open(&db_path)?;
         conn.execute_batch(SCHEMA_SQL)?;
-        Self::run_retention_cleanup(&conn, retention_days)?;
+
+        // Tamper-evident chain: load the key, migrate databases created before the
+        // chain existed, and (re)build the chain if the column was just added or
+        // retention removed rows from the front — otherwise the remaining rows would
+        // be chained from a now-deleted predecessor and verification would wrongly
+        // report tampering.
+        let hmac_key = load_or_create_hmac_key(&db_path)?;
+        let migrated = conn
+            .prepare("SELECT record_hash FROM audit_events LIMIT 0")
+            .is_err();
+        if migrated {
+            conn.execute("ALTER TABLE audit_events ADD COLUMN record_hash TEXT", [])?;
+        }
+        // Phase 1: add the approver column to databases created before it.
+        // Deliberately NO backfill/re-anchor — the presence-versioned canon
+        // (see append_optional_chained_field) keeps every pre-existing row's
+        // stored hash valid, so there is no migration step that could absorb
+        // prior tampering.
+        if conn
+            .prepare("SELECT approver_json FROM audit_events LIMIT 0")
+            .is_err()
+        {
+            conn.execute("ALTER TABLE audit_events ADD COLUMN approver_json TEXT", [])?;
+        }
+        let deleted = Self::run_retention_cleanup(&conn, retention_days)?;
+        if migrated || deleted > 0 {
+            backfill_chain(&conn, &hmac_key)?;
+        }
+
+        // Establish the tail-anchor baseline if this database has never had one
+        // (e.g. upgraded from a build without chain_head). A first-time baseline
+        // cannot mask a prior truncation — there is no earlier anchor to contradict —
+        // and thereafter the anchor is only advanced by the writer.
+        let has_head = conn
+            .query_row("SELECT COUNT(*) FROM chain_head", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .map(|c| c > 0)
+            .unwrap_or(false);
+        if !has_head
+            && let Some((Some(h), seq)) = conn
+                .query_row(
+                    "SELECT record_hash, sequence_number FROM audit_events ORDER BY rowid DESC LIMIT 1",
+                    [],
+                    |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?)),
+                )
+                .optional()?
+        {
+            set_chain_head(&conn, &h, seq)?;
+        }
         conn.execute(
             "INSERT OR IGNORE INTO audit_events_fts(rowid, search_text)
              SELECT
@@ -770,6 +1368,20 @@ impl SqliteAuditSink {
              FROM audit_events",
             [],
         )?;
+
+        // Resume sequence numbering after the existing tail. Restarting at 0
+        // (the original bug) makes every daemon RESTART write duplicate
+        // sequence numbers into the chain — verification orders by sequence,
+        // so the restarted log reads as scrambled/tampered even though every
+        // record hash still links by insertion order.
+        let next_sequence: u64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(sequence_number), -1) + 1 FROM audit_events",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|v| v.max(0) as u64)
+            .unwrap_or(0);
         drop(conn);
 
         let (sender, receiver) = std::sync::mpsc::sync_channel::<AuditEvent>(capacity);
@@ -779,10 +1391,17 @@ impl SqliteAuditSink {
         let writer_pause_clone = writer_pause.clone();
 
         let writer_path = db_path.clone();
+        let writer_key = hmac_key;
         let writer_handle = std::thread::Builder::new()
             .name("audit-writer".into())
             .spawn(move || {
-                Self::writer_loop(&writer_path, receiver, &writer_pause_clone, retention_days);
+                Self::writer_loop(
+                    &writer_path,
+                    receiver,
+                    &writer_pause_clone,
+                    retention_days,
+                    writer_key,
+                );
             })
             .map_err(|e| AuditError::Other(format!("failed to spawn writer thread: {e}")))?;
 
@@ -804,7 +1423,7 @@ impl SqliteAuditSink {
 
         Ok(Self {
             sender,
-            next_sequence: AtomicU64::new(0),
+            next_sequence: AtomicU64::new(next_sequence),
             dropped_count,
             writer_handle: std::sync::Mutex::new(Some(writer_handle)),
             drop_monitor_handle: std::sync::Mutex::new(Some(drop_monitor_handle)),
@@ -900,6 +1519,7 @@ impl SqliteAuditSink {
         receiver: std::sync::mpsc::Receiver<AuditEvent>,
         pause: &std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
         retention_days: u64,
+        key: [u8; 32],
     ) {
         let conn = match rusqlite::Connection::open(db_path) {
             Ok(c) => c,
@@ -911,6 +1531,17 @@ impl SqliteAuditSink {
 
         // WAL mode for better concurrent read performance.
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
+
+        // Chain head: the last written record's hash, or genesis for an empty log.
+        let mut last_hash: String = conn
+            .query_row(
+                "SELECT record_hash FROM audit_events ORDER BY rowid DESC LIMIT 1",
+                [],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| CHAIN_GENESIS.to_string());
 
         let mut batch = Vec::with_capacity(64);
         let mut next_retention_cleanup = std::time::Instant::now() + RETENTION_CLEANUP_INTERVAL;
@@ -938,7 +1569,7 @@ impl SqliteAuditSink {
                         }
                     }
 
-                    if let Err(e) = Self::insert_batch(&conn, &batch) {
+                    if let Err(e) = Self::insert_batch(&conn, &batch, &key, &mut last_hash) {
                         tracing::error!("audit writer insert failed: {e}");
                     }
                     batch.clear();
@@ -956,6 +1587,25 @@ impl SqliteAuditSink {
                                 retention_days,
                                 "audit retention cleanup removed expired rows"
                             );
+                            // Retention removed rows from the front of the chain;
+                            // re-anchor the remaining rows and reset the head so the
+                            // next write chains correctly (and verify does not report
+                            // a false-positive break).
+                            if let Err(e) = backfill_chain(&conn, &key) {
+                                tracing::error!(
+                                    "audit chain re-anchor after retention failed: {e}"
+                                );
+                            } else {
+                                last_hash = conn
+                                    .query_row(
+                                        "SELECT record_hash FROM audit_events ORDER BY rowid DESC LIMIT 1",
+                                        [],
+                                        |r| r.get::<_, Option<String>>(0),
+                                    )
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or_else(|| CHAIN_GENESIS.to_string());
+                            }
                         }
                     }
                     Err(e) => {
@@ -979,6 +1629,12 @@ impl SqliteAuditSink {
         conn: &rusqlite::Connection,
         retention_days: u64,
     ) -> Result<usize, rusqlite::Error> {
+        // SECURITY (M23): retention_days = 0 means "keep forever", never "delete
+        // everything". Guard against a config value (user-writable) that would
+        // otherwise wipe the entire audit trail at startup.
+        if retention_days == 0 {
+            return Ok(0);
+        }
         let cutoff_ms = Self::retention_cutoff_ms(retention_days);
         conn.execute(
             "DELETE FROM audit_events WHERE ts_utc_ms < ?1",
@@ -990,6 +1646,8 @@ impl SqliteAuditSink {
     fn insert_batch(
         conn: &rusqlite::Connection,
         events: &[AuditEvent],
+        key: &[u8; 32],
+        last_hash: &mut String,
     ) -> Result<(), rusqlite::Error> {
         let tx = conn.unchecked_transaction()?;
         {
@@ -998,10 +1656,12 @@ impl SqliteAuditSink {
                     event_id, sequence_number, ts_utc_ms, level, kind,
                     request_id, approval_id, client_json, operation, safety,
                     target_json, outcome, latency_ms, secret_names,
-                    policy_decision, detail, workspace_json, request_hash
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                    policy_decision, detail, workspace_json, request_hash,
+                    approver_json, record_hash
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             )?;
 
+            let mut last_seq: Option<i64> = None;
             for event in events {
                 let client_json = event
                     .client
@@ -1021,15 +1681,48 @@ impl SqliteAuditSink {
                     .workspace
                     .as_ref()
                     .and_then(|w| serde_json::to_string(w).ok());
+                let approver_json = event
+                    .approver
+                    .as_ref()
+                    .and_then(|a| serde_json::to_string(a).ok());
 
-                stmt.execute(rusqlite::params![
-                    event.event_id.to_string(),
+                // Chain this record to the current head over its canonical form.
+                let event_id = event.event_id.to_string();
+                let level = event.level.to_string();
+                let kind = event.kind.to_string();
+                let request_id = event.request_id.map(|u| u.to_string());
+                let approval_id = event.approval_id.map(|u| u.to_string());
+                let mut canon = canonical_record(
+                    &event_id,
+                    event.sequence_number as i64,
+                    event.ts_utc_ms,
+                    &level,
+                    &kind,
+                    request_id.as_deref(),
+                    approval_id.as_deref(),
+                    client_json.as_deref(),
+                    event.operation.as_deref(),
+                    safety_str.as_deref(),
+                    target_json.as_deref(),
+                    event.outcome.as_deref(),
+                    event.latency_ms,
+                    secret_names_str.as_deref(),
+                    event.policy_decision.as_deref(),
+                    event.detail.as_deref(),
+                    workspace_json.as_deref(),
+                    event.request_hash.as_deref(),
+                );
+                append_optional_chained_field(&mut canon, approver_json.as_deref());
+                let record_hash = chain_hash(key, last_hash, &canon);
+
+                let changed = stmt.execute(rusqlite::params![
+                    event_id,
                     event.sequence_number,
                     event.ts_utc_ms,
-                    event.level.to_string(),
-                    event.kind.to_string(),
-                    event.request_id.map(|u| u.to_string()),
-                    event.approval_id.map(|u| u.to_string()),
+                    level,
+                    kind,
+                    request_id,
+                    approval_id,
                     client_json,
                     event.operation,
                     safety_str,
@@ -1041,7 +1734,20 @@ impl SqliteAuditSink {
                     event.detail,
                     workspace_json,
                     event.request_hash,
+                    approver_json,
+                    record_hash,
                 ])?;
+                // Only advance the head if the row was actually inserted (a
+                // duplicate event_id is IGNOREd and must not shift the chain).
+                if changed > 0 {
+                    *last_hash = record_hash;
+                    last_seq = Some(event.sequence_number as i64);
+                }
+            }
+            // Record the tail anchor in the same transaction so verification can
+            // detect truncation of the newest records.
+            if let Some(seq) = last_seq {
+                set_chain_head(&tx, last_hash, seq)?;
             }
         }
         tx.commit()?;
@@ -1284,6 +1990,12 @@ fn row_to_audit_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditEvent> {
 
     let request_hash: Option<String> = row.get("request_hash")?;
 
+    // Absent on databases created before Phase 1 — treat missing column as None.
+    let approver: Option<ApproverIdentity> = row
+        .get::<_, Option<String>>("approver_json")
+        .unwrap_or(None)
+        .and_then(|s| serde_json::from_str(&s).ok());
+
     Ok(AuditEvent {
         event_id,
         sequence_number,
@@ -1303,6 +2015,7 @@ fn row_to_audit_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditEvent> {
         detail,
         workspace,
         request_hash,
+        approver,
     })
 }
 
@@ -1501,6 +2214,7 @@ mod tests {
             exe_sha256_prefix: Some("aabb".into()),
             codesign_team_id: None,
             client_type: ClientType::Agent,
+            principal: None,
         };
         let target = TargetSummary {
             fields: {
@@ -1548,6 +2262,7 @@ mod tests {
             approval_requirement: ApprovalRequirement::Never,
             lease_ttl: None,
             one_time: false,
+            require_distinct_approver: false,
             matched_rule: Some("deny-rule".into()),
             denial_reason: Some("denied".into()),
         };
@@ -1872,6 +2587,219 @@ mod tests {
         let _ = std::fs::remove_file(&db_path);
     }
 
+    // -- Tamper-evident hash chain --
+
+    #[test]
+    fn audit_chain_verifies_clean_log() {
+        let db_path = temp_db_path();
+        let sink = SqliteAuditSink::new(db_path.clone(), 90).unwrap();
+        sink.emit(make_test_event(AuditEventKind::RequestReceived));
+        sink.emit(make_test_event(AuditEventKind::OperationStarted));
+        sink.emit(make_test_event(AuditEventKind::OperationSucceeded));
+        drop(sink); // flush + join writer
+
+        let v = verify_audit_chain(&db_path).unwrap();
+        assert!(v.ok, "clean log should verify: {:?}", v.detail);
+        assert_eq!(v.records_checked, 3);
+        assert!(v.first_bad_sequence.is_none());
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(hmac_key_path(&db_path));
+    }
+
+    #[test]
+    fn audit_chain_survives_daemon_restart() {
+        // REGRESSION (found by the trust-domain e2e): the sink used to reset
+        // its sequence counter to 0 on every open, so a restarted daemon
+        // wrote duplicate sequence numbers into the chain and verification —
+        // which orders by sequence — read the log as scrambled.
+        let db_path = temp_db_path();
+
+        let sink = SqliteAuditSink::new(db_path.clone(), 90).unwrap();
+        sink.emit(make_test_event(AuditEventKind::RequestReceived));
+        sink.emit(make_test_event(AuditEventKind::OperationSucceeded));
+        drop(sink); // daemon shutdown
+
+        // Daemon restart: a fresh sink over the same database.
+        let sink = SqliteAuditSink::new(db_path.clone(), 90).unwrap();
+        sink.emit(make_test_event(AuditEventKind::RequestReceived));
+        sink.emit(make_test_event(AuditEventKind::OperationSucceeded));
+        drop(sink);
+
+        // Sequences must be strictly increasing across the restart…
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let seqs: Vec<i64> = conn
+            .prepare("SELECT sequence_number FROM audit_events ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(seqs, vec![0, 1, 2, 3], "restart must resume numbering");
+        drop(conn);
+
+        // …and the chain must verify end to end.
+        let v = verify_audit_chain(&db_path).unwrap();
+        assert!(v.ok, "restarted log must verify: {:?}", v.detail);
+        assert_eq!(v.records_checked, 4);
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(hmac_key_path(&db_path));
+    }
+
+    #[test]
+    fn audit_chain_detects_row_tamper() {
+        let db_path = temp_db_path();
+        let sink = SqliteAuditSink::new(db_path.clone(), 90).unwrap();
+        sink.emit(make_test_event(AuditEventKind::RequestReceived).with_outcome("ok"));
+        sink.emit(make_test_event(AuditEventKind::PolicyDenied).with_outcome("denied"));
+        sink.emit(make_test_event(AuditEventKind::OperationSucceeded).with_outcome("ok"));
+        drop(sink);
+
+        // Tamper: rewrite a denial to look successful, leaving record_hash untouched.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE audit_events SET outcome = 'ok' WHERE outcome = 'denied'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let v = verify_audit_chain(&db_path).unwrap();
+        assert!(!v.ok, "tampered log must fail verification");
+        assert!(v.first_bad_sequence.is_some());
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(hmac_key_path(&db_path));
+    }
+
+    #[test]
+    fn audit_chain_detects_row_deletion() {
+        let db_path = temp_db_path();
+        let sink = SqliteAuditSink::new(db_path.clone(), 90).unwrap();
+        sink.emit(make_test_event(AuditEventKind::RequestReceived));
+        sink.emit(make_test_event(AuditEventKind::PolicyDenied));
+        sink.emit(make_test_event(AuditEventKind::OperationSucceeded));
+        drop(sink);
+
+        // Delete the middle record — the following record no longer chains.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute("DELETE FROM audit_events WHERE kind = 'policy.denied'", [])
+                .unwrap();
+        }
+
+        let v = verify_audit_chain(&db_path).unwrap();
+        assert!(!v.ok, "deletion must be detected");
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(hmac_key_path(&db_path));
+    }
+
+    #[test]
+    fn retention_zero_keeps_all() {
+        let db_path = temp_db_path();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        // Insert an ancient row directly.
+        conn.execute(
+            "INSERT INTO audit_events (event_id, sequence_number, ts_utc_ms, level, kind)
+             VALUES ('e1', 1, 1, 'info', 'request.received')",
+            [],
+        )
+        .unwrap();
+
+        // M23: retention_days = 0 means keep forever, never wipe everything.
+        let deleted = SqliteAuditSink::run_retention_cleanup(&conn, 0).unwrap();
+        assert_eq!(deleted, 0);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM audit_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "retention_days=0 must not delete anything");
+
+        // A positive retention with an ancient cutoff still removes the old row.
+        let deleted = SqliteAuditSink::run_retention_cleanup(&conn, 1).unwrap();
+        assert_eq!(deleted, 1);
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn retention_front_deletion_breaks_then_rechain_restores() {
+        // A chain is written, then the oldest row is removed (as retention does).
+        // Front-deletion breaks verification (so an attacker's front-deletion is
+        // caught); re-anchoring — what the writer does after retention — restores a
+        // valid chain so retention itself does not raise a false positive.
+        let db_path = temp_db_path();
+        {
+            let sink = SqliteAuditSink::new(db_path.clone(), 90).unwrap();
+            sink.emit(make_test_event(AuditEventKind::RequestReceived));
+            sink.emit(make_test_event(AuditEventKind::OperationStarted));
+            sink.emit(make_test_event(AuditEventKind::OperationSucceeded));
+            drop(sink);
+        }
+        let key = load_or_create_hmac_key(&db_path).unwrap();
+
+        // Simulate retention deleting the oldest row (front of the chain).
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute(
+                "DELETE FROM audit_events WHERE rowid = (SELECT MIN(rowid) FROM audit_events)",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(
+            !verify_audit_chain(&db_path).unwrap().ok,
+            "front-deletion without re-anchor must break the chain"
+        );
+
+        // Re-anchor (as the writer does after retention) restores validity.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            backfill_chain(&conn, &key).unwrap();
+        }
+        assert!(
+            verify_audit_chain(&db_path).unwrap().ok,
+            "re-anchoring after retention must restore a valid chain"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(hmac_key_path(&db_path));
+    }
+
+    #[test]
+    fn audit_chain_detects_tail_truncation() {
+        // Deleting the newest records leaves a valid shorter chain, which the chain
+        // walk alone cannot catch — the head anchor detects it.
+        let db_path = temp_db_path();
+        {
+            let sink = SqliteAuditSink::new(db_path.clone(), 90).unwrap();
+            sink.emit(make_test_event(AuditEventKind::RequestReceived));
+            sink.emit(make_test_event(AuditEventKind::OperationStarted));
+            sink.emit(make_test_event(AuditEventKind::OperationSucceeded));
+            drop(sink);
+        }
+        // Attacker truncates the newest record.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute(
+                "DELETE FROM audit_events WHERE rowid = (SELECT MAX(rowid) FROM audit_events)",
+                [],
+            )
+            .unwrap();
+        }
+        let v = verify_audit_chain(&db_path).unwrap();
+        assert!(
+            !v.ok,
+            "tail truncation must be detected via the head anchor"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(hmac_key_path(&db_path));
+    }
+
     #[test]
     fn sqlite_query_filter_by_operation() {
         let db_path = temp_db_path();
@@ -2100,6 +3028,7 @@ mod tests {
             exe_sha256_prefix: Some("aabb".into()),
             codesign_team_id: None,
             client_type: ClientType::Human,
+            principal: None,
         };
         let target = TargetSummary {
             fields: {
@@ -2495,5 +3424,296 @@ mod tests {
             default_level_for_kind(AuditEventKind::ExecvePrompted),
             AuditLevel::Info
         );
+    }
+
+    // -- Phase 1: approver identity + presence-versioned canon --------------
+
+    fn test_approver() -> ApproverIdentity {
+        ApproverIdentity {
+            principal_id: "hum_0123456789abcdef0123456789abcdef".into(),
+            label: "dev@example.com".into(),
+            source: ApproverSource::LocalBioSession,
+        }
+    }
+
+    /// Build a database exactly the way a pre-Phase-1 daemon did: no
+    /// approver_json column, rows hashed over the original 18-field canon.
+    fn seed_pre_phase1_db(db_path: &Path, rows: usize) {
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE audit_events (
+                event_id TEXT PRIMARY KEY,
+                sequence_number INTEGER NOT NULL,
+                ts_utc_ms INTEGER NOT NULL,
+                level TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                request_id TEXT, approval_id TEXT, client_json TEXT,
+                operation TEXT, safety TEXT, target_json TEXT, outcome TEXT,
+                latency_ms INTEGER, secret_names TEXT, policy_decision TEXT,
+                detail TEXT, workspace_json TEXT, request_hash TEXT,
+                record_hash TEXT
+            );
+            CREATE TABLE chain_head (
+                id INTEGER PRIMARY KEY CHECK (id = 0),
+                last_hash TEXT NOT NULL,
+                last_sequence INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        let key = load_or_create_hmac_key(db_path).unwrap();
+        let mut prev = CHAIN_GENESIS.to_string();
+        for i in 0..rows {
+            let event_id = Uuid::new_v4().to_string();
+            let canon = canonical_record(
+                &event_id,
+                i as i64,
+                1_000 + i as i64,
+                "info",
+                "request.received",
+                None,
+                None,
+                None,
+                Some("legacy.op"),
+                None,
+                None,
+                Some("ok"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            let h = chain_hash(&key, &prev, &canon);
+            conn.execute(
+                "INSERT INTO audit_events (event_id, sequence_number, ts_utc_ms,
+                    level, kind, operation, outcome, record_hash)
+                 VALUES (?1, ?2, ?3, 'info', 'request.received', 'legacy.op', 'ok', ?4)",
+                rusqlite::params![event_id, i as i64, 1_000 + i as i64, h],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chain_head (id, last_hash, last_sequence) VALUES (0, ?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET last_hash = ?1, last_sequence = ?2",
+                rusqlite::params![h, i as i64],
+            )
+            .unwrap();
+            prev = h;
+        }
+    }
+
+    #[test]
+    fn approver_rows_chain_and_roundtrip() {
+        let db_path = temp_db_path();
+        let sink = SqliteAuditSink::new(db_path.clone(), 90).unwrap();
+        sink.emit(make_test_event(AuditEventKind::ApprovalGranted).with_approver(test_approver()));
+        sink.emit(make_test_event(AuditEventKind::OperationSucceeded));
+        drop(sink);
+
+        let v = verify_audit_chain(&db_path).unwrap();
+        assert!(v.ok, "chain with approver rows must verify: {:?}", v.detail);
+
+        let events = query_audit_db(&db_path, &AuditFilter::default()).unwrap();
+        let approved = events
+            .iter()
+            .find(|e| e.kind == AuditEventKind::ApprovalGranted)
+            .unwrap();
+        let approver = approved.approver.as_ref().expect("approver stored");
+        assert_eq!(approver.label, "dev@example.com");
+        assert_eq!(approver.source, ApproverSource::LocalBioSession);
+        assert!(
+            events
+                .iter()
+                .find(|e| e.kind == AuditEventKind::OperationSucceeded)
+                .unwrap()
+                .approver
+                .is_none()
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(hmac_key_path(&db_path));
+    }
+
+    #[test]
+    fn pre_phase1_db_verifies_and_extends_without_backfill() {
+        let db_path = temp_db_path();
+        seed_pre_phase1_db(&db_path, 3);
+
+        // Standalone verify on the untouched old database (read-only path).
+        let v = verify_audit_chain(&db_path).unwrap();
+        assert!(v.ok, "pre-Phase-1 db must verify as-is: {:?}", v.detail);
+        assert_eq!(v.records_checked, 3);
+
+        // Snapshot old hashes, then open with the new sink (migrates: adds
+        // the approver column, must NOT rewrite existing record hashes).
+        let old_hashes: Vec<String> = {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let mut stmt = conn
+                .prepare("SELECT record_hash FROM audit_events ORDER BY rowid")
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+
+        let sink = SqliteAuditSink::new(db_path.clone(), 0).unwrap();
+        sink.emit(make_test_event(AuditEventKind::ApprovalGranted).with_approver(test_approver()));
+        drop(sink);
+
+        let new_hashes: Vec<String> = {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let mut stmt = conn
+                .prepare("SELECT record_hash FROM audit_events ORDER BY rowid LIMIT 3")
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            old_hashes, new_hashes,
+            "migration must not rewrite pre-existing record hashes (no backfill)"
+        );
+
+        // Mixed chain (3 legacy rows + 1 approver row) verifies end to end.
+        let v = verify_audit_chain(&db_path).unwrap();
+        assert!(v.ok, "mixed old/new chain must verify: {:?}", v.detail);
+        assert_eq!(v.records_checked, 4);
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(hmac_key_path(&db_path));
+    }
+
+    #[test]
+    fn tampered_approver_detected_in_all_permutations() {
+        // Permutation 1: edit the approver on a new row.
+        let db_path = temp_db_path();
+        let sink = SqliteAuditSink::new(db_path.clone(), 90).unwrap();
+        sink.emit(make_test_event(AuditEventKind::ApprovalGranted).with_approver(test_approver()));
+        drop(sink);
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE audit_events SET approver_json =
+                    replace(approver_json, 'dev@example.com', 'evil@example.com')",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(
+            !verify_audit_chain(&db_path).unwrap().ok,
+            "edited approver must break the chain"
+        );
+
+        // Permutation 2: strip the approver from that row (NULL it out).
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute("UPDATE audit_events SET approver_json = NULL", [])
+                .unwrap();
+        }
+        assert!(
+            !verify_audit_chain(&db_path).unwrap().ok,
+            "removed approver must break the chain"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(hmac_key_path(&db_path));
+
+        // Permutation 3: inject an approver into a legacy (pre-Phase-1) row
+        // after the column migration.
+        let db_path = temp_db_path();
+        seed_pre_phase1_db(&db_path, 2);
+        let sink = SqliteAuditSink::new(db_path.clone(), 0).unwrap();
+        drop(sink); // migration only
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE audit_events SET approver_json = '{\"principal_id\":\"hum_x\",\
+                 \"label\":\"fake\",\"source\":\"local_bio_session\"}'
+                 WHERE sequence_number = 0",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(
+            !verify_audit_chain(&db_path).unwrap().ok,
+            "approver injected into a legacy row must break the chain"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(hmac_key_path(&db_path));
+    }
+
+    #[test]
+    fn client_summary_principal_serde_compat() {
+        // Old client_json (no principal key) still deserializes.
+        let old = r#"{"uid":501,"gid":20,"pid":1,"exe_path":null,
+            "exe_sha256_prefix":null,"codesign_team_id":null,"client_type":"agent"}"#;
+        let summary: ClientSummary = serde_json::from_str(old).unwrap();
+        assert!(summary.principal.is_none());
+
+        // Without a principal the serialized form has no principal key at all
+        // (byte-stability for the chain).
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(!json.contains("principal"));
+
+        // With a principal it roundtrips.
+        use crate::identity::{AccessMode, PrincipalContext, PrincipalId};
+        let ctx = PrincipalContext {
+            sub: PrincipalId::parse("hum_0123456789abcdef0123456789abcdef").unwrap(),
+            sub_label: "dev@example.com".into(),
+            sub_roles: [crate::identity::Role::Operator].into_iter().collect(),
+            act: PrincipalId::parse("agt_0123456789abcdef0123456789abcdef").unwrap(),
+            act_label: "agent:claude-code".into(),
+            mode: AccessMode::Delegated,
+            jti: "sess-1".into(),
+            human_session_id: None,
+        };
+        let with = summary.with_principal(&ctx);
+        let json = serde_json::to_string(&with).unwrap();
+        let back: ClientSummary = serde_json::from_str(&json).unwrap();
+        let p = back.principal.unwrap();
+        assert_eq!(p.sub_label, "dev@example.com");
+        assert_eq!(p.mode, "delegated");
+        assert_eq!(p.sub_roles, vec!["operator"]);
+    }
+
+    #[test]
+    fn retention_reanchors_chain_with_approver_rows() {
+        let db_path = temp_db_path();
+        {
+            let sink = SqliteAuditSink::new(db_path.clone(), 90).unwrap();
+            sink.emit(
+                make_test_event(AuditEventKind::ApprovalGranted).with_approver(test_approver()),
+            );
+            sink.emit(make_test_event(AuditEventKind::OperationSucceeded));
+            drop(sink);
+        }
+        // Age the first row far past retention, then reopen (runs cleanup +
+        // re-anchor through the v2 canon path).
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE audit_events SET ts_utc_ms = 1000 WHERE sequence_number = 0",
+                [],
+            )
+            .unwrap();
+        }
+        // The aged row breaks the chain (expected: timestamps are chained).
+        assert!(!verify_audit_chain(&db_path).unwrap().ok);
+        {
+            // Reopen with 1-day retention: the aged row is deleted and the
+            // remaining approver-less row is re-anchored.
+            let sink = SqliteAuditSink::new(db_path.clone(), 1).unwrap();
+            sink.emit(
+                make_test_event(AuditEventKind::ApprovalGranted).with_approver(test_approver()),
+            );
+            drop(sink);
+        }
+        let v = verify_audit_chain(&db_path).unwrap();
+        assert!(v.ok, "re-anchored chain must verify: {:?}", v.detail);
+        assert_eq!(v.records_checked, 2);
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(hmac_key_path(&db_path));
     }
 }

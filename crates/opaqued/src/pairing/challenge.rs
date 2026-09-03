@@ -13,8 +13,9 @@ use thiserror::Error;
 use super::store;
 use super::store::PairedDevice;
 
-/// An approval challenge sent to a paired iOS device.
-#[derive(Debug, Clone)]
+/// An approval challenge sent to a paired iOS device. Serializable so the
+/// approval server can hand the device the exact fields it must sign.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ApprovalChallenge {
     /// Stable daemon/server UUID.
     pub server_id: String,
@@ -78,17 +79,53 @@ pub fn hash_operation_summary(summary: &str) -> String {
     result.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The bytes a device signs for a DECISION on a challenge: the challenge
+/// fields plus a length-prefixed decision tag, hashed together.
+///
+/// Binding the decision into the signed bytes matters: were the signature
+/// over the challenge alone, anyone holding a signed *reject* (a relay, a
+/// token-holder) could resubmit it as an *approve* — same challenge, same
+/// valid signature, flipped meaning.
+pub fn decision_bytes(challenge: &ApprovalChallenge, approve: bool) -> Vec<u8> {
+    let mut buf = Vec::new();
+
+    fn append_field(buf: &mut Vec<u8>, data: &[u8]) {
+        let len = data.len() as u32;
+        buf.extend_from_slice(&len.to_le_bytes());
+        buf.extend_from_slice(data);
+    }
+
+    append_field(&mut buf, challenge.server_id.as_bytes());
+    append_field(&mut buf, challenge.request_id.as_bytes());
+    append_field(&mut buf, challenge.operation_summary_hash.as_bytes());
+    append_field(&mut buf, &challenge.expires_at.to_le_bytes());
+    append_field(
+        &mut buf,
+        if approve {
+            b"opaque-approve"
+        } else {
+            b"opaque-reject"
+        },
+    );
+
+    let mut hasher = Sha256::new();
+    hasher.update(&buf);
+    hasher.finalize().to_vec()
+}
+
 /// Verify a signed challenge response from a paired device.
 ///
 /// Checks that:
 /// 1. The device is not revoked
 /// 2. The challenge has not expired
-/// 3. The Ed25519 signature is valid over the challenge bytes
+/// 3. The Ed25519 signature is valid over the decision bytes (challenge +
+///    approve/reject tag — see [`decision_bytes`])
 pub fn verify_challenge_response(
     challenge: &ApprovalChallenge,
     signature_bytes: &[u8],
     device: &PairedDevice,
     current_time: i64,
+    approve: bool,
 ) -> Result<(), ChallengeError> {
     // Check device revocation
     if device.revoked {
@@ -100,8 +137,7 @@ pub fn verify_challenge_response(
         return Err(ChallengeError::Expired);
     }
 
-    // Reconstruct challenge bytes
-    let challenge_bytes = construct_challenge_bytes(challenge);
+    let signed = decision_bytes(challenge, approve);
 
     // Parse signature
     let signature =
@@ -114,7 +150,7 @@ pub fn verify_challenge_response(
 
     // Verify signature
     verifying_key
-        .verify(&challenge_bytes, &signature)
+        .verify(&signed, &signature)
         .map_err(|_| ChallengeError::InvalidSignature)
 }
 
@@ -142,6 +178,9 @@ mod tests {
             paired_at: 1700000000,
             last_seen: None,
             revoked,
+            paired_by: None,
+            token_sha256: None,
+            confirmed: true,
         }
     }
 
@@ -196,10 +235,10 @@ mod tests {
         let device = make_test_device(&verifying_key, false);
         let challenge = make_test_challenge();
 
-        // Sign the challenge
-        let challenge_bytes = construct_challenge_bytes(&challenge);
+        // Sign the decision (challenge + approve tag)
+        let signed = decision_bytes(&challenge, true);
         use ed25519_dalek::Signer;
-        let signature = signing_key.sign(&challenge_bytes);
+        let signature = signing_key.sign(&signed);
 
         // Verify should succeed
         let result = verify_challenge_response(
@@ -207,8 +246,20 @@ mod tests {
             &signature.to_bytes(),
             &device,
             1700000500, // before expiry
+            true,
         );
         assert!(result.is_ok());
+
+        // The SAME signature must not verify as the OPPOSITE decision:
+        // a relayed signed-reject can never be replayed as an approve.
+        let flipped = verify_challenge_response(
+            &challenge,
+            &signature.to_bytes(),
+            &device,
+            1700000500,
+            false,
+        );
+        assert!(matches!(flipped, Err(ChallengeError::InvalidSignature)));
     }
 
     #[test]
@@ -219,12 +270,17 @@ mod tests {
 
         // Use a signature from a different key
         let (other_key, _) = make_test_keypair();
-        let challenge_bytes = construct_challenge_bytes(&challenge);
+        let signed = decision_bytes(&challenge, true);
         use ed25519_dalek::Signer;
-        let bad_signature = other_key.sign(&challenge_bytes);
+        let bad_signature = other_key.sign(&signed);
 
-        let result =
-            verify_challenge_response(&challenge, &bad_signature.to_bytes(), &device, 1700000500);
+        let result = verify_challenge_response(
+            &challenge,
+            &bad_signature.to_bytes(),
+            &device,
+            1700000500,
+            true,
+        );
         assert!(matches!(result, Err(ChallengeError::InvalidSignature)));
     }
 
@@ -234,9 +290,9 @@ mod tests {
         let device = make_test_device(&verifying_key, false);
         let challenge = make_test_challenge();
 
-        let challenge_bytes = construct_challenge_bytes(&challenge);
+        let signed = decision_bytes(&challenge, true);
         use ed25519_dalek::Signer;
-        let signature = signing_key.sign(&challenge_bytes);
+        let signature = signing_key.sign(&signed);
 
         // Current time after expiry
         let result = verify_challenge_response(
@@ -244,6 +300,7 @@ mod tests {
             &signature.to_bytes(),
             &device,
             1700002000, // after expires_at
+            true,
         );
         assert!(matches!(result, Err(ChallengeError::Expired)));
     }
@@ -254,12 +311,12 @@ mod tests {
         let device = make_test_device(&verifying_key, true); // revoked
         let challenge = make_test_challenge();
 
-        let challenge_bytes = construct_challenge_bytes(&challenge);
+        let signed = decision_bytes(&challenge, true);
         use ed25519_dalek::Signer;
-        let signature = signing_key.sign(&challenge_bytes);
+        let signature = signing_key.sign(&signed);
 
         let result =
-            verify_challenge_response(&challenge, &signature.to_bytes(), &device, 1700000500);
+            verify_challenge_response(&challenge, &signature.to_bytes(), &device, 1700000500, true);
         assert!(matches!(result, Err(ChallengeError::DeviceRevoked)));
     }
 

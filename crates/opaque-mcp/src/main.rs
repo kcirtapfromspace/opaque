@@ -241,7 +241,10 @@ async fn handle_tools_call(
             // Sanitize the error to prevent leaking filesystem paths or
             // credentials embedded in connection strings to the LLM context.
             let sanitizer = opaque_core::sanitize::Sanitizer::new();
-            let error_text = format!("Failed to communicate with opaqued: {}", sanitizer.scrub_error(&e.to_string()));
+            let error_text = format!(
+                "Failed to communicate with opaqued: {}",
+                sanitizer.scrub_error(&e.to_string())
+            );
             JsonRpcResponse::ok(
                 id,
                 json!({
@@ -308,7 +311,7 @@ fn handle_secrets_status(
     }
 }
 
-/// Format a sandbox exec daemon response into MCP content items with stdout/stderr.
+/// Format a sandbox exec daemon response into MCP content items (metadata only).
 fn format_sandbox_exec_response(
     id: Option<serde_json::Value>,
     result: Option<serde_json::Value>,
@@ -338,18 +341,21 @@ fn format_sandbox_exec_response(
     }
     content.push(json!({"type": "text", "text": meta}));
 
-    // Add stdout as a text content item if present and non-empty.
-    if let Some(stdout) = val.get("stdout").and_then(|v| v.as_str())
-        && !stdout.is_empty()
-    {
-        content.push(json!({"type": "text", "text": format!("--- stdout ---\n{stdout}")}));
-    }
-
-    // Add stderr as a text content item if present and non-empty.
-    if let Some(stderr) = val.get("stderr").and_then(|v| v.as_str())
-        && !stderr.is_empty()
-    {
-        content.push(json!({"type": "text", "text": format!("--- stderr ---\n{stderr}")}));
+    // SECURITY (C2): never forward stdout/stderr *content* to the LLM. The daemon
+    // returns only lengths, and even if a future change re-added content, this
+    // boundary must not relay command output — it may contain secrets the command
+    // printed. Only exit code and length metadata cross to the model.
+    let stdout_len = val
+        .get("stdout_length")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let stderr_len = val
+        .get("stderr_length")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if stdout_len > 0 || stderr_len > 0 {
+        content.push(json!({"type": "text", "text":
+            format!("output withheld — stdout: {stdout_len} bytes, stderr: {stderr_len} bytes")}));
     }
 
     let is_error = exit_code != 0;
@@ -595,8 +601,14 @@ mod tests {
                 .contains("duration: 1234ms")
         );
 
-        // Second item is stdout.
-        assert!(content[1]["text"].as_str().unwrap().contains("all passed"));
+        // Second item is a length-only "withheld" note — never the content.
+        assert!(content[1]["text"].as_str().unwrap().contains("withheld"));
+        assert!(
+            !content
+                .iter()
+                .any(|c| c["text"].as_str().unwrap_or("").contains("all passed")),
+            "stdout content must never reach the LLM"
+        );
 
         // isError should not be set for exit_code 0.
         assert!(r.get("isError").is_none());
@@ -621,9 +633,15 @@ mod tests {
         assert_eq!(r["isError"], true);
 
         let content = r["content"].as_array().unwrap();
-        // Metadata + stderr (stdout is empty so not included).
+        // Metadata + a length-only "withheld" note; never the stderr content.
         assert_eq!(content.len(), 2);
-        assert!(content[1]["text"].as_str().unwrap().contains("error"));
+        assert!(content[1]["text"].as_str().unwrap().contains("withheld"));
+        assert!(
+            !content
+                .iter()
+                .any(|c| c["text"].as_str().unwrap_or("").contains("error")),
+            "stderr content must never reach the LLM"
+        );
     }
 
     #[test]

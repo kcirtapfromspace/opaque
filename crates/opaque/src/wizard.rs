@@ -430,11 +430,13 @@ pub fn generate_config(providers: &[DetectedProvider], options: &WizardOptions) 
     out.push_str("# Rules are evaluated in order; the first matching rule wins.\n");
     out.push_str("# Default behavior is deny-all (no rules = nothing is permitted).\n\n");
 
-    // Known human clients — detect common shells.
-    out.push_str("# ---- Known human clients ----\n\n");
-    out.push_str("[[known_human_clients]]\n");
-    out.push_str("name = \"opaque-cli\"\n");
-    out.push_str("exe_path = \"**/opaque\"\n\n");
+    // Known human clients: none are added by default. Client classification is
+    // audit-only — an agent drives the same signed CLI a human does, so a human
+    // entry only labels audit records; it grants no bypass. Operators may add
+    // known-human-client entries manually if they want that labeling.
+    out.push_str("# ---- Known human clients ----\n");
+    out.push_str("# None by default: classification is audit-only, not a security\n");
+    out.push_str("# boundary. Add a known-human-client entry only for audit labeling.\n\n");
 
     // Agent reveal deny rule.
     if options.block_agent_reveal {
@@ -752,12 +754,20 @@ pub fn run_interactive(base_dir: &Path, force: bool) -> Result<(), String> {
         ),
         format!(
             "Biometric:  {}",
-            if options.require_biometric { "required (first_use)" } else { "disabled" }
+            if options.require_biometric {
+                "required (first_use)"
+            } else {
+                "disabled"
+            }
         ),
         format!("Lease TTL:  {}s", options.lease_ttl),
         format!(
             "Agent reveal: {}",
-            if options.block_agent_reveal { "blocked" } else { "allowed" }
+            if options.block_agent_reveal {
+                "blocked"
+            } else {
+                "allowed"
+            }
         ),
         format!("Config path: {}", config_path.display()),
     ];
@@ -824,9 +834,30 @@ pub fn run_interactive(base_dir: &Path, force: bool) -> Result<(), String> {
     ui::divider();
     println!();
     ui::info("Next steps:");
-    ui::step(1, 3, &format!("Start the daemon:  {}", console::style("opaque service install").cyan()));
-    ui::step(2, 3, &format!("Seal your config:  {}", console::style("opaque setup --seal").cyan()));
-    ui::step(3, 3, &format!("Test the setup:    {}", console::style("opaque ping").cyan()));
+    ui::step(
+        1,
+        3,
+        &format!(
+            "Start the daemon:  {}",
+            console::style("opaque service install").cyan()
+        ),
+    );
+    ui::step(
+        2,
+        3,
+        &format!(
+            "Seal your config:  {}",
+            console::style("opaque setup --seal").cyan()
+        ),
+    );
+    ui::step(
+        3,
+        3,
+        &format!(
+            "Test the setup:    {}",
+            console::style("opaque ping").cyan()
+        ),
+    );
     println!();
 
     Ok(())
@@ -838,7 +869,10 @@ pub fn run_detect_only() {
 
     let env = RealEnvironment;
 
-    ui::banner("Opaque Environment Detection", "Scanning for providers and AI tools");
+    ui::banner(
+        "Opaque Environment Detection",
+        "Scanning for providers and AI tools",
+    );
 
     ui::step(1, 2, "Detecting secret providers...");
     println!();
@@ -1467,10 +1501,11 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_config_has_known_human_clients() {
+    fn test_generate_config_adds_no_auto_human_clients() {
+        // Software-first: nothing is auto-classified Human; the default config must
+        // not ship a [[known_human_clients]] entry (only an explanatory comment).
         let config = generate_config(&[], &WizardOptions::default());
-        assert!(config.contains("[[known_human_clients]]"));
-        assert!(config.contains("name = \"opaque-cli\""));
+        assert!(!config.contains("[[known_human_clients]]"));
     }
 
     #[test]

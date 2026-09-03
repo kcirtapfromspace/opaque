@@ -71,6 +71,7 @@ nav:
       - Web Dashboard: web-dashboard.md
   - Configuration:
       - Policy Engine: policy.md
+      - Identity: identity.md
       - Operations: operations.md
       - Storage: storage.md
       - Deployment: deployment.md

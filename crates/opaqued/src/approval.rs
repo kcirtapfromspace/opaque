@@ -16,7 +16,25 @@ pub enum ApprovalError {
     Failed(String),
 }
 
-pub async fn prompt(reason: &str) -> Result<bool, ApprovalError> {
+/// The account polkit authenticated (Linux helper), when it reports one.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct UnixAccount {
+    pub uid: u32,
+    pub username: String,
+}
+
+/// Outcome of the native prompt.
+///
+/// On Linux the helper reports which account passed polkit (`account`);
+/// macOS `LocalAuthentication` proves device-owner presence but names no
+/// account — callers bind the login-session principal instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptOutcome {
+    Approved { account: Option<UnixAccount> },
+    Denied,
+}
+
+pub async fn prompt(reason: &str) -> Result<PromptOutcome, ApprovalError> {
     let reason = reason.trim();
     if reason.is_empty() {
         return Err(ApprovalError::InvalidReason);
@@ -24,7 +42,13 @@ pub async fn prompt(reason: &str) -> Result<bool, ApprovalError> {
 
     #[cfg(target_os = "macos")]
     {
-        return prompt_macos(reason).await;
+        return prompt_macos(reason).await.map(|approved| {
+            if approved {
+                PromptOutcome::Approved { account: None }
+            } else {
+                PromptOutcome::Denied
+            }
+        });
     }
 
     #[cfg(target_os = "linux")]
@@ -112,9 +136,12 @@ fn prompt_macos_blocking(reason: &str) -> Result<bool, ApprovalError> {
 /// 1. Intent dialog (zenity/kdialog/TTY) showing what the user is approving
 /// 2. Polkit authentication via `pkcheck`
 ///
-/// Exit codes: 0 = approved, 1 = denied, 2 = unavailable.
+/// Exit codes: 0 = approved, 1 = denied, 2 = unavailable. On approval, newer
+/// helpers additionally print `{"account":{"uid":…,"username":"…"}}` on
+/// stdout naming the polkit-authenticated account; older helpers print
+/// nothing and the approval stays account-anonymous.
 #[cfg(target_os = "linux")]
-async fn prompt_linux(reason: &str) -> Result<bool, ApprovalError> {
+async fn prompt_linux(reason: &str) -> Result<PromptOutcome, ApprovalError> {
     let reason = reason.to_string();
     tokio::task::spawn_blocking(move || launch_approve_helper(&reason))
         .await
@@ -122,21 +149,27 @@ async fn prompt_linux(reason: &str) -> Result<bool, ApprovalError> {
 }
 
 #[cfg(target_os = "linux")]
-fn launch_approve_helper(reason: &str) -> Result<bool, ApprovalError> {
+fn launch_approve_helper(reason: &str) -> Result<PromptOutcome, ApprovalError> {
     let helper_path = find_approve_helper()?;
 
     // Inherit daemon's environment — the helper needs DISPLAY, WAYLAND_DISPLAY,
     // DBUS_SESSION_BUS_ADDRESS, XDG_RUNTIME_DIR etc. to display dialogs and
-    // communicate with polkit.
-    let status = std::process::Command::new(&helper_path)
+    // communicate with polkit. Capture stdout for the account report.
+    let output = std::process::Command::new(&helper_path)
         .arg("--reason")
         .arg(reason)
-        .status()
+        // stdin/stderr stay on the daemon's terminal so the helper's TTY
+        // fallback still works; only stdout is captured for the report.
+        .stdin(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .output()
         .map_err(|e| ApprovalError::Failed(format!("failed to launch approval helper: {e}")))?;
 
-    match status.code() {
-        Some(0) => Ok(true),
-        Some(1) => Ok(false),
+    match output.status.code() {
+        Some(0) => Ok(PromptOutcome::Approved {
+            account: parse_helper_account(&output.stdout),
+        }),
+        Some(1) => Ok(PromptOutcome::Denied),
         Some(2) => Err(ApprovalError::Unavailable),
         Some(c) => Err(ApprovalError::Failed(format!(
             "approval helper exited with code {c}"
@@ -145,6 +178,25 @@ fn launch_approve_helper(reason: &str) -> Result<bool, ApprovalError> {
             "approval helper killed by signal".into(),
         )),
     }
+}
+
+/// Parse the helper's optional stdout account report. Anything malformed
+/// degrades to `None` (account-anonymous approval) — the DECISION rides the
+/// exit code alone, so a hostile or broken stdout can never flip it.
+#[cfg(any(target_os = "linux", test))]
+fn parse_helper_account(stdout: &[u8]) -> Option<UnixAccount> {
+    #[derive(serde::Deserialize)]
+    struct HelperReport {
+        account: UnixAccount,
+    }
+    let text = std::str::from_utf8(stdout).ok()?;
+    let line = text.lines().find(|l| l.trim_start().starts_with('{'))?;
+    let report: HelperReport = serde_json::from_str(line.trim()).ok()?;
+    // An empty or absurdly long name is not a usable label.
+    if report.account.username.is_empty() || report.account.username.len() > 256 {
+        return None;
+    }
+    Some(report.account)
 }
 
 /// Locate the `opaque-approve-helper` binary.
@@ -226,6 +278,34 @@ mod tests {
         assert!(map_exit(Some(2)).is_err());
         assert!(map_exit(Some(42)).is_err());
         assert!(map_exit(None).is_err());
+    }
+
+    #[test]
+    fn helper_account_report_parses() {
+        let out = br#"{"account":{"uid":1000,"username":"pat"}}"#;
+        let acct = parse_helper_account(out).unwrap();
+        assert_eq!(acct.uid, 1000);
+        assert_eq!(acct.username, "pat");
+    }
+
+    #[test]
+    fn helper_account_report_tolerates_leading_dialog_noise() {
+        let out = b"zenity chatter\n{\"account\":{\"uid\":7,\"username\":\"svc\"}}\n";
+        assert_eq!(parse_helper_account(out).unwrap().uid, 7);
+    }
+
+    #[test]
+    fn malformed_or_hostile_account_report_degrades_to_anonymous() {
+        assert!(parse_helper_account(b"").is_none());
+        assert!(parse_helper_account(b"not json").is_none());
+        assert!(parse_helper_account(br#"{"account":{"uid":"x"}}"#).is_none());
+        // Empty and oversized usernames are unusable labels.
+        assert!(parse_helper_account(br#"{"account":{"uid":1,"username":""}}"#).is_none());
+        let long = format!(
+            r#"{{"account":{{"uid":1,"username":"{}"}}}}"#,
+            "a".repeat(300)
+        );
+        assert!(parse_helper_account(long.as_bytes()).is_none());
     }
 
     #[cfg(target_os = "linux")]

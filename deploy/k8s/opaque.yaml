@@ -1,0 +1,187 @@
+# Trust-domain split on Kubernetes: daemon and agent as separate containers
+# in one pod, sharing ONLY the socket emptyDir. The custody volume is mounted
+# by the daemon container alone — inside the agent container those paths do
+# not exist. Distinct ServiceAccounts keep the API-plane identities split too.
+#
+# Same principals as the compose deployment:
+#   runAsUser 7381 = opaqued          runAsUser 7382 = agent workload
+#   gid 7999      = socket group (supplementalGroups; no /etc/group needed)
+#
+# Key custody note: this manifest keeps the daemon's signing/seal keys on the
+# custody PVC (keyfile backend). For higher assurance, replace the keyfiles
+# with a KMS-backed or SPIFFE/SPIRE-issued identity: mount a CSI secrets
+# volume into the DAEMON container only, or run a SPIRE agent sidecar and
+# exchange its SVID for the daemon's signing identity. The agent container
+# mounts none of it either way — that invariant is the deployment's point.
+# Remote attestation before trust (verifying the daemon's image/measurement
+# before handing it keys) slots in at the same seam: the KMS/SPIRE release
+# policy checks the pod's attested identity, not a static credential.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: opaque
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: opaqued
+  namespace: opaque
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: opaque-agent
+  namespace: opaque
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: opaque-state
+  namespace: opaque
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+# The sealed daemon config. Seed it with the bootstrap flow (see
+# deploy/docker/bootstrap.sh for the sequence): config.toml + config.seal +
+# config.seal.key, owned by the daemon principal.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: opaque-config
+  namespace: opaque
+type: Opaque
+stringData:
+  config.toml: |
+    require_seal = true
+
+    [trust_domain]
+    enforce = true
+    socket_group = "7999"
+    socket_path = "/run/opaque/opaqued.sock"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opaque
+  namespace: opaque
+  labels:
+    app.kubernetes.io/name: opaque
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: opaque
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: opaque
+    spec:
+      # The daemon's ServiceAccount is the POD's API identity; the agent
+      # container gets no API credentials at all (no token automount).
+      serviceAccountName: opaqued
+      automountServiceAccountToken: false
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+        # Applies to all containers: the daemon needs gid 7999 to chgrp the
+        # socket surface, the agent needs it to connect. Custody stays safe —
+        # supplemental groups grant nothing on 0700/0600 daemon-owned files.
+        supplementalGroups: [7999]
+      initContainers:
+        # Prepare volume ownership the way bootstrap.sh does for compose:
+        # custody to the daemon uid (0700), socket dir daemon-owned with the
+        # socket group (0750). fsGroup is deliberately NOT used for the
+        # custody volume — it would group-share every custody file, which is
+        # exactly what the daemon's startup check refuses.
+        - name: init-perms
+          image: debian:bookworm-slim
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              install -d -o 7381 -g 7381 -m 0700 /var/lib/opaque
+              install -d -o 7381 -g 7999 -m 0750 /run/opaque
+              cp /seed/config.toml /etc/opaque-work/config.toml
+              chown 7381:7381 /etc/opaque-work/config.toml
+              chmod 0600 /etc/opaque-work/config.toml
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["CHOWN", "FOWNER", "DAC_OVERRIDE"]
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/opaque
+            - name: socket
+              mountPath: /run/opaque
+            - name: config-seed
+              mountPath: /seed
+              readOnly: true
+            - name: config-work
+              mountPath: /etc/opaque-work
+      containers:
+        - name: opaqued
+          image: ghcr.io/kcirtapfromspace/opaque/opaqued:latest # build from repo
+          env:
+            - name: HOME
+              value: /var/lib/opaque
+            - name: OPAQUE_CONFIG
+              value: /etc/opaque/config.toml
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 7381
+            runAsGroup: 7381
+            # Socket-group membership so the daemon can hand the socket
+            # surface to gid 7999 (non-root chgrp rule).
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/opaque
+            - name: socket
+              mountPath: /run/opaque
+            - name: config-work
+              mountPath: /etc/opaque
+        - name: agent
+          # The wrapped agent workload: replace with your agent image; it
+          # talks to the daemon purely over /run/opaque/opaqued.sock.
+          image: debian:bookworm-slim
+          command: ["/bin/sh", "-c", "sleep infinity"]
+          env:
+            - name: HOME
+              value: /tmp
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 7382
+            runAsGroup: 7382
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: socket
+              mountPath: /run/opaque
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: state
+          persistentVolumeClaim:
+            claimName: opaque-state
+        - name: socket
+          emptyDir:
+            medium: Memory
+        - name: config-seed
+          secret:
+            secretName: opaque-config
+        - name: config-work
+          emptyDir:
+            medium: Memory
+        - name: tmp
+          emptyDir: {}

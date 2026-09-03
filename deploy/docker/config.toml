@@ -1,0 +1,11 @@
+# Daemon config for the compose trust-domain split (seeded by bootstrap.sh,
+# sealed at bootstrap, owned by the daemon account inside the config volume).
+
+require_seal = true
+
+[trust_domain]
+enforce = true
+# Numeric socket group: containers have no /etc/group entries; the agent
+# container joins gid 7999 via compose `group_add`.
+socket_group = "7999"
+socket_path = "/run/opaque/opaqued.sock"

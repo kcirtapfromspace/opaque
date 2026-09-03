@@ -195,6 +195,30 @@ pub trait Fido2Transport: Send + Sync + std::fmt::Debug {
     fn authenticate(&self, challenge: &Fido2Challenge) -> Result<Fido2Assertion, Fido2Error>;
 }
 
+/// Transport for daemon-side managers: every interactive ceremony errors,
+/// because authenticator interaction happens in the CLIENT that drives the
+/// key or passkey — the daemon only verifies what comes back.
+#[derive(Debug)]
+pub struct NoLocalTransport;
+
+impl Fido2Transport for NoLocalTransport {
+    fn register(
+        &self,
+        _challenge: &Fido2Challenge,
+        _user_name: &str,
+    ) -> Result<Fido2RegistrationResponse, Fido2Error> {
+        Err(Fido2Error::TransportError(
+            "no local authenticator transport — ceremonies run client-side".into(),
+        ))
+    }
+
+    fn authenticate(&self, _challenge: &Fido2Challenge) -> Result<Fido2Assertion, Fido2Error> {
+        Err(Fido2Error::TransportError(
+            "no local authenticator transport — ceremonies run client-side".into(),
+        ))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Credential store
 // ---------------------------------------------------------------------------
@@ -202,25 +226,29 @@ pub trait Fido2Transport: Send + Sync + std::fmt::Debug {
 /// File-based FIDO2 credential storage.
 ///
 /// Stores credentials as JSON at `~/.config/opaque/fido2_credentials.json`.
-/// The file is integrity-checked via HMAC-SHA256.
+/// The file is integrity-checked via HMAC-SHA256 under a caller-supplied key
+/// (a keyfile in the daemon's custody set — under the trust-domain split the
+/// agent cannot read it, making the tag meaningful rather than decorative).
 #[derive(Debug)]
 pub struct Fido2CredentialStore {
     path: PathBuf,
+    hmac_key: Vec<u8>,
 }
 
 /// On-disk representation with integrity check.
 #[derive(Debug, Serialize, Deserialize)]
 struct CredentialFile {
     credentials: Vec<Fido2Credential>,
-    /// HMAC-SHA256 of the serialized credentials array (hex-encoded).
-    /// The HMAC key is derived from the username as a basic integrity check.
+    /// HMAC-SHA256 of the serialized credentials array (hex-encoded),
+    /// keyed by the store's custody keyfile.
     integrity_tag: String,
 }
 
 impl Fido2CredentialStore {
-    /// Create a new credential store at the given path.
-    pub fn new(path: PathBuf) -> Self {
-        Self { path }
+    /// Create a new credential store at the given path with the given
+    /// integrity key (32 bytes from the daemon's custody keyfile).
+    pub fn new(path: PathBuf, hmac_key: Vec<u8>) -> Self {
+        Self { path, hmac_key }
     }
 
     /// Default credential store path.
@@ -229,22 +257,12 @@ impl Fido2CredentialStore {
         config_dir.join("fido2_credentials.json")
     }
 
-    /// Compute HMAC key from username (deterministic per-user).
-    fn hmac_key() -> Vec<u8> {
-        let username = std::env::var("USER").unwrap_or_else(|_| "opaque".into());
-        let mut hasher = Sha256::new();
-        hasher.update(b"opaque-fido2-integrity-");
-        hasher.update(username.as_bytes());
-        hasher.finalize().to_vec()
-    }
-
     /// Compute integrity tag for the given credentials.
-    fn compute_tag(credentials: &[Fido2Credential]) -> Result<String, Fido2Error> {
+    fn compute_tag(&self, credentials: &[Fido2Credential]) -> Result<String, Fido2Error> {
         use hmac::{Hmac, Mac};
         type HmacSha256 = Hmac<Sha256>;
 
-        let key = Self::hmac_key();
-        let mut mac = HmacSha256::new_from_slice(&key)
+        let mut mac = HmacSha256::new_from_slice(&self.hmac_key)
             .map_err(|e| Fido2Error::StorageError(format!("HMAC key error: {e}")))?;
         let data = serde_json::to_string(credentials)
             .map_err(|e| Fido2Error::StorageError(format!("serialization error: {e}")))?;
@@ -265,7 +283,7 @@ impl Fido2CredentialStore {
             .map_err(|e| Fido2Error::StorageError(format!("parse error: {e}")))?;
 
         // Verify integrity.
-        let expected_tag = Self::compute_tag(&file.credentials)?;
+        let expected_tag = self.compute_tag(&file.credentials)?;
         if file.integrity_tag != expected_tag {
             return Err(Fido2Error::StorageError(
                 "integrity check failed: credential file may have been tampered with".into(),
@@ -283,7 +301,7 @@ impl Fido2CredentialStore {
                 .map_err(|e| Fido2Error::StorageError(format!("mkdir error: {e}")))?;
         }
 
-        let tag = Self::compute_tag(credentials)?;
+        let tag = self.compute_tag(credentials)?;
         let file = CredentialFile {
             credentials: credentials.to_vec(),
             integrity_tag: tag,
@@ -398,11 +416,22 @@ impl Fido2Manager {
         })
     }
 
-    /// Register a new hardware key.
+    /// Register a new hardware key via the local transport.
     pub fn register(&self, user_name: &str, label: &str) -> Result<Fido2Credential, Fido2Error> {
         let challenge = self.registration_challenge()?;
         let response = self.transport.register(&challenge, user_name)?;
+        self.validate_and_store_registration(&response, label)
+    }
 
+    /// Validate a registration response (UP flag, RP hash, P-256 key) and
+    /// store the credential. Used both by local-transport registration and by
+    /// the socket registration ceremony, where a client-side authenticator
+    /// produced the response.
+    pub fn validate_and_store_registration(
+        &self,
+        response: &Fido2RegistrationResponse,
+        label: &str,
+    ) -> Result<Fido2Credential, Fido2Error> {
         // Validate the response: parse authenticator data, check UP flag.
         let auth_data_bytes = URL_SAFE_NO_PAD
             .decode(&response.authenticator_data)
@@ -427,8 +456,8 @@ impl Fido2Manager {
             .map_err(|e| Fido2Error::InvalidAuthData(format!("invalid P-256 key: {e}")))?;
 
         let credential = Fido2Credential {
-            credential_id: response.credential_id,
-            public_key: response.public_key,
+            credential_id: response.credential_id.clone(),
+            public_key: response.public_key.clone(),
             counter: response.counter,
             created_at: Utc::now(),
             label: label.to_string(),
@@ -436,6 +465,26 @@ impl Fido2Manager {
 
         self.store.add(credential.clone())?;
         Ok(credential)
+    }
+
+    /// The relying-party id this manager verifies against.
+    pub fn rp_id(&self) -> &str {
+        &self.rp_id
+    }
+
+    /// Look up a stored credential by id.
+    pub fn find_credential(&self, credential_id: &str) -> Result<Fido2Credential, Fido2Error> {
+        self.store.find(credential_id)
+    }
+
+    /// Persist the counter from a verified assertion (replay floor).
+    pub fn record_assertion_counter(&self, assertion: &Fido2Assertion) -> Result<(), Fido2Error> {
+        let auth_data_bytes = URL_SAFE_NO_PAD
+            .decode(&assertion.authenticator_data)
+            .map_err(|e| Fido2Error::InvalidAuthData(format!("base64 decode: {e}")))?;
+        let auth_data = AuthenticatorData::parse(&auth_data_bytes)?;
+        self.store
+            .update_counter(&assertion.credential_id, auth_data.counter)
     }
 
     /// Generate an authentication challenge for stored credentials.
@@ -468,9 +517,9 @@ impl Fido2Manager {
         let challenge = self.authentication_challenge(&credential_ids)?;
         let assertion = self.transport.authenticate(&challenge)?;
 
-        // Verify the assertion.
+        // Verify the assertion, bound to the exact challenge just issued.
         let credential = self.store.find(&assertion.credential_id)?;
-        self.verify_assertion(&assertion, &credential)?;
+        self.verify_assertion(&assertion, &credential, &challenge.challenge)?;
 
         // Update the counter.
         let auth_data_bytes = URL_SAFE_NO_PAD
@@ -483,12 +532,45 @@ impl Fido2Manager {
         Ok(assertion)
     }
 
-    /// Verify an assertion response against a stored credential.
+    /// Verify an assertion response against a stored credential, bound to
+    /// the challenge this daemon issued.
+    ///
+    /// `expected_challenge` is the base64url challenge from the
+    /// [`Fido2Challenge`] this assertion answers. Binding it here is what
+    /// stops a captured assertion from ANOTHER ceremony (same key, same RP)
+    /// from being replayed into this approval — the counter check alone
+    /// cannot catch a fresher assertion harvested elsewhere.
     pub fn verify_assertion(
         &self,
         assertion: &Fido2Assertion,
         credential: &Fido2Credential,
+        expected_challenge: &str,
     ) -> Result<(), Fido2Error> {
+        // 0. The signed client data must name this ceremony: correct type
+        //    and exactly the challenge we issued.
+        let client_data_bytes_check = URL_SAFE_NO_PAD
+            .decode(&assertion.client_data_json)
+            .map_err(|e| Fido2Error::InvalidAuthData(format!("client data decode: {e}")))?;
+        #[derive(serde::Deserialize)]
+        struct ClientData {
+            #[serde(rename = "type")]
+            type_: String,
+            challenge: String,
+        }
+        let client_data: ClientData = serde_json::from_slice(&client_data_bytes_check)
+            .map_err(|e| Fido2Error::InvalidAuthData(format!("client data parse: {e}")))?;
+        if client_data.type_ != "webauthn.get" {
+            return Err(Fido2Error::InvalidAuthData(format!(
+                "unexpected client data type '{}'",
+                client_data.type_
+            )));
+        }
+        if client_data.challenge != expected_challenge {
+            return Err(Fido2Error::InvalidAuthData(
+                "assertion answers a different challenge than the one issued".into(),
+            ));
+        }
+
         // 1. Decode authenticator data.
         let auth_data_bytes = URL_SAFE_NO_PAD
             .decode(&assertion.authenticator_data)
@@ -683,7 +765,7 @@ mod tests {
     fn temp_store() -> (Fido2CredentialStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fido2_credentials.json");
-        (Fido2CredentialStore::new(path), dir)
+        (Fido2CredentialStore::new(path, vec![0x5a; 32]), dir)
     }
 
     fn test_manager(transport: MockTransport) -> (Fido2Manager, tempfile::TempDir) {
@@ -887,10 +969,12 @@ mod tests {
         let cred = manager.register("user", "key").unwrap();
         let credentials = manager.list_credentials().unwrap();
 
-        // Build a fake assertion signed with a DIFFERENT key.
+        // Build a fake assertion signed with a DIFFERENT key. The client
+        // data matches the issued challenge so the failure isolated here is
+        // the signature itself.
         let bad_sk = SigningKey::random(&mut OsRng);
         let auth_data = build_auth_data("opaque.local", true, 2);
-        let client_data = r#"{"type":"webauthn.get","challenge":"test"}"#;
+        let client_data = r#"{"type":"webauthn.get","challenge":"test-challenge"}"#;
         let client_data_hash = Sha256::digest(client_data.as_bytes());
         let mut signed_data = auth_data.clone();
         signed_data.extend_from_slice(&client_data_hash);
@@ -903,8 +987,70 @@ mod tests {
             signature: URL_SAFE_NO_PAD.encode(bad_sig.to_der()),
         };
 
-        let result = manager.verify_assertion(&bad_assertion, &credentials[0]);
+        let result = manager.verify_assertion(&bad_assertion, &credentials[0], "test-challenge");
         assert!(matches!(result, Err(Fido2Error::InvalidSignature)));
+    }
+
+    #[test]
+    fn test_assertion_for_a_different_challenge_rejected() {
+        // A perfectly valid assertion — right key, right RP, UP set — that
+        // answers some OTHER ceremony's challenge must not satisfy this one.
+        let (assertion, cred) = make_signed_assertion("opaque.local", true, 7, "cross-replay");
+        let (store, _dir) = temp_store();
+        let mgr = Fido2Manager::new(
+            store,
+            Box::new(MockTransport::new("opaque.local")),
+            "opaque.local".into(),
+        );
+
+        // Verifies against the challenge it was built for…
+        assert!(
+            mgr.verify_assertion(&assertion, &cred, "test-challenge")
+                .is_ok()
+        );
+        // …and is rejected against any other.
+        let err = mgr
+            .verify_assertion(&assertion, &cred, "a-different-ceremony")
+            .unwrap_err();
+        assert!(matches!(err, Fido2Error::InvalidAuthData(_)), "{err:?}");
+    }
+
+    #[test]
+    fn test_wrong_client_data_type_rejected() {
+        // webauthn.create (a registration response) must not pass as an
+        // authentication assertion even with a valid signature shape.
+        let sk = SigningKey::random(&mut OsRng);
+        let pk_bytes = sk.verifying_key().to_encoded_point(false);
+        let cred = Fido2Credential {
+            credential_id: "type-test".into(),
+            public_key: URL_SAFE_NO_PAD.encode(pk_bytes.as_bytes()),
+            counter: 0,
+            created_at: Utc::now(),
+            label: "test".into(),
+        };
+        let auth_data = build_auth_data("opaque.local", true, 1);
+        let client_data = r#"{"type":"webauthn.create","challenge":"test-challenge"}"#;
+        let client_data_hash = Sha256::digest(client_data.as_bytes());
+        let mut signed_data = auth_data.clone();
+        signed_data.extend_from_slice(&client_data_hash);
+        let (sig, _) = sk.sign(&signed_data);
+        let assertion = Fido2Assertion {
+            credential_id: "type-test".into(),
+            authenticator_data: URL_SAFE_NO_PAD.encode(&auth_data),
+            client_data_json: URL_SAFE_NO_PAD.encode(client_data.as_bytes()),
+            signature: URL_SAFE_NO_PAD.encode(sig.to_der()),
+        };
+
+        let (store, _dir) = temp_store();
+        let mgr = Fido2Manager::new(
+            store,
+            Box::new(MockTransport::new("opaque.local")),
+            "opaque.local".into(),
+        );
+        let err = mgr
+            .verify_assertion(&assertion, &cred, "test-challenge")
+            .unwrap_err();
+        assert!(matches!(err, Fido2Error::InvalidAuthData(_)), "{err:?}");
     }
 
     // -----------------------------------------------------------------------
@@ -922,7 +1068,7 @@ mod tests {
         let transport = MockTransport::new("opaque.local");
         let mgr = Fido2Manager::new(store, Box::new(transport), "opaque.local".into());
 
-        let result = mgr.verify_assertion(&assertion, &cred);
+        let result = mgr.verify_assertion(&assertion, &cred, "test-challenge");
         assert!(matches!(
             result,
             Err(Fido2Error::CounterReplay {
@@ -943,7 +1089,7 @@ mod tests {
         let transport = MockTransport::new("opaque.local");
         let mgr = Fido2Manager::new(store, Box::new(transport), "opaque.local".into());
 
-        let result = mgr.verify_assertion(&assertion, &cred);
+        let result = mgr.verify_assertion(&assertion, &cred, "test-challenge");
         assert!(matches!(
             result,
             Err(Fido2Error::CounterReplay {
@@ -977,7 +1123,7 @@ mod tests {
         let transport = MockTransport::new("opaque.local");
         let mgr = Fido2Manager::new(store, Box::new(transport), "opaque.local".into());
 
-        let result = mgr.verify_assertion(&assertion, &cred);
+        let result = mgr.verify_assertion(&assertion, &cred, "test-challenge");
         assert!(matches!(result, Err(Fido2Error::UserPresenceNotSet)));
     }
 

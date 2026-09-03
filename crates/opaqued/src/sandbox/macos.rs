@@ -385,30 +385,11 @@ pub async fn execute(
     // Clean up temp profile file.
     let _ = std::fs::remove_file(&profile_path);
 
-    // Detect sandbox-exec exit code 65 at runtime — the cached probe may have
-    // passed with a different profile variant. Fall back to direct execution.
-    if exit_code == 65 {
-        warn!(
-            "sandbox-exec returned exit code 65 at runtime — seatbelt profile \
-             rejected by this macOS version, retrying with direct execution"
-        );
-        let _ = tx
-            .send(ExecFrame::Output {
-                stream: ExecStream::Stderr,
-                data: "sandbox-exec failed (exit 65), retrying without sandbox\n".into(),
-            })
-            .await;
-        return super::execute_direct(
-            &config.command,
-            config.env,
-            config.timeout_secs,
-            config.max_output_bytes,
-            tx,
-            Some(&config.project_dir),
-        )
-        .await
-        .map_err(|e| SandboxError::Setup(format!("direct execution fallback failed: {e}")));
-    }
+    // SECURITY (C4): exit code 65 is returned to the caller as-is. It must NOT
+    // trigger a fallback to unsandboxed execution. sandbox-exec runs the child in
+    // the same process, so this exit status IS the child's — a command can choose
+    // to exit 65 to force the re-run. Never execute the command outside the sandbox
+    // based on an attacker-influenced exit code.
 
     let _ = tx
         .send(ExecFrame::ExecCompleted {

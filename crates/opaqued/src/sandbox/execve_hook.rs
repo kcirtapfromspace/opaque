@@ -649,6 +649,7 @@ mod tests {
 
     fn test_request(params: serde_json::Value) -> OperationRequest {
         OperationRequest {
+            principal: None,
             request_id: Uuid::new_v4(),
             client_identity: ClientIdentity {
                 uid: 501,
@@ -671,6 +672,7 @@ mod tests {
 
     fn approve_request(params: serde_json::Value) -> OperationRequest {
         OperationRequest {
+            principal: None,
             request_id: Uuid::new_v4(),
             client_identity: ClientIdentity {
                 uid: 501,

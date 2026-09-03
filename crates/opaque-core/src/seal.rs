@@ -1,13 +1,30 @@
 //! Config seal: cryptographic integrity verification for `config.toml`.
 //!
-//! Computes a SHA-256 digest of the config file and stores it in the OS
-//! keychain (primary) with a file fallback. On daemon startup, the seal is
-//! verified — if the config has been modified, the daemon refuses to start.
+//! Two seal formats exist:
+//!
+//! - **Keyed (`opqs1:` prefix, current):** HMAC-SHA256 over the config bytes
+//!   with a 32-byte key held beside the seal (`<seal>.key`, 0600, part of the
+//!   daemon's custody set). Unforgeable by any principal that cannot read the
+//!   key — under the trust-domain split that includes the agent, which is
+//!   what makes the seal tamper-*proof* rather than tamper-evident there.
+//! - **Legacy (bare hex):** unkeyed SHA-256. Anyone who can write the seal
+//!   file can recompute it after modifying the config, so it only detects
+//!   accidental drift. Verified for backward compatibility and reported as
+//!   [`SealStatus::VerifiedLegacy`] so callers can ratchet: the daemon warns
+//!   in shared-uid mode and refuses under `trust_domain.enforce`.
+//!
+//! The seal value itself also lands in the OS keychain (primary) with the
+//! file as fallback; the *key* is file-custody only, because at a shared uid
+//! the keychain is readable by the same processes as the file anyway, and
+//! under the split the file is exactly what the agent cannot reach.
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
+
+type HmacSha256 = Hmac<Sha256>;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -16,10 +33,17 @@ use sha2::{Digest, Sha256};
 /// Result of verifying a config seal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SealStatus {
-    /// Seal matches config — integrity verified.
+    /// Keyed seal matches config — integrity verified, unforgeable without
+    /// the seal key.
     Verified,
+    /// Legacy unkeyed seal matches config. Detects accidental drift only —
+    /// any writer can recompute it. Callers decide whether that is enough.
+    VerifiedLegacy,
     /// Seal exists but doesn't match — config was modified.
     Tampered { expected: String, actual: String },
+    /// The seal is keyed but the seal key is gone. Verification is
+    /// impossible; treat as custody breakage, not as "unsealed".
+    KeyMissing,
     /// No seal found — config is unsealed.
     Unsealed,
 }
@@ -28,9 +52,11 @@ impl fmt::Display for SealStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SealStatus::Verified => write!(f, "Verified"),
+            SealStatus::VerifiedLegacy => write!(f, "Verified (legacy unkeyed seal)"),
             SealStatus::Tampered { expected, actual } => {
                 write!(f, "Tampered (expected {expected}, got {actual})")
             }
+            SealStatus::KeyMissing => write!(f, "Keyed seal present but seal key missing"),
             SealStatus::Unsealed => write!(f, "Unsealed"),
         }
     }
@@ -61,14 +87,57 @@ impl std::error::Error for SealError {}
 const KEYCHAIN_SERVICE: &str = "opaque-config";
 const KEYCHAIN_ACCOUNT: &str = "seal";
 
+/// Prefix identifying a keyed (HMAC) seal value.
+pub const KEYED_SEAL_PREFIX: &str = "opqs1:";
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Compute SHA-256 hex digest of config bytes.
+/// Compute the legacy (unkeyed) SHA-256 hex digest of config bytes.
+///
+/// Kept for verifying pre-existing seals; new seals are keyed — see
+/// [`compute_seal_keyed`].
 pub fn compute_seal(config_bytes: &[u8]) -> String {
     let hash = Sha256::digest(config_bytes);
     format!("{hash:x}")
+}
+
+/// Compute the keyed seal value: `opqs1:<hex hmac-sha256>`.
+pub fn compute_seal_keyed(config_bytes: &[u8], key: &[u8; 32]) -> String {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(config_bytes);
+    let out = mac.finalize().into_bytes();
+    let hex: String = out.iter().map(|b| format!("{b:02x}")).collect();
+    format!("{KEYED_SEAL_PREFIX}{hex}")
+}
+
+/// Path of the seal key beside its seal file: `config.seal` → `config.seal.key`.
+pub fn seal_key_path(seal_file: &Path) -> PathBuf {
+    let mut s = seal_file.as_os_str().to_owned();
+    s.push(".key");
+    PathBuf::from(s)
+}
+
+/// Load the seal key if present. `Ok(None)` means no key file exists.
+pub fn load_seal_key(seal_file: &Path) -> Result<Option<[u8; 32]>, SealError> {
+    crate::keyfile::load_key_file(&seal_key_path(seal_file))
+        .map_err(|e| SealError::IoError(e.to_string()))
+}
+
+/// Load the seal key, creating it (0600, CSPRNG) on first use.
+pub fn load_or_create_seal_key(seal_file: &Path) -> Result<[u8; 32], SealError> {
+    crate::keyfile::load_or_create_key_file(&seal_key_path(seal_file))
+        .map_err(|e| SealError::IoError(e.to_string()))
+}
+
+/// Seal config bytes with the keyed format, creating the seal key on first
+/// use, and store the seal (keychain + file). The one-stop entry point for
+/// `opaque setup --seal` and the wizard.
+pub fn store_seal_keyed(config_bytes: &[u8], seal_file: &Path) -> Result<(), SealError> {
+    let key = load_or_create_seal_key(seal_file)?;
+    let seal = compute_seal_keyed(config_bytes, &key);
+    store_seal(&seal, seal_file)
 }
 
 /// Store seal in Keychain (primary) + file (fallback).
@@ -92,62 +161,88 @@ pub fn store_seal(seal: &str, seal_file: &Path) -> Result<(), SealError> {
 /// Verify config bytes against stored seal.
 ///
 /// Checks keychain first, then file fallback. If neither exists, returns
-/// `SealStatus::Unsealed`.
+/// `SealStatus::Unsealed`. The stored value's format decides the algorithm:
+/// `opqs1:` seals verify via HMAC with the sibling key file, bare hex seals
+/// via legacy unkeyed SHA-256 (reported as [`SealStatus::VerifiedLegacy`]).
 pub fn verify_seal(config_bytes: &[u8], seal_file: &Path) -> Result<SealStatus, SealError> {
-    let actual = compute_seal(config_bytes);
-
     // Try keychain first.
-    if let Ok(Some(expected)) = keychain_read() {
-        return if expected == actual {
-            Ok(SealStatus::Verified)
-        } else {
-            Ok(SealStatus::Tampered { expected, actual })
-        };
+    if let Ok(Some(stored)) = keychain_read() {
+        return evaluate_stored_seal(&stored, config_bytes, seal_file);
     }
 
-    verify_against_file(&actual, seal_file)
+    verify_seal_from_file(config_bytes, seal_file)
 }
 
 /// Verify config bytes against the seal file only (no keychain).
 ///
 /// Use this when you need verification isolated from system keychain state,
 /// e.g. in tests or when operating on config files outside the default location.
-pub fn verify_seal_from_file(config_bytes: &[u8], seal_file: &Path) -> Result<SealStatus, SealError> {
-    let actual = compute_seal(config_bytes);
-    verify_against_file(&actual, seal_file)
+pub fn verify_seal_from_file(
+    config_bytes: &[u8],
+    seal_file: &Path,
+) -> Result<SealStatus, SealError> {
+    if !seal_file.exists() {
+        return Ok(SealStatus::Unsealed);
+    }
+    let stored = std::fs::read_to_string(seal_file)
+        .map(|s| s.trim().to_string())
+        .map_err(|e| SealError::IoError(format!("failed to read {}: {e}", seal_file.display())))?;
+    evaluate_stored_seal(&stored, config_bytes, seal_file)
 }
 
-/// Check computed hash against the seal file.
-fn verify_against_file(actual: &str, seal_file: &Path) -> Result<SealStatus, SealError> {
-    if seal_file.exists() {
-        let expected = std::fs::read_to_string(seal_file)
-            .map(|s| s.trim().to_string())
-            .map_err(|e| {
-                SealError::IoError(format!("failed to read {}: {e}", seal_file.display()))
-            })?;
-
-        return if expected == *actual {
+/// Compare a stored seal value against the config, dispatching on its format.
+fn evaluate_stored_seal(
+    stored: &str,
+    config_bytes: &[u8],
+    seal_file: &Path,
+) -> Result<SealStatus, SealError> {
+    if stored.starts_with(KEYED_SEAL_PREFIX) {
+        let Some(key) = load_seal_key(seal_file)? else {
+            return Ok(SealStatus::KeyMissing);
+        };
+        let actual = compute_seal_keyed(config_bytes, &key);
+        return if actual == stored {
             Ok(SealStatus::Verified)
         } else {
             Ok(SealStatus::Tampered {
-                expected,
-                actual: actual.to_string(),
+                expected: stored.to_string(),
+                actual,
             })
         };
     }
 
-    Ok(SealStatus::Unsealed)
+    let actual = compute_seal(config_bytes);
+    if actual == stored {
+        Ok(SealStatus::VerifiedLegacy)
+    } else {
+        Ok(SealStatus::Tampered {
+            expected: stored.to_string(),
+            actual,
+        })
+    }
 }
 
-/// Remove seal from Keychain + file.
+/// Remove seal from Keychain + file (and the seal key beside it).
 pub fn remove_seal(seal_file: &Path) -> Result<(), SealError> {
     // Remove from keychain (ignore errors — may not exist).
     let _ = keychain_delete();
 
-    // Remove file if it exists.
+    remove_seal_files(seal_file)
+}
+
+/// File-side half of [`remove_seal`] (no keychain), separated for tests.
+fn remove_seal_files(seal_file: &Path) -> Result<(), SealError> {
     if seal_file.exists() {
         std::fs::remove_file(seal_file).map_err(|e| {
             SealError::IoError(format!("failed to remove {}: {e}", seal_file.display()))
+        })?;
+    }
+
+    // An orphaned key would just confuse the next seal — remove it with its seal.
+    let key_path = seal_key_path(seal_file);
+    if key_path.exists() {
+        std::fs::remove_file(&key_path).map_err(|e| {
+            SealError::IoError(format!("failed to remove {}: {e}", key_path.display()))
         })?;
     }
 
@@ -159,6 +254,18 @@ pub fn remove_seal(seal_file: &Path) -> Result<(), SealError> {
 // ---------------------------------------------------------------------------
 
 fn write_seal_file(seal: &str, path: &Path) -> Result<(), SealError> {
+    // The previous seal (if any) is 0400, which fails a plain overwrite —
+    // and re-sealing over an old seal is exactly how the legacy→keyed
+    // upgrade works. Remove it first.
+    if path.exists() {
+        std::fs::remove_file(path).map_err(|e| {
+            SealError::IoError(format!(
+                "failed to replace existing seal {}: {e}",
+                path.display()
+            ))
+        })?;
+    }
+
     std::fs::write(path, seal)
         .map_err(|e| SealError::IoError(format!("failed to write {}: {e}", path.display())))?;
 
@@ -503,5 +610,139 @@ mod tests {
             actual: "bbb".into(),
         };
         assert!(tampered.to_string().contains("Tampered"));
+        assert!(SealStatus::VerifiedLegacy.to_string().contains("legacy"));
+        assert!(SealStatus::KeyMissing.to_string().contains("key missing"));
+    }
+
+    // --- Keyed seal ---
+
+    #[test]
+    fn keyed_seal_roundtrip_via_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let seal_file = dir.path().join("config.seal");
+        let config = b"keyed config content";
+
+        let key = load_or_create_seal_key(&seal_file).unwrap();
+        let value = compute_seal_keyed(config, &key);
+        assert!(value.starts_with(KEYED_SEAL_PREFIX));
+        write_seal_file(&value, &seal_file).unwrap();
+
+        assert_eq!(
+            verify_seal_from_file(config, &seal_file).unwrap(),
+            SealStatus::Verified
+        );
+
+        // Key file sits beside the seal with private mode.
+        let key_path = seal_key_path(&seal_file);
+        assert!(key_path.ends_with("config.seal.key"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "seal key must be private, got {mode:o}");
+        }
+
+        // Key creation is stable: a second load returns the same key.
+        assert_eq!(load_or_create_seal_key(&seal_file).unwrap(), key);
+    }
+
+    #[test]
+    fn keyed_seal_detects_config_tampering() {
+        let dir = tempfile::tempdir().unwrap();
+        let seal_file = dir.path().join("config.seal");
+
+        let key = load_or_create_seal_key(&seal_file).unwrap();
+        write_seal_file(&compute_seal_keyed(b"original", &key), &seal_file).unwrap();
+
+        match verify_seal_from_file(b"modified", &seal_file).unwrap() {
+            SealStatus::Tampered { .. } => {}
+            other => panic!("expected Tampered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keyed_seal_cannot_be_forged_without_the_key() {
+        // The attack the legacy seal permits: rewrite config, recompute the
+        // seal, overwrite the seal file. With the keyed format the forger
+        // does not hold the key, so the best they can do is an unkeyed value
+        // or an HMAC under the wrong key — both fail verification.
+        let dir = tempfile::tempdir().unwrap();
+        let seal_file = dir.path().join("config.seal");
+        let key = load_or_create_seal_key(&seal_file).unwrap();
+        write_seal_file(&compute_seal_keyed(b"honest config", &key), &seal_file).unwrap();
+
+        let evil = b"evil config";
+
+        // Forgery 1: legacy unkeyed recompute (what worked before) — the
+        // seal now downgrades to VerifiedLegacy at best, never Verified.
+        write_seal_file(&compute_seal(evil), &seal_file).unwrap();
+        assert_eq!(
+            verify_seal_from_file(evil, &seal_file).unwrap(),
+            SealStatus::VerifiedLegacy,
+            "unkeyed forgery must be distinguishable from a keyed seal"
+        );
+
+        // Forgery 2: HMAC under an attacker-chosen key.
+        let wrong_key = [0x42u8; 32];
+        write_seal_file(&compute_seal_keyed(evil, &wrong_key), &seal_file).unwrap();
+        match verify_seal_from_file(evil, &seal_file).unwrap() {
+            SealStatus::Tampered { .. } => {}
+            other => panic!("wrong-key forgery must fail verification, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keyed_seal_with_missing_key_reports_key_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let seal_file = dir.path().join("config.seal");
+        let key = load_or_create_seal_key(&seal_file).unwrap();
+        write_seal_file(&compute_seal_keyed(b"cfg", &key), &seal_file).unwrap();
+
+        fs::remove_file(seal_key_path(&seal_file)).unwrap();
+        assert_eq!(
+            verify_seal_from_file(b"cfg", &seal_file).unwrap(),
+            SealStatus::KeyMissing
+        );
+    }
+
+    #[test]
+    fn legacy_seal_still_verifies_as_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let seal_file = dir.path().join("config.seal");
+        let config = b"pre-upgrade config";
+        write_seal_file(&compute_seal(config), &seal_file).unwrap();
+
+        assert_eq!(
+            verify_seal_from_file(config, &seal_file).unwrap(),
+            SealStatus::VerifiedLegacy
+        );
+    }
+
+    #[test]
+    fn corrupt_seal_key_is_an_error_not_a_bypass() {
+        let dir = tempfile::tempdir().unwrap();
+        let seal_file = dir.path().join("config.seal");
+        let key = load_or_create_seal_key(&seal_file).unwrap();
+        write_seal_file(&compute_seal_keyed(b"cfg", &key), &seal_file).unwrap();
+
+        // Truncate the key: verification must hard-error, not degrade.
+        fs::write(seal_key_path(&seal_file), b"short").unwrap();
+        assert!(verify_seal_from_file(b"cfg", &seal_file).is_err());
+    }
+
+    #[test]
+    fn remove_seal_files_removes_the_key_too() {
+        // Files only — remove_seal itself also touches the OS keychain,
+        // which tests must not do (see the module-test preamble).
+        let dir = tempfile::tempdir().unwrap();
+        let seal_file = dir.path().join("config.seal");
+        let key = load_or_create_seal_key(&seal_file).unwrap();
+        write_seal_file(&compute_seal_keyed(b"cfg", &key), &seal_file).unwrap();
+        assert!(seal_file.exists());
+        assert!(seal_key_path(&seal_file).exists());
+
+        remove_seal_files(&seal_file).unwrap();
+        assert!(!seal_file.exists());
+        assert!(!seal_key_path(&seal_file).exists());
     }
 }

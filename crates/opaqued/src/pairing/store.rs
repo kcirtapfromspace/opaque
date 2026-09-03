@@ -26,6 +26,44 @@ pub struct PairedDevice {
     /// Whether this device has been revoked.
     #[serde(default)]
     pub revoked: bool,
+    /// Principal holding the login session when this device was paired.
+    /// Attributes device approvals to a human, which is what lets
+    /// `require_distinct_approver` catch self-approval via one's own phone.
+    /// `None` when identity wasn't configured at pair time.
+    ///
+    /// The `skip_serializing_if` on the new fields keeps legacy records
+    /// byte-identical on re-serialization, so pre-existing store HMACs
+    /// still verify (absent = None / unconfirmed, which fails closed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paired_by: Option<String>,
+    /// SHA-256 (hex) of this device's approval-server bearer token. The
+    /// plaintext token is returned exactly once, at pair time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_sha256: Option<String>,
+    /// Whether a human has confirmed this device's key fingerprint through
+    /// an out-of-band approval. Completing `/pair` proves possession of the
+    /// one-time nonce — which an agent reading the pairing terminal also
+    /// sees — so an UNCONFIRMED device must never verify approvals or
+    /// authenticate to the server. The confirmation ceremony shows the key
+    /// fingerprint, which only the genuine phone can also display.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub confirmed: bool,
+}
+
+impl PairedDevice {
+    /// Short fingerprint of the device public key for the confirmation
+    /// ceremony: first 16 hex chars of SHA-256(pubkey), grouped in fours.
+    pub fn key_fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(self.public_key_hex.as_bytes());
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        hex.as_bytes()[..16]
+            .chunks(4)
+            .map(|c| std::str::from_utf8(c).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("-")
+            .to_uppercase()
+    }
 }
 
 impl PairedDevice {
@@ -213,6 +251,20 @@ impl DeviceStore {
         self.save(&devices)
     }
 
+    /// Mark a device's key fingerprint as human-confirmed (see
+    /// [`PairedDevice::confirmed`]). Returns the confirmed device.
+    pub fn confirm_device(&self, device_id: &str) -> Result<PairedDevice, DeviceStoreError> {
+        let mut devices = self.load()?;
+        let device = devices
+            .iter_mut()
+            .find(|d| d.device_id == device_id)
+            .ok_or_else(|| DeviceStoreError::NotFound(device_id.to_owned()))?;
+        device.confirmed = true;
+        let confirmed = device.clone();
+        self.save(&devices)?;
+        Ok(confirmed)
+    }
+
     /// Update last_seen timestamp for a device.
     pub fn touch_device(&self, device_id: &str, timestamp: i64) -> Result<(), DeviceStoreError> {
         let mut devices = self.load()?;
@@ -266,7 +318,41 @@ mod tests {
             paired_at: 1700000000,
             last_seen: None,
             revoked: false,
+            paired_by: None,
+            token_sha256: None,
+            confirmed: true,
         }
+    }
+
+    #[test]
+    fn legacy_store_files_still_verify_after_field_additions() {
+        // A store written before paired_by/token_sha256 existed must load and
+        // re-verify: the new optional fields are skipped when None, so the
+        // legacy record re-serializes byte-identically for the HMAC check.
+        let (_dir, store) = temp_store();
+        let legacy = PairedDevice {
+            device_id: "legacy-dev".into(),
+            name: "Old Phone".into(),
+            public_key_hex: sample_device("x", "x").public_key_hex,
+            paired_at: 1690000000,
+            last_seen: Some(1690000100),
+            revoked: false,
+            paired_by: None,
+            token_sha256: None,
+            confirmed: false,
+        };
+        store.add_device(legacy).unwrap();
+
+        // Reload from disk — HMAC verification happens on load.
+        let devices = store.list_devices().unwrap();
+        assert_eq!(devices.len(), 1);
+        assert!(devices[0].paired_by.is_none());
+
+        // And the serialized JSON genuinely omits the new fields.
+        let raw = std::fs::read_to_string(store.path()).unwrap();
+        assert!(!raw.contains("paired_by"));
+        assert!(!raw.contains("token_sha256"));
+        assert!(!raw.contains("confirmed"));
     }
 
     #[test]

@@ -54,6 +54,11 @@ pub struct PairingSession {
     pub expires_at: i64,
     /// Whether this session has been consumed.
     consumed: bool,
+    /// Principal who initiated pairing (held the login session when the QR
+    /// was generated). Captured HERE, not at completion: the device may
+    /// complete minutes later, when a different human could hold the login —
+    /// attribution must follow whoever actually started the ceremony.
+    initiated_by: Option<String>,
 }
 
 /// Errors from the pairing manager.
@@ -85,8 +90,10 @@ pub struct PairingManager {
     server_id: String,
     /// Daemon's Ed25519 signing key.
     signing_key: SigningKey,
-    /// HTTPS port for the local approval server.
-    port: u16,
+    /// HTTPS port for the local approval server. Atomic because with an
+    /// auto-selected port (bind to :0) the real value is only known after
+    /// the server binds, which happens after this manager is constructed.
+    port: std::sync::atomic::AtomicU16,
     /// Device store for persisting paired devices.
     device_store: DeviceStore,
     /// Active (unconsumed) pairing sessions, keyed by nonce.
@@ -100,6 +107,12 @@ fn hex_encode(data: &[u8]) -> String {
     data.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// SHA-256 as lowercase hex.
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex_encode(&Sha256::digest(data))
+}
+
 impl PairingManager {
     /// Create a new pairing manager.
     pub fn new(
@@ -111,11 +124,16 @@ impl PairingManager {
         Self {
             server_id,
             signing_key,
-            port,
+            port: std::sync::atomic::AtomicU16::new(port),
             device_store,
             active_sessions: Mutex::new(HashMap::new()),
             used_challenges: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Record the approval server's actual bound port (auto-port case).
+    pub fn set_port(&self, port: u16) {
+        self.port.store(port, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Get the server's public key.
@@ -128,7 +146,7 @@ impl PairingManager {
     /// The QR payload is sent to the iOS app (via terminal QR code).
     /// The pairing session is retained server-side until the device completes
     /// pairing or the session expires.
-    pub fn generate_qr_payload(&self) -> (QrPayload, String) {
+    pub fn generate_qr_payload(&self, initiated_by: Option<String>) -> (QrPayload, String) {
         let mut nonce_bytes = [0u8; 32];
         getrandom::fill(&mut nonce_bytes).expect("failed to generate random nonce");
         let nonce = hex_encode(&nonce_bytes);
@@ -142,7 +160,7 @@ impl PairingManager {
         let payload = QrPayload {
             server_id: self.server_id.clone(),
             public_key: hex_encode(self.signing_key.verifying_key().as_bytes()),
-            port: self.port,
+            port: self.port.load(std::sync::atomic::Ordering::Relaxed),
             nonce: nonce.clone(),
             created_at: now,
             expires_at,
@@ -153,6 +171,7 @@ impl PairingManager {
             server_id: self.server_id.clone(),
             expires_at,
             consumed: false,
+            initiated_by,
         };
 
         self.active_sessions
@@ -167,12 +186,17 @@ impl PairingManager {
     ///
     /// Called when the iOS app submits its device public key after scanning
     /// the QR code. Validates the nonce and TTL, then stores the device.
+    ///
+    /// The device's `paired_by` attribution comes from the pairing SESSION
+    /// (the principal who initiated it), never from completion time. Returns
+    /// the device plus its plaintext approval-server bearer token (shown
+    /// exactly once; only its hash is stored).
     pub fn complete_pairing(
         &self,
         nonce: &str,
         device_public_key: &[u8],
         device_name: &str,
-    ) -> Result<PairedDevice, PairingError> {
+    ) -> Result<(PairedDevice, String), PairingError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -192,6 +216,7 @@ impl PairingManager {
         }
 
         session.consumed = true;
+        let paired_by = session.initiated_by.clone();
 
         // Validate the public key
         let key_bytes: [u8; 32] = device_public_key
@@ -201,6 +226,11 @@ impl PairingManager {
             VerifyingKey::from_bytes(&key_bytes).map_err(|_| PairingError::InvalidSignature)?;
 
         let device_id = Uuid::new_v4().to_string();
+        let token = {
+            let mut buf = [0u8; 32];
+            getrandom::fill(&mut buf).expect("failed to generate device token");
+            hex_encode(&buf)
+        };
         let device = PairedDevice {
             device_id: device_id.clone(),
             name: device_name.to_owned(),
@@ -208,6 +238,9 @@ impl PairingManager {
             paired_at: now,
             last_seen: None,
             revoked: false,
+            paired_by,
+            token_sha256: Some(sha256_hex(token.as_bytes())),
+            confirmed: false,
         };
 
         // Drop the lock before accessing store
@@ -215,25 +248,66 @@ impl PairingManager {
 
         self.device_store.add_device(device.clone())?;
 
-        Ok(device)
+        Ok((device, token))
+    }
+
+    /// Check a presented bearer token against a device's stored token hash.
+    ///
+    /// Compares SHA-256 digests, so the stored value never reveals the token
+    /// and the comparison does not leak its bytes. Revoked devices,
+    /// unconfirmed devices (fingerprint ceremony not completed), and devices
+    /// paired before tokens existed always fail.
+    pub fn verify_device_token(&self, device_id: &str, presented: &str) -> bool {
+        let Ok(device) = self.device_store.get_device(device_id) else {
+            return false;
+        };
+        if device.revoked || !device.confirmed {
+            return false;
+        }
+        let Some(stored) = device.token_sha256 else {
+            return false;
+        };
+        // Digest-then-compare: equal length, content already blinded.
+        sha256_hex(presented.as_bytes()) == stored
+    }
+
+    /// Mark a device's key fingerprint as human-confirmed. Only the pairing
+    /// confirmation ceremony (out-of-band approval displaying the
+    /// fingerprint) may call this.
+    pub fn confirm_device(&self, device_id: &str) -> Result<PairedDevice, PairingError> {
+        Ok(self.device_store.confirm_device(device_id)?)
     }
 
     /// Verify a signed approval response from a paired device.
     ///
-    /// Includes replay detection: the same challenge+response pair cannot
-    /// be accepted twice.
+    /// The signature must cover the challenge PLUS the decision (see
+    /// `challenge::decision_bytes`), so a signed reject can never be
+    /// replayed as an approve. Includes replay detection: the same
+    /// challenge+signature pair cannot be accepted twice.
+    ///
+    /// On success, returns the VERIFIED device — the only place an approver
+    /// identity for the paired-device factor may come from.
     pub fn verify_approval(
         &self,
         challenge: &ApprovalChallenge,
         signature: &[u8],
         device_id: &str,
-    ) -> Result<(), PairingError> {
+        approve: bool,
+    ) -> Result<PairedDevice, PairingError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
 
         let device = self.device_store.get_device(device_id)?;
+
+        // An unconfirmed device is quarantined: completing /pair only proves
+        // possession of the one-time nonce, which anyone watching the
+        // pairing terminal also saw. Approval authority starts at the
+        // fingerprint-confirmation ceremony, not before.
+        if !device.confirmed {
+            return Err(PairingError::InvalidSignature);
+        }
 
         // Replay detection: hash the challenge bytes + signature
         let challenge_bytes = construct_challenge_bytes(challenge);
@@ -247,13 +321,15 @@ impl PairingManager {
             // We'll insert after verification succeeds
         }
 
-        verify_challenge_response(challenge, signature, &device, now).map_err(|e| match e {
-            ChallengeError::Expired => PairingError::Expired,
-            ChallengeError::InvalidSignature => PairingError::InvalidSignature,
-            ChallengeError::DeviceRevoked => PairingError::InvalidSignature,
-            ChallengeError::InvalidKey(_) => PairingError::InvalidSignature,
-            ChallengeError::Replay => PairingError::InvalidSignature,
-        })?;
+        verify_challenge_response(challenge, signature, &device, now, approve).map_err(
+            |e| match e {
+                ChallengeError::Expired => PairingError::Expired,
+                ChallengeError::InvalidSignature => PairingError::InvalidSignature,
+                ChallengeError::DeviceRevoked => PairingError::InvalidSignature,
+                ChallengeError::InvalidKey(_) => PairingError::InvalidSignature,
+                ChallengeError::Replay => PairingError::InvalidSignature,
+            },
+        )?;
 
         // Mark as used
         {
@@ -264,7 +340,7 @@ impl PairingManager {
         // Update last_seen
         let _ = self.device_store.touch_device(device_id, now);
 
-        Ok(())
+        Ok(device)
     }
 
     /// Create an approval challenge for the given request.
@@ -338,7 +414,7 @@ mod tests {
     #[test]
     fn test_generate_pairing_qr_data() {
         let (_dir, manager) = temp_manager();
-        let (payload, nonce) = manager.generate_qr_payload();
+        let (payload, nonce) = manager.generate_qr_payload(None);
 
         // Validate JSON fields
         assert_eq!(payload.server_id, "test-server-id");
@@ -366,9 +442,9 @@ mod tests {
     fn test_pairing_nonce_uniqueness() {
         let (_dir, manager) = temp_manager();
 
-        let (p1, _) = manager.generate_qr_payload();
-        let (p2, _) = manager.generate_qr_payload();
-        let (p3, _) = manager.generate_qr_payload();
+        let (p1, _) = manager.generate_qr_payload(None);
+        let (p2, _) = manager.generate_qr_payload(None);
+        let (p3, _) = manager.generate_qr_payload(None);
 
         // Each QR code must have a unique nonce
         assert_ne!(p1.nonce, p2.nonce);
@@ -379,7 +455,7 @@ mod tests {
     #[test]
     fn test_pairing_expiry() {
         let (_dir, manager) = temp_manager();
-        let (payload, _) = manager.generate_qr_payload();
+        let (payload, _) = manager.generate_qr_payload(None);
 
         // QR should expire after 5 minutes
         let ttl = payload.expires_at - payload.created_at;
@@ -389,19 +465,29 @@ mod tests {
     #[test]
     fn test_device_registration() {
         let (_dir, manager) = temp_manager();
-        let (_payload, nonce) = manager.generate_qr_payload();
+        let (_payload, nonce) = manager.generate_qr_payload(Some("hum_owner".into()));
 
         // Generate a device key
         let device_key = SigningKey::generate(&mut OsRng);
         let device_pub = device_key.verifying_key();
 
-        let device = manager
+        let (device, token) = manager
             .complete_pairing(&nonce, device_pub.as_bytes(), "My iPhone 15")
             .unwrap();
 
         assert_eq!(device.name, "My iPhone 15");
         assert!(!device.device_id.is_empty());
         assert!(!device.revoked);
+        assert_eq!(device.paired_by.as_deref(), Some("hum_owner"));
+        // Fresh devices are QUARANTINED: no token works before the human
+        // confirms the key fingerprint out-of-band.
+        assert!(!device.confirmed);
+        assert!(!manager.verify_device_token(&device.device_id, &token));
+        manager.confirm_device(&device.device_id).unwrap();
+        // Confirmed: the bearer token round-trips against its stored hash…
+        assert!(manager.verify_device_token(&device.device_id, &token));
+        // …and a wrong token still fails.
+        assert!(!manager.verify_device_token(&device.device_id, "not-the-token"));
 
         // Verify device is stored
         let devices = manager.list_devices().unwrap();
@@ -412,26 +498,29 @@ mod tests {
     #[test]
     fn test_device_revocation() {
         let (_dir, manager) = temp_manager();
-        let (_payload, nonce) = manager.generate_qr_payload();
+        let (_payload, nonce) = manager.generate_qr_payload(None);
 
         let device_key = SigningKey::generate(&mut OsRng);
         let device_pub = device_key.verifying_key();
 
-        let device = manager
+        let (device, token) = manager
             .complete_pairing(&nonce, device_pub.as_bytes(), "iPhone")
             .unwrap();
 
         // Revoke the device
         manager.revoke_device(&device.device_id).unwrap();
 
-        // Create a challenge and sign it
+        // Create a challenge and sign the approve decision
         let challenge = manager.create_challenge("req-1", "test operation");
-        let challenge_bytes = construct_challenge_bytes(&challenge);
-        let signature = device_key.sign(&challenge_bytes);
+        let signed = challenge::decision_bytes(&challenge, true);
+        let signature = device_key.sign(&signed);
 
         // Verification should fail (device revoked)
-        let result = manager.verify_approval(&challenge, &signature.to_bytes(), &device.device_id);
+        let result =
+            manager.verify_approval(&challenge, &signature.to_bytes(), &device.device_id, true);
         assert!(result.is_err());
+        // Revocation also kills the bearer token.
+        assert!(!manager.verify_device_token(&device.device_id, &token));
     }
 
     #[test]
@@ -440,7 +529,7 @@ mod tests {
 
         // Pair three devices
         for i in 0..3 {
-            let (_payload, nonce) = manager.generate_qr_payload();
+            let (_payload, nonce) = manager.generate_qr_payload(None);
             let key = SigningKey::generate(&mut OsRng);
             let pub_key = key.verifying_key();
             manager
@@ -455,25 +544,33 @@ mod tests {
     #[test]
     fn test_replay_rejection() {
         let (_dir, manager) = temp_manager();
-        let (_payload, nonce) = manager.generate_qr_payload();
+        let (_payload, nonce) = manager.generate_qr_payload(None);
 
         let device_key = SigningKey::generate(&mut OsRng);
         let device_pub = device_key.verifying_key();
 
-        let device = manager
+        let (device, _token) = manager
             .complete_pairing(&nonce, device_pub.as_bytes(), "iPhone")
             .unwrap();
 
         let challenge = manager.create_challenge("req-1", "test op");
-        let challenge_bytes = construct_challenge_bytes(&challenge);
-        let signature = device_key.sign(&challenge_bytes);
+        let signed = challenge::decision_bytes(&challenge, true);
+        let signature = device_key.sign(&signed);
 
-        // First verification should succeed
-        let result = manager.verify_approval(&challenge, &signature.to_bytes(), &device.device_id);
-        assert!(result.is_ok());
+        // Unconfirmed device: even a valid signature is quarantined.
+        let quarantined =
+            manager.verify_approval(&challenge, &signature.to_bytes(), &device.device_id, true);
+        assert!(quarantined.is_err(), "unconfirmed devices must not verify");
+        manager.confirm_device(&device.device_id).unwrap();
+
+        // First verification should succeed and return the verified device.
+        let result =
+            manager.verify_approval(&challenge, &signature.to_bytes(), &device.device_id, true);
+        assert_eq!(result.unwrap().device_id, device.device_id);
 
         // Same challenge+response should be rejected (replay)
-        let result = manager.verify_approval(&challenge, &signature.to_bytes(), &device.device_id);
+        let result =
+            manager.verify_approval(&challenge, &signature.to_bytes(), &device.device_id, true);
         assert!(result.is_err());
     }
 
@@ -490,7 +587,7 @@ mod tests {
     #[test]
     fn test_consumed_session_rejected() {
         let (_dir, manager) = temp_manager();
-        let (_payload, nonce) = manager.generate_qr_payload();
+        let (_payload, nonce) = manager.generate_qr_payload(None);
 
         let key1 = SigningKey::generate(&mut OsRng);
         let pub1 = key1.verifying_key();
@@ -508,11 +605,11 @@ mod tests {
     #[test]
     fn test_remove_device_from_manager() {
         let (_dir, manager) = temp_manager();
-        let (_payload, nonce) = manager.generate_qr_payload();
+        let (_payload, nonce) = manager.generate_qr_payload(None);
 
         let key = SigningKey::generate(&mut OsRng);
         let pubkey = key.verifying_key();
-        let device = manager
+        let (device, _token) = manager
             .complete_pairing(&nonce, pubkey.as_bytes(), "iPhone")
             .unwrap();
 
@@ -526,11 +623,11 @@ mod tests {
     #[test]
     fn test_rename_device_from_manager() {
         let (_dir, manager) = temp_manager();
-        let (_payload, nonce) = manager.generate_qr_payload();
+        let (_payload, nonce) = manager.generate_qr_payload(None);
 
         let key = SigningKey::generate(&mut OsRng);
         let pubkey = key.verifying_key();
-        let device = manager
+        let (device, _token) = manager
             .complete_pairing(&nonce, pubkey.as_bytes(), "Old Name")
             .unwrap();
 
@@ -547,8 +644,8 @@ mod tests {
         let (_dir, manager) = temp_manager();
 
         // Generate some sessions
-        let _ = manager.generate_qr_payload();
-        let _ = manager.generate_qr_payload();
+        let _ = manager.generate_qr_payload(None);
+        let _ = manager.generate_qr_payload(None);
 
         // Sessions should exist
         {
@@ -567,7 +664,7 @@ mod tests {
     #[test]
     fn test_qr_payload_json_roundtrip() {
         let (_dir, manager) = temp_manager();
-        let (payload, _) = manager.generate_qr_payload();
+        let (payload, _) = manager.generate_qr_payload(None);
 
         let json = serde_json::to_string(&payload).unwrap();
         let parsed: QrPayload = serde_json::from_str(&json).unwrap();

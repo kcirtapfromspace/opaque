@@ -16,9 +16,10 @@
 enforce_agent_sessions = true
 agent_session_ttl_secs = 3600
 
-[[known_human_clients]]
-name = "opaque-cli"
-exe_path = "**/opaque"
+# Client classification is audit-only; operations are gated on out-of-band approval
+# and workspace scope. enforce_agent_sessions requires an approved session token,
+# created via `opaque connect` (which prompts for approval — an agent cannot mint
+# its own session because it cannot satisfy the prompt).
 
 # ---- Deny agents from revealing secrets ----
 

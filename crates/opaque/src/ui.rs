@@ -84,10 +84,7 @@ pub static LINK: Emoji<'_, '_> = Emoji("🔗 ", "-> ");
 fn supports_unicode() -> bool {
     // console crate's Term handles TTY detection; if we can get a terminal
     // that is not dumb, assume unicode works.
-    Term::stdout().is_term()
-        && std::env::var("TERM")
-            .map(|t| t != "dumb")
-            .unwrap_or(true)
+    Term::stdout().is_term() && std::env::var("TERM").map(|t| t != "dumb").unwrap_or(true)
 }
 
 pub struct BoxChars {
@@ -296,7 +293,10 @@ pub fn table(headers: &[&str], rows: &[Vec<String>]) {
 
     // Calculate column widths.
     let col_count = headers.len();
-    let mut widths: Vec<usize> = headers.iter().map(|h| console::measure_text_width(h)).collect();
+    let mut widths: Vec<usize> = headers
+        .iter()
+        .map(|h| console::measure_text_width(h))
+        .collect();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
             if i < col_count {
@@ -339,7 +339,7 @@ pub fn table(headers: &[&str], rows: &[Vec<String>]) {
             .map(|(i, cell)| {
                 let w = if i < col_count { widths[i] } else { 0 };
                 let visible = console::measure_text_width(cell);
-                let pad = if w > visible { w - visible } else { 0 };
+                let pad = w.saturating_sub(visible);
                 format!("{cell}{}", " ".repeat(pad))
             })
             .collect::<Vec<_>>()
@@ -519,11 +519,7 @@ pub fn format_response(method: &str, result: &serde_json::Value) {
         }
         "version" => {
             if let Some(ver) = result.get("version").and_then(|v| v.as_str()) {
-                println!(
-                    "  {} {}",
-                    style("opaqued").bold(),
-                    style(ver).cyan().bold()
-                );
+                println!("  {} {}", style("opaqued").bold(), style(ver).cyan().bold());
             } else {
                 print_json(result);
             }
@@ -532,12 +528,18 @@ pub fn format_response(method: &str, result: &serde_json::Value) {
             header("Client Identity");
             if let Some(obj) = result.as_object() {
                 for (k, v) in obj {
+                    // The logged-in principal is rendered as its own
+                    // section below, not as a raw JSON blob.
+                    if k == "identity" || k == "identity_required" {
+                        continue;
+                    }
                     let val = match v {
                         serde_json::Value::String(s) => s.clone(),
                         other => other.to_string(),
                     };
                     kv(k, &val);
                 }
+                format_whoami_identity(obj);
             } else {
                 print_json(result);
             }
@@ -557,9 +559,155 @@ pub fn format_response(method: &str, result: &serde_json::Value) {
         "agent_session_end" => {
             format_agent_session_end_result(result);
         }
+        "identity.logout" => {
+            format_identity_logout_result(result);
+        }
+        "identity.principal_list" => {
+            format_identity_principal_list_result(result);
+        }
+        "identity.role_set" => {
+            format_identity_role_set_result(result);
+        }
+        "identity.delegation_list" => {
+            format_identity_delegation_list_result(result);
+        }
+        "fido2_list" => {
+            let empty = vec![];
+            let creds = result
+                .get("credentials")
+                .and_then(|v| v.as_array())
+                .unwrap_or(&empty);
+            if creds.is_empty() {
+                info("No FIDO2 credentials registered.");
+                return;
+            }
+            header(&format!("{} FIDO2 credential(s)", creds.len()));
+            for c in creds {
+                let label = c.get("label").and_then(|v| v.as_str()).unwrap_or("?");
+                let id = c
+                    .get("credential_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let created = c.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+                println!(
+                    "  {} {}  {}",
+                    style(KEY).dim(),
+                    style(label).yellow().bold(),
+                    style(format!("(registered {created})")).dim()
+                );
+                println!("      {}", style(format!("id {id}")).dim());
+            }
+        }
+        "fido2_remove" => {
+            success("Credential removed — approval authority revoked.");
+        }
+        "device_pair_start" => {
+            format_device_pair_start_result(result);
+        }
+        "device_list" => {
+            format_device_list_result(result);
+        }
+        "device_pair_confirm" => {
+            let name = result.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            success(&format!(
+                "Device \"{name}\" confirmed — it now holds approval authority."
+            ));
+        }
+        "device_revoke" => {
+            let id = result
+                .get("device_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            success(&format!(
+                "Device {id} revoked — approval authority removed."
+            ));
+        }
         _ => {
             print_json(result);
         }
+    }
+}
+
+/// Render the pairing payload + next steps.
+fn format_device_pair_start_result(result: &serde_json::Value) {
+    header("Device pairing started");
+    if let Some(addr) = result.get("server_addr").and_then(|v| v.as_str()) {
+        kv("approval server", addr);
+    }
+    if let Some(payload) = result.get("qr_payload") {
+        if let Some(expires) = payload.get("expires_at").and_then(|v| v.as_i64()) {
+            kv("pairing window ends", &format_epoch_seconds(expires));
+        }
+        println!();
+        info("Scan this payload with the companion app (JSON, single line):");
+        if let Ok(compact) = serde_json::to_string(payload) {
+            println!("{compact}");
+        }
+    }
+    println!();
+    info("After the app completes pairing, run `opaque device ls` to see the new");
+    info("device, then `opaque device confirm <device-id>` and MATCH the key");
+    info("fingerprint against what the device displays. Until confirmed, the");
+    info("device has no approval authority.");
+}
+
+/// Render the device table.
+fn format_device_list_result(result: &serde_json::Value) {
+    let empty = vec![];
+    let devices = result
+        .get("devices")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
+    if devices.is_empty() {
+        info("No paired devices.");
+        return;
+    }
+    header(&format!("{} paired device(s)", devices.len()));
+    for d in devices {
+        let name = d.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+        let id = d.get("device_id").and_then(|v| v.as_str()).unwrap_or("?");
+        let fp = d.get("fingerprint").and_then(|v| v.as_str()).unwrap_or("?");
+        let revoked = d.get("revoked").and_then(|v| v.as_bool()).unwrap_or(false);
+        let confirmed = d
+            .get("confirmed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let badge = if revoked {
+            status_badge("REVOKED", BadgeState::Fail)
+        } else if !confirmed {
+            status_badge("UNCONFIRMED", BadgeState::Warn)
+        } else {
+            status_badge("ACTIVE", BadgeState::Ok)
+        };
+        println!(
+            "  {badge} {}  {}",
+            style(name).yellow().bold(),
+            style(format!("fingerprint {fp}")).dim()
+        );
+        println!("      {}", style(format!("id {id}")).dim());
+        if let Some(paired_by) = d.get("paired_by").and_then(|v| v.as_str()) {
+            println!("      {}", style(format!("paired by {paired_by}")).dim());
+        }
+        if !confirmed && !revoked {
+            println!(
+                "      {}",
+                style(format!("confirm with: opaque device confirm {id}")).cyan()
+            );
+        }
+    }
+}
+
+/// Format a unix-seconds timestamp relative to now (no date dependency).
+fn format_epoch_seconds(secs: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let delta = secs - now;
+    if delta > 0 {
+        format!("in {delta}s")
+    } else {
+        format!("{}s ago", -delta)
     }
 }
 
@@ -603,25 +751,27 @@ fn format_operation_result(result: &serde_json::Value) {
         return;
     }
 
-    // sandbox.exec returns stdout/stderr + exit code.
+    // sandbox.exec returns exit code + output lengths (never content).
     if let Some(exit_code) = obj.get("exit_code").and_then(|v| v.as_i64()) {
-        // Print captured stdout directly (not styled — preserve command output).
-        if let Some(stdout) = obj.get("stdout").and_then(|v| v.as_str())
-            && !stdout.is_empty()
-        {
-            print!("{stdout}");
-            if !stdout.ends_with('\n') {
-                println!();
-            }
-        }
-        // Print captured stderr to stderr.
-        if let Some(stderr) = obj.get("stderr").and_then(|v| v.as_str())
-            && !stderr.is_empty()
-        {
-            eprint!("{stderr}");
-            if !stderr.ends_with('\n') {
-                eprintln!();
-            }
+        // SECURITY (C2): the daemon does not return stdout/stderr content — a
+        // command's output may contain secrets. Only lengths are surfaced here; a
+        // human-only live-output view is tracked as separate follow-up work.
+        let stdout_len = obj
+            .get("stdout_length")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let stderr_len = obj
+            .get("stderr_length")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if stdout_len > 0 || stderr_len > 0 {
+            println!(
+                "  {}",
+                style(format!(
+                    "output withheld (stdout: {stdout_len} bytes, stderr: {stderr_len} bytes)"
+                ))
+                .dim()
+            );
         }
 
         // Show truncation warning if output was capped.
@@ -951,6 +1101,264 @@ fn format_agent_session_end_result(result: &serde_json::Value) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Identity substrate rendering (Phase 1)
+// ---------------------------------------------------------------------------
+
+/// Format a future epoch-ms timestamp as "in Xh Ym" (or "expired").
+fn format_expires_in(expires_at_ms: i64) -> String {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    let remaining_secs = (expires_at_ms - now_ms) / 1000;
+    if remaining_secs <= 0 {
+        return "expired".into();
+    }
+    if remaining_secs < 60 {
+        format!("in {remaining_secs}s")
+    } else if remaining_secs < 3600 {
+        format!("in {}m", remaining_secs / 60)
+    } else if remaining_secs < 86400 {
+        format!(
+            "in {}h {}m",
+            remaining_secs / 3600,
+            (remaining_secs % 3600) / 60
+        )
+    } else {
+        format!(
+            "in {}d {}h",
+            remaining_secs / 86400,
+            (remaining_secs % 86400) / 3600
+        )
+    }
+}
+
+/// Shorten a principal/session id for table display: `hum_0a1b2c3d…`.
+fn short_id(id: &str) -> String {
+    if id.chars().count() > 12 {
+        format!("{}…", id.chars().take(12).collect::<String>())
+    } else {
+        id.to_string()
+    }
+}
+
+fn roles_cell(roles: Option<&serde_json::Value>) -> String {
+    roles
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| r.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "-".into())
+}
+
+/// Render the logged-in principal summary (used by `opaque login` success
+/// and the whoami identity section).
+pub fn format_identity_summary(identity: &serde_json::Value) {
+    if is_quiet() || identity.is_null() {
+        return;
+    }
+    if let Some(label) = identity.get("label").and_then(|v| v.as_str()) {
+        kv("principal", label);
+    }
+    if let Some(id) = identity.get("principal_id").and_then(|v| v.as_str()) {
+        kv("id", &ident(id));
+    }
+    if let Some(email) = identity.get("email").and_then(|v| v.as_str()) {
+        kv("email", email);
+    }
+    let roles = roles_cell(identity.get("roles"));
+    if roles != "-" {
+        kv("roles", &style(roles).cyan().to_string());
+    }
+    if let Some(iss) = identity.get("issuer").and_then(|v| v.as_str()) {
+        kv("issuer", &dim(iss));
+    }
+    if let Some(exp) = identity
+        .get("session_expires_at_utc_ms")
+        .and_then(|v| v.as_i64())
+    {
+        kv("session", &format!("expires {}", format_expires_in(exp)));
+    }
+}
+
+/// Render the identity portion of a whoami response.
+fn format_whoami_identity(obj: &serde_json::Map<String, serde_json::Value>) {
+    let identity = obj.get("identity");
+    let required = obj
+        .get("identity_required")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // Older daemons don't send identity fields at all — print nothing.
+    if identity.is_none() && !required {
+        return;
+    }
+
+    header("Identity");
+    match identity {
+        Some(id_obj) if !id_obj.is_null() => {
+            format_identity_summary(id_obj);
+        }
+        _ => {
+            println!("  {}", dim("not signed in"));
+            if required {
+                println!(
+                    "  {} {}",
+                    style("hint:").cyan().bold(),
+                    style("this daemon requires identity — run `opaque login`").cyan()
+                );
+            }
+        }
+    }
+}
+
+fn format_identity_logout_result(result: &serde_json::Value) {
+    let revoked = result.get("revoked").and_then(|v| v.as_u64()).unwrap_or(0);
+    if revoked == 0 {
+        info("No active login sessions");
+    } else {
+        success(&format!("Revoked {revoked} login session(s)"));
+    }
+}
+
+fn format_identity_principal_list_result(result: &serde_json::Value) {
+    let principals = match result.get("principals").and_then(|v| v.as_array()) {
+        Some(p) => p,
+        None => {
+            print_json(result);
+            return;
+        }
+    };
+    if principals.is_empty() {
+        info("No principals registered — run `opaque login` to create the first one");
+        return;
+    }
+
+    header(&format!("{} principal(s)", principals.len()));
+    let rows: Vec<Vec<String>> = principals
+        .iter()
+        .map(|p| {
+            let id = p.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+            let kind = p.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
+            let label = p.get("label").and_then(|v| v.as_str()).unwrap_or("-");
+            let disabled = p.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false);
+            let last_seen = p
+                .get("last_seen")
+                .and_then(|v| v.as_i64())
+                .map(|secs| crate::format_relative_time(secs * 1000))
+                .unwrap_or_else(|| "-".into());
+            let status = if disabled {
+                status_badge("DISABLED", BadgeState::Fail)
+            } else {
+                status_badge("OK", BadgeState::Ok)
+            };
+            vec![
+                short_id(id),
+                kind.to_string(),
+                label.to_string(),
+                roles_cell(p.get("roles")),
+                last_seen,
+                status,
+            ]
+        })
+        .collect();
+    table(
+        &["ID", "KIND", "LABEL", "ROLES", "LAST SEEN", "STATUS"],
+        &rows,
+    );
+}
+
+fn format_identity_role_set_result(result: &serde_json::Value) {
+    let label = result
+        .get("label")
+        .and_then(|v| v.as_str())
+        .or_else(|| result.get("id").and_then(|v| v.as_str()))
+        .unwrap_or("principal");
+    success(&format!(
+        "Updated roles for {}: {}",
+        style(label).bold(),
+        style(roles_cell(result.get("roles"))).cyan()
+    ));
+}
+
+fn format_identity_delegation_list_result(result: &serde_json::Value) {
+    let delegations = match result.get("delegations").and_then(|v| v.as_array()) {
+        Some(d) => d,
+        None => {
+            print_json(result);
+            return;
+        }
+    };
+    if delegations.is_empty() {
+        info("No delegations recorded");
+        return;
+    }
+
+    header(&format!("{} delegation(s)", delegations.len()));
+    let rows: Vec<Vec<String>> = delegations
+        .iter()
+        .map(|d| {
+            let jti = d.get("jti").and_then(|v| v.as_str()).unwrap_or("?");
+            let mode = d.get("mode").and_then(|v| v.as_str()).unwrap_or("?");
+            let sub = d
+                .get("sub_label")
+                .or_else(|| d.get("sub"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let act = d
+                .get("act_label")
+                .or_else(|| d.get("act"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let approved_by = d
+                .get("approved_by")
+                .and_then(|v| v.as_str())
+                .map(short_id)
+                .unwrap_or_else(|| "-".into());
+            let state = if d.get("revoked_at").is_some_and(|v| !v.is_null()) {
+                status_badge("REVOKED", BadgeState::Warn)
+            } else {
+                match d.get("expires_at").and_then(|v| v.as_i64()) {
+                    // expires_at is unix seconds in delegation records.
+                    Some(exp) => {
+                        let human = format_expires_in(exp * 1000);
+                        if human == "expired" {
+                            status_badge("EXPIRED", BadgeState::Warn)
+                        } else {
+                            format!("expires {human}")
+                        }
+                    }
+                    None => "-".into(),
+                }
+            };
+            vec![
+                short_id(jti),
+                mode.to_string(),
+                sub.to_string(),
+                act.to_string(),
+                approved_by,
+                state,
+            ]
+        })
+        .collect();
+    table(
+        &[
+            "SESSION",
+            "MODE",
+            "ON BEHALF OF",
+            "AGENT",
+            "APPROVED BY",
+            "STATE",
+        ],
+        &rows,
+    );
+}
+
 /// Format a daemon error response.
 pub fn format_error(err: &opaque_core::proto::ErrorObj) {
     error(&err.message);
@@ -985,9 +1393,7 @@ pub fn format_error(err: &opaque_core::proto::ErrorObj) {
                     "  {} Resource not found. Check that names and IDs are correct.",
                     style("hint:").cyan().bold()
                 );
-                println!(
-                    "    • List available resources before trying again"
-                );
+                println!("    • List available resources before trying again");
             }
             code if code.contains("invalid") || code.contains("INVALID") => {
                 println!(
@@ -1008,10 +1414,7 @@ pub fn format_error(err: &opaque_core::proto::ErrorObj) {
                     "    • Verify config: {}",
                     style("opaque policy check").yellow()
                 );
-                println!(
-                    "    • Run diagnostics: {}",
-                    style("opaque doctor").yellow()
-                );
+                println!("    • Run diagnostics: {}", style("opaque doctor").yellow());
             }
             _ => {
                 println!(
@@ -1042,4 +1445,52 @@ pub fn init_step(msg: &str) {
         return;
     }
     println!("  {} {}", style(CHECK).green(), msg);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64
+    }
+
+    #[test]
+    fn format_expires_in_past_is_expired() {
+        assert_eq!(format_expires_in(now_ms() - 5_000), "expired");
+        assert_eq!(format_expires_in(0), "expired");
+    }
+
+    #[test]
+    fn format_expires_in_future_buckets() {
+        let now = now_ms();
+        assert!(format_expires_in(now + 30_000).starts_with("in "));
+        let hours = format_expires_in(now + 2 * 3600 * 1000 + 90_000);
+        assert!(hours.starts_with("in 2h"), "got {hours}");
+        let days = format_expires_in(now + 3 * 86400 * 1000 + 3_600_000);
+        assert!(days.starts_with("in 3d"), "got {days}");
+    }
+
+    #[test]
+    fn short_id_truncates_long_ids_safely() {
+        let id = "hum_0123456789abcdef0123456789abcdef";
+        let short = short_id(id);
+        assert!(short.starts_with("hum_01234567"));
+        assert!(short.ends_with('…'));
+        assert_eq!(short_id("hum_short"), "hum_short");
+        // Multi-byte chars must not panic.
+        let _ = short_id("ééééééééééééééééé");
+    }
+
+    #[test]
+    fn roles_cell_renders_lists_and_dashes() {
+        let v = serde_json::json!(["admin", "operator"]);
+        assert_eq!(roles_cell(Some(&v)), "admin, operator");
+        let empty = serde_json::json!([]);
+        assert_eq!(roles_cell(Some(&empty)), "-");
+        assert_eq!(roles_cell(None), "-");
+    }
 }

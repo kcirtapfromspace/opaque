@@ -8,12 +8,15 @@ pub const DEFAULT_SOCKET_FILENAME: &str = "opaqued.sock";
 /// The daemon should call `socket_path_for_client(false)` to ignore the env
 /// var (prevents an attacker from redirecting via environment). The CLI uses
 /// `socket_path()` which delegates to `socket_path_for_client(true)`.
+/// System socket location used by split (service-account) deployments.
+pub const SYSTEM_SOCKET_PATH: &str = "/run/opaque/opaqued.sock";
+
 pub fn socket_path_for_client(allow_env_override: bool) -> PathBuf {
     if allow_env_override && let Ok(p) = std::env::var("OPAQUE_SOCK") {
         return PathBuf::from(p);
     }
 
-    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+    let user_candidate = if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
         let dir_path = Path::new(&dir);
         // Reject non-absolute or paths with `..` components.
         if dir_path.is_absolute()
@@ -21,15 +24,34 @@ pub fn socket_path_for_client(allow_env_override: bool) -> PathBuf {
                 .components()
                 .any(|c| c == std::path::Component::ParentDir)
         {
-            return dir_path.join("opaque").join(DEFAULT_SOCKET_FILENAME);
+            Some(dir_path.join("opaque").join(DEFAULT_SOCKET_FILENAME))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let user_candidate = user_candidate.unwrap_or_else(|| {
+        let home = std::env::var_os("HOME").unwrap_or_else(|| OsString::from("."));
+        PathBuf::from(home)
+            .join(".opaque")
+            .join("run")
+            .join(DEFAULT_SOCKET_FILENAME)
+    });
+
+    // Clients discover a system daemon (trust-domain split deployment) when no
+    // per-user daemon socket exists. The daemon itself never probes: where it
+    // *binds* must not depend on what files happen to exist (its split-mode
+    // path comes from the sealed config instead).
+    if allow_env_override && !user_candidate.exists() {
+        let system = PathBuf::from(SYSTEM_SOCKET_PATH);
+        if system.exists() {
+            return system;
         }
     }
 
-    let home = std::env::var_os("HOME").unwrap_or_else(|| OsString::from("."));
-    PathBuf::from(home)
-        .join(".opaque")
-        .join("run")
-        .join(DEFAULT_SOCKET_FILENAME)
+    user_candidate
 }
 
 /// Resolve the socket path (client-side, allows env override).
@@ -54,85 +76,128 @@ pub fn ensure_socket_parent_dir(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Verify that a socket path is safe to connect to.
+/// Ownership + mode facts about the socket and its parent directory, fed to
+/// the pure [`check_socket_facts`] so both trust models are unit-testable
+/// (a foreign-uid daemon socket cannot be fabricated in a same-uid test).
+#[derive(Debug, Clone, Copy)]
+pub struct SocketFacts {
+    pub uid: u32,
+    pub mode: u32,
+    pub is_symlink: bool,
+}
+
+/// Decide whether a socket is safe to connect to.
 ///
-/// Checks:
-/// - The socket file exists and is not a symlink
-/// - The socket file is owned by the current user with mode 0600
-/// - The parent directory is not a symlink and is owned by the current user with mode 0700
+/// Two trust models, selected by ownership:
+///
+/// - **Same-uid daemon** (developer mode): the socket belongs to *us* — it and
+///   its directory must be exactly private (0600 / 0700, no exceptions).
+/// - **System daemon** (trust-domain split): the socket belongs to a service
+///   account. We cannot demand our own uid; instead we demand the split's
+///   shape: no world access anywhere, no group *write* on the directory
+///   (a group-writable dir would let any group member replace the socket),
+///   and directory custody by the daemon account or root. Group *connect*
+///   access on the socket itself (0660) is the mechanism that admits clients.
+///
+/// The caller guards against symlinked path components separately via
+/// [`validate_path_chain`]; symlinks at either endpoint fail here too.
+pub fn check_socket_facts(
+    socket: SocketFacts,
+    parent: Option<SocketFacts>,
+    my_uid: u32,
+) -> Result<(), String> {
+    if socket.is_symlink {
+        return Err("socket path is a symlink".into());
+    }
+    if let Some(dir) = &parent
+        && dir.is_symlink
+    {
+        return Err("socket parent directory is a symlink".into());
+    }
+
+    if socket.uid == my_uid {
+        // Same-uid daemon: exact private modes. A group- or world-accessible
+        // socket we ourselves own is not a deployment shape the daemon ever
+        // creates in this mode — treat it as tampering. (This also refuses
+        // connecting *as* the service account of a split daemon: nothing
+        // legitimate drives the CLI from inside the daemon's own trust
+        // domain, and the daemon would refuse that peer anyway.)
+        let mode = socket.mode & 0o777;
+        if mode != 0o600 {
+            return Err(format!("socket has mode {mode:o}, expected 0600"));
+        }
+        if let Some(dir) = parent {
+            if dir.uid != my_uid {
+                return Err(format!(
+                    "parent dir owned by uid {} but expected {my_uid}",
+                    dir.uid
+                ));
+            }
+            let dir_mode = dir.mode & 0o777;
+            if dir_mode != 0o700 {
+                return Err(format!("parent dir has mode {dir_mode:o}, expected 0700"));
+            }
+        }
+        return Ok(());
+    }
+
+    // System daemon under another uid: verify the split's shape.
+    if socket.mode & 0o007 != 0 {
+        return Err(format!(
+            "system daemon socket is world-accessible (mode {:o}) — a split deployment \
+             must gate connect access by group membership (0660)",
+            socket.mode & 0o777
+        ));
+    }
+    let Some(dir) = parent else {
+        return Err("system daemon socket has no parent directory to verify".into());
+    };
+    if dir.uid != socket.uid && dir.uid != 0 {
+        return Err(format!(
+            "system daemon socket owned by uid {} but its directory by uid {} — \
+             the socket directory must belong to the daemon account or root",
+            socket.uid, dir.uid
+        ));
+    }
+    if dir.mode & 0o022 != 0 {
+        return Err(format!(
+            "system daemon socket directory is group- or world-writable (mode {:o}) — \
+             a writable directory lets others replace the socket",
+            dir.mode & 0o777
+        ));
+    }
+    Ok(())
+}
+
+/// Verify that a socket path is safe to connect to (see [`check_socket_facts`]).
 #[cfg(unix)]
 pub fn verify_socket_safety(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
 
-    let my_uid = unsafe { libc::getuid() };
-
-    // lstat the socket file — reject symlinks.
-    let meta = path.symlink_metadata().map_err(|e| {
-        std::io::Error::new(
-            e.kind(),
-            format!("cannot stat socket {}: {e}", path.display()),
-        )
-    })?;
-
-    if meta.file_type().is_symlink() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!("socket path is a symlink: {}", path.display()),
-        ));
-    }
-
-    if meta.uid() != my_uid {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!("socket owned by uid {} but expected {}", meta.uid(), my_uid),
-        ));
-    }
-
-    let mode = meta.mode() & 0o777;
-    if mode != 0o600 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!("socket has mode {:o}, expected 0600", mode),
-        ));
-    }
-
-    // Check parent directory.
-    if let Some(parent) = path.parent() {
-        let parent_meta = parent.symlink_metadata().map_err(|e| {
-            std::io::Error::new(
-                e.kind(),
-                format!("cannot stat parent dir {}: {e}", parent.display()),
-            )
+    let facts_of = |p: &Path| -> std::io::Result<SocketFacts> {
+        let meta = p.symlink_metadata().map_err(|e| {
+            std::io::Error::new(e.kind(), format!("cannot stat {}: {e}", p.display()))
         })?;
+        Ok(SocketFacts {
+            uid: meta.uid(),
+            mode: meta.mode() & 0o7777,
+            is_symlink: meta.file_type().is_symlink(),
+        })
+    };
 
-        if parent_meta.file_type().is_symlink() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!("parent directory is a symlink: {}", parent.display()),
-            ));
-        }
+    let socket_facts = facts_of(path)?;
+    let parent_facts = match path.parent() {
+        Some(parent) => Some(facts_of(parent)?),
+        None => None,
+    };
 
-        if parent_meta.uid() != my_uid {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!(
-                    "parent dir owned by uid {} but expected {}",
-                    parent_meta.uid(),
-                    my_uid
-                ),
-            ));
-        }
-
-        let parent_mode = parent_meta.mode() & 0o777;
-        if parent_mode != 0o700 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!("parent dir has mode {:o}, expected 0700", parent_mode),
-            ));
-        }
-    }
-
-    Ok(())
+    let my_uid = unsafe { libc::getuid() };
+    check_socket_facts(socket_facts, parent_facts, my_uid).map_err(|msg| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{msg} (socket {})", path.display()),
+        )
+    })
 }
 
 /// Walk each component of a path and verify none are symlinks.
@@ -204,6 +269,66 @@ mod tests {
             let path = socket_path_for_client(false);
             assert!(!path.starts_with("/run/../etc"));
         }
+    }
+
+    fn facts(uid: u32, mode: u32) -> SocketFacts {
+        SocketFacts {
+            uid,
+            mode,
+            is_symlink: false,
+        }
+    }
+
+    const ME: u32 = 1000;
+    const DAEMON: u32 = 500;
+
+    #[test]
+    fn same_uid_model_requires_exact_private_modes() {
+        // Exactly 0600 socket in a 0700 dir: fine.
+        assert!(check_socket_facts(facts(ME, 0o600), Some(facts(ME, 0o700)), ME).is_ok());
+        // Anything looser on either endpoint is tampering.
+        assert!(check_socket_facts(facts(ME, 0o660), Some(facts(ME, 0o700)), ME).is_err());
+        assert!(check_socket_facts(facts(ME, 0o600), Some(facts(ME, 0o750)), ME).is_err());
+        // Dir owned by someone else while the socket is ours: rejected.
+        assert!(check_socket_facts(facts(ME, 0o600), Some(facts(DAEMON, 0o700)), ME).is_err());
+    }
+
+    #[test]
+    fn system_daemon_model_accepts_the_split_shape() {
+        // Daemon-owned socket 0660 in a daemon-owned 0750 dir.
+        assert!(check_socket_facts(facts(DAEMON, 0o660), Some(facts(DAEMON, 0o750)), ME).is_ok());
+        // Root-owned runtime dir (pre-created /run/opaque) is also fine.
+        assert!(check_socket_facts(facts(DAEMON, 0o660), Some(facts(0, 0o755)), ME).is_ok());
+    }
+
+    #[test]
+    fn system_daemon_model_rejects_world_access_and_writable_dirs() {
+        // World-connectable socket: the group gate is missing.
+        assert!(check_socket_facts(facts(DAEMON, 0o666), Some(facts(DAEMON, 0o750)), ME).is_err());
+        assert!(check_socket_facts(facts(DAEMON, 0o662), Some(facts(DAEMON, 0o750)), ME).is_err());
+        // Group- or world-writable dir: anyone could swap the socket out.
+        assert!(check_socket_facts(facts(DAEMON, 0o660), Some(facts(DAEMON, 0o770)), ME).is_err());
+        assert!(check_socket_facts(facts(DAEMON, 0o660), Some(facts(DAEMON, 0o757)), ME).is_err());
+        // Dir owned by a third uid (neither daemon nor root): custody unclear.
+        assert!(check_socket_facts(facts(DAEMON, 0o660), Some(facts(1234, 0o750)), ME).is_err());
+        // No parent at all for a foreign socket: nothing vouches for it.
+        assert!(check_socket_facts(facts(DAEMON, 0o660), None, ME).is_err());
+    }
+
+    #[test]
+    fn symlinks_fail_both_models() {
+        let link = SocketFacts {
+            uid: ME,
+            mode: 0o600,
+            is_symlink: true,
+        };
+        assert!(check_socket_facts(link, Some(facts(ME, 0o700)), ME).is_err());
+        let dir_link = SocketFacts {
+            uid: DAEMON,
+            mode: 0o750,
+            is_symlink: true,
+        };
+        assert!(check_socket_facts(facts(DAEMON, 0o660), Some(dir_link), ME).is_err());
     }
 
     #[cfg(unix)]

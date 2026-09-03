@@ -12,6 +12,10 @@ use opaque_core::audit::{
     TracingAuditEmitter,
 };
 use opaque_core::execve_map::{ExecveDefault, ExecveMapper, ExecveRule};
+use opaque_core::identity::{
+    AccessMode, DelegationClaims, PrincipalContext, PrincipalId, now_unix, sign_delegation_token,
+    verify_delegation_token,
+};
 use opaque_core::operation::{
     ApprovalFactor, ApprovalRequirement, ClientIdentity, ClientType, OperationDef,
     OperationRegistry, OperationRequest, OperationSafety,
@@ -41,20 +45,23 @@ mod bitwarden;
 mod doppler;
 mod enclave;
 #[allow(dead_code)]
+mod factors;
+#[allow(dead_code)]
 mod fido2;
 #[allow(dead_code)]
 mod gcp;
 mod github;
 mod gitlab;
+mod identity;
 #[allow(dead_code)]
 mod infisical;
 mod onepassword;
 #[allow(dead_code)]
 mod pairing;
-#[allow(dead_code)]
 mod push;
 mod sandbox;
 pub mod secret;
+mod trust_domain;
 mod vault;
 
 use std::future::Future;
@@ -103,6 +110,96 @@ struct DaemonConfig {
     /// Default decision for execve requests that do not match any rule.
     #[serde(default)]
     execve_default: ExecveDefault,
+
+    /// Identity substrate (`[identity]`): OIDC login, principals, roles.
+    /// Absent = identity features disabled (Phase 0 behavior).
+    #[serde(default)]
+    identity: Option<identity::IdentityConfig>,
+
+    /// Approval backend: `"native"` (default — OS biometric/polkit prompt) or
+    /// `"insecure_auto_approve"` (tests/e2e ONLY; additionally requires the
+    /// environment variable `OPAQUE_INSECURE_AUTO_APPROVE=1` at startup, and
+    /// announces itself with an Error-level audit event).
+    #[serde(default)]
+    approval_backend: Option<String>,
+
+    /// Trust-domain enforcement (`[trust_domain]`): the service-account split
+    /// that turns the audit/seal/delegation guarantees from tamper-evidence
+    /// into tamper-prevention. Absent = shared-uid developer mode (audited,
+    /// not enforced).
+    #[serde(default)]
+    trust_domain: TrustDomainConfig,
+
+    /// Approval factor settings (`[approval]`): which out-of-band factors are
+    /// live beyond the local prompt.
+    #[serde(default)]
+    approval: ApprovalFactorsConfig,
+}
+
+/// `[approval]` — out-of-band approval factor configuration.
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ApprovalFactorsConfig {
+    /// Enable the second-device factor: starts the local HTTPS approval
+    /// server (+ mDNS) where paired devices fetch and sign challenges.
+    #[serde(default)]
+    second_device: bool,
+
+    /// Bind address for the approval server. Defaults to `127.0.0.1:7381`;
+    /// `127.0.0.1:0` picks a free port.
+    #[serde(default)]
+    server_bind: Option<String>,
+
+    /// Seconds a device has to answer a challenge (default 60).
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+
+    /// Enable the FIDO2/passkey factor: hardware keys and platform passkeys
+    /// registered with the daemon can approve operations. Assertion
+    /// verification is daemon-side; the authenticator ceremony runs in the
+    /// client that drives the key.
+    #[serde(default)]
+    fido2: bool,
+
+    /// WebAuthn relying-party id for FIDO2 (default "opaque.local").
+    #[serde(default)]
+    fido2_rp_id: Option<String>,
+}
+
+/// `[trust_domain]` — settings for running the daemon as a principal distinct
+/// from the agents it polices.
+#[derive(Debug, Clone, Deserialize, Default)]
+struct TrustDomainConfig {
+    /// When true the daemon fails closed at startup unless every custody file
+    /// (audit db + chain key, identity db + signing key, config + seal,
+    /// pairing store, profiles) is exclusively owned by the daemon's own uid,
+    /// and refuses connections from peers running *as* the daemon uid
+    /// (nothing legitimate runs as the service account except the daemon).
+    #[serde(default)]
+    enforce: bool,
+
+    /// Drop privileges to this user at startup when launched as root (the
+    /// non-systemd path; under systemd prefer `User=`/`Group=` in the unit).
+    #[serde(default)]
+    run_as: Option<String>,
+
+    /// Group granted connect access to the socket + read access to the
+    /// daemon token in enforce mode. Clients must be members. Without it the
+    /// socket keeps owner-only permissions, which at a split uid means no
+    /// client can connect — so enforce mode requires it.
+    #[serde(default)]
+    socket_group: Option<String>,
+
+    /// Explicit socket path for split deployments (e.g. `/run/opaque/opaqued.sock`).
+    /// Trusted because it comes from the sealed, custody-verified config —
+    /// unlike `$OPAQUE_SOCK`, which the daemon deliberately ignores.
+    #[serde(default)]
+    socket_path: Option<PathBuf>,
+
+    /// Permit running enforce mode as uid 0. Off by default: a root daemon
+    /// cannot be protected from a root agent, and the split loses meaning.
+    /// Container entrypoints that cannot set a runAsUser may opt in.
+    #[serde(default)]
+    allow_root: bool,
 }
 
 /// A single entry in the known human clients allowlist.
@@ -141,6 +238,14 @@ struct DaemonState {
     agent_sessions: Arc<tokio::sync::RwLock<HashMap<String, AgentSession>>>,
     /// Semaphore to limit maximum concurrent connections.
     connection_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Identity runtime, present when `[identity]` is configured.
+    identity: Option<Arc<identity::IdentityRuntime>>,
+    /// Pairing manager, present when `[approval] second_device` is enabled.
+    pairing: Option<Arc<pairing::PairingManager>>,
+    /// Bound address of the approval server, when running.
+    approval_server_addr: Option<std::net::SocketAddr>,
+    /// FIDO2 approval coordination, present when `[approval] fido2` is enabled.
+    fido2: Option<Arc<factors::Fido2Approvals>>,
 }
 
 #[derive(Debug, Clone)]
@@ -150,22 +255,82 @@ struct AgentSession {
     created_by_uid: u32,
     expires_at: SystemTime,
     label: Option<String>,
+    /// Principal binding for this session when identity is configured.
+    /// `None` for legacy (pre-identity) hex-token sessions.
+    delegation: Option<SessionDelegation>,
+}
+
+/// The delegation a session token was minted under. The authoritative copy of
+/// these claims is the signed token + the `delegations` store row; this is the
+/// in-memory binding used to re-validate liveness on every request.
+#[derive(Debug, Clone)]
+struct SessionDelegation {
+    jti: String,
+    sub: PrincipalId,
+    act: PrincipalId,
+    mode: AccessMode,
+    human_session_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
-#[tokio::main]
-async fn main() {
+fn main() {
     init_tracing();
 
-    // Daemon never trusts OPAQUE_SOCK env var.
-    let path = socket_path_for_client(false);
-    if let Err(e) = run(path).await {
+    // Process-wide rustls provider, installed once up front: the approval
+    // server builds a rustls ServerConfig directly, which PANICS if no
+    // default provider exists (only reqwest's internal TLS picks one on its
+    // own). Err just means something installed it earlier — fine.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Config is loaded before the async runtime starts because two decisions
+    // depend on it while the process is still genuinely single-threaded: the
+    // privilege drop (setuid + env repoint must not race other threads) and
+    // the socket path for split deployments.
+    let config_path = resolve_config_path();
+    let config = load_config(&config_path);
+
+    if let Some(user) = config.trust_domain.run_as.clone() {
+        if unsafe { libc::geteuid() } == 0 {
+            if let Err(e) = trust_domain::drop_privileges(&user) {
+                eprintln!("opaqued: privilege drop failed: {e}");
+                std::process::exit(1);
+            }
+        } else {
+            info!("trust_domain.run_as set but not starting as root — already dropped, ignoring");
+        }
+    }
+
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("opaqued: failed to start runtime: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = runtime.block_on(run(config, config_path)) {
         eprintln!("opaqued: {e}");
         std::process::exit(1);
     }
+}
+
+/// Resolve the daemon config path.
+///
+/// `$OPAQUE_CONFIG` wins when set. Otherwise root reads the system location
+/// `/etc/opaque/config.toml` (a root launch precedes a `run_as` drop, and the
+/// service account's config must not live in root's home), and a normal user
+/// reads `~/.opaque/config.toml`.
+fn resolve_config_path() -> PathBuf {
+    if let Ok(p) = std::env::var("OPAQUE_CONFIG") {
+        return PathBuf::from(p);
+    }
+    if unsafe { libc::geteuid() } == 0 {
+        return PathBuf::from("/etc/opaque/config.toml");
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join(".opaque").join("config.toml")
 }
 
 fn init_tracing() {
@@ -174,16 +339,9 @@ fn init_tracing() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
-/// Load daemon config from `~/.opaque/config.toml` or `$OPAQUE_CONFIG`.
-fn load_config() -> DaemonConfig {
-    let path = std::env::var("OPAQUE_CONFIG")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            PathBuf::from(home).join(".opaque").join("config.toml")
-        });
-
-    match std::fs::read_to_string(&path) {
+/// Load daemon config from the resolved config path (see [`resolve_config_path`]).
+fn load_config(path: &Path) -> DaemonConfig {
+    match std::fs::read_to_string(path) {
         Ok(contents) => match toml_edit::de::from_str::<DaemonConfig>(&contents) {
             Ok(mut config) => {
                 // Filter out empty human client entries that would match everything.
@@ -204,6 +362,21 @@ fn load_config() -> DaemonConfig {
                 if filtered > 0 {
                     warn!("{filtered} empty human client entries removed from config");
                 }
+                // Unknown role names in [rules.identity] never match (fail
+                // closed) — surface the typo instead of silently denying.
+                for rule in &config.rules {
+                    if let Some(roles) = &rule.identity.roles {
+                        for role in roles {
+                            if role.parse::<opaque_core::identity::Role>().is_err() {
+                                warn!(
+                                    "policy rule '{}' names unknown role {role:?} — \
+                                     this rule will never match",
+                                    rule.name
+                                );
+                            }
+                        }
+                    }
+                }
                 info!(
                     "loaded config from {} ({} known human clients, {} policy rules)",
                     path.display(),
@@ -213,8 +386,17 @@ fn load_config() -> DaemonConfig {
                 config
             }
             Err(e) => {
-                warn!("failed to parse config {}: {e}", path.display());
-                DaemonConfig::default()
+                // SECURITY: an unparseable config must be FATAL, never a
+                // silent fall-through to defaults. Defaults mean
+                // trust_domain.enforce=false, require_seal=false, no policy
+                // rules — one typo would quietly dissolve every protection
+                // the operator wrote down. A config that exists but cannot
+                // be honored stops the daemon.
+                eprintln!(
+                    "opaqued: refusing to start: config {} exists but failed to parse: {e}",
+                    path.display()
+                );
+                std::process::exit(1);
             }
         },
         Err(_) => {
@@ -226,21 +408,29 @@ fn load_config() -> DaemonConfig {
 
 /// Verify the config seal on daemon startup.
 ///
-/// - **Verified**: config matches seal — proceed normally.
-/// - **Unsealed**: no seal found — warn and continue (backward compatible).
+/// - **Verified** (keyed): proceed normally.
+/// - **VerifiedLegacy** (unkeyed): forgeable by anyone who can write the seal
+///   file — warn in shared-uid mode, hard stop under `trust_domain.enforce`.
+/// - **Unsealed**: no seal found — warn and continue (backward compatible),
+///   unless `require_seal` demands one.
+/// - **KeyMissing**: keyed seal whose key vanished — hard stop (custody break).
 /// - **Tampered**: seal exists but doesn't match — hard stop.
-fn verify_config_seal(require_seal: bool, allow_unsealed: bool) -> std::io::Result<()> {
-    let config_path = std::env::var("OPAQUE_CONFIG")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            PathBuf::from(home).join(".opaque").join("config.toml")
-        });
-
+fn verify_config_seal(
+    config_path: &Path,
+    require_seal: bool,
+    allow_unsealed: bool,
+    enforce: bool,
+) -> std::io::Result<()> {
     let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
     let seal_file = config_dir.join("config.seal");
 
-    check_seal(&config_path, &seal_file, require_seal, allow_unsealed)
+    check_seal(
+        config_path,
+        &seal_file,
+        require_seal,
+        allow_unsealed,
+        enforce,
+    )
 }
 
 /// Core seal-check logic, separated from env-var resolution for testability.
@@ -252,21 +442,69 @@ fn check_seal(
     seal_file: &Path,
     require_seal: bool,
     allow_unsealed: bool,
+    enforce: bool,
 ) -> std::io::Result<()> {
-    use opaque_core::seal::{self, SealStatus};
-
     // If config doesn't exist, nothing to verify (load_config handles defaults).
     if !config_path.exists() {
         return Ok(());
     }
 
     let config_bytes = std::fs::read(config_path)?;
+    let status = opaque_core::seal::verify_seal(&config_bytes, seal_file)
+        .map_err(|e| std::io::Error::other(format!("config seal check failed: {e}")))?;
+    evaluate_seal_status(status, require_seal, allow_unsealed, enforce)
+}
 
-    match seal::verify_seal(&config_bytes, seal_file) {
-        Ok(SealStatus::Verified) => {
-            info!("config seal verified");
+/// File-only variant of `check_seal` for testing.
+///
+/// Skips the OS keychain lookup so tests are not affected by stale keychain
+/// entries from real `opaque setup --seal` runs on this machine.
+#[cfg(test)]
+fn check_seal_file_only(
+    config_path: &Path,
+    seal_file: &Path,
+    require_seal: bool,
+    allow_unsealed: bool,
+    enforce: bool,
+) -> std::io::Result<()> {
+    if !config_path.exists() {
+        return Ok(());
+    }
+
+    let config_bytes = std::fs::read(config_path)?;
+    let status = opaque_core::seal::verify_seal_from_file(&config_bytes, seal_file)
+        .map_err(|e| std::io::Error::other(format!("config seal check failed: {e}")))?;
+    evaluate_seal_status(status, require_seal, allow_unsealed, enforce)
+}
+
+/// Shared policy over a seal verification outcome (see [`verify_config_seal`]).
+fn evaluate_seal_status(
+    status: opaque_core::seal::SealStatus,
+    require_seal: bool,
+    allow_unsealed: bool,
+    enforce: bool,
+) -> std::io::Result<()> {
+    use opaque_core::seal::SealStatus;
+
+    match status {
+        SealStatus::Verified => {
+            info!("config seal verified (keyed)");
         }
-        Ok(SealStatus::Unsealed) => {
+        SealStatus::VerifiedLegacy => {
+            if enforce {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "config carries a legacy UNKEYED seal, which any config writer can \
+                     forge — trust_domain.enforce requires the keyed seal. \
+                     Re-seal with 'opaque setup --seal'.",
+                ));
+            }
+            warn!(
+                "config seal is the legacy unkeyed format (drift detection only) — \
+                 re-seal with 'opaque setup --seal' to upgrade to the keyed seal"
+            );
+        }
+        SealStatus::Unsealed => {
             if require_seal && !allow_unsealed {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
@@ -281,67 +519,20 @@ fn check_seal(
                 warn!("config is unsealed — run 'opaque setup --seal' to protect it");
             }
         }
-        Ok(SealStatus::Tampered { .. }) => {
+        SealStatus::KeyMissing => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "config has a keyed seal but the seal key (config.seal.key) is missing — \
+                 the custody of the seal is broken. Restore the key, or re-seal with \
+                 'opaque setup --reset' then 'opaque setup --seal'.",
+            ));
+        }
+        SealStatus::Tampered { .. } => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "config seal broken — config.toml was modified after sealing. \
                  Run 'opaque setup --reset' to unseal, then reconfigure.",
             ));
-        }
-        Err(e) => {
-            return Err(std::io::Error::other(format!(
-                "config seal check failed: {e}"
-            )));
-        }
-    }
-
-    Ok(())
-}
-
-/// File-only variant of `check_seal` for testing.
-///
-/// Skips the OS keychain lookup so tests are not affected by stale keychain
-/// entries from real `opaque setup --seal` runs on this machine.
-#[cfg(test)]
-fn check_seal_file_only(
-    config_path: &Path,
-    seal_file: &Path,
-    require_seal: bool,
-    allow_unsealed: bool,
-) -> std::io::Result<()> {
-    use opaque_core::seal::{self, SealStatus};
-
-    if !config_path.exists() {
-        return Ok(());
-    }
-
-    let config_bytes = std::fs::read(config_path)?;
-
-    match seal::verify_seal_from_file(&config_bytes, seal_file) {
-        Ok(SealStatus::Verified) => {
-            info!("config seal verified (file-only)");
-        }
-        Ok(SealStatus::Unsealed) => {
-            if require_seal && !allow_unsealed {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "config is unsealed but require_seal is enabled. \
-                     Seal your config with 'opaque setup --seal' or \
-                     start the daemon with '--allow-unsealed' for development use.",
-                ));
-            }
-        }
-        Ok(SealStatus::Tampered { .. }) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "config seal broken — config.toml was modified after sealing. \
-                 Run 'opaque setup --reset' to unseal, then reconfigure.",
-            ));
-        }
-        Err(e) => {
-            return Err(std::io::Error::other(format!(
-                "config seal check failed: {e}"
-            )));
         }
     }
 
@@ -416,8 +607,64 @@ fn init_memory_safety() {
     }
 }
 
-async fn run(socket: PathBuf) -> std::io::Result<()> {
+async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> {
     init_memory_safety();
+
+    // --- Trust domain: verify custody BEFORE opening or creating any state ---
+    let td = &config.trust_domain;
+    if td.enforce {
+        if unsafe { libc::geteuid() } == 0 && !td.allow_root {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "trust_domain.enforce with euid 0: a root daemon cannot be protected from a \
+                 root agent. Run as a dedicated service account (systemd User=, run_as, or a \
+                 container runAsUser) — or set trust_domain.allow_root = true to override.",
+            ));
+        }
+        if td.socket_group.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "trust_domain.enforce requires trust_domain.socket_group: with the socket \
+                 owner-only and the daemon under its own uid, no client could ever connect. \
+                 Create a client group (e.g. groupadd opaque-clients) and name it here.",
+            ));
+        }
+    }
+    // Resolve the client group before touching the filesystem so a typo'd
+    // group name fails the startup, not the post-bind chgrp — and verify the
+    // daemon can actually assign it (non-root owners may chgrp only to their
+    // own supplementary groups).
+    let socket_gid = td
+        .socket_group
+        .as_deref()
+        .map(trust_domain::resolve_gid)
+        .transpose()?;
+    if let (Some(gid), Some(label)) = (socket_gid, td.socket_group.as_deref()) {
+        trust_domain::require_socket_group_membership(gid, label)?;
+    }
+
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+    let custody_violations = trust_domain::startup_custody_check(td.enforce, &home, &config_path)?;
+
+    // Check if --allow-unsealed was passed on the command line.
+    let allow_unsealed = std::env::args().any(|a| a == "--allow-unsealed");
+
+    // Verify config seal before proceeding.
+    verify_config_seal(
+        &config_path,
+        config.require_seal,
+        allow_unsealed,
+        td.enforce,
+    )?;
+
+    // --- Socket surface ---
+    // Split deployments name an explicit socket path in the sealed config
+    // (e.g. /run/opaque/opaqued.sock); the daemon still never trusts
+    // $OPAQUE_SOCK from the environment.
+    let socket = td
+        .socket_path
+        .clone()
+        .unwrap_or_else(|| socket_path_for_client(false));
     ensure_socket_parent_dir(&socket)?;
 
     // Acquire PID file lock before anything else.
@@ -459,15 +706,19 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
     let token_path = write_daemon_token(&socket, &daemon_token)?;
     info!("daemon token written to {}", token_path.display());
 
+    // Open the cross-domain surface last: everything above was created
+    // owner-only, and only now does the client group gain access to exactly
+    // the socket dir (0750), the socket (0660), and the token (0640).
+    if let Some(gid) = socket_gid {
+        let socket_dir = socket.parent().expect("checked above");
+        trust_domain::apply_socket_group(socket_dir, &socket, &token_path, gid)?;
+        info!(
+            "socket surface opened to group {} (gid {gid})",
+            td.socket_group.as_deref().unwrap_or("?"),
+        );
+    }
+
     info!("listening on {}", socket.display());
-
-    let config = load_config();
-
-    // Check if --allow-unsealed was passed on the command line.
-    let allow_unsealed = std::env::args().any(|a| a == "--allow-unsealed");
-
-    // Verify config seal before proceeding.
-    verify_config_seal(config.require_seal, allow_unsealed)?;
 
     // Build enclave with registered operations and policy from config.
     let mut registry = OperationRegistry::new();
@@ -482,12 +733,15 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec![],
             secret_ref_param_keys: vec![],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
             name: "sandbox.exec".into(),
-            safety: OperationSafety::Safe,
+            // SECURITY (C2): SensitiveOutput re-engages the enclave + policy gates
+            // that deny agent access unless a rule explicitly allows it. Restored
+            // after 2fd20b8 re-added stdout/stderr without restoring the class.
+            safety: OperationSafety::SensitiveOutput,
             default_approval: ApprovalRequirement::Always,
             default_factors: vec![ApprovalFactor::LocalBio],
             description: "Execute a command in a sandboxed environment".into(),
@@ -495,7 +749,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["profile".into(), "command".into()],
             secret_ref_param_keys: vec!["profile".into()],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -518,7 +772,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["repo".into()],
             secret_ref_param_keys: vec!["value_ref".into(), "github_token_ref".into()],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -541,7 +795,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["repo".into()],
             secret_ref_param_keys: vec!["value_ref".into(), "github_token_ref".into()],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -563,7 +817,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["repo".into()],
             secret_ref_param_keys: vec!["value_ref".into(), "github_token_ref".into()],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -587,7 +841,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["org".into()],
             secret_ref_param_keys: vec!["value_ref".into(), "github_token_ref".into()],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -609,7 +863,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["repo".into(), "org".into()],
             secret_ref_param_keys: vec!["github_token_ref".into()],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -633,7 +887,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["repo".into(), "org".into()],
             secret_ref_param_keys: vec!["github_token_ref".into()],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -660,7 +914,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["project".into(), "key".into()],
             secret_ref_param_keys: vec!["value_ref".into(), "gitlab_token_ref".into()],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -673,7 +927,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec![],
             secret_ref_param_keys: vec![],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -694,7 +948,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["vault".into(), "item".into()],
             secret_ref_param_keys: vec!["onepassword:{vault}/{item}/{field}".into()],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -711,7 +965,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["vault".into()],
             secret_ref_param_keys: vec![],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -724,7 +978,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec![],
             secret_ref_param_keys: vec![],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -740,7 +994,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["project".into()],
             secret_ref_param_keys: vec![],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -757,7 +1011,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["secret_id".into()],
             secret_ref_param_keys: vec!["secret_id".into()],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     // AWS STS operations
     registry
@@ -771,7 +1025,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec![],
             secret_ref_param_keys: vec![],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -791,7 +1045,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["role_arn".into()],
             secret_ref_param_keys: vec![],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     // AWS Secrets Manager operations
     registry
@@ -805,7 +1059,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec![],
             secret_ref_param_keys: vec![],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -822,7 +1076,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["secret_id".into()],
             secret_ref_param_keys: vec!["secret_id".into()],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -843,7 +1097,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["name".into()],
             secret_ref_param_keys: vec!["value".into()],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -863,7 +1117,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["secret_id".into()],
             secret_ref_param_keys: vec!["value".into()],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -880,7 +1134,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["secret_id".into()],
             secret_ref_param_keys: vec![],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     // AWS SSM Parameter Store operations
     registry
@@ -898,7 +1152,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["name".into()],
             secret_ref_param_keys: vec!["name".into()],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -920,7 +1174,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["name".into()],
             secret_ref_param_keys: vec!["value".into()],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -940,7 +1194,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["path".into()],
             secret_ref_param_keys: vec![],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -957,7 +1211,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec!["name".into()],
             secret_ref_param_keys: vec![],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     // Sandbox execve policy hook operations.
     registry
@@ -971,7 +1225,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec![],
             secret_ref_param_keys: vec![],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     registry
         .register(OperationDef {
@@ -984,7 +1238,7 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
             allowed_target_keys: vec![],
             secret_ref_param_keys: vec![],
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     let policy = PolicyEngine::with_rules(config.rules.clone());
     info!("policy engine loaded with {} rules", policy.rule_count());
@@ -995,19 +1249,99 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         .join("audit.db");
     let retention_days = config.audit_retention_days.unwrap_or(90);
     let sqlite_sink: Arc<dyn AuditSink> = Arc::new(
-        SqliteAuditSink::new(audit_db_path.clone(), retention_days).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("failed to open audit database: {e}"),
-            )
-        })?,
+        SqliteAuditSink::new(audit_db_path.clone(), retention_days)
+            .map_err(|e| std::io::Error::other(format!("failed to open audit database: {e}")))?,
     );
     info!(
         "audit database at {} (retention: {} days)",
         audit_db_path.display(),
         retention_days
     );
+
+    // Integrity (H8): verify the tamper-evident audit chain at startup. A break
+    // means the log was altered while the daemon was down — alert loudly. This is
+    // detection, not prevention: at a shared uid the chain key is agent-readable;
+    // running the daemon under a dedicated service account makes it a hard guarantee.
+    match opaque_core::audit::verify_audit_chain(&audit_db_path) {
+        Ok(v) if v.ok => {
+            info!("audit chain verified ({} records)", v.records_checked);
+        }
+        Ok(v) => {
+            tracing::error!(
+                records_checked = v.records_checked,
+                first_bad_sequence = ?v.first_bad_sequence,
+                "AUDIT CHAIN INTEGRITY FAILURE \u{2014} the audit log was tampered with: {}",
+                v.detail.as_deref().unwrap_or("chain mismatch")
+            );
+        }
+        Err(e) => {
+            warn!("could not verify audit chain at startup: {e}");
+        }
+    }
     let audit: Arc<dyn AuditSink> = Arc::new(MultiAuditSink::new(vec![tracing_sink, sqlite_sink]));
+
+    // Record the trust-domain posture in the tamper-evident chain itself, so
+    // "was the split enforced at the time?" is answerable from the audit log.
+    {
+        let enforced = config.trust_domain.enforce;
+        let detail = if custody_violations.is_empty() {
+            format!(
+                "trust domain {}: custody clean",
+                if enforced { "ENFORCED" } else { "not enforced" }
+            )
+        } else {
+            format!(
+                "trust domain not enforced: {} custody violation(s) — {}",
+                custody_violations.len(),
+                custody_violations
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        };
+        let level = if enforced && custody_violations.is_empty() {
+            opaque_core::audit::AuditLevel::Info
+        } else {
+            opaque_core::audit::AuditLevel::Warn
+        };
+        audit.emit(
+            AuditEvent::new(AuditEventKind::TrustDomainPosture)
+                .with_operation("daemon_startup")
+                .with_outcome(if enforced { "enforced" } else { "shared_uid" })
+                .with_level(level)
+                .with_detail(detail),
+        );
+    }
+
+    // Identity substrate (Phase 1): initialize when `[identity]` is present.
+    // A broken identity config fails the daemon only when `required = true`
+    // (fail closed where identity gates operations); otherwise it degrades to
+    // identity-disabled with a loud warning.
+    let identity_runtime = match config.identity.clone() {
+        None => None,
+        Some(id_config) => {
+            let required = id_config.required;
+            let state_dir = audit_db_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."));
+            match identity::IdentityRuntime::initialize(id_config, &state_dir) {
+                Ok(rt) => Some(Arc::new(rt.with_audit(audit.clone()))),
+                Err(e) if required => {
+                    return Err(std::io::Error::other(format!(
+                        "identity is required but failed to initialize: {e}"
+                    )));
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "identity disabled: failed to initialize identity runtime: {e}"
+                    );
+                    None
+                }
+            }
+        }
+    };
 
     let sandbox_executor = sandbox::SandboxExecutor::new(audit.clone());
 
@@ -1024,20 +1358,20 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
     let (execve_check_handler, execve_approve_handler) =
         sandbox::execve_hook::create_execve_handlers(audit.clone(), execve_mapper);
 
-    let github_actions_handler = github::GitHubHandler::new(audit.clone())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let github_codespaces_handler = github::GitHubHandler::new(audit.clone())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let github_dependabot_handler = github::GitHubHandler::new(audit.clone())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let github_org_handler = github::GitHubHandler::new(audit.clone())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let github_list_handler = github::GitHubHandler::new(audit.clone())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let github_delete_handler = github::GitHubHandler::new(audit.clone())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let gitlab_handler = gitlab::GitLabHandler::new(audit.clone())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let github_actions_handler =
+        github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
+    let github_codespaces_handler =
+        github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
+    let github_dependabot_handler =
+        github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
+    let github_org_handler =
+        github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
+    let github_list_handler =
+        github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
+    let github_delete_handler =
+        github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
+    let gitlab_handler =
+        gitlab::GitLabHandler::new(audit.clone()).map_err(std::io::Error::other)?;
 
     // 1Password handler: prefer Connect Server URL, fall back to `op` CLI.
     let onepassword_connect_url =
@@ -1131,41 +1465,249 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         info!("Bitwarden handler enabled ({})", bitwarden_url);
     }
 
-    // AWS handler: construct per-region service URLs.
-    {
+    // AWS handler.
+    //
+    // SECURITY (C6): the current AWS client sends the access key + secret key as
+    // plaintext headers (SigV4 is not yet implemented), which both fails against
+    // real AWS and would exfiltrate the long-lived secret key to whatever host the
+    // endpoint resolves to. It is therefore DISABLED unless the operator explicitly
+    // opts in via OPAQUE_AWS_ALLOW_INSECURE=1 (intended for mock/testing only). The
+    // region is also validated to close a host-injection vector — an unvalidated
+    // value like "foo@evil.com/" would rewrite the request host.
+    if std::env::var("OPAQUE_AWS_ALLOW_INSECURE").as_deref() == Ok("1") {
         let aws_region = std::env::var(aws::client::AWS_REGION_ENV)
             .unwrap_or_else(|_| aws::client::DEFAULT_REGION.to_owned());
-        let sts_url = format!("https://sts.{aws_region}.amazonaws.com");
-        let sm_url = format!("https://secretsmanager.{aws_region}.amazonaws.com");
-        let ssm_url = format!("https://ssm.{aws_region}.amazonaws.com");
-        let aws_client = aws::client::AwsClient::new(&sts_url, &sm_url, &ssm_url)
-            .expect("invalid AWS service URL scheme");
+        if aws_region.is_empty()
+            || !aws_region
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        {
+            warn!(
+                "AWS handler disabled: invalid region {:?} (must match [a-z0-9-]+)",
+                aws_region
+            );
+        } else {
+            let sts_url = format!("https://sts.{aws_region}.amazonaws.com");
+            let sm_url = format!("https://secretsmanager.{aws_region}.amazonaws.com");
+            let ssm_url = format!("https://ssm.{aws_region}.amazonaws.com");
+            let aws_client = aws::client::AwsClient::new(&sts_url, &sm_url, &ssm_url)
+                .expect("invalid AWS service URL scheme");
 
-        let aws_ops = [
-            "aws.get_caller_identity",
-            "aws.assume_role",
-            "aws.list_secrets",
-            "aws.get_secret_value",
-            "aws.create_secret",
-            "aws.put_secret_value",
-            "aws.delete_secret",
-            "aws.get_parameter",
-            "aws.put_parameter",
-            "aws.get_parameters_by_path",
-            "aws.delete_parameter",
-        ];
-        for op in aws_ops {
-            let handler = aws::AwsHandler::new(audit.clone(), aws_client.clone());
-            enclave_builder = enclave_builder.handler(op, Box::new(handler));
+            let aws_ops = [
+                "aws.get_caller_identity",
+                "aws.assume_role",
+                "aws.list_secrets",
+                "aws.get_secret_value",
+                "aws.create_secret",
+                "aws.put_secret_value",
+                "aws.delete_secret",
+                "aws.get_parameter",
+                "aws.put_parameter",
+                "aws.get_parameters_by_path",
+                "aws.delete_parameter",
+            ];
+            for op in aws_ops {
+                let handler = aws::AwsHandler::new(audit.clone(), aws_client.clone());
+                enclave_builder = enclave_builder.handler(op, Box::new(handler));
+            }
+            warn!(
+                "AWS handler enabled in INSECURE mode (region: {}) — plaintext key \
+                 headers, no SigV4. Do not use with real AWS credentials.",
+                aws_region
+            );
         }
-        info!("AWS handler enabled (region: {})", aws_region);
+    } else {
+        info!(
+            "AWS handler disabled (set OPAQUE_AWS_ALLOW_INSECURE=1 to enable the \
+             insecure mock client; SigV4 support is pending)"
+        );
     }
 
+    // Approval backend selection. The insecure auto-approve backend exists
+    // only so e2e tests can run headless: it demands BOTH the config value and
+    // an explicit environment marker, refuses to start on a partial attempt
+    // (no silent fallback in either direction), and announces itself loudly.
+    let auto_approve_env = std::env::var("OPAQUE_INSECURE_AUTO_APPROVE")
+        .ok()
+        .as_deref()
+        == Some("1");
+    let backend = select_approval_backend(config.approval_backend.as_deref(), auto_approve_env)
+        .map_err(std::io::Error::other)?;
+    // Second-device factor: pairing manager + approval server, when enabled.
+    // Constructed before the gate so the registry can hold the verifier, and
+    // stashed in DaemonState for the device_* control methods.
+    let mut pairing_manager: Option<Arc<pairing::PairingManager>> = None;
+    let mut approval_server_addr: Option<std::net::SocketAddr> = None;
+    let mut second_device_verifier: Option<(
+        Arc<pairing::PairingManager>,
+        approval_server::ApprovalServerHandle,
+    )> = None;
+    if config.approval.second_device {
+        let state_dir = audit_db_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        // Daemon pairing signing key (custody set) — server_id derives from
+        // its public key, so both are stable across restarts.
+        let pairing_key =
+            identity::keys::load_or_create_signing_key(&state_dir.join("pairing.key"))?;
+        let server_id = {
+            let pk = pairing_key.verifying_key();
+            let hex: String = pk.as_bytes()[..8]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            format!("opq-{hex}")
+        };
+
+        // Device store integrity key beside the store (custody set).
+        let store_path = pairing::store::DeviceStore::default_path();
+        if let Some(parent) = store_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let store_hmac =
+            opaque_core::keyfile::load_or_create_key_file(&store_path.with_extension("hmac"))?;
+
+        let bind: std::net::SocketAddr = config
+            .approval
+            .server_bind
+            .as_deref()
+            .unwrap_or("127.0.0.1:7381")
+            .parse()
+            .map_err(|e| std::io::Error::other(format!("approval.server_bind invalid: {e}")))?;
+
+        let store = pairing::store::DeviceStore::new(store_path, store_hmac.to_vec());
+        let pm = Arc::new(pairing::PairingManager::new(
+            server_id,
+            pairing_key,
+            bind.port(),
+            store,
+        ));
+
+        // TLS identity persists so paired devices' fingerprint pin survives
+        // restarts (custody set).
+        let tls = approval_server::load_or_create_tls_identity(&state_dir)
+            .map_err(std::io::Error::other)?;
+        let fingerprint = tls.fingerprint.clone();
+
+        let server = approval_server::ApprovalServer::new(
+            approval_server::ApprovalServerConfig {
+                bind_addr: bind,
+                tls_cert_der: tls.cert_der,
+                tls_key_der: tls.key_der,
+                timeout_secs: config.approval.timeout_secs.unwrap_or(60),
+            },
+            pm.clone(),
+        )
+        .map_err(std::io::Error::other)?;
+        let server_handle = server.handle();
+
+        let (_join, addr) = server
+            .start()
+            .await
+            .map_err(|e| std::io::Error::other(format!("approval server failed to start: {e}")))?;
+        pm.set_port(addr.port());
+        approval_server_addr = Some(addr);
+
+        // mDNS is convenience discovery — never fatal.
+        match approval_server::advertise_mdns(addr.port(), &fingerprint) {
+            Ok(mdns) => {
+                // Keep advertising for the daemon's lifetime.
+                std::mem::forget(mdns);
+            }
+            Err(e) => warn!("mDNS advertisement unavailable: {e}"),
+        }
+
+        info!(
+            "second-device approval factor live on {addr} (fingerprint {})",
+            &fingerprint[..16]
+        );
+        pairing_manager = Some(pm);
+
+        // Stash the handle for the verifier registration below.
+        second_device_verifier = Some((pairing_manager.clone().expect("just set"), server_handle));
+    }
+
+    // FIDO2/passkey factor: daemon-side verification over the socket; the
+    // authenticator ceremony runs in whatever client drives the key.
+    let mut fido2_approvals: Option<Arc<factors::Fido2Approvals>> = None;
+    if config.approval.fido2 {
+        let store_path = fido2::Fido2CredentialStore::default_path();
+        if let Some(parent) = store_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let store_hmac =
+            opaque_core::keyfile::load_or_create_key_file(&store_path.with_extension("hmac"))?;
+        let store = fido2::Fido2CredentialStore::new(store_path, store_hmac.to_vec());
+        let rp_id = config
+            .approval
+            .fido2_rp_id
+            .clone()
+            .unwrap_or_else(|| "opaque.local".into());
+        let manager = fido2::Fido2Manager::new(store, Box::new(fido2::NoLocalTransport), rp_id);
+        let approvals = Arc::new(factors::Fido2Approvals::new(
+            manager,
+            std::time::Duration::from_secs(config.approval.timeout_secs.unwrap_or(60)),
+        ));
+        info!(
+            "FIDO2/passkey approval factor enabled ({} credential(s) registered)",
+            approvals.list_credentials().map(|c| c.len()).unwrap_or(0)
+        );
+        fido2_approvals = Some(approvals);
+    }
+
+    let approval_gate: Box<dyn enclave::ApprovalGate> = match backend {
+        ApprovalBackendKind::Native => {
+            let mut registry = factors::FactorRegistry::new();
+
+            // Local factor, with login-session approver binding when identity
+            // is configured.
+            let resolver = identity_runtime.clone().map(|rt| {
+                Arc::new(move || {
+                    rt.current_human_principal()
+                        .filter(|p| !p.disabled)
+                        .map(|p| opaque_core::audit::ApproverIdentity {
+                            principal_id: p.id.as_str().to_owned(),
+                            label: p.display_label(),
+                            source: opaque_core::audit::ApproverSource::LocalBioSession,
+                        })
+                }) as factors::ApproverResolver
+            });
+            registry.register(Arc::new(factors::LocalBioVerifier::new(resolver)));
+
+            if let Some((pm, handle)) = second_device_verifier.clone() {
+                registry.register(Arc::new(factors::PairedDeviceVerifier::new(pm, handle)));
+            }
+
+            if let Some(approvals) = fido2_approvals.clone() {
+                registry.register(Arc::new(factors::Fido2Verifier::new(approvals)));
+            }
+
+            Box::new(NativeApprovalGate::with_registry(registry))
+        }
+        ApprovalBackendKind::InsecureAutoApprove => {
+            tracing::error!(
+                "INSECURE AUTO-APPROVE BACKEND ACTIVE — every approval will be granted \
+                 without human interaction. Test use only."
+            );
+            audit.emit(
+                AuditEvent::new(AuditEventKind::ApprovalGranted)
+                    .with_operation("daemon_startup")
+                    .with_outcome("insecure_backend_active")
+                    .with_level(opaque_core::audit::AuditLevel::Error)
+                    .with_approver(enclave::InsecureAutoApproveGate::approver())
+                    .with_detail("INSECURE AUTO-APPROVE BACKEND ACTIVE \u{2014} test use only"),
+            );
+            Box::new(enclave::InsecureAutoApproveGate)
+        }
+    };
+
     let enclave = enclave_builder
-        .approval_gate(Box::new(NativeApprovalGate::new()))
+        .approval_gate(approval_gate)
         .audit(audit.clone())
         .build()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     let state = Arc::new(DaemonState {
         enclave: Arc::new(enclave),
@@ -1175,6 +1717,10 @@ async fn run(socket: PathBuf) -> std::io::Result<()> {
         daemon_token,
         agent_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         connection_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+        identity: identity_runtime,
+        pairing: pairing_manager,
+        approval_server_addr,
+        fido2: fido2_approvals,
     });
 
     // Shutdown coordination: watch channel + active connection counter.
@@ -1382,6 +1928,70 @@ fn compute_exe_hash(path: &Path) -> Option<String> {
 /// Instead, it matches the verified peer identity against the configured
 /// `known_human_clients` allowlist. If no entry matches, the client is
 /// classified as `Agent` (safer — more restrictive).
+/// Revoke delegation records for ended sessions and audit each revocation.
+/// Best-effort: the in-memory session is already gone (which alone kills the
+/// connection's access); the store row is the audit-side record.
+fn revoke_delegations(
+    state: &DaemonState,
+    identity: &ClientIdentity,
+    client_type: ClientType,
+    delegations: &[SessionDelegation],
+) {
+    let Some(rt) = state.identity.as_ref() else {
+        return;
+    };
+    for d in delegations {
+        match rt.store.revoke_delegation(&d.jti) {
+            Ok(true) => {
+                state.audit.emit(
+                    AuditEvent::new(AuditEventKind::DelegationRevoked)
+                        .with_operation("agent_session_end")
+                        .with_client(ClientSummary::from((identity, client_type)))
+                        .with_outcome("revoked")
+                        .with_detail(format!("jti={} mode={} sub={}", d.jti, d.mode, d.sub)),
+                );
+            }
+            Ok(false) => {}
+            Err(e) => warn!("failed to revoke delegation record: {e}"),
+        }
+    }
+}
+
+/// Derive an agent workload tool name for the `act` principal: prefer the
+/// client-supplied label, else the client executable's basename, else
+/// "agent" — sanitized to the identity charset (`[A-Za-z0-9._-]`, max 64).
+fn derive_agent_tool_name(label: Option<&str>, identity: &ClientIdentity) -> String {
+    let raw = label
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            identity
+                .exe_path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|f| f.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "agent".into());
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(64)
+        .collect();
+    let cleaned = cleaned.trim_matches('-');
+    if cleaned.is_empty() {
+        "agent".into()
+    } else {
+        cleaned.to_owned()
+    }
+}
+
 fn derive_client_type(identity: &ClientIdentity, config: &DaemonConfig) -> ClientType {
     for entry in &config.known_human_clients {
         if entry_matches(identity, entry) {
@@ -1719,23 +2329,6 @@ async fn verify_workspace(
 // Connection handler
 // ---------------------------------------------------------------------------
 
-/// Verify that the peer UID matches the daemon's own UID.
-///
-/// Rejects connections from other users, which could be confused-deputy
-/// or privilege-escalation attempts in multi-user environments.
-fn verify_peer_uid(peer: &opaque_core::peer::PeerInfo) -> bool {
-    #[cfg(unix)]
-    {
-        let my_uid = unsafe { libc::getuid() };
-        peer.uid == my_uid
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = peer;
-        true
-    }
-}
-
 async fn handle_conn(
     state: Arc<DaemonState>,
     stream: UnixStream,
@@ -1744,17 +2337,28 @@ async fn handle_conn(
     let fd = stream.as_raw_fd();
     let peer = peer_info_from_fd(fd).ok();
 
-    // Verify peer UID matches daemon UID. Reject if unavailable or mismatched.
+    // Peer-uid gate, mode-aware. Shared-uid mode admits only the daemon's own
+    // uid (multi-user protection). The enforced split refuses exactly that
+    // uid: nothing legitimate runs as the service account except the daemon,
+    // so a same-uid peer inside the trust domain is a breach, and everyone
+    // else is gated by socket-group membership + the daemon token.
     match &peer {
         None => {
             warn!("peer credentials unavailable, rejecting connection");
             return Ok(());
         }
         Some(info) => {
-            if !verify_peer_uid(info) {
+            let daemon_uid = unsafe { libc::getuid() };
+            let enforce = state.config.trust_domain.enforce;
+            if !trust_domain::peer_uid_allowed(info.uid, daemon_uid, enforce) {
                 warn!(
-                    "peer UID {} does not match daemon UID, rejecting connection",
-                    info.uid
+                    "peer uid {} refused ({}), rejecting connection",
+                    info.uid,
+                    if enforce {
+                        "runs as the daemon's own service account"
+                    } else {
+                        "does not match daemon uid"
+                    }
                 );
                 return Ok(());
             }
@@ -2003,6 +2607,19 @@ async fn validate_agent_session_token(
     token: &str,
     uid: u32,
 ) -> Option<String> {
+    // Delegation tokens carry signed claims: verify the signature and expiry
+    // BEFORE consulting the session table. A token that parses as a delegation
+    // token but fails verification is rejected outright — the constant-time
+    // store match below is the liveness check, not the authenticity check.
+    if token.starts_with("opqd1.") {
+        let rt = state.identity.as_ref()?;
+        let key = rt.signing.verifying_key();
+        if let Err(e) = verify_delegation_token(token, &key, now_unix()) {
+            warn!("delegation token rejected: {e}");
+            return None;
+        }
+    }
+
     let now = SystemTime::now();
     let mut sessions = state.agent_sessions.write().await;
     // Expire old sessions opportunistically.
@@ -2019,6 +2636,156 @@ async fn validate_agent_session_token(
     })
 }
 
+/// Methods that build an `OperationRequest` and enter the enclave. These are
+/// the requests that carry (and, under `identity.required`, must carry) a
+/// verified principal context. Introspection and identity methods are exempt.
+/// Which approval backend the daemon should use, or a hard startup error.
+///
+/// The insecure auto-approve backend demands BOTH the config value and the
+/// `OPAQUE_INSECURE_AUTO_APPROVE=1` environment marker; every partial or
+/// mismatched combination is a loud refusal, never a silent fallback.
+#[derive(Debug, PartialEq, Eq)]
+enum ApprovalBackendKind {
+    Native,
+    InsecureAutoApprove,
+}
+
+fn select_approval_backend(
+    config_backend: Option<&str>,
+    auto_approve_env: bool,
+) -> Result<ApprovalBackendKind, String> {
+    match config_backend.unwrap_or("native") {
+        "native" => {
+            if auto_approve_env {
+                return Err(
+                    "OPAQUE_INSECURE_AUTO_APPROVE=1 is set but approval_backend is not \
+                     'insecure_auto_approve' — refusing to start with a half-enabled insecure \
+                     backend; unset the variable or set approval_backend"
+                        .into(),
+                );
+            }
+            Ok(ApprovalBackendKind::Native)
+        }
+        "insecure_auto_approve" => {
+            if !auto_approve_env {
+                return Err(
+                    "approval_backend = 'insecure_auto_approve' additionally requires \
+                     OPAQUE_INSECURE_AUTO_APPROVE=1 in the daemon environment — refusing to start"
+                        .into(),
+                );
+            }
+            Ok(ApprovalBackendKind::InsecureAutoApprove)
+        }
+        other => Err(format!(
+            "unknown approval_backend {other:?} (expected 'native' or 'insecure_auto_approve')"
+        )),
+    }
+}
+
+fn is_operation_method(method: &str) -> bool {
+    matches!(
+        method,
+        "execute" | "github" | "gitlab" | "onepassword" | "bitwarden" | "exec"
+    )
+}
+
+/// Re-validate the delegation behind an agent session and build the verified
+/// [`PrincipalContext`] for this request.
+///
+/// Runs on EVERY operation request (like the agent-session TTL re-check), so
+/// revocation, human-session expiry, and principal disablement take effect
+/// mid-connection:
+///
+/// - `Ok(None)` — the session carries no delegation (identity not configured,
+///   or a legacy hex-token session): nothing to attach.
+/// - `Ok(Some(ctx))` — the delegation is live; `sub_roles` are resolved fresh
+///   from the store so role edits apply immediately.
+/// - `Err(reason)` — the session HAS a delegation that is no longer valid
+///   (fail closed: the caller must reject operation requests).
+async fn resolve_principal_context(
+    state: &DaemonState,
+    session_id: Option<&str>,
+) -> Result<Option<PrincipalContext>, String> {
+    let Some(sid) = session_id else {
+        return Ok(None);
+    };
+    let delegation = {
+        let sessions = state.agent_sessions.read().await;
+        match sessions.get(sid) {
+            Some(s) => s.delegation.clone(),
+            None => return Err("agent session no longer exists".into()),
+        }
+    };
+    let Some(d) = delegation else {
+        return Ok(None);
+    };
+    let Some(rt) = state.identity.as_ref() else {
+        return Err("delegated session without an identity runtime".into());
+    };
+
+    let now = now_unix();
+
+    let row = rt
+        .store
+        .get_delegation(&d.jti)
+        .map_err(|e| format!("delegation lookup failed: {e}"))?
+        .ok_or("delegation record missing")?;
+    if row.revoked_at.is_some() {
+        return Err("delegation revoked".into());
+    }
+    if row.expires_at <= now {
+        return Err("delegation expired".into());
+    }
+
+    let sub_principal = rt
+        .store
+        .get_principal(&d.sub)
+        .map_err(|e| format!("principal lookup failed: {e}"))?
+        .ok_or("delegating principal missing")?;
+    if sub_principal.disabled {
+        return Err("delegating principal disabled".into());
+    }
+    let act_principal = rt
+        .store
+        .get_principal(&d.act)
+        .map_err(|e| format!("principal lookup failed: {e}"))?
+        .ok_or("agent principal missing")?;
+
+    // Delegated / break-glass access is only as alive as the human login
+    // session it was granted under.
+    if matches!(d.mode, AccessMode::Delegated | AccessMode::BreakGlass) {
+        let hs_id = d
+            .human_session_id
+            .as_deref()
+            .ok_or("delegation missing its human session binding")?;
+        let hs = rt
+            .store
+            .get_human_session(hs_id)
+            .map_err(|e| format!("session lookup failed: {e}"))?
+            .ok_or("human login session missing")?;
+        if hs.revoked_at.is_some() {
+            return Err("human login session revoked".into());
+        }
+        if hs.expires_at <= now {
+            return Err("human login session expired".into());
+        }
+        if hs.principal_id != d.sub {
+            return Err("human login session does not match the delegation".into());
+        }
+    }
+
+    Ok(Some(PrincipalContext {
+        sub: d.sub.clone(),
+        sub_label: sub_principal.display_label(),
+        sub_roles: sub_principal.roles.clone(),
+        act: d.act.clone(),
+        act_label: act_principal.display_label(),
+        mode: d.mode,
+        jti: d.jti.clone(),
+        human_session_id: d.human_session_id.clone(),
+    }))
+}
+
 async fn handle_request(
     state: &DaemonState,
     req: Request,
@@ -2026,6 +2793,42 @@ async fn handle_request(
     client_type: ClientType,
     session_id: Option<&str>,
 ) -> Response {
+    // Resolve the verified principal context for operation-executing requests.
+    // Fails closed: a session whose delegation has died (revoked, expired
+    // human login, disabled principal) can no longer execute anything, even
+    // though the connection itself stays up for introspection methods.
+    let principal_ctx = if is_operation_method(&req.method) {
+        match resolve_principal_context(state, session_id).await {
+            Ok(ctx) => ctx,
+            Err(reason) => {
+                warn!("rejecting {}: delegation invalid: {reason}", req.method);
+                return Response::err(
+                    Some(req.id),
+                    "delegation_invalid",
+                    "the delegation behind this agent session is no longer valid",
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    // `identity.required`: agent operations must carry a verified delegation.
+    // Enforced on operation methods only — introspection, login, and session
+    // management stay reachable so an agent can be pointed at `opaque login`.
+    if is_operation_method(&req.method)
+        && client_type == ClientType::Agent
+        && state.identity.as_ref().is_some_and(|rt| rt.config.required)
+        && principal_ctx.is_none()
+    {
+        return Response::err(
+            Some(req.id),
+            "identity_required",
+            "this daemon requires agent operations to run under a delegation — \
+             run `opaque login`, then wrap the agent with `opaque agent run`",
+        );
+    }
+
     match req.method.as_str() {
         "ping" => Response::ok(
             req.id,
@@ -2036,44 +2839,339 @@ async fn handle_request(
             serde_json::json!({ "version": state.version, "api_version": opaque_core::API_VERSION }),
         ),
         "whoami" => {
+            let identity_required = state.identity.as_ref().is_some_and(|rt| rt.config.required);
             // Agent clients get minimal info to prevent reconnaissance.
-            // Human clients get the full dump for debugging identity matching.
+            // Human clients get the full dump for debugging identity matching,
+            // plus the logged-in principal when a login session is active.
             let payload = match client_type {
-                ClientType::Human => serde_json::json!({
-                    "uid": identity.uid,
-                    "gid": identity.gid,
-                    "pid": identity.pid,
-                    "exe_path": identity.exe_path.as_ref().map(|p| p.display().to_string()),
-                    "exe_sha256": identity.exe_sha256,
-                    "client_type": client_type,
-                    "agent_session_id": session_id,
-                }),
+                ClientType::Human => {
+                    let logged_in = state
+                        .identity
+                        .as_ref()
+                        .and_then(|rt| rt.current_identity_json());
+                    serde_json::json!({
+                        "uid": identity.uid,
+                        "gid": identity.gid,
+                        "pid": identity.pid,
+                        "exe_path": identity.exe_path.as_ref().map(|p| p.display().to_string()),
+                        "exe_sha256": identity.exe_sha256,
+                        "client_type": client_type,
+                        "agent_session_id": session_id,
+                        "identity": logged_in,
+                        "identity_required": identity_required,
+                    })
+                }
                 ClientType::Agent => serde_json::json!({
                     "uid": identity.uid,
                     "client_type": client_type,
                     "agent_session_id": session_id,
+                    "identity_required": identity_required,
                 }),
             };
             Response::ok(req.id, payload)
         }
-        "agent_session_start" => {
-            if state.config.enforce_agent_sessions && client_type != ClientType::Human {
-                emit_daemon_method_audit(
-                    state,
-                    AuditEventKind::OperationFailed,
-                    "agent_session_start",
-                    identity,
-                    client_type,
-                    "permission_denied",
-                    Some("enforce_agent_sessions requires human client".into()),
-                );
+        "identity.login_start" => {
+            let Some(rt) = state.identity.as_ref() else {
                 return Response::err(
                     Some(req.id),
-                    "permission_denied",
-                    "only human clients can start agent sessions when enforce_agent_sessions is enabled",
+                    "identity_not_configured",
+                    "no [identity] section in the daemon config",
+                );
+            };
+            match rt.login_start().await {
+                Ok(started) => Response::ok(
+                    req.id,
+                    serde_json::json!({
+                        "attempt_id": started.attempt_id,
+                        "auth_url": started.auth_url,
+                        "expires_in_secs": started.expires_in_secs,
+                    }),
+                ),
+                Err(e) => {
+                    warn!("identity.login_start failed: {e}");
+                    Response::err(
+                        Some(req.id),
+                        "login_failed",
+                        "could not start a login attempt (is the identity provider reachable?)",
+                    )
+                }
+            }
+        }
+        "identity.login_status" => {
+            let Some(rt) = state.identity.as_ref() else {
+                return Response::err(
+                    Some(req.id),
+                    "identity_not_configured",
+                    "no [identity] section in the daemon config",
+                );
+            };
+            let attempt_id = req.params.get("attempt_id").and_then(|v| v.as_str());
+            let Some(attempt_id) = attempt_id.and_then(|s| Uuid::parse_str(s).ok()) else {
+                return Response::err(Some(req.id), "invalid_params", "attempt_id must be a UUID");
+            };
+            match rt.login_status(&attempt_id.to_string()) {
+                None => Response::err(
+                    Some(req.id),
+                    "unknown_attempt",
+                    "unknown or expired login attempt",
+                ),
+                Some(identity::login::AttemptOutcome::Pending) => {
+                    Response::ok(req.id, serde_json::json!({ "status": "pending" }))
+                }
+                Some(identity::login::AttemptOutcome::Done { .. }) => Response::ok(
+                    req.id,
+                    serde_json::json!({
+                        "status": "complete",
+                        "identity": rt.current_identity_json(),
+                    }),
+                ),
+                Some(identity::login::AttemptOutcome::Failed { reason }) => Response::ok(
+                    req.id,
+                    serde_json::json!({ "status": "failed", "reason": reason }),
+                ),
+            }
+        }
+        "identity.logout" => {
+            let Some(rt) = state.identity.as_ref() else {
+                return Response::err(
+                    Some(req.id),
+                    "identity_not_configured",
+                    "no [identity] section in the daemon config",
+                );
+            };
+            // Capture who is logging out BEFORE revoking their session.
+            let label = rt
+                .current_human_principal()
+                .map(|p| p.display_label())
+                .unwrap_or_else(|| "none".into());
+            match rt.store.revoke_all_human_sessions() {
+                Ok(revoked) => {
+                    info!("identity.logout revoked {revoked} human session(s)");
+                    state.audit.emit(
+                        AuditEvent::new(AuditEventKind::IdentityLogout)
+                            .with_operation("identity.logout")
+                            .with_client(ClientSummary::from((identity, client_type)))
+                            .with_outcome("ok")
+                            .with_detail(format!("revoked={revoked} current_principal={label}")),
+                    );
+                    Response::ok(req.id, serde_json::json!({ "revoked": revoked }))
+                }
+                Err(e) => {
+                    warn!("identity.logout failed: {e}");
+                    Response::err(Some(req.id), "internal", "failed to revoke sessions")
+                }
+            }
+        }
+        "identity.principal_list" => {
+            let Some(rt) = state.identity.as_ref() else {
+                return Response::err(
+                    Some(req.id),
+                    "identity_not_configured",
+                    "no [identity] section in the daemon config",
+                );
+            };
+            // Once any human is registered, listing requires an active login
+            // session (bootstrap-phase listing stays open so the first login
+            // can be verified). Client classification is NOT a gate here.
+            let humans = rt.store.count_humans().unwrap_or(0);
+            if humans > 0 && rt.current_human_principal().is_none() {
+                return Response::err(
+                    Some(req.id),
+                    "not_authorized",
+                    "an active login session is required (run `opaque login`)",
                 );
             }
-
+            match rt.store.list_principals() {
+                Ok(principals) => {
+                    let list: Vec<serde_json::Value> = principals
+                        .iter()
+                        .map(|p| {
+                            serde_json::json!({
+                                "id": p.id.as_str(),
+                                "kind": match &p.kind {
+                                    opaque_core::identity::PrincipalKind::Human { .. } => "human",
+                                    opaque_core::identity::PrincipalKind::Agent { .. } => "agent",
+                                    opaque_core::identity::PrincipalKind::Service { .. } => "service",
+                                },
+                                "label": p.display_label(),
+                                "roles": p.roles.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
+                                "disabled": p.disabled,
+                                "created_at": p.created_at,
+                                "last_seen": p.last_seen,
+                            })
+                        })
+                        .collect();
+                    Response::ok(req.id, serde_json::json!({ "principals": list }))
+                }
+                Err(e) => {
+                    warn!("identity.principal_list failed: {e}");
+                    Response::err(Some(req.id), "internal", "failed to list principals")
+                }
+            }
+        }
+        "identity.role_set" => {
+            let Some(rt) = state.identity.as_ref() else {
+                return Response::err(
+                    Some(req.id),
+                    "identity_not_configured",
+                    "no [identity] section in the daemon config",
+                );
+            };
+            // Role management requires an active admin login session.
+            if !rt.current_human_has_role(opaque_core::identity::Role::Admin) {
+                return Response::err(
+                    Some(req.id),
+                    "not_authorized",
+                    "role changes require an active admin login session",
+                );
+            }
+            let principal_id = req
+                .params
+                .get("principal_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| opaque_core::identity::PrincipalId::parse(s).ok());
+            let Some(principal_id) = principal_id else {
+                return Response::err(
+                    Some(req.id),
+                    "invalid_params",
+                    "principal_id must be a valid principal id",
+                );
+            };
+            let roles_param = req.params.get("roles").and_then(|v| v.as_array());
+            let Some(roles_param) = roles_param else {
+                return Response::err(
+                    Some(req.id),
+                    "invalid_params",
+                    "roles must be an array of role names",
+                );
+            };
+            let roles_csv = roles_param
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            let roles = match opaque_core::identity::roles_from_string(&roles_csv) {
+                Ok(r) => r,
+                Err(e) => {
+                    return Response::err(Some(req.id), "invalid_params", e.to_string());
+                }
+            };
+            // Refuse to drop the last enabled admin (lockout guard).
+            let target = rt.store.get_principal(&principal_id).ok().flatten();
+            let target_is_admin = target
+                .as_ref()
+                .is_some_and(|p| !p.disabled && p.has_role(opaque_core::identity::Role::Admin));
+            if target_is_admin
+                && !roles.contains(&opaque_core::identity::Role::Admin)
+                && rt
+                    .store
+                    .count_with_role(opaque_core::identity::Role::Admin)
+                    .unwrap_or(0)
+                    <= 1
+            {
+                return Response::err(
+                    Some(req.id),
+                    "last_admin",
+                    "cannot remove the admin role from the last admin",
+                );
+            }
+            let old_roles = target
+                .as_ref()
+                .map(|p| opaque_core::identity::roles_to_string(&p.roles))
+                .unwrap_or_default();
+            match rt.store.set_roles(&principal_id, &roles) {
+                Ok(()) => {
+                    info!(
+                        "roles updated for {principal_id}: [{}]",
+                        opaque_core::identity::roles_to_string(&roles)
+                    );
+                    let acting_admin = rt
+                        .current_human_principal()
+                        .map(|p| p.display_label())
+                        .unwrap_or_else(|| "bootstrap".into());
+                    state.audit.emit(
+                        AuditEvent::new(AuditEventKind::IdentityRoleChanged)
+                            .with_operation("identity.role_set")
+                            .with_client(ClientSummary::from((identity, client_type)))
+                            .with_outcome("ok")
+                            .with_detail(format!(
+                                "principal={principal_id} roles: [{old_roles}] -> [{}] by={acting_admin}",
+                                opaque_core::identity::roles_to_string(&roles)
+                            )),
+                    );
+                    match rt.store.get_principal(&principal_id) {
+                        Ok(Some(p)) => Response::ok(
+                            req.id,
+                            serde_json::json!({
+                                "id": p.id.as_str(),
+                                "label": p.display_label(),
+                                "roles": p.roles.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
+                            }),
+                        ),
+                        _ => Response::ok(req.id, serde_json::json!({ "updated": true })),
+                    }
+                }
+                Err(e) => Response::err(Some(req.id), "invalid_params", e),
+            }
+        }
+        "identity.delegation_list" => {
+            let Some(rt) = state.identity.as_ref() else {
+                return Response::err(
+                    Some(req.id),
+                    "identity_not_configured",
+                    "no [identity] section in the daemon config",
+                );
+            };
+            // Same shape as principal_list: open during bootstrap, then
+            // restricted to an active admin/auditor login session.
+            let humans = rt.store.count_humans().unwrap_or(0);
+            if humans > 0
+                && !(rt.current_human_has_role(opaque_core::identity::Role::Admin)
+                    || rt.current_human_has_role(opaque_core::identity::Role::Auditor))
+            {
+                return Response::err(
+                    Some(req.id),
+                    "not_authorized",
+                    "listing delegations requires an active admin or auditor login session",
+                );
+            }
+            match rt.store.list_delegations() {
+                Ok(delegations) => {
+                    let label_of = |id: &PrincipalId| -> String {
+                        rt.store
+                            .get_principal(id)
+                            .ok()
+                            .flatten()
+                            .map(|p| p.display_label())
+                            .unwrap_or_else(|| id.as_str().to_owned())
+                    };
+                    let list: Vec<serde_json::Value> = delegations
+                        .iter()
+                        .map(|d| {
+                            serde_json::json!({
+                                "jti": d.jti,
+                                "sub": d.sub_principal.as_str(),
+                                "sub_label": label_of(&d.sub_principal),
+                                "act": d.act_principal.as_str(),
+                                "act_label": label_of(&d.act_principal),
+                                "mode": d.mode.as_str(),
+                                "human_session_id": d.human_session_id,
+                                "approved_by": d.approved_by.as_ref().map(|p| p.as_str().to_owned()),
+                                "created_at": d.created_at,
+                                "expires_at": d.expires_at,
+                                "revoked_at": d.revoked_at,
+                            })
+                        })
+                        .collect();
+                    Response::ok(req.id, serde_json::json!({ "delegations": list }))
+                }
+                Err(e) => {
+                    warn!("identity.delegation_list failed: {e}");
+                    Response::err(Some(req.id), "internal", "failed to list delegations")
+                }
+            }
+        }
+        "agent_session_start" => {
             let default_ttl = state.config.agent_session_ttl_secs.unwrap_or(3600);
             let ttl_secs = req
                 .params
@@ -2088,11 +3186,292 @@ async fn handle_request(
                 .map(|s| s.to_owned());
             let label_for_audit = label.clone();
 
+            // --- Identity: resolve the delegation subject BEFORE burning a
+            // human approval, so malformed requests fail early and the
+            // approval prompt can name who the session would act for.
+            let mut delegation_plan: Option<(AccessMode, opaque_core::identity::Principal)> = None;
+            if let Some(rt) = state.identity.as_ref() {
+                let mode_s = req
+                    .params
+                    .get("mode")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("delegated");
+                let mode = match mode_s.parse::<AccessMode>() {
+                    Ok(m) => m,
+                    Err(_) => {
+                        return Response::err(
+                            Some(req.id),
+                            "invalid_params",
+                            "mode must be one of: delegated, autonomous, break_glass",
+                        );
+                    }
+                };
+                let sub = match mode {
+                    AccessMode::BreakGlass => {
+                        emit_daemon_method_audit(
+                            state,
+                            AuditEventKind::OperationFailed,
+                            "agent_session_start",
+                            identity,
+                            client_type,
+                            "break_glass_unavailable",
+                            Some(
+                                "break-glass session requested; no distinct-approver factor".into(),
+                            ),
+                        );
+                        return Response::err(
+                            Some(req.id),
+                            "break_glass_unavailable",
+                            "break-glass access requires a distinct-approver factor \
+                             (paired second device), which is not configured",
+                        );
+                    }
+                    AccessMode::Delegated => {
+                        let session = match rt.store.current_human_session() {
+                            Ok(Some(s)) => s,
+                            Ok(None) => {
+                                emit_daemon_method_audit(
+                                    state,
+                                    AuditEventKind::OperationFailed,
+                                    "agent_session_start",
+                                    identity,
+                                    client_type,
+                                    "login_required",
+                                    Some("delegated session requested with no active login".into()),
+                                );
+                                return Response::err(
+                                    Some(req.id),
+                                    "login_required",
+                                    "delegated agent sessions require an active human login — \
+                                     run `opaque login` first",
+                                );
+                            }
+                            Err(e) => {
+                                warn!("identity store error during session mint: {e}");
+                                return Response::err(
+                                    Some(req.id),
+                                    "internal",
+                                    "identity store unavailable",
+                                );
+                            }
+                        };
+                        match rt.store.get_principal(&session.principal_id) {
+                            Ok(Some(p)) if !p.disabled => p,
+                            Ok(_) => {
+                                return Response::err(
+                                    Some(req.id),
+                                    "login_required",
+                                    "the logged-in principal is missing or disabled",
+                                );
+                            }
+                            Err(e) => {
+                                warn!("identity store error during session mint: {e}");
+                                return Response::err(
+                                    Some(req.id),
+                                    "internal",
+                                    "identity store unavailable",
+                                );
+                            }
+                        }
+                    }
+                    AccessMode::Autonomous => {
+                        let Some(service) = req.params.get("service").and_then(|v| v.as_str())
+                        else {
+                            return Response::err(
+                                Some(req.id),
+                                "invalid_params",
+                                "autonomous mode requires a 'service' principal name",
+                            );
+                        };
+                        match rt.store.get_service_by_name(service) {
+                            Ok(Some(p)) if !p.disabled => p,
+                            Ok(_) => {
+                                emit_daemon_method_audit(
+                                    state,
+                                    AuditEventKind::OperationFailed,
+                                    "agent_session_start",
+                                    identity,
+                                    client_type,
+                                    "unknown_service_principal",
+                                    Some(format!(
+                                        "autonomous session requested for unknown service '{}'",
+                                        service.chars().take(64).collect::<String>()
+                                    )),
+                                );
+                                return Response::err(
+                                    Some(req.id),
+                                    "unknown_service_principal",
+                                    "no such service principal — declare it under \
+                                     [[identity.service_principals]] in the daemon config",
+                                );
+                            }
+                            Err(e) => {
+                                warn!("identity store error during session mint: {e}");
+                                return Response::err(
+                                    Some(req.id),
+                                    "internal",
+                                    "identity store unavailable",
+                                );
+                            }
+                        }
+                    }
+                };
+                delegation_plan = Some((mode, sub));
+            }
+
+            // SECURITY (C1/software-first): minting a session token grants a wrapped
+            // agent scoped access, so it must be authorized by a fresh out-of-band
+            // human approval — not by client classification, which an agent can wear.
+            // The agent cannot satisfy the approval, so it cannot mint its own session.
+            let mut reason = match &label {
+                Some(l) => format!("ttl {ttl_secs}s, label \"{l}\""),
+                None => format!("ttl {ttl_secs}s"),
+            };
+            if let Some((mode, ref sub)) = delegation_plan {
+                reason.push_str(&format!(
+                    ", mode {mode}, on behalf of {}",
+                    sub.display_label()
+                ));
+            }
+            let session_approver = match state
+                .enclave
+                .request_control_approval(
+                    identity,
+                    client_type,
+                    "agent_session_start",
+                    "Create an agent session token",
+                    &reason,
+                )
+                .await
+            {
+                Ok(approver) => approver,
+                Err(e) => {
+                    emit_daemon_method_audit(
+                        state,
+                        AuditEventKind::OperationFailed,
+                        "agent_session_start",
+                        identity,
+                        client_type,
+                        "permission_denied",
+                        Some(format!("session creation not approved: {e}")),
+                    );
+                    return Response::err(
+                        Some(req.id),
+                        "permission_denied",
+                        "creating an agent session requires out-of-band approval",
+                    );
+                }
+            };
+
             let session_id = Uuid::new_v4().to_string();
-            let session_token = generate_daemon_token();
             let expires_at = SystemTime::now()
                 .checked_add(std::time::Duration::from_secs(ttl_secs))
                 .unwrap_or(SystemTime::now());
+
+            // Mint the credential: a signed delegation token when identity is
+            // configured, the legacy opaque hex token otherwise.
+            let (session_token, delegation, mut extra) =
+                match (state.identity.as_ref(), delegation_plan) {
+                    (Some(rt), Some((mode, sub))) => {
+                        // Re-check the login session didn't expire while the
+                        // human was approving (delegated mode only).
+                        let human_session_id = if mode == AccessMode::Delegated {
+                            match rt.store.current_human_session() {
+                                Ok(Some(s)) if s.principal_id == sub.id => Some(s.id),
+                                _ => {
+                                    return Response::err(
+                                        Some(req.id),
+                                        "login_required",
+                                        "the human login session ended before the delegation \
+                                     could be issued — run `opaque login` again",
+                                    );
+                                }
+                            }
+                        } else {
+                            None
+                        };
+
+                        let tool = derive_agent_tool_name(label.as_deref(), identity);
+                        let act = match rt.store.upsert_agent(&tool) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                warn!("failed to upsert agent principal: {e}");
+                                return Response::err(
+                                    Some(req.id),
+                                    "internal",
+                                    "identity store unavailable",
+                                );
+                            }
+                        };
+
+                        let now = now_unix();
+                        let claims = DelegationClaims {
+                            jti: session_id.clone(),
+                            sub: sub.id.clone(),
+                            act: act.id.clone(),
+                            mode,
+                            iat: now,
+                            exp: now + ttl_secs as i64,
+                        };
+                        let token = match sign_delegation_token(&claims, &rt.signing) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                warn!("failed to sign delegation token: {e}");
+                                return Response::err(
+                                    Some(req.id),
+                                    "internal",
+                                    "could not mint a delegation token",
+                                );
+                            }
+                        };
+                        let record = identity::store::DelegationRecord {
+                            jti: session_id.clone(),
+                            sub_principal: sub.id.clone(),
+                            act_principal: act.id.clone(),
+                            mode,
+                            human_session_id: human_session_id.clone(),
+                            // Attribute the delegation to the principal who
+                            // approved its minting, when the gate named one.
+                            approved_by: session_approver
+                                .as_ref()
+                                .and_then(|a| PrincipalId::parse(&a.principal_id).ok()),
+                            created_at: now,
+                            expires_at: now + ttl_secs as i64,
+                            revoked_at: None,
+                        };
+                        if let Err(e) = rt.store.record_delegation(&record) {
+                            warn!("failed to record delegation: {e}");
+                            return Response::err(
+                                Some(req.id),
+                                "internal",
+                                "could not record the delegation",
+                            );
+                        }
+
+                        let extra = serde_json::json!({
+                            "mode": mode.as_str(),
+                            "on_behalf_of": sub.id.as_str(),
+                            "on_behalf_of_label": sub.display_label(),
+                        });
+                        (
+                            token,
+                            Some(SessionDelegation {
+                                jti: session_id.clone(),
+                                sub: sub.id.clone(),
+                                act: act.id.clone(),
+                                mode,
+                                human_session_id,
+                            }),
+                            extra,
+                        )
+                    }
+                    _ => (generate_daemon_token(), None, serde_json::json!({})),
+                };
+
+            let delegation_for_audit = delegation
+                .as_ref()
+                .map(|d| format!(" mode={} sub={}", d.mode, d.sub))
+                .unwrap_or_default();
 
             let session = AgentSession {
                 session_id: session_id.clone(),
@@ -2100,6 +3479,7 @@ async fn handle_request(
                 created_by_uid: identity.uid,
                 expires_at,
                 label,
+                delegation: delegation.clone(),
             };
             state
                 .agent_sessions
@@ -2107,30 +3487,68 @@ async fn handle_request(
                 .await
                 .insert(session_id.clone(), session);
 
-            emit_daemon_method_audit(
-                state,
-                AuditEventKind::OperationSucceeded,
-                "agent_session_start",
-                identity,
-                client_type,
-                "started",
-                Some(format!(
-                    "session_id={} ttl_secs={} label={}",
-                    session_id,
-                    ttl_secs,
-                    label_for_audit.as_deref().unwrap_or("")
-                )),
+            let detail = format!(
+                "session_id={} ttl_secs={} label={}{}",
+                session_id,
+                ttl_secs,
+                label_for_audit.as_deref().unwrap_or(""),
+                delegation_for_audit
             );
+            // A delegated/autonomous mint is a DelegationIssued event carrying
+            // the principal context; a legacy hex-token mint stays a plain
+            // session-start operation event.
+            match &delegation {
+                Some(d) => {
+                    let ctx = PrincipalContext {
+                        sub: d.sub.clone(),
+                        sub_label: state
+                            .identity
+                            .as_ref()
+                            .and_then(|rt| rt.store.get_principal(&d.sub).ok().flatten())
+                            .map(|p| p.display_label())
+                            .unwrap_or_default(),
+                        sub_roles: Default::default(),
+                        act: d.act.clone(),
+                        act_label: String::new(),
+                        mode: d.mode,
+                        jti: d.jti.clone(),
+                        human_session_id: d.human_session_id.clone(),
+                    };
+                    state.audit.emit({
+                        let mut ev = AuditEvent::new(AuditEventKind::DelegationIssued)
+                            .with_operation("agent_session_start")
+                            .with_client(
+                                ClientSummary::from((identity, client_type)).with_principal(&ctx),
+                            )
+                            .with_outcome("issued")
+                            .with_detail(detail);
+                        if let Some(ref approver) = session_approver {
+                            ev = ev.with_approver(approver.clone());
+                        }
+                        ev
+                    });
+                }
+                None => emit_daemon_method_audit(
+                    state,
+                    AuditEventKind::OperationSucceeded,
+                    "agent_session_start",
+                    identity,
+                    client_type,
+                    "started",
+                    Some(detail),
+                ),
+            }
 
-            Response::ok(
-                req.id,
-                serde_json::json!({
-                    "session_id": session_id,
-                    "session_token": session_token,
-                    "expires_at_utc_ms": system_time_to_unix_ms(expires_at),
-                    "ttl_secs": ttl_secs,
-                }),
-            )
+            let mut payload = serde_json::json!({
+                "session_id": session_id,
+                "session_token": session_token,
+                "expires_at_utc_ms": system_time_to_unix_ms(expires_at),
+                "ttl_secs": ttl_secs,
+            });
+            if let (Some(obj), Some(extra_obj)) = (payload.as_object_mut(), extra.as_object_mut()) {
+                obj.append(extra_obj);
+            }
+            Response::ok(req.id, payload)
         }
         "agent_session_end" => {
             let end_all = req
@@ -2160,8 +3578,15 @@ async fn handle_request(
             if end_all {
                 let mut sessions = state.agent_sessions.write().await;
                 let before = sessions.len();
+                let ended_delegations: Vec<SessionDelegation> = sessions
+                    .values()
+                    .filter(|s| s.created_by_uid == identity.uid)
+                    .filter_map(|s| s.delegation.clone())
+                    .collect();
                 sessions.retain(|_, s| s.created_by_uid != identity.uid);
                 let ended_count = before.saturating_sub(sessions.len());
+                drop(sessions);
+                revoke_delegations(state, identity, client_type, &ended_delegations);
                 emit_daemon_method_audit(
                     state,
                     AuditEventKind::OperationSucceeded,
@@ -2218,6 +3643,10 @@ async fn handle_request(
             }
 
             let removed = sessions.remove(session_id);
+            drop(sessions);
+            if let Some(d) = removed.as_ref().and_then(|s| s.delegation.clone()) {
+                revoke_delegations(state, identity, client_type, &[d]);
+            }
             let label = removed.as_ref().and_then(|s| s.label.clone());
             let status = if removed.is_some() {
                 "ended"
@@ -2244,23 +3673,10 @@ async fn handle_request(
             )
         }
         "agent_session_list" => {
-            if client_type != ClientType::Human {
-                emit_daemon_method_audit(
-                    state,
-                    AuditEventKind::OperationFailed,
-                    "agent_session_list",
-                    identity,
-                    client_type,
-                    "permission_denied",
-                    Some("only human clients can list sessions".into()),
-                );
-                return Response::err(
-                    Some(req.id),
-                    "permission_denied",
-                    "only human clients can list agent sessions",
-                );
-            }
-
+            // NOTE (software-first): no longer gated on client classification, which
+            // is audit-only at a shared uid. The listing is already scoped to the
+            // caller's own uid and hides tokens; restricting it from a co-resident
+            // agent soundly requires the separate-uid split (Lever B).
             let now = SystemTime::now();
             let mut sessions = state.agent_sessions.write().await;
             // Expire old sessions opportunistically.
@@ -2309,14 +3725,9 @@ async fn handle_request(
             )
         }
         "leases" => {
-            // Only human clients can inspect active leases.
-            if client_type != ClientType::Human {
-                return Response::err(
-                    Some(req.id),
-                    "permission_denied",
-                    "only human clients can list active leases",
-                );
-            }
+            // NOTE (software-first): no longer gated on client classification
+            // (audit-only at a shared uid). Read-only lease metadata; a sound
+            // restriction from a co-resident agent needs the separate-uid split.
             let leases = state.enclave.active_leases();
             Response::ok(
                 req.id,
@@ -2325,6 +3736,526 @@ async fn handle_request(
                     "leases": leases,
                 }),
             )
+        }
+        "device_pair_start" => {
+            let Some(pm) = &state.pairing else {
+                return Response::err(
+                    Some(req.id),
+                    "factor_disabled",
+                    "second-device approvals are not enabled — set [approval] \
+                     second_device = true in the daemon config",
+                );
+            };
+
+            // SECURITY: pairing begins the addition of a new APPROVER channel,
+            // so it needs a fresh out-of-band approval. The QR nonce this
+            // returns is deliberately weak authority: whatever completes /pair
+            // with it lands QUARANTINED until the fingerprint ceremony.
+            if let Err(e) = state
+                .enclave
+                .request_control_approval(
+                    identity,
+                    client_type,
+                    "device_pair_start",
+                    "Begin pairing a new approver device",
+                    "the paired device gains approval authority only after you \
+                     confirm its key fingerprint",
+                )
+                .await
+            {
+                emit_daemon_method_audit(
+                    state,
+                    AuditEventKind::OperationFailed,
+                    "device_pair_start",
+                    identity,
+                    client_type,
+                    "permission_denied",
+                    Some(format!("pairing start not approved: {e}")),
+                );
+                return Response::err(
+                    Some(req.id),
+                    "permission_denied",
+                    "starting a device pairing requires out-of-band approval",
+                );
+            }
+
+            // Attribution captured NOW, at ceremony start: this is the
+            // principal whose phone this is supposed to become, and the one
+            // SoD will treat as the device's approver identity.
+            let initiated_by = state.identity.as_ref().and_then(|rt| {
+                rt.current_human_principal()
+                    .filter(|p| !p.disabled)
+                    .map(|p| p.id.as_str().to_owned())
+            });
+            let (payload, _nonce) = pm.generate_qr_payload(initiated_by);
+            emit_daemon_method_audit(
+                state,
+                AuditEventKind::OperationSucceeded,
+                "device_pair_start",
+                identity,
+                client_type,
+                "pairing_session_created",
+                Some(format!("expires_at={}", payload.expires_at)),
+            );
+            Response::ok(
+                req.id,
+                serde_json::json!({
+                    "qr_payload": payload,
+                    "server_addr": state.approval_server_addr.map(|a| a.to_string()),
+                }),
+            )
+        }
+        "device_list" => {
+            let Some(pm) = &state.pairing else {
+                return Response::err(
+                    Some(req.id),
+                    "factor_disabled",
+                    "second-device approvals are not enabled",
+                );
+            };
+            match pm.list_devices() {
+                Ok(devices) => {
+                    let rows: Vec<serde_json::Value> = devices
+                        .iter()
+                        .map(|d| {
+                            serde_json::json!({
+                                "device_id": d.device_id,
+                                "name": d.name,
+                                "fingerprint": d.key_fingerprint(),
+                                "paired_at": d.paired_at,
+                                "last_seen": d.last_seen,
+                                "revoked": d.revoked,
+                                "confirmed": d.confirmed,
+                                "paired_by": d.paired_by,
+                            })
+                        })
+                        .collect();
+                    Response::ok(
+                        req.id,
+                        serde_json::json!({ "count": rows.len(), "devices": rows }),
+                    )
+                }
+                Err(e) => Response::err(
+                    Some(req.id),
+                    "internal",
+                    format!("device store unavailable: {e}"),
+                ),
+            }
+        }
+        "device_pair_confirm" => {
+            let Some(pm) = &state.pairing else {
+                return Response::err(
+                    Some(req.id),
+                    "factor_disabled",
+                    "second-device approvals are not enabled",
+                );
+            };
+            let device_id = req
+                .params
+                .get("device_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if device_id.is_empty() {
+                return Response::err(Some(req.id), "bad_request", "missing 'device_id'");
+            }
+            let device = match pm.list_devices() {
+                Ok(devices) => match devices.into_iter().find(|d| d.device_id == device_id) {
+                    Some(d) => d,
+                    None => {
+                        return Response::err(Some(req.id), "not_found", "no such device");
+                    }
+                },
+                Err(e) => {
+                    return Response::err(
+                        Some(req.id),
+                        "internal",
+                        format!("device store unavailable: {e}"),
+                    );
+                }
+            };
+
+            // SECURITY: this approval prompt IS the anti-hijack ceremony. The
+            // human compares the fingerprint below with the one their phone
+            // displays; a device paired by anything else (an agent racing the
+            // nonce with its own key) shows a fingerprint the phone does not.
+            let reason = format!(
+                "device \"{}\" key fingerprint {}  — CONFIRM ONLY IF YOUR DEVICE \
+                 SHOWS THE SAME FINGERPRINT",
+                enclave::sanitize_for_display(&device.name, 64),
+                device.key_fingerprint()
+            );
+            if let Err(e) = state
+                .enclave
+                .request_control_approval(
+                    identity,
+                    client_type,
+                    "device_pair_confirm",
+                    "Grant approval authority to a paired device",
+                    &reason,
+                )
+                .await
+            {
+                emit_daemon_method_audit(
+                    state,
+                    AuditEventKind::OperationFailed,
+                    "device_pair_confirm",
+                    identity,
+                    client_type,
+                    "permission_denied",
+                    Some(format!("device confirmation not approved: {e}")),
+                );
+                return Response::err(
+                    Some(req.id),
+                    "permission_denied",
+                    "confirming a device requires out-of-band approval",
+                );
+            }
+
+            match pm.confirm_device(device_id) {
+                Ok(confirmed) => {
+                    emit_daemon_method_audit(
+                        state,
+                        AuditEventKind::OperationSucceeded,
+                        "device_pair_confirm",
+                        identity,
+                        client_type,
+                        "device_confirmed",
+                        Some(format!(
+                            "device_id={} fingerprint={}",
+                            confirmed.device_id,
+                            confirmed.key_fingerprint()
+                        )),
+                    );
+                    Response::ok(
+                        req.id,
+                        serde_json::json!({
+                            "device_id": confirmed.device_id,
+                            "name": confirmed.name,
+                            "confirmed": true,
+                        }),
+                    )
+                }
+                Err(e) => Response::err(
+                    Some(req.id),
+                    "internal",
+                    format!("confirmation failed: {e}"),
+                ),
+            }
+        }
+        "device_revoke" => {
+            let Some(pm) = &state.pairing else {
+                return Response::err(
+                    Some(req.id),
+                    "factor_disabled",
+                    "second-device approvals are not enabled",
+                );
+            };
+            let device_id = req
+                .params
+                .get("device_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if device_id.is_empty() {
+                return Response::err(Some(req.id), "bad_request", "missing 'device_id'");
+            }
+            // Revocation removes approval authority — the safe direction, so
+            // it is not approval-gated (an emergency kill must never wait on
+            // the very factor being killed). Audited with the client identity.
+            match pm.revoke_device(device_id) {
+                Ok(()) => {
+                    emit_daemon_method_audit(
+                        state,
+                        AuditEventKind::OperationSucceeded,
+                        "device_revoke",
+                        identity,
+                        client_type,
+                        "device_revoked",
+                        Some(format!("device_id={device_id}")),
+                    );
+                    Response::ok(
+                        req.id,
+                        serde_json::json!({ "device_id": device_id, "revoked": true }),
+                    )
+                }
+                Err(e) => Response::err(Some(req.id), "not_found", format!("{e}")),
+            }
+        }
+        "fido2_register_start" => {
+            let Some(f2) = &state.fido2 else {
+                return Response::err(
+                    Some(req.id),
+                    "factor_disabled",
+                    "FIDO2 approvals are not enabled — set [approval] fido2 = true",
+                );
+            };
+            // Registering a credential adds an APPROVER — approval-gated,
+            // like device pairing. (This simplified flow verifies UP + RP +
+            // key, not attestation chains; the human approval here is the
+            // authorization anchor for the new credential.)
+            if let Err(e) = state
+                .enclave
+                .request_control_approval(
+                    identity,
+                    client_type,
+                    "fido2_register_start",
+                    "Register a FIDO2 hardware key / passkey as an approver",
+                    "the credential completing this registration will be able to \
+                     approve operations",
+                )
+                .await
+            {
+                emit_daemon_method_audit(
+                    state,
+                    AuditEventKind::OperationFailed,
+                    "fido2_register_start",
+                    identity,
+                    client_type,
+                    "permission_denied",
+                    Some(format!("registration not approved: {e}")),
+                );
+                return Response::err(
+                    Some(req.id),
+                    "permission_denied",
+                    "registering a FIDO2 credential requires out-of-band approval",
+                );
+            }
+            match f2.register_begin() {
+                Ok((challenge, rp_id)) => {
+                    emit_daemon_method_audit(
+                        state,
+                        AuditEventKind::OperationSucceeded,
+                        "fido2_register_start",
+                        identity,
+                        client_type,
+                        "registration_challenge_issued",
+                        None,
+                    );
+                    Response::ok(
+                        req.id,
+                        serde_json::json!({ "challenge": challenge, "rp_id": rp_id }),
+                    )
+                }
+                Err(e) => Response::err(Some(req.id), "internal", e),
+            }
+        }
+        "fido2_register_complete" => {
+            let Some(f2) = &state.fido2 else {
+                return Response::err(
+                    Some(req.id),
+                    "factor_disabled",
+                    "FIDO2 approvals are not enabled",
+                );
+            };
+            let label = req
+                .params
+                .get("label")
+                .and_then(|v| v.as_str())
+                .unwrap_or("hardware key");
+            let response: fido2::Fido2RegistrationResponse = match req
+                .params
+                .get("response")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+            {
+                Some(r) => r,
+                None => {
+                    return Response::err(
+                        Some(req.id),
+                        "bad_request",
+                        "missing or malformed 'response' (registration payload)",
+                    );
+                }
+            };
+            match f2.register_complete(&response, &enclave::sanitize_for_display(label, 64)) {
+                Ok(credential) => {
+                    emit_daemon_method_audit(
+                        state,
+                        AuditEventKind::OperationSucceeded,
+                        "fido2_register_complete",
+                        identity,
+                        client_type,
+                        "credential_registered",
+                        Some(format!(
+                            "credential_id={} label={}",
+                            credential
+                                .credential_id
+                                .chars()
+                                .take(12)
+                                .collect::<String>(),
+                            credential.label
+                        )),
+                    );
+                    Response::ok(
+                        req.id,
+                        serde_json::json!({
+                            "credential_id": credential.credential_id,
+                            "label": credential.label,
+                        }),
+                    )
+                }
+                Err(e) => {
+                    emit_daemon_method_audit(
+                        state,
+                        AuditEventKind::OperationFailed,
+                        "fido2_register_complete",
+                        identity,
+                        client_type,
+                        "registration_rejected",
+                        Some(e.clone()),
+                    );
+                    Response::err(Some(req.id), "invalid_registration", e)
+                }
+            }
+        }
+        "fido2_list" => {
+            let Some(f2) = &state.fido2 else {
+                return Response::err(
+                    Some(req.id),
+                    "factor_disabled",
+                    "FIDO2 approvals are not enabled",
+                );
+            };
+            match f2.list_credentials() {
+                Ok(creds) => {
+                    let rows: Vec<serde_json::Value> = creds
+                        .iter()
+                        .map(|c| {
+                            serde_json::json!({
+                                "credential_id": c.credential_id,
+                                "label": c.label,
+                                "created_at": c.created_at.to_rfc3339(),
+                                "counter": c.counter,
+                            })
+                        })
+                        .collect();
+                    Response::ok(
+                        req.id,
+                        serde_json::json!({ "count": rows.len(), "credentials": rows }),
+                    )
+                }
+                Err(e) => Response::err(
+                    Some(req.id),
+                    "internal",
+                    format!("credential store unavailable: {e}"),
+                ),
+            }
+        }
+        "fido2_remove" => {
+            let Some(f2) = &state.fido2 else {
+                return Response::err(
+                    Some(req.id),
+                    "factor_disabled",
+                    "FIDO2 approvals are not enabled",
+                );
+            };
+            let credential_id = req
+                .params
+                .get("credential_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if credential_id.is_empty() {
+                return Response::err(Some(req.id), "bad_request", "missing 'credential_id'");
+            }
+            // Like device_revoke: removing an approver is the safe direction.
+            match f2.remove_credential(credential_id) {
+                Ok(removed) => {
+                    emit_daemon_method_audit(
+                        state,
+                        AuditEventKind::OperationSucceeded,
+                        "fido2_remove",
+                        identity,
+                        client_type,
+                        "credential_removed",
+                        Some(format!("label={}", removed.label)),
+                    );
+                    Response::ok(
+                        req.id,
+                        serde_json::json!({ "credential_id": credential_id, "removed": true }),
+                    )
+                }
+                Err(e) => Response::err(Some(req.id), "not_found", format!("{e}")),
+            }
+        }
+        "fido2_pending" => {
+            let Some(f2) = &state.fido2 else {
+                return Response::err(
+                    Some(req.id),
+                    "factor_disabled",
+                    "FIDO2 approvals are not enabled",
+                );
+            };
+            let rounds: Vec<serde_json::Value> = f2
+                .pending_rounds()
+                .into_iter()
+                .map(|(request_id, challenge, rp_id, allowed)| {
+                    serde_json::json!({
+                        "request_id": request_id,
+                        "challenge": challenge,
+                        "rp_id": rp_id,
+                        "allowed_credentials": allowed,
+                    })
+                })
+                .collect();
+            Response::ok(
+                req.id,
+                serde_json::json!({ "count": rounds.len(), "rounds": rounds }),
+            )
+        }
+        "fido2_respond" => {
+            let Some(f2) = &state.fido2 else {
+                return Response::err(
+                    Some(req.id),
+                    "factor_disabled",
+                    "FIDO2 approvals are not enabled",
+                );
+            };
+            let request_id = req
+                .params
+                .get("request_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if request_id.is_empty() {
+                return Response::err(Some(req.id), "bad_request", "missing 'request_id'");
+            }
+            let assertion: fido2::Fido2Assertion = match req
+                .params
+                .get("assertion")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+            {
+                Some(a) => a,
+                None => {
+                    return Response::err(
+                        Some(req.id),
+                        "bad_request",
+                        "missing or malformed 'assertion'",
+                    );
+                }
+            };
+            match f2.respond(request_id, &assertion) {
+                Ok(verified) => {
+                    emit_daemon_method_audit(
+                        state,
+                        AuditEventKind::OperationSucceeded,
+                        "fido2_respond",
+                        identity,
+                        client_type,
+                        "assertion_verified",
+                        Some(format!("label={}", verified.credential.label)),
+                    );
+                    Response::ok(req.id, serde_json::json!({ "verified": true }))
+                }
+                Err(e) => {
+                    emit_daemon_method_audit(
+                        state,
+                        AuditEventKind::OperationFailed,
+                        "fido2_respond",
+                        identity,
+                        client_type,
+                        "assertion_rejected",
+                        Some(e.clone()),
+                    );
+                    Response::err(Some(req.id), "invalid_assertion", e)
+                }
+            }
         }
         "execute" => {
             let operation = req
@@ -2416,6 +4347,7 @@ async fn handle_request(
             }
 
             let op_req = OperationRequest {
+                principal: principal_ctx.clone(),
                 request_id: Uuid::new_v4(),
                 client_identity: identity.clone(),
                 client_type,
@@ -2450,10 +4382,24 @@ async fn handle_request(
 
             // Route list_secrets and delete_secret to their own dispatch paths.
             if action == "list_secrets" {
-                return handle_github_list_secrets(&req, state, identity, client_type).await;
+                return handle_github_list_secrets(
+                    &req,
+                    state,
+                    identity,
+                    client_type,
+                    principal_ctx.as_ref(),
+                )
+                .await;
             }
             if action == "delete_secret" {
-                return handle_github_delete_secret(&req, state, identity, client_type).await;
+                return handle_github_delete_secret(
+                    &req,
+                    state,
+                    identity,
+                    client_type,
+                    principal_ctx.as_ref(),
+                )
+                .await;
             }
 
             let scope = req
@@ -2704,6 +4650,7 @@ async fn handle_request(
             }
 
             let op_req = OperationRequest {
+                principal: principal_ctx.clone(),
                 request_id: Uuid::new_v4(),
                 client_identity: identity.clone(),
                 client_type,
@@ -2735,7 +4682,10 @@ async fn handle_request(
                 return Response::err(
                     Some(req.id),
                     "bad_request",
-                    format!("unknown action '{}' (expected: set_ci_variable)", truncate_for_error(&action, 64)),
+                    format!(
+                        "unknown action '{}' (expected: set_ci_variable)",
+                        truncate_for_error(&action, 64)
+                    ),
                 );
             }
 
@@ -2841,6 +4791,7 @@ async fn handle_request(
             }
 
             let op_req = OperationRequest {
+                principal: principal_ctx.clone(),
                 request_id: Uuid::new_v4(),
                 client_identity: identity.clone(),
                 client_type,
@@ -2987,6 +4938,7 @@ async fn handle_request(
             };
 
             let op_req = OperationRequest {
+                principal: principal_ctx.clone(),
                 request_id: Uuid::new_v4(),
                 client_identity: identity.clone(),
                 client_type,
@@ -3111,6 +5063,7 @@ async fn handle_request(
             };
 
             let op_req = OperationRequest {
+                principal: principal_ctx.clone(),
                 request_id: Uuid::new_v4(),
                 client_identity: identity.clone(),
                 client_type,
@@ -3171,11 +5124,32 @@ async fn handle_request(
                 .unwrap_or_default();
 
             let op_req = OperationRequest {
+                principal: principal_ctx.clone(),
                 request_id: Uuid::new_v4(),
                 client_identity: identity.clone(),
                 client_type,
                 operation: "sandbox.exec".into(),
-                target: HashMap::from([("profile".into(), profile.clone())]),
+                // SECURITY (C3): include the command in `target` so it is rendered
+                // in the approval prompt, covered by allowed_target_keys, and bound
+                // into the content hash and lease key — the approver authorizes the
+                // exact argv, not just the profile name.
+                target: {
+                    let cmd_display = command
+                        .iter()
+                        .map(|a| {
+                            if a.is_empty() || a.chars().any(|c| c.is_whitespace() || c == '"') {
+                                format!("{a:?}")
+                            } else {
+                                a.clone()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    HashMap::from([
+                        ("profile".into(), profile.clone()),
+                        ("command".into(), cmd_display),
+                    ])
+                },
                 secret_ref_names,
                 created_at: SystemTime::now(),
                 expires_at: None,
@@ -3204,6 +5178,7 @@ async fn handle_github_list_secrets(
     state: &DaemonState,
     identity: &ClientIdentity,
     client_type: ClientType,
+    principal_ctx: Option<&PrincipalContext>,
 ) -> opaque_core::proto::Response {
     let scope = req
         .params
@@ -3238,6 +5213,7 @@ async fn handle_github_list_secrets(
     };
 
     let op_req = OperationRequest {
+        principal: principal_ctx.cloned(),
         request_id: Uuid::new_v4(),
         client_identity: identity.clone(),
         client_type,
@@ -3265,6 +5241,7 @@ async fn handle_github_delete_secret(
     state: &DaemonState,
     identity: &ClientIdentity,
     client_type: ClientType,
+    principal_ctx: Option<&PrincipalContext>,
 ) -> opaque_core::proto::Response {
     let scope = req
         .params
@@ -3313,6 +5290,7 @@ async fn handle_github_delete_secret(
     };
 
     let op_req = OperationRequest {
+        principal: principal_ctx.cloned(),
         request_id: Uuid::new_v4(),
         client_identity: identity.clone(),
         client_type,
@@ -3597,28 +5575,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn verify_peer_uid_same_uid() {
-        let my_uid = unsafe { libc::getuid() };
-        let peer = opaque_core::peer::PeerInfo {
-            uid: my_uid,
-            gid: 20,
-            pid: Some(1234),
-        };
-        assert!(verify_peer_uid(&peer));
-    }
-
-    #[test]
-    fn verify_peer_uid_different_uid() {
-        let my_uid = unsafe { libc::getuid() };
-        let other_uid = if my_uid == 0 { 1000 } else { my_uid + 1 };
-        let peer = opaque_core::peer::PeerInfo {
-            uid: other_uid,
-            gid: 20,
-            pid: Some(1234),
-        };
-        assert!(!verify_peer_uid(&peer));
-    }
+    // Peer-uid gating (both modes) is covered by trust_domain::peer_uid_allowed
+    // unit tests; the connection-level wiring is exercised by the daemon e2e
+    // tests, which connect from the same uid in shared mode.
 
     #[test]
     fn constant_time_eq_works() {
@@ -3901,7 +5860,9 @@ exe_sha256 = "deadbeef"
     }
 
     #[tokio::test]
-    async fn agent_session_start_allowed_for_agent_when_not_enforced() {
+    async fn agent_session_start_succeeds_with_approval() {
+        // Software-first: session creation is gated on out-of-band approval, not on
+        // client classification — an agent whose request is approved succeeds.
         let state = make_test_state();
         let req = Request {
             id: 4,
@@ -3921,9 +5882,11 @@ exe_sha256 = "deadbeef"
     }
 
     #[tokio::test]
-    async fn agent_session_start_denied_for_agent_when_enforced() {
-        let mut state = make_test_state();
-        state.config.enforce_agent_sessions = true;
+    async fn agent_session_start_denied_without_approval() {
+        // When approval is not granted (no human present, or an agent that cannot
+        // satisfy it), session creation is denied regardless of classification —
+        // this is what stops an agent minting its own session.
+        let state = make_denying_test_state();
         let req = Request {
             id: 5,
             method: "agent_session_start".into(),
@@ -3935,7 +5898,9 @@ exe_sha256 = "deadbeef"
     }
 
     #[tokio::test]
-    async fn agent_session_list_denied_for_agents() {
+    async fn agent_session_list_allowed_for_local_callers() {
+        // Software-first: listing is no longer gated on classification (audit-only
+        // at a shared uid); it is scoped to the caller's own uid and hides tokens.
         let state = make_test_state();
         let req = Request {
             id: 6,
@@ -3943,8 +5908,9 @@ exe_sha256 = "deadbeef"
             params: serde_json::Value::Null,
         };
         let resp = handle_request(&state, req, &test_identity(), ClientType::Agent, None).await;
-        let err = resp.error.expect("expected permission denial");
-        assert_eq!(err.code, "permission_denied");
+        assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+        let result = resp.result.expect("result expected");
+        assert!(result.get("sessions").and_then(|v| v.as_array()).is_some());
     }
 
     #[tokio::test]
@@ -3960,6 +5926,7 @@ exe_sha256 = "deadbeef"
                 created_by_uid: 501,
                 expires_at: now + std::time::Duration::from_secs(600),
                 label: Some("own-active".into()),
+                delegation: None,
             },
         );
         state.agent_sessions.write().await.insert(
@@ -3970,6 +5937,7 @@ exe_sha256 = "deadbeef"
                 created_by_uid: 501,
                 expires_at: now - std::time::Duration::from_secs(1),
                 label: Some("own-expired".into()),
+                delegation: None,
             },
         );
         state.agent_sessions.write().await.insert(
@@ -3980,6 +5948,7 @@ exe_sha256 = "deadbeef"
                 created_by_uid: 777,
                 expires_at: now + std::time::Duration::from_secs(600),
                 label: Some("other-active".into()),
+                delegation: None,
             },
         );
 
@@ -4031,6 +6000,7 @@ exe_sha256 = "deadbeef"
                 created_by_uid: 501,
                 expires_at: now + std::time::Duration::from_secs(300),
                 label: Some("own-1".into()),
+                delegation: None,
             },
         );
         state.agent_sessions.write().await.insert(
@@ -4041,6 +6011,7 @@ exe_sha256 = "deadbeef"
                 created_by_uid: 501,
                 expires_at: now + std::time::Duration::from_secs(300),
                 label: Some("own-2".into()),
+                delegation: None,
             },
         );
         state.agent_sessions.write().await.insert(
@@ -4051,6 +6022,7 @@ exe_sha256 = "deadbeef"
                 created_by_uid: 777,
                 expires_at: now + std::time::Duration::from_secs(300),
                 label: Some("other".into()),
+                delegation: None,
             },
         );
 
@@ -4123,6 +6095,7 @@ exe_sha256 = "deadbeef"
                 created_by_uid: 501,
                 expires_at: SystemTime::now() + std::time::Duration::from_secs(300),
                 label: Some("own-1".into()),
+                delegation: None,
             },
         );
 
@@ -4150,6 +6123,7 @@ exe_sha256 = "deadbeef"
             created_by_uid: 501,
             expires_at: SystemTime::now() + std::time::Duration::from_secs(300),
             label: Some("test".into()),
+            delegation: None,
         };
         state
             .agent_sessions
@@ -4178,6 +6152,7 @@ exe_sha256 = "deadbeef"
                 created_by_uid: uid,
                 expires_at: SystemTime::now() + std::time::Duration::from_secs(60),
                 label: Some("test".into()),
+                delegation: None,
             },
         );
 
@@ -4307,13 +6282,45 @@ exe_sha256 = "deadbeef"
     // Test helpers
     // -----------------------------------------------------------------------
 
-    fn make_test_state_with_audit(audit: Arc<dyn AuditSink>) -> DaemonState {
+    /// Test approval gate returning a fixed decision, so session-approval paths can
+    /// be exercised without a real biometric prompt.
+    #[derive(Debug)]
+    struct TestApprovalGate {
+        approve: bool,
+    }
+
+    impl crate::enclave::ApprovalGate for TestApprovalGate {
+        fn request_approval(
+            &self,
+            _approval_id: uuid::Uuid,
+            _request: &opaque_core::operation::OperationRequest,
+            _factors: &[opaque_core::operation::ApprovalFactor],
+            _description: &str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::enclave::ApprovalOutcome, String>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            let approve = self.approve;
+            Box::pin(async move {
+                Ok(if approve {
+                    crate::enclave::ApprovalOutcome::approved_anonymous()
+                } else {
+                    crate::enclave::ApprovalOutcome::denied()
+                })
+            })
+        }
+    }
+
+    fn build_test_state(audit: Arc<dyn AuditSink>, approve: bool) -> DaemonState {
         let registry = OperationRegistry::new();
         let policy = PolicyEngine::with_rules(vec![]);
         let enclave = Enclave::builder()
             .registry(registry)
             .policy(policy)
-            .approval_gate(Box::new(NativeApprovalGate::new()))
+            .approval_gate(Box::new(TestApprovalGate { approve }))
             .audit(audit.clone())
             .build()
             .unwrap();
@@ -4325,7 +6332,19 @@ exe_sha256 = "deadbeef"
             daemon_token: "test_token".into(),
             agent_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             connection_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+            identity: None,
+            pairing: None,
+            approval_server_addr: None,
+            fido2: None,
         }
+    }
+
+    fn make_test_state_with_audit(audit: Arc<dyn AuditSink>) -> DaemonState {
+        build_test_state(audit, true)
+    }
+
+    fn make_denying_test_state() -> DaemonState {
+        build_test_state(Arc::new(TracingAuditEmitter::new()), false)
     }
 
     fn make_test_state() -> DaemonState {
@@ -4333,11 +6352,391 @@ exe_sha256 = "deadbeef"
         make_test_state_with_audit(audit)
     }
 
+    /// Test state with an identity runtime (no live IdP — discovery is lazy).
+    fn make_test_state_with_identity() -> (tempfile::TempDir, DaemonState) {
+        let (dir, state, _audit) = make_test_state_with_identity_audit();
+        (dir, state)
+    }
+
+    /// As above, but the daemon audit sink AND the identity runtime share an
+    /// in-memory emitter so lifecycle events can be asserted.
+    fn make_test_state_with_identity_audit() -> (
+        tempfile::TempDir,
+        DaemonState,
+        Arc<opaque_core::audit::InMemoryAuditEmitter>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = identity::IdentityConfig {
+            issuer: "https://idp.example.com".into(),
+            client_id: "opaque-cli".into(),
+            audience: None,
+            redirect_port: None,
+            session_ttl_secs: None,
+            allowed_email_domains: vec![],
+            required: false,
+            service_principals: vec![],
+        };
+        let emitter = Arc::new(opaque_core::audit::InMemoryAuditEmitter::new());
+        let runtime = identity::IdentityRuntime::initialize(config, dir.path())
+            .unwrap()
+            .with_audit(emitter.clone());
+        let mut state = build_test_state(emitter.clone(), true);
+        state.identity = Some(Arc::new(runtime));
+        (dir, state, emitter)
+    }
+
+    #[test]
+    fn approval_backend_selection_fails_closed() {
+        use ApprovalBackendKind::*;
+        // Default and explicit native without the env marker.
+        assert_eq!(select_approval_backend(None, false).unwrap(), Native);
+        assert_eq!(
+            select_approval_backend(Some("native"), false).unwrap(),
+            Native
+        );
+        // Env marker set but backend not selected → refuse.
+        assert!(select_approval_backend(None, true).is_err());
+        assert!(select_approval_backend(Some("native"), true).is_err());
+        // Insecure backend requested without the env marker → refuse.
+        assert!(select_approval_backend(Some("insecure_auto_approve"), false).is_err());
+        // Both present → activate.
+        assert_eq!(
+            select_approval_backend(Some("insecure_auto_approve"), true).unwrap(),
+            InsecureAutoApprove
+        );
+        // Unknown value → refuse.
+        assert!(select_approval_backend(Some("nope"), false).is_err());
+    }
+
+    #[tokio::test]
+    async fn logout_emits_identity_logout_event() {
+        let (_dir, state, audit) = make_test_state_with_identity_audit();
+        let rt = state.identity.as_ref().unwrap();
+        // Bootstrap a human + active session.
+        let p = rt
+            .store
+            .upsert_human(
+                "https://idp.example.com",
+                "u1",
+                Some("dev@example.com"),
+                None,
+                &Default::default(),
+            )
+            .unwrap();
+        rt.store
+            .create_human_session(&p.id, 3600, "https://idp.example.com")
+            .unwrap();
+        let req = Request {
+            id: 1,
+            method: "identity.logout".into(),
+            params: serde_json::json!({}),
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        assert!(resp.error.is_none());
+        assert!(
+            audit
+                .events()
+                .iter()
+                .any(|e| e.kind == AuditEventKind::IdentityLogout),
+            "logout must emit an IdentityLogout audit event"
+        );
+    }
+
+    #[tokio::test]
+    async fn role_set_emits_role_changed_event() {
+        let (_dir, state, audit) = make_test_state_with_identity_audit();
+        let rt = state.identity.as_ref().unwrap();
+        // Bootstrap admin with an active session, plus a target principal.
+        let admin = rt
+            .store
+            .upsert_human(
+                "https://idp.example.com",
+                "admin",
+                Some("admin@example.com"),
+                None,
+                &[opaque_core::identity::Role::Admin].into_iter().collect(),
+            )
+            .unwrap();
+        rt.store
+            .create_human_session(&admin.id, 3600, "https://idp.example.com")
+            .unwrap();
+        let target = rt.store.upsert_service("ci").unwrap();
+        let req = Request {
+            id: 1,
+            method: "identity.role_set".into(),
+            params: serde_json::json!({
+                "principal_id": target.id.as_str(),
+                "roles": ["operator"],
+            }),
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        assert!(resp.error.is_none(), "role_set failed: {:?}", resp.error);
+        assert!(
+            audit
+                .events()
+                .iter()
+                .any(|e| e.kind == AuditEventKind::IdentityRoleChanged),
+            "role_set must emit an IdentityRoleChanged audit event"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Identity method tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn identity_methods_error_when_not_configured() {
+        let state = make_test_state();
+        for method in [
+            "identity.login_start",
+            "identity.login_status",
+            "identity.logout",
+            "identity.principal_list",
+            "identity.role_set",
+        ] {
+            let req = Request {
+                id: 1,
+                method: method.into(),
+                params: serde_json::json!({}),
+            };
+            let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+            assert_eq!(
+                resp.error.expect("error expected").code,
+                "identity_not_configured",
+                "method {method}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn whoami_reports_identity_absent_when_unconfigured() {
+        let state = make_test_state();
+        let req = Request {
+            id: 1,
+            method: "whoami".into(),
+            params: serde_json::Value::Null,
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        let result = resp.result.unwrap();
+        assert_eq!(result["identity"], serde_json::Value::Null);
+        assert_eq!(result["identity_required"], false);
+    }
+
+    #[tokio::test]
+    async fn whoami_reports_logged_in_identity() {
+        let (_dir, state) = make_test_state_with_identity();
+        let rt = state.identity.as_ref().unwrap();
+        let principal = rt
+            .store
+            .upsert_human(
+                "https://idp.example.com",
+                "u-1",
+                Some("dev@example.com"),
+                None,
+                &std::collections::BTreeSet::from([
+                    opaque_core::identity::Role::Admin,
+                    opaque_core::identity::Role::Operator,
+                ]),
+            )
+            .unwrap();
+        rt.store
+            .create_human_session(&principal.id, 3600, "https://idp.example.com")
+            .unwrap();
+
+        let req = Request {
+            id: 1,
+            method: "whoami".into(),
+            params: serde_json::Value::Null,
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        let result = resp.result.unwrap();
+        assert_eq!(result["identity"]["email"], "dev@example.com");
+        assert_eq!(result["identity"]["principal_id"], principal.id.as_str());
+
+        // Agent whoami stays reduced: no identity object, but the flag is there.
+        let req = Request {
+            id: 2,
+            method: "whoami".into(),
+            params: serde_json::Value::Null,
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Agent, None).await;
+        let result = resp.result.unwrap();
+        assert!(result.get("identity").is_none());
+        assert_eq!(result["identity_required"], false);
+        assert!(result.get("exe_path").is_none());
+    }
+
+    #[tokio::test]
+    async fn principal_list_open_during_bootstrap_then_session_gated() {
+        let (_dir, state) = make_test_state_with_identity();
+
+        // Bootstrap phase (no humans yet): listing is allowed.
+        let req = Request {
+            id: 1,
+            method: "identity.principal_list".into(),
+            params: serde_json::json!({}),
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        assert!(resp.error.is_none());
+
+        // Register a human but no active session → gated.
+        let rt = state.identity.as_ref().unwrap();
+        rt.store
+            .upsert_human(
+                "https://idp.example.com",
+                "u-1",
+                None,
+                None,
+                &std::collections::BTreeSet::new(),
+            )
+            .unwrap();
+        let req = Request {
+            id: 2,
+            method: "identity.principal_list".into(),
+            params: serde_json::json!({}),
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        assert_eq!(resp.error.expect("gated").code, "not_authorized");
+    }
+
+    #[tokio::test]
+    async fn role_set_requires_admin_session_and_guards_last_admin() {
+        let (_dir, state) = make_test_state_with_identity();
+        let rt = state.identity.as_ref().unwrap().clone();
+        let admin = rt
+            .store
+            .upsert_human(
+                "https://idp.example.com",
+                "u-admin",
+                Some("admin@example.com"),
+                None,
+                &std::collections::BTreeSet::from([
+                    opaque_core::identity::Role::Admin,
+                    opaque_core::identity::Role::Operator,
+                ]),
+            )
+            .unwrap();
+
+        // No active session → not authorized.
+        let req = Request {
+            id: 1,
+            method: "identity.role_set".into(),
+            params: serde_json::json!({
+                "principal_id": admin.id.as_str(),
+                "roles": ["operator"],
+            }),
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        assert_eq!(resp.error.expect("gated").code, "not_authorized");
+
+        // With an admin session: dropping the last admin's admin role fails.
+        rt.store
+            .create_human_session(&admin.id, 3600, "https://idp.example.com")
+            .unwrap();
+        let req = Request {
+            id: 2,
+            method: "identity.role_set".into(),
+            params: serde_json::json!({
+                "principal_id": admin.id.as_str(),
+                "roles": ["operator"],
+            }),
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        assert_eq!(resp.error.expect("guarded").code, "last_admin");
+
+        // Granting roles to a second principal works and is visible.
+        let second = rt
+            .store
+            .upsert_human(
+                "https://idp.example.com",
+                "u-2",
+                None,
+                None,
+                &std::collections::BTreeSet::new(),
+            )
+            .unwrap();
+        let req = Request {
+            id: 3,
+            method: "identity.role_set".into(),
+            params: serde_json::json!({
+                "principal_id": second.id.as_str(),
+                "roles": ["approver", "operator"],
+            }),
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+        let roles = resp.result.unwrap()["roles"].clone();
+        let roles: Vec<String> = serde_json::from_value(roles).unwrap();
+        assert_eq!(roles, vec!["approver".to_string(), "operator".to_string()]);
+
+        // Unknown role name rejected.
+        let req = Request {
+            id: 4,
+            method: "identity.role_set".into(),
+            params: serde_json::json!({
+                "principal_id": second.id.as_str(),
+                "roles": ["root"],
+            }),
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        assert_eq!(resp.error.expect("invalid role").code, "invalid_params");
+    }
+
+    #[tokio::test]
+    async fn logout_revokes_sessions() {
+        let (_dir, state) = make_test_state_with_identity();
+        let rt = state.identity.as_ref().unwrap();
+        let p = rt
+            .store
+            .upsert_human(
+                "https://idp.example.com",
+                "u-1",
+                None,
+                None,
+                &std::collections::BTreeSet::new(),
+            )
+            .unwrap();
+        rt.store
+            .create_human_session(&p.id, 3600, "https://idp.example.com")
+            .unwrap();
+        assert!(rt.current_identity_json().is_some());
+
+        let req = Request {
+            id: 1,
+            method: "identity.logout".into(),
+            params: serde_json::json!({}),
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        assert_eq!(resp.result.unwrap()["revoked"], 1);
+        assert!(rt.current_identity_json().is_none());
+    }
+
+    #[tokio::test]
+    async fn login_status_requires_uuid_attempt_id() {
+        let (_dir, state) = make_test_state_with_identity();
+        let req = Request {
+            id: 1,
+            method: "identity.login_status".into(),
+            params: serde_json::json!({ "attempt_id": "../../etc/passwd" }),
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        assert_eq!(resp.error.expect("rejected").code, "invalid_params");
+
+        let req = Request {
+            id: 2,
+            method: "identity.login_status".into(),
+            params: serde_json::json!({ "attempt_id": Uuid::new_v4().to_string() }),
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        assert_eq!(resp.error.expect("unknown").code, "unknown_attempt");
+    }
+
     // -----------------------------------------------------------------------
     // Seal enforcement tests
     // -----------------------------------------------------------------------
 
-    /// Helper: create a temp dir with a config.toml and optionally a seal file.
+    /// Helper: create a temp dir with a config.toml and optionally a (keyed,
+    /// current-format) seal + key beside it.
     fn setup_seal_test(
         config_content: &str,
         sealed: bool,
@@ -4348,8 +6747,9 @@ exe_sha256 = "deadbeef"
         let seal_file = dir.path().join("config.seal");
         std::fs::write(&config_path, config_content).unwrap();
         if sealed {
-            let seal_hash = seal::compute_seal(config_content.as_bytes());
-            std::fs::write(&seal_file, &seal_hash).unwrap();
+            let key = seal::load_or_create_seal_key(&seal_file).unwrap();
+            let value = seal::compute_seal_keyed(config_content.as_bytes(), &key);
+            std::fs::write(&seal_file, &value).unwrap();
         }
         (dir, config_path, seal_file)
     }
@@ -4357,17 +6757,64 @@ exe_sha256 = "deadbeef"
     #[test]
     fn seal_require_true_and_sealed_succeeds() {
         let (_dir, config_path, seal_file) = setup_seal_test("[daemon]\n", true);
-        let result = check_seal_file_only(&config_path, &seal_file, true, false);
+        // The keyed seal satisfies both shared-uid and enforce mode.
+        let result = check_seal_file_only(&config_path, &seal_file, true, false, false);
         assert!(
             result.is_ok(),
             "sealed config with require_seal=true should succeed"
+        );
+        let result = check_seal_file_only(&config_path, &seal_file, true, false, true);
+        assert!(
+            result.is_ok(),
+            "keyed seal should satisfy trust_domain.enforce too"
+        );
+    }
+
+    #[test]
+    fn seal_legacy_unkeyed_warns_in_shared_mode_but_fails_enforce() {
+        use opaque_core::seal;
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let seal_file = dir.path().join("config.seal");
+        let content = "[daemon]\n";
+        std::fs::write(&config_path, content).unwrap();
+        // Legacy bare-hex seal, as written by pre-trust-domain builds.
+        std::fs::write(&seal_file, seal::compute_seal(content.as_bytes())).unwrap();
+
+        let result = check_seal_file_only(&config_path, &seal_file, true, false, false);
+        assert!(
+            result.is_ok(),
+            "legacy seal remains accepted in shared mode"
+        );
+
+        let result = check_seal_file_only(&config_path, &seal_file, true, false, true);
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            err.to_string().contains("UNKEYED"),
+            "enforce-mode refusal must explain the legacy seal problem: {err}"
+        );
+    }
+
+    #[test]
+    fn seal_keyed_with_missing_key_fails_closed() {
+        use opaque_core::seal;
+        let (_dir, config_path, seal_file) = setup_seal_test("[daemon]\n", true);
+        std::fs::remove_file(seal::seal_key_path(&seal_file)).unwrap();
+
+        let result = check_seal_file_only(&config_path, &seal_file, false, false, false);
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("seal key"),
+            "key-missing refusal must name the missing key: {err}"
         );
     }
 
     #[test]
     fn seal_require_true_and_unsealed_fails() {
         let (_dir, config_path, seal_file) = setup_seal_test("[daemon]\n", false);
-        let result = check_seal_file_only(&config_path, &seal_file, true, false);
+        let result = check_seal_file_only(&config_path, &seal_file, true, false, false);
         assert!(
             result.is_err(),
             "unsealed config with require_seal=true should fail"
@@ -4392,7 +6839,7 @@ exe_sha256 = "deadbeef"
     #[test]
     fn seal_require_true_allow_unsealed_succeeds() {
         let (_dir, config_path, seal_file) = setup_seal_test("[daemon]\n", false);
-        let result = check_seal_file_only(&config_path, &seal_file, true, true);
+        let result = check_seal_file_only(&config_path, &seal_file, true, true, false);
         assert!(
             result.is_ok(),
             "unsealed config with require_seal=true + allow_unsealed should succeed"
@@ -4402,7 +6849,7 @@ exe_sha256 = "deadbeef"
     #[test]
     fn seal_require_false_default_unsealed_succeeds() {
         let (_dir, config_path, seal_file) = setup_seal_test("[daemon]\n", false);
-        let result = check_seal_file_only(&config_path, &seal_file, false, false);
+        let result = check_seal_file_only(&config_path, &seal_file, false, false, false);
         assert!(
             result.is_ok(),
             "unsealed config with require_seal=false should succeed (backward compat)"
@@ -4452,12 +6899,12 @@ exe_sha256 = "deadbeef"
         std::fs::write(&config_path, "[daemon]\nrequire_seal = true\n").unwrap();
 
         // Should fail with require_seal=false.
-        let result = check_seal_file_only(&config_path, &seal_file, false, false);
+        let result = check_seal_file_only(&config_path, &seal_file, false, false, false);
         assert!(result.is_err(), "tampered config should always fail");
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
 
         // Should fail even with allow_unsealed=true.
-        let result = check_seal_file_only(&config_path, &seal_file, false, true);
+        let result = check_seal_file_only(&config_path, &seal_file, false, true, false);
         assert!(
             result.is_err(),
             "tampered config should fail even with allow_unsealed"
@@ -4471,7 +6918,7 @@ exe_sha256 = "deadbeef"
         let seal_file = dir.path().join("config.seal");
 
         // Even with require_seal=true, if there's no config file it's OK.
-        let result = check_seal_file_only(&config_path, &seal_file, true, false);
+        let result = check_seal_file_only(&config_path, &seal_file, true, false, false);
         assert!(
             result.is_ok(),
             "missing config file should not cause seal failure"
@@ -4495,5 +6942,420 @@ exe_sha256 = "deadbeef"
         let result = truncate_for_error(&s, 64);
         assert_eq!(result.len(), 67); // 64 + "..."
         assert!(result.ends_with("..."));
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage C: delegation minting + enforcement
+    // -----------------------------------------------------------------------
+
+    use opaque_core::identity::{AccessMode, Role};
+
+    /// Identity-enabled test state with `required` toggled and a logged-in
+    /// human (admin+operator) so delegated mints succeed by default.
+    fn identity_state(required: bool) -> (tempfile::TempDir, DaemonState) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = identity::IdentityConfig {
+            issuer: "https://idp.example.com".into(),
+            client_id: "opaque-cli".into(),
+            audience: None,
+            redirect_port: None,
+            session_ttl_secs: None,
+            allowed_email_domains: vec![],
+            required,
+            service_principals: vec![identity::ServicePrincipalConfig {
+                name: "ci".into(),
+                roles: vec!["operator".into()],
+            }],
+        };
+        let runtime = identity::IdentityRuntime::initialize(config, dir.path()).unwrap();
+        let mut state = make_test_state();
+        state.identity = Some(Arc::new(runtime));
+        (dir, state)
+    }
+
+    /// Log a human in (bootstrap admin) and return their principal id.
+    fn login_human(state: &DaemonState) -> PrincipalId {
+        let rt = state.identity.as_ref().unwrap();
+        let p = rt
+            .store
+            .upsert_human(
+                "https://idp.example.com",
+                "u-1",
+                Some("dev@example.com"),
+                Some("Dev"),
+                &std::collections::BTreeSet::from([Role::Admin, Role::Operator]),
+            )
+            .unwrap();
+        rt.store
+            .create_human_session(&p.id, 3600, "https://idp.example.com")
+            .unwrap();
+        p.id
+    }
+
+    async fn start_session(state: &DaemonState, params: serde_json::Value) -> Response {
+        let req = Request {
+            id: 1,
+            method: "agent_session_start".into(),
+            params,
+        };
+        handle_request(state, req, &test_identity(), ClientType::Agent, None).await
+    }
+
+    #[tokio::test]
+    async fn mint_delegated_happy_path_returns_principal_and_opqd1_token() {
+        let (_d, state) = identity_state(false);
+        login_human(&state);
+        let resp = start_session(&state, serde_json::json!({})).await;
+        assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+        let r = resp.result.unwrap();
+        assert!(
+            r["session_token"].as_str().unwrap().starts_with("opqd1."),
+            "expected a delegation token"
+        );
+        assert_eq!(r["mode"], "delegated");
+        assert_eq!(r["on_behalf_of_label"], "dev@example.com");
+        assert!(r["on_behalf_of"].as_str().unwrap().starts_with("hum_"));
+    }
+
+    #[tokio::test]
+    async fn mint_delegated_without_login_fails_closed() {
+        let (_d, state) = identity_state(false);
+        let resp = start_session(&state, serde_json::json!({})).await;
+        assert_eq!(resp.error.expect("should fail").code, "login_required");
+    }
+
+    #[tokio::test]
+    async fn mint_break_glass_unavailable() {
+        let (_d, state) = identity_state(false);
+        login_human(&state);
+        let resp = start_session(&state, serde_json::json!({ "mode": "break_glass" })).await;
+        assert_eq!(
+            resp.error.expect("should fail").code,
+            "break_glass_unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_autonomous_happy_and_unknown_service() {
+        let (_d, state) = identity_state(false);
+        // Known service principal (declared in identity_state config).
+        let ok = start_session(
+            &state,
+            serde_json::json!({ "mode": "autonomous", "service": "ci" }),
+        )
+        .await;
+        assert!(ok.error.is_none(), "unexpected: {:?}", ok.error);
+        let r = ok.result.unwrap();
+        assert_eq!(r["mode"], "autonomous");
+        assert!(r["on_behalf_of"].as_str().unwrap().starts_with("svc_"));
+
+        // Unknown service principal.
+        let bad = start_session(
+            &state,
+            serde_json::json!({ "mode": "autonomous", "service": "nope" }),
+        )
+        .await;
+        assert_eq!(
+            bad.error.expect("should fail").code,
+            "unknown_service_principal"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_autonomous_does_not_require_login() {
+        // Autonomous mode is for unattended operation — no human session.
+        let (_d, state) = identity_state(true);
+        let resp = start_session(
+            &state,
+            serde_json::json!({ "mode": "autonomous", "service": "ci" }),
+        )
+        .await;
+        assert!(resp.error.is_none(), "unexpected: {:?}", resp.error);
+    }
+
+    #[test]
+    fn agent_tool_name_sanitization() {
+        let id = test_identity();
+        // Label wins, sanitized to the identity charset.
+        assert_eq!(
+            derive_agent_tool_name(Some("Claude Code!!"), &id),
+            "Claude-Code"
+        );
+        // Empty/whitespace label → exe basename.
+        assert_eq!(derive_agent_tool_name(Some("   "), &id), "claude-code");
+        assert_eq!(derive_agent_tool_name(None, &id), "claude-code");
+        // No exe path and no label → "agent".
+        let bare = ClientIdentity {
+            uid: 1,
+            gid: 1,
+            pid: None,
+            exe_path: None,
+            exe_sha256: None,
+            codesign_team_id: None,
+        };
+        assert_eq!(derive_agent_tool_name(None, &bare), "agent");
+        // Pure punctuation label collapses to "agent", never empty.
+        assert_eq!(derive_agent_tool_name(Some("///"), &bare), "agent");
+    }
+
+    /// Drive a mint, then return (state, session_id, token) for enforcement tests.
+    async fn mint_delegated(state: &DaemonState) -> (String, String) {
+        let resp = start_session(state, serde_json::json!({})).await;
+        let r = resp.result.unwrap();
+        (
+            r["session_id"].as_str().unwrap().to_owned(),
+            r["session_token"].as_str().unwrap().to_owned(),
+        )
+    }
+
+    #[tokio::test]
+    async fn resolve_context_reflects_live_delegation() {
+        let (_d, state) = identity_state(false);
+        let sub = login_human(&state);
+        let (sid, _tok) = mint_delegated(&state).await;
+        let ctx = resolve_principal_context(&state, Some(&sid))
+            .await
+            .unwrap()
+            .expect("context expected");
+        assert_eq!(ctx.sub, sub);
+        assert_eq!(ctx.mode, AccessMode::Delegated);
+        assert!(ctx.sub_roles.contains(&Role::Operator));
+        assert_eq!(ctx.sub_label, "dev@example.com");
+    }
+
+    #[tokio::test]
+    async fn revoked_delegation_fails_closed() {
+        let (_d, state) = identity_state(false);
+        login_human(&state);
+        let (sid, _tok) = mint_delegated(&state).await;
+        state
+            .identity
+            .as_ref()
+            .unwrap()
+            .store
+            .revoke_delegation(&sid)
+            .unwrap();
+        let err = resolve_principal_context(&state, Some(&sid)).await;
+        assert!(err.is_err(), "revoked delegation must fail closed");
+    }
+
+    #[tokio::test]
+    async fn expired_human_session_kills_delegated_ops() {
+        let (_d, state) = identity_state(false);
+        login_human(&state);
+        let (sid, _tok) = mint_delegated(&state).await;
+        // Revoke the human session mid-flight.
+        state
+            .identity
+            .as_ref()
+            .unwrap()
+            .store
+            .revoke_all_human_sessions()
+            .unwrap();
+        let err = resolve_principal_context(&state, Some(&sid)).await;
+        assert!(
+            err.is_err(),
+            "delegated op must die when the human session ends"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_principal_fails_closed() {
+        let (_d, state) = identity_state(false);
+        let sub = login_human(&state);
+        let (sid, _tok) = mint_delegated(&state).await;
+        // Disable the delegating principal.
+        state
+            .identity
+            .as_ref()
+            .unwrap()
+            .store
+            .set_disabled(&sub, true)
+            .unwrap();
+        let err = resolve_principal_context(&state, Some(&sid)).await;
+        assert!(err.is_err(), "disabled principal must fail closed");
+    }
+
+    #[tokio::test]
+    async fn identity_required_blocks_undelegated_execute_but_not_ping() {
+        let (_d, state) = identity_state(true);
+        // Agent execute without a delegation → identity_required.
+        let exec = Request {
+            id: 1,
+            method: "execute".into(),
+            params: serde_json::json!({ "operation": "noop.test" }),
+        };
+        let resp = handle_request(&state, exec, &test_identity(), ClientType::Agent, None).await;
+        assert_eq!(resp.error.expect("blocked").code, "identity_required");
+
+        // ping is always reachable.
+        let ping = Request {
+            id: 2,
+            method: "ping".into(),
+            params: serde_json::Value::Null,
+        };
+        let resp = handle_request(&state, ping, &test_identity(), ClientType::Agent, None).await;
+        assert!(resp.error.is_none());
+
+        // whoami is reachable (so an agent can be told to log in).
+        let who = Request {
+            id: 3,
+            method: "whoami".into(),
+            params: serde_json::Value::Null,
+        };
+        let resp = handle_request(&state, who, &test_identity(), ClientType::Agent, None).await;
+        assert!(resp.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn identity_required_does_not_block_human() {
+        // Humans are not agents — identity.required targets agent workloads.
+        let (_d, state) = identity_state(true);
+        let exec = Request {
+            id: 1,
+            method: "execute".into(),
+            params: serde_json::json!({ "operation": "noop.test" }),
+        };
+        let resp = handle_request(&state, exec, &test_identity(), ClientType::Human, None).await;
+        // Reaches the enclave (unknown op → not identity_required).
+        assert!(
+            resp.error.is_none() || resp.error.as_ref().unwrap().code != "identity_required",
+            "human must not be identity-gated"
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_require_principal_gates_by_delegation() {
+        use opaque_core::operation::{
+            ApprovalRequirement, OperationDef, OperationRegistry, OperationSafety,
+        };
+        use opaque_core::policy::{IdentityMatch, PolicyEngine, PolicyRule};
+
+        // A rule that only allows delegated requests carrying a principal.
+        let rule = PolicyRule {
+            name: "delegated-only".into(),
+            client: Default::default(),
+            operation_pattern: "noop.*".into(),
+            target: Default::default(),
+            workspace: Default::default(),
+            secret_names: Default::default(),
+            allow: true,
+            client_types: vec![],
+            identity: IdentityMatch {
+                require_principal: Some(true),
+                ..Default::default()
+            },
+            approval: Default::default(),
+        };
+        let mut registry = OperationRegistry::new();
+        registry
+            .register(OperationDef {
+                name: "noop.test".into(),
+                safety: OperationSafety::Safe,
+                default_approval: ApprovalRequirement::Never,
+                default_factors: vec![],
+                description: "test".into(),
+                params_schema: None,
+                allowed_target_keys: vec![],
+                secret_ref_param_keys: vec![],
+            })
+            .unwrap();
+        let engine = PolicyEngine::with_rules(vec![rule]);
+
+        use opaque_core::identity::{PrincipalContext, PrincipalId, PrincipalKind};
+        let ctx = PrincipalContext {
+            sub: PrincipalId::generate(&PrincipalKind::Human {
+                iss: "https://idp.example.com".into(),
+                sub: "u".into(),
+                email: None,
+                name: None,
+            }),
+            sub_label: "u".into(),
+            sub_roles: Default::default(),
+            act: PrincipalId::generate(&PrincipalKind::Agent { tool: "x".into() }),
+            act_label: "agent:x".into(),
+            mode: AccessMode::Delegated,
+            jti: "j".into(),
+            human_session_id: None,
+        };
+
+        let mut req = OperationRequest {
+            principal: None,
+            request_id: Uuid::new_v4(),
+            client_identity: test_identity(),
+            client_type: ClientType::Agent,
+            operation: "noop.test".into(),
+            target: HashMap::new(),
+            secret_ref_names: vec![],
+            created_at: SystemTime::now(),
+            expires_at: None,
+            params: serde_json::Value::Null,
+            workspace: None,
+        };
+        // No principal → denied.
+        assert!(!engine.evaluate(&req, OperationSafety::Safe).allowed);
+        // With a verified principal → allowed.
+        req.principal = Some(ctx);
+        assert!(engine.evaluate(&req, OperationSafety::Safe).allowed);
+    }
+
+    #[tokio::test]
+    async fn delegation_list_gated_and_shaped() {
+        let (_d, state) = identity_state(false);
+        login_human(&state);
+        mint_delegated(&state).await;
+
+        let req = Request {
+            id: 1,
+            method: "identity.delegation_list".into(),
+            params: serde_json::Value::Null,
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
+        assert!(resp.error.is_none(), "unexpected: {:?}", resp.error);
+        let list = resp.result.unwrap();
+        let arr = list["delegations"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["mode"], "delegated");
+        assert_eq!(arr[0]["sub_label"], "dev@example.com");
+        assert!(arr[0]["jti"].is_string());
+    }
+
+    #[tokio::test]
+    async fn end_session_revokes_delegation() {
+        let (_d, state) = identity_state(false);
+        login_human(&state);
+        let (sid, _tok) = mint_delegated(&state).await;
+        let req = Request {
+            id: 1,
+            method: "agent_session_end".into(),
+            params: serde_json::json!({ "session_id": sid }),
+        };
+        let resp = handle_request(&state, req, &test_identity(), ClientType::Agent, None).await;
+        assert!(resp.error.is_none());
+        // The store row is now revoked.
+        let rec = state
+            .identity
+            .as_ref()
+            .unwrap()
+            .store
+            .get_delegation(&sid)
+            .unwrap()
+            .unwrap();
+        assert!(rec.revoked_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn legacy_hex_token_path_unchanged_without_identity() {
+        // No [identity] configured: minting yields a hex token, no principal.
+        let state = make_test_state();
+        let resp = start_session(&state, serde_json::json!({})).await;
+        assert!(resp.error.is_none());
+        let r = resp.result.unwrap();
+        let tok = r["session_token"].as_str().unwrap();
+        assert!(
+            !tok.starts_with("opqd1."),
+            "legacy path must use hex tokens"
+        );
+        assert!(r.get("mode").is_none(), "no delegation metadata expected");
     }
 }

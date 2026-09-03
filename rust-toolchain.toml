@@ -1,0 +1,5 @@
+[toolchain]
+# Pinned so fmt/clippy results are reproducible across dev boxes and CI.
+# Bump deliberately (fmt + clippy drift lands in the same commit as the bump).
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]

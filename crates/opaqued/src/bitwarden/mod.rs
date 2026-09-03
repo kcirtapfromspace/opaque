@@ -243,6 +243,7 @@ mod tests {
 
     fn make_request(operation: &str, params: serde_json::Value) -> OperationRequest {
         OperationRequest {
+            principal: None,
             request_id: uuid::Uuid::new_v4(),
             client_identity: ClientIdentity {
                 uid: 501,
@@ -298,6 +299,19 @@ mod tests {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// These tests share one process-global env var (OPAQUE_BITWARDEN_TOKEN_REF)
+    /// and cleanup_env() removes it — run in parallel, one test's cleanup can
+    /// race another's token resolution, which then falls back to the keychain
+    /// (absent in CI containers). Serialize them.
+    static ENV_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        match ENV_SERIAL.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
     /// Set up a handler pointing at a mock server with the access token
     /// provided via env var.
     async fn setup_handler_with_mock() -> (BitwardenHandler, MockServer, Arc<InMemoryAuditEmitter>)
@@ -321,7 +335,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: serialize env-var tests
     async fn list_projects_via_handler() {
+        let _env = env_guard();
         let (handler, mock_server, audit) = setup_handler_with_mock().await;
 
         Mock::given(method("GET"))
@@ -353,7 +369,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: serialize env-var tests
     async fn list_secrets_via_handler() {
+        let _env = env_guard();
         let (handler, mock_server, _audit) = setup_handler_with_mock().await;
 
         // Mock list_projects to resolve project name → ID
@@ -395,7 +413,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: serialize env-var tests
     async fn list_secrets_no_project_filter() {
+        let _env = env_guard();
         let (handler, mock_server, _audit) = setup_handler_with_mock().await;
 
         Mock::given(method("GET"))
@@ -418,7 +438,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: serialize env-var tests
     async fn list_projects_auth_failure() {
+        let _env = env_guard();
         let (handler, mock_server, _audit) = setup_handler_with_mock().await;
 
         Mock::given(method("GET"))
@@ -438,7 +460,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: serialize env-var tests
     async fn read_secret_via_handler() {
+        let _env = env_guard();
         let (handler, mock_server, audit) = setup_handler_with_mock().await;
 
         Mock::given(method("GET"))
@@ -471,7 +495,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: serialize env-var tests
     async fn read_secret_not_found() {
+        let _env = env_guard();
         let (handler, mock_server, _audit) = setup_handler_with_mock().await;
 
         Mock::given(method("GET"))
@@ -494,7 +520,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: serialize env-var tests
     async fn list_secrets_project_not_found() {
+        let _env = env_guard();
         let (handler, mock_server, _audit) = setup_handler_with_mock().await;
 
         // Project lookup returns empty list → project not found
