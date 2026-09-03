@@ -1,0 +1,800 @@
+/* ==========================================================================
+   Opaque — site design system
+   Archivo (300/400/700) + IBM Plex Mono, one amber "seal" accent,
+   graphite dark scheme / warm-neutral paper light scheme.
+   ========================================================================== */
+
+/* --------------------------------------------------------------------------
+   1. Tokens
+   -------------------------------------------------------------------------- */
+
+:root {
+  --op-radius: 8px;
+  --op-radius-sm: 5px;
+}
+
+[data-md-color-scheme="slate"] {
+  /* graphite ground, cold-neutral */
+  --md-hue: 212deg;
+  --md-default-bg-color: #0f1317;
+  --md-code-bg-color: #151a20;
+  --md-typeset-a-color: #d9a544;
+  --md-accent-fg-color: #e6bd68;
+  --md-primary-fg-color: #0f1317;
+  --md-primary-fg-color--light: #161b21;
+  --md-primary-fg-color--dark: #0b0e12;
+  --md-primary-bg-color: #dde3ea;
+  --md-primary-bg-color--light: #96a0ac;
+  --md-footer-bg-color: #0b0e12;
+  --md-footer-bg-color--dark: #080a0d;
+
+  --op-bg: #0f1317;
+  --op-bg-soft: #12161c;
+  --op-panel: #151a20;
+  --op-text: #dde3ea;
+  --op-text-dim: #949eaa;
+  --op-line: rgba(214, 224, 235, 0.11);
+  --op-line-strong: rgba(214, 224, 235, 0.24);
+  --op-accent: #d9a544;
+  --op-accent-soft: rgba(217, 165, 68, 0.14);
+  --op-btn-bg: #e6e9ec;
+  --op-btn-fg: #101419;
+  --op-redact-bg: #ebe3d0;
+  --op-redact-fg: #14171b;
+}
+
+[data-md-color-scheme="default"] {
+  /* paper ground, ink text */
+  --md-default-bg-color: #f7f6f2;
+  --md-default-fg-color: rgba(20, 24, 29, 0.92);
+  --md-default-fg-color--light: rgba(20, 24, 29, 0.62);
+  --md-default-fg-color--lighter: rgba(20, 24, 29, 0.36);
+  --md-default-fg-color--lightest: rgba(20, 24, 29, 0.08);
+  --md-code-bg-color: #edebe4;
+  --md-typeset-a-color: #7a5504;
+  --md-accent-fg-color: #9a6c05;
+  --md-primary-fg-color: #f7f6f2;
+  --md-primary-fg-color--light: #efede7;
+  --md-primary-fg-color--dark: #e6e3da;
+  --md-primary-bg-color: #14181d;
+  --md-primary-bg-color--light: rgba(20, 24, 29, 0.56);
+
+  --op-bg: #f7f6f2;
+  --op-bg-soft: #f1efe9;
+  --op-panel: #fbfaf7;
+  --op-text: #191d22;
+  --op-text-dim: #5c6470;
+  --op-line: rgba(25, 29, 34, 0.13);
+  --op-line-strong: rgba(25, 29, 34, 0.3);
+  --op-accent: #7a5504;
+  --op-accent-soft: rgba(154, 108, 5, 0.12);
+  --op-btn-bg: #191d22;
+  --op-btn-fg: #f5f4ef;
+  --op-redact-bg: #16181c;
+  --op-redact-fg: #f3efe4;
+}
+
+/* --------------------------------------------------------------------------
+   2. Chrome: header, tabs, footer
+   -------------------------------------------------------------------------- */
+
+.md-header {
+  box-shadow: none;
+  border-bottom: 1px solid var(--op-line);
+}
+
+.md-header--shadow {
+  box-shadow: none;
+}
+
+.md-header__topic .md-ellipsis {
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.md-tabs {
+  border-bottom: 1px solid var(--op-line);
+}
+
+.md-tabs__link {
+  font-size: 0.72rem;
+  margin-top: 0.63rem;
+}
+
+.md-tabs__link--active {
+  font-weight: 700;
+}
+
+[data-md-color-scheme="default"] .md-search__form {
+  background-color: rgba(20, 24, 29, 0.05);
+}
+
+[data-md-color-scheme="default"] .md-search__form:hover {
+  background-color: rgba(20, 24, 29, 0.09);
+}
+
+[data-md-color-scheme="default"] .md-search__input::placeholder {
+  color: rgba(20, 24, 29, 0.45);
+}
+
+/* --------------------------------------------------------------------------
+   3. Docs typography + content polish
+   -------------------------------------------------------------------------- */
+
+.md-typeset h1,
+.md-typeset h2 {
+  font-weight: 700;
+  letter-spacing: -0.015em;
+  color: var(--op-text);
+}
+
+.md-typeset h3,
+.md-typeset h4 {
+  font-weight: 700;
+  letter-spacing: -0.005em;
+}
+
+.md-typeset code {
+  border-radius: 3px;
+  font-size: 0.82em;
+}
+
+.md-typeset pre > code {
+  border-radius: var(--op-radius);
+}
+
+.md-typeset .highlight > pre > code,
+.md-typeset > pre > code {
+  border: 1px solid var(--op-line);
+}
+
+.md-typeset table:not([class]) {
+  border: 1px solid var(--op-line);
+  border-radius: var(--op-radius-sm);
+  font-size: 0.72rem;
+}
+
+.md-typeset table:not([class]) th {
+  font-weight: 700;
+}
+
+.md-typeset .admonition,
+.md-typeset details {
+  border-radius: var(--op-radius-sm);
+  font-size: 0.72rem;
+}
+
+/* docs "grid cards": quiet hairlines, no shadow theatre */
+.md-typeset .grid.cards > ol > li,
+.md-typeset .grid.cards > ul > li {
+  border: 1px solid var(--op-line);
+  border-radius: var(--op-radius);
+  box-shadow: none;
+  transition: border-color 125ms ease;
+}
+
+.md-typeset .grid.cards > ol > li:hover,
+.md-typeset .grid.cards > ul > li:hover {
+  border-color: var(--op-line-strong);
+  box-shadow: none;
+}
+
+/* ==========================================================================
+   4. Landing page (docs/overrides/home.html) — all classes prefixed .op-
+   ========================================================================== */
+
+.op-home {
+  background: var(--op-bg);
+  color: var(--op-text);
+  font-size: 16px;
+  line-height: 1.6;
+}
+
+.op-home section {
+  border-top: 1px solid var(--op-line);
+  padding: clamp(3.25rem, 7vw, 5.25rem) 0;
+}
+
+.op-home section:first-child {
+  border-top: none;
+}
+
+.op-wrap {
+  max-width: 64rem;
+  margin: 0 auto;
+  padding: 0 1.25rem;
+}
+
+.op-home h1,
+.op-home h2,
+.op-home h3 {
+  margin: 0;
+  color: var(--op-text);
+}
+
+.op-home p {
+  margin: 0;
+}
+
+.op-home a {
+  color: inherit;
+}
+
+.op-kicker {
+  max-width: 44rem;
+  margin-bottom: 2.75rem;
+}
+
+.op-kicker h2 {
+  font-size: clamp(1.45rem, 2.6vw, 1.8rem);
+  font-weight: 700;
+  letter-spacing: -0.015em;
+  line-height: 1.15;
+}
+
+.op-kicker p {
+  margin-top: 0.8rem;
+  color: var(--op-text-dim);
+  font-size: 0.99rem;
+}
+
+.op-kicker code,
+.op-home p code {
+  font-family: var(--md-code-font-family);
+  font-size: 0.85em;
+  background: var(--op-bg-soft);
+  border: 1px solid var(--op-line);
+  border-radius: 3px;
+  padding: 0.08em 0.32em;
+}
+
+/* ---- Hero ---------------------------------------------------------------- */
+
+.op-hero {
+  padding-top: clamp(3.5rem, 8vw, 6rem);
+}
+
+.op-hero__grid {
+  display: grid;
+  grid-template-columns: minmax(0, 7fr) minmax(0, 5fr);
+  gap: 3.25rem;
+  align-items: center;
+}
+
+.op-hero h1 {
+  font-size: clamp(1.9rem, 5.2vw + 1rem, 3.55rem);
+  font-weight: 700;
+  letter-spacing: -0.022em;
+  line-height: 1.06;
+}
+
+.op-redact {
+  padding: 0.02em 0.16em;
+  margin-left: -0.16em;
+  background: var(--op-redact-bg);
+  color: var(--op-redact-fg);
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+  animation: op-sweep 0.65s cubic-bezier(0.77, 0, 0.18, 1) 0.3s both;
+}
+
+@keyframes op-sweep {
+  from {
+    clip-path: inset(0 100% 0 0);
+  }
+  to {
+    clip-path: inset(0 0 0 0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .op-redact {
+    animation: none;
+  }
+}
+
+.op-hero__lede {
+  margin-top: 1.4rem;
+  max-width: 34rem;
+  font-size: 1.04rem;
+  color: var(--op-text-dim);
+}
+
+.op-hero__lede strong {
+  color: var(--op-text);
+  font-weight: 700;
+}
+
+.op-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.7rem;
+  margin-top: 1.9rem;
+}
+
+.op-home .op-btn {
+  display: inline-block;
+  padding: 0.56rem 1.1rem;
+  border: 1px solid var(--op-line-strong);
+  border-radius: 6px;
+  font-size: 0.86rem;
+  font-weight: 700;
+  letter-spacing: 0.005em;
+  color: var(--op-text);
+  text-decoration: none;
+  transition: border-color 125ms ease, background-color 125ms ease;
+}
+
+.op-home .op-btn:hover {
+  border-color: var(--op-accent);
+  color: var(--op-text);
+}
+
+.op-home .op-btn--solid {
+  background: var(--op-btn-bg);
+  border-color: var(--op-btn-bg);
+  color: var(--op-btn-fg);
+}
+
+.op-home .op-btn--solid:hover {
+  border-color: var(--op-btn-bg);
+  color: var(--op-btn-fg);
+  opacity: 0.88;
+}
+
+.op-btn:focus-visible,
+.op-copy:focus-visible,
+.op-home a:focus-visible {
+  outline: 2px solid var(--op-accent);
+  outline-offset: 2px;
+}
+
+.op-meta {
+  margin-top: 1.15rem;
+  font-size: 0.8rem;
+  color: var(--op-text-dim);
+}
+
+.op-install-line {
+  display: inline-flex;
+  align-items: stretch;
+  max-width: 100%;
+  margin-top: 1.9rem;
+  border: 1px solid var(--op-line);
+  border-radius: 6px;
+  background: var(--op-bg-soft);
+  overflow: hidden;
+}
+
+.op-install-line > code {
+  padding: 0.6rem 0.9rem;
+  font-family: var(--md-code-font-family);
+  font-size: 0.8rem;
+  white-space: nowrap;
+  overflow-x: auto;
+  color: var(--op-text);
+}
+
+.op-copy {
+  flex: none;
+  padding: 0 0.85rem;
+  border: none;
+  border-left: 1px solid var(--op-line);
+  background: transparent;
+  color: var(--op-text-dim);
+  font-family: var(--md-text-font-family);
+  font-size: 0.72rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: color 125ms ease;
+}
+
+.op-copy:hover {
+  color: var(--op-accent);
+}
+
+.op-copy[data-copied] {
+  color: var(--op-accent);
+}
+
+/* ---- Terminal ------------------------------------------------------------ */
+
+.op-terminal {
+  margin: 0;
+  border: 1px solid var(--op-line-strong);
+  border-radius: var(--op-radius);
+  background: #14171c;
+  box-shadow: 0 18px 44px -28px rgba(4, 6, 9, 0.7);
+  overflow: hidden;
+}
+
+[data-md-color-scheme="default"] .op-terminal {
+  border-color: rgba(25, 29, 34, 0.45);
+  box-shadow: 0 20px 44px -30px rgba(25, 29, 34, 0.55);
+}
+
+.op-terminal__bar {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.55rem 0.9rem;
+  border-bottom: 1px solid rgba(222, 228, 236, 0.1);
+  color: #808a96;
+  font-family: var(--md-code-font-family);
+  font-size: 0.68rem;
+}
+
+.op-terminal__bar i {
+  width: 0.55rem;
+  height: 0.55rem;
+  border: 1px solid #4a545f;
+  border-radius: 50%;
+}
+
+.op-terminal pre {
+  margin: 0;
+  padding: 1rem 1.1rem 1.15rem;
+  overflow-x: auto;
+  font-family: var(--md-code-font-family);
+  font-size: 0.72rem;
+  line-height: 1.75;
+  color: #b8c1cb;
+}
+
+.op-terminal .t-cmd {
+  color: #e8ecf1;
+}
+
+.op-terminal .t-dim {
+  color: #6b7581;
+}
+
+.op-terminal .t-stage {
+  color: #d9a544;
+}
+
+.op-terminal .t-ok {
+  color: #9dc98a;
+}
+
+.op-terminal .t-mask {
+  color: #39404a;
+  letter-spacing: -0.06em;
+}
+
+/* ---- Pipeline rail ------------------------------------------------------- */
+
+.op-rail {
+  list-style: none;
+  counter-reset: gate;
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 1.6rem;
+  position: relative;
+  margin: 0;
+  padding: 0;
+}
+
+.op-rail::before {
+  content: "";
+  position: absolute;
+  top: 0.28rem;
+  left: 0.3rem;
+  right: 18%;
+  height: 1px;
+  background: var(--op-line-strong);
+}
+
+.op-rail li {
+  counter-increment: gate;
+  margin: 0;
+  padding: 0;
+  position: relative;
+}
+
+.op-rail li::before {
+  content: "";
+  display: block;
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 2px;
+  background: var(--op-accent);
+  margin-bottom: 1.1rem;
+  position: relative;
+  z-index: 1;
+  box-shadow: 0 0 0 4px var(--op-bg);
+}
+
+.op-rail h3 {
+  font-size: 1rem;
+  font-weight: 700;
+  letter-spacing: -0.005em;
+}
+
+.op-rail h3::before {
+  content: counter(gate);
+  font-family: var(--md-code-font-family);
+  font-weight: 400;
+  font-size: 0.72rem;
+  color: var(--op-text-dim);
+  margin-right: 0.5rem;
+}
+
+.op-rail p {
+  margin-top: 0.5rem;
+  font-size: 0.83rem;
+  line-height: 1.55;
+  color: var(--op-text-dim);
+}
+
+/* ---- Feature grid -------------------------------------------------------- */
+
+.op-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
+  background: var(--op-line);
+  border: 1px solid var(--op-line);
+  border-radius: var(--op-radius);
+  overflow: hidden;
+}
+
+.op-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+  padding: 1.5rem 1.5rem 1.25rem;
+  background: var(--op-bg);
+  transition: background-color 125ms ease;
+}
+
+.op-cell:hover {
+  background: var(--op-bg-soft);
+}
+
+.op-cell h3 {
+  font-size: 1.02rem;
+  font-weight: 700;
+  letter-spacing: -0.005em;
+}
+
+.op-cell p {
+  font-size: 0.86rem;
+  line-height: 1.55;
+  color: var(--op-text-dim);
+}
+
+.op-cell samp {
+  display: block;
+  margin-top: auto;
+  padding-top: 0.9rem;
+  border-top: 1px solid var(--op-line);
+  font-family: var(--md-code-font-family);
+  font-size: 0.69rem;
+  line-height: 1.5;
+  color: var(--op-accent);
+  overflow-wrap: break-word;
+}
+
+/* ---- Two trust configurations -------------------------------------------- */
+
+.op-modes {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1px;
+  background: var(--op-line);
+  border: 1px solid var(--op-line);
+  border-radius: var(--op-radius);
+  overflow: hidden;
+}
+
+.op-mode {
+  padding: 1.6rem 1.7rem 1.4rem;
+  background: var(--op-bg);
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+}
+
+.op-mode--split {
+  background: var(--op-bg-soft);
+}
+
+.op-mode h3 {
+  font-size: 1.05rem;
+  font-weight: 700;
+}
+
+.op-mode h3 small {
+  display: block;
+  margin-top: 0.2rem;
+  font-size: 0.74rem;
+  font-weight: 400;
+  color: var(--op-accent);
+}
+
+.op-mode p {
+  font-size: 0.88rem;
+  line-height: 1.6;
+  color: var(--op-text-dim);
+}
+
+.op-mode samp {
+  margin-top: auto;
+  padding-top: 1rem;
+  font-family: var(--md-code-font-family);
+  font-size: 0.7rem;
+  line-height: 1.5;
+  color: var(--op-text-dim);
+  overflow-wrap: break-word;
+}
+
+.op-modes-note {
+  margin-top: 1.1rem;
+  max-width: 46rem;
+  font-size: 0.82rem;
+  color: var(--op-text-dim);
+}
+
+/* ---- Providers ----------------------------------------------------------- */
+
+.op-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.op-chips li {
+  margin: 0;
+  padding: 0.42rem 0.85rem;
+  border: 1px solid var(--op-line-strong);
+  border-radius: 999px;
+  font-size: 0.82rem;
+  color: var(--op-text);
+}
+
+.op-clients {
+  margin-top: 1.6rem;
+  max-width: 46rem;
+  font-size: 0.92rem;
+  color: var(--op-text-dim);
+}
+
+/* ---- Install ------------------------------------------------------------- */
+
+.op-install {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1.25rem;
+}
+
+.op-install__item h3 {
+  font-size: 0.88rem;
+  font-weight: 700;
+  margin-bottom: 0.65rem;
+}
+
+.op-install__code {
+  display: flex;
+  align-items: stretch;
+  border: 1px solid var(--op-line);
+  border-radius: 6px;
+  background: var(--op-bg-soft);
+  overflow: hidden;
+}
+
+.op-install__code > code {
+  flex: 1;
+  padding: 0.7rem 0.85rem;
+  font-family: var(--md-code-font-family);
+  font-size: 0.72rem;
+  line-height: 1.5;
+  white-space: pre;
+  overflow-x: auto;
+  color: var(--op-text);
+}
+
+.op-install-notes {
+  margin-top: 2rem;
+  max-width: 50rem;
+  font-size: 0.86rem;
+  line-height: 1.65;
+  color: var(--op-text-dim);
+}
+
+.op-install-notes + .op-install-notes {
+  margin-top: 0.6rem;
+}
+
+/* ---- Docs index ---------------------------------------------------------- */
+
+.op-docs {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0 2.5rem;
+}
+
+.op-docs a {
+  display: block;
+  padding: 1.05rem 0.15rem;
+  border-top: 1px solid var(--op-line);
+  text-decoration: none;
+  transition: border-color 125ms ease;
+}
+
+.op-docs a:hover {
+  border-top-color: var(--op-accent);
+}
+
+.op-docs a:hover h3 {
+  color: var(--op-accent);
+}
+
+.op-docs h3 {
+  font-size: 0.94rem;
+  font-weight: 700;
+  transition: color 125ms ease;
+}
+
+.op-docs p {
+  margin-top: 0.3rem;
+  font-size: 0.8rem;
+  line-height: 1.5;
+  color: var(--op-text-dim);
+}
+
+/* ---- Responsive ---------------------------------------------------------- */
+
+@media screen and (max-width: 76.1875em) {
+  .op-hero__grid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2.5rem;
+  }
+
+  .op-terminal {
+    max-width: 38rem;
+  }
+
+  .op-rail {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 2rem 2.5rem;
+  }
+
+  .op-rail::before {
+    display: none;
+  }
+
+  .op-rail li::before {
+    box-shadow: none;
+  }
+
+  .op-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .op-docs {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media screen and (max-width: 44.9375em) {
+  .op-rail,
+  .op-grid,
+  .op-modes,
+  .op-install,
+  .op-docs {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .op-install-line {
+    display: flex;
+  }
+
+  .op-home section {
+    padding: 2.75rem 0;
+  }
+}
