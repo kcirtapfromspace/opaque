@@ -5,6 +5,8 @@
 ![Release](https://img.shields.io/github/v/release/kcirtapfromspace/opaque)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-blue)
 
+### Secrets stay ███████. Agents stay powerful.
+
 Local approval-gated secrets broker for AI coding tools (Codex, Claude Code, etc) that must not disclose plaintext secrets to LLM context.
 
 ## What It Does

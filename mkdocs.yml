@@ -1,5 +1,5 @@
 site_name: Opaque
-site_description: Approval-gated secrets broker for AI coding tools
+site_description: Secrets stay secret. Agents stay powerful. A local, approval-gated secrets broker for AI coding tools.
 site_url: https://kcirtapfromspace.github.io/opaque/
 repo_url: https://github.com/kcirtapfromspace/opaque
 repo_name: kcirtapfromspace/opaque

@@ -205,14 +205,18 @@
   padding: 0 1.25rem;
 }
 
-.op-home h1,
-.op-home h2,
-.op-home h3 {
+/* Element resets, wrapped in :where() so they carry zero specificity and every
+   component class below beats them. Written as plain `.op-home p`, this reset
+   silently ate the margin-top of every single-class paragraph rule on the
+   page — the hero lede among them. */
+:where(.op-home) h1,
+:where(.op-home) h2,
+:where(.op-home) h3 {
   margin: 0;
   color: var(--op-text);
 }
 
-.op-home p {
+:where(.op-home) p {
   margin: 0;
 }
 
@@ -261,13 +265,22 @@
   align-items: center;
 }
 
+.op-hero__copy {
+  container-type: inline-size;
+}
+
 .op-hero h1 {
-  font-size: clamp(1.9rem, 5.2vw + 1rem, 3.55rem);
+  /* Viewport-sized fallback first; the slogan is two deliberate lines, so
+     where container queries exist the type follows its own column and the
+     break never lands mid-sentence. */
+  font-size: clamp(1.9rem, 5.2vw + 1rem, 3.05rem);
+  font-size: clamp(1.45rem, 9.2cqi, 3.2rem);
   font-weight: 700;
-  letter-spacing: -0.022em;
+  letter-spacing: -0.028em;
   line-height: 1.06;
 }
 
+/* Highlight treatment: the word stays readable, on a redaction ground. */
 .op-redact {
   padding: 0.02em 0.16em;
   margin-left: -0.16em;
@@ -276,6 +289,28 @@
   -webkit-box-decoration-break: clone;
   box-decoration-break: clone;
   animation: op-sweep 0.65s cubic-bezier(0.77, 0, 0.18, 1) 0.3s both;
+}
+
+/* True redaction: the word is in the document — screen readers and search
+   engines read "Secrets stay secret" — and a bar wipes across and covers it,
+   which is the product's own promise performed in one gesture. Without motion
+   the bar is simply there from the start. */
+.op-redacted {
+  position: relative;
+  display: inline-block;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.op-redacted::after {
+  content: "";
+  position: absolute;
+  /* Hug the word: a bar the height of the line box reads as missing content,
+     one that hugs cap height reads as struck through by a censor. */
+  inset: 0.1em -0.12em 0.14em -0.12em;
+  border-radius: 2px;
+  background: var(--op-redact-bg);
+  animation: op-sweep 0.55s cubic-bezier(0.77, 0, 0.18, 1) 0.5s both;
 }
 
 @keyframes op-sweep {
@@ -288,13 +323,14 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .op-redact {
+  .op-redact,
+  .op-redacted::after {
     animation: none;
   }
 }
 
 .op-hero__lede {
-  margin-top: 1.4rem;
+  margin-top: 1.75rem;
   max-width: 34rem;
   font-size: 1.04rem;
   color: var(--op-text-dim);
