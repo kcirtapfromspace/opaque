@@ -698,6 +698,16 @@ fn default_level_for_kind(kind: AuditEventKind) -> AuditLevel {
 pub trait AuditSink: Send + Sync + fmt::Debug {
     /// Emit an audit event. Must not block the caller.
     fn emit(&self, event: AuditEvent);
+
+    /// Block until previously emitted events are durably recorded.
+    ///
+    /// Emission is asynchronous, so a process that exits immediately after
+    /// recording a security-relevant event (a refused policy bundle, a
+    /// fail-closed startup) would otherwise lose it: `std::process::exit`
+    /// runs no destructors, and the writer thread dies mid-flight. Call this
+    /// before any deliberate exit that follows an `emit`. Default: no-op for
+    /// sinks that write synchronously.
+    fn flush(&self, _timeout: std::time::Duration) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -1280,6 +1290,10 @@ const RETENTION_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::fro
 pub struct SqliteAuditSink {
     sender: std::sync::mpsc::SyncSender<AuditEvent>,
     next_sequence: AtomicU64,
+    /// Events accepted into the channel — the target `flush` waits for.
+    accepted: AtomicU64,
+    /// Events committed by the writer, with a condvar so `flush` can wait.
+    committed: std::sync::Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
     /// Counter of events dropped due to channel backpressure.
     dropped_count: std::sync::Arc<AtomicU64>,
     writer_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -1318,8 +1332,22 @@ impl SqliteAuditSink {
         retention_days: u64,
         capacity: usize,
     ) -> Result<Self, AuditError> {
-        // Ensure parent directory exists.
+        // Ensure parent directory exists, owner-only. `create_dir_all` uses
+        // the process umask (0755 typically); the audit database's directory
+        // is custody material, and on a fresh state dir the daemon's custody
+        // pass has already run by the time we get here.
         if let Some(parent) = db_path.parent() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                if !parent.exists() {
+                    std::fs::DirBuilder::new()
+                        .recursive(true)
+                        .mode(0o700)
+                        .create(parent)?;
+                }
+            }
+            #[cfg(not(unix))]
             std::fs::create_dir_all(parent)?;
         }
 
@@ -1428,6 +1456,10 @@ impl SqliteAuditSink {
             std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let writer_pause_clone = writer_pause.clone();
 
+        let committed =
+            std::sync::Arc::new((std::sync::Mutex::new(0u64), std::sync::Condvar::new()));
+        let writer_committed = committed.clone();
+
         let writer_path = db_path.clone();
         let writer_key = hmac_key;
         let writer_handle = std::thread::Builder::new()
@@ -1439,6 +1471,7 @@ impl SqliteAuditSink {
                     &writer_pause_clone,
                     retention_days,
                     writer_key,
+                    &writer_committed,
                 );
             })
             .map_err(|e| AuditError::Other(format!("failed to spawn writer thread: {e}")))?;
@@ -1462,6 +1495,8 @@ impl SqliteAuditSink {
         Ok(Self {
             sender,
             next_sequence: AtomicU64::new(next_sequence),
+            accepted: AtomicU64::new(0),
+            committed,
             dropped_count,
             writer_handle: std::sync::Mutex::new(Some(writer_handle)),
             drop_monitor_handle: std::sync::Mutex::new(Some(drop_monitor_handle)),
@@ -1558,6 +1593,7 @@ impl SqliteAuditSink {
         pause: &std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
         retention_days: u64,
         key: [u8; 32],
+        committed: &std::sync::Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
     ) {
         let conn = match rusqlite::Connection::open(db_path) {
             Ok(c) => c,
@@ -1609,6 +1645,14 @@ impl SqliteAuditSink {
 
                     if let Err(e) = Self::insert_batch(&conn, &batch, &key, &mut last_hash) {
                         tracing::error!("audit writer insert failed: {e}");
+                    }
+                    // Count the batch as settled either way: a failed insert
+                    // is reported above and must not wedge `flush` forever.
+                    {
+                        let (lock, cvar) = &**committed;
+                        let mut done = lock.lock().unwrap_or_else(|p| p.into_inner());
+                        *done += batch.len() as u64;
+                        cvar.notify_all();
                     }
                     batch.clear();
                 }
@@ -1819,14 +1863,45 @@ impl AuditSink for SqliteAuditSink {
         }
         // Non-blocking send. If the channel is full, increment the dropped
         // counter and log a warning with the event kind.
-        if let Err(std::sync::mpsc::TrySendError::Full(dropped_event)) = self.sender.try_send(event)
-        {
-            let prev = self.dropped_count.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(
-                kind = %dropped_event.kind,
-                dropped_total = prev + 1,
-                "audit event dropped due to channel backpressure"
-            );
+        match self.sender.try_send(event) {
+            Ok(()) => {
+                self.accepted.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(std::sync::mpsc::TrySendError::Full(dropped_event)) => {
+                let prev = self.dropped_count.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    kind = %dropped_event.kind,
+                    dropped_total = prev + 1,
+                    "audit event dropped due to channel backpressure"
+                );
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
+        }
+    }
+
+    /// Block until every accepted event has been committed (or `timeout`).
+    fn flush(&self, timeout: std::time::Duration) {
+        let target = self.accepted.load(Ordering::Relaxed);
+        let deadline = std::time::Instant::now() + timeout;
+        let (lock, cvar) = &*self.committed;
+        let mut done = lock.lock().unwrap_or_else(|p| p.into_inner());
+        while *done < target {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                tracing::warn!(
+                    committed = *done,
+                    accepted = target,
+                    "audit flush timed out; some events may not be durable"
+                );
+                return;
+            }
+            let (guard, result) = cvar
+                .wait_timeout(done, remaining)
+                .unwrap_or_else(|p| p.into_inner());
+            done = guard;
+            if result.timed_out() && *done < target {
+                continue;
+            }
         }
     }
 }
@@ -2085,6 +2160,12 @@ impl AuditSink for MultiAuditSink {
     fn emit(&self, event: AuditEvent) {
         for sink in &self.sinks {
             sink.emit(event.clone());
+        }
+    }
+
+    fn flush(&self, timeout: std::time::Duration) {
+        for sink in &self.sinks {
+            sink.flush(timeout);
         }
     }
 }
@@ -2679,6 +2760,37 @@ mod tests {
                 );
             }
         }
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(hmac_key_path(&db_path));
+    }
+
+    #[test]
+    fn flush_makes_emitted_events_durable_before_exit() {
+        // REGRESSION (found by the federation e2e on Linux): a daemon that
+        // records a security-relevant refusal and then exits lost the event,
+        // because emission is asynchronous and process exit runs no
+        // destructors. flush() must make it durable without dropping.
+        let db_path = temp_db_path();
+        let sink = SqliteAuditSink::new(db_path.clone(), 90).unwrap();
+        sink.emit(
+            make_test_event(AuditEventKind::FederationBundleRejected)
+                .with_outcome("rollback_refused"),
+        );
+        sink.flush(std::time::Duration::from_secs(5));
+
+        // Read with a SEPARATE connection while the sink is still alive.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let outcome: String = conn
+            .query_row(
+                "SELECT outcome FROM audit_events WHERE kind = 'federation.bundle_rejected'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("flushed event must be readable before the sink is dropped");
+        assert_eq!(outcome, "rollback_refused");
+        drop(conn);
+        drop(sink);
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(hmac_key_path(&db_path));

@@ -664,6 +664,23 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
     }
 
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+
+    // Materialize the state directory owner-only BEFORE verifying custody:
+    // otherwise a fresh install has nothing to check here, and whichever
+    // subsystem creates it later does so with the process umask (0755) —
+    // leaving the custody root group/world-traversable until the next
+    // restart, which is exactly the window enforcement is meant to close.
+    {
+        let state_dir = home.join(".opaque");
+        if !state_dir.exists() {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&state_dir)?;
+        }
+    }
+
     let custody_violations = trust_domain::startup_custody_check(td.enforce, &home, &config_path)?;
 
     // Check if --allow-unsealed was passed on the command line.
@@ -1780,6 +1797,10 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         match applier.load_and_apply(fed, true).await {
             Ok(()) => {}
             Err(e) if fed.require_bundle => {
+                // The rejection was just audited; emission is asynchronous and
+                // the process is about to exit without running destructors, so
+                // make the security event durable before leaving.
+                audit.flush(std::time::Duration::from_secs(5));
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     format!(

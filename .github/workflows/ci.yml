@@ -70,6 +70,13 @@ jobs:
       - name: Trust-domain split e2e (real daemon, two uids, signed approver)
         run: ./scripts/linux-harness.sh e2e-split
 
+      - name: Federation e2e (signed bundles, chain-verifiable export, attestation)
+        # Not root-gated, but pinned here so a rename can't drop it silently:
+        # the grep fails the step if the suite stops running.
+        run: |
+          cargo test -p opaqued --test federation_e2e 2>&1 | tee /tmp/fed-e2e.out
+          grep -q "test result: ok. 3 passed" /tmp/fed-e2e.out
+
   supply-chain:
     runs-on: ubuntu-latest
     steps:

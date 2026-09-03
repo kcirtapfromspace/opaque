@@ -47,6 +47,32 @@ second_device = true
 fido2 = true
 # fido2_rp_id = "opaque.local"
 
+[federation]
+# Central signed policy. Trust comes from the signature, not the channel —
+# any static host, object store, or git raw URL works. Sign bundles with
+# `opaque bundle sign`; the anchor below is the public half of that key.
+# trust_anchors = ["<hex org public key>"]
+# bundle_url = "https://policy.example.com/opaque/policy.bundle"
+# bundle_path = "/etc/opaque/policy.bundle"   # offline fallback
+# require_bundle = true                       # refuse to start without policy
+# refresh_secs = 300
+
+[export]
+# Stream the tamper-evident chain to your SIEM. Exported records carry their
+# sequence number and record hash, so the stream stays verifiable against the
+# database. Each transport keeps its own cursor.
+# spool_path = "/var/log/opaque/audit.jsonl"
+# webhook_url = "https://siem.example.com/ingest"
+# syslog_addr = "tls://siem.example.com:6514"
+# syslog_ca_file = "/etc/opaque/siem-ca.pem"
+
+[attestation]
+# Periodic custody + chain re-verification, recorded in the audit chain.
+interval_secs = 900
+# Verify-before-trust: prove posture to this verifier before it releases
+# custody key material (the KMS / SPIRE seam).
+# key_release_url = "https://kms.example.com/opaque"
+
 [identity]
 # Identity is what makes cross-uid clients attributable — strongly recommended
 # alongside the split. See docs/identity.md.
