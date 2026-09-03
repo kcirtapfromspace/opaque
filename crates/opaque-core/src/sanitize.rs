@@ -436,6 +436,15 @@ fn is_secret_field_name(name: &str) -> bool {
         "client_secret",
     ];
 
+    // A `*_name` field identifies a secret; it does not carry one. Redacting
+    // it turned every provider confirmation into "Set [REDACTED] on acme/repo",
+    // hiding the one detail the operator needs to check. Content-based
+    // redaction still applies to the value, so a name that looks like a secret
+    // is still caught.
+    if name == "name" || name.ends_with("_name") {
+        return false;
+    }
+
     SECRET_FIELD_NAMES.iter().any(|s| name.contains(s))
 }
 
@@ -756,6 +765,23 @@ mod tests {
         assert!(!is_secret_field_name("repo"));
         assert!(!is_secret_field_name("id"));
         assert!(!is_secret_field_name("description"));
+    }
+
+    #[test]
+    fn name_fields_identify_rather_than_carry() {
+        // Every provider echoes the secret's NAME back so the operator can see
+        // what was written; redacting it made the confirmation meaningless.
+        assert!(!is_secret_field_name("secret_name"));
+        assert!(!is_secret_field_name("token_name"));
+        assert!(!is_secret_field_name("parameter_name"));
+        // The value under a name field is still scrubbed by content.
+        let sanitizer = Sanitizer::new();
+        let out = sanitizer.sanitize_value(&serde_json::json!({
+            "secret_name": "TUTORIAL_KEY",
+            "value": "AKIAIOSFODNN7EXAMPLE",
+        }));
+        assert_eq!(out["secret_name"], serde_json::json!("TUTORIAL_KEY"));
+        assert_eq!(out["value"], serde_json::json!("[REDACTED]"));
     }
 
     #[test]

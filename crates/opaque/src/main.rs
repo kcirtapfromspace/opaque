@@ -3357,7 +3357,9 @@ fn run_audit_tail(
     for event in &events {
         let relative = format_relative_time(event.ts_utc_ms);
         let absolute = chrono_format_ms(event.ts_utc_ms);
-        let when = format!("{}\n{}", relative, style(absolute).dim());
+        // One line per cell: the table measures a cell's full width, so an
+        // embedded newline both over-widened this column and split every row.
+        let when = format!("{}  {}", relative, style(absolute).dim());
 
         let kind = event.kind.to_string();
 

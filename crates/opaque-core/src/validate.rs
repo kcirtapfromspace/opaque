@@ -163,7 +163,7 @@ impl InputValidator {
         Ok(validated)
     }
 
-    /// Validate secret ref names: max 32 entries, each `[A-Za-z0-9_./-]` max
+    /// Validate secret ref names: max 32 entries, each `[A-Za-z0-9_.:/-]` max
     /// 128 chars. Reject if any name matches secret patterns (a value, not a
     /// name).
     pub fn validate_secret_ref_names(names: &[String]) -> Result<Vec<String>, ValidationError> {
@@ -187,11 +187,26 @@ impl InputValidator {
                 });
             }
 
-            // Allowed charset: A-Z, a-z, 0-9, _, ., /, -
-            if !name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '/' || c == '-')
-            {
+            // Refs carry a scheme ("keychain:opaque/github-pat"), and the daemon
+            // requires that prefix on every value_ref before calling this. Strip
+            // a known scheme so the checks below see the ref's own body: the
+            // charset excluded ':' and rejected every well-formed ref, and
+            // "onepassword:" reads to the secret detector as `password:<value>`.
+            let body = crate::profile::ALLOWED_REF_SCHEMES
+                .iter()
+                .find_map(|scheme| name.strip_prefix(scheme))
+                .unwrap_or(name.as_str());
+
+            // Allowed charset: A-Z, a-z, 0-9, _, ., /, -, : — a colon separates
+            // segments within a ref body (`profile:prod:AWS_KEY`).
+            if !body.chars().all(|c| {
+                c.is_ascii_alphanumeric()
+                    || c == '_'
+                    || c == '.'
+                    || c == '/'
+                    || c == '-'
+                    || c == ':'
+            }) {
                 return Err(ValidationError::InvalidCharset {
                     field: "secret_ref_name".into(),
                     value: name.clone(),
@@ -199,7 +214,7 @@ impl InputValidator {
             }
 
             // Reject if the "name" looks like a secret value.
-            if patterns.contains_secret(name) {
+            if patterns.contains_secret(body) {
                 return Err(ValidationError::SecretDetected {
                     field: "secret_ref_name".into(),
                 });
@@ -379,6 +394,45 @@ mod tests {
         ]);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 3);
+    }
+
+    #[test]
+    fn validate_secret_ref_accepts_every_scheme_prefix() {
+        // Regression: the charset excluded ':', so every scheme-prefixed ref —
+        // the only shape the daemon accepts for a value_ref — failed as
+        // bad_request, taking the github/gitlab/1Password/Bitwarden handlers
+        // with it.
+        let refs: Vec<String> = crate::profile::ALLOWED_REF_SCHEMES
+            .iter()
+            .map(|scheme| format!("{scheme}opaque/tutorial-value"))
+            .collect();
+        let result = InputValidator::validate_secret_ref_names(&refs);
+        assert!(result.is_ok(), "scheme-prefixed refs rejected: {result:?}");
+        assert_eq!(result.unwrap().len(), refs.len());
+    }
+
+    #[test]
+    fn validate_secret_ref_accepts_real_provider_refs() {
+        let result = InputValidator::validate_secret_ref_names(&[
+            "keychain:opaque/github-pat".into(),
+            "onepassword:Private/GitHub/token".into(),
+            "profile:prod:AWS_KEY".into(),
+            "vault:secret/data/db".into(),
+            "bitwarden:9f8c2e11-4a3b-4d55-9c1e-77b0a1d2e3f4".into(),
+        ]);
+        assert!(result.is_ok(), "provider refs rejected: {result:?}");
+    }
+
+    #[test]
+    fn validate_secret_ref_still_rejects_control_chars() {
+        let result =
+            InputValidator::validate_secret_ref_names(&["keychain:opaque/pat\nInjected".into()]);
+        match result.unwrap_err() {
+            ValidationError::InvalidCharset { field, .. } => {
+                assert_eq!(field, "secret_ref_name");
+            }
+            other => panic!("expected InvalidCharset, got {other}"),
+        }
     }
 
     #[test]

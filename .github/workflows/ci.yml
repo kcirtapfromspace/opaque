@@ -73,6 +73,15 @@ jobs:
           cargo test -p opaqued --test federation_e2e 2>&1 | tee /tmp/fed-e2e.out
           grep -q "test result: ok. 3 passed" /tmp/fed-e2e.out
 
+      - name: Provider e2e (a real GitHub write, end to end, against a mock API)
+        # Drives the flagship provider path through a live daemon. Two
+        # regressions that made every GitHub write impossible were invisible to
+        # unit tests; this is the suite that sees them. Same anti-vacuous grep,
+        # same reason for running before the root-gated steps.
+        run: |
+          cargo test -p opaqued --test provider_e2e 2>&1 | tee /tmp/prov-e2e.out
+          grep -q "test result: ok. 2 passed" /tmp/prov-e2e.out
+
       - name: Multi-uid isolation suite (custody + privilege drop, as root)
         run: ./scripts/linux-harness.sh isolation
 
