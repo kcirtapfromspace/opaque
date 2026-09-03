@@ -284,6 +284,21 @@ pub fn default_custody_set(home: &Path, config_path: &Path) -> Vec<CustodyPath> 
             label: "profiles directory",
         },
         CustodyPath {
+            path: state.join("bundle.state"),
+            kind: PathKind::File,
+            label: "federation bundle anti-rollback state",
+        },
+        CustodyPath {
+            path: state.join("export.cursor"),
+            kind: PathKind::File,
+            label: "audit export cursors",
+        },
+        CustodyPath {
+            path: state.join("attestation.key"),
+            kind: PathKind::File,
+            label: "attestation signing key",
+        },
+        CustodyPath {
             path: state.join("pairing.key"),
             kind: PathKind::File,
             label: "device pairing signing key",
@@ -554,6 +569,9 @@ mod tests {
             "/var/lib/opaque/.opaque/identity.db",
             "/var/lib/opaque/.opaque/identity.key",
             "/var/lib/opaque/.opaque/profiles",
+            "/var/lib/opaque/.opaque/bundle.state",
+            "/var/lib/opaque/.opaque/export.cursor",
+            "/var/lib/opaque/.opaque/attestation.key",
             "/var/lib/opaque/.opaque/pairing.key",
             "/var/lib/opaque/.opaque/approval_server.key",
             "/var/lib/opaque/.opaque/approval_server.cert",

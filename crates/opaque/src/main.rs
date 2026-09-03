@@ -225,6 +225,30 @@ enum Cmd {
         #[command(subcommand)]
         action: KeyAction,
     },
+    /// Org tooling for signed federation policy bundles (offline).
+    Bundle {
+        #[command(subcommand)]
+        action: BundleAction,
+    },
+    /// Ask the daemon for a signed posture attestation and verify it.
+    #[command(
+        long_about = "Ask the daemon for a signed posture attestation and verify it.\n\n\
+        The CLI generates a fresh random nonce, the daemon answers with a report\n\
+        signed by its attestation key covering custody, audit-chain, trust-domain\n\
+        and federation posture, and the CLI verifies signature + nonce + freshness\n\
+        before printing. Pin the expected key with --key to detect a substituted\n\
+        daemon; exits nonzero when the posture is unhealthy."
+    )]
+    Attest {
+        /// Expected attestation public key (hex). Without it the report is
+        /// verified against the key the daemon itself presents — which proves
+        /// freshness but not identity.
+        #[arg(long)]
+        key: Option<String>,
+        /// Print the raw signed report (for a verifier to check itself).
+        #[arg(long, default_value_t = false)]
+        raw: bool,
+    },
     /// Interactive setup wizard — configure and seal your security policy.
     Setup {
         /// Seal the current config.toml without running the wizard.
@@ -427,6 +451,54 @@ enum KeyAction {
     Remove {
         /// Credential id as shown by `opaque key ls`.
         credential_id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum BundleAction {
+    /// Generate an org signing keypair; prints the public key (trust anchor).
+    Keygen {
+        /// Where to write the private signing key (0600).
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Sign a bundle manifest into a distributable policy bundle.
+    #[command(
+        long_about = "Sign a bundle manifest into a distributable policy bundle.\n\n\
+        The manifest is TOML carrying org, version, optional [[teams]], and the\n\
+        org policy as [[rules]] (the same rule shape as the daemon config).\n\
+        Daemons verify the signature against [federation] trust_anchors and\n\
+        refuse version rollbacks."
+    )]
+    Sign {
+        /// Bundle manifest (TOML: org, version, [[teams]], [[rules]]).
+        #[arg(long)]
+        manifest: PathBuf,
+        /// Org signing key file (from `opaque bundle keygen`).
+        #[arg(long)]
+        key: PathBuf,
+        /// Output bundle file.
+        #[arg(long)]
+        out: PathBuf,
+        /// Override the manifest's version (CI bump automation).
+        #[arg(long)]
+        version: Option<u64>,
+        /// Expire the bundle N days from now.
+        #[arg(long)]
+        expires_days: Option<u32>,
+    },
+    /// Verify a bundle against one or more trust anchors.
+    Verify {
+        /// Bundle file to verify.
+        file: PathBuf,
+        /// Trust anchor (hex Ed25519 public key). Repeatable.
+        #[arg(long, required = true)]
+        anchor: Vec<String>,
+    },
+    /// Show a bundle's contents WITHOUT verifying its signature.
+    Inspect {
+        /// Bundle file to inspect.
+        file: PathBuf,
     },
 }
 
@@ -2231,6 +2303,16 @@ async fn main() {
             }
             return;
         }
+        Cmd::Bundle { action } => {
+            match run_bundle(action) {
+                Ok(()) => {}
+                Err(e) => {
+                    ui::error(&e);
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
         Cmd::Setup {
             seal,
             reset,
@@ -2490,6 +2572,11 @@ async fn main() {
         return;
     }
 
+    // Attestation verification context, filled by the Cmd::Attest arm below.
+    let mut attest_nonce = String::new();
+    let mut attest_expected_key: Option<String> = None;
+    let mut attest_raw = false;
+
     let (method, params) = match cmd {
         Cmd::Ping => ("ping", serde_json::Value::Null),
         Cmd::Version => ("version", serde_json::Value::Null),
@@ -2746,6 +2833,17 @@ async fn main() {
             ),
             IdentityAction::Delegations => ("identity.delegation_list", serde_json::Value::Null),
         },
+        Cmd::Attest { key, raw } => {
+            let nonce = {
+                let mut buf = [0u8; 16];
+                getrandom::fill(&mut buf).expect("nonce");
+                buf.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            };
+            attest_nonce = nonce.clone();
+            attest_expected_key = key.clone();
+            attest_raw = raw;
+            ("attestation_report", serde_json::json!({ "nonce": nonce }))
+        }
         Cmd::Key { action } => match action {
             KeyAction::Ls => ("fido2_list", serde_json::Value::Null),
             KeyAction::Remove { credential_id } => (
@@ -2784,6 +2882,7 @@ async fn main() {
         },
         // Already handled above; unreachable.
         Cmd::Policy { .. }
+        | Cmd::Bundle { .. }
         | Cmd::Init { .. }
         | Cmd::Audit { .. }
         | Cmd::Profile { .. }
@@ -2839,6 +2938,29 @@ async fn main() {
                     std::process::exit(exit_code);
                 }
                 if let Some(result) = &resp.result {
+                    // Attestation is verified CLIENT-SIDE before anything is
+                    // printed: an unverifiable report must never render as a
+                    // healthy posture.
+                    if method == "attestation_report" {
+                        match verify_attestation(
+                            result,
+                            &attest_nonce,
+                            attest_expected_key.as_deref(),
+                            attest_raw,
+                            json_output,
+                        ) {
+                            Ok(healthy) => {
+                                if !healthy {
+                                    std::process::exit(EXIT_DAEMON);
+                                }
+                            }
+                            Err(e) => {
+                                ui::error(&e);
+                                std::process::exit(EXIT_DAEMON);
+                            }
+                        }
+                        return;
+                    }
                     if quiet {
                         // Quiet mode: only show essential output (no decorative formatting).
                         // For methods that have data, print minimal JSON.
@@ -4185,6 +4307,293 @@ async fn run_quickstart() {
 // ---------------------------------------------------------------------------
 // setup
 // ---------------------------------------------------------------------------
+
+/// A signable bundle manifest: org metadata + teams + rules, in the same
+/// TOML rule shape the daemon config uses.
+#[derive(serde::Deserialize)]
+struct BundleManifest {
+    org: String,
+    version: u64,
+    #[serde(default)]
+    expires_days: Option<u32>,
+    #[serde(default)]
+    teams: Vec<opaque_core::bundle::Team>,
+    #[serde(default)]
+    rules: Vec<opaque_core::policy::PolicyRule>,
+}
+
+/// Offline org tooling for signed federation policy bundles.
+fn run_bundle(action: &BundleAction) -> Result<(), String> {
+    use ed25519_dalek::SigningKey;
+    use opaque_core::bundle;
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+    fn load_signing_key(path: &Path) -> Result<SigningKey, String> {
+        let key = opaque_core::keyfile::load_key_file(path)
+            .map_err(|e| format!("cannot read key {}: {e}", path.display()))?
+            .ok_or_else(|| format!("key file {} does not exist", path.display()))?;
+        Ok(SigningKey::from_bytes(&key))
+    }
+    fn now_unix() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+    fn print_payload(p: &opaque_core::bundle::BundlePayload) {
+        ui::kv("org", &p.org);
+        ui::kv("version", &p.version.to_string());
+        ui::kv("issued_at", &p.issued_at.to_string());
+        ui::kv(
+            "expires_at",
+            &p.expires_at
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "never".into()),
+        );
+        ui::kv("rules", &p.rules.len().to_string());
+        for rule in &p.rules {
+            println!(
+                "    - {} ({} -> {})",
+                rule.name,
+                rule.operation_pattern,
+                if rule.allow { "allow" } else { "deny" }
+            );
+        }
+        ui::kv("teams", &p.teams.len().to_string());
+        for team in &p.teams {
+            println!("    - {} ({} member(s))", team.name, team.members.len());
+        }
+    }
+
+    match action {
+        BundleAction::Keygen { out } => {
+            if out.exists() {
+                return Err(format!(
+                    "{} already exists — refusing to overwrite a signing key",
+                    out.display()
+                ));
+            }
+            let key_bytes = opaque_core::keyfile::load_or_create_key_file(out)
+                .map_err(|e| format!("keygen failed: {e}"))?;
+            let key = SigningKey::from_bytes(&key_bytes);
+            ui::success(&format!("Org signing key written to {}", out.display()));
+            ui::kv("trust anchor", &hex(key.verifying_key().as_bytes()));
+            ui::info("Put the trust anchor (public) in each daemon's [federation] trust_anchors.");
+            ui::info("Guard the key file (private) like a signing CA key.");
+            Ok(())
+        }
+        BundleAction::Sign {
+            manifest,
+            key,
+            out,
+            version,
+            expires_days,
+        } => {
+            let text = std::fs::read_to_string(manifest)
+                .map_err(|e| format!("cannot read manifest {}: {e}", manifest.display()))?;
+            let parsed: BundleManifest =
+                toml_edit::de::from_str(&text).map_err(|e| format!("manifest parse error: {e}"))?;
+            let signing_key = load_signing_key(key)?;
+
+            let issued_at = now_unix();
+            let expires_at = expires_days
+                .or(parsed.expires_days)
+                .map(|d| issued_at + i64::from(d) * 86_400);
+            let payload = opaque_core::bundle::BundlePayload {
+                org: parsed.org,
+                version: version.unwrap_or(parsed.version),
+                issued_at,
+                expires_at,
+                key_id: hex(signing_key.verifying_key().as_bytes())
+                    .chars()
+                    .take(16)
+                    .collect(),
+                teams: parsed.teams,
+                rules: parsed.rules,
+            };
+            let bundle_text = bundle::sign_bundle(&payload, &signing_key)
+                .map_err(|e| format!("signing failed: {e}"))?;
+            std::fs::write(out, &bundle_text)
+                .map_err(|e| format!("cannot write {}: {e}", out.display()))?;
+
+            ui::success(&format!("Bundle signed to {}", out.display()));
+            print_payload(&payload);
+            Ok(())
+        }
+        BundleAction::Verify { file, anchor } => {
+            let text = std::fs::read_to_string(file)
+                .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
+            let anchors: Vec<_> = anchor
+                .iter()
+                .map(|a| bundle::parse_anchor(a).map_err(|_| format!("bad trust anchor: {a:?}")))
+                .collect::<Result<_, _>>()?;
+            let verified = bundle::verify_bundle(&text, &anchors, now_unix())
+                .map_err(|e| format!("VERIFICATION FAILED: {e}"))?;
+            ui::success("Bundle signature verified");
+            ui::kv("verified by", &verified.verified_by);
+            ui::kv("digest", &verified.digest);
+            print_payload(&verified.payload);
+            Ok(())
+        }
+        BundleAction::Inspect { file } => {
+            let text = std::fs::read_to_string(file)
+                .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
+            // Structure-only parse; make the trust status unmissable.
+            let payload_b64 = text
+                .trim()
+                .split('.')
+                .nth(1)
+                .ok_or("malformed bundle (expected opqb1.<payload>.<sig>)")?;
+            use base64::Engine;
+            let payload_json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(payload_b64)
+                .map_err(|_| "malformed bundle payload".to_string())?;
+            let payload: opaque_core::bundle::BundlePayload = serde_json::from_slice(&payload_json)
+                .map_err(|e| format!("payload parse error: {e}"))?;
+            ui::warn("UNVERIFIED CONTENTS — signature not checked (use `bundle verify`)");
+            print_payload(&payload);
+            Ok(())
+        }
+    }
+}
+
+/// Verify a daemon attestation response and render it. Returns whether the
+/// posture is healthy (custody + chain clean).
+fn verify_attestation(
+    result: &serde_json::Value,
+    nonce: &str,
+    expected_key: Option<&str>,
+    raw: bool,
+    json_output: bool,
+) -> Result<bool, String> {
+    let report = result
+        .get("report")
+        .and_then(|v| v.as_str())
+        .ok_or("daemon returned no report")?;
+    let presented_key = result
+        .get("attestation_key")
+        .and_then(|v| v.as_str())
+        .ok_or("daemon returned no attestation key")?;
+
+    // Key pinning: without --key we can only prove the report is fresh and
+    // internally consistent, not WHICH daemon produced it. Say so plainly.
+    let key_hex = match expected_key {
+        Some(pinned) => {
+            if !pinned.eq_ignore_ascii_case(presented_key) {
+                return Err(format!(
+                    "ATTESTATION KEY MISMATCH — expected {pinned}, daemon presented \
+                     {presented_key}. Refusing to trust this report."
+                ));
+            }
+            pinned
+        }
+        None => presented_key,
+    };
+
+    let key = opaque_core::bundle::parse_anchor(key_hex)
+        .map_err(|_| format!("attestation key is not a valid Ed25519 key: {key_hex}"))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let verified = opaque_core::attest::verify_report(report, &key, nonce, now, 120)
+        .map_err(|e| format!("ATTESTATION VERIFICATION FAILED: {e}"))?;
+
+    let p = &verified.payload;
+    // Health = is anything broken. Release eligibility additionally requires
+    // the trust-domain split, which a session-mode daemon legitimately lacks.
+    let healthy = p.integrity_ok();
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "verified": true,
+                "attestation_key": key_hex,
+                "key_pinned": expected_key.is_some(),
+                "healthy": healthy,
+                "release_eligible": p.healthy_for_release(),
+                "payload": p,
+            }))
+            .unwrap_or_default()
+        );
+        return Ok(healthy);
+    }
+
+    if raw {
+        println!("{report}");
+        println!();
+    }
+
+    if healthy {
+        ui::success("Attestation verified — posture healthy");
+    } else {
+        ui::error("Attestation verified — POSTURE UNHEALTHY");
+    }
+    if healthy && !p.trust_domain.enforce {
+        ui::info(
+            "Session mode: healthy, but not eligible for custody key release \
+             (that requires the trust-domain split).",
+        );
+    }
+    if expected_key.is_none() {
+        ui::warn(
+            "Key not pinned: this proves the report is fresh, not which daemon signed it. \
+             Re-run with --key <hex> to pin.",
+        );
+    }
+    ui::kv("attestation key", key_hex);
+    ui::kv("daemon", &format!("{} (uid {})", p.daemon_version, p.uid));
+    ui::kv(
+        "trust domain",
+        if p.trust_domain.enforce {
+            "enforced"
+        } else {
+            "not enforced (session mode)"
+        },
+    );
+    ui::kv(
+        "custody",
+        if p.trust_domain.custody_ok {
+            "verified"
+        } else {
+            "VIOLATIONS"
+        },
+    );
+    for violation in &p.trust_domain.custody_violations {
+        println!("      {}", style(violation).red());
+    }
+    ui::kv(
+        "audit chain",
+        &if p.audit.chain_ok {
+            format!("verified ({} records)", p.audit.records)
+        } else {
+            format!(
+                "BROKEN ({})",
+                p.audit.detail.as_deref().unwrap_or("chain mismatch")
+            )
+        },
+    );
+    match &p.federation {
+        Some(f) => ui::kv(
+            "federation",
+            &format!(
+                "{} bundle v{} ({})",
+                f.org,
+                f.version,
+                &f.digest[..16.min(f.digest.len())]
+            ),
+        ),
+        None => ui::kv("federation", "no bundle applied"),
+    }
+    if !p.factors.is_empty() {
+        ui::kv("approval factors", &p.factors.join(", "));
+    }
+
+    Ok(healthy)
+}
 
 /// Run the setup command (wizard, --seal, --reset, --verify).
 fn run_setup(seal_only: bool, reset: bool, verify: bool) -> Result<(), String> {
@@ -7637,6 +8046,57 @@ BAZ=
         // confirm/revoke require the device id.
         assert!(Cli::try_parse_from(["opaque", "device", "confirm"]).is_err());
         assert!(Cli::try_parse_from(["opaque", "device", "revoke"]).is_err());
+    }
+
+    #[test]
+    fn bundle_commands_parse() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["opaque", "bundle", "keygen", "--out", "/tmp/k"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Bundle {
+                action: BundleAction::Keygen { .. }
+            })
+        ));
+        let cli = Cli::try_parse_from([
+            "opaque",
+            "bundle",
+            "sign",
+            "--manifest",
+            "m.toml",
+            "--key",
+            "org.key",
+            "--out",
+            "p.bundle",
+            "--version",
+            "7",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Some(Cmd::Bundle {
+                action: BundleAction::Sign { version, .. },
+            }) => assert_eq!(version, Some(7)),
+            other => panic!("unexpected parse: {other:?}"),
+        }
+        // verify requires at least one --anchor.
+        assert!(Cli::try_parse_from(["opaque", "bundle", "verify", "b.bundle"]).is_err());
+        let cli = Cli::try_parse_from([
+            "opaque", "bundle", "verify", "b.bundle", "--anchor", "aa", "--anchor", "bb",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Some(Cmd::Bundle {
+                action: BundleAction::Verify { anchor, .. },
+            }) => assert_eq!(anchor.len(), 2),
+            other => panic!("unexpected parse: {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["opaque", "bundle", "inspect", "b.bundle"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Bundle {
+                action: BundleAction::Inspect { .. }
+            })
+        ));
     }
 
     #[test]

@@ -37,6 +37,7 @@ const DAEMON_TOKEN_FILENAME: &str = "daemon.token";
 mod approval;
 #[allow(dead_code)]
 mod approval_server;
+mod attest;
 mod aws;
 #[allow(dead_code)]
 mod azure;
@@ -45,7 +46,9 @@ mod bitwarden;
 mod doppler;
 mod enclave;
 #[allow(dead_code)]
+mod export;
 mod factors;
+mod federation;
 #[allow(dead_code)]
 mod fido2;
 #[allow(dead_code)]
@@ -134,6 +137,19 @@ struct DaemonConfig {
     /// live beyond the local prompt.
     #[serde(default)]
     approval: ApprovalFactorsConfig,
+
+    /// Federation (`[federation]`): signed policy bundles from an org.
+    #[serde(default)]
+    federation: federation::FederationConfig,
+
+    /// SIEM export (`[export]`): stream the audit chain off the box.
+    #[serde(default)]
+    export: export::ExportConfig,
+
+    /// Continuous attestation (`[attestation]`): periodic posture reports and
+    /// verify-before-trust key release.
+    #[serde(default)]
+    attestation: attest::AttestationConfig,
 }
 
 /// `[approval]` — out-of-band approval factor configuration.
@@ -246,6 +262,10 @@ struct DaemonState {
     approval_server_addr: Option<std::net::SocketAddr>,
     /// FIDO2 approval coordination, present when `[approval] fido2` is enabled.
     fido2: Option<Arc<factors::Fido2Approvals>>,
+    /// Applied federation bundle context (org, version, teams).
+    federation: Arc<federation::FederationStatus>,
+    /// Attestation service (posture reports; always present).
+    attestation: Arc<attest::AttestationService>,
 }
 
 #[derive(Debug, Clone)]
@@ -644,6 +664,23 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
     }
 
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+
+    // Materialize the state directory owner-only BEFORE verifying custody:
+    // otherwise a fresh install has nothing to check here, and whichever
+    // subsystem creates it later does so with the process umask (0755) —
+    // leaving the custody root group/world-traversable until the next
+    // restart, which is exactly the window enforcement is meant to close.
+    {
+        let state_dir = home.join(".opaque");
+        if !state_dir.exists() {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&state_dir)?;
+        }
+    }
+
     let custody_violations = trust_domain::startup_custody_check(td.enforce, &home, &config_path)?;
 
     // Check if --allow-unsealed was passed on the command line.
@@ -1657,6 +1694,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         fido2_approvals = Some(approvals);
     }
 
+    let mut registered_factors: Vec<String> = Vec::new();
     let approval_gate: Box<dyn enclave::ApprovalGate> = match backend {
         ApprovalBackendKind::Native => {
             let mut registry = factors::FactorRegistry::new();
@@ -1684,6 +1722,12 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
                 registry.register(Arc::new(factors::Fido2Verifier::new(approvals)));
             }
 
+            registered_factors = registry
+                .available_factors()
+                .iter()
+                .map(|f| f.to_string())
+                .collect();
+            info!(factors = ?registered_factors, "approval factors registered");
             Box::new(NativeApprovalGate::with_registry(registry))
         }
         ApprovalBackendKind::InsecureAutoApprove => {
@@ -1708,9 +1752,141 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         .audit(audit.clone())
         .build()
         .map_err(std::io::Error::other)?;
+    let enclave = Arc::new(enclave);
+
+    // --- SIEM export: stream the audit chain off the box ---
+    if config.export.configured() {
+        let pump = export::ExportPump::new(
+            config.export.clone(),
+            audit_db_path.clone(),
+            export::cursor_path(&home),
+            audit.clone(),
+        )
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("[export] configuration invalid (fail closed): {e}"),
+            )
+        })?;
+        tokio::spawn(pump.run());
+    }
+
+    // --- Federation: signed policy bundles ---
+    let federation_status = Arc::new(federation::FederationStatus::default());
+    if config.federation.configured() {
+        let fed = &config.federation;
+        let anchors = fed.anchors()?;
+        if anchors.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "[federation] has a bundle source but no trust_anchors — an unverifiable \
+                 bundle can never be applied",
+            ));
+        }
+        let applier = federation::BundleApplier {
+            anchors,
+            state_file: federation::state_path(&home),
+            enclave: enclave.clone(),
+            status: federation_status.clone(),
+            audit: audit.clone(),
+        };
+
+        // Initial load. Under require_bundle any failure (fetch, signature,
+        // rollback, expiry) refuses startup; otherwise the daemon starts on
+        // local [[rules]] and the refresh task keeps trying.
+        match applier.load_and_apply(fed, true).await {
+            Ok(()) => {}
+            Err(e) if fed.require_bundle => {
+                // The rejection was just audited; emission is asynchronous and
+                // the process is about to exit without running destructors, so
+                // make the security event durable before leaving.
+                audit.flush(std::time::Duration::from_secs(5));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "federation.require_bundle is on and no valid bundle could be \
+                         applied (fail closed): {e}"
+                    ),
+                ));
+            }
+            Err(e) => {
+                warn!(
+                    "federation bundle not applied at startup ({e}) — running on local \
+                     [[rules]] until a refresh succeeds"
+                );
+            }
+        }
+
+        // Refresh task (0 disables).
+        let refresh_secs = fed.refresh_secs.unwrap_or(300);
+        if refresh_secs > 0 {
+            let fed = fed.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(refresh_secs));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                tick.tick().await; // consume the immediate first tick
+                loop {
+                    tick.tick().await;
+                    if let Err(e) = applier.load_and_apply(&fed, false).await {
+                        warn!("federation refresh failed: {e}");
+                    }
+                }
+            });
+        }
+    }
+
+    // --- Continuous attestation ---
+    let attestation = Arc::new(attest::AttestationService::new(
+        attest::load_or_create_key(&home)?,
+        home.clone(),
+        config_path.clone(),
+        audit_db_path.clone(),
+        version_string().to_owned(),
+        config.trust_domain.enforce,
+        registered_factors.clone(),
+        federation_status.clone(),
+    ));
+    info!(
+        attestation_key = %attestation.public_key_hex(),
+        "attestation service ready (enroll this key with your verifier)"
+    );
+    attestation.record_posture(&audit, "startup");
+
+    // Verify-before-trust: prove posture to the verifier before it releases
+    // custody material. A refusal is loud but not fatal — the daemon keeps
+    // running on the key material it already holds.
+    if let Some(url) = config.attestation.key_release_url.clone() {
+        match attest::KeyReleaseClient::new(
+            url,
+            config.attestation.key_release_authorization.clone(),
+        ) {
+            Ok(client) => match client.release(&attestation).await {
+                Ok(material) => info!(
+                    bytes = material.len(),
+                    "verifier released key material after attesting posture"
+                ),
+                Err(e) => warn!("attestation key release did not complete: {e}"),
+            },
+            Err(e) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("[attestation] key_release_url invalid: {e}"),
+                ));
+            }
+        }
+    }
+
+    let attestation_interval = config.attestation.interval_secs.unwrap_or(900);
+    if attestation_interval > 0 {
+        tokio::spawn(
+            attestation
+                .clone()
+                .run_periodic(audit.clone(), attestation_interval),
+        );
+    }
 
     let state = Arc::new(DaemonState {
-        enclave: Arc::new(enclave),
+        enclave,
         audit: audit.clone(),
         config,
         version: version_string(),
@@ -1721,6 +1897,8 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         pairing: pairing_manager,
         approval_server_addr,
         fido2: fido2_approvals,
+        federation: federation_status,
+        attestation,
     });
 
     // Shutdown coordination: watch channel + active connection counter.
@@ -2774,10 +2952,15 @@ async fn resolve_principal_context(
         }
     }
 
+    // Team membership comes from the applied federation bundle, resolved
+    // daemon-side per request (bundle refresh takes effect immediately).
+    let sub_teams = state.federation.teams_of(&sub_principal.display_label());
+
     Ok(Some(PrincipalContext {
         sub: d.sub.clone(),
         sub_label: sub_principal.display_label(),
         sub_roles: sub_principal.roles.clone(),
+        sub_teams,
         act: d.act.clone(),
         act_label: act_principal.display_label(),
         mode: d.mode,
@@ -2834,10 +3017,23 @@ async fn handle_request(
             req.id,
             serde_json::json!({ "ok": true, "api_version": opaque_core::API_VERSION }),
         ),
-        "version" => Response::ok(
-            req.id,
-            serde_json::json!({ "version": state.version, "api_version": opaque_core::API_VERSION }),
-        ),
+        "version" => {
+            let federation = state.federation.current().map(|a| {
+                serde_json::json!({
+                    "org": a.org,
+                    "bundle_version": a.version,
+                    "bundle_digest": &a.digest[..16.min(a.digest.len())],
+                })
+            });
+            Response::ok(
+                req.id,
+                serde_json::json!({
+                    "version": state.version,
+                    "api_version": opaque_core::API_VERSION,
+                    "federation": federation,
+                }),
+            )
+        }
         "whoami" => {
             let identity_required = state.identity.as_ref().is_some_and(|rt| rt.config.required);
             // Agent clients get minimal info to prevent reconnaissance.
@@ -3499,14 +3695,16 @@ async fn handle_request(
             // session-start operation event.
             match &delegation {
                 Some(d) => {
+                    let sub_label = state
+                        .identity
+                        .as_ref()
+                        .and_then(|rt| rt.store.get_principal(&d.sub).ok().flatten())
+                        .map(|p| p.display_label())
+                        .unwrap_or_default();
                     let ctx = PrincipalContext {
                         sub: d.sub.clone(),
-                        sub_label: state
-                            .identity
-                            .as_ref()
-                            .and_then(|rt| rt.store.get_principal(&d.sub).ok().flatten())
-                            .map(|p| p.display_label())
-                            .unwrap_or_default(),
+                        sub_teams: state.federation.teams_of(&sub_label),
+                        sub_label,
                         sub_roles: Default::default(),
                         act: d.act.clone(),
                         act_label: String::new(),
@@ -3978,6 +4176,50 @@ async fn handle_request(
                     )
                 }
                 Err(e) => Response::err(Some(req.id), "not_found", format!("{e}")),
+            }
+        }
+        "attestation_report" => {
+            // Read-only posture proof. Deliberately NOT approval-gated: a
+            // verifier or auditor must be able to ask an unhealthy daemon
+            // for its posture, and the report's contents are the daemon's
+            // own state, never secrets. Freshness and authenticity come from
+            // the caller's nonce and the signature.
+            let nonce = req
+                .params
+                .get("nonce")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            if nonce.len() < 16
+                || nonce.len() > 128
+                || !nonce.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                return Response::err(
+                    Some(req.id),
+                    "bad_request",
+                    "'nonce' must be 16-128 hex characters (caller-chosen, anti-replay)",
+                );
+            }
+            match state.attestation.report(&nonce) {
+                Ok(report) => {
+                    emit_daemon_method_audit(
+                        state,
+                        AuditEventKind::OperationSucceeded,
+                        "attestation_report",
+                        identity,
+                        client_type,
+                        "report_issued",
+                        None,
+                    );
+                    Response::ok(
+                        req.id,
+                        serde_json::json!({
+                            "report": report,
+                            "attestation_key": state.attestation.public_key_hex(),
+                        }),
+                    )
+                }
+                Err(e) => Response::err(Some(req.id), "internal", e),
             }
         }
         "fido2_register_start" => {
@@ -6336,6 +6578,17 @@ exe_sha256 = "deadbeef"
             pairing: None,
             approval_server_addr: None,
             fido2: None,
+            federation: Arc::new(federation::FederationStatus::default()),
+            attestation: Arc::new(attest::AttestationService::new(
+                ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]),
+                PathBuf::from("/nonexistent"),
+                PathBuf::from("/nonexistent/config.toml"),
+                PathBuf::from("/nonexistent/audit.db"),
+                "test".into(),
+                false,
+                vec![],
+                Arc::new(federation::FederationStatus::default()),
+            )),
         }
     }
 
@@ -7272,6 +7525,7 @@ exe_sha256 = "deadbeef"
             }),
             sub_label: "u".into(),
             sub_roles: Default::default(),
+            sub_teams: vec![],
             act: PrincipalId::generate(&PrincipalKind::Agent { tool: "x".into() }),
             act_label: "agent:x".into(),
             mode: AccessMode::Delegated,

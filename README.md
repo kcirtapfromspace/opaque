@@ -191,6 +191,7 @@ opaque policy preset github-secrets
 - [MCP integration](docs/mcp-integration.md)
 - [Bitwarden setup](docs/bitwarden.md)
 - [Vault setup](docs/vault.md)
+- [Federation](docs/federation.md)
 - [Policy](docs/policy.md)
 - [Operations](docs/operations.md)
 - [LLM harness](docs/llm-harness.md)

@@ -72,6 +72,7 @@ nav:
   - Configuration:
       - Policy Engine: policy.md
       - Identity: identity.md
+      - Federation: federation.md
       - Operations: operations.md
       - Storage: storage.md
       - Deployment: deployment.md

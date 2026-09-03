@@ -1062,6 +1062,7 @@ mod tests {
             sub: human,
             sub_label: "dev@example.com".into(),
             sub_roles: Default::default(),
+            sub_teams: vec![],
             act: agent,
             act_label: "agent:claude-code".into(),
             mode: AccessMode::Delegated,
