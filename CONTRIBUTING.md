@@ -80,8 +80,26 @@ It publishes to two places:
 
 | Target | Where | How |
 |---|---|---|
-| **opaque.info** (canonical) | Cloudflare Pages | Builds from `main`; output directory comes from `wrangler.toml`, build command from the Pages dashboard |
+| **opaque.info** (canonical) | Cloudflare Pages | `.github/workflows/deploy-site.yml` — Wrangler direct upload |
 | kcirtapfromspace.github.io/opaque | GitHub Pages | `.github/workflows/pages.yml` |
+
+A push to `main` publishes production. Every other ref — including a pull
+request — publishes a **preview** at its own URL, so a landing-page change can
+be looked at before it is live. Both builds run `--strict`, so a dead link
+fails the deploy instead of shipping.
+
+To deploy by hand, which does the same thing the workflow does:
+
+```sh
+mkdocs build --strict
+wrangler pages deploy            # directory and project come from wrangler.toml
+wrangler pages deploy --branch=scratch    # a preview instead of production
+```
+
+That needs `wrangler login` once. CI instead needs two repository secrets,
+`CLOUDFLARE_API_TOKEN` (Account → Cloudflare Pages → Edit) and
+`CLOUDFLARE_ACCOUNT_ID`; without them the workflow still builds the site and
+simply skips the upload.
 
 Canonical URLs and the sitemap point at `opaque.info` (`site_url` in
 `mkdocs.yml`), so the mirror never competes with it in search results. Asset

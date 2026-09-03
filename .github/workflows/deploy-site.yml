@@ -1,0 +1,98 @@
+name: Deploy site
+
+# Publishes opaque.info from this repository with Wrangler (Pages direct
+# upload), so a push is the deploy — no build configuration living in a
+# dashboard where it can drift from what the repo says.
+#
+# Requires two repository secrets:
+#   CLOUDFLARE_API_TOKEN   Account → Cloudflare Pages → Edit
+#   CLOUDFLARE_ACCOUNT_ID  the account the Pages project lives in
+# Until they exist, the deploy step skips green instead of failing every push.
+#
+# The Pages project must exist once: `wrangler pages project create opaque`
+# (production branch: main).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'mkdocs.yml'
+      - 'wrangler.toml'
+      - '.python-version'
+      - '.github/workflows/deploy-site.yml'
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'mkdocs.yml'
+      - 'wrangler.toml'
+      - '.python-version'
+      - '.github/workflows/deploy-site.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  deployments: write
+
+concurrency:
+  # Serialize per ref: a preview and its own follow-up push should not race.
+  group: pages-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Fork pull requests cannot read secrets; build them, skip the upload.
+    env:
+      CAN_DEPLOY: ${{ secrets.CLOUDFLARE_API_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version-file: '.python-version'
+
+      - uses: astral-sh/setup-uv@v7
+
+      - run: uv pip install --system -r docs/requirements.txt
+
+      # --strict fails the deploy on a dead internal link or an unknown config
+      # key, rather than publishing one. This runs on pull requests too, so a
+      # broken site is caught before it can reach main.
+      - run: mkdocs build --strict
+
+      # The branch name reaches a shell inside the deploy action, and on a pull
+      # request it originates outside this repository — so it is read from the
+      # environment (never interpolated into the script) and reduced to a safe
+      # charset before it is used.
+      - name: Resolve deploy branch
+        env:
+          RAW_REF: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.number) || github.ref_name }}
+        run: |
+          safe=$(printf '%s' "$RAW_REF" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-60)
+          echo "DEPLOY_BRANCH=$safe" >> "$GITHUB_ENV"
+
+      - name: Deploy to Cloudflare Pages
+        if: env.CAN_DEPLOY == 'true'
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          gitHubToken: ${{ secrets.GITHUB_TOKEN }}
+          # Pinned like every other toolchain here, so a deploy does not change
+          # because an upstream release did.
+          wranglerVersion: '4.129.0'
+          # main is the project's production branch, so a push there publishes
+          # opaque.info; every other ref publishes a preview under its own URL,
+          # so landing-page changes can be looked at before they are live.
+          command: >-
+            pages deploy site
+            --project-name=opaque
+            --branch=${{ env.DEPLOY_BRANCH }}
+
+      - name: Note when the deploy was skipped
+        if: env.CAN_DEPLOY != 'true'
+        run: |
+          echo "Built the site, but skipped the upload:" >> "$GITHUB_STEP_SUMMARY"
+          echo "CLOUDFLARE_API_TOKEN is not available to this run" >> "$GITHUB_STEP_SUMMARY"
+          echo "(not set yet, or a fork pull request, which cannot read secrets)." >> "$GITHUB_STEP_SUMMARY"
