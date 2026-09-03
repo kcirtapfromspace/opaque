@@ -1,3 +1,4 @@
+pub mod attest;
 pub mod audit;
 pub mod bundle;
 pub mod execve_map;

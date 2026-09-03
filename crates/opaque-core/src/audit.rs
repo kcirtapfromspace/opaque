@@ -1327,6 +1327,20 @@ impl SqliteAuditSink {
         let conn = rusqlite::Connection::open(&db_path)?;
         conn.execute_batch(SCHEMA_SQL)?;
 
+        // SECURITY: the audit log is custody material — it records every
+        // operation, client, principal, and approver. SQLite creates the
+        // file with the process umask (0644 typically), and the daemon's
+        // startup custody check runs BEFORE this file exists, so nothing
+        // else would tighten it until the next restart: under
+        // trust_domain.enforce a fresh state dir would leave the log
+        // readable at the agent's uid for the life of that process. Set the
+        // mode here, at creation, before WAL/SHM siblings inherit it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600))?;
+        }
+
         // Tamper-evident chain: load the key, migrate databases created before the
         // chain existed, and (re)build the chain if the column was just added or
         // retention removed rows from the front — otherwise the remaining rows would
@@ -2626,6 +2640,45 @@ mod tests {
         assert!(v.ok, "clean log should verify: {:?}", v.detail);
         assert_eq!(v.records_checked, 3);
         assert!(v.first_bad_sequence.is_none());
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(hmac_key_path(&db_path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_database_is_created_owner_only() {
+        // REGRESSION (found by attestation posture reporting): SQLite created
+        // audit.db with the process umask (0644). The daemon's custody check
+        // runs before the file exists, so under trust_domain.enforce a fresh
+        // state dir left the audit log readable at the agent's uid.
+        use std::os::unix::fs::PermissionsExt;
+
+        let db_path = temp_db_path();
+        let sink = SqliteAuditSink::new(db_path.clone(), 90).unwrap();
+        sink.emit(make_test_event(AuditEventKind::RequestReceived));
+        drop(sink); // flush + WAL checkpoint
+
+        let mode = std::fs::metadata(&db_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "audit database must be owner-only, got {mode:o}"
+        );
+
+        // WAL/SHM siblings inherit the main file's mode — assert no group or
+        // world access leaked through them either.
+        for suffix in ["-wal", "-shm"] {
+            let sibling = PathBuf::from(format!("{}{suffix}", db_path.display()));
+            if let Ok(meta) = std::fs::metadata(&sibling) {
+                let mode = meta.permissions().mode() & 0o077;
+                assert_eq!(
+                    mode,
+                    0,
+                    "{} grants access beyond the owner",
+                    sibling.display()
+                );
+            }
+        }
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(hmac_key_path(&db_path));

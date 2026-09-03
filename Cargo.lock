@@ -1950,6 +1950,7 @@ dependencies = [
  "dialoguer",
  "ed25519-dalek",
  "futures-util",
+ "getrandom 0.4.1",
  "glob-match",
  "indicatif",
  "opaque-core",

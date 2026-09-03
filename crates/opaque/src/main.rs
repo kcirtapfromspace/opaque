@@ -230,6 +230,25 @@ enum Cmd {
         #[command(subcommand)]
         action: BundleAction,
     },
+    /// Ask the daemon for a signed posture attestation and verify it.
+    #[command(
+        long_about = "Ask the daemon for a signed posture attestation and verify it.\n\n\
+        The CLI generates a fresh random nonce, the daemon answers with a report\n\
+        signed by its attestation key covering custody, audit-chain, trust-domain\n\
+        and federation posture, and the CLI verifies signature + nonce + freshness\n\
+        before printing. Pin the expected key with --key to detect a substituted\n\
+        daemon; exits nonzero when the posture is unhealthy."
+    )]
+    Attest {
+        /// Expected attestation public key (hex). Without it the report is
+        /// verified against the key the daemon itself presents — which proves
+        /// freshness but not identity.
+        #[arg(long)]
+        key: Option<String>,
+        /// Print the raw signed report (for a verifier to check itself).
+        #[arg(long, default_value_t = false)]
+        raw: bool,
+    },
     /// Interactive setup wizard — configure and seal your security policy.
     Setup {
         /// Seal the current config.toml without running the wizard.
@@ -2553,6 +2572,11 @@ async fn main() {
         return;
     }
 
+    // Attestation verification context, filled by the Cmd::Attest arm below.
+    let mut attest_nonce = String::new();
+    let mut attest_expected_key: Option<String> = None;
+    let mut attest_raw = false;
+
     let (method, params) = match cmd {
         Cmd::Ping => ("ping", serde_json::Value::Null),
         Cmd::Version => ("version", serde_json::Value::Null),
@@ -2809,6 +2833,17 @@ async fn main() {
             ),
             IdentityAction::Delegations => ("identity.delegation_list", serde_json::Value::Null),
         },
+        Cmd::Attest { key, raw } => {
+            let nonce = {
+                let mut buf = [0u8; 16];
+                getrandom::fill(&mut buf).expect("nonce");
+                buf.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            };
+            attest_nonce = nonce.clone();
+            attest_expected_key = key.clone();
+            attest_raw = raw;
+            ("attestation_report", serde_json::json!({ "nonce": nonce }))
+        }
         Cmd::Key { action } => match action {
             KeyAction::Ls => ("fido2_list", serde_json::Value::Null),
             KeyAction::Remove { credential_id } => (
@@ -2903,6 +2938,29 @@ async fn main() {
                     std::process::exit(exit_code);
                 }
                 if let Some(result) = &resp.result {
+                    // Attestation is verified CLIENT-SIDE before anything is
+                    // printed: an unverifiable report must never render as a
+                    // healthy posture.
+                    if method == "attestation_report" {
+                        match verify_attestation(
+                            result,
+                            &attest_nonce,
+                            attest_expected_key.as_deref(),
+                            attest_raw,
+                            json_output,
+                        ) {
+                            Ok(healthy) => {
+                                if !healthy {
+                                    std::process::exit(EXIT_DAEMON);
+                                }
+                            }
+                            Err(e) => {
+                                ui::error(&e);
+                                std::process::exit(EXIT_DAEMON);
+                            }
+                        }
+                        return;
+                    }
                     if quiet {
                         // Quiet mode: only show essential output (no decorative formatting).
                         // For methods that have data, print minimal JSON.
@@ -4399,6 +4457,142 @@ fn run_bundle(action: &BundleAction) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+/// Verify a daemon attestation response and render it. Returns whether the
+/// posture is healthy (custody + chain clean).
+fn verify_attestation(
+    result: &serde_json::Value,
+    nonce: &str,
+    expected_key: Option<&str>,
+    raw: bool,
+    json_output: bool,
+) -> Result<bool, String> {
+    let report = result
+        .get("report")
+        .and_then(|v| v.as_str())
+        .ok_or("daemon returned no report")?;
+    let presented_key = result
+        .get("attestation_key")
+        .and_then(|v| v.as_str())
+        .ok_or("daemon returned no attestation key")?;
+
+    // Key pinning: without --key we can only prove the report is fresh and
+    // internally consistent, not WHICH daemon produced it. Say so plainly.
+    let key_hex = match expected_key {
+        Some(pinned) => {
+            if !pinned.eq_ignore_ascii_case(presented_key) {
+                return Err(format!(
+                    "ATTESTATION KEY MISMATCH — expected {pinned}, daemon presented \
+                     {presented_key}. Refusing to trust this report."
+                ));
+            }
+            pinned
+        }
+        None => presented_key,
+    };
+
+    let key = opaque_core::bundle::parse_anchor(key_hex)
+        .map_err(|_| format!("attestation key is not a valid Ed25519 key: {key_hex}"))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let verified = opaque_core::attest::verify_report(report, &key, nonce, now, 120)
+        .map_err(|e| format!("ATTESTATION VERIFICATION FAILED: {e}"))?;
+
+    let p = &verified.payload;
+    // Health = is anything broken. Release eligibility additionally requires
+    // the trust-domain split, which a session-mode daemon legitimately lacks.
+    let healthy = p.integrity_ok();
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "verified": true,
+                "attestation_key": key_hex,
+                "key_pinned": expected_key.is_some(),
+                "healthy": healthy,
+                "release_eligible": p.healthy_for_release(),
+                "payload": p,
+            }))
+            .unwrap_or_default()
+        );
+        return Ok(healthy);
+    }
+
+    if raw {
+        println!("{report}");
+        println!();
+    }
+
+    if healthy {
+        ui::success("Attestation verified — posture healthy");
+    } else {
+        ui::error("Attestation verified — POSTURE UNHEALTHY");
+    }
+    if healthy && !p.trust_domain.enforce {
+        ui::info(
+            "Session mode: healthy, but not eligible for custody key release \
+             (that requires the trust-domain split).",
+        );
+    }
+    if expected_key.is_none() {
+        ui::warn(
+            "Key not pinned: this proves the report is fresh, not which daemon signed it. \
+             Re-run with --key <hex> to pin.",
+        );
+    }
+    ui::kv("attestation key", key_hex);
+    ui::kv("daemon", &format!("{} (uid {})", p.daemon_version, p.uid));
+    ui::kv(
+        "trust domain",
+        if p.trust_domain.enforce {
+            "enforced"
+        } else {
+            "not enforced (session mode)"
+        },
+    );
+    ui::kv(
+        "custody",
+        if p.trust_domain.custody_ok {
+            "verified"
+        } else {
+            "VIOLATIONS"
+        },
+    );
+    for violation in &p.trust_domain.custody_violations {
+        println!("      {}", style(violation).red());
+    }
+    ui::kv(
+        "audit chain",
+        &if p.audit.chain_ok {
+            format!("verified ({} records)", p.audit.records)
+        } else {
+            format!(
+                "BROKEN ({})",
+                p.audit.detail.as_deref().unwrap_or("chain mismatch")
+            )
+        },
+    );
+    match &p.federation {
+        Some(f) => ui::kv(
+            "federation",
+            &format!(
+                "{} bundle v{} ({})",
+                f.org,
+                f.version,
+                &f.digest[..16.min(f.digest.len())]
+            ),
+        ),
+        None => ui::kv("federation", "no bundle applied"),
+    }
+    if !p.factors.is_empty() {
+        ui::kv("approval factors", &p.factors.join(", "));
+    }
+
+    Ok(healthy)
 }
 
 /// Run the setup command (wizard, --seal, --reset, --verify).

@@ -37,6 +37,7 @@ const DAEMON_TOKEN_FILENAME: &str = "daemon.token";
 mod approval;
 #[allow(dead_code)]
 mod approval_server;
+mod attest;
 mod aws;
 #[allow(dead_code)]
 mod azure;
@@ -144,6 +145,11 @@ struct DaemonConfig {
     /// SIEM export (`[export]`): stream the audit chain off the box.
     #[serde(default)]
     export: export::ExportConfig,
+
+    /// Continuous attestation (`[attestation]`): periodic posture reports and
+    /// verify-before-trust key release.
+    #[serde(default)]
+    attestation: attest::AttestationConfig,
 }
 
 /// `[approval]` — out-of-band approval factor configuration.
@@ -258,6 +264,8 @@ struct DaemonState {
     fido2: Option<Arc<factors::Fido2Approvals>>,
     /// Applied federation bundle context (org, version, teams).
     federation: Arc<federation::FederationStatus>,
+    /// Attestation service (posture reports; always present).
+    attestation: Arc<attest::AttestationService>,
 }
 
 #[derive(Debug, Clone)]
@@ -1669,6 +1677,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         fido2_approvals = Some(approvals);
     }
 
+    let mut registered_factors: Vec<String> = Vec::new();
     let approval_gate: Box<dyn enclave::ApprovalGate> = match backend {
         ApprovalBackendKind::Native => {
             let mut registry = factors::FactorRegistry::new();
@@ -1696,7 +1705,12 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
                 registry.register(Arc::new(factors::Fido2Verifier::new(approvals)));
             }
 
-            info!(factors = ?registry.available_factors(), "approval factors registered");
+            registered_factors = registry
+                .available_factors()
+                .iter()
+                .map(|f| f.to_string())
+                .collect();
+            info!(factors = ?registered_factors, "approval factors registered");
             Box::new(NativeApprovalGate::with_registry(registry))
         }
         ApprovalBackendKind::InsecureAutoApprove => {
@@ -1800,6 +1814,56 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         }
     }
 
+    // --- Continuous attestation ---
+    let attestation = Arc::new(attest::AttestationService::new(
+        attest::load_or_create_key(&home)?,
+        home.clone(),
+        config_path.clone(),
+        audit_db_path.clone(),
+        version_string().to_owned(),
+        config.trust_domain.enforce,
+        registered_factors.clone(),
+        federation_status.clone(),
+    ));
+    info!(
+        attestation_key = %attestation.public_key_hex(),
+        "attestation service ready (enroll this key with your verifier)"
+    );
+    attestation.record_posture(&audit, "startup");
+
+    // Verify-before-trust: prove posture to the verifier before it releases
+    // custody material. A refusal is loud but not fatal — the daemon keeps
+    // running on the key material it already holds.
+    if let Some(url) = config.attestation.key_release_url.clone() {
+        match attest::KeyReleaseClient::new(
+            url,
+            config.attestation.key_release_authorization.clone(),
+        ) {
+            Ok(client) => match client.release(&attestation).await {
+                Ok(material) => info!(
+                    bytes = material.len(),
+                    "verifier released key material after attesting posture"
+                ),
+                Err(e) => warn!("attestation key release did not complete: {e}"),
+            },
+            Err(e) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("[attestation] key_release_url invalid: {e}"),
+                ));
+            }
+        }
+    }
+
+    let attestation_interval = config.attestation.interval_secs.unwrap_or(900);
+    if attestation_interval > 0 {
+        tokio::spawn(
+            attestation
+                .clone()
+                .run_periodic(audit.clone(), attestation_interval),
+        );
+    }
+
     let state = Arc::new(DaemonState {
         enclave,
         audit: audit.clone(),
@@ -1813,6 +1877,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         approval_server_addr,
         fido2: fido2_approvals,
         federation: federation_status,
+        attestation,
     });
 
     // Shutdown coordination: watch channel + active connection counter.
@@ -4090,6 +4155,50 @@ async fn handle_request(
                     )
                 }
                 Err(e) => Response::err(Some(req.id), "not_found", format!("{e}")),
+            }
+        }
+        "attestation_report" => {
+            // Read-only posture proof. Deliberately NOT approval-gated: a
+            // verifier or auditor must be able to ask an unhealthy daemon
+            // for its posture, and the report's contents are the daemon's
+            // own state, never secrets. Freshness and authenticity come from
+            // the caller's nonce and the signature.
+            let nonce = req
+                .params
+                .get("nonce")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            if nonce.len() < 16
+                || nonce.len() > 128
+                || !nonce.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                return Response::err(
+                    Some(req.id),
+                    "bad_request",
+                    "'nonce' must be 16-128 hex characters (caller-chosen, anti-replay)",
+                );
+            }
+            match state.attestation.report(&nonce) {
+                Ok(report) => {
+                    emit_daemon_method_audit(
+                        state,
+                        AuditEventKind::OperationSucceeded,
+                        "attestation_report",
+                        identity,
+                        client_type,
+                        "report_issued",
+                        None,
+                    );
+                    Response::ok(
+                        req.id,
+                        serde_json::json!({
+                            "report": report,
+                            "attestation_key": state.attestation.public_key_hex(),
+                        }),
+                    )
+                }
+                Err(e) => Response::err(Some(req.id), "internal", e),
             }
         }
         "fido2_register_start" => {
@@ -6449,6 +6558,16 @@ exe_sha256 = "deadbeef"
             approval_server_addr: None,
             fido2: None,
             federation: Arc::new(federation::FederationStatus::default()),
+            attestation: Arc::new(attest::AttestationService::new(
+                ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]),
+                PathBuf::from("/nonexistent"),
+                PathBuf::from("/nonexistent/config.toml"),
+                PathBuf::from("/nonexistent/audit.db"),
+                "test".into(),
+                false,
+                vec![],
+                Arc::new(federation::FederationStatus::default()),
+            )),
         }
     }
 
