@@ -1,0 +1,27 @@
+# Cloudflare Pages — opaque.info
+#
+# Pages reads the output directory from this file; the rest of the build is
+# configured once in the dashboard (Workers & Pages → the project → Settings →
+# Build), because Pages does not read those from the repository:
+#
+#   Framework preset:        None
+#   Build command:           uv pip install --system -r docs/requirements.txt && mkdocs build --strict
+#   Build output directory:  site
+#   Root directory:          /
+#
+# If the Pages build image ever lacks uv, `python -m pip install -r
+# docs/requirements.txt` is an exact substitute — every version is pinned in
+# that file, so the resolved set is identical either way.
+#
+# --strict is deliberate: a broken internal link or an unknown config key fails
+# the deploy instead of shipping a site with dead links. Python comes from
+# .python-version.
+#
+# The same build runs in .github/workflows/pages.yml, which publishes the
+# mirror at kcirtapfromspace.github.io/opaque. Canonical URLs and the sitemap
+# point at opaque.info (mkdocs.yml `site_url`), so the mirror never competes
+# with the real site in search results.
+
+name = "opaque"
+pages_build_output_dir = "site"
+compatibility_date = "2026-09-03"
