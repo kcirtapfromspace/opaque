@@ -56,6 +56,16 @@ fn chmod(path: &Path, mode: u32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
+/// Copy the daemon binary into the (world-traversable) test base and return
+/// the copy's path. The cargo target dir may live under a 0750 home (GitHub
+/// runners), where uid 7381 cannot even traverse to exec the original.
+fn stage_daemon_binary(base: &Path) -> PathBuf {
+    let dst = base.join("opaqued");
+    std::fs::copy(env!("CARGO_BIN_EXE_opaqued"), &dst).expect("stage daemon binary");
+    chmod(&dst, 0o755);
+    dst
+}
+
 /// Run a probe command as the given principal, returning (success, output).
 fn run_as(uid: u32, gid: u32, supplementary: &[u32], argv: &[&str]) -> (bool, String) {
     let mut cmd = Command::new(argv[0]);
@@ -124,13 +134,14 @@ impl SplitDaemon {
         // Spawn via setpriv (util-linux) rather than a pre_exec setuid dance:
         // it is exactly what the container entrypoints do, and what the
         // manual reproduction validated.
+        let daemon_bin = stage_daemon_binary(base);
         let log = base.join(format!("daemon-{:04x}.log", rand_u32() & 0xffff));
         let log_file = std::fs::File::create(&log).unwrap();
         let mut cmd = Command::new("setpriv");
         cmd.arg(format!("--reuid={DAEMON_UID}"))
             .arg(format!("--regid={DAEMON_UID}"))
             .arg(format!("--groups={SOCKET_GID}"))
-            .arg(env!("CARGO_BIN_EXE_opaqued"))
+            .arg(&daemon_bin)
             .env_clear()
             .env("HOME", &home)
             .env("OPAQUE_CONFIG", &config_path)
@@ -580,7 +591,8 @@ async fn split_daemon_refuses_stolen_custody() {
     chown(&config_path, DAEMON_UID, DAEMON_UID);
     chmod(&config_path, 0o600);
 
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_opaqued"));
+    let daemon_bin = stage_daemon_binary(&base);
+    let mut cmd = Command::new(&daemon_bin);
     cmd.env_clear()
         .env("HOME", &home)
         .env("OPAQUE_CONFIG", &config_path)
