@@ -806,7 +806,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
                     "environment": {"type": "string"}
                 }
             })),
-            allowed_target_keys: vec!["repo".into()],
+            allowed_target_keys: vec!["repo".into(), "secret_name".into(), "environment".into()],
             secret_ref_param_keys: vec!["value_ref".into(), "github_token_ref".into()],
         })
         .map_err(std::io::Error::other)?;
@@ -829,7 +829,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
                     "selected_repository_ids": {"type": "array", "items": {"type": "integer"}}
                 }
             })),
-            allowed_target_keys: vec!["repo".into()],
+            allowed_target_keys: vec!["repo".into(), "secret_name".into()],
             secret_ref_param_keys: vec!["value_ref".into(), "github_token_ref".into()],
         })
         .map_err(std::io::Error::other)?;
@@ -851,7 +851,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
                     "github_token_ref": {"type": "string"}
                 }
             })),
-            allowed_target_keys: vec!["repo".into()],
+            allowed_target_keys: vec!["repo".into(), "secret_name".into()],
             secret_ref_param_keys: vec!["value_ref".into(), "github_token_ref".into()],
         })
         .map_err(std::io::Error::other)?;
@@ -875,7 +875,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
                     "selected_repository_ids": {"type": "array", "items": {"type": "integer"}}
                 }
             })),
-            allowed_target_keys: vec!["org".into()],
+            allowed_target_keys: vec!["org".into(), "secret_name".into()],
             secret_ref_param_keys: vec!["value_ref".into(), "github_token_ref".into()],
         })
         .map_err(std::io::Error::other)?;
@@ -921,7 +921,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
                     "github_token_ref": {"type": "string"}
                 }
             })),
-            allowed_target_keys: vec!["repo".into(), "org".into()],
+            allowed_target_keys: vec!["repo".into(), "org".into(), "secret_name".into()],
             secret_ref_param_keys: vec!["github_token_ref".into()],
         })
         .map_err(std::io::Error::other)?;

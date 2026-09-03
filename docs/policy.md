@@ -58,9 +58,10 @@ Each `[[rules]]` has:
 Nested tables:
 
 - `[rules.client]`: match on client identity (`uid`, `exe_path`, `exe_sha256`, `codesign_team_id`)
-- `[rules.target]`: match on operation target fields (glob patterns)
+- `[rules.target]`: match on operation target fields (glob patterns) — each operation declares which keys it accepts (`repo`, `secret_name`, `environment`, `org`, `project`, …; see [operations](operations.md))
 - `[rules.workspace]`: match on git workspace context (`remote_url_pattern`, `branch_pattern`, `require_clean`)
 - `[rules.secret_names]`: constrain referenced secret *names* (not values) via glob patterns
+- `[rules.identity]`: match on the verified principal — `principal`, `roles`, `access_modes`, `require_principal`, and `teams` (membership comes from the applied [federation bundle](federation.md), resolved daemon-side per request and never supplied by a client). Any constraint here demands a verified principal, so these rules fail closed.
 - `[rules.approval]`: operation-bound approval requirements
 
 Note: `secret_names` enforcement currently depends on `secret_ref_names` being populated on the request. Some convenience wrappers (e.g., `exec`, `github`, `onepassword`) do not currently provide reliable `secret_ref_names`, so `secret_names` should be treated as best-effort until that is fixed (see the latest [security review](security-assessment.md)).

@@ -1,0 +1,416 @@
+{% extends "main.html" %}
+
+{% block extrahead %}
+  {{ super() }}
+  <style>
+    /* Landing page only: collapse the (empty) main content area */
+    .md-main {
+      display: none;
+    }
+  </style>
+{% endblock %}
+
+{% block site_nav %}{% endblock %}
+
+{% block container %}{% endblock %}
+
+{% block tabs %}
+  {{ super() }}
+  <div class="op-home">
+
+    <!-- Hero -->
+    <section class="op-hero" id="op-hero">
+      <div class="op-wrap op-hero__grid">
+        <div>
+          <h1>
+            Agents get operations.<br>
+            <span class="op-redact">Never plaintext.</span>
+          </h1>
+          <p class="op-hero__lede">
+            Opaque is a <strong>local, approval-gated secrets broker</strong> for Claude Code,
+            Codex, and any MCP client &mdash; the identity-and-policy control plane in front of
+            your secrets provider. The model asks for an operation; the daemon checks policy,
+            takes a human approval out of band, executes, sanitizes the response, and writes
+            the whole thing to a tamper-evident audit chain.
+          </p>
+          <div class="op-actions">
+            <a class="op-btn op-btn--solid" href="{{ 'getting-started/' | url }}">Get started</a>
+            <a class="op-btn" href="{{ config.repo_url }}">View on GitHub</a>
+          </div>
+          <div class="op-install-line">
+            <code>brew install kcirtapfromspace/tap/opaque</code>
+            <button class="op-copy" type="button" data-copy="brew install kcirtapfromspace/tap/opaque">Copy</button>
+          </div>
+          <p class="op-meta">
+            Free under BUSL-1.1 for individuals and organizations under 10 developers.
+            macOS (Apple&nbsp;Silicon, Intel) and Linux.
+          </p>
+        </div>
+        <figure class="op-terminal" role="img"
+                aria-label="Terminal session: an agent-issued opaque command passes policy, a paired-device approval, execution, and sanitization; the secret value is shown redacted; opaque audit verify reports the chain intact.">
+          <figcaption class="op-terminal__bar"><i></i><i></i><i></i>opaqued &mdash; local session</figcaption>
+          <pre aria-hidden="true"><span class="t-dim">$</span> <span class="t-cmd">opaque github set-secret \
+    --repo myorg/api \
+    --secret-name DEPLOY_KEY \
+    --value-ref keychain:opaque/deploy-key</span>
+
+<span class="t-stage">policy</span>    allow-github-actions-secret  <span class="t-dim">matched</span>
+<span class="t-stage">approval</span>  paired device ed25519        <span class="t-ok">hum_9f42</span>
+<span class="t-stage">execute</span>   github.set_actions_secret    <span class="t-dim">myorg/api</span>
+<span class="t-stage">sanitize</span>  value <span class="t-mask">████████████</span>           <span class="t-dim">scrubbed</span>
+<span class="t-stage">audit</span>     record 4182, hmac chain      <span class="t-dim">appended</span>
+
+<span class="t-dim">$</span> <span class="t-cmd">opaque audit verify</span>
+<span class="t-ok">Audit chain intact — 4182 records verified</span></pre>
+        </figure>
+      </div>
+    </section>
+
+    <!-- Pipeline -->
+    <section id="op-pipeline">
+      <div class="op-wrap">
+        <div class="op-kicker">
+          <h2>Every operation clears five gates</h2>
+          <p>
+            There is no fast path. An operation either takes this route through the daemon,
+            or it does not happen.
+          </p>
+        </div>
+        <ol class="op-rail">
+          <li>
+            <h3>Policy</h3>
+            <p>
+              Deny by default. Allowlist rules match the operation, the client's verified
+              executable identity, the workspace, and the principal's live roles.
+              Identity constraints fail closed.
+            </p>
+          </li>
+          <li>
+            <h3>Approval</h3>
+            <p>
+              Out of band and operation-bound: Touch&nbsp;ID, polkit, a paired device, or a
+              FIDO2 key. Each approval is bound to a content hash of exactly what it
+              authorizes.
+            </p>
+          </li>
+          <li>
+            <h3>Execute</h3>
+            <p>
+              The daemon performs the operation itself, against the provider. Plaintext never
+              enters the agent's process; sandboxed exec runs under bubblewrap, Landlock,
+              and seccomp.
+            </p>
+          </li>
+          <li>
+            <h3>Sanitize</h3>
+            <p>
+              Responses pass typestate-enforced sanitization &mdash; returning an unsanitized
+              response is a compile error &mdash; plus secret-pattern scrubbing.
+            </p>
+          </li>
+          <li>
+            <h3>Audit</h3>
+            <p>
+              Every event lands in an HMAC hash chain in SQLite, with correlation IDs and
+              the approver's identity. One command verifies the chain end to end.
+            </p>
+          </li>
+        </ol>
+      </div>
+    </section>
+
+    <!-- Differentiators -->
+    <section id="op-features">
+      <div class="op-wrap">
+        <div class="op-kicker">
+          <h2>Built for the case where the agent is the adversary</h2>
+          <p>
+            Accidental disclosure is the easy problem. These guarantees are designed to hold
+            when the process asking for secrets is actively trying to take them.
+          </p>
+        </div>
+        <div class="op-grid">
+          <div class="op-cell">
+            <h3>Trust-domain enforcement</h3>
+            <p>
+              Run the daemon under a dedicated service account &mdash; or in a separate
+              container &mdash; that exclusively owns every key, database, and config.
+              Startup fails closed on any custody violation, and connections from the
+              daemon's own uid are refused. Tamper-evidence becomes tamper-prevention.
+            </p>
+            <samp>[trust_domain] enforce = true</samp>
+          </div>
+          <div class="op-cell">
+            <h3>Signature-bound approvals</h3>
+            <p>
+              A pluggable factor registry: local biometric, a paired second device with
+              Ed25519 decision-bound signatures and a fingerprint-confirmation pairing
+              ceremony, FIDO2 hardware keys and passkeys verified daemon-side. The audit
+              chain records who approved, cryptographically.
+            </p>
+            <samp>approver: paired_device ed25519, verified</samp>
+          </div>
+          <div class="op-cell">
+            <h3>Tamper-evident audit</h3>
+            <p>
+              Structured events under an HMAC hash chain that survives restarts, with
+              correlation IDs and principal snapshots. Tail truncation is detected through
+              an in-database head anchor, and verification is one command.
+            </p>
+            <samp>$ opaque audit verify</samp>
+          </div>
+          <div class="op-cell">
+            <h3>Sandboxed execution</h3>
+            <p>
+              Exec children actually run under bubblewrap with Landlock and seccomp applied.
+              Response sanitization is enforced by the type system: an unsanitized response
+              does not compile.
+            </p>
+            <samp>bwrap + landlock + seccomp</samp>
+          </div>
+          <div class="op-cell">
+            <h3>Identity substrate</h3>
+            <p>
+              Humans log in at your IdP over OIDC &mdash; PKCE, loopback redirect, owned by
+              the daemon, so an agent driving the CLI cannot complete a login. Agents act
+              on-behalf-of via Ed25519 delegation tokens, roles resolve live at request
+              time, and segregation of duties can require a distinct approver.
+            </p>
+            <samp>sub=hum_9f42 act=agt_claude mode=delegated</samp>
+          </div>
+          <div class="op-cell">
+            <h3>Deny-by-default policy</h3>
+            <p>
+              Nothing is allowed until a rule allows it: operations, executables,
+              workspaces, principals, access modes. Presets cover common agent workflows;
+              anything unmatched is denied &mdash; and audited.
+            </p>
+            <samp>operation_pattern = "github.*"</samp>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Trust configurations -->
+    <section id="op-modes">
+      <div class="op-wrap">
+        <div class="op-kicker">
+          <h2>Two trust configurations</h2>
+          <p>
+            Where the daemon runs decides what an attacker holding the agent's uid
+            can touch.
+          </p>
+        </div>
+        <div class="op-modes">
+          <div class="op-mode">
+            <h3>Session mode <small>tamper-evident</small></h3>
+            <p>
+              The default. The daemon runs as your own user, inside your GUI session, and
+              approvals are local: Touch&nbsp;ID on macOS, polkit on Linux. A process
+              sharing your uid could read the chain key and rewrite state &mdash; you would
+              detect it after the fact with <code>opaque audit verify</code>.
+            </p>
+            <samp>~/.opaque, LaunchAgent / systemd --user</samp>
+          </div>
+          <div class="op-mode op-mode--split">
+            <h3>Trust-domain split <small>tamper-prevention</small></h3>
+            <p>
+              The daemon runs as a dedicated service account, or in a separate container
+              that shares only the socket with the agent. Custody files are unreadable and
+              unwritable at the agent's uid &mdash; in containers they have no path at
+              all &mdash; and startup fails closed on any violation. Approvals move to
+              out-of-band factors: a paired device, a FIDO2 key, a passkey.
+            </p>
+            <samp>/etc/opaque, LaunchDaemon / systemd / compose / k8s</samp>
+          </div>
+        </div>
+        <p class="op-modes-note">
+          Every startup records a <code>trust_domain.posture</code> event in the audit
+          chain, so "was the split enforced at the time?" is answerable from the log
+          itself. The two-mode matrix lives in the
+          <a href="{{ 'deployment/' | url }}">deployment guide</a>.
+        </p>
+      </div>
+    </section>
+
+    <!-- Federation -->
+    <section id="op-federation">
+      <div class="op-wrap">
+        <div class="op-kicker">
+          <h2>One signature governs the fleet</h2>
+          <p>
+            The guarantees above hold on one machine. These hold across every machine
+            that runs the daemon &mdash; without a server anyone has to trust.
+          </p>
+        </div>
+        <div class="op-grid">
+          <div class="op-cell">
+            <h3>Signed policy bundles</h3>
+            <p>
+              Your org signs its policy once; every daemon verifies the signature against
+              its trust anchors before the payload is even parsed. Version rollback is
+              refused from custody &mdash; an older bundle, or a different bundle wearing
+              a version already applied, never takes effect. Serve it from any static
+              host: trust comes from the signature, not the channel.
+            </p>
+            <samp>opqb1 &middot; acme v7 &middot; rollback refused</samp>
+          </div>
+          <div class="op-cell">
+            <h3>An audit stream your SIEM can verify</h3>
+            <p>
+              Export tails the hash chain itself, so every record arrives carrying its
+              sequence number and chain hash &mdash; evidence, not a parallel log that
+              can drift. Spool, webhook, or RFC&nbsp;5424 syslog over TLS, each with its
+              own cursor so one dead collector never stalls the rest.
+            </p>
+            <samp>seq=4182 record_hash=9a2b42bf&hellip;</samp>
+          </div>
+          <div class="op-cell">
+            <h3>Prove posture before trust</h3>
+            <p>
+              A daemon re-verifies its own custody and audit chain on an interval and
+              signs the result against a caller's nonce. A key verifier can demand that
+              proof before releasing custody material &mdash; the seam where KMS or
+              SPIFFE/SPIRE plugs in. A tampered daemon cannot quietly collect fresh keys.
+            </p>
+            <samp>$ opaque attest --key &lt;hex&gt;</samp>
+          </div>
+        </div>
+        <p class="op-modes-note">
+          Team rosters ride in the bundle, so a rule can read
+          <code>teams = ["platform"]</code> and membership resolves daemon-side at request
+          time. The whole model is in the
+          <a href="{{ 'federation/' | url }}">federation guide</a>.
+        </p>
+      </div>
+    </section>
+
+    <!-- Providers -->
+    <section id="op-providers">
+      <div class="op-wrap">
+        <div class="op-kicker">
+          <h2>In front of the stores you already use</h2>
+          <p>
+            Opaque brokers operations against your existing providers. The model never
+            sees what is inside them.
+          </p>
+        </div>
+        <ul class="op-chips">
+          <li>GitHub Actions secrets</li>
+          <li>GitLab CI variables</li>
+          <li>1Password</li>
+          <li>Bitwarden Secrets Manager</li>
+          <li>HashiCorp Vault</li>
+          <li>AWS Secrets Manager</li>
+        </ul>
+        <p class="op-clients">
+          Clients on the other side of the socket: an MCP server for Claude Code, a
+          wrapper mode for Codex sessions (<code>opaque agent run -- codex</code>), and a
+          plain CLI for humans.
+        </p>
+      </div>
+    </section>
+
+    <!-- Install -->
+    <section id="op-install">
+      <div class="op-wrap">
+        <div class="op-kicker">
+          <h2>Install</h2>
+          <p>Three binaries: the trusted daemon, the CLI, and the MCP server.</p>
+        </div>
+        <div class="op-install">
+          <div class="op-install__item">
+            <h3>Homebrew (macOS)</h3>
+            <div class="op-install__code">
+              <code>brew install kcirtapfromspace/tap/opaque</code>
+              <button class="op-copy" type="button" data-copy="brew install kcirtapfromspace/tap/opaque">Copy</button>
+            </div>
+          </div>
+          <div class="op-install__item">
+            <h3>Shell script (Linux, macOS)</h3>
+            <div class="op-install__code">
+              <code>curl -sSfL https://raw.githubusercontent.com/kcirtapfromspace/opaque/main/install.sh | sh</code>
+              <button class="op-copy" type="button" data-copy="curl -sSfL https://raw.githubusercontent.com/kcirtapfromspace/opaque/main/install.sh | sh">Copy</button>
+            </div>
+          </div>
+          <div class="op-install__item">
+            <h3>Cargo (from source)</h3>
+            <div class="op-install__code">
+              <code>cargo install --git https://github.com/kcirtapfromspace/opaque.git opaque opaqued opaque-mcp</code>
+              <button class="op-copy" type="button" data-copy="cargo install --git https://github.com/kcirtapfromspace/opaque.git opaque opaqued opaque-mcp">Copy</button>
+            </div>
+          </div>
+        </div>
+        <p class="op-install-notes">
+          <code>opaqued</code> is the trusted daemon (enclave, policy, approvals, audit);
+          <code>opaque</code> is the CLI; <code>opaque-mcp</code> is the MCP server for
+          Claude Code. Service definitions for launchd, systemd, docker-compose, and
+          Kubernetes ship in the repository's <code>deploy/</code> directory.
+        </p>
+        <p class="op-install-notes">
+          Start with a preset &mdash; <code>opaque init --preset github-secrets</code> &mdash;
+          then point your agent at the socket.
+        </p>
+      </div>
+    </section>
+
+    <!-- Documentation -->
+    <section id="op-docs">
+      <div class="op-wrap">
+        <div class="op-kicker">
+          <h2>Documentation</h2>
+        </div>
+        <nav class="op-docs" aria-label="Documentation">
+          <a href="{{ 'tutorial/' | url }}">
+            <h3>Tutorial</h3>
+            <p>Fifteen minutes from install to a secret your agent moved but never saw.</p>
+          </a>
+          <a href="{{ 'getting-started/' | url }}">
+            <h3>Getting started</h3>
+            <p>Install, initialize a preset, and the full command reference.</p>
+          </a>
+          <a href="{{ 'policy/' | url }}">
+            <h3>Policy engine</h3>
+            <p>Rules, presets, identity constraints, and how deny-by-default composes.</p>
+          </a>
+          <a href="{{ 'mcp-integration/' | url }}">
+            <h3>MCP integration</h3>
+            <p>Wire Opaque into Claude Code as an MCP server.</p>
+          </a>
+          <a href="{{ 'identity/' | url }}">
+            <h3>Identity</h3>
+            <p>OIDC login, principals, roles, and on-behalf-of delegation.</p>
+          </a>
+          <a href="{{ 'deployment/' | url }}">
+            <h3>Deployment</h3>
+            <p>Session mode versus the trust-domain split; launchd, systemd, compose, k8s.</p>
+          </a>
+          <a href="{{ 'federation/' | url }}">
+            <h3>Federation</h3>
+            <p>Signed policy for a fleet, verifiable SIEM export, and attestation.</p>
+          </a>
+          <a href="{{ 'architecture/' | url }}">
+            <h3>Architecture</h3>
+            <p>Design goals, the threat model stated honestly, and the enclave layout.</p>
+          </a>
+        </nav>
+      </div>
+    </section>
+
+  </div>
+
+  <script>
+    document.querySelectorAll(".op-copy").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        navigator.clipboard.writeText(btn.getAttribute("data-copy")).then(function () {
+          btn.setAttribute("data-copied", "");
+          btn.textContent = "Copied";
+          window.setTimeout(function () {
+            btn.removeAttribute("data-copied");
+            btn.textContent = "Copy";
+          }, 1600);
+        });
+      });
+    });
+  </script>
+{% endblock %}

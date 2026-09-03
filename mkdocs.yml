@@ -4,22 +4,28 @@ site_url: https://kcirtapfromspace.github.io/opaque/
 repo_url: https://github.com/kcirtapfromspace/opaque
 repo_name: kcirtapfromspace/opaque
 docs_dir: docs
-exclude_docs: README.md
+exclude_docs: |
+  README.md
+  overrides/
 
 theme:
   name: material
+  custom_dir: docs/overrides
   icon:
     logo: material/shield-lock
+  font:
+    text: Archivo
+    code: IBM Plex Mono
   palette:
     - scheme: slate
-      primary: indigo
-      accent: blue
+      primary: custom
+      accent: custom
       toggle:
         icon: material/brightness-4
         name: Switch to light mode
     - scheme: default
-      primary: indigo
-      accent: blue
+      primary: custom
+      accent: custom
       toggle:
         icon: material/brightness-7
         name: Switch to dark mode
@@ -56,6 +62,9 @@ markdown_extensions:
 plugins:
   - search
 
+extra_css:
+  - stylesheets/extra.css
+
 extra:
   social:
     - icon: fontawesome/brands/github
@@ -66,6 +75,7 @@ copyright: "Copyright &copy; 2026 Patrick Deutsch"
 nav:
   - Home: index.md
   - Getting Started:
+      - Tutorial: tutorial.md
       - Quick Start: getting-started.md
       - Demos: demos.md
       - Web Dashboard: web-dashboard.md

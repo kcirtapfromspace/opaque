@@ -291,13 +291,20 @@ pub fn table(headers: &[&str], rows: &[Vec<String>]) {
         return;
     }
 
+    // A cell is one line. Column widths are measured across the whole cell, so
+    // a stray newline both over-widens its column and breaks the row apart.
+    let rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| row.iter().map(|cell| flatten_cell(cell)).collect())
+        .collect();
+
     // Calculate column widths.
     let col_count = headers.len();
     let mut widths: Vec<usize> = headers
         .iter()
         .map(|h| console::measure_text_width(h))
         .collect();
-    for row in rows {
+    for row in &rows {
         for (i, cell) in row.iter().enumerate() {
             if i < col_count {
                 widths[i] = widths[i].max(console::measure_text_width(cell));
@@ -332,7 +339,7 @@ pub fn table(headers: &[&str], rows: &[Vec<String>]) {
     println!("  {}", style(sep).dim());
 
     // Rows.
-    for row in rows {
+    for row in &rows {
         let line: String = row
             .iter()
             .enumerate()
@@ -346,6 +353,17 @@ pub fn table(headers: &[&str], rows: &[Vec<String>]) {
             .join("  ");
         println!("  {line}");
     }
+}
+
+/// Collapse a table cell to a single line, so one row stays one row.
+fn flatten_cell(cell: &str) -> String {
+    if !cell.contains(['\n', '\r']) {
+        return cell.to_owned();
+    }
+    cell.split(['\n', '\r'])
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("  ")
 }
 
 /// Print a numbered step indicator.
@@ -1456,6 +1474,18 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64
+    }
+
+    #[test]
+    fn flatten_cell_keeps_a_row_on_one_line() {
+        // `audit tail` built its WHEN cell as "relative\nabsolute", which split
+        // every row in the rendered table.
+        assert_eq!(
+            flatten_cell("15s ago\n2026-09-03T18:53:40Z"),
+            "15s ago  2026-09-03T18:53:40Z"
+        );
+        assert_eq!(flatten_cell("plain"), "plain");
+        assert_eq!(flatten_cell("trailing\n"), "trailing");
     }
 
     #[test]

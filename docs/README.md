@@ -1,7 +1,10 @@
 # Docs
 
+- [Tutorial: your first gated operation](tutorial.md)
 - [Getting started](getting-started.md)
 - [Policy model + config format](policy.md)
+- [Identity, delegation, and approval factors](identity.md)
+- [Federation: signed policy bundles, SIEM export, attestation](federation.md)
 - [Operations contract](operations.md)
 - [MCP integration (Claude Code)](mcp-integration.md)
 - [Bitwarden Secrets Manager](bitwarden.md)

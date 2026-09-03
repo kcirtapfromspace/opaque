@@ -8,6 +8,10 @@ Opaque is a local secrets broker made of:
 
 Everything flows through `Enclave::execute()` and results are sanitized so plaintext secrets never enter LLM-visible output.
 
+This page is the reference: install, configure, and every command. If you would
+rather learn by doing, the [tutorial](tutorial.md) walks the same ground in 15
+minutes, ending with a real gated operation and a verified audit chain.
+
 ## Build
 
 ```bash
@@ -325,6 +329,29 @@ The daemon writes a local SQLite audit DB at `~/.opaque/audit.db`.
 ./target/release/opaque audit tail --query github --limit 20
 ```
 
+The log is an HMAC hash chain. Verify it — edits, reorderings, deletions, and
+truncation all fail, and the command exits nonzero:
+
+```bash
+./target/release/opaque audit verify
+```
+
+## Fleet Operations
+
+For an org running many daemons, policy arrives as a signed bundle rather than a
+local file, the audit chain streams to a SIEM, and each daemon can prove its
+posture on demand:
+
+```bash
+opaque bundle keygen --out org-signing.key
+opaque bundle sign --manifest policy.toml --key org-signing.key --out policy.bundle
+opaque bundle verify policy.bundle --anchor <hex>
+opaque attest --key <attestation key hex>
+```
+
+See [federation](federation.md) for bundle format, anti-rollback semantics,
+export transports, and the key-release protocol.
+
 ## Environment Variables
 
 - `OPAQUE_CONFIG`: override daemon/CLI config path (default: `~/.opaque/config.toml`)
@@ -337,7 +364,10 @@ The daemon writes a local SQLite audit DB at `~/.opaque/audit.db`.
 
 ## Next
 
+- [Tutorial: your first gated operation](tutorial.md)
 - [MCP integration (Claude Code)](mcp-integration.md)
+- [Identity, delegation, and approval factors](identity.md)
+- [Federation: signed policy, SIEM export, attestation](federation.md)
 - [Bitwarden setup](bitwarden.md)
 - [Demo recordings](demos.md)
 - [Deployment & OS approval backends](deployment.md)
