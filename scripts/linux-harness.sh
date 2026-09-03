@@ -101,18 +101,48 @@ isolation() {
     echo "isolation suite: all suites ran as root and passed"
 }
 
+e2e_split() {
+    # Full split e2e: real daemon as a dedicated uid, custody probes at the
+    # agent uid, signature-bound approval through the real approval server.
+    # Same root requirement and anti-vacuous grep guards as `isolation`.
+    local prefix=()
+    if [ "$(id -u)" -ne 0 ]; then
+        if command -v sudo >/dev/null 2>&1; then
+            prefix=(sudo -E env "PATH=$PATH" "HOME=$HOME"
+                "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}"
+                "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}")
+        else
+            echo "e2e-split needs root (it stages two principals)" >&2
+            exit 1
+        fi
+    fi
+
+    run_one() {
+        "${prefix[@]}" cargo test -p opaqued --test trust_domain_e2e "$1" \
+            -- --ignored --exact --test-threads=1 2>&1 | tee /tmp/e2e-split.out
+        grep -q "test result: ok. 1 passed" /tmp/e2e-split.out || {
+            echo "e2e-split: $1 did not actually run+pass" >&2
+            exit 1
+        }
+    }
+    run_one split_daemon_refuses_stolen_custody || exit 1
+    run_one split_daemon_custody_and_signature_bound_approver || exit 1
+    echo "e2e-split: split daemon verified end to end as root"
+}
+
 case "$CMD" in
     probe) probe ;;
     gate) gate ;;
     test) cargo test "$@" ;;
     isolation) isolation ;;
+    e2e-split) e2e_split ;;
     all)
         probe
         gate
         ;;
     shell) exec bash ;;
     *)
-        echo "unknown subcommand: $CMD (probe|gate|test|isolation|shell|all)" >&2
+        echo "unknown subcommand: $CMD (probe|gate|test|isolation|e2e-split|shell|all)" >&2
         exit 2
         ;;
 esac

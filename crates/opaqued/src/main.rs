@@ -279,6 +279,12 @@ struct SessionDelegation {
 fn main() {
     init_tracing();
 
+    // Process-wide rustls provider, installed once up front: the approval
+    // server builds a rustls ServerConfig directly, which PANICS if no
+    // default provider exists (only reqwest's internal TLS picks one on its
+    // own). Err just means something installed it earlier — fine.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Config is loaded before the async runtime starts because two decisions
     // depend on it while the process is still genuinely single-threaded: the
     // privilege drop (setuid + env repoint must not race other threads) and
@@ -380,8 +386,17 @@ fn load_config(path: &Path) -> DaemonConfig {
                 config
             }
             Err(e) => {
-                warn!("failed to parse config {}: {e}", path.display());
-                DaemonConfig::default()
+                // SECURITY: an unparseable config must be FATAL, never a
+                // silent fall-through to defaults. Defaults mean
+                // trust_domain.enforce=false, require_seal=false, no policy
+                // rules — one typo would quietly dissolve every protection
+                // the operator wrote down. A config that exists but cannot
+                // be honored stops the daemon.
+                eprintln!(
+                    "opaqued: refusing to start: config {} exists but failed to parse: {e}",
+                    path.display()
+                );
+                std::process::exit(1);
             }
         },
         Err(_) => {

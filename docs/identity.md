@@ -123,23 +123,31 @@ how *effective permission = agent ∩ human* is enforced.
 - Every operation record's `client_json` now carries the principal context
   (`sub`, `act`, mode, delegation id, role snapshot).
 - Approvals record **who approved** (`approver_json`): the approving principal,
-  label, and source (`local_bio_session` today; paired-device signatures when
-  the second-device factor lands).
-- Login, logout, role changes, and delegation issue/revoke are audited events.
+  label, and source. Sources today: `local_bio_session` (presence proven,
+  name session-bound), `polkit_account` (polkit-authenticated account),
+  `paired_device` and `fido2` (SIGNATURE-BOUND — the daemon verified the
+  approver's cryptographic response to its own challenge before recording).
+- Login, logout, role changes, and delegation issue/revoke are audited events;
+  every startup records a `trust_domain.posture` event, so "was the split
+  enforced at the time?" is answerable from the log.
 - All new fields are covered by the HMAC hash chain; pre-Phase-1 databases keep
   verifying unchanged (`opaque audit verify`).
 
 ## Threat-model honesty
 
-- **Same-uid caveat (unchanged from Phase 0):** while the daemon shares the
-  agent's uid, all integrity here is tamper-*evident*, not tamper-*proof* — an
-  adversary holding the uid can read keys and rewrite state. The separate
-  service-account trust domain (deferred Phase 0 work) turns these into hard
-  guarantees.
-- **Approver attribution today** is "the device owner passed local biometric
-  while principal X held the active login session" — presence is
-  cryptographically proven, the *name* is session-bound. Cryptographic approver
-  proof (paired-device / FIDO2 signatures) is the next step on this path.
+- **Same-uid caveat, now MODE-DEPENDENT:** while the daemon shares the agent's
+  uid (session mode), integrity here is tamper-*evident*, not tamper-*proof* —
+  an adversary holding the uid can read keys and rewrite state. Under the
+  trust-domain split (`[trust_domain] enforce = true` — see
+  docs/deployment.md), the custody files are unreadable and unwritable at the
+  agent's uid and startup fails closed on any violation: the same guarantees
+  become tamper-*prevention*, verified end to end by the Linux e2e suite
+  (`scripts/linux-harness.sh e2e-split`).
+- **Approver attribution** depends on the factor: `local_bio_session` proves
+  presence with a session-bound name; `paired_device`/`fido2` approvers are
+  cryptographically verified — an Ed25519 or P-256 signature over the
+  daemon-issued, decision-bound challenge, checked against the pairing or
+  credential store before the approval settles.
 - The loopback redirect follows RFC 8252: `state` binds the callback to the
   attempt, PKCE binds the code to the daemon, and the ID token's `nonce`, `iss`,
   `aud`, signature, and expiry are all verified against the IdP's JWKS.

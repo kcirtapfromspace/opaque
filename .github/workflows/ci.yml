@@ -67,8 +67,8 @@ jobs:
       - name: Multi-uid isolation suite (custody + privilege drop, as root)
         run: ./scripts/linux-harness.sh isolation
 
-      # Later stages append their suites here (sandbox enforcement,
-      # trust-domain e2e) via the same harness entry points.
+      - name: Trust-domain split e2e (real daemon, two uids, signed approver)
+        run: ./scripts/linux-harness.sh e2e-split
 
   supply-chain:
     runs-on: ubuntu-latest

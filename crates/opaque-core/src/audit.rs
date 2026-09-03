@@ -843,9 +843,10 @@ fn hmac_key_path(db_path: &Path) -> PathBuf {
 /// file beside the database, so a process running as the daemon's own uid can read
 /// it. At a shared uid the chain is therefore tamper-*evident* (it detects casual,
 /// partial, or non-key-holder tampering) but not tamper-*proof* against an adversary
-/// that also reads the key. Running the daemon under a dedicated service account
-/// (so the key is not readable by the agent's uid), or moving the key into the OS
-/// keychain, closes that gap — see the integrity roadmap.
+/// that also reads the key. Under the trust-domain split
+/// (`[trust_domain] enforce = true`), the key is part of the daemon's custody set —
+/// unreadable at the agent's uid and ownership-verified at every startup — which
+/// closes that gap; see docs/deployment.md.
 fn load_or_create_hmac_key(db_path: &Path) -> Result<[u8; 32], AuditError> {
     let path = hmac_key_path(db_path);
     if let Ok(bytes) = std::fs::read(&path)
@@ -1367,6 +1368,20 @@ impl SqliteAuditSink {
              FROM audit_events",
             [],
         )?;
+
+        // Resume sequence numbering after the existing tail. Restarting at 0
+        // (the original bug) makes every daemon RESTART write duplicate
+        // sequence numbers into the chain — verification orders by sequence,
+        // so the restarted log reads as scrambled/tampered even though every
+        // record hash still links by insertion order.
+        let next_sequence: u64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(sequence_number), -1) + 1 FROM audit_events",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|v| v.max(0) as u64)
+            .unwrap_or(0);
         drop(conn);
 
         let (sender, receiver) = std::sync::mpsc::sync_channel::<AuditEvent>(capacity);
@@ -1408,7 +1423,7 @@ impl SqliteAuditSink {
 
         Ok(Self {
             sender,
-            next_sequence: AtomicU64::new(0),
+            next_sequence: AtomicU64::new(next_sequence),
             dropped_count,
             writer_handle: std::sync::Mutex::new(Some(writer_handle)),
             drop_monitor_handle: std::sync::Mutex::new(Some(drop_monitor_handle)),
@@ -2587,6 +2602,46 @@ mod tests {
         assert!(v.ok, "clean log should verify: {:?}", v.detail);
         assert_eq!(v.records_checked, 3);
         assert!(v.first_bad_sequence.is_none());
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(hmac_key_path(&db_path));
+    }
+
+    #[test]
+    fn audit_chain_survives_daemon_restart() {
+        // REGRESSION (found by the trust-domain e2e): the sink used to reset
+        // its sequence counter to 0 on every open, so a restarted daemon
+        // wrote duplicate sequence numbers into the chain and verification —
+        // which orders by sequence — read the log as scrambled.
+        let db_path = temp_db_path();
+
+        let sink = SqliteAuditSink::new(db_path.clone(), 90).unwrap();
+        sink.emit(make_test_event(AuditEventKind::RequestReceived));
+        sink.emit(make_test_event(AuditEventKind::OperationSucceeded));
+        drop(sink); // daemon shutdown
+
+        // Daemon restart: a fresh sink over the same database.
+        let sink = SqliteAuditSink::new(db_path.clone(), 90).unwrap();
+        sink.emit(make_test_event(AuditEventKind::RequestReceived));
+        sink.emit(make_test_event(AuditEventKind::OperationSucceeded));
+        drop(sink);
+
+        // Sequences must be strictly increasing across the restart…
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let seqs: Vec<i64> = conn
+            .prepare("SELECT sequence_number FROM audit_events ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(seqs, vec![0, 1, 2, 3], "restart must resume numbering");
+        drop(conn);
+
+        // …and the chain must verify end to end.
+        let v = verify_audit_chain(&db_path).unwrap();
+        assert!(v.ok, "restarted log must verify: {:?}", v.detail);
+        assert_eq!(v.records_checked, 4);
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(hmac_key_path(&db_path));
