@@ -23,11 +23,15 @@ Policy → Approval → Execute → Sanitize → Audit.
   children; typestate-enforced response sanitization.
 - **Identity substrate** — OIDC human login (PKCE, daemon-owned), Ed25519
   delegation tokens, live role resolution, segregation of duties.
+- **Federation** — one org signature carries policy to a whole fleet, with
+  anti-rollback enforcement; the audit chain exports to your SIEM in a form it
+  can verify; daemons prove their posture before receiving key material.
 - **Providers** — GitHub Actions secrets, GitLab CI variables, 1Password,
   Bitwarden Secrets Manager, HashiCorp Vault, AWS Secrets Manager.
 
 Install: `brew install kcirtapfromspace/tap/opaque`, the shell installer, or
-`cargo install`. Licensed BUSL-1.1. See [getting started](getting-started.md),
-the [policy engine](policy.md), [MCP integration](mcp-integration.md),
-[identity](identity.md), [deployment](deployment.md), and
-[architecture](architecture.md).
+`cargo install`. Licensed BUSL-1.1. New here? Start with the
+[tutorial](tutorial.md). Then: [getting started](getting-started.md), the
+[policy engine](policy.md), [MCP integration](mcp-integration.md),
+[identity](identity.md), [deployment](deployment.md),
+[federation](federation.md), and [architecture](architecture.md).

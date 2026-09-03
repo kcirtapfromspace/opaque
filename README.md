@@ -13,6 +13,9 @@ Opaque sits between your AI coding assistant and your secrets. LLMs get **operat
 
 **Policy -> Approval -> Execute -> Sanitize -> Audit**
 
+New here? The [15-minute tutorial](docs/tutorial.md) takes you from install to a
+secret your agent moved but never saw, with an audit chain proving it.
+
 ## Features
 
 - Deny-by-default policy engine with allowlist rules
@@ -22,6 +25,7 @@ Opaque sits between your AI coding assistant and your secrets. LLMs get **operat
 - Tamper-evident HMAC audit chain (SQLite) with `opaque audit verify`, restart-safe sequencing, and correlation IDs
 - Sandboxed execution: bubblewrap + Landlock + seccomp applied to every exec child; typestate-enforced response sanitization + secret-pattern scrubbing
 - Client identity from Unix peer creds + executable identity (path/hash, optional macOS Team ID)
+- **Federation**: one org signature carries policy to a whole fleet (`opqb1` bundles, verified before parsing, with anti-rollback and substitution refusal enforced from custody); the audit chain exports to SIEM over spool/webhook/TLS syslog carrying each record's sequence number and hash; daemons produce signed posture attestations and can be required to prove posture before receiving key material (`docs/federation.md`)
 - MCP server for Claude Code integration
 - Providers: GitHub secrets, GitLab CI variables, 1Password, Bitwarden Secrets Manager, HashiCorp Vault, AWS Secrets Manager
 - Policy presets for common workflows; deploy templates for systemd, launchd, docker-compose, and Kubernetes (`deploy/`)
@@ -187,6 +191,7 @@ opaque policy preset github-secrets
 ## Docs
 
 - [Docs index](docs/README.md)
+- [Tutorial: your first gated operation](docs/tutorial.md)
 - [Getting started](docs/getting-started.md)
 - [MCP integration](docs/mcp-integration.md)
 - [Bitwarden setup](docs/bitwarden.md)

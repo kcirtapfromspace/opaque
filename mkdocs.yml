@@ -75,6 +75,7 @@ copyright: "Copyright &copy; 2026 Patrick Deutsch"
 nav:
   - Home: index.md
   - Getting Started:
+      - Tutorial: tutorial.md
       - Quick Start: getting-started.md
       - Demos: demos.md
       - Web Dashboard: web-dashboard.md

@@ -233,6 +233,58 @@
       </div>
     </section>
 
+    <!-- Federation -->
+    <section id="op-federation">
+      <div class="op-wrap">
+        <div class="op-kicker">
+          <h2>One signature governs the fleet</h2>
+          <p>
+            The guarantees above hold on one machine. These hold across every machine
+            that runs the daemon &mdash; without a server anyone has to trust.
+          </p>
+        </div>
+        <div class="op-grid">
+          <div class="op-cell">
+            <h3>Signed policy bundles</h3>
+            <p>
+              Your org signs its policy once; every daemon verifies the signature against
+              its trust anchors before the payload is even parsed. Version rollback is
+              refused from custody &mdash; an older bundle, or a different bundle wearing
+              a version already applied, never takes effect. Serve it from any static
+              host: trust comes from the signature, not the channel.
+            </p>
+            <samp>opqb1 &middot; acme v7 &middot; rollback refused</samp>
+          </div>
+          <div class="op-cell">
+            <h3>An audit stream your SIEM can verify</h3>
+            <p>
+              Export tails the hash chain itself, so every record arrives carrying its
+              sequence number and chain hash &mdash; evidence, not a parallel log that
+              can drift. Spool, webhook, or RFC&nbsp;5424 syslog over TLS, each with its
+              own cursor so one dead collector never stalls the rest.
+            </p>
+            <samp>seq=4182 record_hash=9a2b42bf&hellip;</samp>
+          </div>
+          <div class="op-cell">
+            <h3>Prove posture before trust</h3>
+            <p>
+              A daemon re-verifies its own custody and audit chain on an interval and
+              signs the result against a caller's nonce. A key verifier can demand that
+              proof before releasing custody material &mdash; the seam where KMS or
+              SPIFFE/SPIRE plugs in. A tampered daemon cannot quietly collect fresh keys.
+            </p>
+            <samp>$ opaque attest --key &lt;hex&gt;</samp>
+          </div>
+        </div>
+        <p class="op-modes-note">
+          Team rosters ride in the bundle, so a rule can read
+          <code>teams = ["platform"]</code> and membership resolves daemon-side at request
+          time. The whole model is in the
+          <a href="{{ 'federation/' | url }}">federation guide</a>.
+        </p>
+      </div>
+    </section>
+
     <!-- Providers -->
     <section id="op-providers">
       <div class="op-wrap">
@@ -309,9 +361,13 @@
           <h2>Documentation</h2>
         </div>
         <nav class="op-docs" aria-label="Documentation">
+          <a href="{{ 'tutorial/' | url }}">
+            <h3>Tutorial</h3>
+            <p>Fifteen minutes from install to a secret your agent moved but never saw.</p>
+          </a>
           <a href="{{ 'getting-started/' | url }}">
             <h3>Getting started</h3>
-            <p>Install, initialize a preset, and run your first gated operation.</p>
+            <p>Install, initialize a preset, and the full command reference.</p>
           </a>
           <a href="{{ 'policy/' | url }}">
             <h3>Policy engine</h3>
@@ -328,6 +384,10 @@
           <a href="{{ 'deployment/' | url }}">
             <h3>Deployment</h3>
             <p>Session mode versus the trust-domain split; launchd, systemd, compose, k8s.</p>
+          </a>
+          <a href="{{ 'federation/' | url }}">
+            <h3>Federation</h3>
+            <p>Signed policy for a fleet, verifiable SIEM export, and attestation.</p>
           </a>
           <a href="{{ 'architecture/' | url }}">
             <h3>Architecture</h3>
