@@ -11,7 +11,9 @@
 #   mkdocs build --strict
 #   wrangler pages deploy            # directory and project come from this file
 #
-# One-time setup, if the project does not exist yet:
+# The project already exists as a direct-upload project (no Git provider), with
+# opaque.info and www.opaque.info attached and `main` as its production branch —
+# so a deploy on any other branch is automatically a preview. To recreate it:
 #
 #   wrangler pages project create opaque   # production branch: main
 #
