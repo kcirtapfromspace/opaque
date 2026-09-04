@@ -1,26 +1,28 @@
 # Cloudflare Pages — opaque.info
 #
-# Pages reads the output directory from this file; the rest of the build is
-# configured once in the dashboard (Workers & Pages → the project → Settings →
-# Build), because Pages does not read those from the repository:
+# The site is published by direct upload from CI
+# (.github/workflows/deploy-site.yml), so the whole pipeline lives in this
+# repository rather than half of it in a dashboard. A push to main publishes
+# production; every other ref publishes a preview under its own URL.
 #
-#   Framework preset:        None
-#   Build command:           uv pip install --system -r docs/requirements.txt && mkdocs build --strict
-#   Build output directory:  site
-#   Root directory:          /
+# Deploying by hand does the same thing:
 #
-# If the Pages build image ever lacks uv, `python -m pip install -r
-# docs/requirements.txt` is an exact substitute — every version is pinned in
-# that file, so the resolved set is identical either way.
+#   uv pip install -r docs/requirements.txt
+#   mkdocs build --strict
+#   wrangler pages deploy            # directory and project come from this file
 #
-# --strict is deliberate: a broken internal link or an unknown config key fails
-# the deploy instead of shipping a site with dead links. Python comes from
-# .python-version.
+# The project already exists as a direct-upload project (no Git provider), with
+# opaque.info and www.opaque.info attached and `main` as its production branch —
+# so a deploy on any other branch is automatically a preview. To recreate it:
 #
-# The same build runs in .github/workflows/pages.yml, which publishes the
-# mirror at kcirtapfromspace.github.io/opaque. Canonical URLs and the sitemap
-# point at opaque.info (mkdocs.yml `site_url`), so the mirror never competes
-# with the real site in search results.
+#   wrangler pages project create opaque   # production branch: main
+#
+# and in CI, two repository secrets: CLOUDFLARE_API_TOKEN (Account → Cloudflare
+# Pages → Edit) and CLOUDFLARE_ACCOUNT_ID. Without them the workflow still
+# builds — it just skips the upload instead of failing.
+#
+# Canonical URLs and the sitemap point at opaque.info (mkdocs.yml `site_url`),
+# so the GitHub Pages mirror never competes with it in search results.
 
 name = "opaque"
 pages_build_output_dir = "site"
