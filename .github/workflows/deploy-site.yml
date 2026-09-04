@@ -72,6 +72,49 @@ jobs:
           safe=$(printf '%s' "$RAW_REF" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-60)
           echo "DEPLOY_BRANCH=$safe" >> "$GITHUB_ENV"
 
+      # Wrangler reports every credential problem as "Authentication error
+      # [code: 10000]", which does not distinguish a bad token value from a
+      # valid token that lacks Pages access. This asks the API both questions
+      # directly and says which one failed. Only status codes are ever printed.
+      - name: Check Cloudflare credentials
+        if: env.CAN_DEPLOY == 'true'
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          api=https://api.cloudflare.com/client/v4
+          code() { curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $CF_TOKEN" "$1"; }
+
+          verify=$(code "$api/user/tokens/verify")
+          project=$(code "$api/accounts/$CF_ACCOUNT/pages/projects/opaque")
+          echo "token verify: HTTP $verify | pages project: HTTP $project"
+
+          if [ "$verify" != "200" ]; then
+            {
+              echo "### Cloudflare token rejected outright (HTTP $verify)"
+              echo ""
+              echo "\`CLOUDFLARE_API_TOKEN\` is not a valid API token. Usually one of:"
+              echo "- a trailing newline in the secret — set it with \`printf '%s' \"\$TOKEN\" | gh secret set CLOUDFLARE_API_TOKEN\`"
+              echo "- it is the **Global API Key**, which cannot be used as a bearer token"
+              echo "- the token was revoked or has expired"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          if [ "$project" != "200" ]; then
+            {
+              echo "### Token is valid but cannot reach the Pages project (HTTP $project)"
+              echo ""
+              echo "It needs **Account → Cloudflare Pages → Edit**, on the account holding the"
+              echo "\`opaque\` project. The \"Edit Cloudflare Workers\" template does not include Pages."
+              echo ""
+              echo "If the permission looks right, check \`CLOUDFLARE_ACCOUNT_ID\` names the same account."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo "Credentials OK: token valid, Pages project reachable." >> "$GITHUB_STEP_SUMMARY"
+
       - name: Deploy to Cloudflare Pages
         if: env.CAN_DEPLOY == 'true'
         uses: cloudflare/wrangler-action@v4
