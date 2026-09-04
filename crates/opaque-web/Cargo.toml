@@ -1,6 +1,6 @@
 [package]
 name = "opaque-web"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 publish = false
 description = "Web dashboard for Opaque — real-time monitoring and onboarding UI"

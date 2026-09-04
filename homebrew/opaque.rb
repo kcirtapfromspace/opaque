@@ -5,7 +5,7 @@
 class Opaque < Formula
   desc "Approval-gated secrets broker for AI coding tools"
   homepage "https://github.com/kcirtapfromspace/opaque"
-  version "0.1.0"
+  version "0.2.0"
   license "BUSL-1.1"
 
   on_macos do

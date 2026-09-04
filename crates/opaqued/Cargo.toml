@@ -1,6 +1,6 @@
 [package]
 name = "opaqued"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 publish = false
 description = "Opaque daemon — policy engine, approval orchestration, and provider execution"

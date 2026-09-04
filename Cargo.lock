@@ -1940,7 +1940,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "opaque"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1967,11 +1967,11 @@ dependencies = [
 
 [[package]]
 name = "opaque-approve-helper"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "opaque-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -2001,7 +2001,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "opaque-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "futures-util",
@@ -2018,7 +2018,7 @@ dependencies = [
 
 [[package]]
 name = "opaque-web"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "bytes",
@@ -2040,7 +2040,7 @@ dependencies = [
 
 [[package]]
 name = "opaqued"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
