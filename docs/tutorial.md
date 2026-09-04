@@ -50,7 +50,8 @@ agent sees carries no secret material.
 Check all three binaries are on your PATH:
 
 ```sh
-opaque --version && opaqued --version
+opaque --version
+command -v opaqued opaque-mcp
 ```
 
 ---

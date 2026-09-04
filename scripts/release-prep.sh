@@ -84,27 +84,9 @@ if n != 1:
 p.write_text(new)
 PY
 
-# 4. The Homebrew formula pins the version it downloads, so it drifts silently
-#    if left out of the bump.
-if [ -f homebrew/opaque.rb ]; then
-  python3 - "$next" <<'PY'
-import pathlib, re, sys
-nxt = sys.argv[1]
-p = pathlib.Path("homebrew/opaque.rb")
-s = p.read_text()
-s2, n = re.subn(r'(?m)^(  version ")[^"]+(")$', rf'\g<1>{nxt}\g<2>', s, count=1)
-if n == 1:
-    p.write_text(s2)
-else:
-    print("release-prep: warning: no version line in homebrew/opaque.rb", file=sys.stderr)
-if "PLACEHOLDER" in s2:
-    print(
-        "release-prep: warning: homebrew/opaque.rb still has PLACEHOLDER checksums — "
-        "`brew install` cannot work until they are filled from the release assets",
-        file=sys.stderr,
-    )
-PY
-fi
+# The Homebrew formula is deliberately NOT touched here: it may only name
+# artifacts that exist, and at this point the release has not been built. It is
+# updated by scripts/update-tap.sh once the release is published.
 
 printf 'release-prep: %s -> %s\n' "$current" "$next" >&2
 echo "version=$next"

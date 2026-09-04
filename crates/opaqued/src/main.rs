@@ -243,6 +243,55 @@ const fn version_string() -> &'static str {
     concat!(env!("CARGO_PKG_VERSION"), "+", env!("OPAQUE_GIT_SHA"))
 }
 
+/// Flags the daemon answers without starting: returns the exit code to stop
+/// with, or `None` to carry on into startup. Unrecognized arguments are left
+/// alone — the daemon's real configuration is the config file, and the one
+/// other flag it reads is scanned for separately at the point it applies.
+fn handle_immediate_flags<I: IntoIterator<Item = String>>(args: I) -> Option<i32> {
+    for arg in args {
+        match arg.as_str() {
+            "--version" | "-V" => {
+                println!("opaqued {}", version_string());
+                return Some(0);
+            }
+            "--help" | "-h" => {
+                print!("{}", usage_text());
+                return Some(0);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// What `opaqued --help` prints. Deliberately short: the daemon takes almost
+/// no arguments, because everything that matters is policy, and policy belongs
+/// in a sealed config file rather than in a command line an agent could shape.
+fn usage_text() -> String {
+    format!(
+        "opaqued {version}
+The Opaque daemon: policy, approvals, execution, and the audit chain.
+
+USAGE:
+    opaqued [OPTIONS]
+
+OPTIONS:
+    --allow-unsealed    Start even though the config carries no valid seal.
+                        Refused outright when trust-domain enforcement is on.
+    -V, --version       Print the version and exit
+    -h, --help          Print this help and exit
+
+ENVIRONMENT:
+    OPAQUE_CONFIG       Config path (default: ~/.opaque/config.toml)
+    XDG_RUNTIME_DIR     Where the socket and daemon token are placed
+    RUST_LOG            Log filter (default: info)
+
+Docs: https://opaque.info/
+",
+        version = version_string()
+    )
+}
+
 struct DaemonState {
     enclave: Arc<Enclave>,
     audit: Arc<dyn AuditSink>,
@@ -297,6 +346,14 @@ struct SessionDelegation {
 // ---------------------------------------------------------------------------
 
 fn main() {
+    // Answered before anything else starts. `opaqued --version` used to fall
+    // through to a full daemon start — binding the socket, verifying custody,
+    // taking the PID lock — which is a startling way to find out what you just
+    // installed.
+    if let Some(code) = handle_immediate_flags(std::env::args().skip(1)) {
+        std::process::exit(code);
+    }
+
     init_tracing();
 
     // Process-wide rustls provider, installed once up front: the approval
