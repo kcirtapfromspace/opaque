@@ -1,6 +1,7 @@
 //! HTTP and durable-ledger regressions for the synthetic bounded-work surface.
 use super::*;
 use opaque_metrics::bounded_demo::{Error, Store, TaskReference, TaskState};
+use webauthn_authenticator_rs::{WebauthnAuthenticator, softpasskey::SoftPasskey};
 
 async fn value(response: Response) -> Value {
     serde_json::from_slice(&to_bytes(response.into_body(), 32768).await.unwrap()).unwrap()
@@ -15,15 +16,84 @@ async fn task(fixture: &Fixture, cookie: &str) -> Value {
 fn reference(task: &Value) -> Value {
     json!({"task_id":task["task_id"],"manifest_sha256":task["manifest_sha256"]})
 }
+fn ledger_approve(
+    store: &mut Store,
+    access: &opaque_metrics::auth::VerifiedAccess,
+    reference: &TaskReference,
+) {
+    let approved_at = now();
+    assert_eq!(
+        store
+            .transition(access, 2, approved_at, reference, TaskState::Approved)
+            .unwrap_err(),
+        Error::Forbidden
+    );
+    store
+        .approve_verified(
+            access,
+            2,
+            approved_at,
+            reference,
+            opaque_metrics::bounded_demo::Approval {
+                kind: "webauthn".into(),
+                approved_at,
+                verification: Some(opaque_metrics::bounded_demo::ApprovalVerification {
+                    issuer: None,
+                    subject: "test-fixture".into(),
+                    credential_sha256: Some("a".repeat(64)),
+                    user_verified: Some(true),
+                }),
+            },
+        )
+        .unwrap();
+}
 async fn approve(fixture: &Fixture, cookie: &str) -> Value {
     let task = task(fixture, cookie).await;
-    let response = fixture
-        .browser("POST", "/api/work-task/approve", cookie, reference(&task))
-        .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let result = value(response).await;
-    assert_eq!(result["state"], "approved");
-    result
+    let mut authenticator = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    for kind in ["registration", "authentication"] {
+        let mut body = reference(&task);
+        body["method"] = json!("passkey");
+        let start = fixture
+            .browser("POST", "/api/work-task/approval/start", cookie, body)
+            .await;
+        assert_eq!(start.status(), StatusCode::OK);
+        let start = value(start).await;
+        assert_eq!(start["kind"], kind);
+        let options = json!({"publicKey":start["public_key"]});
+        let origin = fixture.config.public_origin.parse().unwrap();
+        let credential = if kind == "registration" {
+            serde_json::to_value(
+                authenticator
+                    .do_registration(origin, serde_json::from_value(options).unwrap())
+                    .unwrap(),
+            )
+            .unwrap()
+        } else {
+            serde_json::to_value(
+                authenticator
+                    .do_authentication(origin, serde_json::from_value(options).unwrap())
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let mut body = reference(&task);
+        body["transaction_id"] = start["transaction_id"].clone();
+        body["credential"] = credential;
+        let finish = fixture
+            .browser("POST", "/api/work-task/approval/finish", cookie, body)
+            .await;
+        assert_eq!(finish.status(), StatusCode::OK);
+        let result = value(finish).await;
+        if kind == "registration" {
+            assert_eq!(result["registered"], true);
+            assert_eq!(self::task(fixture, cookie).await["state"], "planned");
+        } else {
+            assert_eq!(result["state"], "approved");
+            assert_eq!(result["approval"]["kind"], "webauthn");
+            return result;
+        }
+    }
+    unreachable!()
 }
 async fn source(fixture: &Fixture, delay: Duration, status: u16) {
     Mock::given(method("POST"))
@@ -70,20 +140,53 @@ async fn bounded_task_exact_manifest_single_use_and_reload() {
     assert_eq!(planned["manifest"]["max_uses"], 1);
     assert_eq!(planned["manifest"]["window_secs"], 60);
     assert_eq!(planned, task(&fixture, &cookie).await);
+    let canonical = planned["manifest_canonical_json"].as_str().unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(canonical).unwrap(),
+        planned["manifest"]
+    );
+    assert_eq!(
+        format!("{:x}", Sha256::digest(canonical.as_bytes())),
+        planned["manifest_sha256"]
+    );
+    assert_eq!(
+        fixture
+            .browser(
+                "POST",
+                "/api/work-task/approve",
+                &cookie,
+                reference(&planned)
+            )
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
     let mut override_request = reference(&planned);
+    override_request["method"] = json!("passkey");
     override_request["tenant_id"] = json!("customer-b");
     assert_eq!(
         fixture
-            .browser("POST", "/api/work-task/approve", &cookie, override_request)
+            .browser(
+                "POST",
+                "/api/work-task/approval/start",
+                &cookie,
+                override_request
+            )
             .await
             .status(),
         StatusCode::UNPROCESSABLE_ENTITY
     );
     let mut wrong_digest = reference(&planned);
     wrong_digest["manifest_sha256"] = json!("0".repeat(64));
+    wrong_digest["method"] = json!("passkey");
     assert_eq!(
         fixture
-            .browser("POST", "/api/work-task/approve", &cookie, wrong_digest)
+            .browser(
+                "POST",
+                "/api/work-task/approval/start",
+                &cookie,
+                wrong_digest
+            )
             .await
             .status(),
         StatusCode::CONFLICT
@@ -121,7 +224,7 @@ async fn bounded_task_exact_manifest_single_use_and_reload() {
     assert!(fixture.source.received_requests().await.unwrap().is_empty());
     source(&fixture, Duration::ZERO, 200).await;
     let approved = approve(&fixture, &cookie).await;
-    assert_eq!(approved["approval"]["kind"], "synthetic_demo_confirmation");
+    assert_eq!(approved["approval"]["kind"], "webauthn");
     let response = fixture
         .browser(
             "POST",
@@ -153,6 +256,34 @@ async fn bounded_task_exact_manifest_single_use_and_reload() {
         StatusCode::CONFLICT
     );
     assert_eq!(fixture.source.received_requests().await.unwrap().len(), 1);
+}
+
+/// Interactive local QA fixture only. Run explicitly with --ignored and use
+/// the private file in the OS temporary directory to attach a test browser.
+#[tokio::test]
+#[ignore = "starts a local browser QA fixture for up to 20 minutes"]
+async fn browser_approval_fixture() {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    let fixture = Fixture::portfolio(false, true).await;
+    let (_, cookie) = org_identity(&fixture, Persona::CustomerAnalyst).await;
+    source(&fixture, Duration::ZERO, 200).await;
+    let path = std::env::temp_dir().join(format!(
+        "opaque-approval-browser-{}.json",
+        std::process::id()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .unwrap();
+    file.write_all(
+        &serde_json::to_vec(&json!({"url":fixture.config.public_origin,"cookie":cookie})).unwrap(),
+    )
+    .unwrap();
+    println!("Browser QA connection file: {}", path.display());
+    tokio::time::sleep(Duration::from_secs(1200)).await;
+    let _ = std::fs::remove_file(path);
 }
 
 #[tokio::test]
@@ -426,9 +557,7 @@ async fn bounded_ledger_restart_expiry_key_binding_and_profile_binding() {
         task_id: planned.task_id.clone(),
         manifest_sha256: planned.manifest_sha256.clone(),
     };
-    store
-        .transition(&access, 2, now(), &reference, TaskState::Approved)
-        .unwrap();
+    ledger_approve(&mut store, &access, &reference);
     store
         .transition(&access, 2, now(), &reference, TaskState::Reserved)
         .unwrap();
@@ -499,9 +628,7 @@ async fn bounded_ledger_restart_expiry_key_binding_and_profile_binding() {
         task_id: planned.task_id,
         manifest_sha256: planned.manifest_sha256,
     };
-    store
-        .transition(&access, 2, now(), &reference, TaskState::Approved)
-        .unwrap();
+    ledger_approve(&mut store, &access, &reference);
     store
         .transition(&access, 2, now(), &reference, TaskState::Reserved)
         .unwrap();
@@ -542,5 +669,55 @@ async fn bounded_ledger_restart_expiry_key_binding_and_profile_binding() {
             .unwrap()
             .receipt
             .is_none()
+    );
+}
+
+#[tokio::test]
+async fn legacy_unsigned_approval_cannot_execute_after_upgrade() {
+    let fixture = Fixture::organization(false).await;
+    let token = fixture.persona_token(Persona::CustomerAnalyst);
+    let verifier = opaque_metrics::auth::AuthVerifier::new(fixture.config.auth.clone()).unwrap();
+    let access = verifier
+        .verify_bearer(Some(&format!("Bearer {token}")))
+        .unwrap();
+    let directory = fixture.config.state_dir.join("legacy-ledger");
+    std::fs::create_dir(&directory).unwrap();
+    let mut store = Store::open(&directory, &fixture.config.source).unwrap();
+    let task = store
+        .current(&access, 2, now(), &fixture.config.source)
+        .unwrap();
+    let reference = TaskReference {
+        task_id: task.task_id,
+        manifest_sha256: task.manifest_sha256,
+    };
+    ledger_approve(&mut store, &access, &reference);
+    drop(store);
+    // Represent an existing record written by the previous click-confirmation
+    // implementation. It must retain no executable authority under the new gate.
+    let connection = rusqlite::Connection::open(directory.join("bounded-demo.sqlite3")).unwrap();
+    let raw: String = connection
+        .query_row("SELECT record FROM task WHERE id=1", [], |row| row.get(0))
+        .unwrap();
+    let mut record: Value = serde_json::from_str(&raw).unwrap();
+    record["task"]["approval"] = json!({"kind":"synthetic_demo_confirmation","approved_at":now()});
+    connection
+        .execute(
+            "UPDATE task SET record=?1 WHERE id=1",
+            [serde_json::to_string(&record).unwrap()],
+        )
+        .unwrap();
+    drop(connection);
+    let mut store = Store::open(&directory, &fixture.config.source).unwrap();
+    assert_eq!(
+        store
+            .transition(&access, 2, now(), &reference, TaskState::Reserved)
+            .unwrap_err(),
+        Error::Conflict
+    );
+    assert!(
+        !store
+            .current(&access, 2, now(), &fixture.config.source)
+            .unwrap()
+            .consumed
     );
 }

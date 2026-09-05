@@ -4,9 +4,9 @@ const path = require('node:path');
 const vm = require('node:vm');
 const {test} = require('node:test');
 
-function ui() {
+function ui(wasmBytes) {
   const html = fs.readFileSync(path.join(__dirname, '../static/index.html'), 'utf8');
-  const source = html.split('<script>')[1].split('</script>')[0].replace(/\ninit\(\);\s*$/, '');
+  const source = html.split('<script>')[1].split('</script>')[0].replace(/\ninit\(\);\s*$/, '').replace('__OPAQUE_APPROVAL_WASM_BYTES__',wasmBytes || '__OPAQUE_APPROVAL_WASM_BYTES__');
   const ids = new Map();
   class Element {
     constructor(tag) {this.tagName=tag;this.children=[];this.dataset={};this.value='';this.hidden=false;this.isConnected=true;this.textContent='';this.style={};}
@@ -17,9 +17,11 @@ function ui() {
     setAttribute(key,value) {this[key]=value;}
     addEventListener() {}
     focus() {}
+    showModal() {this.open=true;}
+    close() {this.open=false;}
   }
   const document = {body:new Element('body'),createElement:tag=>new Element(tag),getElementById:id=>{if(!ids.has(id)) ids.set(id,new Element('div'));return ids.get(id);}};
-  const context = vm.createContext({document,Date,Intl,Map,AbortController,TextDecoder,console,setTimeout:()=>1,clearTimeout(){},setInterval(){}});
+  const context = vm.createContext({document,Date,Intl,Map,AbortController,TextDecoder,TextEncoder,Uint8Array,WebAssembly,crypto:require('node:crypto').webcrypto,atob,btoa,URL,console,setTimeout:()=>1,clearTimeout(){},setInterval(){}});
   vm.runInContext(source,context);
   context.ids=ids;
   return context;
@@ -299,13 +301,13 @@ test('task loading only reads status and never approves or executes on render or
   assert.equal(app.byId('work-notice').textContent,workTask(value).notice);
 });
 
-test('task actions send only the exact reviewed ID and digest and require server confirmation',async()=>{
+test('execution sends only the exact approved ID and digest and requires server confirmation',async()=>{
   const app=ui(),value=workSession();app.renderSession(value);app.state.workTask=app.validateWorkTask(workTask(value));let calls=[];
   app.fetch=async(path,options)=>{calls.push({path,options});return {ok:true,status:200,json:async()=>workTask(value,path.endsWith('approve')?'approved':'completed')};};
   await app.workTaskAction('execute');assert.equal(calls.length,0);
-  await app.workTaskAction('approve');assert.equal(app.state.workTask.state,'approved');assert.equal(app.byId('work-run').hidden,false);
+  app.state.workTask=app.validateWorkTask(workTask(value,'approved'));app.renderWorkTask();assert.equal(app.byId('work-run').hidden,false);
   await app.workTaskAction('execute');assert.equal(app.state.workTask.state,'completed');assert.equal(app.byId('work-receipt').hidden,false);assert.equal(app.byId('work-value').textContent,'18.4%');
-  assert.deepEqual(calls.map(call=>call.path),['/api/work-task/approve','/api/work-task/execute']);
+  assert.deepEqual(calls.map(call=>call.path),['/api/work-task/execute']);
   for(const call of calls){assert.deepEqual(JSON.parse(call.options.body),{task_id:app.state.workTask.task_id,manifest_sha256:'b'.repeat(64)});assert.equal(call.options.credentials,'same-origin');assert.equal(call.options.headers.Authorization,undefined);}
 });
 
@@ -345,3 +347,107 @@ test('returning analyst can display only a revoked older task without its prior 
   assert.equal(app.byId('work-state').textContent,'revoked');assert.equal(app.byId('work-run').hidden,true);assert.equal(app.byId('work-approve').hidden,true);
   revoked.receipt=workTask(earlier,'completed').receipt;assert.throws(()=>app.validateWorkTask(revoked),/earlier identity generation/);
 });
+
+function approvalUI() {
+  const app=ui();app.renderSession(workSession());app.state.workTask=app.validateWorkTask(workTask());
+  // Ceremony UX tests isolate the independently tested WASM review operation.
+  app.reviewApprovalManifest=async()=>{};
+  app.PublicKeyCredential=function(){};app.navigator={credentials:{}};
+  app.fetch=async()=>({ok:true,json:async()=>({passkey:{available:true},oauth:{available:false}})});
+  return app;
+}
+function verifiedTask(kind='webauthn') {
+  const task=workTask(workSession(),'approved');
+  task.approval={kind,approved_at:Math.floor(Date.now()/1000),verification:{issuer:kind==='oidc'?'https://identity.example.com':null,subject:kind==='oidc'?'github-subject':'temporary_demo_visitor',credential_sha256:kind==='webauthn'?'d'.repeat(64):null,user_verified:kind==='webauthn'?true:null}};
+  return task;
+}
+test('opening and cancelling human review cannot call the old unsigned approval endpoint',async()=>{
+  const app=approvalUI(),calls=[];
+  app.fetch=async(path,options)=>{calls.push({path,options});return {ok:true,json:async()=>({passkey:{available:true},oauth:{available:false}})};};
+  await app.workTaskAction('approve');assert.equal(app.byId('approval-window').open,true);
+  assert.equal(app.byId('approval-passkey').disabled,false);assert.equal(app.byId('approval-oauth').disabled,true);
+  app.closeApproval();assert.equal(app.byId('approval-window').open,false);assert.equal(app.state.workTask.state,'planned');
+  assert.equal(calls.length,1);assert.equal(calls[0].path,'/api/work-task/approval');assert.equal(calls[0].options.method,undefined);
+});
+test('a failed review keeps every authentication method disabled',async()=>{
+  const app=approvalUI();app.reviewApprovalManifest=async()=>{throw Error('Digest mismatch');};let calls=0;app.fetch=()=>{calls++;};
+  await app.openApproval();assert.equal(calls,0);assert.equal(app.byId('approval-passkey').disabled,true);assert.equal(app.byId('approval-oauth').disabled,true);assert.match(app.byId('approval-error').textContent,/Digest mismatch/);
+});
+test('passkey registration is followed by fresh authentication before task approval; no execution occurs',async()=>{
+  const app=approvalUI();await app.openApproval();let starts=0,created=0,asserted=0;const calls=[];
+  app.credentialOptions=raw=>raw;
+  app.navigator.credentials={create:async()=>{created++;return {toJSON:()=>({type:'public-key',response:{attestationObject:'registration'}})};},get:async()=>{asserted++;return {toJSON:()=>({type:'public-key',response:{signature:'assertion'}})};}};
+  app.approvalPost=async(path,body)=>{calls.push({path,body});if(path==='start')return {kind:starts++?'authentication':'registration',transaction_id:'ceremony-'+starts,public_key:{}};return body.credential.response.attestationObject?{registered:true}:verifiedTask();};
+  await app.approveWithPasskey();assert.equal(created,1);assert.equal(asserted,1);assert.equal(app.state.workTask.state,'approved');assert.equal(app.byId('approval-window').open,false);
+  assert.deepEqual(calls.map(call=>call.path),['start','finish','start','finish']);
+  assert.ok(calls.every(call=>call.body.task_id===workTask().task_id&&call.body.manifest_sha256==='b'.repeat(64)));
+  assert.match(app.byId('work-human-proof').textContent,/user verification checked by Opaque/);assert.equal(app.byId('work-run').hidden,false);
+});
+test('cancelling native authentication submits no proof and preserves planned state',async()=>{
+  const app=approvalUI();await app.openApproval();let finishes=0;app.credentialOptions=raw=>raw;
+  app.approvalPost=async path=>{if(path==='finish')finishes++;return {kind:'authentication',transaction_id:'challenge',public_key:{}};};
+  app.navigator.credentials.get=async()=>{throw Object.assign(Error('Cancelled'),{name:'NotAllowedError'});};
+  await app.approveWithPasskey();assert.equal(finishes,0);assert.equal(app.state.workTask.state,'planned');assert.match(app.byId('approval-error').textContent,/cancelled or timed out/);
+});
+test('persona change while an authenticator is open discards the late credential',async()=>{
+  const app=approvalUI();await app.openApproval();let resolve,finishes=0;app.credentialOptions=raw=>raw;
+  app.approvalPost=async path=>{if(path==='finish')finishes++;return {kind:'authentication',transaction_id:'challenge',public_key:{}};};
+  app.navigator.credentials.get=()=>new Promise(done=>resolve=done);
+  const pending=app.approveWithPasskey();await new Promise(done=>setImmediate(done));
+  app.renderSession(organizationSession('engineer',2));resolve({toJSON:()=>({response:{signature:'late'}})});await pending;
+  assert.equal(finishes,0);assert.equal(app.approval.open,false);assert.equal(app.state.workTask,null);
+});
+test('expiry aborts the authenticator and disables approval',async()=>{
+  const app=approvalUI();await app.openApproval();const controller=new AbortController();app.approval.controller=controller;
+  app.approval.task.manifest.expires_at=Math.floor(Date.now()/1000)-1;app.tickApproval();
+  assert.equal(controller.signal.aborted,true);assert.equal(app.byId('approval-passkey').disabled,true);assert.equal(app.byId('approval-oauth').disabled,true);
+});
+test('OAuth callback must match the originating popup, exact origin and transaction',async()=>{
+  const app=approvalUI();await app.openApproval();const popup={close(){}};app.window={location:{origin:'https://demo.example.com'}};
+  app.approval.popup=popup;app.approval.busy=true;app.approval.transaction='state-value';let calls=0;
+  app.approvalPost=async()=>{calls++;return verifiedTask('oidc');};
+  const event={origin:'https://demo.example.com',source:popup,data:{type:'opaque-approval-oauth',state:'state-value',code:'one-use-code'}};
+  await app.receiveApprovalOAuth({...event,origin:'https://attacker.example.com'});
+  await app.receiveApprovalOAuth({...event,source:{}});
+  await app.receiveApprovalOAuth({...event,data:{...event.data,state:'wrong-state'}});assert.equal(calls,0);
+  await app.receiveApprovalOAuth(event);assert.equal(calls,1);assert.equal(app.state.workTask.state,'approved');assert.match(app.byId('work-human-proof').textContent,/OIDC identity verified/);
+  await app.receiveApprovalOAuth(event);assert.equal(calls,1);
+});
+test('lost verification response disables retry and closing clears unconfirmed approval state',async()=>{
+  const app=approvalUI();await app.openApproval();app.credentialOptions=raw=>raw;
+  app.navigator.credentials.get=async()=>({toJSON:()=>({response:{signature:'assertion'}})});
+  app.approvalPost=async path=>{if(path==='finish')throw Error('Interrupted');return {kind:'authentication',transaction_id:'challenge',public_key:{}};};
+  await app.approveWithPasskey();assert.equal(app.byId('approval-passkey').disabled,true);assert.equal(app.state.workTask.state,'planned');app.closeApproval();assert.equal(app.state.workTask,null);assert.match(app.state.workNotice,/Check task status/);
+});
+test('human verification evidence cannot be fabricated by a missing or unverified proof',()=>{
+  const app=approvalUI();for(const kind of ['webauthn','oidc']) {const value=verifiedTask(kind);value.approval.verification=null;assert.throws(()=>app.validateWorkTask(value),/human verification/);}
+  const value=verifiedTask();value.approval.verification.user_verified=false;assert.throws(()=>app.validateWorkTask(value),/human verification/);
+});
+test('GitHub approval requires its fixed issuer and stable numeric account ID',()=>{
+  const app=approvalUI(),value=verifiedTask('oidc');value.approval.kind='github_oauth';value.approval.verification.issuer='https://github.com';value.approval.verification.subject='1234567';
+  app.state.workTask=app.validateWorkTask(value);app.renderWorkTask();assert.match(app.byId('work-human-proof').textContent,/GitHub identity verified by Opaque · account 1234567/);
+  value.approval.verification.subject='friendly-login';assert.throws(()=>app.validateWorkTask(value),/GitHub account identity/);
+  value.approval.verification.subject='1234567';value.approval.verification.issuer='https://attacker.example.com';assert.throws(()=>app.validateWorkTask(value),/GitHub account identity/);
+});
+
+// Run after `cargo build -p opaque-metrics` so this exercises the module compiled
+// by the same build.rs and WAT source that the actual gateway embeds.
+if (process.env.OPAQUE_APPROVAL_WASM_JSON) {
+  const wasm=fs.readFileSync(process.env.OPAQUE_APPROVAL_WASM_JSON,'utf8');
+  function reviewTask() {
+    const value=workTask();value.manifest.source_profile_sha256='a'.repeat(64);
+    value.manifest_canonical_json=JSON.stringify(value.manifest);
+    value.manifest_sha256=require('node:crypto').createHash('sha256').update(value.manifest_canonical_json).digest('hex');return value;
+  }
+  test('actual compiled WASM checks exact manifest bytes despite response key reordering',async()=>{
+    const app=ui(wasm);app.renderSession(workSession());const value=reviewTask();value.manifest=Object.fromEntries(Object.entries(value.manifest).sort());await app.reviewApprovalManifest(value);
+    const wrong=reviewTask();wrong.manifest_sha256='b'.repeat(64);await assert.rejects(app.reviewApprovalManifest(wrong),/digest did not match/);
+    const altered=reviewTask();altered.manifest.client_id='changed-client';await assert.rejects(app.reviewApprovalManifest(altered),/review bytes do not match/);
+  });
+  test('compiled WASM rejects digest mutations, excessive authority, NaN and deadlines',async()=>{
+    const {instance}=await WebAssembly.instantiate(new Uint8Array(JSON.parse(wasm))),check=instance.exports.review;
+    assert.equal(check(60,1,100,400,200),0);
+    for(const values of [[61,1,100,400,200],[60,2,100,400,200],[60,1,100,401,200],[60,1,100,400,400],[60,1,100,400,99],[60,1,100,400,NaN]])assert.notEqual(check(...values),0);
+    new Uint8Array(instance.exports.memory.buffer)[31]=1;assert.equal(check(60,1,100,400,200),1);
+  });
+}

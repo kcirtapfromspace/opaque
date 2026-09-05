@@ -35,7 +35,10 @@ PROFILE_SPEC.loader.exec_module(profiles)
 PERSONAS = ("customer_analyst", "engineer", "support")
 CONTROL_PATHS = {"/api/demo/persona", "/api/organization/sharing"}
 TASK_PATHS = {"/api/work-task/approve", "/api/work-task/execute", "/api/work-task/revoke"}
-TASK_RESPONSE_PATHS = TASK_PATHS | {"/api/work-task"}
+APPROVAL_PATHS = {"/api/work-task/approval/start", "/api/work-task/approval/finish"}
+TASK_RESPONSE_PATHS = TASK_PATHS | APPROVAL_PATHS | {"/api/work-task", "/api/work-task/approval"}
+APPROVAL_ENV = ("OPAQUE_DEMO_APPROVAL_ORIGIN", "OPAQUE_DEMO_OAUTH_PROVIDER", "OPAQUE_DEMO_OAUTH_ISSUER", "OPAQUE_DEMO_OAUTH_CLIENT_ID",
+                "OPAQUE_DEMO_OAUTH_CLIENT_SECRET", "OPAQUE_DEMO_OAUTH_REDIRECT_URI")
 
 
 def task_body(value):
@@ -46,6 +49,34 @@ def task_body(value):
             or not isinstance(value["manifest_sha256"], str)
             or not re.fullmatch(r"[0-9a-f]{64}", value["manifest_sha256"])):
         raise ValueError("bounded task reference required")
+    return value
+
+
+def approval_body(path, value):
+    """Forward proof for an existing task, never caller-selected authority."""
+    if not isinstance(value, dict):
+        raise ValueError("object required")
+    task_body({key: value.get(key) for key in ("task_id", "manifest_sha256")})
+    required = {"task_id", "manifest_sha256"}
+    if path == "/api/work-task/approval/start":
+        if set(value) != required | {"method"} or value["method"] not in ("passkey", "oauth"):
+            raise ValueError("invalid approval method")
+    else:
+        required.add("transaction_id")
+        transaction = value.get("transaction_id")
+        if not isinstance(transaction, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", transaction):
+            raise ValueError("invalid approval transaction")
+        if set(value) == required | {"credential"}:
+            if not isinstance(value["credential"], dict):
+                raise ValueError("invalid approval credential")
+        elif set(value) == required | {"code", "state"}:
+            code, state = value["code"], value["state"]
+            if (not isinstance(code, str) or not 0 < len(code.encode()) <= 4096
+                    or any(ord(ch) <= 32 or ord(ch) == 127 for ch in code)
+                    or not isinstance(state, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,512}", state)):
+                raise ValueError("invalid approval OAuth response")
+        else:
+            raise ValueError("invalid approval proof")
     return value
 
 
@@ -118,8 +149,14 @@ def configuration(env):
         env.get("OPAQUE_DEMO_MODEL_PROFILE", profiles.LEGACY_PROFILE_ID),
         env["OPAQUE_DEMO_MODEL_URL"], env["OPAQUE_DEMO_MODEL_ID"],
         env.get("OPAQUE_DEMO_MODEL_TEST_ORIGIN"))
+    approval_env = {name: env[name] for name in APPROVAL_ENV if env.get(name)}
+    if "OPAQUE_DEMO_APPROVAL_ORIGIN" in approval_env:
+        origin = urlsplit(approval_env["OPAQUE_DEMO_APPROVAL_ORIGIN"])
+        if (not origin.hostname or origin.username or origin.password or origin.path or origin.query or origin.fragment
+                or (origin.scheme != "https" and not (origin.scheme == "http" and origin.hostname in {"127.0.0.1", "localhost"}))):
+            raise ValueError("invalid approval public origin")
     return {"lease_id":lease,"tenant_id":tenant,"generation":generation,"expires_at":expires,"secret":secret,
-            "model":model,"model_id":selected.model,"model_profile":selected.profile_id}
+            "model":model,"model_id":selected.model,"model_profile":selected.profile_id,"approval_env":approval_env}
 
 
 class QuietHandler(BaseHTTPRequestHandler):
@@ -209,7 +246,7 @@ class Runtime:
         config["organization_demo"] = organization
         fixture.dump(path,config)
         binary = os.environ.get("OPAQUE_METRICS_BINARY", "/opt/opaque/bin/opaque-metrics")
-        self.gateway = subprocess.Popen([binary,"--config",str(path)],env={"PATH":os.environ.get("PATH","/usr/bin:/bin"),"OPAQUE_METRICS_SOURCE_KEY":source_secret},stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        self.gateway = subprocess.Popen([binary,"--config",str(path)],env={"PATH":os.environ.get("PATH","/usr/bin:/bin"),"OPAQUE_METRICS_SOURCE_KEY":source_secret,**self.config["approval_env"]},stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         deadline=time.monotonic()+15
         while time.monotonic()<deadline:
             if self.gateway.poll() is not None:
@@ -383,7 +420,8 @@ class Proxy(QuietHandler):
         paths={("GET","/workspace"):"/",("GET","/api/session"):"/api/session",("POST","/api/chat"):"/api/chat",
                ("GET","/api/organization/activity"):"/api/organization/activity",
                ("GET","/api/work-task"):"/api/work-task",
-               **{("POST", path): path for path in CONTROL_PATHS | TASK_PATHS}}
+               ("GET","/api/work-task/approval"):"/api/work-task/approval",
+               **{("POST", path): path for path in CONTROL_PATHS | TASK_PATHS | APPROVAL_PATHS}}
         target=paths.get((self.command,self.path))
         if target is None:
             return self.reply(404,{"error":"unsupported_demo_route"})
@@ -392,16 +430,18 @@ class Proxy(QuietHandler):
         body=None
         if self.command=="POST":
             try:
-                body=self.bounded_body(4096)
+                body=self.bounded_body(16384 if target == "/api/work-task/approval/finish" else 4096)
                 value=json.loads(body)
                 if target in CONTROL_PATHS:
                     control_body(target, value)
                 elif target in TASK_PATHS:
                     task_body(value)
+                elif target in APPROVAL_PATHS:
+                    approval_body(target, value)
                 elif not isinstance(value,dict) or set(value)!={"message"} or not isinstance(value["message"],str) or not 0<len(value["message"].encode())<=2000:
                     raise ValueError("bounded question required")
             except (ValueError,TypeError,OSError):
-                return self.reply(400,{"error":"bounded_task_reference_required" if target in TASK_PATHS else "bounded_question_required"})
+                return self.reply(400,{"error":"bounded_approval_request_required" if target in APPROVAL_PATHS else "bounded_task_reference_required" if target in TASK_PATHS else "bounded_question_required"})
         if target in CONTROL_PATHS:
             return self.control_proxy(runtime, target, body, value)
         with runtime.identity_lock:
@@ -418,6 +458,24 @@ class Proxy(QuietHandler):
         try:
             connection.request(self.command,target,body=body,headers={"Cookie":cookie,"Origin":"http://127.0.0.1:8081","Content-Type":"application/json","Accept":"text/event-stream" if target=="/api/chat" else "application/json"})
             response=connection.getresponse()
+            if target in TASK_RESPONSE_PATHS:
+                chunks, size = [], 0
+                while True:
+                    chunk = response.read1(4096)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    size += len(chunk)
+                    if size > 32768:
+                        raise ValueError("task response too large")
+                if response.read(1) or not response.isclosed() or response.length not in (None, 0):
+                    raise ValueError("incomplete task response")
+                data = json.loads(b"".join(chunks))
+                if not isinstance(data, dict) or 300 <= response.status < 400:
+                    raise ValueError("invalid task response")
+                if not runtime.ready or runtime.expired() or runtime.cookie != cookie:
+                    return self.reply(410, {"error": "demo_expired"})
+                return self.reply(response.status, data)
             self.send_response(response.status)
             for name,value in response.getheaders():
                 if name.lower() in ("content-type","content-security-policy","x-content-type-options","referrer-policy"):

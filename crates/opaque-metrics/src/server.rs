@@ -1,10 +1,12 @@
 //! A single-tenant OAuth resource server and same-origin chat BFF.
 //! Provider credentials never enter the browser, model context, or MCP result.
 use crate::{
+    approval_oauth::{OAuthChallenge, OAuthProvider},
     auth::{AuthConfig, AuthError, AuthVerifier, VerifiedAccess},
     bounded_demo::{self, TaskReference, TaskState},
     chat::{ChatModel, ModelConfig, label, unit},
     experience::{CREDIT_METRICS, CREDIT_POLICY_ID, Experience, credit_request_denial},
+    human_approval::{Binding as ApprovalBinding, Finish as PasskeyFinish, PasskeyApprover},
     metrics::{MetricsClient, MetricsEvidence, MetricsQuery, MetricsSourceConfig},
     organization::{OrganizationConfig, OrganizationState, Persona},
     portfolio::{self, Measure, PortfolioEvidence, PortfolioQuery},
@@ -85,6 +87,11 @@ struct Rate {
     start: i64,
     count: u32,
 }
+struct PendingOAuthApproval {
+    binding: ApprovalBinding,
+    expires_at: i64,
+    challenge: OAuthChallenge,
+}
 pub struct App {
     config: GatewayConfig,
     auth: AuthVerifier,
@@ -98,6 +105,9 @@ pub struct App {
     latest_policy: Mutex<HashMap<String, Value>>,
     organization: Mutex<OrganizationState>,
     bounded_task: Option<Mutex<bounded_demo::Store>>,
+    passkey_approver: Mutex<Option<PasskeyApprover>>,
+    oauth_approver: Option<OAuthProvider>,
+    oauth_approvals: Mutex<HashMap<String, PendingOAuthApproval>>,
     capacity: Arc<Semaphore>,
     revoked: Mutex<BTreeSet<String>>,
     audit: Mutex<File>,
@@ -132,8 +142,9 @@ fn valid_label(s: &str) -> bool {
 fn trusted_url(s: &str, fixture: bool) -> Result<reqwest::Url, String> {
     let u = reqwest::Url::parse(s).map_err(|_| "invalid trusted URL")?;
     let local = u.host_str().is_some_and(|v| {
-        v.parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
+        v == "localhost"
+            || v.parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
     });
     if !(u.scheme() == "https" || (fixture && u.scheme() == "http" && local))
         || !u.username().is_empty()
@@ -347,13 +358,14 @@ impl App {
             .mode(0o600)
             .open(config.state_dir.join("audit.jsonl"))
             .map_err(|_| "audit unavailable")?;
-        let script = include_str!("../static/index.html")
+        let html = dashboard_html();
+        let script = html
             .split_once("<script>")
             .and_then(|(_, rest)| rest.split_once("</script>").map(|(script, _)| script))
             .ok_or("chat UI script is missing")?;
         let script_hash =
             base64::engine::general_purpose::STANDARD.encode(Sha256::digest(script.as_bytes()));
-        let csp = HeaderValue::from_str(&format!("default-src 'none'; script-src 'sha256-{script_hash}'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"))
+        let csp = HeaderValue::from_str(&format!("default-src 'none'; script-src 'sha256-{script_hash}' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"))
             .map_err(|_| "chat content policy is invalid")?;
         let bounded_task = if config.fixture_mode && config.organization_demo.is_some() {
             Some(Mutex::new(
@@ -363,6 +375,22 @@ impl App {
         } else {
             None
         };
+        let configured_origin = std::env::var("OPAQUE_DEMO_APPROVAL_ORIGIN").ok();
+        let approval_origin = configured_origin
+            .as_deref()
+            .unwrap_or(&config.public_origin);
+        let passkey_approver = Mutex::new(if configured_origin.is_some() {
+            Some(PasskeyApprover::new(approval_origin)?)
+        } else {
+            // WebAuthn RPs require a DNS name (localhost works for local QA).
+            // An internal IP listener without a public approval origin keeps
+            // passkey approval unavailable rather than altering its RP binding.
+            PasskeyApprover::new(approval_origin).ok()
+        });
+        let oauth_approver = OAuthProvider::from_env()?;
+        if let Some(provider) = &oauth_approver {
+            provider.validate_redirect_origin(approval_origin)?;
+        }
         Ok(Arc::new(Self {
             config,
             auth,
@@ -376,6 +404,9 @@ impl App {
             latest_policy: Mutex::new(HashMap::new()),
             organization: Mutex::new(OrganizationState::default()),
             bounded_task,
+            passkey_approver,
+            oauth_approver,
+            oauth_approvals: Mutex::new(HashMap::new()),
             capacity: Arc::new(Semaphore::new(8)),
             revoked: Mutex::new(revoked),
             audit: Mutex::new(audit),
@@ -544,6 +575,9 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/organization/sharing", post(organization_sharing))
         .route("/api/work-task", get(work_task))
         .route("/api/work-task/approve", post(approve_work_task))
+        .route("/api/work-task/approval", get(approval_capabilities))
+        .route("/api/work-task/approval/start", post(start_work_approval))
+        .route("/api/work-task/approval/finish", post(finish_work_approval))
         .route("/api/work-task/execute", post(execute_work_task))
         .route("/api/work-task/revoke", post(revoke_work_task))
         .route("/mcp", post(mcp))
@@ -656,8 +690,14 @@ fn auth_error(app: &App, e: AuthError) -> Response {
     );
     response
 }
-async fn index() -> Html<&'static str> {
-    Html(include_str!("../static/index.html"))
+fn dashboard_html() -> String {
+    include_str!("../static/index.html").replace(
+        "__OPAQUE_APPROVAL_WASM_BYTES__",
+        include_str!(concat!(env!("OUT_DIR"), "/approval-wasm.json")),
+    )
+}
+async fn index() -> Html<String> {
+    Html(dashboard_html())
 }
 async fn metadata(State(app): State<Arc<App>>) -> Json<Value> {
     Json(
@@ -828,7 +868,12 @@ fn work_response(app: Arc<App>, access: VerifiedAccess, epoch: u64) -> Response 
     let body = axum::body::Body::from_stream(stream::once(async move {
         let value = app.work_apply(&access, Some(epoch), |store, epoch| {
             store.current(&access, epoch, now(), &app.config.source)
-        }).and_then(|task| serde_json::to_value(task).map_err(|_| bounded_demo::Error::Unavailable))
+        }).and_then(|task| {
+            let canonical = serde_json::to_string(&task.manifest).map_err(|_| bounded_demo::Error::Unavailable)?;
+            let mut value = serde_json::to_value(task).map_err(|_| bounded_demo::Error::Unavailable)?;
+            value["manifest_canonical_json"] = json!(canonical);
+            Ok(value)
+        })
           .unwrap_or_else(|_| json!({"error":{"code":"task_access_denied","message":"Task authority changed before delivery; no result is disclosed."}}));
         Ok::<_, Infallible>(serde_json::to_vec(&value).unwrap())
     }));
@@ -852,12 +897,270 @@ async fn work_task(State(app): State<Arc<App>>, headers: HeaderMap) -> Response 
         Err(e) => work_error(e),
     }
 }
-async fn approve_work_task(
+async fn approve_work_task(State(app): State<Arc<App>>) -> Response {
+    if let Some(response) = work_disabled(&app) {
+        return response;
+    }
+    error(
+        StatusCode::FORBIDDEN,
+        "human_approval_required",
+        "Complete a verified passkey or configured OAuth approval ceremony for this exact task.",
+    )
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovalStart {
+    task_id: String,
+    manifest_sha256: String,
+    method: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovalFinish {
+    task_id: String,
+    manifest_sha256: String,
+    transaction_id: String,
+    credential: Option<Value>,
+    code: Option<String>,
+    state: Option<String>,
+}
+fn approval_error(message: &str) -> Response {
+    error(
+        StatusCode::FORBIDDEN,
+        "approval_verification_failed",
+        message,
+    )
+}
+impl App {
+    fn approval_binding(
+        &self,
+        headers: &HeaderMap,
+        access: &VerifiedAccess,
+        reference: &TaskReference,
+    ) -> Result<ApprovalBinding, bounded_demo::Error> {
+        let sid = cookie(headers, &self.cookie_name()).ok_or(bounded_demo::Error::Forbidden)?;
+        self.work_apply(access, None, |store, epoch| {
+            let task = store.current(access, epoch, now(), &self.config.source)?;
+            if task.task_id != reference.task_id
+                || task.manifest_sha256 != reference.manifest_sha256
+                || task.state != TaskState::Planned
+                || task.manifest.expires_at <= now()
+            {
+                return Err(bounded_demo::Error::Conflict);
+            }
+            Ok(ApprovalBinding {
+                session_id: sid,
+                jti: access.jti().into(),
+                task_id: task.task_id,
+                manifest_sha256: task.manifest_sha256,
+                generation: epoch,
+                expires_at: task.manifest.expires_at.min(access.expires_at()),
+            })
+        })
+    }
+}
+async fn approval_capabilities(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    if let Some(response) = work_disabled(&app) {
+        return response;
+    }
+    let (_, access) = match app.session(&headers) {
+        Ok(value) => value,
+        Err(e) => return auth_error(&app, e),
+    };
+    if let Err(e) = app.work_apply(&access, None, |_, _| Ok(())) {
+        return work_error(e);
+    }
+    let passkey = match app.passkey_approver.lock() {
+        Ok(approver) => approver.as_ref().map(PasskeyApprover::capabilities).unwrap_or_else(|| json!({"available":false,"notice":"A public approval origin is required for passkeys."})),
+        Err(_) => return approval_error("Passkey service unavailable."),
+    };
+    Json(json!({"passkey":passkey,"oauth":{"available":app.oauth_approver.is_some(),"provider":app.oauth_approver.as_ref().map(OAuthProvider::label),"kind":app.oauth_approver.as_ref().map(OAuthProvider::proof_kind),"notice":"OAuth identity verification does not establish production tenant membership."},"unsigned_confirmation":false})).into_response()
+}
+async fn start_work_approval(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
-    Json(reference): Json<TaskReference>,
+    Json(request): Json<ApprovalStart>,
 ) -> Response {
-    transition_work_task(app, headers, reference, TaskState::Approved)
+    if let Some(response) = work_disabled(&app) {
+        return response;
+    }
+    let (_, access) = match app.session(&headers) {
+        Ok(value) => value,
+        Err(e) => return auth_error(&app, e),
+    };
+    if let Err(message) = app.rate(&access) {
+        return error(StatusCode::TOO_MANY_REQUESTS, "rate_limited", &message);
+    }
+    let reference = TaskReference {
+        task_id: request.task_id,
+        manifest_sha256: request.manifest_sha256,
+    };
+    let binding = match app.approval_binding(&headers, &access, &reference) {
+        Ok(value) => value,
+        Err(e) => return work_error(e),
+    };
+    match request.method.as_str() {
+        "passkey" => {
+            let result = app
+                .passkey_approver
+                .lock()
+                .map_err(|_| "Passkey service unavailable.".to_string())
+                .and_then(|mut approver| {
+                    approver
+                        .as_mut()
+                        .ok_or_else(|| "Passkey approval origin is not configured.".to_string())?
+                        .start(binding, now())
+                });
+            match result {
+                Ok(value) => Json(value).into_response(),
+                Err(message) => approval_error(&message),
+            }
+        }
+        "oauth" => {
+            let Some(provider) = &app.oauth_approver else {
+                return approval_error("OAuth approval is not configured for this deployment.");
+            };
+            let challenge = match provider.start().await {
+                Ok(value) => value,
+                Err(message) => return approval_error(&message),
+            };
+            match app.approval_binding(&headers, &access, &reference) {
+                Ok(current) if current == binding => {}
+                _ => {
+                    return approval_error("Task authority changed before OAuth approval started.");
+                }
+            }
+            let result = json!({"kind":"oauth","transaction_id":challenge.state,"authorization_url":challenge.authorization_url});
+            let Ok(mut pending) = app.oauth_approvals.lock() else {
+                return approval_error("OAuth approval state unavailable.");
+            };
+            pending.retain(|_, entry| {
+                entry.expires_at > now() && entry.binding.session_id != binding.session_id
+            });
+            if pending.len() >= 256 {
+                return approval_error("Too many pending OAuth approvals.");
+            }
+            pending.insert(
+                challenge.state.clone(),
+                PendingOAuthApproval {
+                    expires_at: binding.expires_at.min(now() + 120),
+                    binding,
+                    challenge,
+                },
+            );
+            Json(result).into_response()
+        }
+        _ => approval_error("Choose a supported approval method."),
+    }
+}
+async fn finish_work_approval(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(request): Json<ApprovalFinish>,
+) -> Response {
+    if let Some(response) = work_disabled(&app) {
+        return response;
+    }
+    let (_, access) = match app.session(&headers) {
+        Ok(value) => value,
+        Err(e) => return auth_error(&app, e),
+    };
+    if let Err(message) = app.rate(&access) {
+        return error(StatusCode::TOO_MANY_REQUESTS, "rate_limited", &message);
+    }
+    let reference = TaskReference {
+        task_id: request.task_id,
+        manifest_sha256: request.manifest_sha256,
+    };
+    let binding = match app.approval_binding(&headers, &access, &reference) {
+        Ok(value) => value,
+        Err(e) => return work_error(e),
+    };
+    if request.transaction_id.is_empty() || request.transaction_id.len() > 128 {
+        return approval_error("Invalid approval transaction.");
+    }
+    let proof = match (request.credential, request.code, request.state) {
+        (Some(credential), None, None) => {
+            let result = app
+                .passkey_approver
+                .lock()
+                .map_err(|_| "Passkey service unavailable.".to_string())
+                .and_then(|mut approver| {
+                    approver
+                        .as_mut()
+                        .ok_or_else(|| "Passkey approval origin is not configured.".to_string())?
+                        .finish(&binding, &request.transaction_id, credential, now())
+                });
+            match result {
+                Ok(PasskeyFinish::Registered) => {
+                    return match app.approval_binding(&headers, &access, &reference) {
+                        Ok(current) if current == binding => Json(json!({"registered":true,"notice":"Passkey enrolled for this temporary session. A fresh passkey assertion is required to approve the task."})).into_response(),
+                        _ => approval_error("Task authority changed during passkey enrollment."),
+                    };
+                }
+                Ok(PasskeyFinish::Approved(proof)) => proof,
+                Err(message) => return approval_error(&message),
+            }
+        }
+        (None, Some(code), Some(state))
+            if !code.is_empty() && code.len() <= 4096 && state == request.transaction_id =>
+        {
+            let Some(provider) = &app.oauth_approver else {
+                return approval_error("OAuth approval is not configured for this deployment.");
+            };
+            let pending = match app.oauth_approvals.lock() {
+                Ok(mut pending) => pending.remove(&request.transaction_id),
+                Err(_) => return approval_error("OAuth approval state unavailable."),
+            };
+            let Some(pending) = pending else {
+                return approval_error("OAuth challenge expired or was already used.");
+            };
+            if pending.binding != binding || pending.expires_at <= now() {
+                return approval_error("OAuth challenge does not match current task authority.");
+            }
+            let ceremony_expires_at = pending.expires_at;
+            let identity = match provider.finish(pending.challenge, &code, &state).await {
+                Ok(value) => value,
+                Err(message) => return approval_error(&message),
+            };
+            if ceremony_expires_at <= now() {
+                return approval_error("OAuth approval expired during identity verification.");
+            }
+            bounded_demo::Approval {
+                kind: identity.kind.into(),
+                approved_at: now(),
+                verification: Some(bounded_demo::ApprovalVerification {
+                    issuer: Some(identity.issuer),
+                    subject: identity.subject,
+                    credential_sha256: None,
+                    user_verified: None,
+                }),
+            }
+        }
+        _ => {
+            return approval_error(
+                "Provide exactly one valid passkey assertion or OAuth response.",
+            );
+        }
+    };
+    // Recheck current membership, token, persona, manifest and expiry after
+    // authenticator/issuer verification and immediately before durable approval.
+    match app.approval_binding(&headers, &access, &reference) {
+        Ok(current) if current == binding => {}
+        _ => return approval_error("Task authority changed during identity verification."),
+    }
+    let result = app.work_apply(&access, Some(binding.generation), |store, epoch| {
+        let approved_at = now();
+        let mut proof = proof;
+        proof.approved_at = approved_at;
+        store
+            .approve_verified(&access, epoch, approved_at, &reference, proof)
+            .map(|_| epoch)
+    });
+    match result {
+        Ok(epoch) => work_response(app, access, epoch),
+        Err(e) => work_error(e),
+    }
 }
 async fn revoke_work_task(
     State(app): State<Arc<App>>,

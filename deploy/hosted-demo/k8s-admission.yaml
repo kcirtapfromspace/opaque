@@ -62,13 +62,28 @@ spec:
         object.spec.containers[0].env.all(e, e.name in [
           'OPAQUE_DEMO_LEASE_ID', 'OPAQUE_DEMO_TENANT_ID', 'OPAQUE_DEMO_GENERATION',
           'OPAQUE_DEMO_EXPIRES_AT_MS', 'OPAQUE_DEMO_MODEL_PROFILE', 'OPAQUE_DEMO_MODEL_URL', 'OPAQUE_DEMO_MODEL_ID',
+          'OPAQUE_DEMO_APPROVAL_ORIGIN', 'OPAQUE_DEMO_OAUTH_PROVIDER', 'OPAQUE_DEMO_OAUTH_CLIENT_ID',
+          'OPAQUE_DEMO_OAUTH_REDIRECT_URI', 'OPAQUE_DEMO_OAUTH_CLIENT_SECRET',
           'OPAQUE_DEMO_PROXY_SECRET', 'OPAQUE_DEMO_STATE_DIR', 'PYTHONDONTWRITEBYTECODE', 'HOME', 'TMPDIR']) &&
         object.spec.containers[0].env.all(e,
           object.spec.containers[0].env.filter(other, other.name == e.name).size() == 1) &&
         object.spec.containers[0].env.filter(e, has(e.valueFrom)).all(e,
-          e.name == 'OPAQUE_DEMO_PROXY_SECRET' && has(e.valueFrom.secretKeyRef) &&
-          e.valueFrom.secretKeyRef.name == object.metadata.name && e.valueFrom.secretKeyRef.key == 'proxy-secret')
+          has(e.valueFrom.secretKeyRef) && e.valueFrom.secretKeyRef.name == object.metadata.name &&
+          ((e.name == 'OPAQUE_DEMO_PROXY_SECRET' && e.valueFrom.secretKeyRef.key == 'proxy-secret') ||
+           (e.name == 'OPAQUE_DEMO_OAUTH_CLIENT_SECRET' && e.valueFrom.secretKeyRef.key == 'oauth-client-secret')))
       message: Runtime authority comes only from the fixed model and its own lease secret.
+    - expression: >-
+        object.spec.containers[0].env.exists(e,
+          e.name == 'OPAQUE_DEMO_APPROVAL_ORIGIN' && e.value == '${WORKER_ORIGIN}') &&
+        object.spec.containers[0].env.filter(e, e.name == 'OPAQUE_DEMO_OAUTH_PROVIDER').all(e,
+          e.value == 'github') &&
+        object.spec.containers[0].env.filter(e, e.name == 'OPAQUE_DEMO_OAUTH_CLIENT_ID').all(e,
+          e.value.matches('^[A-Za-z0-9._-]{1,256}$')) &&
+        object.spec.containers[0].env.filter(e, e.name == 'OPAQUE_DEMO_OAUTH_REDIRECT_URI').all(e,
+          e.value == '${WORKER_ORIGIN}/approval/callback') &&
+        object.spec.containers[0].env.filter(e, e.name == 'OPAQUE_DEMO_OAUTH_CLIENT_SECRET').all(e,
+          has(e.valueFrom) && has(e.valueFrom.secretKeyRef))
+      message: Human approval uses the reviewed origin, GitHub provider, and exact callback.
     - expression: >-
         object.spec.containers[0].env.exists(e,
           e.name == 'OPAQUE_DEMO_MODEL_PROFILE' &&

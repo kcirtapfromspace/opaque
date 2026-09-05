@@ -104,7 +104,7 @@ impl Fixture {
         let model = MockServer::start().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bind = listener.local_addr().unwrap();
-        let origin = format!("http://{bind}");
+        let origin = format!("http://localhost:{}", bind.port());
         let directory = TestDirectory::new();
         // Cargo supplies this public package name to the test process. Using it
         // avoids mutating shared process environment or reading any real secret.
@@ -329,7 +329,13 @@ impl Fixture {
         Request::builder()
             .method(method)
             .uri(path)
-            .header(header::HOST, self.config.bind.to_string())
+            .header(
+                header::HOST,
+                self.config
+                    .public_origin
+                    .trim_start_matches("http://")
+                    .trim_start_matches("https://"),
+            )
             .header(header::ORIGIN, &self.config.public_origin)
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
