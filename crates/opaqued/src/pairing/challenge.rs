@@ -181,6 +181,7 @@ mod tests {
             paired_by: None,
             token_sha256: None,
             confirmed: true,
+            kind: crate::pairing::store::DeviceKind::Ios,
         }
     }
 

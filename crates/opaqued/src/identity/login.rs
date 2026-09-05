@@ -367,6 +367,16 @@ async fn complete_login(
         }
     };
 
+    // Match the verified issuer-local subject, never a client-supplied tenant
+    // label or email claim. Rejection precedes first-human admin bootstrap.
+    if !runtime.config.allowed_subjects.is_empty()
+        && !runtime.config.allowed_subjects.contains(&verified.sub)
+    {
+        return AttemptOutcome::Failed {
+            reason: "identity subject not permitted by daemon policy".into(),
+        };
+    }
+
     // Email domain allowlist (fail closed when configured and email absent).
     let domains = &runtime.config.allowed_email_domains;
     if !domains.is_empty() {
@@ -564,6 +574,7 @@ mod tests {
             redirect_port: None,
             session_ttl_secs: None,
             allowed_email_domains: domains,
+            allowed_subjects: vec![],
             required: false,
             service_principals: vec![ServicePrincipalConfig {
                 name: "ci".into(),
@@ -612,6 +623,49 @@ mod tests {
             }
         }
         panic!("login attempt never became terminal");
+    }
+
+    #[tokio::test]
+    async fn tenant_subject_membership_is_checked_before_admin_bootstrap() {
+        for allowed in [false, true] {
+            let server = MockServer::start().await;
+            mount_discovery(&server, &server.uri()).await;
+            let directory = tempfile::tempdir().unwrap();
+            let subject = base_claims(&server.uri(), "probe")["sub"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let mut config = test_config(&server.uri(), vec![]);
+            config.allowed_subjects = vec![if allowed {
+                subject
+            } else {
+                "different-tenant-member".into()
+            }];
+            let runtime = Arc::new(IdentityRuntime::initialize(config, directory.path()).unwrap());
+            let login = runtime.login_start().await.unwrap();
+            let nonce = query_param(&login.auth_url, "nonce").unwrap();
+            let state = query_param(&login.auth_url, "state").unwrap();
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id_token": sign_id_token(base_claims(&server.uri(), &nonce), "test-key-1"),
+                })))
+                .mount(&server)
+                .await;
+            drive_callback(&login.auth_url, "valid-code", &state).await;
+            let outcome = wait_terminal(&runtime, &login.attempt_id).await;
+            assert_eq!(matches!(outcome, AttemptOutcome::Done { .. }), allowed);
+            assert_eq!(
+                runtime.store.count_humans().unwrap(),
+                if allowed { 1 } else { 0 }
+            );
+            assert_eq!(runtime.current_identity_json().is_some(), allowed);
+            if !allowed {
+                assert!(
+                    matches!(outcome, AttemptOutcome::Failed { reason } if reason.contains("subject"))
+                );
+            }
+        }
     }
 
     #[tokio::test]

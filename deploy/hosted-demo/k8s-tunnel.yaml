@@ -1,0 +1,50 @@
+# NEW dedicated tunnel only. Root/operator supplies its token separately;
+# no existing tunnel, ingress, DNS record or customer application is changed.
+# CLOUDFLARED_IMAGE must be a digest-pinned image at version2025.7 or newer.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opaque-demo-tunnel
+  namespace: opaque-demo-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: opaque-demo-tunnel
+  template:
+    metadata:
+      labels:
+        app: opaque-demo-tunnel
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: cloudflared
+          image: ${CLOUDFLARED_IMAGE}
+          args: [tunnel, --no-autoupdate, --protocol, quic, run]
+          env:
+            - name: TUNNEL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: opaque-demo-tunnel
+                  key: TUNNEL_TOKEN
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]

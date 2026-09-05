@@ -62,6 +62,9 @@ pub enum ApprovalFactor {
     /// Second-device approval via paired iOS device (Face ID).
     IosFaceId,
 
+    /// Full-manifest review signed by an enrolled trusted workstation.
+    PairedWorkstation,
+
     /// Hardware security key or passkey (FIDO2/WebAuthn).
     Fido2,
 }
@@ -71,6 +74,7 @@ impl fmt::Display for ApprovalFactor {
         match self {
             Self::LocalBio => write!(f, "local_bio"),
             Self::IosFaceId => write!(f, "ios_faceid"),
+            Self::PairedWorkstation => write!(f, "paired_workstation"),
             Self::Fido2 => write!(f, "fido2"),
         }
     }

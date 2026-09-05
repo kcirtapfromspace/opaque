@@ -19,10 +19,10 @@ const GITHUB_ACCEPT: &str = "application/vnd.github+json";
 
 /// Default GitHub API base URL. Override with `OPAQUE_GITHUB_API_URL` env var
 /// (useful for GitHub Enterprise Server or testing).
-const DEFAULT_GITHUB_API_URL: &str = "https://api.github.com";
+pub const DEFAULT_GITHUB_API_URL: &str = "https://api.github.com";
 
 /// Environment variable to override the GitHub API base URL.
-const GITHUB_API_URL_ENV: &str = "OPAQUE_GITHUB_API_URL";
+pub const GITHUB_API_URL_ENV: &str = "OPAQUE_GITHUB_API_URL";
 
 /// GitHub API error types. Raw API error messages are never exposed.
 #[derive(Debug, thiserror::Error)]
@@ -47,6 +47,9 @@ pub enum GitHubApiError {
 
     #[error("{0}")]
     InvalidUrlScheme(String),
+
+    #[error("GitHub returned invalid repository identity metadata")]
+    InvalidRepositoryIdentity,
 }
 
 impl GitHubApiError {
@@ -286,15 +289,24 @@ impl GitHubClient {
         let base_url =
             std::env::var(GITHUB_API_URL_ENV).unwrap_or_else(|_| DEFAULT_GITHUB_API_URL.to_owned());
 
-        validate_url_scheme(&base_url)?;
+        Self::from_base_url(&base_url)
+    }
+
+    pub(super) fn from_base_url(base_url: &str) -> Result<Self, GitHubApiError> {
+        validate_url_scheme(base_url)?;
 
         let http = reqwest::Client::builder()
             .user_agent(Self::user_agent())
             .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .build()
             .map_err(GitHubApiError::Network)?;
 
-        Ok(Self { http, base_url })
+        Ok(Self {
+            http,
+            base_url: base_url.trim_end_matches('/').to_owned(),
+        })
     }
 
     /// Create a client pointing at a custom base URL (for testing with mock servers).
@@ -304,10 +316,58 @@ impl GitHubClient {
         let http = reqwest::Client::builder()
             .user_agent(Self::user_agent())
             .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .build()
             .expect("failed to build reqwest client");
 
         Self { http, base_url }
+    }
+
+    /// Bind a repository name to the provider's stable numeric identity.
+    pub async fn repository_id(
+        &self,
+        token: &str,
+        owner: &str,
+        repo: &str,
+    ) -> Result<u64, GitHubApiError> {
+        let url = format!("{}/repos/{owner}/{repo}", self.base_url);
+        let resp = self
+            .http
+            .get(url)
+            .bearer_auth(token)
+            .header("Accept", GITHUB_ACCEPT)
+            .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
+            .send()
+            .await
+            .map_err(GitHubApiError::Network)?;
+        match resp.status().as_u16() {
+            200 => {
+                let body = resp
+                    .json::<serde_json::Value>()
+                    .await
+                    .map_err(GitHubApiError::Network)?;
+                let id = body
+                    .get("id")
+                    .and_then(|v| v.as_u64())
+                    .filter(|id| *id > 0)
+                    .ok_or(GitHubApiError::InvalidRepositoryIdentity)?;
+                let expected_name = format!("{owner}/{repo}");
+                let full_name = body
+                    .get("full_name")
+                    .and_then(|v| v.as_str())
+                    .ok_or(GitHubApiError::InvalidRepositoryIdentity)?;
+                if !full_name.eq_ignore_ascii_case(&expected_name) {
+                    return Err(GitHubApiError::InvalidRepositoryIdentity);
+                }
+                Ok(id)
+            }
+            401 | 403 => Err(GitHubApiError::Unauthorized),
+            404 => Err(GitHubApiError::NotFound(format!("{owner}/{repo}"))),
+            429 => Err(GitHubApiError::RateLimited),
+            500..=599 => Err(GitHubApiError::ServerError),
+            other => Err(GitHubApiError::UnexpectedStatus(other)),
+        }
     }
 
     /// Fetch the public key for a given secret scope.
@@ -533,6 +593,7 @@ mod tests {
 
     #[test]
     fn client_default_base_url() {
+        let _guard = super::super::TEST_ENV_LOCK.blocking_lock();
         // Remove env override if set, to test the default.
         let prev = std::env::var(super::GITHUB_API_URL_ENV).ok();
         unsafe { std::env::remove_var(super::GITHUB_API_URL_ENV) };
@@ -548,6 +609,7 @@ mod tests {
 
     #[test]
     fn client_respects_env_override() {
+        let _guard = super::super::TEST_ENV_LOCK.blocking_lock();
         unsafe {
             std::env::set_var(
                 super::GITHUB_API_URL_ENV,

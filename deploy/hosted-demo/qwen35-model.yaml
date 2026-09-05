@@ -1,0 +1,190 @@
+# Dedicated, trusted model service. It is outside disposable tenant workspaces.
+# Download and serving are separately bounded; only verified weights are served.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: opaque-models
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: v1.35
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: qwen35-4b-model
+  namespace: opaque-models
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 8Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fetch-qwen35-4b-q4-v2
+  namespace: opaque-models
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 900
+  template:
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/hostname: talos-jetson-1
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: fetch
+          image: python@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254
+          command: [python3, -u, -c]
+          args:
+            - |
+              import hashlib, os, pathlib, urllib.request
+              base = pathlib.Path('/models')
+              name = 'Qwen3.5-4B-Q4_K_M.gguf'
+              expected = '00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4'
+              size = 2740937888
+              final, partial = base/name, base/(name+'.partial')
+              def digest(path):
+                  h = hashlib.sha256()
+                  with path.open('rb') as f:
+                      for block in iter(lambda: f.read(1048576), b''): h.update(block)
+                  return h.hexdigest()
+              if final.exists():
+                  assert final.stat().st_size == size and digest(final) == expected
+                  print('Existing model bytes verified'); raise SystemExit(0)
+              url = 'https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/e87f176479d0855a907a41277aca2f8ee7a09523/'+name
+              request = urllib.request.Request(url, headers={'User-Agent':'opaque-model-fetch/1'})
+              h, total, report, synced = hashlib.sha256(), 0, 0, 0
+              with urllib.request.urlopen(request, timeout=60) as response, partial.open('wb') as output:
+                  while True:
+                      block = response.read(1048576)
+                      if not block: break
+                      total += len(block)
+                      assert total <= size, 'Unexpected model length'
+                      h.update(block); output.write(block)
+                      if total-synced >= 16777216:
+                          output.flush(); os.fdatasync(output.fileno())
+                          os.posix_fadvise(output.fileno(), 0, total, os.POSIX_FADV_DONTNEED)
+                          synced=total
+                      if total-report >= 268435456:
+                          print('Downloaded bytes', total, flush=True); report=total
+                  output.flush(); os.fsync(output.fileno())
+              assert total == size and h.hexdigest() == expected, 'Model digest mismatch'
+              partial.chmod(0o444); partial.replace(final)
+              print('Verified model SHA-256', expected)
+          resources:
+            requests: {cpu: 100m, memory: 64Mi}
+            limits: {cpu: '1', memory: 512Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: models, mountPath: /models}
+      volumes:
+        - name: models
+          persistentVolumeClaim: {claimName: qwen35-4b-model}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llama-server-qwen35
+  namespace: opaque-models
+spec:
+  # Initial installs must stage at zero until download and GPU allocation finish.
+  # This is the qualified production replica count.
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: opaque-qwen35}
+  template:
+    metadata:
+      labels: {app: opaque-qwen35}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      nodeSelector:
+        kubernetes.io/hostname: talos-jetson-1
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: model
+          image: 192.168.25.201:5050/llamacpp-jetson@sha256:d69eef7f2933b3d689f21c893767f05dbdf7bab345c83cbb88e93360a6678bf7
+          command: [/usr/local/bin/llama-server]
+          args:
+            - -m
+            - /models/Qwen3.5-4B-Q4_K_M.gguf
+            - --alias
+            - Qwen3.5-4B-Q4_K_M.gguf
+            - --host
+            - 0.0.0.0
+            - --port
+            - '8080'
+            - --ctx-size
+            - '2048'
+            - --parallel
+            - '1'
+            - --n-gpu-layers
+            - '99'
+            - --batch-size
+            - '128'
+            - --ubatch-size
+            - '128'
+            - --jinja
+            - --reasoning-budget
+            - '0'
+            - --chat-template-kwargs
+            - '{"enable_thinking":false}'
+          env:
+            - {name: HOME, value: /tmp}
+            - {name: TMPDIR, value: /tmp}
+          ports: [{name: api, containerPort: 8080}]
+          resources:
+            requests: {cpu: '1', memory: 4Gi, nvidia.com/gpu: '1'}
+            limits: {cpu: '4', memory: 5500Mi, nvidia.com/gpu: '1'}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          startupProbe:
+            httpGet: {path: /health, port: 8080}
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: {path: /health, port: 8080}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /health, port: 8080}
+            periodSeconds: 20
+            failureThreshold: 3
+          volumeMounts:
+            - {name: models, mountPath: /models, readOnly: true}
+            - {name: scratch, mountPath: /tmp}
+      volumes:
+        - name: models
+          persistentVolumeClaim: {claimName: qwen35-4b-model}
+        - name: scratch
+          emptyDir: {medium: Memory, sizeLimit: 64Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-server-qwen35
+  namespace: opaque-models
+spec:
+  type: ClusterIP
+  selector: {app: opaque-qwen35}
+  ports: [{name: api, port: 8080, targetPort: 8080}]

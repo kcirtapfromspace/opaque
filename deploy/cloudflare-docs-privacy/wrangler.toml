@@ -1,0 +1,45 @@
+name = "opaque-docs-privacy"
+main = "src/worker.mjs"
+compatibility_date = "2026-09-04"
+workers_dev = false
+preview_urls = false
+
+[[routes]]
+pattern = "opaque.info/product/*"
+zone_name = "opaque.info"
+
+[[routes]]
+pattern = "opaque.info/product"
+zone_name = "opaque.info"
+
+[[routes]]
+pattern = "opaque.info/dogfood*"
+zone_name = "opaque.info"
+
+[[routes]]
+pattern = "opaque.info/release-dogfood*"
+zone_name = "opaque.info"
+
+[[routes]]
+pattern = "opaque.info/tenant-boundaries*"
+zone_name = "opaque.info"
+
+[[routes]]
+pattern = "www.opaque.info/product/*"
+zone_name = "opaque.info"
+
+[[routes]]
+pattern = "www.opaque.info/product"
+zone_name = "opaque.info"
+
+[[routes]]
+pattern = "www.opaque.info/dogfood*"
+zone_name = "opaque.info"
+
+[[routes]]
+pattern = "www.opaque.info/release-dogfood*"
+zone_name = "opaque.info"
+
+[[routes]]
+pattern = "www.opaque.info/tenant-boundaries*"
+zone_name = "opaque.info"

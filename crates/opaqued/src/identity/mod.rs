@@ -58,6 +58,11 @@ pub struct IdentityConfig {
     #[serde(default)]
     pub allowed_email_domains: Vec<String>,
 
+    /// Exact issuer-local subjects admitted by trusted operator configuration.
+    /// This is a membership boundary, evaluated before account bootstrap.
+    #[serde(default)]
+    pub allowed_subjects: Vec<String>,
+
     /// When true, agent operations will require a valid delegation bound to
     /// an authenticated principal (enforced from Stage C onward).
     #[serde(default)]
@@ -107,6 +112,11 @@ impl IdentityConfig {
         if self.client_id.trim().is_empty() {
             return Err("invalid [identity] client_id: empty".into());
         }
+        if self.allowed_subjects.iter().any(|subject| {
+            subject.is_empty() || subject.len() > 255 || subject.chars().any(char::is_control)
+        }) {
+            return Err("invalid [identity] allowed_subjects".into());
+        }
         Ok(())
     }
 }
@@ -133,6 +143,38 @@ pub struct IdentityRuntime {
 }
 
 impl IdentityRuntime {
+    /// Admission remains live after login. Persisted sessions/principals must
+    /// not preserve membership removed from the current broker configuration.
+    pub fn principal_permitted(&self, principal: &opaque_core::identity::Principal) -> bool {
+        use opaque_core::identity::PrincipalKind;
+        if principal.disabled {
+            return false;
+        }
+        match &principal.kind {
+            PrincipalKind::Human {
+                iss, sub, email, ..
+            } => {
+                iss == &self.config.issuer
+                    && (self.config.allowed_subjects.is_empty()
+                        || self.config.allowed_subjects.contains(sub))
+                    && (self.config.allowed_email_domains.is_empty()
+                        || email
+                            .as_deref()
+                            .and_then(|email| email.rsplit_once('@'))
+                            .is_some_and(|(_, domain)| {
+                                self.config
+                                    .allowed_email_domains
+                                    .iter()
+                                    .any(|allowed| domain.eq_ignore_ascii_case(allowed))
+                            }))
+            }
+            PrincipalKind::Service { name } => self.config.service_principals.iter().any(|entry| {
+                entry.name == *name && roles_from_string(&entry.roles.join(",")).is_ok()
+            }),
+            PrincipalKind::Agent { .. } => false,
+        }
+    }
+
     /// Initialize the identity runtime: validate config, open the store,
     /// load or create the signing key, and upsert config-declared service
     /// principals. `state_dir` is `~/.opaque` (the audit.db directory).
@@ -231,6 +273,9 @@ impl IdentityRuntime {
             .get_principal(&session.principal_id)
             .ok()
             .flatten()?;
+        if session.idp_issuer != self.config.issuer || !self.principal_permitted(&principal) {
+            return None;
+        }
         Some(serde_json::json!({
             "principal_id": principal.id.as_str(),
             "label": principal.display_label(),
@@ -248,10 +293,14 @@ impl IdentityRuntime {
     /// The principal behind the current active human session, if any.
     pub fn current_human_principal(&self) -> Option<opaque_core::identity::Principal> {
         let session = self.store.current_human_session().ok().flatten()?;
+        if session.idp_issuer != self.config.issuer {
+            return None;
+        }
         self.store
             .get_principal(&session.principal_id)
             .ok()
             .flatten()
+            .filter(|principal| self.principal_permitted(principal))
     }
 
     /// True when the current human session's principal holds `role`.

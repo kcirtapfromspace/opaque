@@ -9,6 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+tempfile = "3"
 opaque-core = { path = "../opaque-core" }
 bytes = { workspace = true }
 libc = { workspace = true }
@@ -45,9 +46,9 @@ mdns-sd = { workspace = true }
 hyper-util = { workspace = true }
 
 [dev-dependencies]
+opaque-approver = { path = "../opaque-approver" }
 tokio = { workspace = true, features = ["test-util"] }
 wiremock = { workspace = true }
-tempfile = "3"
 reqwest = { workspace = true, features = ["rustls-tls"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

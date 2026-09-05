@@ -1,8 +1,9 @@
 //! Enclave: the central enforcement funnel for all secret-using operations.
 //!
-//! **Every** operation request flows through [`Enclave::execute()`]. There are
-//! no bypass paths. The type system enforces that only sanitized responses
-//! can be returned to the client.
+//! Individual operations flow through [`Enclave::execute()`]. Immutable task
+//! manifests use `Enclave::execute_task`, which checks every child operation,
+//! obtains a fresh native approval and charges durable slots before dispatch.
+//! Both transport paths sanitize their responses before returning to clients.
 //!
 //! The execution pipeline:
 //!
@@ -34,6 +35,9 @@ use opaque_core::sanitize::{Sanitized, SanitizedResponse, Sanitizer, Unsanitized
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
+
+mod task;
+pub use task::{inference_task_operations, release_task_operations, task_operation};
 
 // ---------------------------------------------------------------------------
 // Server-side secret ref name derivation
@@ -541,9 +545,12 @@ pub trait ApprovalGate: Send + Sync + fmt::Debug {
 
 /// The central enforcement funnel.
 ///
-/// All secret-using operations MUST pass through `Enclave::execute()`.
-/// The type system guarantees that only sanitized responses are returned.
+/// All secret-using operations pass through this enclave, via individual
+/// execution or the typed, durably accounted task path.
 pub struct Enclave {
+    inference_profile: Option<crate::inference::TrustedInferenceProfile>,
+    /// Only agent-session creation may use this configured complete-review factor.
+    session_approval_factor: ApprovalFactor,
     /// Operation registry (immutable after construction).
     registry: OperationRegistry,
 
@@ -551,6 +558,7 @@ pub struct Enclave {
     /// hot-swap the whole rule set without restarting the daemon; the read
     /// path takes an uncontended read lock per evaluation.
     policy: std::sync::RwLock<PolicyEngine>,
+    policy_generation: std::sync::atomic::AtomicU64,
 
     /// Operation handlers, keyed by operation name.
     handlers: HashMap<String, Box<dyn OperationHandler>>,
@@ -589,6 +597,8 @@ impl fmt::Debug for Enclave {
 
 /// Builder for constructing an [`Enclave`].
 pub struct EnclaveBuilder {
+    inference_profile: Option<crate::inference::TrustedInferenceProfile>,
+    session_approval_factor: ApprovalFactor,
     registry: OperationRegistry,
     policy: PolicyEngine,
     handlers: HashMap<String, Box<dyn OperationHandler>>,
@@ -601,6 +611,8 @@ impl EnclaveBuilder {
     /// Create a new builder.
     pub fn new() -> Self {
         Self {
+            inference_profile: None,
+            session_approval_factor: ApprovalFactor::LocalBio,
             registry: OperationRegistry::new(),
             policy: PolicyEngine::new(),
             handlers: HashMap::new(),
@@ -619,6 +631,21 @@ impl EnclaveBuilder {
     /// Set the policy engine.
     pub fn policy(mut self, policy: PolicyEngine) -> Self {
         self.policy = policy;
+        self
+    }
+
+    pub fn inference_profile(
+        mut self,
+        profile: Option<crate::inference::TrustedInferenceProfile>,
+    ) -> Self {
+        self.inference_profile = profile;
+        self
+    }
+
+    /// Choose the trusted review channel for agent-session creation only.
+    /// Other control-plane approvals always retain the local native factor.
+    pub fn session_approval_factor(mut self, factor: ApprovalFactor) -> Self {
+        self.session_approval_factor = factor;
         self
     }
 
@@ -653,9 +680,18 @@ impl EnclaveBuilder {
 
     /// Build the enclave. Returns an error if required components are missing.
     pub fn build(self) -> Result<Enclave, String> {
+        if !matches!(
+            self.session_approval_factor,
+            ApprovalFactor::LocalBio | ApprovalFactor::PairedWorkstation
+        ) {
+            return Err("agent-session approval requires local_bio or paired_workstation".into());
+        }
         Ok(Enclave {
+            inference_profile: self.inference_profile,
+            session_approval_factor: self.session_approval_factor,
             registry: self.registry,
             policy: std::sync::RwLock::new(self.policy),
+            policy_generation: std::sync::atomic::AtomicU64::new(0),
             handlers: self.handlers,
             approval_gate: self.approval_gate.ok_or("approval gate is required")?,
             audit: self.audit.ok_or("audit sink is required")?,
@@ -674,6 +710,11 @@ impl Default for EnclaveBuilder {
 }
 
 impl Enclave {
+    pub fn inference_profile(&self) -> Result<&crate::inference::TrustedInferenceProfile, String> {
+        self.inference_profile
+            .as_ref()
+            .ok_or_else(|| "tenant inference is not configured".into())
+    }
     /// Create a builder for constructing an enclave.
     pub fn builder() -> EnclaveBuilder {
         EnclaveBuilder::new()
@@ -691,16 +732,19 @@ impl Enclave {
     /// new rule count.
     pub fn swap_policy(&self, policy: PolicyEngine) -> usize {
         let count = policy.rule_count();
-        *self
+        let mut current = self
             .policy
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = policy;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *current = policy;
+        self.policy_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         count
     }
 
     /// Execute an operation request through the full enforcement funnel.
     ///
-    /// This is the **ONLY** path to run any operation. The return type
+    /// This is the path for individual operations. The return type
     /// `SanitizedResponse<Sanitized>` guarantees at compile time that the
     /// response has been sanitized.
     ///
@@ -1028,6 +1072,26 @@ impl Enclave {
         reason: &str,
     ) -> Result<Option<opaque_core::audit::ApproverIdentity>, EnclaveError> {
         let client_summary = ClientSummary::from((identity, client_type));
+        let session_review = operation_label == "agent_session_start";
+        let reviewed_reason = if session_review {
+            // The caller constructs trusted authority fields and a bounded
+            // label. Preserve every reviewed byte; invalid or oversized
+            // content must fail rather than hide authority by truncation.
+            if reason.trim().is_empty() || reason.len() > 8 * 1024 || reason.chars().any(|c| {
+                (c.is_control() && c != '\n' && c != '\t')
+                    || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+            }) {
+                return Err(EnclaveError::InvalidInput("agent-session review must be complete, bounded, and free of display controls".into()));
+            }
+            reason.to_owned()
+        } else {
+            sanitize_for_display(reason, 256)
+        };
+        let factor = if session_review {
+            self.session_approval_factor
+        } else {
+            ApprovalFactor::LocalBio
+        };
 
         if !self
             .rate_limiter
@@ -1053,8 +1117,12 @@ impl Enclave {
             .await
             .map_err(|_| EnclaveError::ApprovalUnavailable("approval gate closed".into()))?;
 
-        // Synthetic request: the gate needs only identity + description for the
-        // local biometric factor; classification is audit-only.
+        let description = format!(
+            "Operation: {action_description}\n  {reviewed_reason}\nClient: {}",
+            identity
+        );
+        // Bind the full agent-session review into request authority as well
+        // as the workstation protocol's exact reviewed-content signature.
         let synth = OperationRequest {
             principal: None,
             request_id: approval_id,
@@ -1065,14 +1133,13 @@ impl Enclave {
             secret_ref_names: vec![],
             created_at: std::time::SystemTime::now(),
             expires_at: None,
-            params: serde_json::Value::Null,
+            params: if session_review {
+                serde_json::json!({"control_review": description})
+            } else {
+                serde_json::Value::Null
+            },
             workspace: None,
         };
-        let description = format!(
-            "Operation: {action_description}\n  {}\nClient: {}",
-            sanitize_for_display(reason, 256),
-            identity
-        );
 
         self.audit.emit(
             AuditEvent::new(AuditEventKind::ApprovalPresented)
@@ -1083,12 +1150,7 @@ impl Enclave {
 
         let result = self
             .approval_gate
-            .request_approval(
-                approval_id,
-                &synth,
-                &[ApprovalFactor::LocalBio],
-                &description,
-            )
+            .request_approval(approval_id, &synth, &[factor], &description)
             .await;
 
         match result {
@@ -1231,6 +1293,15 @@ impl Enclave {
         // rendering into the approval prompt. This is defense-in-depth: even
         // if upstream validation is bypassed, the prompt cannot be spoofed.
         let mut description = format!("Operation: {}", op_def.description);
+        if matches!(
+            request.operation.as_str(),
+            "github.publish_manifest" | "github.release_manifest" | "inference.fixed_manifest"
+        ) {
+            description.push_str(&task::approval_description(
+                request,
+                self.inference_profile.as_ref(),
+            )?);
+        }
         for (k, v) in &request.target {
             // SECURITY (C3): the command is the security-critical field the approver
             // must actually read, so render it in full (sanitized to a single line)
@@ -1380,6 +1451,7 @@ impl Enclave {
                         ApprovalFactor::LocalBio => "local_bio",
                         ApprovalFactor::IosFaceId => "ios_faceid",
                         ApprovalFactor::Fido2 => "fido2",
+                        ApprovalFactor::PairedWorkstation => "paired_workstation",
                     })
                     .collect();
                 let factor_str = factor_names.join(", ");
@@ -2944,6 +3016,197 @@ mod tests {
                 .push(description.to_owned());
             Box::pin(async { Ok(ApprovalOutcome::approved_anonymous()) })
         }
+    }
+
+    type CapturedControlReview = (OperationRequest, Vec<ApprovalFactor>, String);
+
+    #[derive(Debug, Default)]
+    struct ControlCaptureGate {
+        captured: Arc<Mutex<Vec<CapturedControlReview>>>,
+    }
+
+    impl ApprovalGate for ControlCaptureGate {
+        fn request_approval(
+            &self,
+            _approval_id: Uuid,
+            request: &OperationRequest,
+            factors: &[ApprovalFactor],
+            description: &str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ApprovalOutcome, String>> + Send + '_>,
+        > {
+            self.captured.lock().unwrap().push((
+                request.clone(),
+                factors.to_vec(),
+                description.to_owned(),
+            ));
+            Box::pin(async { Ok(ApprovalOutcome::denied()) })
+        }
+    }
+
+    #[test]
+    fn agent_session_factor_accepts_only_complete_review_factors() {
+        for factor in [ApprovalFactor::Fido2, ApprovalFactor::IosFaceId] {
+            let result = Enclave::builder()
+                .session_approval_factor(factor)
+                .approval_gate(Box::new(ControlCaptureGate::default()))
+                .audit(Arc::new(InMemoryAuditEmitter::new()))
+                .build();
+            assert!(
+                result
+                    .unwrap_err()
+                    .contains("local_bio or paired_workstation")
+            );
+        }
+        for factor in [ApprovalFactor::LocalBio, ApprovalFactor::PairedWorkstation] {
+            assert!(
+                Enclave::builder()
+                    .session_approval_factor(factor)
+                    .approval_gate(Box::new(ControlCaptureGate::default()))
+                    .audit(Arc::new(InMemoryAuditEmitter::new()))
+                    .build()
+                    .is_ok()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_session_factor_selection_never_changes_other_control_approval() {
+        for configured in [None, Some(ApprovalFactor::PairedWorkstation)] {
+            let gate = ControlCaptureGate::default();
+            let captured = gate.captured.clone();
+            let audit = Arc::new(InMemoryAuditEmitter::new());
+            let mut builder = Enclave::builder()
+                .approval_gate(Box::new(gate))
+                .audit(audit.clone());
+            if let Some(factor) = configured {
+                builder = builder.session_approval_factor(factor);
+            }
+            let enclave = builder.build().unwrap();
+            let identity = test_request("test", ClientType::Agent).client_identity;
+            for operation in [
+                "agent_session_start",
+                "device_pair_start",
+                "device_pair_confirm",
+                "fido2_register",
+                "identity.role_set",
+                "agent_session_start.other",
+            ] {
+                let result = enclave
+                    .request_control_approval(
+                        &identity,
+                        ClientType::Agent,
+                        operation,
+                        "Control approval",
+                        "Tenant: test\nTTL: 600 seconds",
+                    )
+                    .await;
+                assert!(matches!(result, Err(EnclaveError::ApprovalNotGranted(_))));
+            }
+            let records = captured.lock().unwrap();
+            assert_eq!(records.len(), 6);
+            assert_eq!(
+                records[0].1,
+                vec![configured.unwrap_or(ApprovalFactor::LocalBio)]
+            );
+            for (_, factors, _) in &records[1..] {
+                assert_eq!(factors, &vec![ApprovalFactor::LocalBio]);
+            }
+            assert_eq!(
+                audit.events_of_kind(AuditEventKind::ApprovalRequired).len(),
+                6
+            );
+            assert_eq!(
+                audit
+                    .events_of_kind(AuditEventKind::ApprovalPresented)
+                    .len(),
+                6
+            );
+            assert_eq!(
+                audit.events_of_kind(AuditEventKind::ApprovalDenied).len(),
+                6
+            );
+            assert!(
+                audit
+                    .events_of_kind(AuditEventKind::ApprovalGranted)
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_session_review_keeps_full_authority_and_binds_request_content() {
+        let gate = ControlCaptureGate::default();
+        let captured = gate.captured.clone();
+        let enclave = Enclave::builder()
+            .session_approval_factor(ApprovalFactor::PairedWorkstation)
+            .approval_gate(Box::new(gate))
+            .audit(Arc::new(InMemoryAuditEmitter::new()))
+            .build()
+            .unwrap();
+        let identity = test_request("test", ClientType::Agent).client_identity;
+        let reason = format!(
+            "Tenant: exact-tenant\nTenant broker: 7f720ac8-fac2-4b5f-966c-ed2de3a738a8\nSubject principal: opaque-human-123\nMode: delegated\nPeer UID: {}\nLabel: {}\nTTL: 600 seconds\nFinal reviewed authority",
+            identity.uid,
+            "label".repeat(100)
+        );
+        let result = enclave
+            .request_control_approval(
+                &identity,
+                ClientType::Agent,
+                "agent_session_start",
+                "Start one delegated agent session",
+                &reason,
+            )
+            .await;
+        assert!(matches!(result, Err(EnclaveError::ApprovalNotGranted(_))));
+        let records = captured.lock().unwrap();
+        let (request, _, description) = &records[0];
+        assert!(description.contains(&reason));
+        assert!(description.contains("Final reviewed authority"));
+        assert_eq!(request.params["control_review"], *description);
+        let original_hash = request.content_hash();
+        let mut changed = request.clone();
+        changed.params["control_review"] = description.replace("600 seconds", "601 seconds").into();
+        assert_ne!(changed.content_hash(), original_hash);
+        let mut changed = request.clone();
+        changed.operation = "device_pair_start".into();
+        assert_ne!(changed.content_hash(), original_hash);
+    }
+
+    #[tokio::test]
+    async fn agent_session_review_rejects_overflow_and_display_controls_without_prompt() {
+        let gate = ControlCaptureGate::default();
+        let captured = gate.captured.clone();
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let enclave = Enclave::builder()
+            .session_approval_factor(ApprovalFactor::PairedWorkstation)
+            .approval_gate(Box::new(gate))
+            .audit(audit.clone())
+            .build()
+            .unwrap();
+        let identity = test_request("test", ClientType::Agent).client_identity;
+        for reason in [
+            "".into(),
+            "x".repeat(8193),
+            "Tenant: a\0hidden".into(),
+            "Tenant: a\u{202e}other".into(),
+        ] {
+            assert!(matches!(
+                enclave
+                    .request_control_approval(
+                        &identity,
+                        ClientType::Agent,
+                        "agent_session_start",
+                        "Start agent session",
+                        &reason
+                    )
+                    .await,
+                Err(EnclaveError::InvalidInput(_))
+            ));
+        }
+        assert!(captured.lock().unwrap().is_empty());
+        assert!(audit.events().is_empty());
     }
 
     // -- Approval gate error path --

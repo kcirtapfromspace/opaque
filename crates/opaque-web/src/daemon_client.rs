@@ -38,18 +38,26 @@ fn read_daemon_token(sock: &Path) -> std::io::Result<String> {
 #[derive(Clone)]
 pub struct DaemonClient {
     socket_path: PathBuf,
+    /// Delegation supplied by the process launcher, never by an HTTP caller.
+    session_token: Option<String>,
 }
 
 impl DaemonClient {
     /// Create a new daemon client using the default or env-overridden socket path.
     pub fn new(socket_override: Option<PathBuf>) -> Self {
         let socket_path = socket_override.unwrap_or_else(socket_path);
-        Self { socket_path }
+        let session_token = std::env::var("OPAQUE_SESSION_TOKEN")
+            .ok()
+            .filter(|token| !token.is_empty());
+        Self {
+            socket_path,
+            session_token,
+        }
     }
 
     /// Quick check whether the daemon socket file exists.
-    pub fn is_available(&self) -> bool {
-        self.socket_path.exists()
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
     }
 
     /// Send a request to the daemon and return the response.
@@ -59,7 +67,25 @@ impl DaemonClient {
     }
 
     /// Send a request to the daemon and return the response.
-    async fn call(&self, method: &str, params: serde_json::Value) -> std::io::Result<Response> {
+    pub async fn call(&self, method: &str, params: serde_json::Value) -> std::io::Result<Response> {
+        // Reconciliation can read several bounded provider pages. It never
+        // dispatches work, and must not be retried automatically on timeout.
+        let timeout = if method == "task_reconcile" { 45 } else { 5 };
+        tokio::time::timeout(
+            Duration::from_secs(timeout),
+            self.call_inner(method, params),
+        )
+        .await
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "daemon request timed out")
+        })?
+    }
+
+    async fn call_inner(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> std::io::Result<Response> {
         verify_socket_safety(&self.socket_path)?;
         let daemon_token = read_daemon_token(&self.socket_path)?;
 
@@ -89,11 +115,15 @@ impl DaemonClient {
             .new_codec();
         let mut framed = Framed::new(stream, codec);
 
-        // Send handshake as the first frame (no session token — web is a human client).
-        let handshake = serde_json::json!({
+        // A dashboard may run inside an agent wrapper. The daemon determines
+        // its OS identity and validates the launcher's delegation on each call.
+        let mut handshake = serde_json::json!({
             "handshake": "v1",
             "daemon_token": daemon_token.trim(),
         });
+        if let Some(token) = &self.session_token {
+            handshake["session_token"] = serde_json::json!(token);
+        }
         let hs_bytes = serde_json::to_vec(&handshake).map_err(std::io::Error::other)?;
         framed.send(Bytes::from(hs_bytes)).await?;
 

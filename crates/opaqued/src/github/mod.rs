@@ -11,6 +11,17 @@
 
 pub mod client;
 pub mod crypto;
+pub mod release;
+mod task;
+
+pub use release::{
+    dispatch_staging_release, plan_staging_release, prepare_staging_release,
+    reconcile_staging_release,
+};
+pub use task::{execute_task_action, plan_task_manifest, prepare_task_manifest};
+
+#[cfg(test)]
+static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 use std::fmt;
 use std::future::Future;

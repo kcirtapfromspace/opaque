@@ -292,6 +292,9 @@ pub enum ApproverSource {
     /// the paired-device factor verifier, never from relayed, unverified
     /// device ids.
     PairedDevice,
+    /// An enrolled workstation key signed the full review and decision. The
+    /// broker trusts workstation custody; this is not biometric attestation.
+    PairedWorkstation,
     /// A FIDO2/WebAuthn assertion (hardware key or passkey) over the approval
     /// challenge was verified against the stored credential. Signature-bound.
     Fido2,
@@ -308,6 +311,7 @@ impl fmt::Display for ApproverSource {
         match self {
             Self::LocalBioSession => write!(f, "local_bio_session"),
             Self::PairedDevice => write!(f, "paired_device"),
+            Self::PairedWorkstation => write!(f, "paired_workstation"),
             Self::Fido2 => write!(f, "fido2"),
             Self::PolkitAccount => write!(f, "polkit_account"),
             Self::InsecureAutoApprove => write!(f, "insecure_auto_approve"),

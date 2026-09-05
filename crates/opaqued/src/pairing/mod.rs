@@ -5,6 +5,8 @@
 
 pub mod challenge;
 pub mod store;
+mod workstation;
+pub use workstation::WorkstationApproverConfig;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -100,6 +102,9 @@ pub struct PairingManager {
     active_sessions: Mutex<HashMap<String, PairingSession>>,
     /// Set of used challenge hashes for replay detection.
     used_challenges: Mutex<HashSet<String>>,
+    workstation_allowlist: Mutex<HashSet<String>>,
+    workstation_enrollments: Mutex<HashMap<String, opaque_core::workstation::EnrollmentChallenge>>,
+    workstation_auth: Mutex<()>,
 }
 
 /// Simple hex encoding.
@@ -128,6 +133,9 @@ impl PairingManager {
             device_store,
             active_sessions: Mutex::new(HashMap::new()),
             used_challenges: Mutex::new(HashSet::new()),
+            workstation_allowlist: Mutex::new(HashSet::new()),
+            workstation_enrollments: Mutex::new(HashMap::new()),
+            workstation_auth: Mutex::new(()),
         }
     }
 
@@ -241,6 +249,7 @@ impl PairingManager {
             paired_by,
             token_sha256: Some(sha256_hex(token.as_bytes())),
             confirmed: false,
+            kind: crate::pairing::store::DeviceKind::Ios,
         };
 
         // Drop the lock before accessing store
@@ -262,6 +271,9 @@ impl PairingManager {
             return false;
         };
         if device.revoked || !device.confirmed {
+            return false;
+        }
+        if device.kind == store::DeviceKind::Workstation && !self.workstation_allowed(&device) {
             return false;
         }
         let Some(stored) = device.token_sha256 else {
@@ -305,7 +317,7 @@ impl PairingManager {
         // possession of the one-time nonce, which anyone watching the
         // pairing terminal also saw. Approval authority starts at the
         // fingerprint-confirmation ceremony, not before.
-        if !device.confirmed {
+        if !device.confirmed || device.kind != store::DeviceKind::Ios {
             return Err(PairingError::InvalidSignature);
         }
 
@@ -334,7 +346,9 @@ impl PairingManager {
         // Mark as used
         {
             let mut used = self.used_challenges.lock().expect("replay lock");
-            used.insert(replay_key);
+            if !used.insert(replay_key) {
+                return Err(PairingError::InvalidSignature);
+            }
         }
 
         // Update last_seen
@@ -370,6 +384,10 @@ impl PairingManager {
 
     /// Revoke a paired device (keeps record for audit).
     pub fn revoke_device(&self, device_id: &str) -> Result<(), PairingError> {
+        let _guard = self
+            .workstation_auth
+            .lock()
+            .map_err(|_| PairingError::InvalidSignature)?;
         Ok(self.device_store.revoke_device(device_id)?)
     }
 

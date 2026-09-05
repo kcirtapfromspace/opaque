@@ -63,6 +63,72 @@ pub async fn prompt(reason: &str) -> Result<PromptOutcome, ApprovalError> {
     }
 }
 
+const MAX_TASK_REVIEW_BYTES: usize = 128 * 1024;
+
+fn task_review_text(reason: &str) -> Result<(String, String), ApprovalError> {
+    use sha2::{Digest, Sha256};
+
+    if reason.trim().is_empty() || reason.contains('\0') {
+        return Err(ApprovalError::InvalidReason);
+    }
+    let digest: String = Sha256::digest(reason.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let review = format!("{reason}\n\nReview fingerprint (SHA-256): {digest}\n");
+    if review.len() > MAX_TASK_REVIEW_BYTES {
+        return Err(ApprovalError::InvalidReason);
+    }
+    Ok((review, digest))
+}
+
+/// Show the complete immutable task in a trusted scrollable review window,
+/// then authenticate a short reason bound to the same reviewed description.
+/// Review confirmation never substitutes for the configured native factor.
+pub async fn prompt_task(reason: &str) -> Result<PromptOutcome, ApprovalError> {
+    let (review, digest) = task_review_text(reason)?;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use std::process::Stdio;
+        use tokio::io::AsyncWriteExt;
+
+        let helper = find_approve_helper()?;
+        let mut child = tokio::process::Command::new(helper)
+            .args(["--review-only", "--reason-stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|_| ApprovalError::Unavailable)?;
+        let mut stdin = child.stdin.take().ok_or(ApprovalError::Unavailable)?;
+        stdin
+            .write_all(review.as_bytes())
+            .await
+            .map_err(|_| ApprovalError::Unavailable)?;
+        drop(stdin);
+        let status = tokio::time::timeout(std::time::Duration::from_secs(90), child.wait())
+            .await
+            .map_err(|_| ApprovalError::Failed("task review timed out".into()))?
+            .map_err(|_| ApprovalError::Unavailable)?;
+        match status.code() {
+            Some(0) => {}
+            Some(1) => return Ok(PromptOutcome::Denied),
+            _ => return Err(ApprovalError::Unavailable),
+        }
+        let short_reason = format!(
+            "Authorize the task just reviewed in Opaque. Review fingerprint: {}",
+            &digest[..16]
+        );
+        prompt(&short_reason).await
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (review, digest);
+        Err(ApprovalError::Unsupported)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // macOS: LocalAuthentication (Touch ID / password)
 // ---------------------------------------------------------------------------
@@ -204,14 +270,14 @@ fn parse_helper_account(stdout: &[u8]) -> Option<UnixAccount> {
 /// Search order:
 /// 1. Same directory as the running daemon binary
 /// 2. Well-known system paths
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn find_approve_helper() -> Result<std::path::PathBuf, ApprovalError> {
     // Next to the daemon binary (works during development and standard installs).
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
         let helper = dir.join("opaque-approve-helper");
-        if helper.exists() {
+        if helper.is_file() {
             return Ok(helper);
         }
     }
@@ -222,7 +288,7 @@ fn find_approve_helper() -> Result<std::path::PathBuf, ApprovalError> {
         "/usr/bin/opaque-approve-helper",
     ] {
         let p = std::path::PathBuf::from(path);
-        if p.exists() {
+        if p.is_file() {
             return Ok(p);
         }
     }
@@ -256,6 +322,23 @@ mod tests {
             .unwrap();
         let result = rt.block_on(prompt("   "));
         assert!(matches!(result, Err(ApprovalError::InvalidReason)));
+    }
+
+    #[test]
+    fn task_review_keeps_full_scope_and_binds_its_fingerprint() {
+        let reason = format!(
+            "Task\n{}\n32. LAST ACTION\nmanifest_digest=abc",
+            "scope\n".repeat(1000)
+        );
+        let (review, fingerprint) = task_review_text(&reason).unwrap();
+        assert!(review.starts_with(&reason));
+        assert!(review.contains("32. LAST ACTION"));
+        assert!(review.contains(&fingerprint));
+        assert_eq!(fingerprint.len(), 64);
+        let (_, changed) = task_review_text(&format!("{reason} changed")).unwrap();
+        assert_ne!(fingerprint, changed);
+        assert!(task_review_text(&"x".repeat(MAX_TASK_REVIEW_BYTES)).is_err());
+        assert!(task_review_text("\0").is_err());
     }
 
     #[cfg(target_os = "linux")]

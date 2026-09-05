@@ -1,0 +1,96 @@
+# Fixed-template defense in depth. Only the newly labelled demo slot namespaces
+# match; existing workloads and cluster networking are not modified.
+# Render ${RUNTIME_IMAGE} to the exact image digest used by the controller.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: opaque-hosted-demo-runtime
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels:
+        opaque.dev/demo-slot: "true"
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [pods]
+  validations:
+    - expression: >-
+        object.metadata.name.matches('^demo-[0-9a-f]{32}$') &&
+        object.metadata.labels['opaque.dev/hosted-demo'] == 'true' &&
+        object.metadata.labels['opaque.dev/lease-id'] == object.metadata.name.substring(5)
+      message: Demo pods must have a bound deterministic lease identity.
+    - expression: >-
+        object.spec.containers.size() == 1 &&
+        object.spec.containers[0].name == 'runtime' &&
+        object.spec.containers[0].image == '${RUNTIME_IMAGE}' &&
+        object.spec.containers[0].command == ['python3', '/opt/opaque/deploy/hosted-demo/runtime.py'] &&
+        (!has(object.spec.containers[0].args) || object.spec.containers[0].args.size() == 0) &&
+        (!has(object.spec.initContainers) || object.spec.initContainers.size() == 0) &&
+        (!has(object.spec.ephemeralContainers) || object.spec.ephemeralContainers.size() == 0)
+      message: Only the reviewed digest-pinned runtime may execute in a demo slot.
+    - expression: >-
+        object.spec.serviceAccountName == 'opaque-demo-runtime' &&
+        has(object.spec.automountServiceAccountToken) && object.spec.automountServiceAccountToken == false &&
+        object.spec.restartPolicy == 'Never' &&
+        has(object.spec.activeDeadlineSeconds) && object.spec.activeDeadlineSeconds > 0 &&
+        object.spec.activeDeadlineSeconds <= 900 &&
+        (!has(object.spec.hostNetwork) || object.spec.hostNetwork == false) &&
+        (!has(object.spec.hostPID) || object.spec.hostPID == false) &&
+        (!has(object.spec.hostIPC) || object.spec.hostIPC == false)
+      message: Demo runtimes must be bounded, tokenless and outside host namespaces.
+    - expression: >-
+        object.spec.volumes.size() == 1 && object.spec.volumes[0].name == 'scratch' &&
+        has(object.spec.volumes[0].emptyDir) && object.spec.volumes[0].emptyDir.medium == 'Memory' &&
+        dyn(object.spec.volumes[0].emptyDir).sizeLimit == '64Mi' &&
+        object.spec.containers[0].volumeMounts.size() == 1 &&
+        object.spec.containers[0].volumeMounts[0].name == 'scratch' &&
+        object.spec.containers[0].volumeMounts[0].mountPath == '/tmp'
+      message: Demo runtimes may mount only bounded temporary memory.
+    - expression: >-
+        dyn(object.spec.containers[0].resources).requests['cpu'] == '100m' &&
+        dyn(object.spec.containers[0].resources).requests['memory'] == '128Mi' &&
+        dyn(object.spec.containers[0].resources).limits['cpu'] == '500m' &&
+        dyn(object.spec.containers[0].resources).limits['memory'] == '384Mi' &&
+        object.spec.containers[0].securityContext.readOnlyRootFilesystem == true &&
+        object.spec.containers[0].securityContext.allowPrivilegeEscalation == false
+      message: Demo runtime resource and filesystem limits are fixed.
+    - expression: >-
+        (!has(object.spec.containers[0].envFrom) || object.spec.containers[0].envFrom.size() == 0) &&
+        object.spec.containers[0].env.all(e, e.name in [
+          'OPAQUE_DEMO_LEASE_ID', 'OPAQUE_DEMO_TENANT_ID', 'OPAQUE_DEMO_GENERATION',
+          'OPAQUE_DEMO_EXPIRES_AT_MS', 'OPAQUE_DEMO_MODEL_PROFILE', 'OPAQUE_DEMO_MODEL_URL', 'OPAQUE_DEMO_MODEL_ID',
+          'OPAQUE_DEMO_PROXY_SECRET', 'OPAQUE_DEMO_STATE_DIR', 'PYTHONDONTWRITEBYTECODE', 'HOME', 'TMPDIR']) &&
+        object.spec.containers[0].env.all(e,
+          object.spec.containers[0].env.filter(other, other.name == e.name).size() == 1) &&
+        object.spec.containers[0].env.filter(e, has(e.valueFrom)).all(e,
+          e.name == 'OPAQUE_DEMO_PROXY_SECRET' && has(e.valueFrom.secretKeyRef) &&
+          e.valueFrom.secretKeyRef.name == object.metadata.name && e.valueFrom.secretKeyRef.key == 'proxy-secret')
+      message: Runtime authority comes only from the fixed model and its own lease secret.
+    - expression: >-
+        object.spec.containers[0].env.exists(e,
+          e.name == 'OPAQUE_DEMO_MODEL_PROFILE' &&
+          ((e.value == 'gemma4-e2b' &&
+            object.spec.containers[0].env.exists(u, u.name == 'OPAQUE_DEMO_MODEL_URL' && u.value == 'http://llama-server.gemma4.svc.cluster.local:8080/') &&
+            object.spec.containers[0].env.exists(m, m.name == 'OPAQUE_DEMO_MODEL_ID' && m.value == 'gemma-4-E2B-it-Q3_K_M.gguf')) ||
+           (e.value == 'qwen35-4b' &&
+            object.spec.containers[0].env.exists(u, u.name == 'OPAQUE_DEMO_MODEL_URL' && u.value == 'http://llama-server-qwen35.opaque-models.svc.cluster.local:8080/') &&
+            object.spec.containers[0].env.exists(m, m.name == 'OPAQUE_DEMO_MODEL_ID' && m.value == 'Qwen3.5-4B-Q4_K_M.gguf')) ||
+           (e.value == 'qwen3-14b' &&
+            object.spec.containers[0].env.exists(u, u.name == 'OPAQUE_DEMO_MODEL_URL' && u.value == 'http://llamacpp-head.nvidia-system.svc.cluster.local:8080/') &&
+            object.spec.containers[0].env.exists(m, m.name == 'OPAQUE_DEMO_MODEL_ID' && m.value == 'Qwen3-14B-Q4_K_M.gguf'))))
+      message: The model profile, destination and model name must match one approved binding.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: opaque-hosted-demo-runtime
+spec:
+  policyName: opaque-hosted-demo-runtime
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        opaque.dev/demo-slot: "true"

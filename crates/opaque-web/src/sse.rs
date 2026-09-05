@@ -22,85 +22,69 @@ struct PollState {
 pub fn audit_sse_stream(
     db_path: PathBuf,
     cancel: CancellationToken,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let stream = futures_util::stream::unfold(None, move |state: Option<PollState>| {
-        let db_path = db_path.clone();
-        let cancel = cancel.clone();
-        async move {
-            // Initialize on first call.
-            let mut state = match state {
-                Some(s) => s,
-                None => {
-                    let conn = match rusqlite::Connection::open_with_flags(
-                        &db_path,
-                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-                    ) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            let event = Event::default()
-                                .event("error")
-                                .data(format!("failed to open audit db: {e}"));
-                            // Return one error event then stop.
-                            return Some((Ok(event), None));
-                        }
-                    };
-
-                    let last_seq: i64 = conn
-                        .query_row(
-                            "SELECT COALESCE(MAX(sequence_number), -1) FROM audit_events",
-                            [],
-                            |row| row.get(0),
-                        )
-                        .unwrap_or(-1);
-
-                    PollState {
-                        conn,
-                        last_seq,
-                        cancel,
-                        buffer: vec![],
-                    }
-                }
-            };
-
+    last_seq: Option<i64>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, rusqlite::Error> {
+    let conn = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let max_seq = conn.query_row(
+        "SELECT COALESCE(MAX(sequence_number), -1) FROM audit_events",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let initial = PollState {
+        conn,
+        last_seq: last_seq.unwrap_or(max_seq),
+        cancel,
+        buffer: vec![],
+    };
+    let stream =
+        futures_util::stream::unfold(Some(initial), |state: Option<PollState>| async move {
+            let mut state = state?;
             loop {
-                // Drain buffered events first.
                 if let Some(row) = state.buffer.pop() {
-                    if let Some(seq) = row.get("sequence_number").and_then(|v| v.as_i64())
-                        && seq > state.last_seq
-                    {
+                    if let Some(seq) = row.get("sequence_number").and_then(|v| v.as_i64()) {
                         state.last_seq = seq;
                     }
-                    let data = serde_json::to_string(&row).unwrap_or_default();
-                    let event = Event::default().event("audit").data(data);
+                    let event = Event::default()
+                        .event("audit")
+                        .id(state.last_seq.to_string())
+                        .data(row.to_string());
                     return Some((Ok(event), Some(state)));
                 }
-
-                // Wait for next poll interval or cancellation.
                 tokio::select! {
                     _ = state.cancel.cancelled() => return None,
                     _ = tokio::time::sleep(Duration::from_millis(500)) => {}
                 }
-
-                // Poll for new events.
-                let mut rows = query_new_events(&state.conn, state.last_seq);
-                // Reverse so pop() gives us events in ascending order.
-                rows.reverse();
-                state.buffer = rows;
+                match query_new_events(&state.conn, state.last_seq) {
+                    Ok(mut rows) => {
+                        rows.reverse();
+                        state.buffer = rows;
+                    }
+                    Err(error) => {
+                        tracing::warn!("audit stream query failed: {error}");
+                        let event = Event::default()
+                            .event("stream_error")
+                            .data("Audit database became unavailable. Reconnecting.");
+                        return Some((Ok(event), None));
+                    }
+                }
             }
-        }
-    });
-
-    Sse::new(stream).keep_alive(
+        });
+    Ok(Sse::new(stream).keep_alive(
         axum::response::sse::KeepAlive::new()
             .interval(Duration::from_secs(15))
             .text("ping"),
-    )
+    ))
 }
 
 /// Query events with sequence_number greater than `last_seq`.
-fn query_new_events(conn: &rusqlite::Connection, last_seq: i64) -> Vec<serde_json::Value> {
-    let mut stmt = match conn.prepare(
+fn query_new_events(
+    conn: &rusqlite::Connection,
+    last_seq: i64,
+) -> Result<Vec<serde_json::Value>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
         "SELECT event_id, sequence_number, ts_utc_ms, level, kind,
                 request_id, operation, safety, outcome, latency_ms,
                 secret_names, detail, target_json
@@ -108,33 +92,24 @@ fn query_new_events(conn: &rusqlite::Connection, last_seq: i64) -> Vec<serde_jso
          WHERE sequence_number > ?1
          ORDER BY sequence_number ASC
          LIMIT 100",
-    ) {
-        Ok(s) => s,
-        Err(_) => return vec![],
-    };
+    )?;
 
-    let rows = stmt
-        .query_map(rusqlite::params![last_seq], |row| {
-            Ok(serde_json::json!({
-                "event_id": row.get::<_, Option<String>>("event_id")?,
-                "sequence_number": row.get::<_, i64>("sequence_number")?,
-                "ts_utc_ms": row.get::<_, i64>("ts_utc_ms")?,
-                "level": row.get::<_, Option<String>>("level")?,
-                "kind": row.get::<_, Option<String>>("kind")?,
-                "request_id": row.get::<_, Option<String>>("request_id")?,
-                "operation": row.get::<_, Option<String>>("operation")?,
-                "safety": row.get::<_, Option<String>>("safety")?,
-                "outcome": row.get::<_, Option<String>>("outcome")?,
-                "latency_ms": row.get::<_, Option<i64>>("latency_ms")?,
-                "secret_names": row.get::<_, Option<String>>("secret_names")?,
-                "detail": row.get::<_, Option<String>>("detail")?,
-                "target_json": row.get::<_, Option<String>>("target_json")?,
-            }))
-        })
-        .ok();
-
-    match rows {
-        Some(r) => r.filter_map(|r| r.ok()).collect(),
-        None => vec![],
-    }
+    let rows = stmt.query_map(rusqlite::params![last_seq], |row| {
+        Ok(serde_json::json!({
+            "event_id": row.get::<_, Option<String>>("event_id")?,
+            "sequence_number": row.get::<_, i64>("sequence_number")?,
+            "ts_utc_ms": row.get::<_, i64>("ts_utc_ms")?,
+            "level": row.get::<_, Option<String>>("level")?,
+            "kind": row.get::<_, Option<String>>("kind")?,
+            "request_id": row.get::<_, Option<String>>("request_id")?,
+            "operation": row.get::<_, Option<String>>("operation")?,
+            "safety": row.get::<_, Option<String>>("safety")?,
+            "outcome": row.get::<_, Option<String>>("outcome")?,
+            "latency_ms": row.get::<_, Option<i64>>("latency_ms")?,
+            "secret_names": row.get::<_, Option<String>>("secret_names")?,
+            "detail": row.get::<_, Option<String>>("detail")?,
+            "target_json": row.get::<_, Option<String>>("target_json")?,
+        }))
+    })?;
+    rows.collect()
 }

@@ -97,6 +97,10 @@ impl SecretResolver for AwsResolver {
     fn resolve(&self, ref_str: &str) -> Result<SecretValue, ResolveError> {
         let parsed = Self::parse_ref(ref_str)?;
 
+        self.client
+            .ensure_mock_configuration()
+            .map_err(|e| ResolveError::AwsError(ref_str.to_owned(), e.to_string()))?;
+
         // Resolve AWS credentials via base resolvers only (env + keychain).
         let base = BaseResolver::new();
         let access_key_value = base.resolve(&self.access_key_ref).map_err(|e| {
@@ -222,5 +226,20 @@ mod tests {
         let resolver = AwsResolver::new(client);
         let debug = format!("{resolver:?}");
         assert!(debug.contains("AwsResolver"));
+    }
+
+    #[test]
+    fn remote_resolution_fails_before_accessing_credentials() {
+        let client = AwsClient::new(
+            "https://sts.us-east-1.amazonaws.com",
+            "https://secretsmanager.us-east-1.amazonaws.com",
+            "https://ssm.us-east-1.amazonaws.com",
+        )
+        .unwrap();
+        let resolver = AwsResolver::new(client);
+        for reference in ["aws:prod/db-password", "aws:ssm:/prod/password"] {
+            let err = resolver.resolve(reference).unwrap_err();
+            assert!(err.to_string().contains("disabled pending SigV4"));
+        }
     }
 }

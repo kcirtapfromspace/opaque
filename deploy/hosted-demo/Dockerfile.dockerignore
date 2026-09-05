@@ -1,0 +1,11 @@
+**
+!deploy
+!deploy/hosted-demo
+!deploy/hosted-demo/bin
+!deploy/hosted-demo/bin/opaque-metrics
+!deploy/hosted-demo/runtime.py
+!deploy/hosted-demo/controller.py
+!deploy/hosted-demo/credit_source.py
+!deploy/hosted-demo/model_profiles.py
+!scripts
+!scripts/metrics_chat_dogfood.py

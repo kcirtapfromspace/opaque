@@ -259,6 +259,79 @@ pub struct Sanitizer {
 }
 
 impl Sanitizer {
+    /// Task receipts contain typed public authority metadata, never provider
+    /// output. Preserve their verified digest and reference identifiers while
+    /// still scrubbing free text. Generic key/token heuristics would otherwise
+    /// destroy the exact scope the owner needs to review.
+    pub fn sanitize_task_record(
+        &self,
+        record: &crate::task::TaskRecord,
+    ) -> Result<serde_json::Value, String> {
+        record
+            .validate_tenant_and_inference_receipts()
+            .map_err(|_| "invalid tenant inference receipt")?;
+        record
+            .validate_release_observation()
+            .map_err(|_| "invalid release observation")?;
+        record
+            .manifest
+            .validate()
+            .map_err(|_| "invalid task receipt")?;
+        if record
+            .manifest
+            .digest()
+            .map_err(|_| "invalid task receipt")?
+            != record.manifest_digest
+            || record.slots.len() != record.manifest.actions.len()
+            || record
+                .slots
+                .iter()
+                .zip(&record.manifest.actions)
+                .any(|(slot, action)| &slot.action != action)
+        {
+            return Err("invalid task receipt integrity".into());
+        }
+        for slot in &record.slots {
+            if let Some(outcome) = &slot.outcome {
+                outcome
+                    .validate()
+                    .map_err(|_| "invalid task receipt outcome")?;
+            }
+        }
+        let source = serde_json::to_value(record).map_err(|_| "invalid task receipt")?;
+        let mut output = self.sanitize_value(&source);
+        output["manifest_digest"] = source["manifest_digest"].clone();
+        if record.tenant.is_some() {
+            output["tenant"] = source["tenant"].clone();
+        }
+        if record.release_observation.is_some() {
+            output["release_observation"] = source["release_observation"].clone();
+        }
+        for key in ["github_api_url", "vault_api_url", "actions"] {
+            output["manifest"][key] = source["manifest"][key].clone();
+        }
+        for (index, slot) in record.slots.iter().enumerate() {
+            output["slots"][index]["action"] = source["slots"][index]["action"].clone();
+            if let Some(receipt) = slot
+                .outcome
+                .as_ref()
+                .and_then(|outcome| outcome.inference_receipt.as_ref())
+            {
+                // Only validated public demo text can bypass generic secret-shaped
+                // field removal. Keep the exact text whose digest the receipt binds.
+                if receipt
+                    .output_text
+                    .as_ref()
+                    .is_some_and(|text| self.patterns.redact(text) != *text)
+                {
+                    return Err("unsafe model output in task receipt".into());
+                }
+                output["slots"][index]["outcome"]["inference_receipt"] =
+                    source["slots"][index]["outcome"]["inference_receipt"].clone();
+            }
+        }
+        Ok(output)
+    }
     /// Create a new sanitizer with the default pattern set.
     pub fn new() -> Self {
         Self {

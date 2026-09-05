@@ -13,19 +13,44 @@
 //! - 1: denied (user declined in dialog or polkit denied)
 //! - 2: unavailable (no display, no dialog tool, no pkcheck)
 
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Read};
 use std::process::{Command, ExitCode};
 
 const EXIT_APPROVED: u8 = 0;
 const EXIT_DENIED: u8 = 1;
 const EXIT_UNAVAILABLE: u8 = 2;
+const MAX_REVIEW_BYTES: usize = 128 * 1024;
+
+mod review;
+
+#[derive(Debug, PartialEq, Eq)]
+enum HelperRequest {
+    Legacy(String),
+    ReviewStdin,
+}
 
 fn main() -> ExitCode {
-    let reason = match parse_reason() {
-        Some(r) => r,
-        None => {
-            eprintln!("usage: opaque-approve-helper --reason <description>");
+    let request = match parse_request(std::env::args().skip(1).collect()) {
+        Ok(request) => request,
+        Err(()) => {
+            eprintln!(
+                "usage: opaque-approve-helper --reason <description> | --review-only --reason-stdin"
+            );
             return ExitCode::from(EXIT_UNAVAILABLE);
+        }
+    };
+    let reason = match request {
+        HelperRequest::Legacy(reason) => reason,
+        HelperRequest::ReviewStdin => {
+            let reason = match read_review(std::io::stdin().lock()) {
+                Ok(reason) => reason,
+                Err(()) => return ExitCode::from(EXIT_UNAVAILABLE),
+            };
+            return ExitCode::from(match review::show(&reason) {
+                Ok(true) => EXIT_APPROVED,
+                Ok(false) => EXIT_DENIED,
+                Err(()) => EXIT_UNAVAILABLE,
+            });
         }
     };
 
@@ -85,16 +110,34 @@ fn report_account() {
 }
 
 /// Parse `--reason <text>` from command-line arguments.
-fn parse_reason() -> Option<String> {
-    let args: Vec<String> = std::env::args().collect();
-    let mut i = 1;
-    while i < args.len() {
-        if args[i] == "--reason" && i + 1 < args.len() {
-            return Some(args[i + 1].clone());
-        }
-        i += 1;
+fn parse_request(args: Vec<String>) -> Result<HelperRequest, ()> {
+    if args.len() == 2 && args[0] == "--reason" && !args[1].trim().is_empty() {
+        return Ok(HelperRequest::Legacy(args[1].clone()));
     }
-    None
+    if args.len() == 2
+        && args.contains(&"--review-only".to_owned())
+        && args.contains(&"--reason-stdin".to_owned())
+    {
+        return Ok(HelperRequest::ReviewStdin);
+    }
+    Err(())
+}
+
+/// Read one exact UTF-8 document, never silently truncate the approved scope.
+fn read_review(input: impl Read) -> Result<String, ()> {
+    let mut bytes = Vec::new();
+    input
+        .take(MAX_REVIEW_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ())?;
+    if bytes.len() > MAX_REVIEW_BYTES {
+        return Err(());
+    }
+    let reason = String::from_utf8(bytes).map_err(|_| ())?;
+    if reason.trim().is_empty() || reason.contains('\0') {
+        return Err(());
+    }
+    Ok(reason)
 }
 
 /// Display an intent dialog showing the operation details.
@@ -162,5 +205,47 @@ fn polkit_authenticate() -> Result<bool, String> {
         Some(1) | Some(2) => Ok(false),
         Some(c) => Err(format!("pkcheck exited with unexpected code {c}")),
         None => Err("pkcheck killed by signal".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn review_mode_requires_both_explicit_flags_and_no_inline_content() {
+        let args = |values: &[&str]| values.iter().map(|s| (*s).to_owned()).collect();
+        assert_eq!(
+            parse_request(args(&["--review-only", "--reason-stdin"])),
+            Ok(HelperRequest::ReviewStdin)
+        );
+        assert_eq!(
+            parse_request(args(&["--reason-stdin", "--review-only"])),
+            Ok(HelperRequest::ReviewStdin)
+        );
+        assert_eq!(
+            parse_request(args(&["--reason", "legacy description"])),
+            Ok(HelperRequest::Legacy("legacy description".into()))
+        );
+        for invalid in [
+            vec!["--review-only"],
+            vec!["--reason-stdin"],
+            vec!["--reason", ""],
+            vec!["--review-only", "--reason", "hidden"],
+            vec!["--review-only", "--reason-stdin", "extra"],
+        ] {
+            assert!(parse_request(args(&invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn review_input_preserves_every_byte_and_fails_closed_at_limit() {
+        let text = "\nExact task\n32. final action\nSHA-256: abc\n";
+        assert_eq!(read_review(text.as_bytes()).unwrap(), text);
+        assert!(read_review(vec![b'x'; MAX_REVIEW_BYTES].as_slice()).is_ok());
+        assert!(read_review(vec![b'x'; MAX_REVIEW_BYTES + 1].as_slice()).is_err());
+        assert!(read_review(&[0xff][..]).is_err());
+        assert!(read_review(&b"text\0hidden"[..]).is_err());
+        assert!(read_review(&b" \n\t"[..]).is_err());
     }
 }

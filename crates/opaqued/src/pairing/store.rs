@@ -4,6 +4,8 @@
 //! `~/.config/opaque/paired_devices.json` with an HMAC integrity check
 //! using the daemon's master key.
 
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use ed25519_dalek::VerifyingKey;
@@ -48,6 +50,23 @@ pub struct PairedDevice {
     /// fingerprint, which only the genuine phone can also display.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub confirmed: bool,
+    /// Capability is assigned by trusted enrollment, never a device request.
+    #[serde(default, skip_serializing_if = "DeviceKind::is_legacy")]
+    pub kind: DeviceKind,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceKind {
+    #[default]
+    Ios,
+    Workstation,
+}
+
+impl DeviceKind {
+    fn is_legacy(&self) -> bool {
+        *self == Self::Ios
+    }
 }
 
 impl PairedDevice {
@@ -111,6 +130,7 @@ pub struct DeviceStore {
     path: PathBuf,
     /// HMAC key (daemon's master key or derived key).
     hmac_key: Vec<u8>,
+    mutation_lock: std::sync::Mutex<()>,
 }
 
 /// Simple hex encoding (no extra dependency needed).
@@ -120,8 +140,8 @@ mod hex {
     }
 
     pub fn decode(s: &str) -> Result<Vec<u8>, String> {
-        if !s.len().is_multiple_of(2) {
-            return Err("odd-length hex string".into());
+        if !s.len().is_multiple_of(2) || !s.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("invalid hex string".into());
         }
         (0..s.len())
             .step_by(2)
@@ -136,7 +156,11 @@ mod hex {
 impl DeviceStore {
     /// Create a new device store at the given path with the given HMAC key.
     pub fn new(path: PathBuf, hmac_key: Vec<u8>) -> Self {
-        Self { path, hmac_key }
+        Self {
+            path,
+            hmac_key,
+            mutation_lock: std::sync::Mutex::new(()),
+        }
     }
 
     /// Default store path: `~/.config/opaque/paired_devices.json`.
@@ -196,16 +220,33 @@ impl DeviceStore {
 
         let contents = serde_json::to_string_pretty(&store_file)?;
 
-        // Write atomically via temp file
-        let tmp_path = self.path.with_extension("tmp");
-        std::fs::write(&tmp_path, contents)?;
+        // Persist revocation before returning: rename alone does not ensure
+        // it survives a broker crash. All callers serialize mutations.
+        let tmp_path = self
+            .path
+            .with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+        let mut temporary = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&tmp_path)?;
+        temporary.write_all(contents.as_bytes())?;
+        temporary.sync_all()?;
         std::fs::rename(&tmp_path, &self.path)?;
+        if let Some(parent) = self.path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
 
         Ok(())
     }
 
     /// Add a new paired device.
     pub fn add_device(&self, device: PairedDevice) -> Result<(), DeviceStoreError> {
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| DeviceStoreError::Integrity("device store lock poisoned".into()))?;
         let mut devices = self.load()?;
         if devices.iter().any(|d| d.device_id == device.device_id) {
             return Err(DeviceStoreError::AlreadyExists(device.device_id));
@@ -230,6 +271,10 @@ impl DeviceStore {
 
     /// Remove a device by ID.
     pub fn remove_device(&self, device_id: &str) -> Result<PairedDevice, DeviceStoreError> {
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| DeviceStoreError::Integrity("device store lock poisoned".into()))?;
         let mut devices = self.load()?;
         let idx = devices
             .iter()
@@ -242,6 +287,10 @@ impl DeviceStore {
 
     /// Mark a device as revoked (keeps it in the store for audit trail).
     pub fn revoke_device(&self, device_id: &str) -> Result<(), DeviceStoreError> {
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| DeviceStoreError::Integrity("device store lock poisoned".into()))?;
         let mut devices = self.load()?;
         let device = devices
             .iter_mut()
@@ -254,6 +303,10 @@ impl DeviceStore {
     /// Mark a device's key fingerprint as human-confirmed (see
     /// [`PairedDevice::confirmed`]). Returns the confirmed device.
     pub fn confirm_device(&self, device_id: &str) -> Result<PairedDevice, DeviceStoreError> {
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| DeviceStoreError::Integrity("device store lock poisoned".into()))?;
         let mut devices = self.load()?;
         let device = devices
             .iter_mut()
@@ -267,6 +320,10 @@ impl DeviceStore {
 
     /// Update last_seen timestamp for a device.
     pub fn touch_device(&self, device_id: &str, timestamp: i64) -> Result<(), DeviceStoreError> {
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| DeviceStoreError::Integrity("device store lock poisoned".into()))?;
         let mut devices = self.load()?;
         let device = devices
             .iter_mut()
@@ -278,6 +335,10 @@ impl DeviceStore {
 
     /// Rename a device.
     pub fn rename_device(&self, device_id: &str, new_name: &str) -> Result<(), DeviceStoreError> {
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| DeviceStoreError::Integrity("device store lock poisoned".into()))?;
         let mut devices = self.load()?;
         let device = devices
             .iter_mut()
@@ -290,6 +351,29 @@ impl DeviceStore {
     /// Get the store file path (for testing/diagnostics).
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn rotate_workstation_token(
+        &self,
+        device_id: &str,
+        token_hash: String,
+    ) -> Result<(), DeviceStoreError> {
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| DeviceStoreError::Integrity("device store lock poisoned".into()))?;
+        let mut devices = self.load()?;
+        let device = devices
+            .iter_mut()
+            .find(|device| device.device_id == device_id)
+            .ok_or_else(|| DeviceStoreError::NotFound(device_id.into()))?;
+        if device.revoked || !device.confirmed || device.kind != DeviceKind::Workstation {
+            return Err(DeviceStoreError::Integrity(
+                "workstation enrollment is unavailable".into(),
+            ));
+        }
+        device.token_sha256 = Some(token_hash);
+        self.save(&devices)
     }
 }
 
@@ -321,6 +405,7 @@ mod tests {
             paired_by: None,
             token_sha256: None,
             confirmed: true,
+            kind: crate::pairing::store::DeviceKind::Ios,
         }
     }
 
@@ -340,6 +425,7 @@ mod tests {
             paired_by: None,
             token_sha256: None,
             confirmed: false,
+            kind: crate::pairing::store::DeviceKind::Ios,
         };
         store.add_device(legacy).unwrap();
 

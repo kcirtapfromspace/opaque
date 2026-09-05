@@ -30,7 +30,7 @@ use opaque_core::attest::{
     AuditPosture, FederationPosture, ReportPayload, TrustDomainPosture, sign_report,
 };
 use opaque_core::audit::{AuditEvent, AuditEventKind, AuditLevel, AuditSink};
-use opaque_core::trust_domain::{SystemFs, default_custody_set, verify_custody};
+use opaque_core::trust_domain::{SystemFs, verify_custody};
 use serde::Deserialize;
 use tracing::warn;
 
@@ -122,7 +122,11 @@ impl AttestationService {
     /// made true.
     pub fn observe(&self) -> (TrustDomainPosture, AuditPosture) {
         let uid = unsafe { libc::geteuid() };
-        let set = default_custody_set(&self.home, &self.config_path);
+        let set = crate::trust_domain::custody_paths(
+            &self.home,
+            &self.config_path,
+            self.audit_db.parent().unwrap_or_else(|| Path::new(".")),
+        );
         let violations = verify_custody(&set, uid, &SystemFs);
         let trust_domain = TrustDomainPosture {
             enforce: self.enforce,
@@ -318,8 +322,13 @@ impl KeyReleaseClient {
 }
 
 /// Load (or create) the daemon's attestation signing key from the custody set.
+#[cfg(test)]
 pub fn load_or_create_key(home: &Path) -> std::io::Result<SigningKey> {
-    let path = home.join(".opaque").join("attestation.key");
+    load_or_create_key_in(&home.join(".opaque"))
+}
+
+pub fn load_or_create_key_in(state_dir: &Path) -> std::io::Result<SigningKey> {
+    let path = state_dir.join("attestation.key");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }

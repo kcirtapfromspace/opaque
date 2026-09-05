@@ -10,6 +10,11 @@ CHANGELOG-release.md
 plan-*.md
 tasks/
 *-explorer.html
+.wrangler/
+.playwright-cli/
+output/
+__pycache__/
+*.pyc
 
 # MkDocs
 site/

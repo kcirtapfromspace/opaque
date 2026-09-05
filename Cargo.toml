@@ -5,8 +5,10 @@ members = [
   "crates/opaqued",
   "crates/opaque",
   "crates/opaque-approve-helper",
+  "crates/opaque-approver",
   "crates/opaque-mcp",
   "crates/opaque-web",
+  "crates/opaque-metrics",
 ]
 
 [workspace.package]

@@ -40,6 +40,7 @@ use tracing::{info, warn};
 
 use crate::pairing::PairingManager;
 use crate::pairing::store::PairedDevice;
+mod workstation;
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -168,6 +169,7 @@ pub(crate) struct ServerState {
     pending: Mutex<HashMap<String, PendingApproval>>,
     pairing: Arc<PairingManager>,
     timeout: Duration,
+    workstation_pending: std::sync::Mutex<HashMap<String, workstation::PendingWorkstation>>,
 }
 
 impl std::fmt::Debug for ServerState {
@@ -370,6 +372,7 @@ impl ApprovalServer {
             pending: Mutex::new(HashMap::new()),
             pairing,
             timeout: Duration::from_secs(config.timeout_secs),
+            workstation_pending: std::sync::Mutex::new(HashMap::new()),
         });
 
         Ok(Self { state, config })
@@ -411,7 +414,10 @@ impl ApprovalServer {
                 }
             });
 
-            // Accept TLS connections and serve.
+            // A remote peer must not block other approvers by opening a TCP
+            // socket and withholding its TLS handshake. Bound concurrent
+            // connections and apply the handshake timeout inside each task.
+            let connections = Arc::new(tokio::sync::Semaphore::new(128));
             loop {
                 let (stream, _) = match listener.accept().await {
                     Ok(conn) => conn,
@@ -421,16 +427,26 @@ impl ApprovalServer {
                     }
                 };
 
-                let tls_stream = match tls_acceptor.accept(stream).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        warn!("TLS handshake failed: {e}");
-                        continue;
-                    }
+                let Ok(permit) = connections.clone().try_acquire_owned() else {
+                    continue;
                 };
-
+                let tls_acceptor = tls_acceptor.clone();
                 let app = app.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
+                    let tls_stream = match tokio::time::timeout(
+                        Duration::from_secs(10),
+                        tls_acceptor.accept(stream),
+                    )
+                    .await
+                    {
+                        Ok(Ok(stream)) => stream,
+                        Ok(Err(error)) => {
+                            warn!("TLS handshake failed: {error}");
+                            return;
+                        }
+                        Err(_) => return,
+                    };
                     let io = hyper_util::rt::TokioIo::new(tls_stream);
                     let service = hyper_util::service::TowerToHyperService::new(app.into_service());
                     if let Err(e) = hyper_util::server::conn::auto::Builder::new(
@@ -476,6 +492,7 @@ fn build_tls_config(cert_der: &[u8], key_der: &[u8]) -> Result<rustls::ServerCon
 
 fn build_router(state: Arc<ServerState>) -> Router {
     Router::new()
+        .merge(workstation::routes())
         .route("/health", get(health_handler))
         .route("/pair", post(pair_handler))
         .route("/approvals/pending", get(pending_handler))
@@ -534,7 +551,10 @@ async fn pending_handler(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
 ) -> Result<Json<PendingApprovalsResponse>, StatusCode> {
-    validate_auth(&state, &headers)?;
+    let device_id = validate_auth(&state, &headers)?;
+    if state.pairing.workstation_device(&device_id).is_ok() {
+        return Err(StatusCode::FORBIDDEN);
+    }
 
     let pending = state.pending.lock().await;
     let approvals: Vec<ApprovalChallenge> = pending.values().map(|p| p.challenge.clone()).collect();
@@ -1345,6 +1365,7 @@ mod tests {
             pending: Mutex::new(HashMap::new()),
             pairing,
             timeout: Duration::from_secs(60),
+            workstation_pending: std::sync::Mutex::new(HashMap::new()),
         };
         let dbg = format!("{state:?}");
         assert!(dbg.contains("timeout"));

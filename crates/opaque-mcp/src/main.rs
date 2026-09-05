@@ -194,7 +194,16 @@ async fn handle_tools_call(
     };
 
     // Build daemon IPC params.
-    let daemon_params = (tool_def.build_params)(&arguments);
+    let mut daemon_params = (tool_def.build_params)(&arguments);
+    if daemon_method == "github" || daemon_method.starts_with("task_") {
+        // Workspace claims come from this MCP server's actual process cwd,
+        // never the model's tool arguments. The daemon verifies the claim
+        // against this process before using repo-scoped policy.
+        daemon_params["workspace"] = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| collect_workspace_context(&cwd))
+            .unwrap_or(serde_json::Value::Null);
+    }
 
     debug!(
         tool = tool_name,
@@ -219,6 +228,22 @@ async fn handle_tools_call(
                 format_sandbox_exec_response(id, resp.result)
             } else {
                 // Daemon returned success.
+                let incomplete_task = (tool_name == "opaque_task_run"
+                    && resp
+                        .result
+                        .as_ref()
+                        .and_then(|result| result.get("task"))
+                        .and_then(|task| task.get("state"))
+                        .and_then(|state| state.as_str())
+                        != Some("completed"))
+                    || (tool_name == "opaque_task_reconcile"
+                        && matches!(
+                            resp.result
+                                .as_ref()
+                                .and_then(|r| r.pointer("/task/release_observation/state"))
+                                .and_then(|s| s.as_str()),
+                            Some("failed" | "ambiguous")
+                        ));
                 let result_text = match resp.result {
                     Some(val) => {
                         if let Some(s) = val.as_str() {
@@ -232,7 +257,8 @@ async fn handle_tools_call(
                 JsonRpcResponse::ok(
                     id,
                     json!({
-                        "content": [{"type": "text", "text": result_text}]
+                        "content": [{"type": "text", "text": result_text}],
+                        "isError": incomplete_task
                     }),
                 )
             }
@@ -254,6 +280,33 @@ async fn handle_tools_call(
             )
         }
     }
+}
+
+fn collect_workspace_context(cwd: &std::path::Path) -> Option<serde_json::Value> {
+    fn git(cwd: &std::path::Path, arguments: &[&str]) -> Option<String> {
+        let output = std::process::Command::new("git")
+            .current_dir(cwd)
+            .args(arguments)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+    let repo_root = git(cwd, &["rev-parse", "--show-toplevel"])?;
+    let remote_url = git(cwd, &["remote", "get-url", "origin"])
+        .map(|url| opaque_core::validate::InputValidator::sanitize_url(&url));
+    let branch = git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    let head_sha = git(cwd, &["rev-parse", "HEAD"]);
+    let dirty = git(cwd, &["status", "--porcelain"]).is_some_and(|status| !status.is_empty());
+    Some(json!({
+        "repo_root": repo_root, "remote_url": remote_url,
+        "branch": branch, "head_sha": head_sha, "dirty": dirty,
+    }))
 }
 
 /// Handle `opaque_sandbox_list_profiles` client-side by reading profile TOMLs.
@@ -492,7 +545,7 @@ mod tests {
         let resp = handle_tools_list(Some(json!(1)));
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 14);
+        assert_eq!(tools.len(), 21);
 
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
 
@@ -507,6 +560,11 @@ mod tests {
         assert!(tool_names.contains(&"opaque_sandbox_exec"));
         assert!(tool_names.contains(&"opaque_sandbox_list_profiles"));
         assert!(tool_names.contains(&"opaque_secrets_status"));
+        assert!(tool_names.contains(&"opaque_task_plan"));
+        assert!(tool_names.contains(&"opaque_task_run"));
+        assert!(tool_names.contains(&"opaque_task_get"));
+        assert!(tool_names.contains(&"opaque_task_list"));
+        assert!(tool_names.contains(&"opaque_task_revoke"));
 
         // Verify no Reveal operations leak through.
         for name in &tool_names {
@@ -700,5 +758,41 @@ mod tests {
         // The format string in handle_tools_call uses this pattern:
         let msg = format!("unknown tool: {}", truncated);
         assert_eq!(msg.len(), "unknown tool: ".len() + 64);
+    }
+
+    #[test]
+    fn workspace_context_uses_actual_git_checkout_and_scrubs_remote_credentials() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(collect_workspace_context(directory.path()).is_none());
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(directory.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .args([
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://credential@github.com/owner/repo.git"
+                ])
+                .current_dir(directory.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let workspace = collect_workspace_context(directory.path()).unwrap();
+        assert_eq!(
+            std::path::PathBuf::from(workspace["repo_root"].as_str().unwrap())
+                .canonicalize()
+                .unwrap(),
+            directory.path().canonicalize().unwrap()
+        );
+        assert_eq!(workspace["remote_url"], "https://github.com/owner/repo.git");
+        assert!(workspace.get("workspace_verified").is_none());
     }
 }

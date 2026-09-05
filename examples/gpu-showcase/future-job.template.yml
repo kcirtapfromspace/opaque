@@ -1,0 +1,81 @@
+# Proposed future contract only. Not applied. No namespace, PVC or image exists
+# by virtue of this file. Leave suspended until owner allocation and review.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: opaque-gpu-smoke-proposed
+  namespace: opaque-gpu-dogfood-proposed
+  labels:
+    opaque.dev/workflow: gpu-smoke
+spec:
+  suspend: true
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  activeDeadlineSeconds: 300
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        opaque.dev/workflow: gpu-smoke
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 5
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: fixed-gpu-smoke
+          image: registry.example.invalid/opaque/jetson-gpu-smoke@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          imagePullPolicy: IfNotPresent
+          command:
+            - /usr/local/bin/opaque-gpu-smoke
+          args:
+            - --model
+            - /models/model.gguf
+            - --model-sha256
+            - "0000000000000000000000000000000000000000000000000000000000000000"
+            - --max-output-tokens
+            - "96"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "2"
+              memory: 4Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: reviewed-model
+              mountPath: /models
+              readOnly: true
+      volumes:
+        - name: reviewed-model
+          persistentVolumeClaim:
+            claimName: opaque-reviewed-model-proposed
+            readOnly: true
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: opaque-gpu-smoke-deny-network
+  namespace: opaque-gpu-dogfood-proposed
+spec:
+  podSelector:
+    matchLabels:
+      opaque.dev/workflow: gpu-smoke
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress: []

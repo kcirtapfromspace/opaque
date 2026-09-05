@@ -159,6 +159,11 @@ enum Cmd {
         #[command(subcommand)]
         action: GithubAction,
     },
+    /// Plan, approve, and inspect a bounded GitHub publishing task.
+    Task {
+        #[command(subcommand)]
+        action: TaskAction,
+    },
     /// Manage GitLab CI/CD variables.
     Gitlab {
         #[command(subcommand)]
@@ -526,6 +531,37 @@ enum DeviceAction {
     Revoke {
         /// Device id as shown by `opaque device ls`.
         device_id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TaskAction {
+    /// Plan three fixed public-source completions in the authenticated tenant.
+    PlanInference {
+        #[arg(long, default_value = "Tenant public data inference")]
+        title: String,
+        #[arg(long, default_value_t = 600)]
+        expires_in_secs: u64,
+    },
+    /// Resolve exact repositories and pin a manifest for trusted review.
+    Plan {
+        /// JSON manifest with schema_version, title, expires_in_secs and actions.
+        #[arg(long)]
+        manifest: PathBuf,
+    },
+    /// Request trusted approval and execute this task once.
+    Run { task_id: String },
+    /// Show exact scope, charged slots and provider outcomes.
+    Show { task_id: String },
+    /// Read correlated staging workflow evidence without dispatching again.
+    Reconcile { task_id: String },
+    /// Block future writes; already dispatched writes may still finish.
+    Revoke { task_id: String },
+    /// List tasks belonging to this authenticated owner.
+    List {
+        /// Continue after the task ID returned as next_cursor on a prior page.
+        #[arg(long)]
+        cursor: Option<String>,
     },
 }
 
@@ -2582,6 +2618,17 @@ async fn main() {
         Cmd::Version => ("version", serde_json::Value::Null),
         Cmd::Whoami => ("whoami", serde_json::Value::Null),
         Cmd::Leases => ("leases", serde_json::Value::Null),
+        Cmd::Task { action } => match task_command_params(action) {
+            Ok(request) => request,
+            Err(error) => {
+                if json_output {
+                    println!("{}", serde_json::json!({"error": error}));
+                } else {
+                    ui::error(&error);
+                }
+                std::process::exit(EXIT_USAGE);
+            }
+        },
         Cmd::Execute {
             operation,
             target,
@@ -2978,12 +3025,38 @@ async fn main() {
                                 }
                             }
                         }
+                    } else if method.starts_with("task_") {
+                        format_task_response(result);
                     } else {
                         ui::format_response(method, result);
                     }
                 } else if !quiet {
                     ui::success("Done (no result payload)");
                 }
+            }
+            if method == "task_run"
+                && resp
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("task"))
+                    .and_then(|task| task.get("state"))
+                    .and_then(|state| state.as_str())
+                    != Some("completed")
+            {
+                // A successful RPC can still have a partial/unknown receipt.
+                // Preserve its JSON while reporting failure to automation.
+                std::process::exit(EXIT_ERROR);
+            }
+            if method == "task_reconcile"
+                && matches!(
+                    resp.result
+                        .as_ref()
+                        .and_then(|r| r.pointer("/task/release_observation/state"))
+                        .and_then(|s| s.as_str()),
+                    Some("failed" | "ambiguous")
+                )
+            {
+                std::process::exit(EXIT_ERROR);
             }
         }
         Err(e) => {
@@ -3037,6 +3110,236 @@ async fn main() {
     }
 }
 
+fn task_command_params(action: TaskAction) -> Result<(&'static str, serde_json::Value), String> {
+    use serde_json::json;
+    Ok(match action {
+        TaskAction::PlanInference {
+            title,
+            expires_in_secs,
+        } => (
+            "task_plan_inference",
+            json!({"title": title, "expires_in_secs": expires_in_secs}),
+        ),
+        TaskAction::Plan { manifest } => {
+            let metadata = std::fs::metadata(&manifest)
+                .map_err(|error| format!("cannot read manifest {}: {error}", manifest.display()))?;
+            if metadata.len() > (opaque_core::MAX_FRAME_LENGTH - 4096) as u64 {
+                return Err("task manifest exceeds the IPC size limit".into());
+            }
+            let bytes = std::fs::read(&manifest)
+                .map_err(|error| format!("cannot read manifest {}: {error}", manifest.display()))?;
+            // Numeric repository IDs and provider URLs are enriched by the
+            // daemon. Deserialize strictly here without accepting extensions.
+            let manifest: opaque_core::task::TaskManifest = serde_json::from_slice(&bytes)
+                .map_err(|error| format!("invalid task manifest: {error}"))?;
+            ("task_plan", json!({"manifest": manifest}))
+        }
+        TaskAction::Run { task_id } => ("task_run", json!({"task_id": task_id})),
+        TaskAction::Show { task_id } => ("task_get", json!({"task_id": task_id})),
+        TaskAction::Reconcile { task_id } => ("task_reconcile", json!({"task_id": task_id})),
+        TaskAction::Revoke { task_id } => ("task_revoke", json!({"task_id": task_id})),
+        TaskAction::List { cursor } => ("task_list", json!({"cursor": cursor})),
+    })
+}
+
+fn format_task_response(result: &serde_json::Value) {
+    let records: Result<Vec<opaque_core::task::TaskRecord>, _> = if let Some(tasks) =
+        result.get("tasks")
+    {
+        serde_json::from_value(tasks.clone())
+    } else {
+        serde_json::from_value(result.get("task").unwrap_or(result).clone()).map(|task| vec![task])
+    };
+    let records = match records {
+        Ok(records) => records,
+        Err(_) => {
+            ui::error(
+                "Daemon returned an invalid task receipt; use --json to inspect the response.",
+            );
+            return;
+        }
+    };
+    if records.is_empty() {
+        ui::info("No tasks for this authenticated owner.");
+        return;
+    }
+    for task in records {
+        println!("{}", render_task_receipt(&task));
+    }
+    if result.get("has_more").and_then(|value| value.as_bool()) == Some(true)
+        && let Some(cursor) = result.get("next_cursor").and_then(|value| value.as_str())
+    {
+        println!("Older tasks are available. Continue with: opaque task list --cursor {cursor}");
+    }
+}
+
+fn render_task_receipt(task: &opaque_core::task::TaskRecord) -> String {
+    use opaque_core::task::{SlotState, TaskApprovalMode, TaskState};
+    use std::fmt::Write;
+    let state = match task.state {
+        TaskState::Planned => "planned",
+        TaskState::Running => "running",
+        TaskState::Completed => "completed",
+        TaskState::Partial => "partial",
+        TaskState::Revoked => "revoked",
+        TaskState::Expired => "expired",
+    };
+    let charged = task
+        .slots
+        .iter()
+        .filter(|slot| slot.state != SlotState::Pending)
+        .count();
+    let mut output = format!(
+        "{}\nTask: {}\nState: {} | Charged: {}/{} writes\nDigest: {}\nExpires: {} (Unix seconds)\nGitHub: {}\nVault: {}\n",
+        task.manifest.title,
+        task.id,
+        state,
+        charged,
+        task.slots.len(),
+        task.manifest_digest,
+        task.expires_at,
+        task.manifest.github_api_url,
+        task.manifest.vault_api_url,
+    );
+    if task.manifest.is_inference() {
+        output = format!(
+            "{}\nTask: {}\nState: {} | Charged: {}/{} attempts\nDigest: {}\nExpires: {} (Unix seconds)\n",
+            task.manifest.title,
+            task.id,
+            state,
+            charged,
+            task.slots.len(),
+            task.manifest_digest,
+            task.expires_at
+        );
+    }
+    if let Some(tenant) = &task.tenant {
+        output.push_str(&tenant.approval_context());
+    }
+    if let Some(approved_at) = task.approved_at {
+        let mode = match task.approval_mode {
+            Some(TaskApprovalMode::Native) => "native approval",
+            Some(TaskApprovalMode::PairedWorkstation) => "paired workstation approval",
+            Some(TaskApprovalMode::InsecureTest) => "INSECURE TEST APPROVAL",
+            None => "approval mode unavailable",
+        };
+        let _ = writeln!(output, "Approval: {mode} at {approved_at} (Unix seconds)");
+    } else {
+        output.push_str("Approval: not granted\n");
+    }
+    for slot in &task.slots {
+        let state = match slot.state {
+            SlotState::Pending => "not attempted",
+            SlotState::Reserved => "in flight (charged)",
+            SlotState::ApiAccepted => "API accepted",
+            SlotState::Rejected => "rejected (charged)",
+            SlotState::Unknown => "unknown (charged; do not retry)",
+        };
+        match &slot.action {
+            opaque_core::task::TaskAction::Inference(action) => {
+                let _ = writeln!(
+                    output,
+                    "\n  Request {} | Model: {}\n    Profile: {}\n    Source: {}\n    Source snapshot SHA-256: {}\n    Prompt SHA-256: {}\n    Output allowance: {} tokens (requested ceiling)\n    Slot: {}\n    Outcome: {}",
+                    action.ordinal,
+                    action.model_id,
+                    action.profile_id,
+                    action.source_id,
+                    action.source_snapshot_sha256,
+                    action.prompt_sha256,
+                    action.options.max_output_tokens,
+                    slot.id,
+                    state
+                );
+            }
+            opaque_core::task::TaskAction::PublishSecret(action) => {
+                let _ = writeln!(
+                    output,
+                    "\n  {} / {} [repository {}]\n    Source: {}\n    Slot: {}\n    Outcome: {}",
+                    action.repo,
+                    action.secret_name,
+                    action.repository_id,
+                    action.value_ref,
+                    slot.id,
+                    state
+                );
+            }
+            opaque_core::task::TaskAction::StagingRelease(action) => {
+                let _ = writeln!(
+                    output,
+                    "\n  {} [repository {}]\n    Workflow: {} [workflow {}]\n    Branch: {}\n    Approved commit: {}\n    Workflow SHA-256: {}\n    Artifact: {}@{}\n    Environment: {}\n    Slot: {}\n    Dispatch outcome: {}",
+                    action.repo,
+                    action.repository_id,
+                    action.workflow_path,
+                    action.workflow_id,
+                    action.workflow_ref,
+                    action.approved_commit_sha,
+                    action.workflow_sha256,
+                    action.image_repository,
+                    action.image_digest,
+                    action.environment,
+                    slot.id,
+                    state
+                );
+            }
+        }
+        if let Some(reference) = slot.action.github_token_ref() {
+            let _ = writeln!(output, "    Credential reference: {reference}");
+        }
+        if let Some(outcome) = &slot.outcome {
+            let _ = writeln!(output, "    Receipt code: {}", outcome.code);
+            if let Some(receipt) = &outcome.inference_receipt {
+                let _ = writeln!(
+                    output,
+                    "    Model evidence: {:?}\n    Input tokens: {} | Observed output tokens: {:?}\n    Reserved output units: {}",
+                    receipt.code,
+                    receipt.input_tokens,
+                    receipt.observed_output_tokens,
+                    receipt.reserved_output_tokens
+                );
+                if let Some(text) = &receipt.output_text {
+                    let _ = writeln!(output, "    Model output: {text}");
+                }
+            }
+        }
+    }
+    match task.state {
+        TaskState::Planned => {
+            let _ = writeln!(
+                output,
+                "\nReview the exact scope above, then run: opaque task run {}",
+                task.id
+            );
+        }
+        TaskState::Running => output.push_str(
+            "\nInspect this task again for its receipt. Another run cannot add allowance.\n",
+        ),
+        TaskState::Completed => output.push_str(if task.manifest.is_inference() {
+            "\nThree model completions recorded. Further inference requires a new task and fresh approval. Provider usage does not attest GPU time or hardware isolation.\n"
+        } else if task.manifest.is_release() {
+            "\nDispatch recorded. Use task reconcile to observe the workflow; this does not establish deployment or service health.\n"
+        } else { "\nGitHub accepted these writes; secret values cannot be read back for verification.\n" }),
+        TaskState::Partial | TaskState::Revoked | TaskState::Expired => output.push_str(
+            "\nThis task is closed. Any further operations require a new task and fresh approval.\n",
+        ),
+    }
+    if let Some(observation) = &task.release_observation {
+        let _ = writeln!(
+            output,
+            "\nWorkflow evidence: {:?} ({})\nChecked: {} (Unix seconds)",
+            observation.state, observation.code, observation.checked_at
+        );
+        if let Some(url) = &observation.run_url {
+            let _ = writeln!(
+                output,
+                "Run: {url} (attempt {})",
+                observation.run_attempt.unwrap_or_default()
+            );
+        }
+        output.push_str("Workflow success describes the trusted workflow's checks; it does not independently prove service health.\n");
+    }
+    output
+}
+
 /// Read the daemon token from `<socket_dir>/daemon.token`.
 fn read_daemon_token(sock: &Path) -> std::io::Result<String> {
     let token_path = sock
@@ -3080,7 +3383,11 @@ fn resolve_workspace_context() -> Option<serde_json::Value> {
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+        .map(|o| {
+            opaque_core::validate::InputValidator::sanitize_url(
+                String::from_utf8_lossy(&o.stdout).trim(),
+            )
+        });
 
     let branch = Command::new("git")
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
@@ -3120,8 +3427,13 @@ const INITIAL_RETRY_MS: u64 = 200;
 async fn call(
     sock: &PathBuf,
     method: &str,
-    params: serde_json::Value,
+    mut params: serde_json::Value,
 ) -> std::io::Result<Response> {
+    // These wrappers participate in repo-scoped policy. Always derive context
+    // from the CLI's actual cwd; callers cannot replace it in tool arguments.
+    if method == "github" || method.starts_with("task_") {
+        params["workspace"] = resolve_workspace_context().unwrap_or(serde_json::Value::Null);
+    }
     // Verify socket ownership and permissions before connecting.
     verify_socket_safety(sock)?;
 
@@ -3148,7 +3460,10 @@ async fn call(
                         | std::io::ErrorKind::TimedOut
                         | std::io::ErrorKind::BrokenPipe
                 );
-                if !retryable || attempt == MAX_RETRIES {
+                // A task_run may have crossed the dispatch boundary before
+                // the connection failed. Inspect its durable receipt instead
+                // of silently issuing another execution request.
+                if !retryable || attempt == MAX_RETRIES || method == "task_run" {
                     return Err(e);
                 }
                 last_err = Some(e);
@@ -8125,6 +8440,113 @@ BAZ=
     fn identity_roles_requires_at_least_one_role() {
         use clap::Parser;
         assert!(Cli::try_parse_from(["opaque", "identity", "roles", "hum_x"]).is_err());
+    }
+
+    #[test]
+    fn task_commands_require_broker_ids_and_explicit_manifest_paths() {
+        for (command, method) in [
+            ("run", "task_run"),
+            ("show", "task_get"),
+            ("revoke", "task_revoke"),
+        ] {
+            let cli = Cli::try_parse_from(["opaque", "task", command, "task-123"]).unwrap();
+            let Some(Cmd::Task { action }) = cli.cmd else {
+                panic!("expected task command")
+            };
+            let (actual_method, params) = task_command_params(action).unwrap();
+            assert_eq!(actual_method, method);
+            assert_eq!(params["task_id"], "task-123");
+            assert!(params.get("approved").is_none());
+            assert!(Cli::try_parse_from(["opaque", "task", command]).is_err());
+        }
+        assert!(Cli::try_parse_from(["opaque", "task", "plan"]).is_err());
+        assert_eq!(
+            task_command_params(TaskAction::List { cursor: None })
+                .unwrap()
+                .0,
+            "task_list"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("manifest.json");
+        std::fs::write(&path, r#"{"schema_version":1,"title":"Dogfood","expires_in_secs":600,"actions":[{"repo":"owner/repo","secret_name":"MARKER","value_ref":"vault:kv/data/demo?version=1#MARKER"}]}"#).unwrap();
+        let (method, params) = task_command_params(TaskAction::Plan {
+            manifest: path.clone(),
+        })
+        .unwrap();
+        assert_eq!(method, "task_plan");
+        assert_eq!(params["manifest"]["actions"][0]["repository_id"], 0);
+        let mut invalid = params["manifest"].clone();
+        invalid["approved"] = true.into();
+        std::fs::write(&path, invalid.to_string()).unwrap();
+        assert!(task_command_params(TaskAction::Plan { manifest: path }).is_err());
+    }
+
+    #[test]
+    fn task_receipt_reports_uncertainty_and_exact_authority_without_claiming_verification() {
+        use opaque_core::task::*;
+        let action = PublishAction {
+            repo: "owner/repo".into(),
+            repository_id: 42,
+            secret_name: "MARKER".into(),
+            value_ref: "vault:kv/data/demo?version=7#MARKER".into(),
+            github_token_ref: None,
+        };
+        let manifest = TaskManifest {
+            schema_version: 1,
+            title: "Dogfood".into(),
+            expires_in_secs: 600,
+            github_api_url: "https://api.github.com".into(),
+            vault_api_url: "https://vault.example.com".into(),
+            actions: vec![action.clone().into()],
+        };
+        let mut task = TaskRecord {
+            tenant: None,
+            id: "task-1".into(),
+            manifest_digest: manifest.digest().unwrap(),
+            manifest,
+            owner_key: "owner".into(),
+            created_at: 100,
+            expires_at: 700,
+            approved_at: Some(101),
+            approval_mode: Some(TaskApprovalMode::Native),
+            state: TaskState::Partial,
+            release_observation: None,
+            slots: vec![TaskSlot {
+                id: "task-1:01".into(),
+                action: action.into(),
+                state: SlotState::Unknown,
+                request_id: Some("r".into()),
+                reserved_at: Some(102),
+                finished_at: Some(103),
+                outcome: Some(SlotOutcome {
+                    inference_receipt: None,
+                    provider_run_id: None,
+                    state: SlotState::Unknown,
+                    code: "transport_unknown".into(),
+                }),
+            }],
+        };
+        let output = render_task_receipt(&task);
+        for expected in [
+            "owner/repo / MARKER",
+            "repository 42",
+            "version=7#MARKER",
+            "Charged: 1/1",
+            "unknown (charged; do not retry)",
+            "fresh approval",
+            "native approval",
+            &task.manifest_digest,
+        ] {
+            assert!(output.contains(expected), "missing {expected}");
+        }
+        task.approval_mode = Some(TaskApprovalMode::InsecureTest);
+        let output = render_task_receipt(&task);
+        assert!(output.contains("INSECURE TEST APPROVAL"));
+        assert!(!output.contains("native approval"));
+        task.approval_mode = None;
+        assert!(render_task_receipt(&task).contains("approval mode unavailable"));
+        task.approved_at = None;
+        assert!(render_task_receipt(&task).contains("Approval: not granted"));
     }
 
     #[test]

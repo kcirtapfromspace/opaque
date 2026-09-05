@@ -56,6 +56,7 @@ mod gcp;
 mod github;
 mod gitlab;
 mod identity;
+mod inference;
 #[allow(dead_code)]
 mod infisical;
 mod onepassword;
@@ -64,8 +65,14 @@ mod pairing;
 mod push;
 mod sandbox;
 pub mod secret;
+mod task_api;
+mod task_store;
+mod tenant;
 mod trust_domain;
 mod vault;
+mod workspace_process;
+
+use workspace_process::WorkspaceCommandExt;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -79,6 +86,19 @@ use enclave::{Enclave, NativeApprovalGate, OperationHandler};
 /// Daemon configuration loaded from `~/.opaque/config.toml`.
 #[derive(Debug, Clone, Deserialize, Default)]
 struct DaemonConfig {
+    /// One immutable tenant per independently isolated broker installation.
+    #[serde(default)]
+    tenant: Option<tenant::TenantConfig>,
+    /// Sealed, operator-selected model and public source profile.
+    #[serde(default)]
+    inference: Option<inference::InferenceProfileConfig>,
+    /// Opt-in fixed-manifest publishing; existing single-write rules keep their floor.
+    #[serde(default)]
+    enable_task_grants: bool,
+
+    /// Trusted state location for isolated installations and dogfood runs.
+    #[serde(default)]
+    data_dir: Option<PathBuf>,
     /// Known human client executables. If a connecting client matches any
     /// entry, it is classified as `Human`; otherwise it defaults to `Agent`.
     #[serde(default)]
@@ -126,6 +146,15 @@ struct DaemonConfig {
     #[serde(default)]
     approval_backend: Option<String>,
 
+    /// Public keys authorized by the trusted operator to review whole tasks.
+    #[serde(default)]
+    workstation_approvers: Vec<pairing::WorkstationApproverConfig>,
+
+    /// Downgrades receipt provenance for an automated signing fixture. This
+    /// does not bypass any enrollment, signature, expiry or policy check.
+    #[serde(default)]
+    workstation_test_mode: bool,
+
     /// Trust-domain enforcement (`[trust_domain]`): the service-account split
     /// that turns the audit/seal/delegation guarantees from tamper-evidence
     /// into tamper-prevention. Absent = shared-uid developer mode (audited,
@@ -155,6 +184,10 @@ struct DaemonConfig {
 /// `[approval]` — out-of-band approval factor configuration.
 #[derive(Debug, Clone, Deserialize, Default)]
 struct ApprovalFactorsConfig {
+    /// Session creation requires full review, locally or on a paired workstation.
+    #[serde(default)]
+    session_factor: Option<ApprovalFactor>,
+
     /// Enable the second-device factor: starts the local HTTPS approval
     /// server (+ mDNS) where paired devices fetch and sign challenges.
     #[serde(default)]
@@ -179,6 +212,15 @@ struct ApprovalFactorsConfig {
     /// WebAuthn relying-party id for FIDO2 (default "opaque.local").
     #[serde(default)]
     fido2_rp_id: Option<String>,
+}
+
+impl ApprovalFactorsConfig {
+    fn validated_session_factor(&self) -> Result<ApprovalFactor, String> {
+        match self.session_factor.unwrap_or(ApprovalFactor::LocalBio) {
+            factor @ (ApprovalFactor::LocalBio | ApprovalFactor::PairedWorkstation) => Ok(factor),
+            _ => Err("approval.session_factor requires local_bio or paired_workstation".into()),
+        }
+    }
 }
 
 /// `[trust_domain]` — settings for running the daemon as a principal distinct
@@ -293,7 +335,9 @@ Docs: https://opaque.info/
 }
 
 struct DaemonState {
+    tenant: Option<tenant::TenantBoundary>,
     enclave: Arc<Enclave>,
+    tasks: Option<Arc<task_store::TaskStore>>,
     audit: Arc<dyn AuditSink>,
     config: DaemonConfig,
     version: &'static str,
@@ -687,6 +731,11 @@ fn init_memory_safety() {
 async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> {
     init_memory_safety();
 
+    let session_approval_factor = config
+        .approval
+        .validated_session_factor()
+        .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+
     // --- Trust domain: verify custody BEFORE opening or creating any state ---
     let td = &config.trust_domain;
     if td.enforce {
@@ -721,6 +770,21 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
     }
 
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+    let state_dir = config
+        .data_dir
+        .clone()
+        .unwrap_or_else(|| home.join(".opaque"));
+    if !state_dir.is_absolute() {
+        return Err(std::io::Error::other("data_dir must be an absolute path"));
+    }
+    if config.data_dir.is_some() {
+        validate_path_chain(&state_dir)?;
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(state_dir.join("approval"))?;
+    }
 
     // Materialize the state directory owner-only BEFORE verifying custody:
     // otherwise a fresh install has nothing to check here, and whichever
@@ -728,7 +792,6 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
     // leaving the custody root group/world-traversable until the next
     // restart, which is exactly the window enforcement is meant to close.
     {
-        let state_dir = home.join(".opaque");
         if !state_dir.exists() {
             use std::os::unix::fs::DirBuilderExt;
             std::fs::DirBuilder::new()
@@ -738,7 +801,8 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         }
     }
 
-    let custody_violations = trust_domain::startup_custody_check(td.enforce, &home, &config_path)?;
+    let custody_violations =
+        trust_domain::startup_custody_check_at(td.enforce, &home, &config_path, &state_dir)?;
 
     // Check if --allow-unsealed was passed on the command line.
     let allow_unsealed = std::env::args().any(|a| a == "--allow-unsealed");
@@ -751,6 +815,26 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         td.enforce,
     )?;
 
+    // Bind custody before any identity, ledger, or provider state is opened.
+    validate_tenant_startup(&config, &state_dir).map_err(std::io::Error::other)?;
+    let tenant = config
+        .tenant
+        .as_ref()
+        .map(|tenant_config| tenant::TenantBoundary::open(tenant_config, &state_dir, td.enforce))
+        .transpose()
+        .map_err(std::io::Error::other)?;
+    let inference_profile = config
+        .inference
+        .as_ref()
+        .map(|profile| {
+            let boundary = tenant
+                .as_ref()
+                .ok_or("inference requires a tenant-bound broker")?;
+            profile.bind(boundary.binding())
+        })
+        .transpose()
+        .map_err(std::io::Error::other)?;
+
     // --- Socket surface ---
     // Split deployments name an explicit socket path in the sealed config
     // (e.g. /run/opaque/opaqued.sock); the daemon still never trusts
@@ -758,6 +842,12 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
     let socket = td
         .socket_path
         .clone()
+        .or_else(|| {
+            config
+                .data_dir
+                .as_ref()
+                .map(|dir| dir.join("run/opaqued.sock"))
+        })
         .unwrap_or_else(|| socket_path_for_client(false));
     ensure_socket_parent_dir(&socket)?;
 
@@ -1335,12 +1425,35 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         .map_err(std::io::Error::other)?;
 
     let policy = PolicyEngine::with_rules(config.rules.clone());
+    registry
+        .register(enclave::task_operation())
+        .map_err(std::io::Error::other)?;
+    for operation in enclave::release_task_operations()
+        .into_iter()
+        .chain(enclave::inference_task_operations())
+    {
+        registry
+            .register(operation)
+            .map_err(std::io::Error::other)?;
+    }
     info!("policy engine loaded with {} rules", policy.rule_count());
 
     let tracing_sink: Arc<dyn AuditSink> = Arc::new(TracingAuditEmitter::new());
-    let audit_db_path = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
-        .join(".opaque")
-        .join("audit.db");
+    let audit_db_path = state_dir.join("audit.db");
+    let tasks = if config.enable_task_grants {
+        Some(Arc::new(
+            match tenant.as_ref() {
+                Some(boundary) => task_store::TaskStore::open_for_tenant(
+                    &state_dir.join("tasks.db"),
+                    Some(boundary.binding().clone()),
+                ),
+                None => task_store::TaskStore::open(&state_dir.join("tasks.db")),
+            }
+            .map_err(|e| std::io::Error::other(format!("task ledger unavailable: {e}")))?,
+        ))
+    } else {
+        None
+    };
     let retention_days = config.audit_retention_days.unwrap_or(90);
     let sqlite_sink: Arc<dyn AuditSink> = Arc::new(
         SqliteAuditSink::new(audit_db_path.clone(), retention_days)
@@ -1472,6 +1585,8 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         std::env::var(onepassword::client::CONNECT_URL_ENV).unwrap_or_default();
 
     let mut enclave_builder = Enclave::builder()
+        .inference_profile(inference_profile)
+        .session_approval_factor(session_approval_factor)
         .registry(registry)
         .policy(policy)
         .handler("test.noop", Box::new(NoopHandler))
@@ -1559,35 +1674,10 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         info!("Bitwarden handler enabled ({})", bitwarden_url);
     }
 
-    // AWS handler.
-    //
-    // SECURITY (C6): the current AWS client sends the access key + secret key as
-    // plaintext headers (SigV4 is not yet implemented), which both fails against
-    // real AWS and would exfiltrate the long-lived secret key to whatever host the
-    // endpoint resolves to. It is therefore DISABLED unless the operator explicitly
-    // opts in via OPAQUE_AWS_ALLOW_INSECURE=1 (intended for mock/testing only). The
-    // region is also validated to close a host-injection vector — an unvalidated
-    // value like "foo@evil.com/" would rewrite the request host.
-    if std::env::var("OPAQUE_AWS_ALLOW_INSECURE").as_deref() == Ok("1") {
-        let aws_region = std::env::var(aws::client::AWS_REGION_ENV)
-            .unwrap_or_else(|_| aws::client::DEFAULT_REGION.to_owned());
-        if aws_region.is_empty()
-            || !aws_region
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-        {
-            warn!(
-                "AWS handler disabled: invalid region {:?} (must match [a-z0-9-]+)",
-                aws_region
-            );
-        } else {
-            let sts_url = format!("https://sts.{aws_region}.amazonaws.com");
-            let sm_url = format!("https://secretsmanager.{aws_region}.amazonaws.com");
-            let ssm_url = format!("https://ssm.{aws_region}.amazonaws.com");
-            let aws_client = aws::client::AwsClient::new(&sts_url, &sm_url, &ssm_url)
-                .expect("invalid AWS service URL scheme");
-
-            let aws_ops = [
+    // The unsigned AWS transport is quarantined to explicitly enabled loopback mocks.
+    match aws::client::AwsClient::from_mock_env() {
+        Ok(Some(aws_client)) => {
+            for op in [
                 "aws.get_caller_identity",
                 "aws.assume_role",
                 "aws.list_secrets",
@@ -1599,22 +1689,16 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
                 "aws.put_parameter",
                 "aws.get_parameters_by_path",
                 "aws.delete_parameter",
-            ];
-            for op in aws_ops {
-                let handler = aws::AwsHandler::new(audit.clone(), aws_client.clone());
-                enclave_builder = enclave_builder.handler(op, Box::new(handler));
+            ] {
+                enclave_builder = enclave_builder.handler(
+                    op,
+                    Box::new(aws::AwsHandler::new(audit.clone(), aws_client.clone())),
+                );
             }
-            warn!(
-                "AWS handler enabled in INSECURE mode (region: {}) — plaintext key \
-                 headers, no SigV4. Do not use with real AWS credentials.",
-                aws_region
-            );
+            warn!("AWS loopback mock handler enabled; real AWS signing is not implemented");
         }
-    } else {
-        info!(
-            "AWS handler disabled (set OPAQUE_AWS_ALLOW_INSECURE=1 to enable the \
-             insecure mock client; SigV4 support is pending)"
-        );
+        Ok(None) => info!("AWS handler disabled; signed production transport is not implemented"),
+        Err(_) => return Err(std::io::Error::other("invalid AWS mock configuration")),
     }
 
     // Approval backend selection. The insecure auto-approve backend exists
@@ -1636,7 +1720,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         Arc<pairing::PairingManager>,
         approval_server::ApprovalServerHandle,
     )> = None;
-    if config.approval.second_device {
+    if config.approval.second_device || !config.workstation_approvers.is_empty() {
         let state_dir = audit_db_path
             .parent()
             .map(Path::to_path_buf)
@@ -1656,7 +1740,11 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         };
 
         // Device store integrity key beside the store (custody set).
-        let store_path = pairing::store::DeviceStore::default_path();
+        let store_path = config
+            .data_dir
+            .as_ref()
+            .map(|dir| dir.join("approval/paired_devices.json"))
+            .unwrap_or_else(pairing::store::DeviceStore::default_path);
         if let Some(parent) = store_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -1678,6 +1766,10 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
             bind.port(),
             store,
         ));
+        for approver in &config.workstation_approvers {
+            pm.enroll_workstation(approver)
+                .map_err(std::io::Error::other)?;
+        }
 
         // TLS identity persists so paired devices' fingerprint pin survives
         // restarts (custody set).
@@ -1727,7 +1819,11 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
     // authenticator ceremony runs in whatever client drives the key.
     let mut fido2_approvals: Option<Arc<factors::Fido2Approvals>> = None;
     if config.approval.fido2 {
-        let store_path = fido2::Fido2CredentialStore::default_path();
+        let store_path = config
+            .data_dir
+            .as_ref()
+            .map(|dir| dir.join("approval/fido2_credentials.json"))
+            .unwrap_or_else(fido2::Fido2CredentialStore::default_path);
         if let Some(parent) = store_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -1772,7 +1868,17 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
             registry.register(Arc::new(factors::LocalBioVerifier::new(resolver)));
 
             if let Some((pm, handle)) = second_device_verifier.clone() {
-                registry.register(Arc::new(factors::PairedDeviceVerifier::new(pm, handle)));
+                if config.approval.second_device {
+                    registry.register(Arc::new(factors::PairedDeviceVerifier::new(
+                        pm.clone(),
+                        handle.clone(),
+                    )));
+                }
+                if !config.workstation_approvers.is_empty() {
+                    registry.register(Arc::new(factors::PairedWorkstationVerifier::new(
+                        pm, handle,
+                    )));
+                }
             }
 
             if let Some(approvals) = fido2_approvals.clone() {
@@ -1894,7 +2000,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
 
     // --- Continuous attestation ---
     let attestation = Arc::new(attest::AttestationService::new(
-        attest::load_or_create_key(&home)?,
+        attest::load_or_create_key_in(&state_dir)?,
         home.clone(),
         config_path.clone(),
         audit_db_path.clone(),
@@ -1943,7 +2049,9 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
     }
 
     let state = Arc::new(DaemonState {
+        tenant,
         enclave,
+        tasks,
         audit: audit.clone(),
         config,
         version: version_string(),
@@ -2192,6 +2300,53 @@ fn revoke_delegations(
     }
 }
 
+/// Build the full session review from trusted authority and bounded display hints.
+fn session_approval_reason(
+    tenant: Option<&opaque_core::tenant::TenantBinding>,
+    uid: u32,
+    ttl_secs: u64,
+    delegation: Option<&(AccessMode, opaque_core::identity::Principal)>,
+    label: Option<&str>,
+) -> String {
+    // Authority is always first and comes from verified runtime state. Labels
+    // are separate, single-line display hints and cannot hide these fields.
+    let mut reason = tenant.map_or_else(
+        || "Tenant: unbound local broker\n".to_owned(),
+        opaque_core::tenant::TenantBinding::approval_context,
+    );
+    reason.push_str(&format!(
+        "Peer UID: {uid}\nSession lifetime: {ttl_secs} seconds\n"
+    ));
+    if let Some((mode, principal)) = delegation {
+        reason.push_str(&format!(
+            "Subject principal: {}\nAccess mode: {mode}\n",
+            principal.id
+        ));
+    } else {
+        reason.push_str("Subject principal: none (legacy local session)\nAccess mode: legacy\n");
+    }
+    let display_label = |value: &str, limit: usize| {
+        let filtered: String = value.chars().filter(|c| {
+            !c.is_control()
+                && !matches!(*c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        }).take(limit.saturating_add(1)).collect();
+        enclave::sanitize_for_display(&filtered, limit)
+    };
+    if let Some((_, principal)) = delegation {
+        reason.push_str(&format!(
+            "Subject display label: {}\n",
+            display_label(&principal.display_label(), 128)
+        ));
+    }
+    if let Some(label) = label {
+        reason.push_str(&format!(
+            "Requested session label: {}\n",
+            display_label(label, 96)
+        ));
+    }
+    reason
+}
+
 /// Derive an agent workload tool name for the `act` principal: prefer the
 /// client-supplied label, else the client executable's basename, else
 /// "agent" — sanitized to the identity charset (`[A-Za-z0-9._-]`, max 64).
@@ -2371,7 +2526,8 @@ fn safe_command(bin: &str) -> std::process::Command {
     cmd.env("PATH", "/usr/bin:/usr/local/bin:/bin");
     cmd.env("LC_ALL", "C");
     cmd.env("GIT_CONFIG_NOSYSTEM", "1");
-    cmd.env("HOME", "/nonexistent"); // Prevent reading ~/.gitconfig
+    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
+    cmd.env("GIT_OPTIONAL_LOCKS", "0");
     cmd.env("GIT_TERMINAL_PROMPT", "0");
     cmd
 }
@@ -2398,7 +2554,7 @@ fn read_client_cwd(pid: i32) -> Option<PathBuf> {
 #[cfg(target_os = "macos")]
 fn read_client_cwd_macos(pid: i32) -> Option<PathBuf> {
     // Use lsof to get the cwd of a process on macOS.
-    let output = safe_command("lsof")
+    let output = safe_command("/usr/sbin/lsof")
         .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
         .output()
         .ok()?;
@@ -2456,14 +2612,14 @@ fn verify_workspace_blocking(
     }
 
     // Verify git toplevel matches.
-    let toplevel = safe_command("git")
+    let toplevel = workspace_git_read_command()
         .args([
             "-C",
             &claimed.repo_root.to_string_lossy(),
             "rev-parse",
             "--show-toplevel",
         ])
-        .output()
+        .workspace_output()
         .map_err(|e| format!("failed to run git: {e}"))?;
     if !toplevel.status.success() {
         return Err(format!(
@@ -2490,7 +2646,7 @@ fn verify_workspace_blocking(
     // Verify remote URL if claimed.
     // Fail-closed: if git remote command fails, deny the request.
     if let Some(ref claimed_url) = claimed.remote_url {
-        let remote = safe_command("git")
+        let remote = workspace_git_read_command()
             .args([
                 "-C",
                 &claimed.repo_root.to_string_lossy(),
@@ -2498,7 +2654,7 @@ fn verify_workspace_blocking(
                 "get-url",
                 "origin",
             ])
-            .output()
+            .workspace_output()
             .map_err(|e| format!("failed to get remote url: {e}"))?;
         if !remote.status.success() {
             return Err(
@@ -2506,7 +2662,7 @@ fn verify_workspace_blocking(
             );
         }
         let actual_url = String::from_utf8_lossy(&remote.stdout).trim().to_string();
-        if actual_url != *claimed_url {
+        if InputValidator::sanitize_url(&actual_url) != *claimed_url {
             // Sanitize URLs before embedding in error messages to strip
             // embedded credentials (e.g. https://token@host/...).
             let safe_claimed = InputValidator::sanitize_url(claimed_url);
@@ -2521,7 +2677,7 @@ fn verify_workspace_blocking(
     // Verify branch if claimed.
     // Fail-closed: if git branch command fails, deny the request.
     if let Some(ref claimed_branch) = claimed.branch {
-        let branch = safe_command("git")
+        let branch = workspace_git_read_command()
             .args([
                 "-C",
                 &claimed.repo_root.to_string_lossy(),
@@ -2529,7 +2685,7 @@ fn verify_workspace_blocking(
                 "--abbrev-ref",
                 "HEAD",
             ])
-            .output()
+            .workspace_output()
             .map_err(|e| format!("failed to get branch: {e}"))?;
         if !branch.status.success() {
             return Err(
@@ -2545,11 +2701,365 @@ fn verify_workspace_blocking(
         }
     }
 
+    let snapshot = WorkspaceGitSnapshot::capture(&claimed.repo_root)?;
+    if claimed
+        .head_sha
+        .as_ref()
+        .is_some_and(|expected| expected != &snapshot.head)
+    {
+        return Err("workspace HEAD changed".into());
+    }
+    if snapshot.is_dirty()? != claimed.dirty {
+        return Err("workspace dirty state differs from the supplied context".into());
+    }
     Ok(())
 }
 
+/// Repository metadata plumbing may read untrusted Git data, but may never
+/// invoke a transport/credential helper or lazy-fetch missing objects.
+fn workspace_git_read_command() -> std::process::Command {
+    let mut command = safe_command("git");
+    command
+        .stdin(std::process::Stdio::null())
+        .arg("--no-pager")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_ALLOW_PROTOCOL", "")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ]);
+    command
+}
+
+/// Status runs with broker-owned metadata, never the mutable repository's
+/// config. Enumerating then overriding filter names is unsafe: a new name can
+/// be added after enumeration and executed by Git under the daemon account.
+struct WorkspaceGitSnapshot {
+    directory: tempfile::TempDir,
+    worktree: PathBuf,
+    objects: PathBuf,
+    head: String,
+    safe_config: Vec<(String, String)>,
+}
+
+impl WorkspaceGitSnapshot {
+    fn capture(worktree: &std::path::Path) -> Result<Self, String> {
+        let unavailable = || "workspace metadata cannot be verified safely".to_owned();
+        let read_git = |args: &[&str]| -> Result<Vec<u8>, String> {
+            let output = workspace_git_read_command()
+                .arg("-C")
+                .arg(worktree)
+                .args(args)
+                .workspace_output_with_limit(128 * 1024)
+                .map_err(|_| unavailable())?;
+            if !output.status.success() || output.stdout.len() > 128 * 1024 {
+                return Err(unavailable());
+            }
+            Ok(output.stdout)
+        };
+        let text_git = |args: &[&str]| -> Result<String, String> {
+            String::from_utf8(read_git(args)?)
+                .map(|s| s.trim_end_matches('\n').to_owned())
+                .map_err(|_| unavailable())
+        };
+        let head = text_git(&["rev-parse", "--verify", "HEAD"])?;
+        if head.len() != 40
+            || !head.bytes().all(|c| c.is_ascii_hexdigit())
+            || text_git(&["rev-parse", "--show-object-format"])? != "sha1"
+        {
+            return Err("workspace HEAD or object format is unsupported".into());
+        }
+        let index = PathBuf::from(text_git(&[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "index",
+        ])?);
+        let objects = PathBuf::from(text_git(&[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "objects",
+        ])?);
+        if !index.is_absolute() || !objects.is_absolute() || !objects.is_dir() {
+            return Err(unavailable());
+        }
+        let config = read_git(&["config", "--includes", "--null", "--list"])?;
+        let mut safe_config = Vec::new();
+        for entry in config.split(|b| *b == 0).filter(|entry| !entry.is_empty()) {
+            let entry = std::str::from_utf8(entry).map_err(|_| unavailable())?;
+            let (key, value) = entry.split_once('\n').unwrap_or((entry, "true"));
+            let key = key.to_ascii_lowercase();
+            if matches!(
+                key.as_str(),
+                "core.sparsecheckout" | "core.sparsecheckoutcone" | "index.sparse"
+            ) && !matches!(value, "false" | "no" | "off" | "0")
+            {
+                return Err("sparse workspaces cannot be verified safely".into());
+            }
+            if matches!(key.as_str(), "core.attributesfile" | "core.excludesfile") {
+                return Err("external workspace attribute or exclude files are unsupported".into());
+            }
+            // Only built-in conversion/stat settings are copied. In particular,
+            // there are no filter.*, include.*, remote.*, extensions.*, fsmonitor,
+            // hooks, credential helpers, alternate commands or shell programs.
+            if matches!(
+                key.as_str(),
+                "core.filemode"
+                    | "core.ignorecase"
+                    | "core.symlinks"
+                    | "core.precomposeunicode"
+                    | "core.autocrlf"
+                    | "core.eol"
+                    | "core.safecrlf"
+                    | "core.checkstat"
+                    | "core.trustctime"
+            ) {
+                if value.len() > 32 || !value.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                    return Err(unavailable());
+                }
+                safe_config.push((key, value.to_owned()));
+            }
+        }
+        let directory = tempfile::Builder::new()
+            .prefix("opaque-workspace-")
+            .tempdir()
+            .map_err(|_| unavailable())?;
+        std::fs::create_dir(directory.path().join("refs")).map_err(|_| unavailable())?;
+        std::fs::create_dir(directory.path().join("objects")).map_err(|_| unavailable())?;
+        std::fs::create_dir(directory.path().join("info")).map_err(|_| unavailable())?;
+        std::fs::write(directory.path().join("HEAD"), format!("{head}\n"))
+            .map_err(|_| unavailable())?;
+        std::fs::write(
+            directory.path().join("config"),
+            "[core]\nrepositoryformatversion = 0\nbare = false\n",
+        )
+        .map_err(|_| unavailable())?;
+        Self::copy_metadata(&index, &directory.path().join("index"), 64 * 1024 * 1024)?;
+        for name in ["exclude", "attributes"] {
+            let relative = format!("info/{name}");
+            let source = PathBuf::from(text_git(&[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                &relative,
+            ])?);
+            Self::copy_metadata(&source, &directory.path().join(relative), 128 * 1024)?;
+        }
+        let snapshot = Self {
+            directory,
+            worktree: worktree.to_path_buf(),
+            objects,
+            head,
+            safe_config,
+        };
+        snapshot.rebuild_index()?;
+        Ok(snapshot)
+    }
+
+    fn copy_metadata(
+        source: &std::path::Path,
+        destination: &std::path::Path,
+        limit: u64,
+    ) -> Result<(), String> {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(source)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err("workspace metadata unavailable".into()),
+        };
+        let metadata = file
+            .metadata()
+            .map_err(|_| "workspace metadata unavailable")?;
+        if !metadata.is_file() || metadata.len() > limit {
+            return Err("workspace metadata exceeds supported limits".into());
+        }
+        let mut bytes = Vec::new();
+        file.take(limit + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "workspace metadata unavailable")?;
+        if bytes.len() as u64 > limit {
+            return Err("workspace metadata exceeds supported limits".into());
+        }
+        std::fs::write(destination, bytes)
+            .map_err(|_| "workspace metadata snapshot unavailable".into())
+    }
+
+    fn command(&self) -> std::process::Command {
+        let mut command = workspace_git_read_command();
+        command
+            .arg("--no-pager")
+            .arg(format!("--git-dir={}", self.directory.path().display()))
+            .arg(format!("--work-tree={}", self.worktree.display()))
+            .arg("-C")
+            .arg(&self.worktree)
+            .env("GIT_OBJECT_DIRECTORY", &self.objects)
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .env("GIT_NO_REPLACE_OBJECTS", "1")
+            .env("GIT_ATTR_NOSYSTEM", "1")
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.untrackedCache=false",
+                "-c",
+                "core.ignorestat=false",
+            ]);
+        for (key, value) in &self.safe_config {
+            command.arg("-c").arg(format!("{key}={value}"));
+        }
+        command
+    }
+
+    fn rebuild_index(&self) -> Result<(), String> {
+        let flags = self
+            .command()
+            .args(["ls-files", "-v", "-z"])
+            .workspace_output()
+            .map_err(|_| "workspace index unavailable")?;
+        if !flags.status.success()
+            || flags
+                .stdout
+                .split(|b| *b == 0)
+                .filter(|entry| !entry.is_empty())
+                .any(|entry| entry[0].is_ascii_lowercase() || entry[0] == b'S')
+        {
+            return Err(
+                "assume-unchanged, split or sparse workspace indexes are unsupported".into(),
+            );
+        }
+        let entries = self
+            .command()
+            .args(["ls-files", "--stage", "--sparse", "-z"])
+            .workspace_output()
+            .map_err(|_| "workspace index unavailable")?;
+        if !entries.status.success() || entries.stdout.len() > 16 * 1024 * 1024 {
+            return Err("workspace index is unsupported or unavailable".into());
+        }
+        for entry in entries
+            .stdout
+            .split(|b| *b == 0)
+            .filter(|entry| !entry.is_empty())
+        {
+            let header = entry
+                .split(|b| *b == b'\t')
+                .next()
+                .ok_or("invalid workspace index")?;
+            let header = std::str::from_utf8(header).map_err(|_| "invalid workspace index")?;
+            let fields: Vec<_> = header.split(' ').collect();
+            if fields.len() != 3
+                || !matches!(fields[0], "100644" | "100755" | "120000" | "160000")
+                || fields[1].len() != 40
+                || !fields[1].bytes().all(|b| b.is_ascii_hexdigit())
+                || !matches!(fields[2], "0" | "1" | "2" | "3")
+            {
+                return Err("workspace index entry is unsupported".into());
+            }
+        }
+        let input = self.directory.path().join("index-entries");
+        let rebuilt = self.directory.path().join("rebuilt-index");
+        std::fs::write(&input, entries.stdout)
+            .map_err(|_| "workspace index snapshot unavailable")?;
+        let empty = self
+            .command()
+            .env("GIT_INDEX_FILE", &rebuilt)
+            .args(["read-tree", "--empty"])
+            .workspace_output()
+            .map_err(|_| "workspace index snapshot unavailable")?;
+        if !empty.status.success() {
+            return Err("workspace index snapshot unavailable".into());
+        }
+        let result = self
+            .command()
+            .env("GIT_INDEX_FILE", &rebuilt)
+            .args(["update-index", "-z", "--index-info"])
+            .stdin(std::fs::File::open(input).map_err(|_| "workspace index snapshot unavailable")?)
+            .workspace_output()
+            .map_err(|_| "workspace index snapshot unavailable")?;
+        if !result.status.success() {
+            return Err("workspace index snapshot unavailable".into());
+        }
+        std::fs::rename(rebuilt, self.directory.path().join("index"))
+            .map_err(|_| "workspace index snapshot unavailable".into())
+    }
+
+    fn reject_external_filters(&self) -> Result<(), String> {
+        // check-attr reads attributes but never executes their filter programs.
+        // A late filter remains harmless because this Git directory has no
+        // corresponding filter configuration, even if worktree files race.
+        let files = self
+            .command()
+            .args([
+                "ls-files",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "-z",
+            ])
+            .workspace_output()
+            .map_err(|_| "workspace index unavailable")?;
+        if !files.status.success() || files.stdout.len() > 16 * 1024 * 1024 {
+            return Err("workspace index is unsupported or unavailable".into());
+        }
+        let paths = self.directory.path().join("checked-paths");
+        std::fs::write(&paths, files.stdout)
+            .map_err(|_| "workspace attribute check unavailable")?;
+        let input =
+            std::fs::File::open(paths).map_err(|_| "workspace attribute check unavailable")?;
+        let attributes = self
+            .command()
+            .args(["check-attr", "-z", "--stdin", "filter"])
+            .stdin(input)
+            .workspace_output()
+            .map_err(|_| "workspace attribute check unavailable")?;
+        if !attributes.status.success() || attributes.stdout.len() > 64 * 1024 * 1024 {
+            return Err("workspace attributes unavailable".into());
+        }
+        let fields: Vec<_> = attributes.stdout.split(|b| *b == 0).collect();
+        if fields.last() != Some(&b"".as_slice()) || (fields.len() - 1) % 3 != 0 {
+            return Err("workspace attributes unavailable".into());
+        }
+        if fields[..fields.len() - 1]
+            .chunks_exact(3)
+            .any(|entry| entry[2] != b"unspecified" && entry[2] != b"unset")
+        {
+            return Err("workspaces using external Git filters cannot be verified safely".into());
+        }
+        Ok(())
+    }
+
+    fn is_dirty(&self) -> Result<bool, String> {
+        self.reject_external_filters()?;
+        let status = self
+            .command()
+            .args([
+                "status",
+                "--porcelain",
+                "--untracked-files=normal",
+                "--ignore-submodules=all",
+            ])
+            .workspace_output()
+            .map_err(|_| "could not verify workspace state")?;
+        if !status.status.success() {
+            return Err("could not verify workspace state".into());
+        }
+        self.reject_external_filters()?;
+        Ok(!status.stdout.is_empty())
+    }
+}
+
 /// Async wrapper around `verify_workspace_blocking` that offloads the
-/// blocking `Command::output()` calls to a Tokio blocking thread.
+/// bounded subprocess calls to a Tokio blocking thread.
 async fn verify_workspace(
     claimed: &opaque_core::operation::WorkspaceContext,
     client_pid: Option<i32>,
@@ -2717,19 +3227,22 @@ async fn handle_conn(
                 }
 
                 // Never log params (may contain secrets due to client bugs).
-                // Request timeout: 120 seconds.
+                // Task work is bounded by its durable expiry (at most one hour).
+                // Native review plus several provider calls may exceed the
+                // ordinary request timeout; cancellation still seals the ledger.
                 // Race against client disconnect so the approval semaphore is
                 // released immediately when the requesting client goes away.
                 let req_id = req.id;
+                let timeout_secs = if req.method == "task_run" { 3600 } else { 120 };
                 let resp = tokio::select! {
                     r = tokio::time::timeout(
-                        std::time::Duration::from_secs(120),
+                        std::time::Duration::from_secs(timeout_secs),
                         handle_request(&state, req, &identity, client_type, session_id.as_deref()),
                     ) => {
                         match r {
                             Ok(r) => r,
                             Err(_) => {
-                                warn!("request timed out after 120s");
+                                warn!(timeout_secs, "request timed out");
                                 Response::err(Some(req_id), "timeout", "request timed out")
                             }
                         }
@@ -2917,10 +3430,47 @@ fn select_approval_backend(
     }
 }
 
+fn validate_tenant_startup(
+    config: &DaemonConfig,
+    state_dir: &std::path::Path,
+) -> Result<(), String> {
+    if config.tenant.is_none()
+        && [tenant::BINDING_FILE, tenant::LOCK_FILE]
+            .iter()
+            .any(|name| std::fs::symlink_metadata(state_dir.join(name)).is_ok())
+    {
+        return Err("tenant-bound custody requires its tenant configuration".into());
+    }
+    if config.inference.is_some()
+        && (config.tenant.is_none()
+            || !config.enable_task_grants
+            || !config
+                .identity
+                .as_ref()
+                .is_some_and(|identity| identity.required && !identity.allowed_subjects.is_empty()))
+    {
+        return Err("tenant inference requires task grants and identity.required=true with explicit identity.allowed_subjects membership".into());
+    }
+    Ok(())
+}
+
 fn is_operation_method(method: &str) -> bool {
     matches!(
         method,
-        "execute" | "github" | "gitlab" | "onepassword" | "bitwarden" | "exec"
+        "execute"
+            | "github"
+            | "gitlab"
+            | "onepassword"
+            | "bitwarden"
+            | "exec"
+            | "task_plan"
+            | "task_plan_inference"
+            | "task_run"
+            | "task_get"
+            | "task_list"
+            | "task_revoke"
+            | "task_reconcile"
+            | "identity.role_set"
     )
 }
 
@@ -2947,7 +3497,8 @@ async fn resolve_principal_context(
     let delegation = {
         let sessions = state.agent_sessions.read().await;
         match sessions.get(sid) {
-            Some(s) => s.delegation.clone(),
+            Some(s) if s.expires_at > SystemTime::now() => s.delegation.clone(),
+            Some(_) => return Err("agent session expired".into()),
             None => return Err("agent session no longer exists".into()),
         }
     };
@@ -2980,11 +3531,17 @@ async fn resolve_principal_context(
     if sub_principal.disabled {
         return Err("delegating principal disabled".into());
     }
+    if !rt.principal_permitted(&sub_principal) {
+        return Err("delegating principal is no longer permitted by identity policy".into());
+    }
     let act_principal = rt
         .store
         .get_principal(&d.act)
         .map_err(|e| format!("principal lookup failed: {e}"))?
         .ok_or("agent principal missing")?;
+    if act_principal.disabled {
+        return Err("agent principal disabled".into());
+    }
 
     // Delegated / break-glass access is only as alive as the human login
     // session it was granted under.
@@ -3003,6 +3560,9 @@ async fn resolve_principal_context(
         }
         if hs.expires_at <= now {
             return Err("human login session expired".into());
+        }
+        if hs.idp_issuer != rt.config.issuer {
+            return Err("human login session issuer is no longer permitted".into());
         }
         if hs.principal_id != d.sub {
             return Err("human login session does not match the delegation".into());
@@ -3069,7 +3629,42 @@ async fn handle_request(
         );
     }
 
+    let wrapper_workspace = if matches!(
+        req.method.as_str(),
+        "github" | "gitlab" | "onepassword" | "bitwarden" | "exec"
+    ) {
+        match task_api::verified_workspace(&req.params, identity).await {
+            Ok(workspace) => workspace,
+            Err(_) => {
+                return Response::err(
+                    Some(req.id),
+                    "workspace_verification_failed",
+                    "workspace verification failed",
+                );
+            }
+        }
+    } else {
+        None
+    };
+
     match req.method.as_str() {
+        "task_plan"
+        | "task_plan_inference"
+        | "task_run"
+        | "task_get"
+        | "task_list"
+        | "task_revoke"
+        | "task_reconcile" => {
+            task_api::handle(
+                state,
+                &req,
+                identity,
+                client_type,
+                session_id,
+                principal_ctx,
+            )
+            .await
+        }
         "ping" => Response::ok(
             req.id,
             serde_json::json!({ "ok": true, "api_version": opaque_core::API_VERSION }),
@@ -3088,6 +3683,10 @@ async fn handle_request(
                     "version": state.version,
                     "api_version": opaque_core::API_VERSION,
                     "federation": federation,
+                    "approval_backend": state.config.approval_backend.as_deref().unwrap_or("native"),
+                    "workstation_test_mode": state.config.workstation_test_mode,
+                    "task_grants_enabled": state.tasks.is_some(),
+                    "trust_domain_enforced": state.config.trust_domain.enforce,
                 }),
             )
         }
@@ -3270,12 +3869,27 @@ async fn handle_request(
                     "no [identity] section in the daemon config",
                 );
             };
-            // Role management requires an active admin login session.
-            if !rt.current_human_has_role(opaque_core::identity::Role::Admin) {
+            // An ambient admin login is only a prerequisite. It never permits
+            // another socket holder to mutate roles without fresh approval.
+            let acting_admin = rt
+                .current_human_principal()
+                .filter(|principal| principal.has_role(opaque_core::identity::Role::Admin));
+            let Some(acting_admin) = acting_admin else {
                 return Response::err(
                     Some(req.id),
                     "not_authorized",
                     "role changes require an active admin login session",
+                );
+            };
+            if principal_ctx.as_ref().is_some_and(|context| {
+                !context
+                    .sub_roles
+                    .contains(&opaque_core::identity::Role::Admin)
+            }) {
+                return Response::err(
+                    Some(req.id),
+                    "not_authorized",
+                    "delegated role changes require an admin subject",
                 );
             }
             let principal_id = req
@@ -3300,39 +3914,114 @@ async fn handle_request(
             };
             let roles_csv = roles_param
                 .iter()
-                .filter_map(|v| v.as_str())
-                .collect::<Vec<_>>()
-                .join(",");
+                .map(|v| v.as_str())
+                .collect::<Option<Vec<_>>>();
+            let Some(roles_csv) = roles_csv else {
+                return Response::err(
+                    Some(req.id),
+                    "invalid_params",
+                    "every role must be a role name",
+                );
+            };
+            let roles_csv = roles_csv.join(",");
             let roles = match opaque_core::identity::roles_from_string(&roles_csv) {
                 Ok(r) => r,
                 Err(e) => {
                     return Response::err(Some(req.id), "invalid_params", e.to_string());
                 }
             };
-            // Refuse to drop the last enabled admin (lockout guard).
+            // Only an admitted, enabled human can administer roles through
+            // this flow. Service roles and removed members cannot satisfy the
+            // lockout guard. The store repeats this under its writer lock.
+            let eligible_admin = |principal: &opaque_core::identity::Principal| {
+                matches!(
+                    &principal.kind,
+                    opaque_core::identity::PrincipalKind::Human { .. }
+                ) && principal.has_role(opaque_core::identity::Role::Admin)
+                    && rt.principal_permitted(principal)
+            };
+            let current_eligible_admin_count = || {
+                rt.store
+                    .list_principals()
+                    .map(|principals| {
+                        principals
+                            .iter()
+                            .filter(|principal| eligible_admin(principal))
+                            .count()
+                    })
+                    .unwrap_or(0)
+            };
             let target = rt.store.get_principal(&principal_id).ok().flatten();
-            let target_is_admin = target
-                .as_ref()
-                .is_some_and(|p| !p.disabled && p.has_role(opaque_core::identity::Role::Admin));
+            let target_is_admin = target.as_ref().is_some_and(eligible_admin);
             if target_is_admin
                 && !roles.contains(&opaque_core::identity::Role::Admin)
-                && rt
-                    .store
-                    .count_with_role(opaque_core::identity::Role::Admin)
-                    .unwrap_or(0)
-                    <= 1
+                && current_eligible_admin_count() <= 1
             {
                 return Response::err(
                     Some(req.id),
                     "last_admin",
-                    "cannot remove the admin role from the last admin",
+                    "cannot remove the admin role from the last admitted human admin",
                 );
             }
             let old_roles = target
                 .as_ref()
                 .map(|p| opaque_core::identity::roles_to_string(&p.roles))
                 .unwrap_or_default();
-            match rt.store.set_roles(&principal_id, &roles) {
+            let tenant_context = state
+                .tenant
+                .as_ref()
+                .map(|tenant| tenant.binding().approval_context())
+                .unwrap_or_default();
+            let review = format!(
+                "Change principal roles\n{tenant_context}Acting admin: {}\nTarget principal: {}\nPrevious roles: [{}]\nApproved replacement roles: [{}]",
+                acting_admin.id,
+                principal_id,
+                old_roles,
+                opaque_core::identity::roles_to_string(&roles)
+            );
+            if state.enclave.request_control_approval(identity, client_type, "identity.role_set", &review, "This changes the principal's authorization. Apply exactly this replacement role set.").await.is_err() {
+                return Response::err(Some(req.id), "permission_denied", "role changes require fresh out-of-band admin approval");
+            }
+            if resolve_principal_context(state, session_id)
+                .await
+                .ok()
+                .as_ref()
+                != Some(&principal_ctx)
+            {
+                return Response::err(
+                    Some(req.id),
+                    "authority_changed",
+                    "delegation changed during role approval",
+                );
+            }
+            if rt.current_human_principal().is_none_or(|current| {
+                current.id != acting_admin.id
+                    || !current.has_role(opaque_core::identity::Role::Admin)
+            }) || rt
+                .store
+                .get_principal(&principal_id)
+                .ok()
+                .flatten()
+                .is_none_or(|current| {
+                    opaque_core::identity::roles_to_string(&current.roles) != old_roles
+                })
+                || (target_is_admin
+                    && !roles.contains(&opaque_core::identity::Role::Admin)
+                    && current_eligible_admin_count() <= 1)
+            {
+                return Response::err(
+                    Some(req.id),
+                    "authority_changed",
+                    "identity authority changed during approval; request a fresh review",
+                );
+            }
+            match rt.store.set_reviewed_roles(
+                &acting_admin.id,
+                &principal_id,
+                &old_roles,
+                &roles,
+                |principal| rt.principal_permitted(principal),
+            ) {
                 Ok(()) => {
                     info!(
                         "roles updated for {principal_id}: [{}]",
@@ -3509,7 +4198,12 @@ async fn handle_request(
                             }
                         };
                         match rt.store.get_principal(&session.principal_id) {
-                            Ok(Some(p)) if !p.disabled => p,
+                            Ok(Some(p))
+                                if rt.principal_permitted(&p)
+                                    && session.idp_issuer == rt.config.issuer =>
+                            {
+                                p
+                            }
                             Ok(_) => {
                                 return Response::err(
                                     Some(req.id),
@@ -3537,7 +4231,7 @@ async fn handle_request(
                             );
                         };
                         match rt.store.get_service_by_name(service) {
-                            Ok(Some(p)) if !p.disabled => p,
+                            Ok(Some(p)) if rt.principal_permitted(&p) => p,
                             Ok(_) => {
                                 emit_daemon_method_audit(
                                     state,
@@ -3576,16 +4270,13 @@ async fn handle_request(
             // agent scoped access, so it must be authorized by a fresh out-of-band
             // human approval — not by client classification, which an agent can wear.
             // The agent cannot satisfy the approval, so it cannot mint its own session.
-            let mut reason = match &label {
-                Some(l) => format!("ttl {ttl_secs}s, label \"{l}\""),
-                None => format!("ttl {ttl_secs}s"),
-            };
-            if let Some((mode, ref sub)) = delegation_plan {
-                reason.push_str(&format!(
-                    ", mode {mode}, on behalf of {}",
-                    sub.display_label()
-                ));
-            }
+            let reason = session_approval_reason(
+                state.tenant.as_ref().map(|boundary| boundary.binding()),
+                identity.uid,
+                ttl_secs,
+                delegation_plan.as_ref(),
+                label.as_deref(),
+            );
             let session_approver = match state
                 .enclave
                 .request_control_approval(
@@ -3623,103 +4314,121 @@ async fn handle_request(
 
             // Mint the credential: a signed delegation token when identity is
             // configured, the legacy opaque hex token otherwise.
-            let (session_token, delegation, mut extra) =
-                match (state.identity.as_ref(), delegation_plan) {
-                    (Some(rt), Some((mode, sub))) => {
-                        // Re-check the login session didn't expire while the
-                        // human was approving (delegated mode only).
-                        let human_session_id = if mode == AccessMode::Delegated {
-                            match rt.store.current_human_session() {
-                                Ok(Some(s)) if s.principal_id == sub.id => Some(s.id),
-                                _ => {
-                                    return Response::err(
-                                        Some(req.id),
-                                        "login_required",
-                                        "the human login session ended before the delegation \
-                                     could be issued — run `opaque login` again",
-                                    );
-                                }
+            let (session_token, delegation, mut extra) = match (
+                state.identity.as_ref(),
+                delegation_plan,
+            ) {
+                (Some(rt), Some((mode, sub))) => {
+                    // Membership or principal state may have changed while
+                    // the independent approver reviewed session creation.
+                    let sub = match rt.store.get_principal(&sub.id) {
+                        Ok(Some(current)) if rt.principal_permitted(&current) => current,
+                        _ => {
+                            return Response::err(
+                                Some(req.id),
+                                "identity_not_permitted",
+                                "the delegating principal is no longer permitted by identity policy",
+                            );
+                        }
+                    };
+                    // Re-check the login session didn't expire while the
+                    // human was approving (delegated mode only).
+                    let human_session_id = if mode == AccessMode::Delegated {
+                        match rt.store.current_human_session() {
+                            Ok(Some(s))
+                                if s.principal_id == sub.id && s.idp_issuer == rt.config.issuer =>
+                            {
+                                Some(s.id)
                             }
-                        } else {
-                            None
-                        };
-
-                        let tool = derive_agent_tool_name(label.as_deref(), identity);
-                        let act = match rt.store.upsert_agent(&tool) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                warn!("failed to upsert agent principal: {e}");
+                            _ => {
                                 return Response::err(
                                     Some(req.id),
-                                    "internal",
-                                    "identity store unavailable",
+                                    "login_required",
+                                    "the human login session ended before the delegation \
+                                     could be issued — run `opaque login` again",
                                 );
                             }
-                        };
+                        }
+                    } else {
+                        None
+                    };
 
-                        let now = now_unix();
-                        let claims = DelegationClaims {
+                    let tool = derive_agent_tool_name(label.as_deref(), identity);
+                    let act = match rt.store.upsert_agent(&tool) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            warn!("failed to upsert agent principal: {e}");
+                            return Response::err(
+                                Some(req.id),
+                                "internal",
+                                "identity store unavailable",
+                            );
+                        }
+                    };
+
+                    let now = now_unix();
+                    let claims = DelegationClaims {
+                        jti: session_id.clone(),
+                        sub: sub.id.clone(),
+                        act: act.id.clone(),
+                        mode,
+                        iat: now,
+                        exp: now + ttl_secs as i64,
+                    };
+                    let token = match sign_delegation_token(&claims, &rt.signing) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            warn!("failed to sign delegation token: {e}");
+                            return Response::err(
+                                Some(req.id),
+                                "internal",
+                                "could not mint a delegation token",
+                            );
+                        }
+                    };
+                    let record = identity::store::DelegationRecord {
+                        jti: session_id.clone(),
+                        sub_principal: sub.id.clone(),
+                        act_principal: act.id.clone(),
+                        mode,
+                        human_session_id: human_session_id.clone(),
+                        // Attribute the delegation to the principal who
+                        // approved its minting, when the gate named one.
+                        approved_by: session_approver
+                            .as_ref()
+                            .and_then(|a| PrincipalId::parse(&a.principal_id).ok()),
+                        created_at: now,
+                        expires_at: now + ttl_secs as i64,
+                        revoked_at: None,
+                    };
+                    if let Err(e) = rt.store.record_delegation(&record) {
+                        warn!("failed to record delegation: {e}");
+                        return Response::err(
+                            Some(req.id),
+                            "internal",
+                            "could not record the delegation",
+                        );
+                    }
+
+                    let extra = serde_json::json!({
+                        "mode": mode.as_str(),
+                        "on_behalf_of": sub.id.as_str(),
+                        "on_behalf_of_label": sub.display_label(),
+                    });
+                    (
+                        token,
+                        Some(SessionDelegation {
                             jti: session_id.clone(),
                             sub: sub.id.clone(),
                             act: act.id.clone(),
                             mode,
-                            iat: now,
-                            exp: now + ttl_secs as i64,
-                        };
-                        let token = match sign_delegation_token(&claims, &rt.signing) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                warn!("failed to sign delegation token: {e}");
-                                return Response::err(
-                                    Some(req.id),
-                                    "internal",
-                                    "could not mint a delegation token",
-                                );
-                            }
-                        };
-                        let record = identity::store::DelegationRecord {
-                            jti: session_id.clone(),
-                            sub_principal: sub.id.clone(),
-                            act_principal: act.id.clone(),
-                            mode,
-                            human_session_id: human_session_id.clone(),
-                            // Attribute the delegation to the principal who
-                            // approved its minting, when the gate named one.
-                            approved_by: session_approver
-                                .as_ref()
-                                .and_then(|a| PrincipalId::parse(&a.principal_id).ok()),
-                            created_at: now,
-                            expires_at: now + ttl_secs as i64,
-                            revoked_at: None,
-                        };
-                        if let Err(e) = rt.store.record_delegation(&record) {
-                            warn!("failed to record delegation: {e}");
-                            return Response::err(
-                                Some(req.id),
-                                "internal",
-                                "could not record the delegation",
-                            );
-                        }
-
-                        let extra = serde_json::json!({
-                            "mode": mode.as_str(),
-                            "on_behalf_of": sub.id.as_str(),
-                            "on_behalf_of_label": sub.display_label(),
-                        });
-                        (
-                            token,
-                            Some(SessionDelegation {
-                                jti: session_id.clone(),
-                                sub: sub.id.clone(),
-                                act: act.id.clone(),
-                                mode,
-                                human_session_id,
-                            }),
-                            extra,
-                        )
-                    }
-                    _ => (generate_daemon_token(), None, serde_json::json!({})),
-                };
+                            human_session_id,
+                        }),
+                        extra,
+                    )
+                }
+                _ => (generate_daemon_token(), None, serde_json::json!({})),
+            };
 
             let delegation_for_audit = delegation
                 .as_ref()
@@ -4959,7 +5668,7 @@ async fn handle_request(
                 created_at: SystemTime::now(),
                 expires_at: None,
                 params: op_params,
-                workspace: None,
+                workspace: wrapper_workspace.clone(),
             };
 
             state
@@ -5100,7 +5809,7 @@ async fn handle_request(
                 created_at: SystemTime::now(),
                 expires_at: None,
                 params: op_params,
-                workspace: None,
+                workspace: wrapper_workspace.clone(),
             };
 
             state
@@ -5247,7 +5956,7 @@ async fn handle_request(
                 created_at: SystemTime::now(),
                 expires_at: None,
                 params: op_params,
-                workspace: None,
+                workspace: wrapper_workspace.clone(),
             };
 
             state
@@ -5372,7 +6081,7 @@ async fn handle_request(
                 created_at: SystemTime::now(),
                 expires_at: None,
                 params: op_params,
-                workspace: None,
+                workspace: wrapper_workspace.clone(),
             };
 
             state
@@ -5456,7 +6165,7 @@ async fn handle_request(
                     "profile": profile,
                     "command": command,
                 }),
-                workspace: None,
+                workspace: wrapper_workspace.clone(),
             };
 
             state
@@ -5522,7 +6231,16 @@ async fn handle_github_list_secrets(
         created_at: SystemTime::now(),
         expires_at: None,
         params: op_params,
-        workspace: None,
+        workspace: match task_api::verified_workspace(&req.params, identity).await {
+            Ok(workspace) => workspace,
+            Err(_) => {
+                return Response::err(
+                    Some(req.id),
+                    "workspace_verification_failed",
+                    "workspace verification failed",
+                );
+            }
+        },
     };
 
     state
@@ -5599,7 +6317,16 @@ async fn handle_github_delete_secret(
         created_at: SystemTime::now(),
         expires_at: None,
         params: op_params,
-        workspace: None,
+        workspace: match task_api::verified_workspace(&req.params, identity).await {
+            Ok(workspace) => workspace,
+            Err(_) => {
+                return Response::err(
+                    Some(req.id),
+                    "workspace_verification_failed",
+                    "workspace verification failed",
+                );
+            }
+        },
     };
 
     state
@@ -5910,7 +6637,10 @@ mod tests {
             envs.get("GIT_CONFIG_NOSYSTEM").map(|s| s.as_str()),
             Some("1")
         );
-        assert_eq!(envs.get("HOME").map(|s| s.as_str()), Some("/nonexistent"));
+        assert_eq!(
+            envs.get("GIT_CONFIG_GLOBAL").map(|s| s.as_str()),
+            Some("/dev/null")
+        );
         // Should not contain common env vars that would be inherited.
         assert!(!envs.contains_key("USER"));
         assert!(!envs.contains_key("SHELL"));
@@ -5933,8 +6663,11 @@ mod tests {
             envs.get("GIT_CONFIG_NOSYSTEM").map(|s| s.as_str()),
             Some("1")
         );
-        // HOME=/nonexistent prevents reading ~/.gitconfig.
-        assert_eq!(envs.get("HOME").map(|s| s.as_str()), Some("/nonexistent"));
+        // The global config override prevents reading user git configuration.
+        assert_eq!(
+            envs.get("GIT_CONFIG_GLOBAL").map(|s| s.as_str()),
+            Some("/dev/null")
+        );
     }
 
     #[test]
@@ -6624,7 +7357,9 @@ exe_sha256 = "deadbeef"
             .build()
             .unwrap();
         DaemonState {
+            tenant: None,
             enclave: Arc::new(enclave),
+            tasks: None,
             audit,
             config: DaemonConfig::default(),
             version: version_string(),
@@ -6646,6 +7381,24 @@ exe_sha256 = "deadbeef"
                 vec![],
                 Arc::new(federation::FederationStatus::default()),
             )),
+        }
+    }
+
+    #[test]
+    fn tenant_configuration_cannot_be_removed_from_initialized_custody() {
+        for marker in [tenant::BINDING_FILE, tenant::LOCK_FILE] {
+            let directory = tempfile::tempdir().unwrap();
+            let config = DaemonConfig::default();
+            assert!(validate_tenant_startup(&config, directory.path()).is_ok());
+            std::fs::write(directory.path().join(marker), b"existing tenant lineage").unwrap();
+            assert!(validate_tenant_startup(&config, directory.path()).is_err());
+            std::fs::remove_file(directory.path().join(marker)).unwrap();
+            std::os::unix::fs::symlink(
+                directory.path().join("absent"),
+                directory.path().join(marker),
+            )
+            .unwrap();
+            assert!(validate_tenant_startup(&config, directory.path()).is_err());
         }
     }
 
@@ -6683,6 +7436,7 @@ exe_sha256 = "deadbeef"
             redirect_port: None,
             session_ttl_secs: None,
             allowed_email_domains: vec![],
+            allowed_subjects: vec![],
             required: false,
             service_principals: vec![],
         };
@@ -6907,6 +7661,54 @@ exe_sha256 = "deadbeef"
         };
         let resp = handle_request(&state, req, &test_identity(), ClientType::Human, None).await;
         assert_eq!(resp.error.expect("gated").code, "not_authorized");
+    }
+
+    #[tokio::test]
+    async fn ambient_admin_login_cannot_authorize_agent_role_changes_without_approval() {
+        let (_directory, mut state) = make_test_state_with_identity();
+        state.enclave = build_test_state(state.audit.clone(), false).enclave;
+        let runtime = state.identity.as_ref().unwrap();
+        let admin = runtime
+            .store
+            .upsert_human(
+                "https://idp.example.com",
+                "role-admin",
+                None,
+                None,
+                &std::collections::BTreeSet::from([opaque_core::identity::Role::Admin]),
+            )
+            .unwrap();
+        runtime
+            .store
+            .create_human_session(&admin.id, 3600, "https://idp.example.com")
+            .unwrap();
+        let target = runtime
+            .store
+            .upsert_human(
+                "https://idp.example.com",
+                "role-target",
+                None,
+                None,
+                &std::collections::BTreeSet::from([opaque_core::identity::Role::Operator]),
+            )
+            .unwrap();
+        let request = Request {
+            id: 1,
+            method: "identity.role_set".into(),
+            params: serde_json::json!({"principal_id": target.id, "roles": ["admin", "operator"]}),
+        };
+        let response =
+            handle_request(&state, request, &test_identity(), ClientType::Agent, None).await;
+        assert_eq!(response.error.unwrap().code, "permission_denied");
+        assert_eq!(
+            runtime
+                .store
+                .get_principal(&target.id)
+                .unwrap()
+                .unwrap()
+                .roles,
+            target.roles
+        );
     }
 
     #[tokio::test]
@@ -7271,6 +8073,7 @@ exe_sha256 = "deadbeef"
             redirect_port: None,
             session_ttl_secs: None,
             allowed_email_domains: vec![],
+            allowed_subjects: vec![],
             required,
             service_principals: vec![identity::ServicePrincipalConfig {
                 name: "ci".into(),
@@ -7408,6 +8211,73 @@ exe_sha256 = "deadbeef"
         assert_eq!(derive_agent_tool_name(Some("///"), &bare), "agent");
     }
 
+    #[test]
+    fn session_approval_factor_config_requires_full_review() {
+        assert_eq!(
+            ApprovalFactorsConfig::default()
+                .validated_session_factor()
+                .unwrap(),
+            ApprovalFactor::LocalBio
+        );
+        for factor in [ApprovalFactor::LocalBio, ApprovalFactor::PairedWorkstation] {
+            let config = ApprovalFactorsConfig {
+                session_factor: Some(factor),
+                ..Default::default()
+            };
+            assert_eq!(config.validated_session_factor().unwrap(), factor);
+        }
+        for factor in [ApprovalFactor::IosFaceId, ApprovalFactor::Fido2] {
+            let config = ApprovalFactorsConfig {
+                session_factor: Some(factor),
+                ..Default::default()
+            };
+            assert!(config.validated_session_factor().is_err());
+        }
+        let config: DaemonConfig =
+            toml_edit::de::from_str("[approval]\nsession_factor = 'paired_workstation'\n").unwrap();
+        assert_eq!(
+            config.approval.validated_session_factor().unwrap(),
+            ApprovalFactor::PairedWorkstation
+        );
+    }
+
+    #[test]
+    fn session_approval_reason_preserves_authority_before_bounded_labels() {
+        let (_directory, state) = identity_state(false);
+        let principal_id = login_human(&state);
+        let principal = state
+            .identity
+            .as_ref()
+            .unwrap()
+            .store
+            .get_principal(&principal_id)
+            .unwrap()
+            .unwrap();
+        let tenant = opaque_core::tenant::TenantBinding::new(
+            opaque_core::tenant::TenantId::parse("tenant-a").unwrap(),
+            Uuid::parse_str("b173e800-52ee-48f1-9bd8-a45487988089").unwrap(),
+        )
+        .unwrap();
+        let label = format!("\n\r\u{061c}\u{200e}\u{202e}{}", "界".repeat(20_000));
+        let reason = session_approval_reason(
+            Some(&tenant),
+            42,
+            600,
+            Some(&(AccessMode::Delegated, principal)),
+            Some(&label),
+        );
+        assert!(reason.starts_with(&tenant.approval_context()));
+        assert!(reason.contains("Peer UID: 42\nSession lifetime: 600 seconds\n"));
+        let authority = format!("Subject principal: {principal_id}\nAccess mode: delegated\n");
+        assert!(reason.contains(&authority));
+        assert!(
+            reason.find(&authority).unwrap() < reason.find("Requested session label:").unwrap()
+        );
+        assert!(!reason.contains(['\r', '\u{061c}', '\u{200e}', '\u{202e}']));
+        assert!(reason.len() < 1024);
+        assert_eq!(reason.lines().count(), 8);
+    }
+
     /// Drive a mint, then return (state, session_id, token) for enforcement tests.
     async fn mint_delegated(state: &DaemonState) -> (String, String) {
         let resp = start_session(state, serde_json::json!({})).await;
@@ -7431,6 +8301,138 @@ exe_sha256 = "deadbeef"
         assert_eq!(ctx.mode, AccessMode::Delegated);
         assert!(ctx.sub_roles.contains(&Role::Operator));
         assert_eq!(ctx.sub_label, "dev@example.com");
+    }
+
+    #[tokio::test]
+    async fn identity_membership_changes_reject_persisted_human_authority() {
+        for change in ["subject", "issuer", "domain"] {
+            let (directory, mut state) = identity_state(false);
+            login_human(&state);
+            let (sid, _) = mint_delegated(&state).await;
+            let mut config = state.identity.as_ref().unwrap().config.clone();
+            match change {
+                "subject" => config.allowed_subjects = vec!["different-member".into()],
+                "issuer" => config.issuer = "https://different.example.com".into(),
+                _ => config.allowed_email_domains = vec!["different.example.com".into()],
+            }
+            // Reopen the same persisted identity store with revised trusted
+            // configuration. No session/principal rows are deleted as a crutch.
+            state.identity = Some(Arc::new(
+                identity::IdentityRuntime::initialize(config, directory.path()).unwrap(),
+            ));
+            let runtime = state.identity.as_ref().unwrap();
+            assert!(runtime.store.current_human_session().unwrap().is_some());
+            assert!(runtime.current_human_principal().is_none());
+            assert!(runtime.current_identity_json().is_none());
+            assert!(!runtime.current_human_has_role(Role::Admin));
+            assert!(
+                resolve_principal_context(&state, Some(&sid)).await.is_err(),
+                "{change} must invalidate the live authority fence"
+            );
+            let response = start_session(&state, serde_json::json!({})).await;
+            assert_eq!(
+                response.error.unwrap().code,
+                "login_required",
+                "{change} must forbid fresh minting from a persisted session"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn identity_membership_changes_reject_persisted_service_authority() {
+        for invalid_roles in [false, true] {
+            let (directory, mut state) = identity_state(false);
+            let response = start_session(
+                &state,
+                serde_json::json!({"mode":"autonomous", "service":"ci"}),
+            )
+            .await;
+            let sid = response.result.unwrap()["session_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let mut config = state.identity.as_ref().unwrap().config.clone();
+            if invalid_roles {
+                config.service_principals[0].roles = vec!["unrecognized-role".into()];
+            } else {
+                config.service_principals.clear();
+            }
+            state.identity = Some(Arc::new(
+                identity::IdentityRuntime::initialize(config, directory.path()).unwrap(),
+            ));
+            assert!(
+                state
+                    .identity
+                    .as_ref()
+                    .unwrap()
+                    .store
+                    .get_service_by_name("ci")
+                    .unwrap()
+                    .is_some(),
+                "test must retain the stale principal row"
+            );
+            assert!(resolve_principal_context(&state, Some(&sid)).await.is_err());
+            let response = start_session(
+                &state,
+                serde_json::json!({"mode":"autonomous", "service":"ci"}),
+            )
+            .await;
+            assert_eq!(response.error.unwrap().code, "unknown_service_principal");
+        }
+    }
+
+    #[tokio::test]
+    async fn identity_membership_is_rechecked_after_session_approval() {
+        struct DisableDuringApproval {
+            runtime: Arc<identity::IdentityRuntime>,
+            principal: PrincipalId,
+        }
+        impl std::fmt::Debug for DisableDuringApproval {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("DisableDuringApproval")
+            }
+        }
+        impl crate::enclave::ApprovalGate for DisableDuringApproval {
+            fn request_approval(
+                &self,
+                _: Uuid,
+                _: &OperationRequest,
+                _: &[ApprovalFactor],
+                _: &str,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<crate::enclave::ApprovalOutcome, String>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async move {
+                    self.runtime
+                        .store
+                        .set_disabled(&self.principal, true)
+                        .unwrap();
+                    Ok(crate::enclave::ApprovalOutcome::approved_anonymous())
+                })
+            }
+        }
+        let (_directory, mut state) = identity_state(false);
+        let principal = login_human(&state);
+        state.enclave = Arc::new(
+            Enclave::builder()
+                .registry(OperationRegistry::new())
+                .policy(PolicyEngine::with_rules(vec![]))
+                .approval_gate(Box::new(DisableDuringApproval {
+                    runtime: state.identity.as_ref().unwrap().clone(),
+                    principal,
+                }))
+                .audit(state.audit.clone())
+                .build()
+                .unwrap(),
+        );
+        let response = start_session(&state, serde_json::json!({})).await;
+        assert_eq!(response.error.unwrap().code, "identity_not_permitted");
+        assert!(state.agent_sessions.read().await.is_empty());
     }
 
     #[tokio::test]
@@ -7484,6 +8486,344 @@ exe_sha256 = "deadbeef"
             .unwrap();
         let err = resolve_principal_context(&state, Some(&sid)).await;
         assert!(err.is_err(), "disabled principal must fail closed");
+    }
+
+    #[tokio::test]
+    async fn expired_wrapper_session_fails_live_context_check() {
+        let (_directory, state) = identity_state(false);
+        login_human(&state);
+        let (sid, _) = mint_delegated(&state).await;
+        state
+            .agent_sessions
+            .write()
+            .await
+            .get_mut(&sid)
+            .unwrap()
+            .expires_at = std::time::UNIX_EPOCH;
+        assert_eq!(
+            resolve_principal_context(&state, Some(&sid))
+                .await
+                .unwrap_err(),
+            "agent session expired"
+        );
+        // Legacy sessions also have a live TTL, even without a delegation.
+        state
+            .agent_sessions
+            .write()
+            .await
+            .get_mut(&sid)
+            .unwrap()
+            .delegation = None;
+        assert!(resolve_principal_context(&state, Some(&sid)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn disabled_acting_agent_fails_live_context_check() {
+        let (_directory, state) = identity_state(false);
+        login_human(&state);
+        let (sid, _) = mint_delegated(&state).await;
+        let context = resolve_principal_context(&state, Some(&sid))
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .identity
+            .as_ref()
+            .unwrap()
+            .store
+            .set_disabled(&context.act, true)
+            .unwrap();
+        assert_eq!(
+            resolve_principal_context(&state, Some(&sid))
+                .await
+                .unwrap_err(),
+            "agent principal disabled"
+        );
+    }
+
+    #[test]
+    fn workspace_verification_checks_dirty_and_head_without_executing_filters() {
+        use opaque_core::operation::WorkspaceContext;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let git = |args: &[&str]| {
+            let output = safe_command("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "initial",
+        ]);
+        let mut workspace = WorkspaceContext {
+            repo_root: root.clone(),
+            remote_url: None,
+            branch: None,
+            head_sha: Some(git(&["rev-parse", "HEAD"])),
+            dirty: false,
+            workspace_verified: false,
+        };
+        assert!(verify_workspace_blocking(&workspace, None).is_ok());
+        std::fs::write(root.join("changed.txt"), "changed").unwrap();
+        assert!(
+            verify_workspace_blocking(&workspace, None)
+                .unwrap_err()
+                .contains("dirty")
+        );
+        workspace.dirty = true;
+        assert!(verify_workspace_blocking(&workspace, None).is_ok());
+        workspace.head_sha = Some("0000000000000000000000000000000000000000".into());
+        assert!(
+            verify_workspace_blocking(&workspace, None)
+                .unwrap_err()
+                .contains("HEAD")
+        );
+        workspace.head_sha = None;
+        let marker = root.join("filter-executed");
+        std::fs::write(root.join(".gitattributes"), "*.txt filter=unsafe\n").unwrap();
+        git(&[
+            "config",
+            "filter.unsafe.clean",
+            &format!("touch {}", marker.display()),
+        ]);
+        git(&[
+            "config",
+            "core.fsmonitor",
+            &format!("touch {}", marker.display()),
+        ]);
+        assert!(
+            verify_workspace_blocking(&workspace, None)
+                .unwrap_err()
+                .contains("external Git filters")
+        );
+        assert!(
+            !marker.exists(),
+            "workspace verification must not execute repository programs"
+        );
+    }
+
+    #[test]
+    fn workspace_snapshot_late_filter_cannot_execute_broker_commands() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let git = |args: &[&str]| {
+            let result = safe_command("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join("tracked"), "before\n").unwrap();
+        git(&["add", "tracked"]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "initial",
+        ]);
+        let snapshot = WorkspaceGitSnapshot::capture(&root).unwrap();
+        assert!(!snapshot.is_dirty().unwrap());
+        snapshot.reject_external_filters().unwrap();
+        // The attack lands after config capture AND the attribute precheck.
+        let marker = root.join("filter-executed");
+        git(&[
+            "config",
+            "filter.late.clean",
+            &format!("touch {}", marker.display()),
+        ]);
+        git(&[
+            "config",
+            "core.fsmonitor",
+            &format!("touch {}", marker.display()),
+        ]);
+        std::fs::write(root.join(".gitattributes"), "tracked filter=late\n").unwrap();
+        std::fs::write(root.join("tracked"), "after!\n").unwrap();
+        let status = snapshot
+            .command()
+            .args([
+                "status",
+                "--porcelain",
+                "--untracked-files=normal",
+                "--ignore-submodules=all",
+            ])
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        assert!(
+            !marker.exists(),
+            "status must not discover the changed original config"
+        );
+        assert!(
+            snapshot
+                .is_dirty()
+                .unwrap_err()
+                .contains("external Git filters")
+        );
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn workspace_snapshot_preserves_builtin_eol_staging_and_linked_worktree_semantics() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let git = |root: &std::path::Path, args: &[&str]| {
+            let result = safe_command("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        };
+        git(&root, &["init", "-q"]);
+        git(&root, &["config", "core.autocrlf", "true"]);
+        std::fs::write(root.join("tracked.txt"), "before\r\n").unwrap();
+        git(&root, &["add", "tracked.txt"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "initial",
+            ],
+        );
+        assert!(
+            !WorkspaceGitSnapshot::capture(&root)
+                .unwrap()
+                .is_dirty()
+                .unwrap()
+        );
+        std::fs::write(root.join("tracked.txt"), "after!\r\n").unwrap();
+        assert!(
+            WorkspaceGitSnapshot::capture(&root)
+                .unwrap()
+                .is_dirty()
+                .unwrap()
+        );
+        git(&root, &["add", "tracked.txt"]);
+        assert!(
+            WorkspaceGitSnapshot::capture(&root)
+                .unwrap()
+                .is_dirty()
+                .unwrap(),
+            "staged change must remain dirty"
+        );
+        git(
+            &root,
+            &["update-index", "--assume-unchanged", "tracked.txt"],
+        );
+        assert!(WorkspaceGitSnapshot::capture(&root).is_err());
+        git(
+            &root,
+            &["update-index", "--no-assume-unchanged", "tracked.txt"],
+        );
+        let linked = directory.path().join("linked");
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        assert!(
+            !WorkspaceGitSnapshot::capture(&linked)
+                .unwrap()
+                .is_dirty()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn workspace_metadata_fifo_is_rejected_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+        let directory = tempfile::tempdir().unwrap();
+        let fifo = directory.path().join("index");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: path is a valid, owned temporary pathname and mode is private.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        assert!(
+            WorkspaceGitSnapshot::copy_metadata(&fifo, &directory.path().join("copy"), 1024)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn workspace_snapshot_ignorestat_cannot_hide_changed_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let git = |args: &[&str]| {
+            let result = safe_command("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join("tracked"), "before\n").unwrap();
+        git(&["add", "tracked"]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "initial",
+        ]);
+        // The source index is ordinary; copying this configuration while
+        // rebuilding it would silently set CE_VALID on every tracked entry.
+        git(&["config", "core.ignorestat", "true"]);
+        let snapshot = WorkspaceGitSnapshot::capture(&root).unwrap();
+        assert!(!snapshot.is_dirty().unwrap());
+        std::fs::write(root.join("tracked"), "after!\n").unwrap();
+        assert!(
+            snapshot.is_dirty().unwrap(),
+            "repository ignorestat must not hide changed content"
+        );
     }
 
     #[tokio::test]

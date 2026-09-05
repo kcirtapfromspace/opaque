@@ -215,14 +215,24 @@ impl FactorVerifier for LocalBioVerifier {
     fn verify(&self, ctx: ApprovalContext) -> VerifyFuture {
         let resolver = self.approver_resolver.clone();
         Box::pin(async move {
-            let outcome = crate::approval::prompt(&ctx.description)
-                .await
-                .map_err(|e| match e {
-                    crate::approval::ApprovalError::Unavailable => {
-                        FactorError::Unavailable("no interactive session for local prompt".into())
-                    }
-                    other => FactorError::Failed(other.to_string()),
-                })?;
+            let result = if matches!(
+                ctx.operation.as_str(),
+                "github.publish_manifest"
+                    | "github.release_manifest"
+                    | "inference.fixed_manifest"
+                    | "agent_session_start"
+                    | "identity.role_set"
+            ) {
+                crate::approval::prompt_task(&ctx.description).await
+            } else {
+                crate::approval::prompt(&ctx.description).await
+            };
+            let outcome = result.map_err(|e| match e {
+                crate::approval::ApprovalError::Unavailable => {
+                    FactorError::Unavailable("no interactive session for local prompt".into())
+                }
+                other => FactorError::Failed(other.to_string()),
+            })?;
 
             match outcome {
                 crate::approval::PromptOutcome::Denied => Ok(VerifiedDecision {
@@ -292,7 +302,13 @@ impl FactorVerifier for PairedDeviceVerifier {
             // No usable device → this factor cannot decide; let others race.
             let has_device = pairing
                 .list_devices()
-                .map(|devices| devices.iter().any(|d| !d.revoked))
+                .map(|devices| {
+                    devices.iter().any(|d| {
+                        !d.revoked
+                            && d.confirmed
+                            && d.kind == crate::pairing::store::DeviceKind::Ios
+                    })
+                })
                 .unwrap_or(false);
             if !has_device {
                 return Err(FactorError::Unavailable(
@@ -346,6 +362,96 @@ impl FactorVerifier for PairedDeviceVerifier {
                     "second-device approval timed out".into(),
                 )),
             }
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Paired workstation full-review factor
+// ---------------------------------------------------------------------------
+
+pub struct PairedWorkstationVerifier {
+    pairing: Arc<crate::pairing::PairingManager>,
+    server: crate::approval_server::ApprovalServerHandle,
+}
+
+impl fmt::Debug for PairedWorkstationVerifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PairedWorkstationVerifier").finish()
+    }
+}
+
+impl PairedWorkstationVerifier {
+    pub fn new(
+        pairing: Arc<crate::pairing::PairingManager>,
+        server: crate::approval_server::ApprovalServerHandle,
+    ) -> Self {
+        Self { pairing, server }
+    }
+}
+
+impl FactorVerifier for PairedWorkstationVerifier {
+    fn factor(&self) -> ApprovalFactor {
+        ApprovalFactor::PairedWorkstation
+    }
+
+    fn verify(&self, ctx: ApprovalContext) -> VerifyFuture {
+        let pairing = self.pairing.clone();
+        let server = self.server.clone();
+        Box::pin(async move {
+            use opaque_core::workstation::{
+                MAX_CHALLENGE_TTL_SECS, WorkstationChallenge, WorkstationReview, hex, review_hash,
+            };
+            if !pairing.has_workstation() {
+                return Err(FactorError::Unavailable(
+                    "no enrolled, allowed, unrevoked workstation".into(),
+                ));
+            }
+            let mut nonce = [0; 32];
+            getrandom::fill(&mut nonce)
+                .map_err(|_| FactorError::Failed("workstation nonce unavailable".into()))?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            let ttl = server
+                .timeout()
+                .as_secs()
+                .min(MAX_CHALLENGE_TTL_SECS as u64)
+                .max(1) as i64;
+            let review = WorkstationReview {
+                challenge: WorkstationChallenge {
+                    schema_version: 1,
+                    broker_id: pairing.server_id().to_owned(),
+                    approval_id: ctx.approval_id.to_string(),
+                    request_id: ctx.request_id.to_string(),
+                    operation: ctx.operation,
+                    content_hash: review_hash(&ctx.description),
+                    nonce: hex(&nonce),
+                    created_at: now,
+                    expires_at: now + ttl,
+                },
+                review_text: ctx.description,
+            };
+            let verified = server
+                .await_workstation_review(review)
+                .await
+                .map_err(FactorError::Failed)?;
+            let device = pairing
+                .workstation_device(&verified.device.device_id)
+                .map_err(|_| {
+                    FactorError::Failed("approving workstation is no longer authorized".into())
+                })?;
+            Ok(VerifiedDecision {
+                approved: verified.approve,
+                approver: Some(ApproverIdentity {
+                    principal_id: device
+                        .paired_by
+                        .unwrap_or_else(|| format!("workstation:{}", device.device_id)),
+                    label: format!("{} (paired workstation)", device.name),
+                    source: opaque_core::audit::ApproverSource::PairedWorkstation,
+                }),
+            })
         })
     }
 }

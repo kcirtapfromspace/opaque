@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="Explore portfolio intelligence for a fictional credit union, with Opaque enforcing access to synthetic loan application metrics.">
+<title>Try Opaque · Portfolio intelligence</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 24 24%27%3E%3Cpath fill=%27%23d9a544%27 d=%27M12 1 2 5v7c0 5 5 9 10 11 5-2 10-6 10-11V5z%27/%3E%3C/svg%3E">
+<style>
+:root{color-scheme:dark;--bg:#0f1317;--panel:#151a20;--line:#2b333b;--strong:#46515b;--text:#dde3ea;--dim:#a1aab4;--quiet:#788491;--amber:#d9a544;--paper:#e6e9ec;--green:#a7cd91;--red:#e9a298;--font:Archivo,'Avenir Next',Avenir,'Segoe UI',sans-serif;--mono:'IBM Plex Mono','SF Mono',Consolas,monospace}
+*{box-sizing:border-box}html{min-width:320px;background:var(--bg);scroll-behavior:smooth}body{margin:0;color:var(--text);font:15px/1.65 var(--font)}button,a{touch-action:manipulation}button{font:inherit;cursor:pointer}button:disabled{opacity:.45;cursor:default}a{color:inherit}button:focus-visible,a:focus-visible{outline:2px solid var(--amber);outline-offset:5px}[hidden]{display:none!important}::selection{background:var(--amber);color:var(--bg)}.wrap{width:min(1240px,100%);margin:auto;padding:0 42px}
+header{display:flex;justify-content:space-between;align-items:center;gap:24px;min-height:96px;border-bottom:1px solid var(--line)}.brand{display:flex;align-items:center;gap:12px;text-decoration:none;font:700 18px var(--mono);letter-spacing:.12em}.brand svg{width:26px;height:30px;color:var(--amber)}.header-links{display:flex;gap:27px;font-size:12px;color:var(--dim)}.header-links a{text-decoration:none}.header-links a:hover{color:var(--text)}
+.main-grid{display:grid;grid-template-columns:minmax(0,1fr) 410px;gap:74px;align-items:start;padding:66px 0 56px}.eyebrow{display:flex;align-items:center;gap:9px;font:10px var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--amber);margin:0 0 24px}.eyebrow::before{content:'';width:21px;height:1px;background:currentColor}h1{font-size:clamp(38px,4.4vw,58px);line-height:1.04;letter-spacing:-.055em;font-weight:400;margin:0 0 25px;max-width:600px}h1 span{color:var(--amber)}.intro{font-size:16px;line-height:1.8;color:var(--dim);max-width:500px;margin:0 0 28px}.boundaries{display:flex;flex-wrap:wrap;gap:8px}.boundary{font:10px var(--mono);color:var(--dim);border:1px solid var(--line);padding:7px 9px}.experiment{margin-top:48px;border-top:1px solid var(--line);padding-top:21px}.section-label{font:10px var(--mono);text-transform:uppercase;letter-spacing:.1em;color:var(--quiet);margin:0 0 13px}.example-question{font-size:20px;font-weight:400;line-height:1.5;letter-spacing:-.02em;margin:0 0 11px;max-width:450px}.experiment p:last-child{font-size:12px;color:var(--dim);line-height:1.8;max-width:450px;margin:0}
+.session-card{border:1px solid var(--strong);background:var(--panel);min-width:0}.card-top{padding:18px 22px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;gap:16px;align-items:center}.card-top h2{font:11px var(--mono);letter-spacing:.06em;margin:0;font-weight:400}.service-status{display:flex;align-items:center;gap:7px;font:9px var(--mono);color:var(--quiet);text-align:right}.service-status::before{content:'';width:5px;height:5px;flex-shrink:0;border-radius:50%;background:var(--quiet)}.service-status.open{color:var(--green)}.service-status.open::before{background:var(--green)}.card-content{padding:25px 22px}.state-code{font:9px var(--mono);color:var(--amber);letter-spacing:.13em;text-transform:uppercase;margin-bottom:12px}.state-title{font-size:28px;font-weight:400;letter-spacing:-.04em;line-height:1.17;margin:0 0 14px}.state-description{font-size:13px;color:var(--dim);line-height:1.8;margin:0}.session-facts{display:grid;grid-template-columns:1fr;border-top:1px solid var(--line);border-bottom:1px solid var(--line);margin:24px 0;padding:17px 0;gap:16px}.fact-label{font:9px var(--mono);color:var(--quiet);letter-spacing:.04em;margin-bottom:6px}.fact-value{font:19px var(--mono);color:var(--text);letter-spacing:-.04em}.fact-value small{font:10px var(--mono);color:var(--dim);letter-spacing:0}.verification{margin:0 0 16px}.verification-label{font-size:11px;color:var(--dim);margin:0 0 10px}.challenge-box{min-height:66px;max-width:100%;overflow:hidden}.verification-status{font-size:11px;color:var(--quiet);margin:8px 0 0;line-height:1.65}.actions{display:flex;flex-direction:column;gap:9px}.primary,.secondary{display:flex;align-items:center;justify-content:center;gap:16px;width:100%;min-height:47px;border:1px solid var(--paper);background:var(--paper);color:var(--bg);text-decoration:none;font-size:13px;font-weight:600;padding:11px 15px}.primary svg{width:15px;height:15px;flex-shrink:0}.secondary{background:transparent;border-color:var(--strong);color:var(--dim);min-height:40px;font-weight:400;font-size:12px}.primary[aria-disabled="true"]{pointer-events:none;opacity:.45}.card-note{color:var(--quiet);font-size:11px;line-height:1.75;margin:16px 0 0}.queue-position{font:54px var(--mono);letter-spacing:-.06em;line-height:1;margin:0 0 10px;color:var(--text)}.queue-label{font-size:12px;color:var(--dim);margin:0}.state-detail{border-left:2px solid var(--amber);padding:0 0 0 14px;margin:22px 0}.countdown{font:38px var(--mono);letter-spacing:-.05em;color:var(--text);line-height:1.25}.countdown-caption{font:10px var(--mono);color:var(--dim);margin-top:5px}.error-box{border:1px solid #734f48;background:#291e1b;padding:12px 14px;color:var(--red);font-size:12px;line-height:1.7;margin:17px 0 0}.sync-note{font:9px var(--mono);color:var(--quiet);margin-top:16px;line-height:1.7}.card-footer{padding:15px 22px;border-top:1px solid var(--line);font-size:11px;color:var(--quiet)}
+.how-it-works{border-top:1px solid var(--line);padding:29px 0 42px}.steps{display:grid;grid-template-columns:1fr;gap:0;margin-top:20px}.steps article{display:grid;grid-template-columns:175px 235px minmax(0,1fr);gap:28px;padding:22px 0;border-top:1px solid var(--line)}.step-number{font:10px var(--mono);color:var(--amber);margin-bottom:13px}.steps h3{font-size:16px;font-weight:400;letter-spacing:-.02em;margin:0 0 10px}.steps p{font-size:12px;line-height:1.85;color:var(--dim);margin:0}.footer{display:flex;justify-content:space-between;gap:20px;border-top:1px solid var(--line);padding:22px 0 28px;font:9px var(--mono);color:var(--quiet)}.footer a{text-decoration:none;color:var(--dim)}.sr-only{position:absolute;width:1px;height:1px;padding:0;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+@media(max-width:1020px){.wrap{padding:0 28px}.main-grid{grid-template-columns:minmax(0,1fr) 375px;gap:35px;padding-top:49px}h1{font-size:48px}.intro{font-size:14px}.experiment{margin-top:33px}}
+@media(max-width:760px){.steps article{grid-template-columns:1fr;gap:8px;padding:20px 0}.wrap{padding:0 22px}header{min-height:78px;gap:16px}.brand{font-size:16px}.brand svg{width:23px;height:27px}.header-links{gap:16px;font-size:11px}.main-grid{grid-template-columns:1fr;gap:34px;padding:39px 0 36px}.eyebrow{margin-bottom:20px}h1{font-size:clamp(41px,7.4vw,59px);max-width:570px}.intro{max-width:570px}.experiment{display:none}.session-card{max-width:560px;width:100%}.card-content{padding:25px}.card-top{padding:18px 25px}.card-footer{padding:15px 25px}.steps{gap:23px}.steps h3{font-size:15px}}
+@media(max-width:450px){.wrap{padding:0 18px}.header-links a:first-child{display:none}.main-grid{padding-top:33px;gap:29px}h1{font-size:42px}.intro{font-size:13px;line-height:1.85}.boundary{font-size:9px;padding:6px 7px}.card-content{padding:22px 18px}.card-top,.card-footer{padding-left:18px;padding-right:18px}.state-title{font-size:27px}.steps{grid-template-columns:1fr;gap:26px}.step-number{margin-bottom:9px}.how-it-works{padding-top:24px}.footer{flex-wrap:wrap;gap:9px}.challenge-box{min-height:66px}}
+@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+
+.model-selection{margin:0 0 22px}.model-selection label,.session-model-label{display:block;font:10px var(--mono);letter-spacing:.05em;color:var(--dim);margin:0 0 9px}.model-selection select{display:block;width:100%;min-width:0;min-height:45px;padding:10px 34px 10px 12px;background:var(--bg);color:var(--text);border:1px solid var(--strong);border-radius:0;font:13px var(--font);text-overflow:ellipsis}.model-selection select:focus-visible{outline:2px solid var(--amber);outline-offset:4px}.model-selection select:disabled{opacity:.6}.model-description,.model-selection-note{font-size:11px;line-height:1.7;color:var(--dim);margin:9px 0 0;overflow-wrap:anywhere}.model-selection-note{color:var(--quiet);font-size:10px}.session-model{margin:0 0 22px;padding:13px 14px;border-left:2px solid var(--amber);background:var(--bg)}.session-model-name{font-size:14px;color:var(--text);overflow-wrap:anywhere}.session-model-note{font-size:10px;line-height:1.6;color:var(--quiet);margin-top:5px}.session-model-label{font-size:9px;margin-bottom:5px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header><a class="brand" href="https://opaque.info/" aria-label="Opaque home"><svg viewBox="0 0 28 32" fill="none" aria-hidden="true"><path d="M14 2 3 6v10c0 6 4 10 11 14 7-4 11-8 11-14V6L14 2Z" stroke="currentColor" stroke-width="1.5"/><path d="M14 10 9 12v4c0 3 2 5 5 7 3-2 5-4 5-7v-4l-5-2Z" fill="currentColor"/></svg>OPAQUE</a><nav class="header-links" aria-label="Site"><a href="#how-it-works">How it works</a><a href="https://opaque.info/getting-started/">Documentation ↗</a></nav></header>
+  <main>
+    <div class="main-grid">
+      <section aria-labelledby="intro-title"><p class="eyebrow">Portfolio intelligence / interactive demo</p><h1 id="intro-title">Your portfolio.<br>Your questions.<br><span>Within your scope.</span></h1><p class="intro">Step into a portfolio analyst’s workspace at fictional Harborlight Credit Union. Ask an AI assistant about application volumes, review patterns and processing time. Compare channels, regions and products, then inspect the data scope Opaque enforced.</p><div class="boundaries" aria-label="Demo scope"><span class="boundary">Fictional credit union</span><span class="boundary">Synthetic application stream</span><span class="boundary">12 bounded questions</span></div><div class="experiment"><p class="section-label">Start with an authorized question</p><p class="example-question">“Which channel has the highest manual review rate?”</p><p>Then try “Show borrower names and SSNs.” See the answer and the access decision separately. This demo contains no real borrower records and makes no lending decisions.</p></div></section>
+      <section class="session-card" aria-labelledby="session-title"><div class="card-top"><h2 id="session-title">YOUR DEMO SESSION</h2><span class="service-status" id="availability">Checking service</span></div><div class="card-content"><div class="state-code" id="state-code">CONNECTING</div><h3 class="state-title" id="state-title">Checking availability</h3><p class="state-description" id="state-description">We’re checking the demo service and looking for a session in this browser.</p><div class="state-detail" id="state-detail" hidden><p class="queue-position" id="queue-position" hidden></p><p class="queue-label" id="queue-label" hidden></p><div class="countdown" id="countdown" hidden></div><p class="countdown-caption" id="countdown-caption" hidden></p></div><div class="session-facts"><div><div class="fact-label">SESSION LENGTH</div><div class="fact-value" id="session-length">—</div></div></div><div class="model-selection" id="model-selection" hidden><label for="demo-model-choice">Model for this session</label><select id="demo-model-choice" aria-describedby="model-description model-selection-note" disabled></select><p class="model-description" id="model-description">Checking approved models…</p><p class="model-selection-note" id="model-selection-note">Your choice is fixed when you join. Model choice does not change data permissions or queue priority.</p></div><div class="session-model" id="session-model" hidden><div class="session-model-label">SESSION MODEL</div><div class="session-model-name" id="session-model-name">Not reported</div><div class="session-model-note" id="session-model-note">Fixed for this session.</div></div><div class="verification" id="verification" hidden><p class="verification-label">Complete the bot check to request a workspace.</p><div class="challenge-box" id="bot-verification-widget"></div><p class="verification-status" id="verification-status">Loading verification…</p></div><div class="actions"><button class="primary" id="join" type="button" disabled hidden>Request a demo <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2 8h11M8 3l5 5-5 5" stroke="currentColor" stroke-width="1.5"/></svg></button><a class="primary" id="workspace" href="/workspace" hidden>Open your workspace <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2 8h11M8 3l5 5-5 5" stroke="currentColor" stroke-width="1.5"/></svg></a><button class="secondary" id="cancel" type="button" hidden>Leave the queue</button><button class="secondary" id="retry" type="button" hidden>Check status again</button></div><div class="error-box" id="error" role="alert" hidden></div><p class="card-note" id="card-note">No account or email required. A browser session keeps your place.</p><div class="sync-note" id="sync-note">Waiting for a verified service response.</div><span class="sr-only" id="state-announcement" role="status" aria-live="polite"></span></div><div class="card-footer">Fictional institution and synthetic data. Do not enter borrower information.</div></section>
+    </div>
+    <section class="how-it-works" id="how-it-works" aria-labelledby="how-title"><h2 class="section-label" id="how-title">Three ways to explore the workspace</h2><div class="steps"><article><div class="step-number">01 / ASK WITHIN SCOPE</div><h3>Find a pattern in the portfolio</h3><p>Compare review rates by channel, follow application trends, or ask how processing time changed from the previous period. Explore seeded history and live synthetic events.</p></article><article><div class="step-number">02 / TEST THE BOUNDARY</div><h3>Ask for something outside it</h3><p>Try borrower records, another lender, or average credit score. The Opaque panel shows the actual policy decision and whether a source was accessed.</p></article><article><div class="step-number">03 / INSPECT THE EVIDENCE</div><h3>See what made the answer possible</h3><p>Inspect the authorized query, exact time window, sample counts and source-computed comparisons. Switch demo personas to see how activity and data access differ. Your workspace expires after 10 minutes.</p></article></div></section>
+  </main>
+  <footer class="footer"><span>OPAQUE / GOVERNED ACCESS FOR AI SERVICES.</span><a href="https://opaque.info/">Back to opaque.info ↗</a></footer>
+</div>
+<script>
+'use strict';
+var model = {config:null,session:null,botToken:null,widgetId:null,widgetPromise:null,busy:false,refreshing:false,pollTimer:null,lastState:null,lastSync:null,error:null,actionError:null,selectedModelId:null,modelSelectionInitialized:false,catalogSignature:null};
+var STATES = {
+  none:{code:'REQUEST A SESSION',title:'Your analyst workspace awaits.',description:'Explore portfolio intelligence with synthetic loan application events. Your temporary session has a fixed customer and metric scope. If there’s a wait, we’ll show your place in the queue.'},
+  queued:{code:'IN THE QUEUE',title:'Your place is held.',description:'The service will prepare your workspace when it is your turn. You can leave this page open or return in this browser.'},
+  provisioning:{code:'PREPARING',title:'Preparing your workspace.',description:'The cluster is preparing the demo and checking that it is ready. Your workspace link appears only after those checks pass.'},
+  ready:{code:'READY',title:'Your workspace is ready.',description:'Open your portfolio assistant and explore the authorized dataset. The deadline shown below is set by the service.'},
+  active:{code:'SESSION ACTIVE',title:'Your demo is running.',description:'Return to your workspace to keep exploring. Access ends at the deadline; opening it again does not extend the session.'},
+  cleaning:{code:'CLEANUP IN PROGRESS',title:'Removing the workspace.',description:'Session access has ended. The service is confirming removal of your workspace.'},
+  expired:{code:'SESSION EXPIRED',title:'Your demo has ended.',description:'The session deadline has passed. You can request another demo when the service is accepting requests.'},
+  failed:{code:'COULD NOT START',title:'This workspace did not become ready.',description:'The service could not complete preparation. No working demo is being reported. You can request another session when available.'},
+  cancelled:{code:'REQUEST CANCELLED',title:'You’ve left this session.',description:'Your request was cancelled. If resources were already being prepared, the service will confirm their cleanup.'},
+  quarantined:{code:'OPERATOR CHECK REQUIRED',title:'Cleanup needs attention.',description:'The service has withheld this workspace from reuse. Demo access is closed while an operator checks the remaining resources.'}
+};
+function el(id){return document.getElementById(id);}
+function terminal(state){return ['none','expired','failed','cancelled'].includes(state);}
+function safeWorkspace(value){return value === '/workspace' || value === '/workspace/' ? value : null;}
+function remaining(expiresAt, now){if(typeof expiresAt !== 'number' || !Number.isFinite(expiresAt)) return null;return Math.max(0,Math.ceil((expiresAt-now)/1000));}
+function duration(seconds){return Number.isFinite(seconds)&&seconds>0 ? Math.ceil(seconds/60)+' min' : 'Unavailable';}
+function clock(seconds){return String(Math.floor(seconds/60)).padStart(2,'0')+':'+String(seconds%60).padStart(2,'0');}
+function validSession(value){if(!value||typeof value!=='object'||!Object.hasOwn(STATES,value.state))throw new Error('The service returned an unrecognized session state.');return value;}
+function renderError(){var message=model.actionError||model.error;el('error').textContent=message||'';el('error').hidden=!message;el('retry').hidden=!message;}
+function showError(message,action){if(action)model.actionError=message;else model.error=message;renderError();}
+function clearError(preserveAction){model.error=null;if(!preserveAction)model.actionError=null;renderError();}
+function retryStatus(){clearError();model.config=null;return refresh();}
+function updateCountdown(){
+  var session=model.session;
+  var active=session&&['ready','active'].includes(session.state);
+  var seconds=active?remaining(session.expires_at,Date.now()):null;
+  el('countdown').hidden=!active;el('countdown-caption').hidden=!active;
+  if(!active)return;
+  el('countdown').textContent=seconds===null?'—':clock(seconds);
+  el('countdown-caption').textContent=seconds===null?'Deadline unavailable. Checking service status.':seconds===0?'Deadline reached. Waiting for service confirmation.':'Time remaining · deadline set by the service';
+  var allowed=seconds!==null&&seconds>0&&safeWorkspace(session.workspace_url)&&!model.error;
+  el('workspace').hidden=!allowed;
+  if(allowed)el('workspace').href=safeWorkspace(session.workspace_url);
+}
+function approvedModels(){
+  var catalog=model.config&&model.config.models;
+  if(!Array.isArray(catalog)||catalog.length<1||catalog.length>20)return [];
+  var seen=new Set();
+  if(!catalog.every(function(item){if(!item||typeof item.id!=='string'||!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(item.id)||seen.has(item.id)||typeof item.label!=='string'||!item.label.trim()||item.label.length>160||typeof item.description!=='string'||item.description.length>1000)return false;seen.add(item.id);return true;}))return [];
+  return catalog;
+}
+function selectedModel(){return approvedModels().find(function(item){return item.id===model.selectedModelId;})||null;}
+function chooseModel(value){
+  if(model.busy||!model.session||!terminal(model.session.state))return;
+  model.actionError=null;renderError();
+  model.selectedModelId=value;model.modelSelectionInitialized=true;renderModelChoice();updateJoin();
+}
+function renderModelChoice(){
+  var session=model.session,catalog=approvedModels(),canChoose=!!session&&terminal(session.state);
+  el('model-selection').hidden=!canChoose;
+  var binding=session&&session.model;
+  el('session-model').hidden=!session||session.state==='none';
+  el('session-model-name').textContent=binding&&typeof binding.id==='string'&&typeof binding.label==='string'?binding.label:'Model was not reported by the service';
+  el('session-model-note').textContent=canChoose?'Model used for the previous session. Choose a model for your new request.':'Fixed for this session. A different model requires a new request after this session ends.';
+  if(!canChoose)return;
+  if(!model.modelSelectionInitialized&&catalog.some(function(item){return item.id===model.config.default_model;})){model.selectedModelId=model.config.default_model;model.modelSelectionInitialized=true;}
+  var signature=JSON.stringify([catalog,model.config&&model.config.default_model]);
+  if(signature!==model.catalogSignature){
+    el('demo-model-choice').replaceChildren();
+    var placeholder=document.createElement('option');placeholder.value='';placeholder.textContent=catalog.length?'Choose an approved model':'No approved models available';placeholder.disabled=true;el('demo-model-choice').appendChild(placeholder);
+    catalog.forEach(function(item){var option=document.createElement('option');option.value=item.id;option.textContent=item.label+(item.id===model.config.default_model?' · Default':'');el('demo-model-choice').appendChild(option);});
+    model.catalogSignature=signature;
+  }
+  var selected=selectedModel();el('demo-model-choice').value=selected?selected.id:'';
+  el('demo-model-choice').disabled=model.busy||!catalog.length;
+  el('model-description').textContent=selected?selected.description:catalog.length?(model.modelSelectionInitialized?'Your selected model is no longer available. Choose an approved model to continue.':'Choose a model from the approved catalog to continue.'):'The service has no approved models available. Requests remain unavailable.';
+}
+function updateJoin(){el('join').disabled=model.busy||model.refreshing||!!model.error||!model.botToken||!model.config||model.config.available!==true||!model.session||!terminal(model.session.state)||!selectedModel();}
+function render(){
+  var session=model.session,config=model.config;
+  if(config){var admissionOpen=config.available===true&&typeof config.turnstile_site_key==='string'&&!!config.turnstile_site_key.trim()&&approvedModels().length>0;el('availability').textContent=admissionOpen?'Requests open':'Requests paused';el('availability').className='service-status'+(admissionOpen?' open':'');el('session-length').textContent=duration(config.session_seconds);}
+  renderModelChoice();
+  if(!session){updateJoin();return;}
+  var copy=STATES[session.state];
+  el('state-code').textContent=copy.code;el('state-title').textContent=copy.title;el('state-description').textContent=copy.description;
+  if(model.lastState!==session.state){el('state-announcement').textContent=copy.title+' '+copy.description;model.lastState=session.state;}
+  var canRequest=terminal(session.state),waiting=session.state==='queued';
+  el('verification').hidden=!canRequest;el('join').hidden=!canRequest;
+  el('join').textContent=session.state==='none'?'Request a demo →':'Request another demo →';
+  el('state-detail').hidden=!['queued','ready','active'].includes(session.state);
+  el('queue-position').hidden=!waiting;el('queue-label').hidden=!waiting;
+  if(waiting){var position=Number.isInteger(session.position)&&session.position>0?session.position:null;el('queue-position').textContent=position===null?'—':String(position).padStart(2,'0');el('queue-label').textContent=position===null?'Position is not available yet.':'Your current queue position';}
+  var canCancel=['queued','provisioning','ready','active'].includes(session.state);
+  el('cancel').hidden=!canCancel;el('cancel').disabled=model.busy;
+  el('cancel').textContent=waiting?'Leave the queue':['ready','active'].includes(session.state)?'End this demo':'Cancel request';
+  el('workspace').hidden=true;updateCountdown();updateJoin();
+  el('card-note').textContent=canRequest?'No account or email required. A browser session keeps your place.':session.state==='queued'?'Queue order is controlled by the service. No time estimate is promised until a workspace is ready.':'This browser holds your session. Workspace access and cleanup are enforced by the service.';
+  if(canRequest)ensureWidget();
+}
+async function request(path,options){
+  var response=await fetch('/demo/api/'+path,Object.assign({credentials:'same-origin',cache:'no-store',headers:{Accept:'application/json'}},options||{}));
+  var data=await response.json().catch(function(){return {};});
+  if(!response.ok)throw new Error(typeof data.message==='string'?data.message:typeof data.error==='string'?data.error:data.error&&data.error.message||'The demo service did not accept this request ('+response.status+').');
+  return data;
+}
+function resetWidget(){model.botToken=null;try{if(model.widgetId!==null&&window.turnstile)window.turnstile.reset(model.widgetId);}catch(_error){}updateJoin();}
+function turnstileScript(){
+  if(typeof window.turnstile?.render==='function')return Promise.resolve();
+  if(model.widgetPromise)return model.widgetPromise;
+  model.widgetPromise=new Promise(function(resolve,reject){
+    var script=document.createElement('script');
+    function failed(){model.widgetPromise=null;script.remove();reject(new Error('Bot verification could not load. Check your connection and try again.'));}
+    script.src='https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';script.async=true;script.defer=true;
+    script.onload=function(){if(typeof window.turnstile?.render==='function')resolve();else failed();};
+    script.onerror=failed;document.head.appendChild(script);
+  });
+  return model.widgetPromise;
+}
+async function ensureWidget(){
+  if(!model.config||!model.session||!terminal(model.session.state)||model.widgetId!==null)return;
+  if(typeof model.config.turnstile_site_key!=='string'||!model.config.turnstile_site_key.trim()){el('verification-status').textContent='Bot verification is not configured. Requests remain unavailable.';updateJoin();return;}
+  if(model.config.available!==true){el('verification-status').textContent='New requests are paused. Your existing session can still be checked.';return;}
+  try{
+    await turnstileScript();
+    if(model.widgetId!==null||!model.session||!terminal(model.session.state))return;
+    model.widgetId=window.turnstile.render('#bot-verification-widget',{sitekey:model.config.turnstile_site_key,theme:'dark',size:'flexible',action:'demo_join','response-field':false,callback:function(token){model.botToken=token;el('verification-status').textContent='Verification complete. You can request a demo.';updateJoin();},'expired-callback':function(){model.botToken=null;el('verification-status').textContent='Verification expired. Complete the check again.';updateJoin();},'error-callback':function(){model.botToken=null;el('verification-status').textContent='Verification was not completed. Retry the check to continue.';updateJoin();}});
+    el('verification-status').textContent='Complete the verification above to continue.';
+  }catch(error){el('verification-status').textContent=error.message;showError(error.message);}
+}
+function schedulePoll(){clearTimeout(model.pollTimer);model.pollTimer=setTimeout(refresh,5000);}
+async function refresh(){
+  if(model.busy||model.refreshing){schedulePoll();return;}
+  model.refreshing=true;updateJoin();
+  try{
+    model.config=await request('config');
+    model.session=validSession(await request('session'));model.lastSync=Date.now();clearError(true);render();
+    el('sync-note').textContent='Checked '+new Date(model.lastSync).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})+' · updates every 5 seconds';
+  }catch(error){showError(error.message);el('sync-note').textContent='Status update failed. The last confirmed state is retained.';el('availability').textContent='Service unavailable';el('availability').className='service-status';el('workspace').hidden=true;}
+  finally{model.refreshing=false;updateJoin();schedulePoll();}
+}
+async function join(){
+  if(model.busy||model.refreshing||model.error||!model.botToken||!model.config||!model.config.available||!model.session||!terminal(model.session.state)||!selectedModel())return;
+  var selectedId=model.selectedModelId;
+  var token=model.botToken;model.botToken=null;model.busy=true;clearError();renderModelChoice();updateJoin();el('join').textContent='Submitting request…';
+  var failure=null;
+  try{await request('join',{method:'POST',headers:{Accept:'application/json','Content-Type':'application/json'},body:JSON.stringify({turnstile_token:token,model_id:selectedId})});}
+  catch(error){failure=error.message;}
+  finally{model.busy=false;resetWidget();await refresh();if(failure){showError(failure,true);updateJoin();}}
+}
+async function cancel(){
+  if(model.busy||model.refreshing||!model.session||!['queued','provisioning','ready','active'].includes(model.session.state))return;
+  model.busy=true;el('cancel').disabled=true;clearError();
+  var failure=null;
+  try{await request('cancel',{method:'POST',headers:{Accept:'application/json','Content-Type':'application/json'},body:'{}'});}
+  catch(error){failure=error.message;}
+  finally{model.busy=false;await refresh();if(failure){showError(failure,true);updateJoin();}}
+}
+function init(){el('demo-model-choice').addEventListener('change',function(){chooseModel(this.value);});el('join').addEventListener('click',join);el('cancel').addEventListener('click',cancel);el('retry').addEventListener('click',retryStatus);document.addEventListener('visibilitychange',function(){if(!document.hidden)refresh();});setInterval(updateCountdown,1000);refresh();}
+init();
+</script>
+</body>
+</html>
