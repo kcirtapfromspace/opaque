@@ -32,7 +32,9 @@ LEASE_LABEL = "opaque.dev/lease-id"
 GEN_LABEL = "opaque.dev/generation"
 PATHS = {"workspace": "GET", "api/session": "GET", "api/chat": "POST",
          "api/organization/activity": "GET", "api/demo/persona": "POST",
-         "api/organization/sharing": "POST"}
+         "api/organization/sharing": "POST", "api/work-task": "GET",
+         "api/work-task/approve": "POST", "api/work-task/execute": "POST",
+         "api/work-task/revoke": "POST"}
 NAME = re.compile(r"[a-z][a-z0-9-]{0,62}\Z")
 LEASE = re.compile(r"[0-9a-f]{32}\Z")
 IMAGE = re.compile(r"[A-Za-z0-9._:/-]+@sha256:[0-9a-f]{64}\Z")

@@ -3,7 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Opaque · Customer metrics</title>
+<title>Opaque · Bounded work &amp; portfolio metrics</title>
+<meta name="description" content="Review one bounded task, approve a synthetic metric read, and inspect the service receipt. Explore portfolio chat within its separate session limits.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 24 24%27%3E%3Cpath fill=%27%23c2e77b%27 d=%27M12 1 2 5v7c0 5 5 9 10 11 5-2 10-6 10-11V5z%27/%3E%3C/svg%3E">
 <style>
 :root{color-scheme:dark;--bg:#0d1117;--panel:#131a20;--raised:#192229;--line:#29343b;--text:#e5e9e4;--dim:#a1ada9;--muted:#71817e;--accent:#c2e77b;--amber:#edc27e;--red:#ffab9e;--mono:'SF Mono','Cascadia Code',Consolas,monospace;--sans:'Avenir Next',Avenir,'Segoe UI',sans-serif}
@@ -137,6 +138,12 @@ body.credit-experience{color-scheme:light;--bg:#f3f5f1;--panel:#fff;--raised:#e9
 
 .dataset-explorer{border:1px solid var(--line);background:var(--panel);margin-bottom:22px;padding:16px 18px}.dataset-explorer summary{font-size:13px;font-weight:600;cursor:pointer}.dataset-label{font-size:11px;color:var(--dim);line-height:1.7;margin:12px 0}.dataset-section{margin-top:14px}.dataset-section h3{font:9px var(--mono);color:var(--muted);font-weight:400;letter-spacing:.06em;text-transform:uppercase;margin:0 0 8px}.dataset-measures{display:grid;gap:6px}.dataset-measure{font-size:11px;color:var(--dim);display:flex;justify-content:space-between;gap:12px}.dataset-measure small{font:9px var(--mono);color:var(--muted);white-space:nowrap}.dataset-dimension{font-size:11px;line-height:1.7;margin:8px 0;color:var(--dim)}.dataset-dimension strong{font-weight:500;color:var(--text);display:block}.dataset-note{font-size:10px;color:var(--muted);line-height:1.75;margin:13px 0 0}.dataset-window{font:10px var(--mono);color:var(--accent);line-height:1.8}.portfolio-result{grid-column:1/-1;min-width:0;background:var(--panel);border:1px solid var(--line);border-top:3px solid #90ac7c;padding:18px}.portfolio-result h3{font-size:15px;font-weight:500;letter-spacing:-.02em;margin:0 0 6px}.portfolio-query{font-size:11px;color:var(--dim);line-height:1.7;overflow-wrap:anywhere}.portfolio-answer{font-size:14px;color:var(--text);line-height:1.8;white-space:pre-wrap;overflow-wrap:anywhere;margin:15px 0}.portfolio-table-wrap{overflow-x:auto;max-width:100%;margin-top:16px}.portfolio-table{width:100%;border-collapse:collapse;font-size:11px;line-height:1.6;min-width:440px}.portfolio-table th{text-align:right;font-weight:500;color:var(--muted);border-bottom:1px solid var(--line);padding:9px 10px;font-size:10px;vertical-align:bottom}.portfolio-table td{text-align:right;font:11px var(--mono);color:var(--text);padding:10px;border-bottom:1px solid var(--line);vertical-align:top}.portfolio-table th:first-child,.portfolio-table td:first-child{text-align:left;padding-left:0;font-family:var(--sans)}.portfolio-table th small{display:block;font:9px var(--mono);color:var(--muted)}.portfolio-table td small{display:block;font:9px var(--mono);color:var(--muted);margin-top:4px}.portfolio-caption{font-size:10px;color:var(--muted);line-height:1.75;margin:10px 0 0}.portfolio-proof{white-space:pre-line;font:9px var(--mono);color:var(--muted);line-height:1.8;margin-top:15px;overflow-wrap:anywhere}.portfolio-charts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;margin-top:20px}.portfolio-chart-title{font-size:11px;color:var(--dim);margin-bottom:10px}.portfolio-bars{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(0,1fr);gap:8px;align-items:end;min-height:112px}.portfolio-bar-item{min-width:0;text-align:center}.portfolio-bar-track{height:64px;display:flex;align-items:flex-end;justify-content:center;border-bottom:1px solid var(--line)}.portfolio-bar-fill{width:65%;max-width:44px;background:#90ac7c;min-height:0}.portfolio-bar-value{font:9px var(--mono);color:var(--text);margin-bottom:6px;overflow-wrap:anywhere}.portfolio-bar-label{font-size:9px;color:var(--muted);line-height:1.5;margin-top:6px;overflow-wrap:anywhere}.portfolio-empty-bar{font:10px var(--mono);color:var(--muted);padding-bottom:15px}
 @media(max-width:760px){.portfolio-result{padding:14px}.portfolio-charts{grid-template-columns:1fr}.portfolio-table-wrap{margin-right:-2px}.dataset-explorer{padding:16px}.portfolio-bars{gap:6px}}
+
+/* The task review reuses the workspace palette and stays separate from chat authority. */
+.work-task{border:1px solid var(--line);border-top:3px solid var(--accent);padding:22px 24px;margin:0 0 30px;background:var(--panel);min-width:0}
+.work-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:18px}.work-heading h2{font-size:23px;font-weight:500;letter-spacing:-.035em;line-height:1.25;margin:0 0 8px}.work-heading p{font-size:12px;color:var(--dim);margin:0;max-width:590px}.work-state{font:10px var(--mono);color:var(--accent);white-space:nowrap;padding:4px 0;text-transform:uppercase}.work-steps{display:flex;flex-wrap:wrap;gap:9px 21px;margin:18px 0;padding:0;list-style:none;font:10px var(--mono);color:var(--muted)}.work-steps li[aria-current=step]{color:var(--accent)}.work-scope{display:grid;grid-template-columns:1fr 1fr;gap:15px 24px;margin:20px 0}.work-scope div{min-width:0}.work-scope dt{font:9px var(--mono);color:var(--muted);margin-bottom:5px}.work-scope dd{margin:0;font-size:13px;overflow-wrap:anywhere}.work-notice,.work-note{font-size:11px;line-height:1.75;color:var(--dim);margin:14px 0 0}.work-note{color:var(--muted)}.work-review{border-top:1px solid var(--line);padding-top:13px;font-size:11px}.work-review summary{cursor:pointer;color:var(--dim)}.work-review dl{display:grid;grid-template-columns:92px minmax(0,1fr);gap:8px 14px;margin:14px 0;font-size:10px}.work-review dt{color:var(--muted)}.work-review dd{margin:0;color:var(--dim);overflow-wrap:anywhere;font-family:var(--mono)}.work-actions{display:flex;flex-wrap:wrap;align-items:center;gap:9px;margin-top:18px}.work-actions button{min-height:40px}.work-primary{background:var(--accent);color:var(--bg);border:1px solid var(--accent);padding:9px 16px;font-size:12px;font-weight:600;transition:filter .15s}.work-primary:hover:not(:disabled){filter:brightness(.94)}.work-primary:active:not(:disabled){transform:translateY(1px)}.work-error{font-size:12px;color:var(--red);line-height:1.7;overflow-wrap:anywhere;margin:14px 0 0}.work-status{font-size:11px;color:var(--dim);line-height:1.7;margin:13px 0 0}.work-receipt{margin-top:20px;padding-top:19px;border-top:1px solid var(--line)}.work-receipt h3{font-size:13px;font-weight:500;margin:0 0 13px}.work-value{font:30px var(--mono);letter-spacing:-.05em;line-height:1.3;color:var(--accent);margin:0 0 7px}.work-receipt p{font-size:11px;color:var(--dim);line-height:1.8;margin:5px 0}.work-receipt .work-hash{font:9px/1.8 var(--mono);overflow-wrap:anywhere;color:var(--muted)}.credit-experience .work-task{background:#edf2e9;border-color:#c8d7c1;border-top-color:var(--accent)}.credit-experience .work-primary{color:#fff}.work-role{font-size:12px;color:var(--dim);line-height:1.8;margin-top:16px}
+@media(max-width:720px){.work-task{padding:19px 17px;margin-bottom:25px}.work-heading{flex-wrap:wrap;gap:5px}.work-heading h2{font-size:22px}.work-scope{gap:16px}.work-steps{gap:9px 14px}.work-review dl{grid-template-columns:80px minmax(0,1fr)}}
+@media(max-width:420px){.work-scope{grid-template-columns:1fr}.work-actions button{flex:1}.work-actions .retry-button{white-space:normal}.work-steps{font-size:9px}}
 </style>
 </head>
 <body>
@@ -161,6 +168,21 @@ body.credit-experience{color-scheme:light;--bg:#f3f5f1;--panel:#fff;--raised:#e9
   </section>
   <main class="layout">
     <section class="conversation-panel" aria-labelledby="conversation-title">
+      <section class="work-task" id="work-task" hidden aria-labelledby="work-title">
+        <div class="work-heading"><div><p class="eyebrow">Bounded work / interactive preview</p><h2 id="work-title">Approve one read. Inspect its receipt.</h2><p>Review exactly what this task may do before it receives authority to run.</p></div><span class="work-state" id="work-state">Checking</span></div>
+        <p class="work-role" id="work-role" hidden>This task is available to the portfolio analyst. This identity cannot approve, run or inspect its metric receipt.</p>
+        <div id="work-content" hidden>
+          <ol class="work-steps" aria-label="Task lifecycle"><li id="work-step-review">01 Review</li><li id="work-step-approve">02 Confirm</li><li id="work-step-run">03 Run once</li><li id="work-step-receipt">04 Receipt</li></ol>
+          <dl class="work-scope"><div><dt>Operation</dt><dd id="work-operation"></dd></div><div><dt>Customer</dt><dd id="work-customer"></dd></div><div><dt>Allowed metric &amp; window</dt><dd id="work-metric"></dd></div><div><dt>Read allowance</dt><dd id="work-allowance"></dd></div><div><dt>Acting identity</dt><dd id="work-subject"></dd></div><div><dt>Authority expires</dt><dd id="work-expiry"></dd></div></dl>
+          <details class="work-review"><summary>Inspect the exact task binding</summary><dl><dt>Task</dt><dd id="work-id"></dd><dt>Manifest SHA-256</dt><dd id="work-digest"></dd><dt>Source</dt><dd id="work-source"></dd><dt>Client</dt><dd id="work-client"></dd><dt>Identity generation</dt><dd id="work-generation"></dd></dl></details>
+          <p class="work-notice" id="work-notice"></p>
+          <div class="work-actions"><button class="work-primary" id="work-approve" type="button" hidden>Confirm this demo task</button><button class="work-primary" id="work-run" type="button" hidden>Run once</button><button class="retry-button" id="work-replay" type="button" hidden>Test replay denial</button><button class="retry-button" id="work-revoke" type="button" hidden>Revoke task</button></div>
+          <section class="work-receipt" id="work-receipt" hidden aria-labelledby="work-receipt-title"><h3 id="work-receipt-title">Service receipt · synthetic source observed</h3><div class="work-value" id="work-value"></div><p id="work-samples"></p><p id="work-times"></p><p class="work-hash" id="work-evidence"></p><p>Source response recorded by the demo service; this receipt is unsigned.</p></section>
+        </div>
+        <p class="work-status" id="work-status" role="status" aria-live="polite">Checking this identity’s task access.</p><p class="work-error" id="work-error" role="alert" hidden></p>
+        <div class="work-actions"><button class="retry-button" id="work-refresh" type="button">Check task status</button></div>
+        <p class="work-note">This task’s one-read limit applies to Run once; portfolio chat retains its session limits. Changing demo identity invalidates outstanding task authority.</p>
+      </section>
       <div id="chat-content">
       <div class="panel-heading"><h2 id="conversation-title">Conversation</h2><span class="quiet-label">Read-only metrics</span></div>
       <div class="conversation" id="conversation" aria-label="Conversation history">
@@ -185,7 +207,7 @@ body.credit-experience{color-scheme:light;--bg:#f3f5f1;--panel:#fff;--raised:#e9
 </div>
 <script>
 'use strict';
-var state = {session:null,customerId:null,controller:null,active:null,latest:new Map(),freshnessNodes:[],expiryTimer:null,policyEvents:[],identityKey:null,organizationBusy:false,activityRevision:0,activityLoading:false,activitySignature:null,supportExpired:false};
+var state = {session:null,customerId:null,controller:null,active:null,latest:new Map(),freshnessNodes:[],expiryTimer:null,policyEvents:[],identityKey:null,organizationBusy:false,activityRevision:0,activityLoading:false,activitySignature:null,supportExpired:false,workTask:null,workBusy:false,workLoading:false,workRevision:0,workUnavailable:false,workError:null,workNotice:null};
 var MAX_STREAM_BUFFER = 262144;
 function byId(id) { return document.getElementById(id); }
 function node(tag, className, text) {
@@ -290,6 +312,7 @@ function updateComposer() {
 }
 function expireSession(message) {
   state.session = null;
+  clearWorkTask(); renderWorkTask();
   if (state.controller) state.controller.abort();
   clearActivity('Session unavailable. Check the session before requesting activity.');
   byId('organization-panel').hidden = true;
@@ -392,7 +415,7 @@ function toggleSharing() {
 }
 async function changeOrganization(path, body) {
   if (!state.session || state.organizationBusy) return;
-  state.organizationBusy = true; organizationError(null); clearActivity('Confirming the requested organization change…');
+  state.organizationBusy = true; organizationError(null); clearActivity('Confirming the requested organization change…'); clearWorkTask(); renderWorkTask();
   if (state.controller) state.controller.abort();
   renderOrganization(); updateComposer();
   try {
@@ -402,8 +425,121 @@ async function changeOrganization(path, body) {
     if (!response.ok) throw new Error(value.message || (value.error && value.error.message) || 'The service did not authorize this change.');
     renderSession(value); byId('support-form').hidden = true; byId('support-reason').value = '';
   } catch (error) { organizationError(error.message); }
-  finally { state.organizationBusy = false; renderOrganization(); updateComposer(); if (state.session) loadActivity(); }
+  finally { state.organizationBusy = false; renderOrganization(); updateComposer(); if (state.session) { loadActivity(); loadWorkTask(); } }
 }
+function canWorkTask() {
+  var org = organizationContext(state.session);
+  return !!(org && org.membership.persona_id === 'customer_analyst' && org.active_persona_id === 'customer_analyst' && org.data_entitlement.allowed && !state.organizationBusy);
+}
+function clearWorkTask() {
+  state.workRevision += 1; state.workTask = null; state.workBusy = false; state.workLoading = false; state.workUnavailable = false; state.workError = null; state.workNotice = null;
+  ['work-value','work-samples','work-times','work-evidence','work-operation','work-customer','work-metric','work-allowance','work-subject','work-expiry','work-id','work-digest','work-source','work-client','work-generation','work-notice'].forEach(function(id) { byId(id).textContent = ''; });
+  byId('work-content').hidden = true; byId('work-receipt').hidden = true;
+}
+function validateWorkTask(value) {
+  var org = organizationContext(state.session), manifest = value && value.manifest;
+  if (!canWorkTask() || !value || value.simulation !== true || typeof value.task_id !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value.task_id) || typeof value.manifest_sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(value.manifest_sha256) || !['planned','approved','reserved','completed','unknown','revoked','expired'].includes(value.state) || typeof value.consumed !== 'boolean' || typeof value.notice !== 'string' || !manifest || manifest.operation !== 'metrics.aggregate.read' || manifest.tenant_id !== state.customerId || manifest.subject !== state.session.subject.id || typeof manifest.client_id !== 'string' || !manifest.client_id || typeof manifest.source_id !== 'string' || manifest.source_id !== state.session.source.label || !Array.isArray(manifest.metrics) || manifest.metrics.length !== 1 || manifest.metrics[0] !== 'manual_review_rate_percent' || manifest.window_secs !== 60 || manifest.max_uses !== 1 || !Number.isSafeInteger(manifest.created_at) || !Number.isSafeInteger(manifest.expires_at) || manifest.expires_at <= manifest.created_at || manifest.expires_at - manifest.created_at > 300 || dateValue(manifest.expires_at).getTime() > dateValue(state.session.expires_at).getTime() || !Number.isSafeInteger(manifest.persona_generation) || manifest.persona_generation < 1) throw new Error('The task did not match this analyst’s bounded scope. It was not displayed.');
+  if (manifest.persona_generation !== org.generation && (value.state !== 'revoked' || value.receipt !== null)) throw new Error('The task belongs to an earlier identity generation. Its authority and receipt were not displayed.');
+  if (value.approval !== null && (!value.approval || value.approval.kind !== 'synthetic_demo_confirmation' || !Number.isSafeInteger(value.approval.approved_at) || value.approval.approved_at < manifest.created_at || value.approval.approved_at > manifest.expires_at)) throw new Error('The service returned an invalid demo confirmation.');
+  if (['approved','reserved','completed','unknown'].includes(value.state) && !value.approval) throw new Error('The service did not report this task’s required confirmation.');
+  if (['reserved','completed','unknown'].includes(value.state) && !value.consumed) throw new Error('The service returned inconsistent task consumption.');
+  if (value.receipt !== null) {
+    var receipt = value.receipt, result = receipt && receipt.result, metric = result && Array.isArray(result.metrics) && result.metrics[0];
+    if (value.state !== 'completed' || !receipt || receipt.evidence !== 'synthetic_source_observed' || !Number.isSafeInteger(receipt.completed_at) || receipt.completed_at < manifest.created_at || receipt.completed_at > manifest.expires_at || typeof receipt.evidence_sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(receipt.evidence_sha256) || !result || result.tenant_id !== manifest.tenant_id || result.source_id !== manifest.source_id || result.window_secs !== manifest.window_secs || !Number.isSafeInteger(result.as_of) || !Number.isSafeInteger(result.watermark) || !Number.isSafeInteger(result.observed_at) || result.metrics.length !== 1 || !metric || metric.name !== manifest.metrics[0] || !Number.isFinite(metric.value) || metric.value < 0 || metric.value > 100 || !Number.isSafeInteger(metric.count) || metric.count < 0) throw new Error('The receipt did not match the approved task. No metric result was displayed.');
+  }
+  if (value.state === 'completed' && !value.receipt) throw new Error('The service reported completion without a receipt. No result was displayed.');
+  return value;
+}
+function renderWorkTask() {
+  var org = organizationContext(state.session), allowed = canWorkTask(), task = state.workTask;
+  byId('work-task').hidden = !org || state.workUnavailable;
+  byId('work-role').hidden = !org || allowed || state.organizationBusy;
+  byId('work-content').hidden = !allowed || !task;
+  byId('work-refresh').hidden = !allowed;
+  byId('work-refresh').disabled = state.workBusy || state.workLoading;
+  byId('work-error').hidden = !allowed || !state.workError;
+  byId('work-error').textContent = allowed ? state.workError || '' : '';
+  byId('work-state').textContent = state.organizationBusy ? 'Checking identity' : !allowed ? 'Analyst only' : task ? task.state : 'Awaiting status';
+  byId('work-status').textContent = state.organizationBusy ? 'Confirming the identity change. Earlier task evidence has been cleared.' : !allowed ? 'Task authority and metric receipts are restricted to the analyst identity.' : state.workBusy ? 'Waiting for the service. No automatic execution retry is made.' : state.workLoading ? 'Checking the task’s persisted state…' : state.workNotice || (task ? {planned:'Review the scope above, then confirm this demo task.',approved:'The service recorded your demo confirmation. Run once starts the source read.',reserved:'The one-read allowance is consumed. The service has not reported a completed result.',completed:'The service reported a completed source read. Test replay denial to inspect the one-use boundary.',unknown:'The allowance is consumed and the outcome is uncertain. This task cannot be run again.',revoked:'The service revoked this task. It cannot be approved or run again.',expired:'The service reported that this task expired. It cannot be approved or run again.'}[task.state] : 'Check task status to retrieve this identity’s preview task.');
+  if (!allowed || !task) { byId('work-receipt').hidden = true; return; }
+  var manifest = task.manifest, deadline = dateValue(manifest.expires_at).getTime(), seconds = Math.max(0,Math.ceil((deadline-Date.now())/1000));
+  byId('work-operation').textContent = 'Read one aggregate snapshot';
+  byId('work-customer').textContent = state.session.customer.display_name + ' · ' + manifest.tenant_id;
+  byId('work-metric').textContent = 'Manual review rate · ' + manifest.window_secs + ' second window';
+  byId('work-allowance').textContent = manifest.max_uses + ' source read · ' + (task.consumed ? 'Consumed' : 'Not consumed');
+  byId('work-subject').textContent = manifest.subject;
+  byId('work-expiry').textContent = timestampText(manifest.expires_at) + (seconds ? ' · ' + seconds + 's remaining' : ' · Deadline reached');
+  byId('work-id').textContent = task.task_id; byId('work-digest').textContent = task.manifest_sha256; byId('work-source').textContent = manifest.source_id; byId('work-client').textContent = manifest.client_id; byId('work-generation').textContent = manifest.persona_generation;
+  byId('work-notice').textContent = task.notice;
+  var step = {planned:'review',approved:'run',reserved:'run',completed:'receipt',unknown:'receipt'}[task.state];
+  ['review','approve','run','receipt'].forEach(function(name) { byId('work-step-'+name).setAttribute('aria-current',name === step ? 'step' : 'false'); });
+  var disabled = state.workBusy || state.workLoading || !!state.workError;
+  byId('work-approve').hidden = task.state !== 'planned'; byId('work-approve').disabled = disabled || !seconds;
+  byId('work-run').hidden = task.state !== 'approved'; byId('work-run').disabled = disabled || !seconds;
+  byId('work-replay').hidden = !task.consumed; byId('work-replay').disabled = disabled;
+  byId('work-revoke').hidden = !['planned','approved','reserved'].includes(task.state); byId('work-revoke').disabled = disabled;
+  byId('work-receipt').hidden = !task.receipt;
+  if (task.receipt) {
+    var receipt = task.receipt, result = receipt.result, metric = result.metrics[0];
+    byId('work-value').textContent = textValue(metric.value) + '%';
+    byId('work-samples').textContent = 'Manual review rate · ' + textValue(metric.count) + ' samples · ' + result.window_secs + ' second window';
+    byId('work-times').textContent = 'Snapshot ' + timestampText(result.as_of) + ' · latest event ' + timestampText(result.watermark) + ' · observed ' + timestampText(result.observed_at) + ' · completed ' + timestampText(receipt.completed_at);
+    byId('work-evidence').textContent = 'Evidence SHA-256 · ' + receipt.evidence_sha256;
+  }
+}
+async function loadWorkTask() {
+  if (!canWorkTask() || state.workBusy || state.workLoading) { renderWorkTask(); return; }
+  var revision = ++state.workRevision, identityKey = state.identityKey;
+  state.workLoading = true; state.workError = null; state.workNotice = null; renderWorkTask();
+  try {
+    var response = await fetch('/api/work-task',{credentials:'same-origin',headers:{Accept:'application/json'},cache:'no-store'});
+    if (revision !== state.workRevision || identityKey !== state.identityKey || !canWorkTask()) return;
+    if (response.status === 401) { expireSession(); return; }
+    if (response.status === 404) { state.workTask = null; state.workUnavailable = true; return; }
+    var value = await response.json();
+    if (revision !== state.workRevision || identityKey !== state.identityKey || !canWorkTask()) return;
+    if (!response.ok) throw new Error(value.error && value.error.message || 'Task status could not be confirmed.');
+    state.workTask = validateWorkTask(value); state.workUnavailable = false;
+  } catch (error) {
+    if (revision !== state.workRevision || identityKey !== state.identityKey) return;
+    state.workTask = null; state.workError = error.message;
+  } finally { if (revision === state.workRevision) { state.workLoading = false; renderWorkTask(); } }
+}
+async function workTaskAction(action) {
+  var task = state.workTask;
+  if (!canWorkTask() || !task || state.workBusy || state.workLoading || state.workError || !['approve','execute','revoke'].includes(action)) return;
+  if (action === 'approve' && task.state !== 'planned' || action === 'execute' && task.state !== 'approved' && !task.consumed || action === 'revoke' && !['planned','approved','reserved'].includes(task.state)) return;
+  var revision = ++state.workRevision, identityKey = state.identityKey;
+  state.workBusy = true; state.workError = null; state.workNotice = null; renderWorkTask();
+  try {
+    var response = await fetch('/api/work-task/'+action,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json',Accept:'application/json'},body:JSON.stringify({task_id:task.task_id,manifest_sha256:task.manifest_sha256})});
+    if (revision !== state.workRevision || identityKey !== state.identityKey || !canWorkTask()) return;
+    if (response.status === 401) { expireSession(); return; }
+    var value = await response.json();
+    if (revision !== state.workRevision || identityKey !== state.identityKey || !canWorkTask()) return;
+    if (!response.ok) {
+      if (response.status >= 400 && response.status < 500) {
+        if (response.status === 409 && action === 'execute' && task.state === 'completed' && task.consumed) {
+          state.workNotice = 'Replay request denied. The recorded task remains consumed.' + (value.error && typeof value.error.code === 'string' ? ' Service response: ' + value.error.code + '.' : '') + (value.error && typeof value.error.message === 'string' ? ' ' + value.error.message : '');
+          return;
+        }
+        if (response.status === 403) state.workTask = null;
+        state.workError = 'Service denied this request' + (value.error && typeof value.error.code === 'string' ? ' · ' + value.error.code : '') + '. ' + (value.error && value.error.message || 'Check the current task status.');
+        state.workNotice = 'The service did not grant this action. Check task status for the current persisted state.';
+        return;
+      }
+      throw new Error('The service could not confirm this action.');
+    }
+    var checked = validateWorkTask(value);
+    if (checked.task_id !== task.task_id || checked.manifest_sha256 !== task.manifest_sha256) throw new Error('The action response did not match the reviewed task.');
+    state.workTask = checked;
+  } catch (error) {
+    if (revision !== state.workRevision || identityKey !== state.identityKey) return;
+    state.workTask = null; state.workError = error.message;
+    state.workNotice = 'The action outcome is not confirmed. Check task status before continuing. No automatic execution retry is made.';
+  } finally { if (revision === state.workRevision) { state.workBusy = false; renderWorkTask(); } }
+}
+
 function activitySource(record) {
   if (record.source_accessed === true) return 'Authorized source evidence received';
   if (record.source_accessed === false) return 'No source access reported for this request';
@@ -515,7 +651,7 @@ function renderSession(session) {
   var expires = validDate(session.expires_at);
   if (!expires || expires.getTime() <= Date.now()) throw new Error('The authenticated session has expired. Sign in again through the trusted flow.');
   var identityKey = session.customer.id + ':' + session.subject.id + ':' + (org ? org.id + ':' + org.generation : 'customer');
-  if (state.identityKey && state.identityKey !== identityKey) { if (state.controller) state.controller.abort(); clearConversation(); clearActivity(); byId('support-form').hidden = true; }
+  if (state.identityKey && state.identityKey !== identityKey) { if (state.controller) state.controller.abort(); clearConversation(); clearActivity(); clearWorkTask(); byId('support-form').hidden = true; }
   state.identityKey = identityKey;
   state.customerId = session.customer.id;
   state.session = session;
@@ -548,6 +684,7 @@ function renderSession(session) {
   renderExperience(session);
   renderOrganization();
   renderDataset(session);
+  renderWorkTask();
   byId('page-error').hidden = true;
   clearTimeout(state.expiryTimer);
   state.expiryTimer = setTimeout(function() { expireSession(); },Math.min(expires.getTime() - Date.now(),2147483647));
@@ -561,8 +698,8 @@ async function loadSession() {
     var response = await fetch('/api/session',{credentials:'same-origin',headers:{Accept:'application/json'},cache:'no-store'});
     if (response.status === 401) { expireSession('No active customer session. Sign in to this customer to continue. The sign-in service identifies any fixture or test ceremony.'); return; }
     if (!response.ok) throw new Error('The session service is unavailable. Existing evidence is retained.');
-    renderSession(await response.json()); loadActivity();
-  } catch (error) { state.session = null; clearActivity('Session authority could not be confirmed.'); byId('organization-panel').hidden = true; setConnection('Connection unavailable','error'); showPageError(error.message); updateComposer(); }
+    renderSession(await response.json()); loadActivity(); loadWorkTask();
+  } catch (error) { state.session = null; clearWorkTask(); renderWorkTask(); clearActivity('Session authority could not be confirmed.'); byId('organization-panel').hidden = true; setConnection('Connection unavailable','error'); showPageError(error.message); updateComposer(); }
   finally { byId('reconnect').disabled = false; }
 }
 function addMessage(kind, text) {
@@ -731,6 +868,12 @@ function init() {
   byId('support-dismiss').addEventListener('click',function() { byId('support-form').hidden = true; byId('support-reason').value = ''; });
   byId('sharing-toggle').addEventListener('click',toggleSharing);
   byId('activity-refresh').addEventListener('click',loadActivity);
+  byId('work-refresh').addEventListener('click',loadWorkTask);
+  byId('work-approve').addEventListener('click',function() { workTaskAction('approve'); });
+  byId('work-run').addEventListener('click',function() { workTaskAction('execute'); });
+  byId('work-replay').addEventListener('click',function() { workTaskAction('execute'); });
+  byId('work-revoke').addEventListener('click',function() { workTaskAction('revoke'); });
+  setInterval(renderWorkTask,1000);
   setInterval(updateFreshness,15000);
   setInterval(updateSupportCase,1000);
   setInterval(loadActivity,5000);

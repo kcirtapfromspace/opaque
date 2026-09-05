@@ -536,6 +536,13 @@ enum DeviceAction {
 
 #[derive(Debug, Subcommand)]
 enum TaskAction {
+    /// Plan one fixed host health check using the tenant's Vault SSH signer.
+    PlanSsh {
+        #[arg(long, default_value = "Service health on approved host")]
+        title: String,
+        #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..=300))]
+        expires_in_secs: u64,
+    },
     /// Plan three fixed public-source completions in the authenticated tenant.
     PlanInference {
         #[arg(long, default_value = "Tenant public data inference")]
@@ -3113,6 +3120,13 @@ async fn main() {
 fn task_command_params(action: TaskAction) -> Result<(&'static str, serde_json::Value), String> {
     use serde_json::json;
     Ok(match action {
+        TaskAction::PlanSsh {
+            title,
+            expires_in_secs,
+        } => (
+            "task_plan_ssh",
+            json!({"title": title, "expires_in_secs": expires_in_secs}),
+        ),
         TaskAction::PlanInference {
             title,
             expires_in_secs,
@@ -3201,7 +3215,7 @@ fn render_task_receipt(task: &opaque_core::task::TaskRecord) -> String {
         task.manifest.github_api_url,
         task.manifest.vault_api_url,
     );
-    if task.manifest.is_inference() {
+    if task.manifest.is_inference() || task.manifest.is_ssh() {
         output = format!(
             "{}\nTask: {}\nState: {} | Charged: {}/{} attempts\nDigest: {}\nExpires: {} (Unix seconds)\n",
             task.manifest.title,
@@ -3236,6 +3250,28 @@ fn render_task_receipt(task: &opaque_core::task::TaskRecord) -> String {
             SlotState::Unknown => "unknown (charged; do not retry)",
         };
         match &slot.action {
+            opaque_core::task::TaskAction::SshHealth(action) => {
+                let _ = writeln!(
+                    output,
+                    "\n  SSH health: {}:{}\n    Host key SHA-256: {}\n    Principal / user: {} / {}\n    Source IP: {}\n    Exact command: {}\n    Session limit: {} seconds\n    Vault signer role: {}\n    Grant: {}\n    Slot: {}\n    Outcome: {}",
+                    action.destination_host,
+                    action.destination_port,
+                    action.host_key_sha256,
+                    action.principal,
+                    action.login_user,
+                    action.source_address,
+                    action.command,
+                    action.max_session_secs,
+                    action.vault_role,
+                    action.grant_id,
+                    slot.id,
+                    if slot.state == SlotState::ApiAccepted {
+                        "authenticated health observation"
+                    } else {
+                        state
+                    }
+                );
+            }
             opaque_core::task::TaskAction::Inference(action) => {
                 let _ = writeln!(
                     output,
@@ -3287,6 +3323,16 @@ fn render_task_receipt(task: &opaque_core::task::TaskRecord) -> String {
         }
         if let Some(outcome) = &slot.outcome {
             let _ = writeln!(output, "    Receipt code: {}", outcome.code);
+            if let Some(receipt) = &outcome.ssh_receipt {
+                let _ = writeln!(
+                    output,
+                    "    Authenticated host result: {:?}\n    Signed receipt SHA-256: {}",
+                    receipt.code, receipt.signed_receipt_sha256
+                );
+                if let Some(text) = &receipt.output_text {
+                    let _ = writeln!(output, "    Host output: {text}");
+                }
+            }
             if let Some(receipt) = &outcome.inference_receipt {
                 let _ = writeln!(
                     output,
@@ -8443,6 +8489,37 @@ BAZ=
     }
 
     #[test]
+    fn ssh_plan_selects_only_title_and_bounded_expiry_without_caller_transport_controls() {
+        let cli = Cli::try_parse_from(["opaque", "task", "plan-ssh"]).unwrap();
+        let Some(Cmd::Task { action }) = cli.cmd else {
+            panic!("expected task")
+        };
+        let (method, params) = task_command_params(action).unwrap();
+        assert_eq!(method, "task_plan_ssh");
+        assert_eq!(
+            params,
+            serde_json::json!({"title":"Service health on approved host","expires_in_secs":300})
+        );
+        for value in ["0", "301", "-1"] {
+            assert!(
+                Cli::try_parse_from(["opaque", "task", "plan-ssh", "--expires-in-secs", value])
+                    .is_err()
+            );
+        }
+        for flag in [
+            "--command",
+            "--host",
+            "--principal",
+            "--private-key",
+            "--vault-role",
+        ] {
+            assert!(
+                Cli::try_parse_from(["opaque", "task", "plan-ssh", flag, "unreviewed"]).is_err()
+            );
+        }
+    }
+
+    #[test]
     fn task_commands_require_broker_ids_and_explicit_manifest_paths() {
         for (command, method) in [
             ("run", "task_run"),
@@ -8519,6 +8596,7 @@ BAZ=
                 reserved_at: Some(102),
                 finished_at: Some(103),
                 outcome: Some(SlotOutcome {
+                    ssh_receipt: None,
                     inference_receipt: None,
                     provider_run_id: None,
                     state: SlotState::Unknown,

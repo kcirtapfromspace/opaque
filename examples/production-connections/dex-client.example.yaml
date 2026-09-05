@@ -1,0 +1,8 @@
+# Proposed fragment for the existing dex.config; NOT a Kubernetes manifest.
+# Preserve existing connectors/staticClients; do not replace argocd-cm.
+staticClients:
+  - id: opaque-broker
+    name: Opaque broker
+    public: true
+    redirectURIs:
+      - http://127.0.0.1:8721/callback

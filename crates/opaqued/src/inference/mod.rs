@@ -277,6 +277,7 @@ fn outcome(state: SlotState, code: &str) -> SlotOutcome {
         state,
         code: code.into(),
         provider_run_id: None,
+        ssh_receipt: None,
         inference_receipt: None,
     }
 }

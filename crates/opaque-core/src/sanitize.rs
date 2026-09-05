@@ -269,7 +269,7 @@ impl Sanitizer {
     ) -> Result<serde_json::Value, String> {
         record
             .validate_tenant_and_inference_receipts()
-            .map_err(|_| "invalid tenant inference receipt")?;
+            .map_err(|_| "invalid tenant or bounded task receipt")?;
         record
             .validate_release_observation()
             .map_err(|_| "invalid release observation")?;
@@ -312,6 +312,16 @@ impl Sanitizer {
         }
         for (index, slot) in record.slots.iter().enumerate() {
             output["slots"][index]["action"] = source["slots"][index]["action"].clone();
+            if slot
+                .outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.ssh_receipt.is_some())
+            {
+                // Only strictly validated and broker-authenticated host metadata
+                // and bounded nonsecret output bypass generic hash redaction.
+                output["slots"][index]["outcome"]["ssh_receipt"] =
+                    source["slots"][index]["outcome"]["ssh_receipt"].clone();
+            }
             if let Some(receipt) = slot
                 .outcome
                 .as_ref()

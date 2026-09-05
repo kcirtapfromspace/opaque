@@ -1,6 +1,6 @@
-# Try the portfolio demo
+# Try bounded work with Opaque
 
-Ask an AI assistant about a fictional credit union’s application portfolio, then inspect the permission checks and source evidence behind its answer.
+Approve the work. Keep authority bounded. Review one task for a fictional credit union, confirm one permitted source read, and inspect the service receipt. Then explore portfolio questions with a real hosted model and test the access boundaries.
 
 [Request a demo](https://demo.opaque.info/)
 
@@ -11,7 +11,24 @@ Ask an AI assistant about a fictional credit union’s application portfolio, th
 3. Open the workspace when the service reports that it is ready. The countdown shows your session’s deadline.
 4. End the session when you finish, or let it expire. The page shows cleanup separately from active access.
 
-A session lasts **10 minutes** and allows up to **12 questions**. Reopening the workspace does not extend it. Your selected model stays fixed for the session; changing models requires a new session. Model choice does not change your data permissions.
+A session lasts **10 minutes** and allows one preview task plus up to **12 portfolio questions**. Reopening the workspace does not extend it. Your selected model stays fixed for the session; changing models requires a new session. Model choice does not change your data permissions.
+
+## Review and run one bounded task
+
+Start as the **portfolio analyst**. The bounded task panel fixes one operation: read **manual review rate** from Harborlight’s synthetic source over a **60 second window**, once. Review the customer, acting identity, source, one-read allowance, expiry and manifest digest before confirming it.
+
+1. Select **Confirm this demo task**. The service records your confirmation against the exact task and manifest digest.
+2. Select **Run once**. The service consumes the allowance before requesting the source and reports the persisted result.
+3. Inspect the service receipt’s metric value, sample count, source times and evidence digest.
+4. Select **Test replay denial** to deliberately request another execution. Inspect the service’s denial, then **Check task status** to retrieve its current state.
+
+The task expires after at most **five minutes**, ending sooner if the session ends. Receipt access ends at that deadline too. **Revoke task** closes outstanding task authority; it cannot retract a source request or evidence already received. Reloading the workspace retrieves its state without approving, executing or refilling the task. A source failure can leave a consumed task with an uncertain outcome; it cannot be run again.
+
+Changing demo identity invalidates outstanding task authority. Engineers and support identities cannot approve or execute this task or see its metric receipt. Returning to the analyst does not restore the earlier grant or refill its allowance.
+
+**Your visitor confirmation is a demo interaction.** It is not a verified production identity or a production signed human approval. The displayed receipt records the service’s synthetic source observation; it is not an independently signed host receipt.
+
+This task’s one-read limit applies to **Run once**. Portfolio chat retains its separate session limits and does not inherit new access from task approval.
 
 ## Ask a portfolio question
 
@@ -94,6 +111,10 @@ Try one of these questions:
 > Compare with another lender.
 
 These requests are outside the current demo’s scope. Inspect the reported policy decision rather than relying on the model’s wording. A specific denied check may report no source access; a generic error or interrupted connection does not establish that.
+
+## How this relates to host operations
+
+The same product direction applies to narrow host operations: review a fixed operation, constrain its destination and principal, expire its authority, enforce command and session controls, and retain a receipt. A Vault-signed SSH certificate flow has been validated for a restricted host health check in a separate private fixture. That fixture is not connected to this public demo; the public preview does not issue SSH certificates or operate customer hosts.
 
 ## Use synthetic information only
 

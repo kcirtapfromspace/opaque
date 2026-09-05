@@ -34,6 +34,19 @@ PROFILE_SPEC.loader.exec_module(profiles)
 
 PERSONAS = ("customer_analyst", "engineer", "support")
 CONTROL_PATHS = {"/api/demo/persona", "/api/organization/sharing"}
+TASK_PATHS = {"/api/work-task/approve", "/api/work-task/execute", "/api/work-task/revoke"}
+TASK_RESPONSE_PATHS = TASK_PATHS | {"/api/work-task"}
+
+
+def task_body(value):
+    """A task reference can confirm reviewed work; it cannot select new work."""
+    if (not isinstance(value, dict) or set(value) != {"task_id", "manifest_sha256"}
+            or not isinstance(value["task_id"], str)
+            or not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", value["task_id"])
+            or not isinstance(value["manifest_sha256"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", value["manifest_sha256"])):
+        raise ValueError("bounded task reference required")
+    return value
 
 
 def control_body(path, value):
@@ -188,11 +201,11 @@ class Runtime:
         self.servers = [source,auth,bridge]
         for server in self.servers:
             threading.Thread(target=server.serve_forever,daemon=True).start()
-        config = {"bind":"127.0.0.1:8081","public_origin":origin,"tenant_id":self.config["tenant_id"],"customer_name":client["display_name"],"experience":"credit_portfolio","state_dir":str(self.directory/"gateway"),"auth":{"issuer":issuer,"resource_audience":client["resource"],"public_key_pem":public.read_text(),"admissions":[{"tenant_id":client["tenant_id"],"subject":client["subject"],"scopes":scopes}],"allow_loopback_http":True},"oauth":{"authorization_endpoint":issuer+"/authorize","token_endpoint":issuer+"/token","client_id":client["client_id"],"scopes":scopes},"source":{"tenant_id":client["tenant_id"],"source_id":"loan-application-stream-"+self.config["lease_id"][:8],"base_url":"http://127.0.0.1:8083","credential_env":"OPAQUE_METRICS_SOURCE_KEY","allowed_metrics":names,"max_window_secs":300,"max_staleness_secs":5,"allow_loopback_http":True},"model":{"kind":"openai_compatible","base_url":"http://127.0.0.1:8084/","model":self.config["model_id"],"allow_loopback_http":True},"fixture_mode":True}
+        config = {"bind":"127.0.0.1:8081","public_origin":origin,"tenant_id":self.config["tenant_id"],"customer_name":client["display_name"],"experience":"credit_portfolio","state_dir":str(self.directory/"gateway"),"auth":{"issuer":issuer,"resource_audience":client["resource"],"public_key_pem":public.read_text(),"admissions":[{"tenant_id":client["tenant_id"],"subject":client["subject"],"client_id":client["client_id"],"scopes":scopes}],"allow_loopback_http":True},"oauth":{"authorization_endpoint":issuer+"/authorize","token_endpoint":issuer+"/token","client_id":client["client_id"],"scopes":scopes},"source":{"tenant_id":client["tenant_id"],"source_id":"loan-application-stream-"+self.config["lease_id"][:8],"base_url":"http://127.0.0.1:8083","credential_env":"OPAQUE_METRICS_SOURCE_KEY","allowed_metrics":names,"max_window_secs":300,"max_staleness_secs":5,"allow_loopback_http":True},"model":{"kind":"openai_compatible","base_url":"http://127.0.0.1:8084/","model":self.config["model_id"],"allow_loopback_http":True},"fixture_mode":True}
         config["source"]["allowed_portfolio_measures"] = list(credit.PORTFOLIO_MEASURES)
         path = self.directory/"gateway.json"
         config["auth"]["admissions"] = [{"tenant_id": c["tenant_id"], "subject": c["subject"],
-                                          "scopes": c["scopes"]} for c in clients]
+                                          "client_id": c["client_id"], "scopes": c["scopes"]} for c in clients]
         config["organization_demo"] = organization
         fixture.dump(path,config)
         binary = os.environ.get("OPAQUE_METRICS_BINARY", "/opt/opaque/bin/opaque-metrics")
@@ -369,7 +382,8 @@ class Proxy(QuietHandler):
             return self.reply(200,runtime.health())
         paths={("GET","/workspace"):"/",("GET","/api/session"):"/api/session",("POST","/api/chat"):"/api/chat",
                ("GET","/api/organization/activity"):"/api/organization/activity",
-               **{("POST", path): path for path in CONTROL_PATHS}}
+               ("GET","/api/work-task"):"/api/work-task",
+               **{("POST", path): path for path in CONTROL_PATHS | TASK_PATHS}}
         target=paths.get((self.command,self.path))
         if target is None:
             return self.reply(404,{"error":"unsupported_demo_route"})
@@ -382,10 +396,12 @@ class Proxy(QuietHandler):
                 value=json.loads(body)
                 if target in CONTROL_PATHS:
                     control_body(target, value)
+                elif target in TASK_PATHS:
+                    task_body(value)
                 elif not isinstance(value,dict) or set(value)!={"message"} or not isinstance(value["message"],str) or not 0<len(value["message"].encode())<=2000:
                     raise ValueError("bounded question required")
             except (ValueError,TypeError,OSError):
-                return self.reply(400,{"error":"bounded_question_required"})
+                return self.reply(400,{"error":"bounded_task_reference_required" if target in TASK_PATHS else "bounded_question_required"})
         if target in CONTROL_PATHS:
             return self.control_proxy(runtime, target, body, value)
         with runtime.identity_lock:
@@ -395,7 +411,7 @@ class Proxy(QuietHandler):
             with runtime.lock:
                 if target=="/api/chat" and (runtime.active_requests or runtime.model_unknown):
                     return self.reply(409,{"error":"chat_busy"})
-                if target=="/api/chat":
+                if target == "/api/chat" or target in TASK_RESPONSE_PATHS:
                     runtime.active_requests+=1
         connection=http.client.HTTPConnection("127.0.0.1",8081,timeout=65)
         complete=False
@@ -434,9 +450,9 @@ class Proxy(QuietHandler):
         finally:
             connection.close()
             with runtime.lock:
-                if target=="/api/chat":
+                if target == "/api/chat" or target in TASK_RESPONSE_PATHS:
                     runtime.active_requests-=1
-                    if not complete:
+                    if target=="/api/chat" and not complete:
                         runtime.model_unknown+=1
 
 

@@ -36,6 +36,9 @@ use wiremock::{
 const PRIVATE_FIXTURE: &str = include_str!("../../opaqued/tests/fixtures/test_rsa_key.pem");
 const PUBLIC_FIXTURE: &str = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA5+m4fkcL6cuTGRLTSSrF\n7zfrwFFnYRJG1yVmmCwn4q0PXhuWmUu9mo2wg9ftf9BLFspkMqyzxpdfzGTan6J9\n5w7Ad7gbP5R2aDGnVJRTX9dph3cKBgwnDsUa751mYWfr1rsTnoiMIDWzOGsRSdOi\nRzZGCYo3yo4YNB+sNIOFMQ/tc3X558HGCZl3boecDmlwt1lHebe6/+kXRTYLLpIl\nf7u1mw98TYtOenu2SIUOrJKY9VGluMxvGH9e4SExpZaG61wTNsosD20tEBkWUjCo\nxo01adXNjPYKx/mJB3NgCIWacU4NwbZxVRUg5HYR85cq+5I2oNQDwuyNDv7kZQfA\nywIDAQAB\n-----END PUBLIC KEY-----\n";
 
+#[path = "gateway/bounded_demo.rs"]
+mod bounded_demo;
+
 struct TestDirectory(PathBuf);
 impl TestDirectory {
     fn new() -> Self {
@@ -107,6 +110,7 @@ impl Fixture {
         // avoids mutating shared process environment or reading any real secret.
         assert_eq!(std::env::var("CARGO_PKG_NAME").unwrap(), "opaque-metrics");
         let mut config = GatewayConfig {
+            broker_authority: None,
             bind,
             public_origin: origin.clone(),
             tenant_id: "customer-a".into(),
@@ -119,6 +123,7 @@ impl Fixture {
                 admissions: vec![Admission {
                     tenant_id: TenantId::parse("customer-a").unwrap(),
                     subject: "fixture-user".into(),
+                    client_id: "metrics-chat-fixture".into(),
                     scopes: METRIC_SCOPES.iter().map(|s| s.to_string()).collect(),
                 }],
                 revoked_jtis: BTreeSet::new(),
@@ -198,11 +203,13 @@ impl Fixture {
                 Admission {
                     tenant_id: TenantId::parse("customer-a").unwrap(),
                     subject: "product-engineer".into(),
+                    client_id: "metrics-chat-engineer".into(),
                     scopes: [ACTIVITY_SCOPE.into()].into(),
                 },
                 Admission {
                     tenant_id: TenantId::parse("customer-a").unwrap(),
                     subject: "customer-support".into(),
+                    client_id: "metrics-chat-support".into(),
                     scopes: support_scopes,
                 },
             ]);
@@ -895,6 +902,31 @@ async fn production_configuration_cannot_enable_fixture_model_transport() {
         model: "configured-model".into(),
         allow_loopback_http: false,
     };
+    assert!(
+        App::new(config.clone())
+            .err()
+            .unwrap()
+            .contains("requires broker_authority")
+    );
+    // The credential is disposable test data. Construction reads it but never
+    // grants a request while this intentionally absent broker is unavailable.
+    std::fs::create_dir_all(&directory.0).unwrap();
+    let credential_file = directory.0.join("resource.key");
+    std::fs::write(&credential_file, [9u8; 32]).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&credential_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    config.broker_authority = Some(opaque_metrics::auth::BrokerClientConfig {
+        socket_path: directory.0.join("resource.sock"),
+        credential_file,
+        broker_uid: unsafe { libc::geteuid() },
+        binding: opaque_core::tenant::TenantBinding::new(
+            TenantId::parse("customer-a").unwrap(),
+            Uuid::new_v4(),
+        )
+        .unwrap(),
+    });
+    config.auth.admissions.clear();
+    config.auth.public_key_pem.clear();
     // The otherwise identical production configuration is usable; this test
     // cannot pass merely because another configuration field is invalid.
     drop(App::new(config.clone()).unwrap());
@@ -943,6 +975,63 @@ async fn each_metric_requires_its_own_scope_and_foreign_tenant_never_reaches_sou
         ));
     }
     assert!(fixture.source.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn direct_mcp_rejects_unadmitted_client_before_source_or_model_access() {
+    let fixture = Fixture::new(true).await;
+    let mut claims = fixture.claims(&METRIC_SCOPES);
+    claims["client_id"] = json!("unadmitted-oauth-client");
+    let response = fixture
+        .mcp(
+            Some(&fixture.token(&claims)),
+            args(&["requests_per_second"]),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(fixture.source.received_requests().await.unwrap().is_empty());
+    assert!(fixture.model.received_requests().await.unwrap().is_empty());
+
+    // The same subject and scopes still work through its exact admitted client.
+    fixture.successful_source().await;
+    let token = fixture.token(&fixture.claims(&METRIC_SCOPES));
+    let response = fixture
+        .mcp(Some(&token), args(&["requests_per_second"]))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(fixture.source.received_requests().await.unwrap().len(), 1);
+    assert!(fixture.model.received_requests().await.unwrap().is_empty());
+
+    // A client admitted for another subject cannot borrow the analyst's grant.
+    let organization = Fixture::organization(true).await;
+    let mut claims = organization.claims(&[
+        "metrics:read",
+        "metrics:metric:credit_applications_per_minute",
+    ]);
+    claims["client_id"] = json!("metrics-chat-engineer");
+    let response = organization
+        .mcp(
+            Some(&organization.token(&claims)),
+            args(&["credit_applications_per_minute"]),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        organization
+            .source
+            .received_requests()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        organization
+            .model
+            .received_requests()
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -1680,6 +1769,9 @@ async fn organization_login_pins_subject_and_client_and_rejects_engineer_metric_
         .await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     let config = fixture.config.organization_demo.as_ref().unwrap();
+    let mut mismatched_client = fixture.config.auth.clone();
+    mismatched_client.admissions[0].client_id = "different-client".into();
+    assert!(config.validate(&mismatched_client, "customer-a").is_err());
     let mut auth = fixture.config.auth.clone();
     auth.admissions
         .iter_mut()

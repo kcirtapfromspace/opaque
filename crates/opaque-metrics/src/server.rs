@@ -2,6 +2,7 @@
 //! Provider credentials never enter the browser, model context, or MCP result.
 use crate::{
     auth::{AuthConfig, AuthError, AuthVerifier, VerifiedAccess},
+    bounded_demo::{self, TaskReference, TaskState},
     chat::{ChatModel, ModelConfig, label, unit},
     experience::{CREDIT_METRICS, CREDIT_POLICY_ID, Experience, credit_request_denial},
     metrics::{MetricsClient, MetricsEvidence, MetricsQuery, MetricsSourceConfig},
@@ -56,6 +57,8 @@ pub struct GatewayConfig {
     pub customer_name: String,
     pub state_dir: PathBuf,
     pub auth: AuthConfig,
+    #[serde(default)]
+    pub broker_authority: Option<crate::auth::BrokerClientConfig>,
     pub oauth: OAuthConfig,
     pub source: MetricsSourceConfig,
     pub model: ModelConfig,
@@ -94,6 +97,7 @@ pub struct App {
     active_chats: Mutex<BTreeSet<String>>,
     latest_policy: Mutex<HashMap<String, Value>>,
     organization: Mutex<OrganizationState>,
+    bounded_task: Option<Mutex<bounded_demo::Store>>,
     capacity: Arc<Semaphore>,
     revoked: Mutex<BTreeSet<String>>,
     audit: Mutex<File>,
@@ -143,6 +147,18 @@ fn trusted_url(s: &str, fixture: bool) -> Result<reqwest::Url, String> {
 }
 impl App {
     pub fn new(mut config: GatewayConfig) -> Result<Arc<Self>, String> {
+        if config.broker_authority.is_none() && !config.fixture_mode {
+            return Err("production gateway requires broker_authority".into());
+        }
+        if let Some(broker) = &config.broker_authority
+            && (broker.binding.tenant_id.as_str() != config.tenant_id
+                || !config.auth.admissions.is_empty()
+                || !config.auth.public_key_pem.is_empty()
+                || !config.auth.revoked_jtis.is_empty()
+                || config.organization_demo.is_some())
+        {
+            return Err("broker authority requires exact tenant binding and no gateway admission, key, revocation or persona policy".into());
+        }
         let origin = trusted_url(&config.public_origin, config.fixture_mode)?;
         if origin.path() != "/"
             || config.public_origin.ends_with('/')
@@ -265,7 +281,12 @@ impl App {
                 &std::fs::read(&binding_path).map_err(|_| "tenant binding unavailable")?,
             )
             .map_err(|_| "tenant binding invalid")?;
-            if binding.get("tenant_id").and_then(Value::as_str) != Some(config.tenant_id.as_str())
+            let broker_binding =
+                serde_json::to_value(config.broker_authority.as_ref().map(|b| &b.binding))
+                    .map_err(|_| "invalid broker binding")?;
+            if binding.get("broker_binding").unwrap_or(&Value::Null) != &broker_binding
+                || binding.get("tenant_id").and_then(Value::as_str)
+                    != Some(config.tenant_id.as_str())
                 || binding.get("audience").and_then(Value::as_str)
                     != Some(config.auth.resource_audience.as_str())
             {
@@ -280,7 +301,7 @@ impl App {
                 .map_err(|_| "tenant binding unavailable")?;
             f.write_all(
                 serde_json::to_string(
-                    &json!({"tenant_id":config.tenant_id,"audience":config.auth.resource_audience}),
+                    &json!({"tenant_id":config.tenant_id,"audience":config.auth.resource_audience,"broker_binding":config.broker_authority.as_ref().map(|b| &b.binding)}),
                 )
                 .unwrap()
                 .as_bytes(),
@@ -291,7 +312,7 @@ impl App {
         }
         let revoked_path = config.state_dir.join("revoked.json");
         let mut revoked = config.auth.revoked_jtis.clone();
-        if revoked_path.exists() {
+        if config.broker_authority.is_none() && revoked_path.exists() {
             let bytes = std::fs::read(revoked_path).map_err(|_| "revocation state unavailable")?;
             if bytes.len() > 1024 * 1024 {
                 return Err("revocation state exceeded limit".into());
@@ -302,7 +323,15 @@ impl App {
             );
         }
         config.auth.revoked_jtis = revoked.clone();
-        let auth = AuthVerifier::new(config.auth.clone()).map_err(|e| e.to_string())?;
+        let auth = match &config.broker_authority {
+            Some(broker) => AuthVerifier::broker(
+                broker.clone(),
+                config.auth.issuer.clone(),
+                config.auth.resource_audience.clone(),
+            ),
+            None => AuthVerifier::new(config.auth.clone()),
+        }
+        .map_err(|e| e.to_string())?;
         let metrics = MetricsClient::new(vec![config.source.clone()]).map_err(|e| e.to_string())?;
         let model = ChatModel::new(config.model.clone())?;
         let http = reqwest::Client::builder()
@@ -326,6 +355,14 @@ impl App {
             base64::engine::general_purpose::STANDARD.encode(Sha256::digest(script.as_bytes()));
         let csp = HeaderValue::from_str(&format!("default-src 'none'; script-src 'sha256-{script_hash}'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"))
             .map_err(|_| "chat content policy is invalid")?;
+        let bounded_task = if config.fixture_mode && config.organization_demo.is_some() {
+            Some(Mutex::new(
+                bounded_demo::Store::open(&config.state_dir, &config.source)
+                    .map_err(|_| "bounded demo ledger unavailable")?,
+            ))
+        } else {
+            None
+        };
         Ok(Arc::new(Self {
             config,
             auth,
@@ -338,6 +375,7 @@ impl App {
             active_chats: Mutex::new(BTreeSet::new()),
             latest_policy: Mutex::new(HashMap::new()),
             organization: Mutex::new(OrganizationState::default()),
+            bounded_task,
             capacity: Arc::new(Semaphore::new(8)),
             revoked: Mutex::new(revoked),
             audit: Mutex::new(audit),
@@ -363,10 +401,12 @@ impl App {
         headers: &HeaderMap,
     ) -> Result<(Zeroizing<String>, VerifiedAccess), AuthError> {
         let sid = cookie(headers, &self.cookie_name()).ok_or(AuthError::MissingBearer)?;
-        let mut sessions = self.sessions.lock().map_err(|_| AuthError::Unavailable)?;
-        sessions.retain(|_, s| s.expires_at > now());
-        let session = sessions.get(&sid).ok_or(AuthError::InvalidToken)?;
-        let token = Zeroizing::new(session.token.to_string());
+        let token = {
+            let mut sessions = self.sessions.lock().map_err(|_| AuthError::Unavailable)?;
+            sessions.retain(|_, s| s.expires_at > now());
+            let session = sessions.get(&sid).ok_or(AuthError::InvalidToken)?;
+            Zeroizing::new(session.token.to_string())
+        }; // Never hold the global session lock across broker I/O.
         let access = self
             .auth
             .verify_bearer(Some(&format!("Bearer {}", token.as_str())))?;
@@ -502,6 +542,10 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/demo/persona", post(activate_persona))
         .route("/api/organization/activity", get(organization_activity))
         .route("/api/organization/sharing", post(organization_sharing))
+        .route("/api/work-task", get(work_task))
+        .route("/api/work-task/approve", post(approve_work_task))
+        .route("/api/work-task/execute", post(execute_work_task))
+        .route("/api/work-task/revoke", post(revoke_work_task))
         .route("/mcp", post(mcp))
         .layer(DefaultBodyLimit::max(16 * 1024))
         .layer(middleware::from_fn_with_state(app.clone(), security))
@@ -713,6 +757,200 @@ async fn session(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
 fn organization_error(message: &str) -> Response {
     error(StatusCode::FORBIDDEN, "organization_access_denied", message)
 }
+fn work_error(error_value: bounded_demo::Error) -> Response {
+    match error_value {
+        bounded_demo::Error::Unavailable => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "task_unavailable",
+            "The bounded task ledger is unavailable.",
+        ),
+        bounded_demo::Error::Forbidden => error(
+            StatusCode::FORBIDDEN,
+            "task_access_denied",
+            "This task requires its current authorizing analyst identity.",
+        ),
+        bounded_demo::Error::Conflict => error(
+            StatusCode::CONFLICT,
+            "task_state_conflict",
+            "The task or its exact manifest is no longer eligible for this transition. No additional source read was authorized.",
+        ),
+    }
+}
+impl App {
+    fn work_apply<T>(
+        &self,
+        access: &VerifiedAccess,
+        expected_epoch: Option<u64>,
+        operation: impl FnOnce(&mut bounded_demo::Store, u64) -> Result<T, bounded_demo::Error>,
+    ) -> Result<T, bounded_demo::Error> {
+        let denied = || bounded_demo::Error::Forbidden;
+        self.auth.check_access(access).map_err(|_| denied())?;
+        query_scope(access, &bounded_demo::query()).map_err(|_| denied())?;
+        let config = self.config.organization_demo.as_ref().ok_or_else(denied)?;
+        let state = self
+            .organization
+            .lock()
+            .map_err(|_| bounded_demo::Error::Unavailable)?;
+        if config.member(access).map_err(|_| denied())?.persona_id != Persona::CustomerAnalyst {
+            return Err(denied());
+        }
+        let epoch = state.snapshot(config, access).map_err(|_| denied())?;
+        if expected_epoch.is_some_and(|expected| expected != epoch) {
+            return Err(denied());
+        }
+        state
+            .check_data(config, access, epoch, now())
+            .map_err(|_| denied())?;
+        let mut store = self
+            .bounded_task
+            .as_ref()
+            .ok_or_else(denied)?
+            .lock()
+            .map_err(|_| bounded_demo::Error::Unavailable)?;
+        operation(&mut store, epoch)
+    }
+}
+fn work_disabled(app: &App) -> Option<Response> {
+    (!(app.config.fixture_mode
+        && app.config.organization_demo.is_some()
+        && app.bounded_task.is_some()))
+    .then(|| {
+        error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "The bounded work demonstration is not enabled.",
+        )
+    })
+}
+fn work_response(app: Arc<App>, access: VerifiedAccess, epoch: u64) -> Response {
+    // Re-read the durable state at body delivery. A request waiting for its
+    // reader cannot disclose a cached result after a revoke or identity change.
+    let body = axum::body::Body::from_stream(stream::once(async move {
+        let value = app.work_apply(&access, Some(epoch), |store, epoch| {
+            store.current(&access, epoch, now(), &app.config.source)
+        }).and_then(|task| serde_json::to_value(task).map_err(|_| bounded_demo::Error::Unavailable))
+          .unwrap_or_else(|_| json!({"error":{"code":"task_access_denied","message":"Task authority changed before delivery; no result is disclosed."}}));
+        Ok::<_, Infallible>(serde_json::to_vec(&value).unwrap())
+    }));
+    ([(header::CONTENT_TYPE, "application/json")], body).into_response()
+}
+async fn work_task(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    if let Some(response) = work_disabled(&app) {
+        return response;
+    }
+    let (_, access) = match app.session(&headers) {
+        Ok(value) => value,
+        Err(e) => return auth_error(&app, e),
+    };
+    let result = app.work_apply(&access, None, |store, epoch| {
+        store
+            .current(&access, epoch, now(), &app.config.source)
+            .map(|_| epoch)
+    });
+    match result {
+        Ok(epoch) => work_response(app, access, epoch),
+        Err(e) => work_error(e),
+    }
+}
+async fn approve_work_task(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(reference): Json<TaskReference>,
+) -> Response {
+    transition_work_task(app, headers, reference, TaskState::Approved)
+}
+async fn revoke_work_task(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(reference): Json<TaskReference>,
+) -> Response {
+    transition_work_task(app, headers, reference, TaskState::Revoked)
+}
+fn transition_work_task(
+    app: Arc<App>,
+    headers: HeaderMap,
+    reference: TaskReference,
+    target: TaskState,
+) -> Response {
+    if let Some(response) = work_disabled(&app) {
+        return response;
+    }
+    let (_, access) = match app.session(&headers) {
+        Ok(value) => value,
+        Err(e) => return auth_error(&app, e),
+    };
+    let result = app.work_apply(&access, None, |store, epoch| {
+        store
+            .transition(&access, epoch, now(), &reference, target)
+            .map(|_| epoch)
+    });
+    match result {
+        Ok(epoch) => work_response(app, access, epoch),
+        Err(e) => work_error(e),
+    }
+}
+async fn execute_work_task(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(reference): Json<TaskReference>,
+) -> Response {
+    if let Some(response) = work_disabled(&app) {
+        return response;
+    }
+    let (_, access) = match app.session(&headers) {
+        Ok(value) => value,
+        Err(e) => return auth_error(&app, e),
+    };
+    if let Err(message) = app.rate(&access) {
+        return error(StatusCode::TOO_MANY_REQUESTS, "rate_limited", &message);
+    }
+    let epoch = match app.work_apply(&access, None, |store, epoch| {
+        store
+            .transition(&access, epoch, now(), &reference, TaskState::Reserved)
+            .map(|_| epoch)
+    }) {
+        Ok(epoch) => epoch,
+        Err(e) => return work_error(e),
+    };
+    // Reservation is committed with FULL synchronous durability before source
+    // I/O. Cancellation, timeout and ambiguous source responses never refund it.
+    if let Err(e) = app.work_apply(&access, Some(epoch), |store, epoch| {
+        let task = store.current(&access, epoch, now(), &app.config.source)?;
+        if task.state != TaskState::Reserved {
+            return Err(bounded_demo::Error::Conflict);
+        }
+        Ok(())
+    }) {
+        if let Some(store) = &app.bounded_task
+            && let Ok(mut store) = store.lock()
+        {
+            let _ = store.finish(&reference, now(), None);
+        }
+        return work_error(e);
+    }
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        app.metrics.query(access.tenant_id(), bounded_demo::query()),
+    )
+    .await;
+    let evidence = result.ok().and_then(Result::ok);
+    let finish = app.work_apply(&access, Some(epoch), |store, _| {
+        store.finish(&reference, now(), evidence)
+    });
+    match finish {
+        Ok(_) => work_response(app, access, epoch),
+        Err(e) => {
+            // An authority change during the read withholds evidence and leaves
+            // the consumed allowance terminal, even when the source succeeded.
+            if let Some(store) = &app.bounded_task
+                && let Ok(mut store) = store.lock()
+            {
+                let _ = store.finish(&reference, now(), None);
+            }
+            work_error(e)
+        }
+    }
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PersonaRequest {
@@ -747,7 +985,18 @@ async fn activate_persona(
                 request.reason.as_deref(),
                 now(),
                 |details| app.organization_audit(&access, details),
-            )
+            )?;
+            // Identity switching never creates a fresh allowance. Persist the
+            // revocation while holding the same organization lock used by task
+            // reservation and disclosure.
+            if let Some(store) = &app.bounded_task {
+                store
+                    .lock()
+                    .map_err(|_| "bounded task ledger unavailable".to_string())?
+                    .revoke_for_identity_change()
+                    .map_err(|_| "bounded task revocation unavailable".to_string())?;
+            }
+            Ok(())
         });
     if let Err(message) = result {
         return organization_error(&message);
@@ -1141,23 +1390,39 @@ async fn callback(
     response
 }
 async fn logout(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
-    let (_, access) = match app.session(&headers) {
-        Ok(v) => v,
-        Err(e) => return auth_error(&app, e),
+    let sid = cookie(&headers, &app.cookie_name());
+    let token = {
+        let mut sessions = match app.sessions.lock() {
+            Ok(sessions) => sessions,
+            Err(_) => return auth_error(&app, AuthError::Unavailable),
+        };
+        // Expired or missing cookie sessions need only local sign-out. Report
+        // that separately from a durable token revocation acknowledgement.
+        sessions.retain(|_, session| session.expires_at > now());
+        sid.as_ref()
+            .and_then(|sid| sessions.get(sid))
+            .map(|session| Zeroizing::new(session.token.to_string()))
     };
-    if app.auth.revoke_jti(access.jti()).is_err() {
-        return error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "unavailable",
-            "Revocation unavailable.",
-        );
-    }
+    let Some(token) = token else {
+        return logout_response(&app, false);
+    };
+    let jti = match app
+        .auth
+        .revoke_bearer(Some(&format!("Bearer {}", token.as_str())))
+    {
+        Ok(jti) => jti,
+        Err(error) => return auth_error(&app, error),
+    };
     let persisted = (|| -> Result<(), String> {
+        // Broker mode already persisted revocation in its identity store.
+        if app.config.broker_authority.is_some() {
+            return Ok(());
+        }
         let mut revoked = app
             .revoked
             .lock()
             .map_err(|_| "revocation state unavailable")?;
-        revoked.insert(access.jti().to_owned());
+        revoked.insert(jti);
         let path = app.config.state_dir.join("revoked.json.new");
         let mut f = OpenOptions::new()
             .create(true)
@@ -1183,10 +1448,18 @@ async fn logout(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
             "Access is revoked here, but durable revocation could not be recorded.",
         );
     }
-    if let Some(sid) = cookie(&headers, &app.cookie_name()) {
-        app.sessions.lock().unwrap().remove(&sid);
+    if let Some(sid) = sid {
+        match app.sessions.lock() {
+            Ok(mut sessions) => {
+                sessions.remove(&sid);
+            }
+            Err(_) => return auth_error(&app, AuthError::Unavailable),
+        }
     }
-    let mut response = Json(json!({"revoked":true})).into_response();
+    logout_response(&app, true)
+}
+fn logout_response(app: &App, revoked: bool) -> Response {
+    let mut response = Json(json!({"signed_out":true,"revoked":revoked})).into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
         HeaderValue::from_str(&app.set_cookie(&app.cookie_name(), "", 0)).unwrap(),
@@ -1431,6 +1704,9 @@ async fn mcp(
                     "audit_unavailable",
                     "Metric result could not be recorded.",
                 );
+            }
+            if let Err(message) = app.check_data(&access, epoch) {
+                return organization_error(&message);
             }
             rpc(
                 id,
@@ -2029,6 +2305,9 @@ async fn portfolio_mcp(
             "audit_unavailable",
             "Portfolio evidence could not be recorded.",
         );
+    }
+    if let Err(message) = app.check_data(access, epoch) {
+        return organization_error(&message);
     }
     rpc(
         id,

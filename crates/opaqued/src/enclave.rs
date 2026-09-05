@@ -37,7 +37,9 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 mod task;
-pub use task::{inference_task_operations, release_task_operations, task_operation};
+pub use task::{
+    inference_task_operations, release_task_operations, ssh_task_operations, task_operation,
+};
 
 // ---------------------------------------------------------------------------
 // Server-side secret ref name derivation
@@ -549,6 +551,7 @@ pub trait ApprovalGate: Send + Sync + fmt::Debug {
 /// execution or the typed, durably accounted task path.
 pub struct Enclave {
     inference_profile: Option<crate::inference::TrustedInferenceProfile>,
+    ssh_profile: Option<crate::ssh::TrustedSshProfile>,
     /// Only agent-session creation may use this configured complete-review factor.
     session_approval_factor: ApprovalFactor,
     /// Operation registry (immutable after construction).
@@ -598,6 +601,7 @@ impl fmt::Debug for Enclave {
 /// Builder for constructing an [`Enclave`].
 pub struct EnclaveBuilder {
     inference_profile: Option<crate::inference::TrustedInferenceProfile>,
+    ssh_profile: Option<crate::ssh::TrustedSshProfile>,
     session_approval_factor: ApprovalFactor,
     registry: OperationRegistry,
     policy: PolicyEngine,
@@ -612,6 +616,7 @@ impl EnclaveBuilder {
     pub fn new() -> Self {
         Self {
             inference_profile: None,
+            ssh_profile: None,
             session_approval_factor: ApprovalFactor::LocalBio,
             registry: OperationRegistry::new(),
             policy: PolicyEngine::new(),
@@ -639,6 +644,11 @@ impl EnclaveBuilder {
         profile: Option<crate::inference::TrustedInferenceProfile>,
     ) -> Self {
         self.inference_profile = profile;
+        self
+    }
+
+    pub fn ssh_profile(mut self, profile: Option<crate::ssh::TrustedSshProfile>) -> Self {
+        self.ssh_profile = profile;
         self
     }
 
@@ -688,6 +698,7 @@ impl EnclaveBuilder {
         }
         Ok(Enclave {
             inference_profile: self.inference_profile,
+            ssh_profile: self.ssh_profile,
             session_approval_factor: self.session_approval_factor,
             registry: self.registry,
             policy: std::sync::RwLock::new(self.policy),
@@ -710,6 +721,11 @@ impl Default for EnclaveBuilder {
 }
 
 impl Enclave {
+    pub fn ssh_profile(&self) -> Result<&crate::ssh::TrustedSshProfile, String> {
+        self.ssh_profile
+            .as_ref()
+            .ok_or_else(|| "tenant SSH is not configured".into())
+    }
     pub fn inference_profile(&self) -> Result<&crate::inference::TrustedInferenceProfile, String> {
         self.inference_profile
             .as_ref()
@@ -1295,11 +1311,15 @@ impl Enclave {
         let mut description = format!("Operation: {}", op_def.description);
         if matches!(
             request.operation.as_str(),
-            "github.publish_manifest" | "github.release_manifest" | "inference.fixed_manifest"
+            "github.publish_manifest"
+                | "github.release_manifest"
+                | "inference.fixed_manifest"
+                | "ssh.health_manifest"
         ) {
             description.push_str(&task::approval_description(
                 request,
                 self.inference_profile.as_ref(),
+                self.ssh_profile.as_ref(),
             )?);
         }
         for (k, v) in &request.target {

@@ -3,26 +3,35 @@
 **Status:** Historical proposal · September 4, 2026; reconciled September 5.
 **Current execution plan:** [private milestone roadmap](../docs/product/roadmap.md).
 The original story checkboxes below are design acceptance criteria, not today's
-delivery checklist or a current schedule. This track is queued as M4 after the
-native-review, private staging-smoke and real-source integration milestones.
+delivery checklist or a current schedule. M4 is partially implemented alongside
+the native-review, private staging-smoke and real-source integration milestones.
 macOS enterprise positioning remains a separate decision.
 
 ## Current reconciliation
 
 | Original phase | Current state | Remaining work |
 | --- | --- | --- |
-| A — Attestor seam | Proposed. `ClientMatch` still uses fixed Unix/code-signing fields; no complete selector/attestor registry is present. | M4a: canonical identity, listener-bound attestation and migration compatibility. |
+| A — Attestor seam | Canonical workload selectors/strength and listener-bound attestation exist; real-daemon checks cover observed identity, denied caller claims and the audit chain. `ClientMatch` still uses legacy fields. | M4a: policy selector matching/strength floors, the full compatibility corpus, selector-derived lease fingerprints and multi-listener registry. |
 | B — Fan-out authority | Durable task grants now share fixed allowances across callers; the generic in-memory approval lease still has TTL/one-time fields and no counted budget. | M4b: generic counted leases and safe claimed attribution. Task-grant validation does not complete US-006/007. |
-| C — Reference attestors | Production `build_client_identity` still assigns `codesign_team_id: None`. Existing peer credentials are not behind the proposed attestor trait. | M4a/M4c: peercred adapter and native signed-helper construction-path evidence. |
-| D — EMA | Separate `opaque-metrics` HTTP MCP gateway now implements configured issuer/audience validation, protected-resource metadata and scoped OAuth access. It does not complete enterprise provisioning or unify broker authority. | M3/M4d: reconcile transport ownership with the implemented gateway, then demonstrate the complete provisioned-client flow. Do not build a second disconnected gateway merely to tick an original story. |
+| C — Reference attestors | A listener-selected `PeercredAttestor` observes Unix callers after privilege drop. Same-UID identity is weak and separate-UID identity is medium; neither is hardware measurement. Native code-signing identity remains unpopulated. | M4c: native signed-helper identity through the production construction path, with explicit platform prerequisites. |
+| D — EMA | The HTTP MCP gateway now uses broker-owned current admission, membership, role and durable revocation; real daemon/gateway fixtures exercise source and disclosure boundaries. | M3/M4d: actual IdP/client registration, a compatible resource access-token contract and the complete provisioned-client flow. Existing broker integration does not establish full EMA. |
 
 Evidence: [bounded work](../docs/product/2026-09-04-dogfood-readiness.md),
-[scoped gateway](../docs/product/2026-09-04-scoped-metrics-chat.md), and current
+[attestor progress](../docs/product/2026-09-05-attestor-ssh-progress.md),
+[broker resource authority](../docs/product/2026-09-05-broker-resource-authority.md), and current
 [`ClientMatch`](../crates/opaque-core/src/policy.rs),
 [`LeaseEntry`](../crates/opaqued/src/enclave.rs),
 [`build_client_identity`](../crates/opaqued/src/main.rs). Line numbers, market
 context and future-tense claims in the original proposal below describe its
 draft snapshot; revalidate them when implementing a story.
+
+M4 also includes a separately bounded fixed-health SSH operation: Vault signs
+short-lived certificates after broker approval; signed host grants/receipts and
+the host guard enforce exact scope, single use and session limits. Its
+[47 Vault/OpenSSH checks and 26 Linux host/control tests](../docs/product/2026-09-05-vault-ssh-integration.md)
+are fixture evidence, including the actual Rust executor. Native human approval,
+a selected real host and production custody remain separate gates; this does
+not complete any original story by implication.
 
 ---
 

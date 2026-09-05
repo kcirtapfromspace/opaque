@@ -6,6 +6,9 @@ const ID = /^[a-f0-9]{64}$/;
 const REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const PUBLIC_PATHS = new Map([['/workspace','workspace'],['/api/session','api/session'],['/api/chat','api/chat'],['/api/organization/activity','api/organization/activity'],['/api/demo/persona','api/demo/persona'],['/api/organization/sharing','api/organization/sharing']]);
 const CONTROL_PATHS = new Set(['api/demo/persona','api/organization/sharing']);
+const TASK_PATHS = new Set(['api/work-task/approve','api/work-task/execute','api/work-task/revoke']);
+PUBLIC_PATHS.set('/api/work-task','api/work-task');
+for (const path of TASK_PATHS) PUBLIC_PATHS.set('/'+path,path);
 const encoder = new TextEncoder();
 const error = (code,status=400) => Response.json({error:code,message:code.replaceAll('_',' ')},{status,headers:{'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}});
 
@@ -96,7 +99,7 @@ async function htmlResponse(response,env) {
 async function authenticatedProxy(request,env,ctx,path,visitorHash) {
   if(!env.CONTROLLER_ORIGIN||!env.CONTROLLER_SECRET)return error('demo_backend_unavailable',503);
   const method=request.method;
-  const writes=path==='api/chat'||CONTROL_PATHS.has(path);
+  const writes=path==='api/chat'||CONTROL_PATHS.has(path)||TASK_PATHS.has(path);
   if(method!==(writes?'POST':'GET'))return error('method_not_allowed',405);
   if(method==='POST'&&!sameOrigin(request,env))return error('same_origin_required',403);
   let body, reservation, lease;
@@ -121,6 +124,13 @@ async function authenticatedProxy(request,env,ctx,path,visitorHash) {
       } else if(keys!=='enabled'||typeof input.enabled!=='boolean')return error('invalid_question_sharing');
       body=JSON.stringify(input);
     }
+    if(TASK_PATHS.has(path)) {
+      const input=await boundedJSON(request,1024);
+      if(Object.keys(input).sort().join(',')!=='manifest_sha256,task_id'
+        ||typeof input.task_id!=='string'||!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(input.task_id)
+        ||typeof input.manifest_sha256!=='string'||!ID.test(input.manifest_sha256))return error('bounded_task_reference_required');
+      body=JSON.stringify(input);
+    }
     lease=await schedule(env,'authorize',visitorHash);
   }
   const destination=new URL(env.CONTROLLER_ORIGIN);
@@ -132,6 +142,16 @@ async function authenticatedProxy(request,env,ctx,path,visitorHash) {
   const headers=new Headers({'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer'});
   if(reservation)headers.set('Idempotency-Key',reservation.reservation.request_id);
   for(const name of ['Content-Type','Content-Security-Policy'])if(upstream.headers.has(name))headers.set(name,upstream.headers.get(name));
+  if(path==='api/work-task'||TASK_PATHS.has(path)) {
+    // The task ledger belongs to the runtime. The edge never retries an action
+    // or invents a receipt, and rechecks the visitor lease before disclosure.
+    const task=await boundedJSON(upstream,32768);
+    const current=await schedule(env,'authorize',visitorHash);
+    if(current.lease_id!==lease.lease_id||current.generation!==lease.generation)return error('demo_session_changed',410);
+    if(task.receipt && (!Number.isSafeInteger(task.manifest?.expires_at)
+      ||task.manifest.expires_at<=Math.floor(Date.now()/1000)))return error('task_receipt_expired',410);
+    return Response.json(task,{status:upstream.status,headers});
+  }
   if((path==='api/session'||path==='api/organization/activity'||CONTROL_PATHS.has(path)) && upstream.ok) {
     const session=await upstream.json();
     if(path!=='api/organization/activity') {

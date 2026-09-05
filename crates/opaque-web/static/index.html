@@ -1885,6 +1885,8 @@ function taskApprovalMode(task) {
 }
 function isReleaseAction(action) { return action && action.operation === 'github.dispatch_staging_workflow'; }
 function releaseAction(task) { return (task.manifest.actions || []).find(isReleaseAction); }
+function isSshAction(action) { return action && action.operation === 'ssh.service_health'; }
+function sshAction(task) { return (task.manifest.actions || []).find(isSshAction); }
 function isInferenceAction(action) { return action && action.operation === 'inference.fixed_completion'; }
 function inferenceAction(task) { return (task.manifest.actions || []).find(isInferenceAction); }
 function inferenceReceipt(slot) { return slot.outcome && slot.outcome.inference_receipt; }
@@ -1901,6 +1903,7 @@ function workflowLabel(observation) {
   return {pending:'Awaiting correlated run',running:'Workflow running',succeeded:'Workflow succeeded',failed:'Workflow failed',ambiguous:'Workflow evidence ambiguous'}[observation.state] || 'Workflow evidence unavailable';
 }
 function taskStateLabel(task) {
+  if (sshAction(task) && task.state === 'completed') return 'Authenticated health observation';
   if (inferenceAction(task) && task.state === 'completed') return 'Inference receipts recorded';
   return releaseAction(task) && task.state === 'completed' ? 'Dispatch recorded' : task.state;
 }
@@ -1946,6 +1949,7 @@ function renderTasks() {
     var slots = task.slots || [];
     var release = releaseAction(task);
     var inference = inferenceAction(task);
+    var ssh = sshAction(task);
     var used = slots.filter(function(slot) { return slot.reserved_at != null; }).length;
     var accepted = slots.filter(function(slot) { return slot.state === 'api_accepted'; }).length;
     var unknown = slots.filter(function(slot) { return slot.state === 'unknown'; }).length;
@@ -1953,14 +1957,14 @@ function renderTasks() {
     var title = el('button', {className:'task-title', 'aria-expanded':String(state.expandedTask === task.id), onclick:function() { toggleTask(task.id); }}, task.manifest.title || task.id);
     card.appendChild(el('div', {className:'task-card-header'}, [title, el('span', {className:'task-state ' + task.state}, taskStateLabel(task))]));
     card.appendChild(el('div', {className:'task-metrics'}, [
-      el('span', null, [el('strong', null, used + ' / ' + slots.length), txt(inference ? ' generation allowances consumed' : release ? ' dispatch allowance consumed' : ' slots consumed')]),
-      el('span', null, [el('strong', null, String(inference ? slots.filter(function(slot) { var receipt = inferenceReceipt(slot); return receipt && receipt.code === 'completion_observed'; }).length : accepted)), txt(inference ? ' completions observed' : release ? ' dispatch accepted' : ' API accepted')]),
+      el('span', null, [el('strong', null, used + ' / ' + slots.length), txt(ssh ? ' connection allowance consumed' : inference ? ' generation allowances consumed' : release ? ' dispatch allowance consumed' : ' slots consumed')]),
+      el('span', null, [el('strong', null, String(inference ? slots.filter(function(slot) { var receipt = inferenceReceipt(slot); return receipt && receipt.code === 'completion_observed'; }).length : accepted)), txt(ssh ? ' authenticated health observations' : inference ? ' completions observed' : release ? ' dispatch accepted' : ' API accepted')]),
       el('span', null, [el('strong', null, String(unknown)), txt(' unknown')]),
       el('span', {style:{color:task.approval_mode === 'insecure_test' ? 'var(--amber)' : 'var(--dim)'}}, task.approved_at != null ? taskApprovalMode(task) + ' · ' + taskTimestamp(task.approved_at) : (testApprovalActive() ? 'Awaiting test approval' : 'Awaiting trusted approval')),
     ]));
-    var repos = Array.from(new Set(slots.map(function(slot) { return isInferenceAction(slot.action) ? slot.action.tenant.tenant_id + ' · ' + slot.action.model_id : slot.action.repo; })));
+    var repos = Array.from(new Set(slots.map(function(slot) { return isSshAction(slot.action) ? slot.action.login_user + '@' + slot.action.destination_host + ':' + slot.action.destination_port : isInferenceAction(slot.action) ? slot.action.tenant.tenant_id + ' · ' + slot.action.model_id : slot.action.repo; })));
     card.appendChild(el('div', {className:'task-targets'}, repos.join(' · ')));
-    if (unknown) card.appendChild(el('p', {className:'task-note', style:{color:'var(--amber)',marginTop:'12px'}}, inference ? 'The model may have generated output. The reserved allowance stays consumed; this task cannot retry that request.' : release ? 'The dispatch may have reached GitHub. Its allowance stays consumed. Check the correlated workflow before planning any new dispatch.' : 'An unknown write may have reached GitHub. Its allowance stays consumed. Inspect the target before planning any new work.'));
+    if (unknown) card.appendChild(el('p', {className:'task-note', style:{color:'var(--amber)',marginTop:'12px'}}, ssh ? 'The host may have executed the health check. This allowance stays consumed; this task cannot retry the connection.' : inference ? 'The model may have generated output. The reserved allowance stays consumed; this task cannot retry that request.' : release ? 'The dispatch may have reached GitHub. Its allowance stays consumed. Check the correlated workflow before planning any new dispatch.' : 'An unknown write may have reached GitHub. Its allowance stays consumed. Inspect the target before planning any new work.'));
     if (release) card.appendChild(buildWorkflowEvidence(task));
     if (inference) card.appendChild(buildInferenceEvidence(task));
     if (state.expandedTask === task.id) card.appendChild(buildTaskDetail(task));
@@ -2044,13 +2048,16 @@ function buildTaskDetail(task) {
   var facts = el('dl');
   var release = releaseAction(task);
   var inference = inferenceAction(task);
+  var ssh = sshAction(task);
   var pairs = [ ['Task ID', task.id], ['Manifest digest', task.manifest_digest], ['Created', taskTimestamp(task.created_at)], ['Expires', taskTimestamp(task.expires_at)], ['Approved', taskTimestamp(task.approved_at)], ['Approval mode', task.approved_at != null ? taskApprovalMode(task) : 'Not approved'] ];
-  if (inference) {
+  if (ssh) {
+    pairs = pairs.concat([['Tenant', ssh.tenant.tenant_id], ['Broker', ssh.tenant.broker_id], ['Subject', ssh.subject], ['Delegation session', ssh.delegation_id], ['Observed UID', String(ssh.workload_uid)], ['Executable SHA-256', ssh.workload_exe_sha256 || 'Unavailable'], ['Profile', ssh.profile_id], ['Profile SHA-256', ssh.profile_sha256], ['Destination', ssh.destination_host + ':' + ssh.destination_port], ['Host key SHA-256', ssh.host_key_sha256], ['Principal / login', ssh.principal + ' / ' + ssh.login_user], ['Source IP', ssh.source_address], ['Exact command', ssh.command], ['Session limit', ssh.max_session_secs + ' seconds'], ['Vault role', ssh.vault_role], ['Vault CA SHA-256', ssh.vault_ca_sha256], ['Vault credential reference', ssh.vault_token_ref], ['Grant ID', ssh.grant_id]]);
+  } else if (inference) {
     pairs = pairs.concat([['Tenant', inference.tenant.tenant_id], ['Broker', inference.tenant.broker_id], ['Profile', inference.profile_id], ['Profile SHA-256', inference.profile_sha256], ['Model', inference.model_id], ['Model SHA-256 (operator-attested)', inference.model_artifact_sha256], ['Per-request limit', inference.options.max_input_tokens + ' input tokens · ' + inference.options.max_output_tokens + ' output tokens · ' + inference.options.deadline_secs + ' seconds']]);
   } else pairs.push(['GitHub API', task.manifest.github_api_url || 'Unavailable']);
   if (release) {
     pairs = pairs.concat([['Environment', release.environment], ['Workflow', release.workflow_path + ' (ID ' + release.workflow_id + ')'], ['Approved branch', release.workflow_ref], ['Approved commit', release.approved_commit_sha], ['Workflow SHA-256', release.workflow_sha256], ['Image repository', release.image_repository], ['Image digest', release.image_digest]]);
-  } else if (!inference) {
+  } else if (!inference && !ssh) {
     pairs.push(['Vault API', task.manifest.vault_api_url || 'Unavailable']);
   }
   pairs.forEach(function(pair) {
@@ -2058,10 +2065,21 @@ function buildTaskDetail(task) {
   });
   detail.appendChild(facts);
   var table = el('table', {className:'task-slots' + (inference ? ' inference-slots' : '')});
-  table.appendChild(el('thead', null, [el('tr', null, [el('th', {scope:'col'}, inference ? 'Fixed prompt / pinned source' : release ? 'Exact dispatch / immutable artifact' : 'Exact write / pinned source'), el('th', {scope:'col'}, 'Receipt'), el('th', {scope:'col'}, 'Evidence')])]));
+  table.appendChild(el('thead', null, [el('tr', null, [el('th', {scope:'col'}, ssh ? 'Fixed command / pinned host' : inference ? 'Fixed prompt / pinned source' : release ? 'Exact dispatch / immutable artifact' : 'Exact write / pinned source'), el('th', {scope:'col'}, 'Receipt'), el('th', {scope:'col'}, 'Evidence')])]));
   var body = el('tbody');
   (task.slots || []).forEach(function(slot) {
     var action = slot.action;
+    if (isSshAction(action)) {
+      var receipt = slot.outcome && slot.outcome.ssh_receipt;
+      var evidence = [txt(receipt ? 'Authenticated host result: ' + receipt.code : 'No authenticated host evidence'), el('span', {className:'source-ref'}, 'Slot ' + slot.id)];
+      if (receipt) {
+        evidence.push(el('span', {className:'source-ref'}, 'Signed receipt SHA-256 ' + receipt.signed_receipt_sha256));
+        if (receipt.output_sha256) evidence.push(el('span', {className:'source-ref'}, 'Output SHA-256 ' + receipt.output_sha256));
+        if (receipt.output_text != null) evidence.push(el('p', {style:{whiteSpace:'pre-wrap',overflowWrap:'anywhere'}}, receipt.output_text));
+      }
+      body.appendChild(el('tr', null, [el('td', null, [txt(action.command + ' on ' + action.login_user + '@' + action.destination_host), el('span', {className:'source-ref'}, 'Host key SHA-256 ' + action.host_key_sha256)]), el('td', {className:'slot-' + slot.state}, slot.state === 'api_accepted' ? 'Health observed' : slot.state === 'unknown' ? 'Unknown — may have run' : slotLabel(slot.state, false)), el('td', null, evidence)]));
+      return;
+    }
     if (isInferenceAction(action)) {
       var receipt = inferenceReceipt(slot);
       var evidence = [txt(receipt ? receipt.code : 'No completion evidence'), el('span', {className:'source-ref'}, 'Slot ' + slot.id)];

@@ -10,19 +10,30 @@ checklist or evidence that the implementation is absent. Use the
 
 | Story group | Implemented and recorded evidence | Still needs distinct evidence |
 | --- | --- | --- |
-| US-001–003: dashboard, workspace and AWS quarantine | Authenticated dashboard/MCP flows, task workspace checks and loopback-only mock AWS restrictions are implemented. Later workspace security fixes and regressions are recorded. | Current-revision verification belongs to M0; do not treat the early assessment's observed defects as current failures without reproducing them. |
+| US-001–003: dashboard, workspace and AWS quarantine | Authenticated dashboard/MCP flows, task workspace checks and loopback-only mock AWS restrictions are implemented. Later workspace security fixes and regressions are recorded. The unified one-read public demo is also deployed with explicit synthetic identity and its own coordinator. | Do not treat the early assessment's observed defects as current failures without reproducing them. Demo approval is not a signed production broker grant. |
 | US-004–005: pinned source and immutable grant | Fixed manifests bind repository IDs, Vault KV v2 versions, expiry and canonical approval scope. | Real source permissions and protected downstream-consumer evidence were not established by fixture preflight. |
-| US-006: trusted review | Native full-manifest review and paired-workstation signing are implemented; enrollment, TLS pinning and test signing were exercised. | M1 requires a completed human ceremony and its receipt; automatic test signatures never count as human consent. |
-| US-007–009: durable authority and outcomes | Fixed allowances, concurrency/replay prevention, restart recovery, revocation checks and permanently consumed unknown outcomes passed fixtures. | Real provider effectiveness remains M2; fresh authority is required for another mutating attempt. |
+| US-006: trusted review | Native full-manifest review and paired-workstation signing are implemented; enrollment, TLS pinning and test signing were exercised. The human attempt timed out after 90 seconds with zero dispatches. | M1 requires a completed human ceremony and its receipt; automatic test signatures never count as human consent. |
+| US-007–009: durable authority and outcomes | Fixed allowances, concurrency/replay prevention, restart recovery, revocation checks and permanently consumed unknown outcomes passed fixtures. The broker now also owns current gateway resource authority; Vault SSH fixtures exercise signed host control and fixed-operation receipts. | Real staging provider effectiveness remains M2; actual source/IdP and selected real-host operation remain M3/M4. Fresh authority is required for another mutating attempt. |
 | US-010: task and evidence | CLI/MCP/dashboard task views, approval provenance and receipts exist; release tasks add read-only workflow reconciliation. | Observe human interpretation of scope and uncertainty in M1 and a real workflow receipt in M2. |
 | US-011 and commercial gates | No completed customer adoption/pilot evidence is recorded. | Repeated useful customer work and consented measurement; demos and synthetic traffic do not count. |
 
 Evidence: [bounded-work implementation](../docs/product/2026-09-04-dogfood-readiness.md),
 [separate-broker release](../docs/product/2026-09-04-remote-release-readiness.md),
-[workspace security review](../docs/product/2026-09-04-release-security-review.md).
+[workspace security review](../docs/product/2026-09-04-release-security-review.md),
+[native attempt/private staging preflight](../docs/product/2026-09-05-milestone-validation.md),
+[broker resource authority](../docs/product/2026-09-05-broker-resource-authority.md),
+[Vault SSH integration](../docs/product/2026-09-05-vault-ssh-integration.md) and
+[deployed demo](../deploy/hosted-demo/BOUNDED-WORK-VALIDATION.md).
 This is reconciliation by implemented contract, not a claim that every
 subcriterion in each story has been independently verified. Historical public
 repository examples are not destinations for the current private dogfood work.
+
+The private staging template and GET-only preflight are prepared. Actions remain
+disabled; effective workflow/environment protections, a reviewed immutable
+private artifact and narrow credential references are still prerequisites for
+the one real staging smoke dispatch. Historical local test counts belong to
+their recorded revisions; the roadmap separates the early milestone checkpoint
+from the later unified-product merge and subsequent consolidation checks.
 
 Companion: [product strategy](/Users/thinkstudio/opaque/docs/product/2026-09-04-product-strategy.md). This PRD is additive; it does not overwrite the existing attestor proposal. Scope assumes discovery confirms repeated demand for the workflow. The user has not yet supplied customer or staffing evidence.
 

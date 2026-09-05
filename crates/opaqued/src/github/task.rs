@@ -103,6 +103,7 @@ pub async fn plan_task_manifest(mut manifest: TaskManifest) -> Result<TaskManife
 
 fn outcome(state: SlotState, code: &str) -> SlotOutcome {
     SlotOutcome {
+        ssh_receipt: None,
         inference_receipt: None,
         provider_run_id: None,
         state,

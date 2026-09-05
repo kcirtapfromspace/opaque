@@ -1,0 +1,8 @@
+# Proposed fragment, not applied. Register the adjacent Dex public client first.
+# Two actual issuer/subject memberships and policies still require enrollment.
+[identity]
+issuer = "https://argocd.tail16ecc2.ts.net/api/dex"
+client_id = "opaque-broker"
+audience = "opaque-broker"
+redirect_port = 8721
+required = true

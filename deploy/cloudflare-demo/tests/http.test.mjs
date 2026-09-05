@@ -9,6 +9,7 @@ const encode = new TextEncoder();
 const EVENT = 'event: result\ndata: {"value":17.25}\n\n';
 const DONE = 'event: done\ndata: {}\n\n';
 const STOPPED = 'event: opaque_execution_complete\ndata: {}\n\n';
+const TASK_REF = {task_id:'46e8a66c-2ad6-4a93-a668-976e1a12769c',manifest_sha256:'d'.repeat(64)};
 
 function fixture(t, modelIds = ['gemma4-e2b'], defaultModel = 'gemma4-e2b') {
   let state = null;
@@ -109,6 +110,58 @@ function fixture(t, modelIds = ['gemma4-e2b'], defaultModel = 'gemma4-e2b') {
   result.chats = () => result.calls.filter((call) => call.action === 'finishChat');
   return result;
 }
+
+test('bounded task actions preserve reviewed references and reject added authority before dispatch', async (t) => {
+  const f=fixture(t);await f.ready();
+  f.stream=()=>Response.json({task:{...TASK_REF,state:'approved'}});
+  for(const action of ['approve','execute','revoke']) {
+    const path='/api/work-task/'+action;
+    assert.equal((await f.send(path,{method:'POST',body:TASK_REF,origin:'https://foreign.example'})).status,403);
+    assert.equal((await f.send(path,{method:'POST',body:{...TASK_REF,tenant_id:'another-customer'}})).status,400);
+    assert.equal((await f.send(path,{method:'POST',body:{...TASK_REF,manifest_sha256:'invalid'}})).status,400);
+    assert.equal((await f.send(path)).status,405);
+  }
+  assert.equal(f.requests.length,0);
+  const response=await f.send('/api/work-task/execute',{method:'POST',body:TASK_REF,headers:{Authorization:'Bearer attacker',Cookie:f.cookie+'; source_key=attacker'}});
+  assert.equal(response.status,200);
+  assert.deepEqual((await response.json()).task,{...TASK_REF,state:'approved'});
+  assert.equal(f.requests.length,1);
+  assert.deepEqual(JSON.parse(f.requests[0].init.body),TASK_REF);
+  assert.equal(new Headers(f.requests[0].init.headers).get('Cookie'),null);
+  assert.equal(f.calls.filter(c=>c.action==='authorize').length,2);
+  assert.equal(f.calls.filter(c=>c.action==='reserveChat').length,0);
+});
+
+test('bounded task receipts are withheld when the visitor lease expires during execution', async (t) => {
+  const f=fixture(t);await f.ready();
+  f.stream=()=>{f.now=f.lease.expires_at+1;return Response.json({task:{state:'completed',receipt:{value:42}}});};
+  const response=await f.send('/api/work-task/execute',{method:'POST',body:TASK_REF});
+  assert.notEqual(response.status,200);
+  assert.doesNotMatch(await response.text(),/receipt|completed|42/);
+  assert.equal(f.requests.length,1,'an ambiguous or expired action is never retried at the edge');
+});
+
+test('task reads and replay denials pass through without manufacturing a successful receipt', async (t) => {
+  const f=fixture(t);await f.ready();
+  f.stream=()=>Response.json({error:{code:'task_consumed',message:'This task has no remaining reads.'}},{status:409,headers:{'Set-Cookie':'private=secret'}});
+  const response=await f.send('/api/work-task/execute',{method:'POST',body:TASK_REF});
+  assert.equal(response.status,409);
+  assert.equal(response.headers.get('Set-Cookie'),null);
+  assert.equal((await response.json()).error.code,'task_consumed');
+  assert.equal(f.requests.length,1);
+  f.stream=()=>Response.json({task:{...TASK_REF,state:'planned'}});
+  assert.equal((await f.send('/api/work-task')).status,200);
+});
+
+test('task receipt expiry is enforced at the edge independently of the longer visitor lease', async (t) => {
+  const f=fixture(t);await f.ready();
+  const deadline=Math.floor(f.now/1000)+300;
+  f.stream=()=>{f.now=(deadline+1)*1000;return Response.json({state:'completed',manifest:{expires_at:deadline},receipt:{result:{value:42}}});};
+  const response=await f.send('/api/work-task');
+  assert.equal(response.status,410);
+  assert.equal((await response.json()).error,'task_receipt_expired');
+  assert.equal(f.requests.length,1);
+});
 
 function streamFixture(parts, { fail = false } = {}) {
   let reads = 0, cancelled = false;
