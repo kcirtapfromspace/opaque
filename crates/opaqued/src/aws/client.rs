@@ -1,8 +1,7 @@
 //! AWS API client.
 //!
-//! Wraps the REST endpoints needed for AWS STS, Secrets Manager, and SSM
-//! Parameter Store. Uses standard AWS JSON protocol over HTTPS with
-//! credential-based auth (access key / secret key / region).
+//! Mock transport for AWS STS, Secrets Manager, and SSM tests.
+//! Production AWS support is disabled until Signature V4 is implemented.
 //!
 //! **Never** leaks raw API error bodies to callers — all errors are
 //! mapped to sanitized strings.
@@ -17,15 +16,19 @@ pub const AWS_ACCESS_KEY_ID_ENV: &str = "OPAQUE_AWS_ACCESS_KEY_ID";
 #[allow(dead_code)]
 pub const AWS_SECRET_ACCESS_KEY_ENV: &str = "OPAQUE_AWS_SECRET_ACCESS_KEY";
 
-/// Environment variable for the AWS region.
-pub const AWS_REGION_ENV: &str = "OPAQUE_AWS_REGION";
-
-/// Default AWS region when none is configured.
-pub const DEFAULT_REGION: &str = "us-east-1";
+/// Explicit opt-in for the unsigned, loopback-only mock transport.
+pub const AWS_ALLOW_INSECURE_ENV: &str = "OPAQUE_AWS_ALLOW_INSECURE";
+/// Explicit local mock endpoint; real AWS service URLs are never used here.
+pub const AWS_MOCK_URL_ENV: &str = "OPAQUE_AWS_MOCK_URL";
 
 /// AWS API error types. Raw API error messages are never exposed.
 #[derive(Debug, thiserror::Error)]
 pub enum AwsApiError {
+    #[error(
+        "AWS support is disabled pending SigV4; mock mode requires OPAQUE_AWS_ALLOW_INSECURE=1 and a loopback OPAQUE_AWS_MOCK_URL"
+    )]
+    MockOnly,
+
     #[error("network error communicating with AWS")]
     Network(#[source] reqwest::Error),
 
@@ -183,6 +186,23 @@ fn validate_url_scheme(url: &str) -> Result<(), AwsApiError> {
     )))
 }
 
+/// Validate the actual parsed destination, including URL authority syntax.
+/// No remote host is permitted even when mock mode is enabled.
+fn validate_mock_url(url: &str) -> Result<(), AwsApiError> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| AwsApiError::MockOnly)?;
+    let is_loopback = matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    if !is_loopback
+        || !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(AwsApiError::MockOnly);
+    }
+    Ok(())
+}
+
 /// Map an HTTP status code to an appropriate error.
 fn map_status(status: u16, context: &str) -> AwsApiError {
     match status {
@@ -199,22 +219,45 @@ fn map_status(status: u16, context: &str) -> AwsApiError {
 /// Follows the same pattern as `BitwardenClient`: no stored credentials
 /// (passed per-call), timeouts, and a user-agent header.
 ///
-/// This client uses simple HTTP calls against AWS-compatible endpoints.
-/// Credentials (access key, secret key) are passed per-call and sent via
-/// headers rather than AWS Signature V4 — suitable for mock testing and
-/// local development. Production usage should layer SigV4 signing.
+/// Credentials are passed per-call to a loopback mock using unsigned headers.
+/// Every request checks the mock boundary and redirects/proxies are disabled.
 #[derive(Debug, Clone)]
 pub struct AwsClient {
     http: reqwest::Client,
     /// Base URL for STS calls (e.g., `https://sts.us-east-1.amazonaws.com`).
-    pub sts_url: String,
+    sts_url: String,
     /// Base URL for Secrets Manager calls.
-    pub secretsmanager_url: String,
+    secretsmanager_url: String,
     /// Base URL for SSM calls.
-    pub ssm_url: String,
+    ssm_url: String,
 }
 
 impl AwsClient {
+    /// Only explicit mock configuration enables an AWS resolver or handler.
+    pub fn from_mock_env() -> Result<Option<Self>, AwsApiError> {
+        if std::env::var(AWS_ALLOW_INSECURE_ENV).as_deref() != Ok("1") {
+            return Ok(None);
+        }
+        let url = std::env::var(AWS_MOCK_URL_ENV).map_err(|_| AwsApiError::MockOnly)?;
+        validate_mock_url(&url)?;
+        Self::new(&url, &url, &url).map(Some)
+    }
+
+    /// Check before resolving credentials as well as before each request.
+    pub fn ensure_mock_configuration(&self) -> Result<(), AwsApiError> {
+        if !cfg!(test) && std::env::var(AWS_ALLOW_INSECURE_ENV).as_deref() != Ok("1") {
+            return Err(AwsApiError::MockOnly);
+        }
+        validate_mock_url(&self.sts_url)?;
+        validate_mock_url(&self.secretsmanager_url)?;
+        validate_mock_url(&self.ssm_url)
+    }
+
+    fn mock_request(&self, url: &str) -> Result<reqwest::RequestBuilder, AwsApiError> {
+        self.ensure_mock_configuration()?;
+        Ok(self.http.post(url))
+    }
+
     /// Build the user-agent string from the crate version.
     fn user_agent() -> String {
         format!("opaqued/{}", env!("CARGO_PKG_VERSION"))
@@ -235,6 +278,8 @@ impl AwsClient {
         let http = reqwest::Client::builder()
             .user_agent(Self::user_agent())
             .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
             .build()
             .map_err(AwsApiError::Network)?;
 
@@ -265,8 +310,7 @@ impl AwsClient {
         secret_key: &str,
     ) -> Result<CallerIdentity, AwsApiError> {
         let resp = self
-            .http
-            .post(&self.sts_url)
+            .mock_request(&self.sts_url)?
             .header("X-Amz-Access-Key", access_key)
             .header("X-Amz-Secret-Key", secret_key)
             .header(
@@ -338,8 +382,7 @@ impl AwsClient {
         });
 
         let resp = self
-            .http
-            .post(&self.sts_url)
+            .mock_request(&self.sts_url)?
             .header("X-Amz-Access-Key", access_key)
             .header("X-Amz-Secret-Key", secret_key)
             .header(
@@ -408,8 +451,7 @@ impl AwsClient {
         });
 
         let resp = self
-            .http
-            .post(&self.secretsmanager_url)
+            .mock_request(&self.secretsmanager_url)?
             .header("X-Amz-Access-Key", access_key)
             .header("X-Amz-Secret-Key", secret_key)
             .header("X-Amz-Target", "secretsmanager.GetSecretValue")
@@ -447,8 +489,7 @@ impl AwsClient {
         }
 
         let resp = self
-            .http
-            .post(&self.secretsmanager_url)
+            .mock_request(&self.secretsmanager_url)?
             .header("X-Amz-Access-Key", access_key)
             .header("X-Amz-Secret-Key", secret_key)
             .header("X-Amz-Target", "secretsmanager.CreateSecret")
@@ -482,8 +523,7 @@ impl AwsClient {
         });
 
         let resp = self
-            .http
-            .post(&self.secretsmanager_url)
+            .mock_request(&self.secretsmanager_url)?
             .header("X-Amz-Access-Key", access_key)
             .header("X-Amz-Secret-Key", secret_key)
             .header("X-Amz-Target", "secretsmanager.PutSecretValue")
@@ -508,8 +548,7 @@ impl AwsClient {
         secret_key: &str,
     ) -> Result<ListSecretsResponse, AwsApiError> {
         let resp = self
-            .http
-            .post(&self.secretsmanager_url)
+            .mock_request(&self.secretsmanager_url)?
             .header("X-Amz-Access-Key", access_key)
             .header("X-Amz-Secret-Key", secret_key)
             .header("X-Amz-Target", "secretsmanager.ListSecrets")
@@ -542,8 +581,7 @@ impl AwsClient {
         });
 
         let resp = self
-            .http
-            .post(&self.secretsmanager_url)
+            .mock_request(&self.secretsmanager_url)?
             .header("X-Amz-Access-Key", access_key)
             .header("X-Amz-Secret-Key", secret_key)
             .header("X-Amz-Target", "secretsmanager.DeleteSecret")
@@ -579,8 +617,7 @@ impl AwsClient {
         });
 
         let resp = self
-            .http
-            .post(&self.ssm_url)
+            .mock_request(&self.ssm_url)?
             .header("X-Amz-Access-Key", access_key)
             .header("X-Amz-Secret-Key", secret_key)
             .header("X-Amz-Target", "AmazonSSM.GetParameter")
@@ -621,8 +658,7 @@ impl AwsClient {
         });
 
         let resp = self
-            .http
-            .post(&self.ssm_url)
+            .mock_request(&self.ssm_url)?
             .header("X-Amz-Access-Key", access_key)
             .header("X-Amz-Secret-Key", secret_key)
             .header("X-Amz-Target", "AmazonSSM.PutParameter")
@@ -655,8 +691,7 @@ impl AwsClient {
         });
 
         let resp = self
-            .http
-            .post(&self.ssm_url)
+            .mock_request(&self.ssm_url)?
             .header("X-Amz-Access-Key", access_key)
             .header("X-Amz-Secret-Key", secret_key)
             .header("X-Amz-Target", "AmazonSSM.GetParametersByPath")
@@ -688,8 +723,7 @@ impl AwsClient {
         });
 
         let resp = self
-            .http
-            .post(&self.ssm_url)
+            .mock_request(&self.ssm_url)?
             .header("X-Amz-Access-Key", access_key)
             .header("X-Amz-Secret-Key", secret_key)
             .header("X-Amz-Target", "AmazonSSM.DeleteParameter")
@@ -923,6 +957,63 @@ mod tests {
     fn validate_url_scheme_rejects_ftp() {
         let err = validate_url_scheme("ftp://example.com/file").unwrap_err();
         assert!(err.to_string().contains("unsupported URL scheme"));
+    }
+
+    #[test]
+    fn mock_boundary_rejects_remote_and_ambiguous_destinations() {
+        for url in [
+            "https://sts.us-east-1.amazonaws.com",
+            "https://secretsmanager.us-east-1.amazonaws.com",
+            "http://localhost.example.com:8200",
+            "http://localhost@attacker.example:8200",
+            "http://localhost:8200@attacker.example",
+            "http://user:pass@127.0.0.1:8200",
+            "http://127.0.0.1:8200?destination=remote",
+            "http://127.0.0.1:8200#remote",
+            "file:///tmp/mock",
+        ] {
+            assert!(validate_mock_url(url).is_err(), "accepted {url}");
+        }
+        for url in [
+            "http://127.0.0.1:8200",
+            "http://localhost:8200",
+            "https://localhost:8200",
+        ] {
+            validate_mock_url(url).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn real_aws_endpoint_is_rejected_before_network() {
+        let client = AwsClient::new(
+            "https://sts.us-east-1.amazonaws.com",
+            "https://secretsmanager.us-east-1.amazonaws.com",
+            "https://ssm.us-east-1.amazonaws.com",
+        )
+        .unwrap();
+        let err = client
+            .get_caller_identity("disposable-access", "disposable-secret")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AwsApiError::MockOnly));
+    }
+
+    #[tokio::test]
+    async fn mock_transport_does_not_forward_credentials_on_redirect() {
+        let server = MockServer::start().await;
+        let destination = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(307).insert_header("Location", destination.uri()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = AwsClient::new_single(&server.uri());
+        let err = client
+            .get_caller_identity("disposable-access", "disposable-secret")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AwsApiError::UnexpectedStatus(307)));
+        assert!(destination.received_requests().await.unwrap().is_empty());
     }
 
     // -----------------------------------------------------------------------

@@ -8,8 +8,9 @@
 //!   `aws.get_parameters_by_path`, `aws.delete_parameter`
 //! - **Secret resolution** via `aws:<secret-name>` or `aws:ssm:<param-name>` refs
 //!
-//! Auth via `OPAQUE_AWS_ACCESS_KEY_ID` and `OPAQUE_AWS_SECRET_ACCESS_KEY` env vars
-//! (or keychain refs). Region via `OPAQUE_AWS_REGION` (defaults to `us-east-1`).
+//! Production AWS support is disabled pending Signature V4. Mock use requires
+//! `OPAQUE_AWS_ALLOW_INSECURE=1` and a loopback `OPAQUE_AWS_MOCK_URL`, with
+//! disposable credentials supplied through the configured base resolver refs.
 
 pub mod client;
 pub mod resolve;

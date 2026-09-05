@@ -333,14 +333,10 @@ impl CompositeResolver {
             }
         };
 
-        // AWS backend: available if URL scheme is valid.
-        let aws_region = std::env::var(crate::aws::client::AWS_REGION_ENV)
-            .unwrap_or_else(|_| crate::aws::client::DEFAULT_REGION.to_owned());
-        let sts_url = format!("https://sts.{aws_region}.amazonaws.com");
-        let sm_url = format!("https://secretsmanager.{aws_region}.amazonaws.com");
-        let ssm_url = format!("https://ssm.{aws_region}.amazonaws.com");
-        let aws = match crate::aws::client::AwsClient::new(&sts_url, &sm_url, &ssm_url) {
-            Ok(client) => Some(crate::aws::resolve::AwsResolver::new(client)),
+        // AWS remains disabled until SigV4 exists. Only explicitly configured
+        // loopback mocks can be reached by any aws: secret resolution path.
+        let aws = match crate::aws::client::AwsClient::from_mock_env() {
+            Ok(client) => client.map(crate::aws::resolve::AwsResolver::new),
             Err(e) => {
                 tracing::warn!("AWS client disabled: {e}");
                 None
@@ -418,7 +414,7 @@ impl SecretResolver for CompositeResolver {
                 Some(r) => r.resolve(ref_str),
                 None => Err(ResolveError::AwsError(
                     ref_str.to_owned(),
-                    "AWS not configured".into(),
+                    "AWS support disabled pending SigV4 (only explicit loopback mock configuration is supported)".into(),
                 )),
             }
         } else if ref_str.starts_with("vault:") {
@@ -625,6 +621,16 @@ mod tests {
         let err = result.unwrap_err();
         assert!(matches!(err, ResolveError::BitwardenError(..)));
         assert!(format!("{err}").contains("not configured"));
+    }
+
+    #[test]
+    fn composite_resolver_aws_disabled_for_both_ref_forms() {
+        let resolver = CompositeResolver::without_onepassword();
+        for reference in ["aws:prod/db-password", "aws:ssm:/prod/password"] {
+            let err = resolver.resolve(reference).unwrap_err();
+            assert!(matches!(err, ResolveError::AwsError(..)));
+            assert!(err.to_string().contains("disabled pending SigV4"));
+        }
     }
 
     #[test]
