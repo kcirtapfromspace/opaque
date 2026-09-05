@@ -99,7 +99,9 @@ async function htmlResponse(response,env,callback=false) {
   const policy=callback
     ? `default-src 'none'; script-src ${hashes.join(' ')}; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`
     : `default-src 'none'; script-src ${hashes.join(' ')} https://challenges.cloudflare.com; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`;
-  return new Response(html,{headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer','Content-Security-Policy':policy,...(callback?{'X-Robots-Tag':'noindex, noarchive'}:{})}});
+  // The OAuth callback must not acquire analytics or challenge scripts from
+  // intermediary HTML transforms while carrying a short-lived login code.
+  return new Response(html,{headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':callback?'no-store, no-transform':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer','Content-Security-Policy':policy,...(callback?{'X-Robots-Tag':'noindex, noarchive'}:{})}});
 }
 function taskReference(input) {
   return typeof input.task_id==='string'&&/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(input.task_id)

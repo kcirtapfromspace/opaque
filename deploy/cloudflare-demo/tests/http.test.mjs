@@ -191,7 +191,7 @@ test('OAuth popup callback is public only at the exact path and uses hashed scri
   assert.match(policy,/default-src 'none'/);
   assert.doesNotMatch(policy,/https:|connect-src|frame-src/);
   assert.equal(response.headers.get('Referrer-Policy'),'no-referrer');
-  assert.equal(response.headers.get('Cache-Control'),'no-store');
+  assert.equal(response.headers.get('Cache-Control'),'no-store, no-transform');
   assert.equal(response.headers.get('Set-Cookie'),null);
   const events=[];
   const context={URLSearchParams,location:{search:'?code=private-code&state=transaction-123',origin:'https://demo.example'},
