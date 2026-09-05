@@ -46,7 +46,7 @@ jobs:
 
       - name: Open or update the release PR
         if: steps.prep.outputs.changed == 'true'
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           branch: release/next
           base: main
