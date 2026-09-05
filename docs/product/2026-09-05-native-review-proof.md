@@ -94,6 +94,37 @@ without a network or credentials. A local image ID is not a registry digest, and
 local success does not establish publication or the workflow's private pull access.
 See [artifact preparation](../../examples/staging-release/README.md).
 
+The actual local artifact build and isolated smoke check passed against commit
+`9681a7bbf16d216bbd06614439edd7bbb1636f60`:
+
+```sh
+python3 scripts/build_staging_artifact.py \
+  --output-dir /private/tmp/opaque-staging-proof-20260905
+```
+
+The build took approximately three minutes. Inspection verified `linux/amd64`,
+the exact source/revision labels, `/usr/local/bin/opaque` entrypoint and
+`65532:65532` user. The fixed smoke command ran with no network, a read-only
+filesystem, no capabilities and bounded CPU/memory/PIDs; it returned
+`opaque 0.2.0+9681a7b`. Its local image identity is
+`sha256:6d0c47833e8ae8f808569def78f351793aec7cdd728c6c8b0ee34d10fdbf92ff`,
+tagged `opaque-staging-artifact:9681a7bbf16d-8c0a886b`. This is local image
+evidence, not an observed registry publication/digest. The recipe SHA-256 was
+`47cb5ef094873286d262e631b5e252ab95d963849fcc490dc1eef2af80c86906`.
+Temporary source context/archive cleanup completed; build logs and the local
+image remain available. Cleanup commands targeted only this task's uniquely named
+fixture/smoke containers. Final inventory retained the original BuildKit and Talos
+registry containers. Two unrelated `admachina-p1` containers seen at the initial
+inventory were absent at the final check; this task did not stop or remove them,
+and their lifecycle was not investigated.
+
+The sanitized report is `/private/tmp/opaque-staging-proof-20260905/evidence.json`.
+It explicitly records `published: false`, `registry_digest: null` and
+`ready_for_live_dispatch: false`. A future approved `main` commit needs its own
+matching artifact; do not substitute this development artifact for a different
+approved commit. No repository setting, remote workflow, package or workload was
+changed during this validation.
+
 M1 is demonstrated. M2 requires the real private workflow, protection/reviewer
 configuration, published immutable artifact, separately custodied live broker,
 and one native-approved GitHub dispatch with correlated terminal evidence. The

@@ -59,7 +59,7 @@ merely because an earlier note called GPU inference future work.
 | --- | --- | --- | --- |
 | **M0 — Unify product and refresh the demo** | Demo and visitor guide deployed and verified September 5 | Continue M1–M4; Actions remain disabled | Actual allowed read, denied replay, concurrency/restart/expiry/revocation checks; browser/deployment verification; private material excluded; existing workloads preserved |
 | **M1 — Human signed review across the broker boundary** | Demonstrated September 5 with actual human native review and one fixture dispatch | Proceed to M2; retain the bounded native-review regressions and readiness probe | `paired_workstation` receipt, one observed fixture dispatch, denied replay before/after restart, MCP/dashboard reconciliation. [Proof](2026-09-05-native-review-proof.md) |
-| **M2 — One real private staging artifact smoke check** | Private template/preflight prepared; live prerequisites unmet and Actions disabled | Recheck workflow/environment/protections; select immutable private artifact and credential references before one reviewed dispatch | Native-approved GitHub dispatch; exact run correlation; fixed smoke command succeeds; replay causes no second dispatch |
+| **M2 — One real private staging artifact smoke check** | Guarded workflow/live broker recipe prepared; amd64 artifact locally validated, unpublished; live prerequisites unmet and Actions disabled | Configure independent review and effective private protections, install workflow, publish a matching private artifact and provision live broker custody | Native-approved GitHub dispatch; exact run correlation; fixed smoke command succeeds; replay causes no second dispatch. [Local proof and live limits](2026-09-05-native-review-proof.md) |
 | **M3 — Real source, production identity and unified authorization** | Broker-owned resource authority implemented and exercised with real daemon/gateway fixtures; production selection open | Configure a suitable tenant-aware application source and IdP resource/client contract | Two actual test tenants; permitted read/disclosure; source-level foreign-tenant denial; membership removal, expiry and rotation checks |
 | **M4 — Attestor, counted leases, EMA and bounded SSH** | First attestor slice plus broker/Vault SSH operation implemented | Finish policy/lease integration; demonstrate native approval and provision a selected real host | Compatibility, concurrency, real identity/provisioning and host-operation evidence; certificate issuance alone is insufficient |
 
@@ -180,6 +180,9 @@ completion.
 - [x] Prepare the private manual workflow and GET-only preflight, including
   private artifact access and exact workflow-byte checks. Retain inherited
   public-publication guards before any Actions enablement.
+- [x] Build and inspect one committed-source amd64 artifact locally, then run
+  its fixed smoke command without network/credentials. This does not establish
+  private registry publication or workflow pull access. [Artifact evidence](2026-09-05-native-review-proof.md).
 - [ ] Install/verify the manual workflow, `staging` environment and effective
   branch/workflow protections. Record Actions availability and missing prerequisites.
 - [ ] Select an immutable reviewed artifact and a private distribution path
