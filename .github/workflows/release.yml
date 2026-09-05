@@ -11,6 +11,8 @@ permissions:
 
 jobs:
   build:
+    # Release/signing automation belongs to the public product repository only.
+    if: ${{ github.repository == 'kcirtapfromspace/opaque' && github.event.repository.private == false }}
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -119,6 +121,7 @@ jobs:
             ${{ steps.tarball.outputs.archive }}.sha256
 
   release:
+    if: ${{ github.repository == 'kcirtapfromspace/opaque' && github.event.repository.private == false }}
     name: Create release
     needs: build
     runs-on: ubuntu-latest

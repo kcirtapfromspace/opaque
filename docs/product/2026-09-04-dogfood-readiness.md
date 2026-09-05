@@ -1,5 +1,12 @@
 # Bounded work: implementation and dogfood handoff
 
+> **Historical evidence — September 4, 2026.** Current priorities and completion
+> gates are in the [private milestone roadmap](roadmap.md). This note preserves
+> its original implementation, test counts and temporary runtime references;
+> those references are not a current session inventory. Later work adds separate
+> broker/workstation review. Unchecked historical PRDs are not today's checklist,
+> and public repository examples below are not current dogfood destinations.
+
 This records the first, secret-publication increment. The subsequent
 [remote approval and staging-release increment](2026-09-04-remote-release-readiness.md)
 adds a separate broker trust boundary, paired workstation review, and read-only

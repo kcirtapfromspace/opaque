@@ -2,7 +2,7 @@
 
 This fixture runs the real broker, CLI, MCP server, and dashboard in separate Docker containers. A workstation outside those containers enrolls over pinned TLS and signs the complete, bounded release review. GitHub is a disposable loopback fixture: no workflow is installed, no image is pulled by a workflow, and no service or cluster is changed.
 
-The release contract approves one dispatch of a specific workflow in `kcirtapfromspace/opaque`, at an exact commit, with one immutable image digest and the `staging` environment. The reviewed workflow template at `examples/staging-release/opaque-staging-release.workflow.yml` performs an artifact smoke check. It is not a service rollout.
+The release contract approves one dispatch of a specific workflow in `kcirtapfromspace/opaque-dogfood`, at an exact commit, with one immutable image digest and the `staging` environment. The reviewed workflow template at `examples/staging-release/opaque-staging-release.workflow.yml` performs an artifact smoke check. This runner simulates the repository and workflow responses locally; it never executes that GitHub workflow or establishes its live prerequisites. It is not a service rollout. Current milestone status is maintained in the private [roadmap](product/roadmap.md).
 
 ## Run the automated protocol check
 
@@ -43,6 +43,30 @@ python3 scripts/release_dogfood.py --serve --no-build --data-dir /private/tmp/or
 Use **Check workflow** in the dashboard to refresh evidence. That endpoint can only perform daemon-scoped reconciliation. It does not approve, dispatch, retry, or create authority. Audit and policy files are deliberately not mounted into the client container; their dashboard tabs report that those local data sources are unavailable.
 
 ## Use the native workstation reviewer
+
+For one complete human walkthrough, build the host reviewers and run:
+
+```bash
+cargo build --locked -p opaque-approver -p opaque-approve-helper
+python3 scripts/release_dogfood.py --native-check
+```
+
+This starts a fresh isolated broker, enrolls the workstation public key, opens
+the complete native review, and waits for the human decision and authentication.
+It never supplies a decision or substitutes the automated signer. On acceptance,
+it verifies exactly one fixture dispatch, workflow reconciliation, denied replay,
+receipt persistence and replay denial after broker restart, plus MCP and dashboard
+checks. It then stops only its own containers and retains the private fixture
+directory. `--no-build` may be used only after a current Linux build has passed.
+
+`native-approved-receipt.json` and `native-review-evidence.json` record a completed
+`paired_workstation` outcome. Rejection, expiry, missing native UI, test provenance,
+an unknown effect or an unexpected dispatch count cannot produce a passing human
+milestone. Logs and key material stay in temporary private custody, never Git.
+This proves the exercised workstation application/protocol path against a
+disposable provider, not hardware biometric attestation or real GitHub execution.
+
+For manual exploration instead of the automatic post-review checks:
 
 Build the host binaries, then create a fresh fixture directory:
 

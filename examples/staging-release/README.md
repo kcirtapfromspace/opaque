@@ -13,22 +13,33 @@ reads GitHub run evidence; it cannot retry the dispatch.
 
 ## Contract and trusted configuration
 
-The supplied workflow targets `kcirtapfromspace/opaque` (repository ID
-`1156844526`) on `main`. It checks the approved SHA, a fixed image repository,
+The supplied workflow targets the **private** `kcirtapfromspace/opaque-dogfood`
+(repository ID `1357845081`) on `main`. It checks the approved SHA, a fixed image repository,
 staging destination, task correlation, and first run attempt before pulling an
 image by digest. It then runs the fixed `/usr/local/bin/opaque --version` smoke
-check in a restricted disposable container. It receives no deployment or broker
-credentials, checks out no repository scripts, accepts no shell command or
+check in a restricted disposable container. The fetch step uses the workflow's
+short-lived `GITHUB_TOKEN` with only `packages: read`, through password-stdin and
+a temporary Docker configuration removed on exit. That token is not passed to
+the artifact container. The job receives no deployment or broker credentials,
+checks out no repository scripts, accepts no shell command or
 arbitrary extra inputs, and performs no rollout.
 
-The proposed `ghcr.io/kcirtapfromspace/opaque` image has **not** been verified or
+The proposed `ghcr.io/kcirtapfromspace/opaque-dogfood` image has **not** been verified or
 published for this flow. Replace the zero digest in `opaque.json` with a real
-reviewed artifact digest only after the image contract is met: public registry
-read access, `/usr/local/bin/opaque`, and the
+reviewed artifact digest only after the image contract is met: **private** package
+visibility, a link and Actions read access for the private dogfood repository,
+`linux/amd64`, executable `/usr/local/bin/opaque` as UID/GID `65532`, and the
 `org.opencontainers.image.revision` label equal to the approved commit. That
 label is a consistency check, not cryptographic build provenance. Workflow
 success means that smoke check succeeded; it does not establish application
 health or a completed staging deployment.
+
+Repository privacy does not establish package privacy. Verify both separately;
+do not publish dogfood artifacts in the public product package. GitHub documents
+the required private package access for a workflow's `GITHUB_TOKEN` in
+[Working with the Container registry](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry).
+The provider sends image coordinates only; the workflow owns package
+authentication, so this private registry contract requires no new provider input.
 
 Before live use, an operator must review the entire workflow, install it as
 `.github/workflows/opaque-staging-release.yml` through the repository's reviewed
@@ -37,6 +48,63 @@ branch and workflow changes with appropriate required review and environment
 protection. The provider checks GitHub's `protected` branch flag; that flag does
 not prove specific review rules, CODEOWNERS coverage, bypass restrictions, or
 environment protections. Those remain an operator prerequisite.
+Some environment protection features depend on the GitHub plan for a private
+repository. Verify that they are enforced before proceeding; converting the
+repository or artifact to public visibility is not an acceptable workaround.
+[GitHub environment requirements](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments)
+
+## Read-only preflight and next operator steps
+
+Run from this checkout using an existing `gh` login:
+
+```sh
+python3 scripts/staging_release_preflight.py
+python3 scripts/staging_release_preflight.py --json
+python3 -m unittest discover -s scripts -p 'test_staging_release_preflight.py'
+```
+
+The preflight performs GitHub API GETs only, pins the destination to the private
+dogfood repository, and stops before further queries if privacy or numeric
+identity does not match. It checks Actions, the branch and its protection,
+same-name tag absence, workflow identity and exact bytes at the observed SHA and
+default branch, staging environment controls, and private package identity. With
+a real digest it searches at most 300 package versions for that exact digest.
+The JSON report contains selected facts only, never authentication headers,
+credential values, API bodies, or subprocess error output. A `404` on a protected
+resource is reported as absent **or inaccessible**.
+
+Exit `1` means a prerequisite is blocked or requires operator evidence; exit `2`
+means invalid local contract input. `api_prerequisites_met` describes the machine
+checks only. This first version intentionally leaves `ready_for_live_demo` false
+until runtime artifact and effective authority evidence have been collected; it
+does not accept a flag that turns those unchecked assertions into a pass.
+
+The executable sequence to close this milestone is:
+
+1. Review effective branch rules, workflow ownership, bypass permissions and
+   dispatch/rerun access for the private repository. Provision the required
+   protections and staging environment through the reviewed administration flow.
+2. Review this complete workflow and install its exact bytes at
+   `.github/workflows/opaque-staging-release.yml` on the default branch. Enable
+   Actions deliberately; existing workflows may become eligible when enabled.
+3. Build and verify a private immutable artifact from that final approved commit.
+   Record its digest, architecture, revision label, isolated version check, package
+   visibility and Actions read access. Do not invent or reuse a fixture digest.
+4. Copy `opaque.json` into ignored or temporary storage, replace only the sentinel
+   digest with the observed digest, and optionally pin `approved_commit_sha`.
+   Re-run `--manifest /absolute/path/to/private-manifest.json --json` and resolve
+   every blocker. Keep sanitized evidence in internal milestone records.
+5. Pin the reviewed workflow hash in the trusted broker, complete native human
+   approval, dispatch once, reconcile that exact task, and demonstrate denied
+   replay. Retain the run identity, terminal conclusion, and durable slot evidence.
+
+None of these commands install a workflow, enable Actions, publish an artifact,
+change protections, or dispatch a task. The disposable `release_dogfood.py`
+harness serves synthetic GitHub metadata on loopback and hashes these bytes; it
+does not execute GitHub workflow guards, pull this package, or validate live
+repository settings. Fixture success cannot close the live milestone.
+
+## Trusted broker configuration
 
 Pin the reviewed workflow's exact file bytes in the **trusted broker's**
 environment. The agent must not control these settings or the broker filesystem.
@@ -46,10 +114,10 @@ workflow's exact local bytes:
 ```sh
 export OPAQUE_GITHUB_API_URL=https://api.github.com
 export OPAQUE_GITHUB_TOKEN_REF=keychain:opaque/github-pat
-export OPAQUE_STAGING_REPO=kcirtapfromspace/opaque
+export OPAQUE_STAGING_REPO=kcirtapfromspace/opaque-dogfood
 export OPAQUE_STAGING_WORKFLOW_PATH=.github/workflows/opaque-staging-release.yml
 export OPAQUE_STAGING_REF=main
-export OPAQUE_STAGING_IMAGE_REPOSITORY=ghcr.io/kcirtapfromspace/opaque
+export OPAQUE_STAGING_IMAGE_REPOSITORY=ghcr.io/kcirtapfromspace/opaque-dogfood
 export OPAQUE_STAGING_WORKFLOW_SHA256="$(shasum -a 256 "$reviewed_workflow" | cut -d ' ' -f 1)"
 ```
 

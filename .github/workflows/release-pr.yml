@@ -27,7 +27,7 @@ jobs:
   release-pr:
     runs-on: ubuntu-latest
     # Merging the release PR must not immediately open another one.
-    if: ${{ !startsWith(github.event.head_commit.message, 'chore(release):') }}
+    if: ${{ github.repository == 'kcirtapfromspace/opaque' && github.event.repository.private == false && !startsWith(github.event.head_commit.message, 'chore(release):') }}
     steps:
       - uses: actions/checkout@v6
         with:

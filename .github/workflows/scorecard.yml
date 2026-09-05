@@ -11,6 +11,8 @@ permissions: read-all
 jobs:
   analysis:
     name: Scorecard analysis
+    # publish_results sends evidence outside GitHub; keep dogfood evidence private.
+    if: ${{ github.repository == 'kcirtapfromspace/opaque' && github.event.repository.private == false }}
     runs-on: ubuntu-latest
     permissions:
       security-events: write

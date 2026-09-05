@@ -1,5 +1,12 @@
 # Customer-scoped streaming metrics chat
 
+> **Historical evidence — September 4, 2026.** Use the
+> [private milestone roadmap](roadmap.md) for current work. This note preserves
+> the original gateway contract and evidence; later organization, portfolio and
+> hosted-demo validation extend it. A real source, production IdP and unified
+> broker/gateway admission and revocation remain M3. Existing OAuth support does
+> not complete the historical attestor PRD's EMA provisioning checklist.
+
 The user asks a chat agent a question about live metrics. The agent may choose a permitted tool, but cannot select a customer, supply a source credential, change a query, or authorize itself. The gateway derives the customer and metric permissions from a validated OAuth access token. A separate customer-specific credential authenticates the gateway to that customer's aggregate source.
 
 This increment adds `opaque-metrics`, an experimental standalone gateway and chat client. It does not silently widen the existing `opaqued` task API or share the previous fixture's grants. The initial integration uses two synthetic customer event streams, with an actual language model available through the existing cluster's llama.cpp service. It is intended to validate this data-access workflow before connecting private data or reconciling a Kubernetes deployment.
