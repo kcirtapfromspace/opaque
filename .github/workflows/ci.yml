@@ -7,6 +7,42 @@ on:
       - main
 
 jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master
+        with:
+          toolchain: "1.95.0"
+          components: clippy
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
   test:
     runs-on: ubuntu-latest
     steps:
@@ -24,21 +60,15 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Run clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
       - name: Run workspace tests
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
       - name: Verify wrapper enforcement handshake test
         # --exact needs the full module path; a bare name matches 0 tests and
         # passes vacuously. The grep guard fails the step if the test ever
         # stops running (renamed/moved), instead of silently passing.
         run: |
-          cargo test -p opaqued tests::enforce_agent_sessions_rejects_unwrapped_and_allows_session_token -- --exact 2>&1 | tee /tmp/wrapper-test.out
+          cargo test --locked -p opaqued tests::enforce_agent_sessions_rejects_unwrapped_and_allows_session_token -- --exact 2>&1 | tee /tmp/wrapper-test.out
           grep -q "test result: ok. 1 passed" /tmp/wrapper-test.out
 
   # Verifies the Linux-only trust-domain guarantees (separate-uid custody,
@@ -73,7 +103,7 @@ jobs:
         # non-root cargo cannot lock. The grep fails the step if the suite
         # ever stops running (renamed/moved), instead of passing vacuously.
         run: |
-          cargo test -p opaqued --test federation_e2e 2>&1 | tee /tmp/fed-e2e.out
+          cargo test --locked -p opaqued --test federation_e2e 2>&1 | tee /tmp/fed-e2e.out
           grep -q "test result: ok. 3 passed" /tmp/fed-e2e.out
 
       - name: Provider e2e (a real GitHub write, end to end, against a mock API)
@@ -82,7 +112,7 @@ jobs:
         # unit tests; this is the suite that sees them. Same anti-vacuous grep,
         # same reason for running before the root-gated steps.
         run: |
-          cargo test -p opaqued --test provider_e2e 2>&1 | tee /tmp/prov-e2e.out
+          cargo test --locked -p opaqued --test provider_e2e 2>&1 | tee /tmp/prov-e2e.out
           grep -q "test result: ok. 2 passed" /tmp/prov-e2e.out
 
       - name: Multi-uid isolation suite (custody + privilege drop, as root)
