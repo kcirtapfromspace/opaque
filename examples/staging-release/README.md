@@ -1,9 +1,15 @@
 # One reviewed staging workflow
 
-This is an **uninstalled contract template**, not a tested live deployment. The
+This is a **prepared local workflow**, not an installed or tested live deployment. The
 provider fixture tests use disposable local responses. No GitHub workflow was
 installed or dispatched, and no image, repository protection, environment, or
 staging service was provisioned by creating these files.
+
+The copy at `.github/workflows/opaque-staging-release.yml` is byte-identical to
+the template here and refuses any other repository or public visibility. The
+[live runbook](LIVE-RUNBOOK.md) and `broker.live.example.toml` make the separate
+production path reviewable; remote installation, independent review and the
+private artifact prerequisites still need completion.
 
 The narrow flow approves one repository/workflow identity, branch and observed
 commit, exact workflow bytes, immutable image, and `staging` destination. It
@@ -105,6 +111,53 @@ does not execute GitHub workflow guards, pull this package, or validate live
 repository settings. Fixture success cannot close the live milestone.
 
 ## Trusted broker configuration
+
+### Prepare and validate the artifact locally
+
+The local builder exports committed source into a fresh private directory, builds
+only the CLI for **linux/amd64**, and verifies its exact local image ID before the
+fixed isolated `--version` smoke check. Its official Rust and Debian base images
+are pinned to their reviewed amd64 manifest digests in `Dockerfile.artifact`.
+It does not reuse the native arm64 fixture binaries.
+
+```sh
+# No Docker invocation: prepare a reviewable archive, recipe and build command.
+python3 scripts/build_staging_artifact.py --prepare-only
+
+# Requires a clean worktree; builds and validates locally without publication.
+python3 scripts/build_staging_artifact.py
+
+# When unrelated work is in progress, supply the full immutable committed SHA.
+python3 scripts/build_staging_artifact.py --revision FULL_40_CHARACTER_COMMIT_SHA
+python3 -m unittest discover -s scripts -p 'test_build_staging_artifact.py'
+```
+
+An explicit revision uses only that commit, excluding uncommitted changes and
+untracked files. Default HEAD refuses a dirty worktree. The selected commit must
+include the CLI's `OPAQUE_BUILD_REVISION` build support; older commits fail the
+version check rather than claiming matching provenance. Build labels retain the
+full source SHA and exact private repository URL; the CLI embeds its first seven
+characters. These are build consistency checks, not signed build attestation.
+
+The tool uses a unique local image tag and a new private temporary directory, or
+the new directory named by `--output-dir`. `evidence.json` contains sanitized
+metadata and a strictly validated version string. `build.log` stays local. The
+smoke container runs as UID/GID `65532`, with no network, read-only filesystem,
+no capabilities and bounded memory, CPU and processes. The tool removes only its
+own smoke container and disposable source context; existing workloads and caches
+remain. `--prepare-only` retains the context for review. Allow local disk space
+for an amd64 Rust build before proceeding.
+
+Neither a successful local image ID nor a matching version is a registry digest.
+The report therefore keeps `registry_digest` null, `published` false and
+`ready_for_live_dispatch` false. Publication is a separate operator action after
+private destination and package-access review. Only the digest observed from the
+actual private registry can replace the manifest sentinel. The final workflow's
+`GITHUB_TOKEN` pull access and live smoke result still require M2 evidence. No
+login, credential extraction, push, Actions change or provider dispatch is
+performed by this builder.
+
+### Configure the separate live broker
 
 Pin the reviewed workflow's exact file bytes in the **trusted broker's**
 environment. The agent must not control these settings or the broker filesystem.

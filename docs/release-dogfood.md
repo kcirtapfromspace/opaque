@@ -48,8 +48,22 @@ For one complete human walkthrough, build the host reviewers and run:
 
 ```bash
 cargo build --locked -p opaque-approver -p opaque-approve-helper
+python3 scripts/release_dogfood.py --native-preflight
 python3 scripts/release_dogfood.py --native-check
 ```
+
+The preflight runs `opaque-approver check-native` without creating keys, enrolling,
+opening an approval window, authenticating, or creating a task or container. It
+checks the current desktop session and native authentication availability. A
+successful probe does **not** prove that a human saw or approved a review. The
+walkthrough repeats this check before building or starting its broker.
+
+When Cargo uses a different target directory, pass the actual host binary
+directory to both commands with `--native-bin-dir /absolute/path/to/debug`.
+Both reviewer executables must be built from the current source. The retained
+`native-readiness.json` records their SHA-256 hashes. Native Linux execution
+preserves the current desktop connection metadata while excluding provider
+credentials and unrelated environment overrides.
 
 This starts a fresh isolated broker, enrolls the workstation public key, opens
 the complete native review, and waits for the human decision and authentication.
@@ -65,6 +79,16 @@ an unknown effect or an unexpected dispatch count cannot produce a passing human
 milestone. Logs and key material stay in temporary private custody, never Git.
 This proves the exercised workstation application/protocol path against a
 disposable provider, not hardware biometric attestation or real GitHub execution.
+
+`native-progress.json` identifies the current stage: challenge, review, task
+completion, receipt validation, reconciliation, replay, restart, or MCP/dashboard
+verification. A failure at any of those stages records a failed milestone,
+including failures after a valid human approval. `native-review.log` retains
+fixed native stage diagnostics. The review deadline remains 90 seconds; the
+separate native authentication deadline remains unchanged. A timeout reports the
+last observed helper stage; an ordered window is not proof of human visibility.
+Use a fresh fixture directory for each native check so an earlier result cannot
+be overwritten by a later attempt.
 
 For manual exploration instead of the automatic post-review checks:
 

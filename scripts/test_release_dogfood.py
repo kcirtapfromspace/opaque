@@ -8,7 +8,75 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from release_dogfood import ReleaseDogfood, validate_native_completion
+from release_dogfood import ReleaseDogfood, host_environment, main, native_readiness, validate_native_completion
+
+
+class NativeReadinessTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.path = Path(self.directory.name).resolve()
+        for name in ("opaque-approver", "opaque-approve-helper"):
+            executable = self.path / name
+            executable.write_text("fixture executable identity\n")
+            executable.chmod(0o700)
+        self.report = {"check": "native_review", "ready": True,
+                       "visibility_verified": False, "authentication_available": True}
+
+    def test_explicit_binaries_are_probed_without_custody_or_approval(self):
+        response = subprocess.CompletedProcess([], 0, json.dumps(self.report), "")
+        with patch("release_dogfood.execute", return_value=response) as run:
+            evidence = native_readiness(self.path, {})
+        self.assertEqual(run.call_args.args[0], [str(self.path / "opaque-approver"), "check-native"])
+        self.assertFalse(evidence["visibility_verified"])
+        self.assertFalse(evidence["human_approval"])
+        self.assertEqual(set(evidence["binary_sha256"]), {"opaque-approver", "opaque-approve-helper"})
+        self.assertTrue(all(len(value) == 64 for value in evidence["binary_sha256"].values()))
+        self.assertEqual(len(list(self.path.iterdir())), 2)
+
+    def test_unavailable_authentication_or_unsupported_report_cannot_pass(self):
+        for report in ({}, [], {**self.report, "ready": 1},
+                       {**self.report, "authentication_available": False},
+                       {**self.report, "visibility_verified": True}):
+            response = subprocess.CompletedProcess([], 0, json.dumps(report), "")
+            with self.subTest(report=report), patch("release_dogfood.execute", return_value=response), \
+                 self.assertRaisesRegex(RuntimeError, "unsupported or incomplete"):
+                native_readiness(self.path, {})
+
+    def test_missing_or_nonexecutable_helper_stops_before_probe(self):
+        helper = self.path / "opaque-approve-helper"
+        helper.chmod(0o600)
+        with patch("release_dogfood.execute") as run, self.assertRaisesRegex(RuntimeError, "not executable"):
+            native_readiness(self.path, {})
+        run.assert_not_called()
+        helper.unlink()
+        with self.assertRaisesRegex(RuntimeError, "missing"):
+            native_readiness(self.path, {})
+
+    def test_failed_probe_stops_before_docker_build_or_task_creation(self):
+        fixture = ReleaseDogfood.__new__(ReleaseDogfood)
+        fixture.args = SimpleNamespace(native=True)
+        fixture.native_bin_dir = self.path
+        fixture.clean_env = {}
+        fixture.docker = Mock()
+        failure = subprocess.CompletedProcess([], 2, "", "native review UI unavailable")
+        with patch("release_dogfood.execute", return_value=failure), \
+             self.assertRaisesRegex(RuntimeError, "before task creation"):
+            fixture.build()
+        fixture.docker.assert_not_called()
+
+    def test_native_desktop_metadata_survives_without_provider_credentials(self):
+        environment = {"PATH": "/usr/bin", "DISPLAY": ":0", "XDG_RUNTIME_DIR": "/run/user/1000",
+                       "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+                       "GITHUB_TOKEN": "must-not-propagate", "LD_PRELOAD": "must-not-load"}
+        with patch.dict("release_dogfood.os.environ", environment, clear=True):
+            native = host_environment(native=True)
+            automated = host_environment()
+        self.assertEqual(native["DISPLAY"], ":0")
+        self.assertEqual(native["DBUS_SESSION_BUS_ADDRESS"], environment["DBUS_SESSION_BUS_ADDRESS"])
+        self.assertNotIn("GITHUB_TOKEN", native)
+        self.assertNotIn("LD_PRELOAD", native)
+        self.assertEqual(automated, {"PATH": "/usr/bin"})
 
 
 class NativeEvidenceTests(unittest.TestCase):
@@ -56,6 +124,8 @@ class NativeEvidenceTests(unittest.TestCase):
             fixture = ReleaseDogfood.__new__(ReleaseDogfood)
             fixture.args = SimpleNamespace(native=True)
             fixture.directory = fixture.signer_dir = Path(directory)
+            fixture.native_bin_dir = Path(directory)
+            fixture.task_id = None
             fixture.agent_name = "isolated-native-test-agent"
             fixture.clean_env = {}
             fixture.assert_custody = Mock()
@@ -73,11 +143,85 @@ class NativeEvidenceTests(unittest.TestCase):
                 fixture.native_check()
             evidence = json.loads((Path(directory) / "native-review-evidence.json").read_text())
             self.assertFalse(evidence["passed"])
+            self.assertEqual(evidence["stage"], "native_review")
             self.assertEqual(evidence["observed_dispatches"], 0)
             self.assertFalse((Path(directory) / "native-approved-receipt.json").exists())
             process.terminate.assert_called_once()
             process.wait.assert_called_once_with(timeout=5)
             fixture.task.assert_called_once_with("plan", "--manifest", "/input/manifest.json")
+
+    def test_failure_after_human_review_still_records_failed_milestone(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ReleaseDogfood.__new__(ReleaseDogfood)
+            fixture.args = SimpleNamespace(native=True)
+            fixture.directory = Path(directory)
+            fixture.task_id = "fixture-task"
+            fixture.count_dispatches = Mock(side_effect=[0, 1])
+
+            def failed_reconciliation(_baseline):
+                fixture.native_progress("reconciliation")
+                raise RuntimeError("The observed run is ambiguous")
+
+            fixture._native_check = failed_reconciliation
+            with self.assertRaisesRegex(RuntimeError, "ambiguous"):
+                fixture.native_check()
+            evidence = json.loads((fixture.directory / "native-review-evidence.json").read_text())
+            self.assertFalse(evidence["passed"])
+            self.assertEqual(evidence["stage"], "reconciliation")
+            self.assertEqual(evidence["observed_dispatches"], 1)
+            self.assertFalse((fixture.directory / "native-approved-receipt.json").exists())
+
+    def test_new_attempt_cannot_overwrite_previous_native_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ReleaseDogfood.__new__(ReleaseDogfood)
+            fixture.args = SimpleNamespace(native=True)
+            fixture.directory = Path(directory)
+            path = fixture.directory / "native-review-evidence.json"
+            path.write_text('{"passed":false,"task_id":"previous"}\n')
+            original = path.read_bytes()
+            fixture._native_check = Mock()
+            with self.assertRaisesRegex(RuntimeError, "fresh --data-dir"):
+                fixture.native_check()
+            self.assertEqual(path.read_bytes(), original)
+            fixture._native_check.assert_not_called()
+
+    def test_constructor_refuses_old_native_attempt_before_any_mutation(self):
+        for evidence_name in ("native-review-evidence.json", "native-progress.json", "native-approved-receipt.json"):
+            with self.subTest(evidence=evidence_name), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory)
+                marker = path / ".opaque-release-dogfood.json"
+                marker.write_text('{"native":true,"prefix":"retained"}\n')
+                evidence = path / evidence_name
+                evidence.write_text('{"task_id":"previous"}\n')
+                before = {item.name: item.read_bytes() for item in path.iterdir()}
+                args = SimpleNamespace(data_dir=path, native=True, native_check=True)
+                with self.assertRaisesRegex(RuntimeError, "before starting any fixture resources"):
+                    ReleaseDogfood(args)
+                self.assertEqual({item.name: item.read_bytes() for item in path.iterdir()}, before)
+
+    def test_interrupt_retains_failed_native_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ReleaseDogfood.__new__(ReleaseDogfood)
+            fixture.args = SimpleNamespace(native=True)
+            fixture.directory = Path(directory)
+            fixture.task_id = "fixture-task"
+            fixture.count_dispatches = Mock(return_value=0)
+            fixture._native_check = Mock(side_effect=KeyboardInterrupt())
+            with self.assertRaises(KeyboardInterrupt):
+                fixture.native_check()
+            evidence = json.loads((fixture.directory / "native-review-evidence.json").read_text())
+            self.assertFalse(evidence["passed"])
+            self.assertEqual(evidence["reason"], "native_walkthrough_interrupted")
+            self.assertEqual(evidence["observed_dispatches"], 0)
+
+    def test_interrupted_command_returns_nonzero_and_closes_only_its_fixture(self):
+        fixture = Mock()
+        fixture.directory = Path("/private/tmp/fixture-interrupted")
+        fixture.native_check.side_effect = KeyboardInterrupt()
+        with patch("release_dogfood.sys.argv", ["release_dogfood.py", "--native-check"]), \
+             patch("release_dogfood.ReleaseDogfood", return_value=fixture):
+            self.assertEqual(main(), 130)
+        fixture.close.assert_called_once_with()
 
 
 if __name__ == "__main__":

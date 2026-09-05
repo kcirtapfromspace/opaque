@@ -42,7 +42,7 @@ fixtures extend the tested boundary without completing those gates.
 | Broker custody, separate identity, sandbox, OIDC and signed delegation | Yes | Real-daemon/fixture checks; split broker/workload UIDs | Foundation in use; no isolation between co-resident sibling agents or protection from a trusted host administrator. [Foundation](../../CHANGELOG.md), [release evidence](2026-09-04-remote-release-readiness.md). |
 | Signed policy, rollback protection, audit export and signed posture | Yes | Federation/identity daemon checks and verifier-gated key release | Software posture and enrolled keys; no hardware measurement. [Federation contract](../federation.md). |
 | Durable bounded task grants | Yes | Secret, release and inference fixtures: fixed allowances, replay, expiry/revocation, restart, permanently consumed unknowns | Human consent and real provider effectiveness are distinct gates; this is not generic counted approval leases. [Task evidence](2026-09-04-dogfood-readiness.md), [PRD reconciliation](../../tasks/prd-bounded-agent-work.md). |
-| Paired workstation review and one staging workflow dispatch | Yes | Enrollment, pinned TLS, signed test review, separate custody and read-only reconciliation | Native human attempt timed out after 90 seconds with zero dispatches; completed human review and real GitHub dispatch remain M1–M2. [Release evidence](2026-09-04-remote-release-readiness.md), [attempt record](2026-09-05-milestone-validation.md). |
+| Paired workstation review and one staging workflow dispatch | Yes | Enrollment, pinned TLS, separate custody, completed native human review and read-only reconciliation | M1 demonstrated: one human-approved fixture dispatch, denied replay and persisted receipt after restart. Real GitHub dispatch remains M2. [Native proof](2026-09-05-native-review-proof.md), [release evidence](2026-09-04-remote-release-readiness.md). |
 | Tenant inference and HTTP OAuth/MCP aggregate gateway | Yes; broker-owned resource authority added | Two-tenant fixtures; real daemon/gateway current role, membership, disclosure and durable revocation checks | Synthetic-source chat observed with a real model; production IdP/source remain M3. [Inference](2026-09-04-tenant-inference-readiness.md), [gateway](2026-09-04-scoped-metrics-chat.md), [authority](2026-09-05-broker-resource-authority.md). |
 | Hosted GPU demo, organization/support roles and demo lifecycle controller | Yes; deployed | Final packaged Gemma/Qwen qualification: 13/13 checks each; separate narrow denial-counter repeats | Public allowed queries, role/customer denials and cleanup observed September 4. Synthetic data and demo-specific controller; no general tenant operator or GPU isolation proof. [Portfolio ledger](../../deploy/hosted-demo/PORTFOLIO-VALIDATION.md), [organization ledger](../../deploy/hosted-demo/ORGANIZATION-VALIDATION.md). |
 | Runtime attestor registry, selectors, native codesign identity, generic counted leases and full EMA | Partial: canonical workload identity and listener-bound peercred attestor | Real-daemon observed identity, caller-claim denials and verifying audit chain | Policy selectors/floors, lease migration, registry, codesign and EMA remain. [September 5 progress](2026-09-05-attestor-ssh-progress.md). |
@@ -58,7 +58,7 @@ merely because an earlier note called GPU inference future work.
 | Milestone | Status | Next concrete work | Completion evidence |
 | --- | --- | --- | --- |
 | **M0 — Unify product and refresh the demo** | Demo and visitor guide deployed and verified September 5 | Continue M1–M4; Actions remain disabled | Actual allowed read, denied replay, concurrency/restart/expiry/revocation checks; browser/deployment verification; private material excluded; existing workloads preserved |
-| **M1 — Human signed review across the broker boundary** | Walkthrough implemented; native attempt timed out after 90 seconds, with zero dispatches | Verify native window visibility and host reviewer; prepare a fresh disposable task and rerun `--native-check` | Real human decision, `paired_workstation` receipt, one fixture dispatch, denied replay and read-only reconciliation |
+| **M1 — Human signed review across the broker boundary** | Demonstrated September 5 with actual human native review and one fixture dispatch | Proceed to M2; retain the bounded native-review regressions and readiness probe | `paired_workstation` receipt, one observed fixture dispatch, denied replay before/after restart, MCP/dashboard reconciliation. [Proof](2026-09-05-native-review-proof.md) |
 | **M2 — One real private staging artifact smoke check** | Private template/preflight prepared; live prerequisites unmet and Actions disabled | Recheck workflow/environment/protections; select immutable private artifact and credential references before one reviewed dispatch | Native-approved GitHub dispatch; exact run correlation; fixed smoke command succeeds; replay causes no second dispatch |
 | **M3 — Real source, production identity and unified authorization** | Broker-owned resource authority implemented and exercised with real daemon/gateway fixtures; production selection open | Configure a suitable tenant-aware application source and IdP resource/client contract | Two actual test tenants; permitted read/disclosure; source-level foreign-tenant denial; membership removal, expiry and rotation checks |
 | **M4 — Attestor, counted leases, EMA and bounded SSH** | First attestor slice plus broker/Vault SSH operation implemented | Finish policy/lease integration; demonstrate native approval and provision a selected real host | Compatibility, concurrency, real identity/provisioning and host-operation evidence; certificate issuance alone is insufficient |
@@ -144,15 +144,15 @@ exclusion, after a strict 74-file rebuild and generated-output privacy scan.
 
 - [x] Exercise separate broker/workload custody, protected workstation state
   and operator-pinned enrollment with the actual host reviewer/helper.
-- [ ] Verify the native review window is visible, prepare a fresh fixture and
+- [x] Verify the native review window is usable, prepare a fresh fixture and
   recheck its host reviewer/helper binaries before the next human attempt.
-- [ ] Prepare a current task; show the full repository, workflow, artifact,
+- [x] Prepare a current task; show the full repository, workflow, artifact,
   destination, allowance, expiry and unknown-outcome meaning.
-- [ ] The human completes review and the native ceremony. Record understanding
-  of scope, review time, mistakes and interventions.
-- [ ] Verify `paired_workstation` receipt provenance, observe the fixture result,
+- [x] The human completes review and the native ceremony. Record observed
+  timing and interventions; subjective comprehension was not surveyed.
+- [x] Verify `paired_workstation` receipt provenance, observe the fixture result,
   repeat execution and reconcile without a second dispatch.
-- [ ] Retain a sanitized evidence summary. Key enrollment, a displayed window or
+- [x] Retain a sanitized evidence summary. Key enrollment, a displayed window or
   automatic signature does not close this gate.
 
 Runbook: [release dogfood](../release-dogfood.md). Disposable providers test the
@@ -164,6 +164,13 @@ dispatches**. No completed human decision or successful native receipt is
 recorded. The runner's fail-fast/error-evidence fix is retained; a displayed
 window or automatic fixture signature would not close this gate. See the
 [sanitized attempt record](2026-09-05-milestone-validation.md).
+
+The subsequent [native walkthrough](2026-09-05-native-review-proof.md) completed
+in 10.14 seconds with an actual human decision and native authentication. Exactly
+one fixture dispatch was observed; replay before/after restart, persisted receipt,
+MCP and dashboard reconciliation passed. The earlier timeout remains historical
+evidence with an unconfirmed cause. No real GitHub effect is implied by this M1
+completion.
 
 ### M2: private artifact smoke check
 

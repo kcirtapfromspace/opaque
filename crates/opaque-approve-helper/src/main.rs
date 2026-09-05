@@ -21,12 +21,15 @@ const EXIT_DENIED: u8 = 1;
 const EXIT_UNAVAILABLE: u8 = 2;
 const MAX_REVIEW_BYTES: usize = 128 * 1024;
 
+#[cfg(target_os = "linux")]
+mod process;
 mod review;
 
 #[derive(Debug, PartialEq, Eq)]
 enum HelperRequest {
     Legacy(String),
     ReviewStdin,
+    CheckUi,
 }
 
 fn main() -> ExitCode {
@@ -34,12 +37,26 @@ fn main() -> ExitCode {
         Ok(request) => request,
         Err(()) => {
             eprintln!(
-                "usage: opaque-approve-helper --reason <description> | --review-only --reason-stdin"
+                "usage: opaque-approve-helper --reason <description> | --review-only --reason-stdin | --check-ui"
             );
             return ExitCode::from(EXIT_UNAVAILABLE);
         }
     };
     let reason = match request {
+        HelperRequest::CheckUi => {
+            return match review::check_ui() {
+                Ok(()) => {
+                    println!(
+                        "{{\"check\":\"native_review_ui\",\"ready\":true,\"visibility_verified\":false}}"
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("opaque-approve-helper: {error}");
+                    ExitCode::from(EXIT_UNAVAILABLE)
+                }
+            };
+        }
         HelperRequest::Legacy(reason) => reason,
         HelperRequest::ReviewStdin => {
             let reason = match read_review(std::io::stdin().lock()) {
@@ -49,7 +66,10 @@ fn main() -> ExitCode {
             return ExitCode::from(match review::show(&reason) {
                 Ok(true) => EXIT_APPROVED,
                 Ok(false) => EXIT_DENIED,
-                Err(()) => EXIT_UNAVAILABLE,
+                Err(error) => {
+                    eprintln!("opaque-approve-helper: {error}");
+                    EXIT_UNAVAILABLE
+                }
             });
         }
     };
@@ -111,6 +131,9 @@ fn report_account() {
 
 /// Parse `--reason <text>` from command-line arguments.
 fn parse_request(args: Vec<String>) -> Result<HelperRequest, ()> {
+    if args == ["--check-ui"] {
+        return Ok(HelperRequest::CheckUi);
+    }
     if args.len() == 2 && args[0] == "--reason" && !args[1].trim().is_empty() {
         return Ok(HelperRequest::Legacy(args[1].clone()));
     }
@@ -227,12 +250,18 @@ mod tests {
             parse_request(args(&["--reason", "legacy description"])),
             Ok(HelperRequest::Legacy("legacy description".into()))
         );
+        assert_eq!(
+            parse_request(args(&["--check-ui"])),
+            Ok(HelperRequest::CheckUi)
+        );
         for invalid in [
             vec!["--review-only"],
             vec!["--reason-stdin"],
             vec!["--reason", ""],
             vec!["--review-only", "--reason", "hidden"],
             vec!["--review-only", "--reason-stdin", "extra"],
+            vec!["--check-ui", "--review-only", "--reason-stdin"],
+            vec!["--check-ui", "--reason", "hidden"],
         ] {
             assert!(parse_request(args(&invalid)).is_err());
         }

@@ -8,7 +8,10 @@ repository.workspace = true
 homepage.workspace = true
 description = "Native approval review helper for Opaque"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.3"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSGeometry"] }
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "NSApplication", "NSAlert", "NSButton", "NSControl", "NSScrollView", "NSTextView", "NSText", "NSTextContainer", "NSView", "NSFont", "NSWindow", "NSRunningApplication", "NSResponder", "NSGraphics"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "NSApplication", "NSAlert", "NSButton", "NSControl", "NSScrollView", "NSTextView", "NSText", "NSTextContainer", "NSView", "NSFont", "NSWindow", "NSRunningApplication", "NSResponder", "NSGraphics", "NSScreen"] }

@@ -1,0 +1,16 @@
+# Public official linux/amd64 manifests resolved September 5, 2026.
+# The Python coordinator supplies only an immutable committed source archive.
+FROM rust:1.95.0-slim-bookworm@sha256:6f9e63259f12e1e599296f5ecfed2bae46de4af0ee0525dd8b89c046e236d5c5 AS build
+WORKDIR /src
+COPY source/ /src/
+ARG OPAQUE_BUILD_REVISION
+RUN OPAQUE_BUILD_REVISION="$OPAQUE_BUILD_REVISION" cargo build --locked --release -p opaque
+
+FROM debian:bookworm-slim@sha256:5ae3c39ebd15e229dcedd5cee596b2497182493d41ff162e824ba13fc1b2b867
+ARG OPAQUE_BUILD_REVISION
+LABEL org.opencontainers.image.source="https://github.com/kcirtapfromspace/opaque-dogfood" \
+      org.opencontainers.image.revision="$OPAQUE_BUILD_REVISION"
+COPY --from=build --chmod=0555 /src/target/release/opaque /usr/local/bin/opaque
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/opaque"]
+CMD ["--version"]

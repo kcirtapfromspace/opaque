@@ -59,6 +59,18 @@ class PreflightTests(unittest.TestCase):
         report = preflight.inspect_contract(self.action, self.workflow, api)
         return report, {item["name"]: item for item in report["checks"]}, api
 
+    def test_local_workflow_matches_reviewed_template_and_private_destination_guard(self):
+        installed = preflight.ROOT / preflight.WORKFLOW_PATH
+        self.assertEqual(installed.read_bytes(), self.workflow)
+        self.assertIn(
+            b"if: ${{ github.repository == 'kcirtapfromspace/opaque-dogfood' && "
+            b"github.repository_id == '1357845081' && github.event.repository.private == true }}",
+            self.workflow,
+        )
+        self.assertIn(b"  workflow_dispatch:\n", self.workflow)
+        self.assertNotIn(b"  push:\n", self.workflow)
+        self.assertNotIn(b"  pull_request:\n", self.workflow)
+
     def test_api_success_does_not_forge_artifact_or_authority_evidence(self):
         report, checks, _ = self.inspect()
         self.assertTrue(report["api_prerequisites_met"])

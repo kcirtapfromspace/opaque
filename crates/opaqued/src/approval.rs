@@ -65,6 +65,100 @@ pub async fn prompt(reason: &str) -> Result<PromptOutcome, ApprovalError> {
 
 const MAX_TASK_REVIEW_BYTES: usize = 128 * 1024;
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const REVIEW_STAGES: &[&str] = &[
+    "helper-started",
+    "ui-ready",
+    "window-ordered",
+    "dialog-started",
+    "review-confirmed",
+    "review-cancelled",
+];
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn read_review_stages(
+    output: impl tokio::io::AsyncRead + Unpin,
+    stage: &std::sync::atomic::AtomicUsize,
+) {
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+
+    // Only fixed protocol markers reach the operator. OS dialog output or a
+    // malformed helper cannot leak review content through these diagnostics.
+    let mut reader = BufReader::new(output.take(4096));
+    let mut line = Vec::new();
+    while reader.read_until(b'\n', &mut line).await.unwrap_or(0) > 0 {
+        if let Ok(text) = std::str::from_utf8(&line)
+            && let Some(name) = text
+                .trim_end_matches('\n')
+                .strip_prefix("opaque-review-stage: ")
+            && let Some(index) = REVIEW_STAGES.iter().position(|value| *value == name)
+        {
+            stage.store(index, Ordering::Relaxed);
+            println!("opaque-review-stage: {name}");
+        }
+        line.clear();
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn run_task_review(
+    helper: &std::path::Path,
+    review: &str,
+    deadline: std::time::Duration,
+) -> Result<bool, ApprovalError> {
+    use std::process::Stdio;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::AsyncWriteExt;
+
+    let mut child = tokio::process::Command::new(helper)
+        .args(["--review-only", "--reason-stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|_| {
+            ApprovalError::Failed(
+                "native review helper could not start; run opaque-approver check-native".into(),
+            )
+        })?;
+    let mut stdin = child.stdin.take().ok_or(ApprovalError::Unavailable)?;
+    let stdout = child.stdout.take().ok_or(ApprovalError::Unavailable)?;
+    let stage = AtomicUsize::new(0);
+    let interaction = async {
+        // Include document delivery in the same deadline: a helper that never
+        // reads stdin must not leave the approval waiting indefinitely.
+        stdin.write_all(review.as_bytes()).await?;
+        drop(stdin);
+        let (status, ()) = tokio::join!(child.wait(), read_review_stages(stdout, &stage));
+        status
+    };
+    let result = tokio::time::timeout(deadline, interaction).await;
+    let stage_name = REVIEW_STAGES[stage.load(Ordering::Relaxed)];
+    match result {
+        Err(_) => {
+            // Reap the helper before returning. kill_on_drop also protects
+            // cancellation by a caller whose broker challenge has expired.
+            let _ = child.kill().await;
+            Err(ApprovalError::Failed(format!(
+                "task review timed out after {} seconds (last stage: {stage_name}); no native authorization completed. Check the desktop for Review Opaque task and run opaque-approver check-native before requesting a fresh approval",
+                deadline.as_secs()
+            )))
+        }
+        Ok(Err(_)) => Err(ApprovalError::Failed(format!(
+            "native review helper failed (last stage: {stage_name}); run opaque-approver check-native"
+        ))),
+        Ok(Ok(status)) => match status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(ApprovalError::Failed(format!(
+                "native review UI unavailable (last stage: {stage_name}); run opaque-approver check-native from the signed-in desktop session"
+            ))),
+        },
+    }
+}
+
 fn task_review_text(reason: &str) -> Result<(String, String), ApprovalError> {
     use sha2::{Digest, Sha256};
 
@@ -89,38 +183,20 @@ pub async fn prompt_task(reason: &str) -> Result<PromptOutcome, ApprovalError> {
     let (review, digest) = task_review_text(reason)?;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        use std::process::Stdio;
-        use tokio::io::AsyncWriteExt;
-
         let helper = find_approve_helper()?;
-        let mut child = tokio::process::Command::new(helper)
-            .args(["--review-only", "--reason-stdin"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|_| ApprovalError::Unavailable)?;
-        let mut stdin = child.stdin.take().ok_or(ApprovalError::Unavailable)?;
-        stdin
-            .write_all(review.as_bytes())
-            .await
-            .map_err(|_| ApprovalError::Unavailable)?;
-        drop(stdin);
-        let status = tokio::time::timeout(std::time::Duration::from_secs(90), child.wait())
-            .await
-            .map_err(|_| ApprovalError::Failed("task review timed out".into()))?
-            .map_err(|_| ApprovalError::Unavailable)?;
-        match status.code() {
-            Some(0) => {}
-            Some(1) => return Ok(PromptOutcome::Denied),
-            _ => return Err(ApprovalError::Unavailable),
+        if !run_task_review(&helper, &review, std::time::Duration::from_secs(90)).await? {
+            return Ok(PromptOutcome::Denied);
         }
         let short_reason = format!(
             "Authorize the task just reviewed in Opaque. Review fingerprint: {}",
             &digest[..16]
         );
-        prompt(&short_reason).await
+        println!("opaque-review-stage: authenticating");
+        let outcome = prompt(&short_reason).await;
+        if outcome.is_err() {
+            eprintln!("opaque-review-stage: authentication-failed");
+        }
+        outcome
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -303,6 +379,103 @@ fn find_approve_helper() -> Result<std::path::PathBuf, ApprovalError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn review_diagnostics_accept_only_fixed_markers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let stage = AtomicUsize::new(0);
+        read_review_stages(
+            &b"review content must not become diagnostics\nopaque-review-stage: ui-ready\nopaque-review-stage: secret=value\nopaque-review-stage: window-ordered\n"[..],
+            &stage,
+        )
+        .await;
+        assert_eq!(
+            REVIEW_STAGES[stage.load(Ordering::Relaxed)],
+            "window-ordered"
+        );
+        let stage = AtomicUsize::new(0);
+        let oversized = format!(
+            "{}\nopaque-review-stage: review-confirmed\n",
+            "x".repeat(4096)
+        );
+        read_review_stages(oversized.as_bytes(), &stage).await;
+        assert_eq!(stage.load(Ordering::Relaxed), 0);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn review_test_helper(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("review-helper");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        (directory, path)
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn review_timeout_reports_last_stage_and_reaps_helper() {
+        let (_directory, helper) = review_test_helper(
+            "printf '%s\\n' $$ > \"$0.pid\"\nprintf '%s\\n' 'opaque-review-stage: window-ordered'\nexec /bin/sleep 5",
+        );
+        let started = std::time::Instant::now();
+        let error = run_task_review(&helper, "complete task", std::time::Duration::from_secs(1))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("task review timed out"));
+        assert!(error.contains("last stage: window-ordered"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        let pid: i32 = std::fs::read_to_string(helper.with_extension("pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: signal zero performs a liveness check without sending a
+        // signal; the pid was written by this test's disposable helper.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn unread_review_input_cannot_escape_the_deadline() {
+        let (_directory, helper) = review_test_helper("exec /bin/sleep 5");
+        let started = std::time::Instant::now();
+        let error = run_task_review(
+            &helper,
+            &"x".repeat(MAX_TASK_REVIEW_BYTES),
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("task review timed out"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn helper_markers_cannot_override_denial_or_failure() {
+        let (_directory, helper) = review_test_helper(
+            "cat >/dev/null\nprintf '%s\\n' 'opaque-review-stage: review-confirmed'\nexit 1",
+        );
+        assert!(
+            !run_task_review(&helper, "task", std::time::Duration::from_secs(2))
+                .await
+                .unwrap()
+        );
+        let (_directory, helper) = review_test_helper("cat >/dev/null\nexit 2");
+        let error = run_task_review(&helper, "task", std::time::Duration::from_secs(2))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("native review UI unavailable"));
+    }
 
     #[test]
     fn empty_reason_returns_invalid() {

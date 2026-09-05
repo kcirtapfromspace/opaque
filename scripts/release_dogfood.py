@@ -49,6 +49,16 @@ PROVIDER_PORT = 18901
 APPROVAL_PORT = 18902
 SOCKET = "/run/opaque/opaqued.sock"
 BROKER_STATE = "/var/lib/opaque"
+HOST_ENV_KEYS = ("PATH", "HOME", "USER", "LANG", "LC_ALL", "TMPDIR")
+# Native Linux review needs the current desktop session. Preserve only its
+# connection metadata, never broad provider/authentication environment values.
+DESKTOP_ENV_KEYS = ("DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR",
+                    "DBUS_SESSION_BUS_ADDRESS", "XAUTHORITY")
+
+
+def host_environment(native=False):
+    keys = HOST_ENV_KEYS + (DESKTOP_ENV_KEYS if native else ())
+    return {key: os.environ[key] for key in keys if key in os.environ}
 
 
 def dump(path: Path, value):
@@ -72,6 +82,48 @@ def port_available(port):
     with socket.socket() as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(("127.0.0.1", port))
+
+
+def native_readiness(binary_directory, env):
+    """Check the actual host binaries before starting a timed approval.
+
+    This probe never creates workstation custody or asks for a decision. Its
+    result is deliberately weaker than evidence of a visible, completed review.
+    """
+    directory = Path(binary_directory).expanduser().resolve()
+    identities = {}
+    for name in ("opaque-approver", "opaque-approve-helper"):
+        path = directory / name
+        if not path.is_file() or not os.access(path, os.X_OK):
+            raise RuntimeError(f"Native executable missing or not executable: {path}. "
+                               "Build both host reviewers and select --native-bin-dir.")
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        identities[name] = digest.hexdigest()
+    result = execute([str(directory / "opaque-approver"), "check-native"],
+                     env=env, timeout=15, check=False)
+    if result.returncode:
+        # The probe's diagnostics are fixed native readiness messages, not an
+        # approval document or provider response. Keep the exact error local.
+        raise RuntimeError("Native readiness failed before task creation: "
+                           + result.stderr.strip()[-1000:])
+    try:
+        probe = json.loads(result.stdout)
+        valid = (isinstance(probe, dict) and probe.get("check") == "native_review"
+                 and probe.get("ready") is True
+                 and probe.get("authentication_available") is True
+                 and probe.get("visibility_verified") is False)
+    except ValueError:
+        valid = False
+    if not valid:
+        raise RuntimeError("Native readiness returned an unsupported or incomplete report; "
+                           "rebuild both host reviewers from this checkout.")
+    return {"schema_version": 1, "check": "native_review", "ready": True,
+            "authentication_available": True, "visibility_verified": False,
+            "human_approval": False, "binary_directory": str(directory),
+            "binary_sha256": identities}
 
 
 class FixtureServer(ThreadingHTTPServer):
@@ -373,6 +425,10 @@ class ReleaseDogfood:
             raise RuntimeError("Choose a disposable directory, not ~/.opaque")
         if self.directory.exists() and any(self.directory.iterdir()) and not marker.exists():
             raise RuntimeError("Data directory must be empty or marked as a release fixture")
+        if args.native_check and any((self.directory / name).exists() for name in (
+                "native-review-evidence.json", "native-progress.json", "native-approved-receipt.json")):
+            raise RuntimeError("A native attempt already exists here; choose a fresh --data-dir "
+                               "to preserve its evidence before starting any fixture resources.")
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.directory.chmod(0o700)
         previous = json.loads(marker.read_text()) if marker.exists() else {}
@@ -390,11 +446,12 @@ class ReleaseDogfood:
         # provider/client container. Approver custody is never mounted there.
         for directory in (self.fixture_dir, self.bin_dir, self.input_dir):
             directory.chmod(0o755)
-        self.clean_env = {key: os.environ[key] for key in ("PATH", "HOME", "USER", "LANG", "LC_ALL", "TMPDIR") if key in os.environ}
+        self.clean_env = host_environment(args.native)
         self.signer = None
         self.logs = []
         self.container_names = []
         self.task_id = None
+        self.native_bin_dir = (args.native_bin_dir or ROOT / "target/debug").expanduser().resolve()
         self.workstation_port = args.approval_port
         self.openssl = shutil.which("openssl")
         if not self.openssl:
@@ -419,6 +476,11 @@ class ReleaseDogfood:
         return len(path.read_text().splitlines()) if path.exists() else 0
 
     def build(self):
+        if self.args.native:
+            readiness = native_readiness(self.native_bin_dir, self.clean_env)
+            dump(self.directory / "native-readiness.json", readiness)
+            print("Native UI and authentication preflight passed; no approval requested. "
+                  "Window visibility still requires the human walkthrough.", flush=True)
         self.docker("version", "--format", "{{.Server.Version}}")
         for image in (RUST_IMAGE, RUNTIME_IMAGE, self.args.python_image):
             self.docker("image", "inspect", image)
@@ -427,9 +489,6 @@ class ReleaseDogfood:
             command = ["docker", "run", "--rm", "-v", f"{ROOT}:/work:ro", "-v", "opaque-linux-target:/ctarget", "-v", "opaque-linux-cargo-registry:/usr/local/cargo/registry", "-v", "opaque-linux-rustup:/usr/local/rustup", "-e", "CARGO_TARGET_DIR=/ctarget", "-e", "CARGO_INCREMENTAL=0", "-w", "/work", RUST_IMAGE, "cargo", "build", "--locked", "-p", "opaqued", "-p", "opaque", "-p", "opaque-web", "-p", "opaque-mcp"]
             subprocess.run(command, check=True, cwd=ROOT)
         self.docker("run", "--rm", "-v", "opaque-linux-target:/ctarget:ro", "-v", f"{self.bin_dir}:/out", RUNTIME_IMAGE, "sh", "-c", "cp /ctarget/debug/opaqued /ctarget/debug/opaque /ctarget/debug/opaque-web /ctarget/debug/opaque-mcp /out/ && chmod 755 /out/*")
-        if self.args.native and not all((ROOT / "target/debug" / name).exists()
-                                        for name in ("opaque-approver", "opaque-approve-helper")):
-            raise RuntimeError("Build native opaque-approver and opaque-approve-helper first")
 
     def prepare(self):
         workflow_path = ROOT / "examples/staging-release/opaque-staging-release.workflow.yml"
@@ -442,7 +501,7 @@ class ReleaseDogfood:
         if self.args.native:
             key_path = self.signer_dir / "public-key.txt"
             if not key_path.exists():
-                result = execute([str(ROOT / "target/debug/opaque-approver"), "init", "--state-dir", str(self.signer_dir), "--name", "Release dogfood workstation"], env=self.clean_env)
+                result = execute([str(self.native_bin_dir / "opaque-approver"), "init", "--state-dir", str(self.signer_dir), "--name", "Release dogfood workstation"], env=self.clean_env)
                 (self.directory / "approver-init.txt").write_text(result.stdout)
                 public = json.loads(result.stdout).get("public_key_hex", "")
                 if not re.fullmatch("[0-9a-f]{64}", public):
@@ -555,7 +614,7 @@ setpriv --reuid=7381 --regid=7381 --clear-groups /opt/opaque/opaque setup --seal
         self.broker_id = challenge["broker_id"]
         (self.directory / "broker-id.txt").write_text(self.broker_id + "\n")
         if self.args.native:
-            execute([str(ROOT / "target/debug/opaque-approver"), "enroll", "--state-dir", str(self.signer_dir), "--broker", f"https://127.0.0.1:{self.workstation_port}", "--broker-id", self.broker_id, "--tls-fingerprint", self.fingerprint], env=self.clean_env)
+            execute([str(self.native_bin_dir / "opaque-approver"), "enroll", "--state-dir", str(self.signer_dir), "--broker", f"https://127.0.0.1:{self.workstation_port}", "--broker-id", self.broker_id, "--tls-fingerprint", self.fingerprint], env=self.clean_env)
         else:
             log = (self.signer_dir / "test-signer.log").open("a")
             self.logs.append(log)
@@ -627,14 +686,40 @@ setpriv --reuid=7381 --regid=7381 --clear-groups /opt/opaque/opaque setup --seal
         """Open real human review, then verify its bounded fixture effect."""
         if not self.args.native:
             raise RuntimeError("Native walkthrough requires native workstation mode")
+        if (self.directory / "native-review-evidence.json").exists():
+            raise RuntimeError("A native attempt already exists here; choose a fresh --data-dir "
+                               "to preserve its evidence.")
+        baseline = self.count_dispatches()
+        self.native_stage = "custody"
+        try:
+            self._native_check(baseline)
+        except (RuntimeError, OSError, ValueError, subprocess.SubprocessError, AssertionError, KeyboardInterrupt) as error:
+            dump(self.directory / "native-review-evidence.json", {
+                "passed": False, "task_id": self.task_id,
+                "observed_dispatches": self.count_dispatches() - baseline,
+                "reason": ("native_walkthrough_interrupted" if isinstance(error, KeyboardInterrupt)
+                           else "native_walkthrough_did_not_complete"),
+                "stage": self.native_stage, "error_type": type(error).__name__,
+                "provider": "disposable_loopback_fixture", "live_github": False,
+            })
+            raise
+
+    def native_progress(self, stage, **facts):
+        self.native_stage = stage
+        dump(self.directory / "native-progress.json", {
+            "stage": stage, "task_id": self.task_id,
+            "provider": "disposable_loopback_fixture", **facts,
+        })
+
+    def _native_check(self, baseline):
         self.assert_custody()
         self.control(observation="succeeded")
-        baseline = self.count_dispatches()
+        self.native_progress("planning")
         planned, _ = self.task("plan", "--manifest", "/input/manifest.json")
         self.task_id = planned["id"]
         command = ["docker", "exec", self.agent_name, "/opt/opaque/opaque",
                    "--socket", SOCKET, "--json", "task", "run", self.task_id]
-        approver = str(ROOT / "target/debug/opaque-approver")
+        approver = str(self.native_bin_dir / "opaque-approver")
         started = time.monotonic()
         print("NATIVE HUMAN REVIEW: one disposable provider dispatch. "
               "Review the full document and authenticate in the native window. "
@@ -644,6 +729,7 @@ setpriv --reuid=7381 --regid=7381 --clear-groups /opt/opaque/opaque setup --seal
              (self.directory / "native-task.stderr").open("w") as errors:
             process = subprocess.Popen(command, stdout=output, stderr=errors)
             try:
+                self.native_progress("awaiting_challenge")
                 deadline = time.monotonic() + 30
                 while True:
                     pending = execute([approver, "list", "--state-dir", str(self.signer_dir)],
@@ -659,6 +745,10 @@ setpriv --reuid=7381 --regid=7381 --clear-groups /opt/opaque/opaque setup --seal
                     if process.poll() is not None or time.monotonic() >= deadline:
                         raise RuntimeError("Native approval did not become pending")
                     time.sleep(0.25)
+                self.native_progress("native_review", approval_id=approval_id)
+                print(f"Opening native review for task {self.task_id}. "
+                      "The review has a 90-second deadline, followed by native authentication. "
+                      "Only the human can confirm or cancel it.", flush=True)
                 review = execute([approver, "review", "--state-dir", str(self.signer_dir),
                                   "--approval-id", approval_id],
                                  env=self.clean_env, timeout=200, check=False)
@@ -666,6 +756,7 @@ setpriv --reuid=7381 --regid=7381 --clear-groups /opt/opaque/opaque setup --seal
                 if review.returncode:
                     raise RuntimeError("Native review did not complete; inspect native-review.log. "
                                        "No human-approval success is claimed.")
+                self.native_progress("task_completion", approval_id=approval_id)
                 status = process.wait(timeout=30)
                 output.seek(0)
                 payload = json.load(output)
@@ -673,27 +764,27 @@ setpriv --reuid=7381 --regid=7381 --clear-groups /opt/opaque/opaque setup --seal
                 if status or payload.get("error"):
                     raise RuntimeError("Native review/task did not complete; inspect the retained "
                                        "native review log. No human-approval success is claimed.")
-            except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as error:
-                dump(self.directory / "native-review-evidence.json", {
-                    "passed": False, "task_id": self.task_id,
-                    "observed_dispatches": self.count_dispatches() - baseline,
-                    "reason": "native_review_or_task_did_not_complete",
-                    "error_type": type(error).__name__,
-                })
-                raise
             finally:
                 if process.poll() is None:
                     process.terminate()
-                    process.wait(timeout=5)
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+        self.native_progress("receipt_validation", approval_id=approval_id)
         self.validate_receipt(completed)
         validate_native_completion(completed, self.count_dispatches() - baseline)
+        self.native_progress("reconciliation", approval_id=approval_id)
         observed, _ = self.task("reconcile", self.task_id)
         self.validate_receipt(observed)
         if observed["release_observation"]["state"] != "succeeded":
             raise RuntimeError("Native-approved fixture workflow did not reconcile successfully")
+        self.native_progress("replay_check", approval_id=approval_id)
         _, denied = self.task("run", self.task_id, allow_error=True)
         if not denied or self.count_dispatches() != baseline + 1:
             raise RuntimeError("Native-approved task replay was not bounded to one dispatch")
+        self.native_progress("restart_check", approval_id=approval_id)
         self.docker("restart", self.broker_name)
         deadline = time.monotonic() + 20
         while True:
@@ -712,6 +803,7 @@ setpriv --reuid=7381 --regid=7381 --clear-groups /opt/opaque/opaque setup --seal
         _, denied = self.task("run", self.task_id, allow_error=True)
         if not denied or self.count_dispatches() != baseline + 1:
             raise RuntimeError("Restart replenished native-approved dispatch authority")
+        self.native_progress("mcp_dashboard", approval_id=approval_id)
         self.check_mcp(restored)
         self.check_web(restored)
         dump(self.directory / "native-approved-receipt.json", restored)
@@ -723,6 +815,7 @@ setpriv --reuid=7381 --regid=7381 --clear-groups /opt/opaque/opaque setup --seal
             "provider": "disposable_loopback_fixture", "live_github": False,
             "biometric_attestation": False,
         })
+        self.native_progress("passed", approval_id=approval_id)
         print("NATIVE CHECK PASSED: paired-workstation human review; one fixture dispatch; "
               "reconciliation, replay denial, restart, MCP and dashboard verified.", flush=True)
 
@@ -869,7 +962,7 @@ setpriv --reuid=7381 --regid=7381 --clear-groups /opt/opaque/opaque setup --seal
         print("Run task: " + shlex.join(["docker", "exec", self.agent_name, "/opt/opaque/opaque", "--socket", SOCKET, "task", "run", self.task_id]), flush=True)
         print("MCP: " + shlex.join(["docker", "exec", "-i", self.agent_name, "/opt/opaque/opaque-mcp"]), flush=True)
         if self.args.native:
-            print("Review pending approvals: " + shlex.join([str(ROOT / "target/debug/opaque-approver"), "list", "--state-dir", str(self.signer_dir)]), flush=True)
+            print("Review pending approvals: " + shlex.join([str(self.native_bin_dir / "opaque-approver"), "list", "--state-dir", str(self.signer_dir)]), flush=True)
             print("Review one: opaque-approver review --state-dir " + shlex.quote(str(self.signer_dir)) + " --approval-id ID", flush=True)
         print("Ctrl-C stops these fixture containers; state volumes are retained. Cleanup command is saved in cleanup.txt.", flush=True)
         while True:
@@ -921,13 +1014,23 @@ def main():
     mode.add_argument("--check", action="store_true", help="Run the disposable automated signed-protocol check (default)")
     mode.add_argument("--serve", action="store_true", help="Keep isolated broker, agent, providers, and dashboard running")
     mode.add_argument("--native-check", action="store_true", help="Open human native review, verify one fixture dispatch and replay/restart, then clean up")
+    mode.add_argument("--native-preflight", action="store_true", help="Check host UI/authentication without creating a task, custody, or containers")
     parser.add_argument("--native", action="store_true", help="Use the native host workstation reviewer with --serve (implied by --native-check)")
+    parser.add_argument("--native-bin-dir", type=Path, help="Directory containing the built host opaque-approver and opaque-approve-helper (default: target/debug)")
     parser.add_argument("--data-dir", type=Path)
     parser.add_argument("--port", type=int, default=19393)
     parser.add_argument("--approval-port", type=int, default=19443)
     parser.add_argument("--no-build", action="store_true", help="Copy existing Linux binaries from opaque-linux-target")
     parser.add_argument("--python-image", default=PYTHON_IMAGE)
     args = parser.parse_args()
+    if args.native_preflight:
+        try:
+            env = host_environment(native=True)
+            print(json.dumps(native_readiness(args.native_bin_dir or ROOT / "target/debug", env), indent=2))
+            return 0
+        except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+            print("NATIVE PREFLIGHT FAILED: " + str(error), file=sys.stderr)
+            return 1
     if args.native_check:
         args.native = True
     if not 1 <= args.port < 65535 or not 1 <= args.approval_port <= 65535 or args.port == args.approval_port or {args.port, args.port + 1} & {PROVIDER_PORT, APPROVAL_PORT}:
@@ -950,7 +1053,7 @@ def main():
         else:
             environment.check()
     except KeyboardInterrupt:
-        pass
+        return 130
     except (RuntimeError, subprocess.SubprocessError, OSError, AssertionError) as error:
         print("RELEASE DOGFOOD FAILED: " + str(error), file=sys.stderr)
         return 1

@@ -30,6 +30,8 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Check local review and authentication capability without opening a prompt.
+    CheckNative,
     /// Generate a dedicated workstation identity; prints public enrollment data only.
     Init {
         #[arg(long)]
@@ -87,6 +89,7 @@ async fn run(args: Args) -> Result<(), String> {
         );
     }
     match args.command {
+        Command::CheckNative => check_native().await?,
         Command::Init { state_dir, name } => {
             let state = custody::initialize(&state_dir, &name)?;
             println!(
@@ -265,6 +268,104 @@ async fn run(args: Args) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+async fn check_native() -> Result<(), String> {
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    let helper = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|dir| dir.join("opaque-approve-helper")))
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            [
+                "/usr/local/bin/opaque-approve-helper",
+                "/usr/bin/opaque-approve-helper",
+            ]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|path| path.is_file())
+        })
+        .ok_or("native review helper missing; build or install it beside opaque-approver")?;
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new(helper)
+            .arg("--check-ui")
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| "native review capability check timed out; inspect the desktop session")?
+    .map_err(|_| "native review helper could not start; check its installation and permissions")?;
+    if !output.status.success() {
+        // A fixed diagnostic avoids forwarding arbitrary OS/helper output.
+        return Err("native review UI unavailable; run opaque-approve-helper --check-ui from the signed-in desktop session for details".into());
+    }
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_| "native review helper returned an invalid capability report; rebuild both host binaries")?;
+    if result["check"] != "native_review_ui"
+        || result["ready"] != true
+        || result["visibility_verified"] != false
+    {
+        return Err("native review helper capability mismatch; rebuild both host binaries".into());
+    }
+    check_authentication()?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "check": "native_review",
+            "ready": true,
+            "visibility_verified": false,
+            "authentication_available": true,
+        })
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn check_authentication() -> Result<(), String> {
+    use objc2_local_authentication::{LAContext, LAPolicy};
+    // This capability query does not evaluate policy, display UI or accept a
+    // decision. A successful result is not evidence of native authentication.
+    let context = unsafe { LAContext::new() };
+    unsafe { context.canEvaluatePolicy_error(LAPolicy::DeviceOwnerAuthentication) }
+        .map_err(|_| "native authentication unavailable in this macOS session".into())
+}
+
+#[cfg(target_os = "linux")]
+fn check_authentication() -> Result<(), String> {
+    use std::process::{Command, Stdio};
+    let status = Command::new("pkcheck")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|_| "pkcheck is required for native authentication")?;
+    if !status.success() {
+        return Err("polkit authentication tools are unavailable".into());
+    }
+    // Inspect the daemon's registered action without checking or granting an
+    // authorization. Tool installation alone does not prove polkit is ready.
+    let action = Command::new("pkaction")
+        .args(["--action-id", "com.opaque.approve"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|_| "pkaction is required to inspect native authentication readiness")?;
+    if !action.status.success()
+        || std::str::from_utf8(&action.stdout).map(str::trim) != Ok("com.opaque.approve")
+    {
+        return Err("polkit approval action unavailable; install the Opaque policy and verify the polkit service".into());
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn check_authentication() -> Result<(), String> {
+    Err("native authentication is unsupported on this platform".into())
 }
 
 fn uuid_like(value: &str) -> Option<()> {
