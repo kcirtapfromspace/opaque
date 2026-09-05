@@ -39,6 +39,9 @@ const PUBLIC_FIXTURE: &str = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQ
 #[path = "gateway/bounded_demo.rs"]
 mod bounded_demo;
 
+#[path = "gateway/exploration.rs"]
+mod exploration;
+
 struct TestDirectory(PathBuf);
 impl TestDirectory {
     fn new() -> Self {
@@ -2002,11 +2005,11 @@ fn event_value(events: &str, kind: &str) -> Value {
     .unwrap()
 }
 #[tokio::test]
-async fn portfolio_chat_uses_one_plan_and_computed_answer_with_exact_source_binding() {
+async fn portfolio_chat_plans_and_selects_computed_findings_with_exact_source_binding() {
     let fixture = Fixture::portfolio(true, false).await;
     portfolio_source(&fixture, Duration::ZERO).await;
     let query = portfolio_args()["arguments"].clone();
-    Mock::given(method("POST")).and(path("/v1/chat/completions")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":json!({"name":"opaque_portfolio_query","arguments":query}).to_string()}}]}))).expect(1).mount(&fixture.model).await;
+    exploration::model_plan(&fixture, json!({"kind":"query","interpretation":"Compare channel review rates over the last 15 minutes.","queries":[query]}), None).await;
     let token = credit_token(&fixture);
     let cookie = fixture.login(&token).await;
     let session = body(
@@ -2030,14 +2033,19 @@ async fn portfolio_chat_uses_one_plan_and_computed_answer_with_exact_source_bind
     let result = event_value(&events, "portfolio_result");
     assert_eq!(result["coverage"], "complete");
     assert_eq!(result["query"], query);
-    assert_eq!(event_value(&events, "answer")["text"], result["answer"]);
+    assert!(
+        event_value(&events, "answer")["text"]
+            .as_str()
+            .unwrap()
+            .contains("Partner has the highest manual review rate: 30.00 %")
+    );
     assert!(
         result["answer"]
             .as_str()
             .unwrap()
             .contains("Partner has the highest manual review rate: 30.00 %")
     );
-    assert_eq!(fixture.model.received_requests().await.unwrap().len(), 1);
+    assert_eq!(fixture.model.received_requests().await.unwrap().len(), 2);
     let calls = fixture.source.received_requests().await.unwrap();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].headers["authorization"], "Bearer opaque-metrics");
@@ -2141,7 +2149,21 @@ async fn portfolio_denies_unsupported_history_fields_and_scope_before_model_or_s
         "Watch manual review rate over the last 15 minutes",
     ] {
         let events = chat_events(&fixture, &cookie, question).await;
-        assert!(events.contains("event: error"), "{events}");
+        assert!(
+            events.contains("event: error")
+                || (events.contains("event: answer")
+                    && event_value(&events, "answer")["kind"] == "unsupported"),
+            "{events}"
+        );
+        assert!(!events.contains("event: portfolio_result"), "{events}");
+        assert!(
+            fixture.model.received_requests().await.unwrap().is_empty(),
+            "unsupported request reached the model: {question}"
+        );
+        assert!(
+            fixture.source.received_requests().await.unwrap().is_empty(),
+            "unsupported request reached the source: {question}"
+        );
     }
     let token =
         fixture.token(&fixture.claims(&["portfolio:read", "portfolio:measure:application_count"]));

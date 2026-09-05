@@ -776,11 +776,12 @@ async fn session(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
             && !measures.is_empty();
         value["dataset"] = portfolio::dataset(&measures, &app.config.source.source_id, can_query);
         value["suggested_questions"] = json!([
-            "Which channel has the highest manual review rate in the last 15 minutes?",
+            "What stands out in our application data?",
+            "Are reviews increasing because we have more applications, or a higher review rate?",
+            "Which channel is giving our review team the most work?",
+            "Are applications moving faster or slower than before?",
             "Compare mobile identity mismatch rates with the previous 15 minutes",
-            "Show processing time by channel over the last hour",
-            "Show application volume trends over the last hour",
-            "Watch our manual review rate live"
+            "Show processing time by channel over the last hour"
         ]);
         let mut tools = vec![];
         if permitted && access.require_scope("metrics:read").is_ok() {
@@ -2143,7 +2144,10 @@ async fn emit(tx: &mpsc::Sender<ChatEvent>, kind: &str, value: Value) -> Result<
             .event(kind)
             .json_data(value)
             .map_err(|_| "event encoding failed")?,
-        matches!(kind, "result" | "portfolio_result" | "answer" | "tool"),
+        matches!(
+            kind,
+            "result" | "portfolio_result" | "answer" | "tool" | "interpretation"
+        ),
     )))
     .await
     .map_err(|_| "client disconnected".into())
@@ -2642,57 +2646,144 @@ async fn run_portfolio_chat(
     access
         .require_scope("metrics:explain")
         .map_err(|e| e.to_string())?;
-    let query = app
+    let plan = app
         .model
-        .plan_portfolio(message, &allowed_portfolio(app, access))
+        .plan_exploration(message, &allowed_portfolio(app, access))
         .await?;
     app.check_data(access, epoch)?;
-    portfolio_scope(app, access, &query)?;
-    policy_event_for((app,access,tx,portfolio::TOOL),"tool_check","allowed","tool_scope_allowed","Portfolio measures and query bounds checked. MCP will independently authorize the customer aggregate read.",false).await?;
-    let evidence_id = Uuid::new_v4().to_string();
-    emit(tx,"tool",json!({"name":portfolio::TOOL,"phase":"request","message":format!("Authorized portfolio aggregates · {} second window",query.window_secs),"evidence_id":evidence_id})).await?;
-    app.check_data(access, epoch)?;
-    portfolio_scope(app, access, &query)?;
-    app.activity_portfolio(activity, &query);
-    let response=app.http.post(format!("{}/mcp",app.config.public_origin)).bearer_auth(token).header("X-Opaque-Persona-Generation",epoch.unwrap_or(0)).header(header::ACCEPT,"application/json, text/event-stream").header("MCP-Protocol-Version","2025-11-25").json(&json!({"jsonrpc":"2.0","id":evidence_id,"method":"tools/call","params":{"name":portfolio::TOOL,"arguments":query}})).send().await.map_err(|_|"MCP portfolio request did not complete; no retry was made.")?;
-    let body = bounded_json(response)
-        .await
-        .map_err(|_| "MCP returned no usable portfolio response; no retry was made.")?;
-    if body.pointer("/result/isError").and_then(Value::as_bool) != Some(false) {
-        return Err("MCP returned no authorized, complete portfolio evidence.".into());
+    let queries = match plan {
+        crate::chat::ExplorationPlan::Query { queries, .. } => queries,
+        crate::chat::ExplorationPlan::Clarify { question } => {
+            app.finish_activity(activity, "clarification", Some(false), None);
+            emit(
+                tx,
+                "answer",
+                json!({"text":question,"kind":"clarification","source_accessed":false}),
+            )
+            .await?;
+            return Ok(());
+        }
+        crate::chat::ExplorationPlan::Unsupported { reason } => {
+            app.finish_activity(activity, "unsupported", Some(false), None);
+            emit(
+                tx,
+                "answer",
+                json!({"text":reason,"kind":"unsupported","source_accessed":false}),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    // Validate the entire proposal before the first read. The model never
+    // chooses the customer, source, identity, credentials or query allowance.
+    if queries.is_empty() || queries.len() > 4 {
+        return Err("Investigation exceeds the four-query allowance.".into());
     }
-    let evidence: PortfolioEvidence = serde_json::from_value(
-        body.pointer("/result/structuredContent")
-            .cloned()
-            .ok_or("MCP evidence absent")?,
+    for query in &queries {
+        portfolio_scope(app, access, query)?;
+    }
+    let description = crate::exploration::plan_description(&queries);
+    let description = if app.model.is_fixture() {
+        format!("Deterministic test scenario (no language model). {description}")
+    } else {
+        description
+    };
+    emit(
+        tx,
+        "interpretation",
+        json!({"text":description,"query_count":queries.len()}),
     )
-    .map_err(|_| "MCP portfolio evidence invalid")?;
-    evidence.snapshot.validate(
-        access.tenant_id(),
-        &query,
-        &allowed_portfolio(app, access),
-        now(),
-        app.config.source.max_staleness_secs,
-    )?;
-    if evidence.source_id != app.config.source.source_id
-        || evidence.coverage != "complete"
-        || evidence.observed_at > now() + 5
-        || evidence.observed_at < now() - i64::from(app.config.source.max_staleness_secs)
-    {
-        return Err("MCP source or coverage did not match the authorized query.".into());
+    .await?;
+    let mut collected = Vec::new();
+    for query in &queries {
+        app.check_data(access, epoch)?;
+        portfolio_scope(app, access, query)?;
+        policy_event_for((app,access,tx,portfolio::TOOL),"tool_check","allowed","tool_scope_allowed","Portfolio measures and query bounds checked. MCP will independently authorize the customer aggregate read.",!collected.is_empty()).await?;
+        let evidence_id = Uuid::new_v4().to_string();
+        emit(tx,"tool",json!({"name":portfolio::TOOL,"phase":"request","message":format!("Authorized portfolio aggregates · {} second window",query.window_secs),"evidence_id":evidence_id})).await?;
+        app.check_data(access, epoch)?;
+        portfolio_scope(app, access, query)?;
+        app.activity_portfolio(activity, query);
+        let response=app.http.post(format!("{}/mcp",app.config.public_origin)).bearer_auth(token).header("X-Opaque-Persona-Generation",epoch.unwrap_or(0)).header(header::ACCEPT,"application/json, text/event-stream").header("MCP-Protocol-Version","2025-11-25").json(&json!({"jsonrpc":"2.0","id":evidence_id,"method":"tools/call","params":{"name":portfolio::TOOL,"arguments":query}})).send().await.map_err(|_|"MCP portfolio request did not complete; no retry was made.")?;
+        let body = bounded_json(response)
+            .await
+            .map_err(|_| "MCP returned no usable portfolio response; no retry was made.")?;
+        if body.pointer("/result/isError").and_then(Value::as_bool) != Some(false) {
+            return Err("MCP returned no authorized, complete portfolio evidence.".into());
+        }
+        let evidence: PortfolioEvidence = serde_json::from_value(
+            body.pointer("/result/structuredContent")
+                .cloned()
+                .ok_or("MCP evidence absent")?,
+        )
+        .map_err(|_| "MCP portfolio evidence invalid")?;
+        evidence.snapshot.validate(
+            access.tenant_id(),
+            query,
+            &allowed_portfolio(app, access),
+            now(),
+            app.config.source.max_staleness_secs,
+        )?;
+        if evidence.source_id != app.config.source.source_id
+            || evidence.coverage != "complete"
+            || evidence.observed_at > now() + 5
+            || evidence.observed_at < now() - i64::from(app.config.source.max_staleness_secs)
+        {
+            return Err("MCP source or coverage did not match the authorized query.".into());
+        }
+        app.check_data(access, epoch)?;
+        portfolio_scope(app, access, query)?;
+        app.finish_activity(activity, "running", Some(true), None);
+        policy_event_for((app,access,tx,portfolio::TOOL),"source_read","allowed","source_evidence_received","Complete portfolio aggregates received from the authorized customer source. Answers are computed from this evidence.",true).await?;
+        app.check_data(access, epoch)?;
+        portfolio_scope(app, access, query)?;
+        portfolio_audit(app, access, &evidence)?;
+        let mut presentation = evidence.presentation(&evidence_id);
+        presentation["partial"] = json!(true);
+        emit(tx, "portfolio_result", presentation).await?;
+        app.check_data(access, epoch)?;
+        portfolio_scope(app, access, query)?;
+        emit(tx,"tool",json!({"name":portfolio::TOOL,"phase":"complete","message":"Validated portfolio aggregates received","evidence_id":evidence_id})).await?;
+        collected.push((evidence_id, evidence));
     }
-    app.check_data(access, epoch)?;
-    portfolio_scope(app, access, &query)?;
-    app.finish_activity(activity, "running", Some(true), None);
-    policy_event_for((app,access,tx,portfolio::TOOL),"source_read","allowed","source_evidence_received","Complete portfolio aggregates received from the authorized customer source. Answers are computed from this evidence.",true).await?;
-    app.check_data(access, epoch)?;
-    portfolio_scope(app, access, &query)?;
-    portfolio_audit(app, access, &evidence)?;
-    emit(tx, "portfolio_result", evidence.presentation(&evidence_id)).await?;
-    app.check_data(access, epoch)?;
-    portfolio_scope(app, access, &query)?;
-    emit(tx,"tool",json!({"name":portfolio::TOOL,"phase":"complete","message":"Validated portfolio aggregates received","evidence_id":evidence_id})).await?;
-    app.check_data(access, epoch)?;
-    emit(tx, "answer", json!({"text":evidence.answer()})).await?;
+    let verify_disclosure = || -> Result<(), String> {
+        app.check_data(access, epoch)?;
+        access
+            .require_scope("metrics:explain")
+            .map_err(|e| e.to_string())?;
+        for (_, evidence) in &collected {
+            portfolio_scope(app, access, &evidence.snapshot.query)?;
+            // Freshness was checked at the read. Findings describe that
+            // immutable observation time, even if model selection takes longer
+            // than the live-source freshness interval. Authority stays live.
+            evidence.snapshot.validate(
+                access.tenant_id(),
+                &evidence.snapshot.query,
+                &allowed_portfolio(app, access),
+                evidence.observed_at,
+                app.config.source.max_staleness_secs,
+            )?;
+        }
+        Ok(())
+    };
+    verify_disclosure()?;
+    let catalog = crate::exploration::findings(&collected);
+    let selection = app.model.select_findings(message, &catalog).await;
+    // A summary selection failure cannot invent a substitute query or fact.
+    // Use only already validated observations, explicitly label the fallback.
+    verify_disclosure()?;
+    let (ids, fallback) = match selection {
+        Ok(ids) if crate::exploration::selected(&catalog, &ids).is_ok() => (ids, false),
+        _ => (catalog.iter().take(8).map(|f| f.id.clone()).collect(), true),
+    };
+    let selected = crate::exploration::selected(&catalog, &ids)?;
+    let text = crate::exploration::answer(&catalog, &ids, fallback)?;
+    let evidence_ids = selected
+        .iter()
+        .map(|f| f.evidence_id.clone())
+        .collect::<Vec<_>>();
+    app.organization_audit(access,&json!({"operation":"portfolio.answer","outcome":"grounded","finding_ids":ids,"evidence_ids":evidence_ids,"computed_fallback":fallback}))?;
+    verify_disclosure()?;
+    emit(tx, "answer", json!({"text":text,"kind":"grounded","summary_mode":if fallback {"computed_fallback"} else {"model_selected_evidence"},"findings":selected,"evidence_ids":evidence_ids})).await?;
     Ok(())
 }

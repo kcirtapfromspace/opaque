@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use super::persona::{PersonaConfig, VerifiedPersonaClaims};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
@@ -24,6 +25,8 @@ pub struct VerifiedIdToken {
     pub sub: String,
     pub email: Option<String>,
     pub name: Option<String>,
+    /// Present only when opt-in persona verification has passed.
+    pub persona: Option<VerifiedPersonaClaims>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -136,12 +139,51 @@ impl OidcClient {
         code_challenge: &str,
         redirect_uri: &str,
     ) -> String {
+        self.auth_url_for_scope(
+            state,
+            nonce,
+            code_challenge,
+            redirect_uri,
+            "openid email profile",
+        )
+    }
+
+    pub fn build_auth_url_with_persona(
+        &self,
+        state: &str,
+        nonce: &str,
+        code_challenge: &str,
+        redirect_uri: &str,
+        persona: &PersonaConfig,
+    ) -> Result<String, String> {
+        persona.validate()?;
+        Ok(format!(
+            "{}&max_age={}",
+            self.auth_url_for_scope(
+                state,
+                nonce,
+                code_challenge,
+                redirect_uri,
+                "openid email profile groups"
+            ),
+            persona.max_age_secs,
+        ))
+    }
+
+    fn auth_url_for_scope(
+        &self,
+        state: &str,
+        nonce: &str,
+        code_challenge: &str,
+        redirect_uri: &str,
+        scope: &str,
+    ) -> String {
         format!(
             "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&nonce={}&code_challenge={}&code_challenge_method=S256",
             self.authorization_endpoint,
             urlencode(&self.client_id),
             urlencode(redirect_uri),
-            urlencode("openid email profile"),
+            urlencode(scope),
             urlencode(state),
             urlencode(nonce),
             urlencode(code_challenge),
@@ -186,11 +228,34 @@ impl OidcClient {
     }
 
     /// Verify an ID token: allowed alg, known kid, signature, iss, aud,
-    /// exp/iat (60s leeway), and the expected nonce. Returns extracted claims.
+    /// exp (60s leeway), and the expected nonce. Persona mode additionally
+    /// requires strictly fresh signed iat/auth_time and bounded exact groups.
     pub async fn verify_id_token(
         &self,
         raw: &str,
         expected_nonce: &str,
+    ) -> Result<VerifiedIdToken, String> {
+        self.verify_token(raw, expected_nonce, None).await
+    }
+
+    pub async fn verify_id_token_with_persona(
+        &self,
+        raw: &str,
+        expected_nonce: &str,
+        persona: &PersonaConfig,
+    ) -> Result<VerifiedIdToken, String> {
+        persona.validate()?;
+        if raw.len() > 64 * 1024 {
+            return Err("id_token exceeds persona verification limit".into());
+        }
+        self.verify_token(raw, expected_nonce, Some(persona)).await
+    }
+
+    async fn verify_token(
+        &self,
+        raw: &str,
+        expected_nonce: &str,
+        persona: Option<&PersonaConfig>,
     ) -> Result<VerifiedIdToken, String> {
         let header =
             jsonwebtoken::decode_header(raw).map_err(|_| "id_token header invalid".to_string())?;
@@ -218,6 +283,8 @@ impl OidcClient {
             email: Option<String>,
             #[serde(default)]
             name: Option<String>,
+            #[serde(flatten)]
+            extra: serde_json::Map<String, serde_json::Value>,
         }
 
         let data = jsonwebtoken::decode::<Claims>(raw, &key, &validation)
@@ -228,10 +295,25 @@ impl OidcClient {
             _ => return Err("id_token nonce mismatch".into()),
         }
 
+        // This map came from the successful signature/issuer/audience/nonce
+        // verification above. Never decode a second, unverified token payload.
+        let verified_persona = persona
+            .map(|config| {
+                VerifiedPersonaClaims::from_verified_claims(
+                    &self.issuer,
+                    &data.claims.sub,
+                    config,
+                    &data.claims.extra,
+                    opaque_core::identity::now_unix(),
+                )
+            })
+            .transpose()?;
+
         Ok(VerifiedIdToken {
             sub: data.claims.sub,
             email: data.claims.email,
             name: data.claims.name,
+            persona: verified_persona,
         })
     }
 
@@ -445,6 +527,93 @@ pub(crate) mod tests {
         assert_eq!(verified.sub, "user-123");
         assert_eq!(verified.email.as_deref(), Some("dev@example.com"));
         assert_eq!(verified.name.as_deref(), Some("Dev Example"));
+        assert!(verified.persona.is_none());
+    }
+
+    #[tokio::test]
+    async fn persona_groups_are_extracted_only_after_signed_token_verification() {
+        let (server, client) = mock_idp().await;
+        let config = PersonaConfig {
+            groups_claim: "organization_groups".into(),
+            max_age_secs: 60,
+        };
+        let now = opaque_core::identity::now_unix();
+        let mut claims = base_claims(&server.uri(), "persona-nonce");
+        claims["organization_groups"] = serde_json::json!(["reviewers"]);
+        claims["auth_time"] = serde_json::json!(now);
+        let token = sign_id_token(claims.clone(), "test-key-1");
+        assert!(
+            client
+                .verify_id_token_with_persona(&token, "persona-nonce", &config)
+                .await
+                .unwrap()
+                .persona
+                .is_some()
+        );
+        // A valid signed token followed by payload substitution must not refresh
+        // persona evidence, even if the replacement claims have the right shape.
+        let parts: Vec<_> = token.split('.').collect();
+        claims["organization_groups"] = serde_json::json!(["administrators"]);
+        let altered = format!(
+            "{}.{}.{}",
+            parts[0],
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap()),
+            parts[2]
+        );
+        assert!(
+            client
+                .verify_id_token_with_persona(&altered, "persona-nonce", &config)
+                .await
+                .is_err()
+        );
+        for (field, replacement) in [
+            ("auth_time", serde_json::Value::Null),
+            ("auth_time", serde_json::json!(now - 120)),
+            ("auth_time", serde_json::json!(now + 120)),
+            ("iat", serde_json::json!(now + 120)),
+            ("exp", serde_json::json!(now - 1)),
+            ("organization_groups", serde_json::Value::Null),
+            ("organization_groups", serde_json::json!(["reviewers", 1])),
+        ] {
+            let mut invalid = claims.clone();
+            invalid[field] = replacement;
+            let signed = sign_id_token(invalid, "test-key-1");
+            assert!(
+                client
+                    .verify_id_token_with_persona(&signed, "persona-nonce", &config)
+                    .await
+                    .is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn regular_login_keeps_optional_persona_claims_and_authentication_behavior() {
+        let (server, client) = mock_idp().await;
+        let mut claims = base_claims(&server.uri(), "nonce");
+        claims.as_object_mut().unwrap().remove("iat");
+        let token = sign_id_token(claims, "test-key-1");
+        assert!(
+            client
+                .verify_id_token(&token, "nonce")
+                .await
+                .unwrap()
+                .persona
+                .is_none()
+        );
+        let regular = client.build_auth_url("s", "n", "c", "http://127.0.0.1:1/callback");
+        assert!(!regular.contains("max_age="));
+        assert!(regular.contains("scope=openid%20email%20profile&"));
+        let persona = PersonaConfig {
+            groups_claim: "groups".into(),
+            max_age_secs: 60,
+        };
+        let fresh = client
+            .build_auth_url_with_persona("s", "n", "c", "http://127.0.0.1:1/callback", &persona)
+            .unwrap();
+        assert!(fresh.contains("scope=openid%20email%20profile%20groups&"));
+        assert!(fresh.ends_with("&max_age=60"));
     }
 
     #[tokio::test]

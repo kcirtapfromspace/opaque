@@ -15,6 +15,8 @@
 pub mod keys;
 pub mod login;
 pub mod oidc;
+pub mod persona;
+pub mod provisioning;
 pub mod store;
 
 use std::path::Path;
@@ -26,6 +28,7 @@ use tracing::{info, warn};
 
 use login::LoginAttempts;
 use oidc::OidcClient;
+pub use persona::PersonaConfig;
 use store::IdentityStore;
 
 // ---------------------------------------------------------------------------
@@ -67,6 +70,11 @@ pub struct IdentityConfig {
     /// an authenticated principal (enforced from Stage C onward).
     #[serde(default)]
     pub required: bool,
+
+    /// Opt-in verified IdP groups and fresh authentication for provisioning.
+    /// New humans receive no implicit roles while this is enabled.
+    #[serde(default)]
+    pub persona: Option<PersonaConfig>,
 
     /// Config-declared service principals for autonomous operation.
     #[serde(default)]
@@ -116,6 +124,9 @@ impl IdentityConfig {
             subject.is_empty() || subject.len() > 255 || subject.chars().any(char::is_control)
         }) {
             return Err("invalid [identity] allowed_subjects".into());
+        }
+        if let Some(persona) = &self.persona {
+            persona.validate()?;
         }
         Ok(())
     }
@@ -183,6 +194,9 @@ impl IdentityRuntime {
 
         let store = IdentityStore::open(&state_dir.join("identity.db"))
             .map_err(|e| format!("failed to open identity store: {e}"))?;
+        // Every startup, including disabled persona mode, changes the durable
+        // evidence generation when claim semantics/freshness policy changes.
+        store.sync_persona_policy(config.persona.as_ref())?;
         let signing = keys::load_or_create_signing_key(&state_dir.join("identity.key"))
             .map_err(|e| format!("failed to load identity signing key: {e}"))?;
 

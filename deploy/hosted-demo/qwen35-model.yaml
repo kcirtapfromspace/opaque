@@ -148,6 +148,11 @@ spec:
             - '0'
             - --chat-template-kwargs
             - '{"enable_thinking":false}'
+            # The server defaults to an 8192 MiB cross-request prompt cache,
+            # larger than this container's entire 5500 MiB memory allowance.
+            # Keep the active context bounded without accumulating that cache.
+            - --cache-ram
+            - '0'
           env:
             - {name: HOME, value: /tmp}
             - {name: TMPDIR, value: /tmp}

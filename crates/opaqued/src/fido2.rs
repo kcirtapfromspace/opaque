@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Utc};
+use opaque_core::identity::{PrincipalId, PrincipalKind};
 use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -44,6 +45,9 @@ pub enum Fido2Error {
     #[error("user presence flag not set in authenticator data")]
     UserPresenceNotSet,
 
+    #[error("user verification flag not set in authenticator data")]
+    UserVerificationNotSet,
+
     #[error("credential storage error: {0}")]
     StorageError(String),
 
@@ -55,11 +59,55 @@ pub enum Fido2Error {
 
     #[error("FIDO2 transport error: {0}")]
     TransportError(String),
+
+    #[error("FIDO2 credential is not bound to the requested principal and broker")]
+    PrincipalBindingMismatch,
+
+    #[error("invalid FIDO2 principal binding: {0}")]
+    InvalidPrincipalBinding(String),
 }
 
 // ---------------------------------------------------------------------------
 // Credential types
 // ---------------------------------------------------------------------------
+
+/// An authenticated enterprise identity and the broker that established its
+/// binding to an already enrolled credential. Values come from trusted broker
+/// context, never from the assertion or a client-supplied display label.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Fido2PrincipalBinding {
+    pub principal_id: PrincipalId,
+    pub issuer: String,
+    pub subject: String,
+    pub tenant_id: String,
+    pub broker_id: String,
+}
+
+impl Fido2PrincipalBinding {
+    pub fn validate(&self) -> Result<(), Fido2Error> {
+        if !self.principal_id.is_human() {
+            return Err(Fido2Error::InvalidPrincipalBinding(
+                "a verified human principal is required".into(),
+            ));
+        }
+        PrincipalKind::Human {
+            iss: self.issuer.clone(),
+            sub: self.subject.clone(),
+            email: None,
+            name: None,
+        }
+        .validate()
+        .map_err(|error| Fido2Error::InvalidPrincipalBinding(error.to_string()))?;
+        let tenant_id = opaque_core::tenant::TenantId::parse(&self.tenant_id)
+            .map_err(|error| Fido2Error::InvalidPrincipalBinding(error.to_string()))?;
+        let broker_id = uuid::Uuid::parse_str(&self.broker_id)
+            .map_err(|_| Fido2Error::InvalidPrincipalBinding("invalid broker id".into()))?;
+        opaque_core::tenant::TenantBinding::new(tenant_id, broker_id)
+            .map_err(|error| Fido2Error::InvalidPrincipalBinding(error.to_string()))?;
+        Ok(())
+    }
+}
 
 /// A stored FIDO2 credential (public key + metadata).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +126,12 @@ pub struct Fido2Credential {
 
     /// Human-readable label for this key.
     pub label: String,
+
+    /// Legacy credentials remain global approvers until explicitly bound by
+    /// the principal enrollment ceremony. Omitting None preserves their
+    /// existing serialized bytes and HMAC integrity tags.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_binding: Option<Fido2PrincipalBinding>,
 }
 
 /// A FIDO2 authentication assertion returned by the authenticator.
@@ -172,6 +226,10 @@ impl AuthenticatorData {
     /// Check if the User Presence (UP) flag is set (bit 0).
     pub fn user_present(&self) -> bool {
         self.flags & 0x01 != 0
+    }
+
+    pub fn user_verified(&self) -> bool {
+        self.flags & 0x04 != 0
     }
 }
 
@@ -290,6 +348,12 @@ impl Fido2CredentialStore {
             ));
         }
 
+        for credential in &file.credentials {
+            if let Some(binding) = &credential.principal_binding {
+                binding.validate()?;
+            }
+        }
+
         Ok(file.credentials)
     }
 
@@ -310,17 +374,31 @@ impl Fido2CredentialStore {
         let data = serde_json::to_string_pretty(&file)
             .map_err(|e| Fido2Error::StorageError(format!("serialization error: {e}")))?;
 
-        std::fs::write(&self.path, data)
-            .map_err(|e| Fido2Error::StorageError(format!("write error: {e}")))?;
-
-        // Set restrictive permissions (owner-only read/write).
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            std::fs::set_permissions(&self.path, perms)
-                .map_err(|e| Fido2Error::StorageError(format!("chmod error: {e}")))?;
-        }
+        // Commit counter and identity binding together. Readers must never
+        // observe a truncated credential file during concurrent verification.
+        use std::io::Write;
+        let temporary = self
+            .path
+            .with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+        let result = (|| -> std::io::Result<()> {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&temporary)?;
+            file.write_all(data.as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, &self.path)?;
+            if let Some(parent) = self.path.parent() {
+                std::fs::File::open(parent)?.sync_all()?;
+            }
+            Ok(())
+        })();
+        let _ = std::fs::remove_file(&temporary);
+        result.map_err(|e| Fido2Error::StorageError(format!("credential commit error: {e}")))?;
 
         Ok(())
     }
@@ -328,6 +406,14 @@ impl Fido2CredentialStore {
     /// Add a credential to the store.
     pub fn add(&self, credential: Fido2Credential) -> Result<(), Fido2Error> {
         let mut creds = self.load()?;
+        if creds
+            .iter()
+            .any(|existing| existing.credential_id == credential.credential_id)
+        {
+            return Err(Fido2Error::StorageError(
+                "credential already registered".into(),
+            ));
+        }
         creds.push(credential);
         self.save(&creds)
     }
@@ -390,6 +476,7 @@ pub struct Fido2Manager {
     store: Fido2CredentialStore,
     transport: Box<dyn Fido2Transport>,
     rp_id: String,
+    credential_mutation: std::sync::Mutex<()>,
 }
 
 impl Fido2Manager {
@@ -403,6 +490,7 @@ impl Fido2Manager {
             store,
             transport,
             rp_id,
+            credential_mutation: std::sync::Mutex::new(()),
         }
     }
 
@@ -432,6 +520,10 @@ impl Fido2Manager {
         response: &Fido2RegistrationResponse,
         label: &str,
     ) -> Result<Fido2Credential, Fido2Error> {
+        let _guard = self
+            .credential_mutation
+            .lock()
+            .map_err(|_| Fido2Error::StorageError("credential mutation lock unavailable".into()))?;
         // Validate the response: parse authenticator data, check UP flag.
         let auth_data_bytes = URL_SAFE_NO_PAD
             .decode(&response.authenticator_data)
@@ -461,6 +553,7 @@ impl Fido2Manager {
             counter: response.counter,
             created_at: Utc::now(),
             label: label.to_string(),
+            principal_binding: None,
         };
 
         self.store.add(credential.clone())?;
@@ -477,14 +570,96 @@ impl Fido2Manager {
         self.store.find(credential_id)
     }
 
-    /// Persist the counter from a verified assertion (replay floor).
-    pub fn record_assertion_counter(&self, assertion: &Fido2Assertion) -> Result<(), Fido2Error> {
+    /// Verify and commit under the same mutation lock so concurrent requests
+    /// cannot reuse a counter or overwrite an intervening principal binding.
+    pub fn verify_and_record_assertion(
+        &self,
+        assertion: &Fido2Assertion,
+        challenge: &str,
+    ) -> Result<Fido2Credential, Fido2Error> {
+        self.verify_and_commit(assertion, challenge, None)
+    }
+
+    pub fn bind_credential(
+        &self,
+        assertion: &Fido2Assertion,
+        challenge: &str,
+        binding: &Fido2PrincipalBinding,
+    ) -> Result<Fido2Credential, Fido2Error> {
+        self.verify_and_commit(assertion, challenge, Some((binding, true)))
+    }
+
+    pub fn verify_bound_assertion(
+        &self,
+        assertion: &Fido2Assertion,
+        challenge: &str,
+        binding: &Fido2PrincipalBinding,
+    ) -> Result<Fido2Credential, Fido2Error> {
+        self.verify_and_commit(assertion, challenge, Some((binding, false)))
+    }
+
+    fn verify_and_commit(
+        &self,
+        assertion: &Fido2Assertion,
+        challenge: &str,
+        requested_binding: Option<(&Fido2PrincipalBinding, bool)>,
+    ) -> Result<Fido2Credential, Fido2Error> {
+        if let Some((binding, _)) = requested_binding {
+            binding.validate()?;
+        }
+        let _guard = self
+            .credential_mutation
+            .lock()
+            .map_err(|_| Fido2Error::StorageError("credential mutation lock unavailable".into()))?;
+        let mut credentials = self.store.load()?;
+        let credential = credentials
+            .iter_mut()
+            .find(|credential| credential.credential_id == assertion.credential_id)
+            .ok_or_else(|| Fido2Error::CredentialNotFound(assertion.credential_id.clone()))?;
+        if let Some((binding, may_bind)) = requested_binding {
+            match &credential.principal_binding {
+                Some(current) if current != binding => {
+                    return Err(Fido2Error::PrincipalBindingMismatch);
+                }
+                None if !may_bind => return Err(Fido2Error::PrincipalBindingMismatch),
+                _ => {}
+            }
+        }
+        self.verify_assertion(assertion, credential, challenge)?;
         let auth_data_bytes = URL_SAFE_NO_PAD
             .decode(&assertion.authenticator_data)
             .map_err(|e| Fido2Error::InvalidAuthData(format!("base64 decode: {e}")))?;
         let auth_data = AuthenticatorData::parse(&auth_data_bytes)?;
-        self.store
-            .update_counter(&assertion.credential_id, auth_data.counter)
+        if requested_binding.is_some() {
+            if !auth_data.user_verified() {
+                return Err(Fido2Error::UserVerificationNotSet);
+            }
+            #[derive(Deserialize)]
+            struct BoundClientData {
+                origin: String,
+                #[serde(default, rename = "crossOrigin")]
+                cross_origin: bool,
+            }
+            let client_data_bytes = URL_SAFE_NO_PAD
+                .decode(&assertion.client_data_json)
+                .map_err(|_| Fido2Error::InvalidAuthData("invalid bound client data".into()))?;
+            let client_data: BoundClientData =
+                serde_json::from_slice(&client_data_bytes).map_err(|_| {
+                    Fido2Error::InvalidAuthData("bound assertions require an origin".into())
+                })?;
+            if client_data.origin != format!("https://{}", self.rp_id) || client_data.cross_origin {
+                return Err(Fido2Error::InvalidAuthData(
+                    "bound assertion origin mismatch".into(),
+                ));
+            }
+        }
+        credential.counter = auth_data.counter;
+        if let Some((binding, true)) = requested_binding {
+            credential.principal_binding = Some(binding.clone());
+        }
+        let verified = credential.clone();
+        self.store.save(&credentials)?;
+        Ok(verified)
     }
 
     /// Generate an authentication challenge for stored credentials.
@@ -518,16 +693,7 @@ impl Fido2Manager {
         let assertion = self.transport.authenticate(&challenge)?;
 
         // Verify the assertion, bound to the exact challenge just issued.
-        let credential = self.store.find(&assertion.credential_id)?;
-        self.verify_assertion(&assertion, &credential, &challenge.challenge)?;
-
-        // Update the counter.
-        let auth_data_bytes = URL_SAFE_NO_PAD
-            .decode(&assertion.authenticator_data)
-            .map_err(|e| Fido2Error::InvalidAuthData(format!("base64 decode: {e}")))?;
-        let auth_data = AuthenticatorData::parse(&auth_data_bytes)?;
-        self.store
-            .update_counter(&assertion.credential_id, auth_data.counter)?;
+        self.verify_and_record_assertion(&assertion, &challenge.challenge)?;
 
         Ok(assertion)
     }
@@ -633,6 +799,10 @@ impl Fido2Manager {
 
     /// Remove a credential by ID.
     pub fn remove_credential(&self, credential_id: &str) -> Result<Fido2Credential, Fido2Error> {
+        let _guard = self
+            .credential_mutation
+            .lock()
+            .map_err(|_| Fido2Error::StorageError("credential mutation lock unavailable".into()))?;
         self.store.remove(credential_id)
     }
 }
@@ -796,6 +966,7 @@ mod tests {
         let pk_bytes = sk.verifying_key().to_encoded_point(false);
 
         let cred = Fido2Credential {
+            principal_binding: None,
             credential_id: credential_id.into(),
             public_key: URL_SAFE_NO_PAD.encode(pk_bytes.as_bytes()),
             counter: 0,
@@ -920,6 +1091,7 @@ mod tests {
 
         // Add a credential.
         let cred = Fido2Credential {
+            principal_binding: None,
             credential_id: "test-cred-id".into(),
             public_key: "test-pk".into(),
             counter: 42,
@@ -934,6 +1106,50 @@ mod tests {
         assert_eq!(loaded[0].credential_id, "test-cred-id");
         assert_eq!(loaded[0].counter, 42);
         assert_eq!(loaded[0].label, "Test Key");
+    }
+
+    #[test]
+    fn legacy_unbound_credential_hmac_remains_readable_without_migration() {
+        use hmac::{Hmac, Mac};
+        let (store, _dir) = temp_store();
+        // Exact pre-binding wire format, including original struct field order.
+        let legacy = r#"[{"credential_id":"legacy-id","public_key":"legacy-public-key","counter":7,"created_at":"2026-09-05T00:00:00Z","label":"Existing Key"}]"#;
+        let mut mac = Hmac::<Sha256>::new_from_slice(&[0x5a; 32]).unwrap();
+        mac.update(legacy.as_bytes());
+        let tag = hex_encode(mac.finalize().into_bytes());
+        std::fs::write(
+            &store.path,
+            format!(r#"{{"credentials":{legacy},"integrity_tag":"{tag}"}}"#),
+        )
+        .unwrap();
+        let credentials = store.load().unwrap();
+        assert_eq!(credentials[0].principal_binding, None);
+        assert_eq!(credentials[0].counter, 7);
+        store.save(&credentials).unwrap();
+        assert!(
+            !std::fs::read_to_string(&store.path)
+                .unwrap()
+                .contains("principal_binding")
+        );
+        assert_eq!(store.load().unwrap()[0].principal_binding, None);
+    }
+
+    #[test]
+    fn registration_cannot_duplicate_an_existing_credential_id() {
+        let transport = MockTransport::new("opaque.local");
+        let (manager, _dir) = test_manager(transport.clone());
+        let response = transport
+            .register(&manager.registration_challenge().unwrap(), "human")
+            .unwrap();
+        manager
+            .validate_and_store_registration(&response, "existing")
+            .unwrap();
+        assert!(
+            manager
+                .validate_and_store_registration(&response, "replacement")
+                .is_err()
+        );
+        assert_eq!(manager.list_credentials().unwrap().len(), 1);
     }
 
     #[test]
@@ -1022,6 +1238,7 @@ mod tests {
         let sk = SigningKey::random(&mut OsRng);
         let pk_bytes = sk.verifying_key().to_encoded_point(false);
         let cred = Fido2Credential {
+            principal_binding: None,
             credential_id: "type-test".into(),
             public_key: URL_SAFE_NO_PAD.encode(pk_bytes.as_bytes()),
             counter: 0,
@@ -1136,6 +1353,7 @@ mod tests {
         let (store, _dir) = temp_store();
 
         let cred = Fido2Credential {
+            principal_binding: None,
             credential_id: "integrity-test".into(),
             public_key: "pk".into(),
             counter: 0,
@@ -1211,6 +1429,7 @@ mod tests {
         let (store, _dir) = temp_store();
 
         let cred = Fido2Credential {
+            principal_binding: None,
             credential_id: "findme".into(),
             public_key: "pk".into(),
             counter: 7,
@@ -1231,6 +1450,7 @@ mod tests {
         let (store, _dir) = temp_store();
 
         let cred = Fido2Credential {
+            principal_binding: None,
             credential_id: "ctr-test".into(),
             public_key: "pk".into(),
             counter: 1,

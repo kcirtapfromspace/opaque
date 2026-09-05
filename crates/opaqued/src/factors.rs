@@ -221,6 +221,8 @@ impl FactorVerifier for LocalBioVerifier {
                     | "github.release_manifest"
                     | "inference.fixed_manifest"
                     | "agent_session_start"
+                    | "identity.provisioning.bind_start"
+                    | "identity.provisioning.mandate_start"
                     | "identity.role_set"
             ) {
                 crate::approval::prompt_task(&ctx.description).await
@@ -532,6 +534,42 @@ impl Fido2Approvals {
         self.manager.remove_credential(credential_id)
     }
 
+    /// Issue an unpredictable key-possession challenge without creating a
+    /// registration round. The caller owns its principal binding, deadline,
+    /// human authorization and single-use nonce lifecycle.
+    pub fn binding_challenge(&self) -> Result<(String, String), String> {
+        self.manager
+            .authentication_challenge(&[])
+            .map(|challenge| (challenge.challenge, challenge.rp_id))
+            .map_err(|error| format!("binding challenge unavailable: {error}"))
+    }
+
+    /// Associate an already enrolled key with a trusted verified principal.
+    /// This cannot register a key or replace a different existing binding.
+    pub fn bind_credential(
+        &self,
+        assertion: &crate::fido2::Fido2Assertion,
+        challenge: &str,
+        binding: &crate::fido2::Fido2PrincipalBinding,
+    ) -> Result<crate::fido2::Fido2Credential, String> {
+        self.manager
+            .bind_credential(assertion, challenge, binding)
+            .map_err(|error| format!("credential binding rejected: {error}"))
+    }
+
+    /// Verify possession only when the complete persisted principal/broker
+    /// binding matches. The caller separately rechecks live authorization.
+    pub fn verify_bound_assertion(
+        &self,
+        assertion: &crate::fido2::Fido2Assertion,
+        challenge: &str,
+        binding: &crate::fido2::Fido2PrincipalBinding,
+    ) -> Result<crate::fido2::Fido2Credential, String> {
+        self.manager
+            .verify_bound_assertion(assertion, challenge, binding)
+            .map_err(|error| format!("bound assertion rejected: {error}"))
+    }
+
     /// Begin an approval round: issue a challenge and park a sender for the
     /// verified result. Returns the receiver the factor verifier awaits.
     fn begin_round(
@@ -604,15 +642,8 @@ impl Fido2Approvals {
 
         let credential = self
             .manager
-            .find_credential(&assertion.credential_id)
-            .map_err(|e| format!("unknown credential: {e}"))?;
-
-        self.manager
-            .verify_assertion(assertion, &credential, &challenge_b64)
+            .verify_and_record_assertion(assertion, &challenge_b64)
             .map_err(|e| format!("assertion verification failed: {e}"))?;
-        self.manager
-            .record_assertion_counter(assertion)
-            .map_err(|e| format!("counter update failed: {e}"))?;
 
         let verified = VerifiedFido2Approval { credential };
 
@@ -722,10 +753,15 @@ impl FactorVerifier for Fido2Verifier {
                 Ok(Ok(verified)) => {
                     let cred = verified.credential;
                     let id_prefix: String = cred.credential_id.chars().take(12).collect();
+                    let principal_id = cred
+                        .principal_binding
+                        .as_ref()
+                        .map(|binding| binding.principal_id.as_str().to_owned())
+                        .unwrap_or_else(|| format!("fido2:{id_prefix}"));
                     Ok(VerifiedDecision {
                         approved: true,
                         approver: Some(ApproverIdentity {
-                            principal_id: format!("fido2:{id_prefix}"),
+                            principal_id,
                             label: format!("{} (FIDO2 key)", cred.label),
                             source: opaque_core::audit::ApproverSource::Fido2,
                         }),
@@ -972,6 +1008,17 @@ mod tests {
         challenge_b64: &str,
         counter: u32,
     ) -> crate::fido2::Fido2Assertion {
+        sign_assertion_with_options(sk, challenge_b64, counter, 0x01, None, false)
+    }
+
+    fn sign_assertion_with_options(
+        sk: &p256::ecdsa::SigningKey,
+        challenge_b64: &str,
+        counter: u32,
+        flags: u8,
+        origin: Option<&str>,
+        cross_origin: bool,
+    ) -> crate::fido2::Fido2Assertion {
         use base64::Engine;
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use p256::ecdsa::signature::Signer;
@@ -980,10 +1027,14 @@ mod tests {
         let rp_hash = sha2::Sha256::digest("opaque.local".as_bytes());
         let mut auth_data = Vec::with_capacity(37);
         auth_data.extend_from_slice(&rp_hash);
-        auth_data.push(0x01);
+        auth_data.push(flags);
         auth_data.extend_from_slice(&counter.to_be_bytes());
 
-        let client_data = format!(r#"{{"type":"webauthn.get","challenge":"{challenge_b64}"}}"#);
+        let mut client_data = serde_json::json!({"type":"webauthn.get","challenge":challenge_b64,"crossOrigin":cross_origin});
+        if let Some(origin) = origin {
+            client_data["origin"] = serde_json::json!(origin);
+        }
+        let client_data = serde_json::to_string(&client_data).unwrap();
         let client_data_hash = sha2::Sha256::digest(client_data.as_bytes());
         let mut signed = auth_data.clone();
         signed.extend_from_slice(&client_data_hash);
@@ -995,6 +1046,252 @@ mod tests {
             client_data_json: URL_SAFE_NO_PAD.encode(client_data.as_bytes()),
             signature: URL_SAFE_NO_PAD.encode(sig.to_der()),
         }
+    }
+
+    fn test_principal_binding() -> crate::fido2::Fido2PrincipalBinding {
+        crate::fido2::Fido2PrincipalBinding {
+            principal_id: opaque_core::identity::PrincipalId::parse(
+                "hum_00000000000000000000000000000001",
+            )
+            .unwrap(),
+            issuer: "https://idp.example.com".into(),
+            subject: "employee-1".into(),
+            tenant_id: "enterprise-a".into(),
+            broker_id: "01a0729c-c688-7651-b876-4af57644d2f8".into(),
+        }
+    }
+
+    fn sign_bound_assertion(
+        sk: &p256::ecdsa::SigningKey,
+        challenge: &str,
+        counter: u32,
+    ) -> crate::fido2::Fido2Assertion {
+        sign_assertion_with_options(
+            sk,
+            challenge,
+            counter,
+            0x05,
+            Some("https://opaque.local"),
+            false,
+        )
+    }
+
+    #[test]
+    fn fido2_principal_binding_is_exact_persistent_and_requires_existing_key() {
+        let (approvals, key, dir) = fido2_rig(true);
+        let key = key.unwrap();
+        let binding = test_principal_binding();
+        let (challenge, rp_id) = approvals.binding_challenge().unwrap();
+        assert_eq!(rp_id, "opaque.local");
+        assert_ne!(challenge, approvals.binding_challenge().unwrap().0);
+        let initial = sign_bound_assertion(&key, &challenge, 1);
+        assert!(
+            approvals
+                .verify_bound_assertion(&initial, &challenge, &binding)
+                .is_err()
+        );
+        let credential = approvals
+            .bind_credential(&initial, &challenge, &binding)
+            .unwrap();
+        assert_eq!(credential.counter, 1);
+        assert_eq!(credential.principal_binding, Some(binding.clone()));
+        assert!(
+            approvals
+                .verify_bound_assertion(&initial, &challenge, &binding)
+                .is_err()
+        );
+
+        let (challenge, _) = approvals.binding_challenge().unwrap();
+        let assertion = sign_bound_assertion(&key, &challenge, 2);
+        let mut mismatches = Vec::new();
+        let mut other = binding.clone();
+        other.principal_id =
+            opaque_core::identity::PrincipalId::parse("hum_00000000000000000000000000000002")
+                .unwrap();
+        mismatches.push(other);
+        let mut other = binding.clone();
+        other.issuer = "https://other.example.com".into();
+        mismatches.push(other);
+        let mut other = binding.clone();
+        other.subject = "employee-2".into();
+        mismatches.push(other);
+        let mut other = binding.clone();
+        other.tenant_id = "enterprise-b".into();
+        mismatches.push(other);
+        let mut other = binding.clone();
+        other.broker_id = "01a0729c-c688-7651-b876-4af57644d2f9".into();
+        mismatches.push(other);
+        for other in mismatches {
+            assert!(
+                approvals
+                    .bind_credential(&assertion, &challenge, &other)
+                    .is_err()
+            );
+            assert!(
+                approvals
+                    .verify_bound_assertion(&assertion, &challenge, &other)
+                    .is_err()
+            );
+        }
+        approvals
+            .verify_bound_assertion(&assertion, &challenge, &binding)
+            .unwrap();
+        drop(approvals);
+
+        let store =
+            crate::fido2::Fido2CredentialStore::new(dir.path().join("creds.json"), vec![3u8; 32]);
+        let manager = crate::fido2::Fido2Manager::new(
+            store,
+            Box::new(crate::fido2::NoLocalTransport),
+            "opaque.local".into(),
+        );
+        let reopened = Fido2Approvals::new(manager, std::time::Duration::from_secs(5));
+        assert_eq!(
+            reopened.list_credentials().unwrap()[0].principal_binding,
+            Some(binding.clone())
+        );
+        let mut other = binding.clone();
+        other.subject = "employee-2".into();
+        let fresh = sign_bound_assertion(&key, &challenge, 3);
+        assert!(
+            reopened
+                .bind_credential(&fresh, &challenge, &other)
+                .is_err()
+        );
+        assert_eq!(reopened.list_credentials().unwrap()[0].counter, 2);
+        reopened
+            .verify_bound_assertion(&fresh, &challenge, &binding)
+            .unwrap();
+
+        let (empty, _, _empty_dir) = fido2_rig(false);
+        assert!(empty.bind_credential(&fresh, &challenge, &binding).is_err());
+    }
+
+    #[test]
+    fn fido2_binding_rejects_forgery_wrong_ceremony_origin_and_missing_uv() {
+        let (approvals, key, _dir) = fido2_rig(true);
+        let key = key.unwrap();
+        let binding = test_principal_binding();
+        let (challenge, _) = approvals.binding_challenge().unwrap();
+        let interloper = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let invalid = [
+            sign_bound_assertion(&interloper, &challenge, 1),
+            sign_bound_assertion(&key, "wrong-challenge", 1),
+            sign_assertion_with_options(
+                &key,
+                &challenge,
+                1,
+                0x01,
+                Some("https://opaque.local"),
+                false,
+            ),
+            sign_assertion_with_options(
+                &key,
+                &challenge,
+                1,
+                0x04,
+                Some("https://opaque.local"),
+                false,
+            ),
+            sign_assertion_with_options(&key, &challenge, 1, 0x05, None, false),
+            sign_assertion_with_options(
+                &key,
+                &challenge,
+                1,
+                0x05,
+                Some("https://other.example.com"),
+                false,
+            ),
+            sign_assertion_with_options(
+                &key,
+                &challenge,
+                1,
+                0x05,
+                Some("https://opaque.local"),
+                true,
+            ),
+        ];
+        for assertion in invalid {
+            assert!(
+                approvals
+                    .bind_credential(&assertion, &challenge, &binding)
+                    .is_err()
+            );
+            let credential = approvals.list_credentials().unwrap().remove(0);
+            assert_eq!(credential.counter, 0);
+            assert_eq!(credential.principal_binding, None);
+        }
+        approvals
+            .bind_credential(
+                &sign_bound_assertion(&key, &challenge, 1),
+                &challenge,
+                &binding,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn fido2_concurrent_binding_never_overwrites_another_principal() {
+        let (approvals, key, _dir) = fido2_rig(true);
+        let (challenge, _) = approvals.binding_challenge().unwrap();
+        let assertion = sign_bound_assertion(&key.unwrap(), &challenge, 1);
+        let first = test_principal_binding();
+        let mut second = first.clone();
+        second.subject = "employee-2".into();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let attempts: Vec<_> = [first, second]
+            .into_iter()
+            .map(|binding| {
+                let approvals = approvals.clone();
+                let assertion = assertion.clone();
+                let challenge = challenge.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    approvals.bind_credential(&assertion, &challenge, &binding)
+                })
+            })
+            .collect();
+        assert_eq!(
+            attempts
+                .into_iter()
+                .map(|attempt| attempt.join().unwrap())
+                .filter(Result::is_ok)
+                .count(),
+            1
+        );
+        assert_eq!(approvals.list_credentials().unwrap()[0].counter, 1);
+    }
+
+    #[tokio::test]
+    async fn fido2_bound_key_attributes_the_complete_human_principal() {
+        let (approvals, key, _dir) = fido2_rig(true);
+        let key = key.unwrap();
+        let binding = test_principal_binding();
+        let (challenge, _) = approvals.binding_challenge().unwrap();
+        approvals
+            .bind_credential(
+                &sign_bound_assertion(&key, &challenge, 1),
+                &challenge,
+                &binding,
+            )
+            .unwrap();
+        let verifier = Fido2Verifier::new(approvals.clone());
+        let responder = async {
+            loop {
+                if let Some((id, challenge, _, _)) = approvals.pending_rounds().first().cloned() {
+                    approvals
+                        .respond(&id, &sign_round_assertion(&key, &challenge, 2))
+                        .unwrap();
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        let (decision, ()) = tokio::join!(verifier.verify(ctx()), responder);
+        let approver = decision.unwrap().approver.unwrap();
+        assert_eq!(approver.principal_id, binding.principal_id.as_str());
+        assert_eq!(approver.source, ApproverSource::Fido2);
     }
 
     #[tokio::test]

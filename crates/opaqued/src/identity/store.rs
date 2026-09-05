@@ -631,7 +631,7 @@ impl IdentityStore {
             .map_err(|e| e.to_string())
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
+    pub(super) fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
         // A poisoned mutex means a panic mid-write; the connection itself is
         // still usable and refusing all identity ops would fail the daemon
         // open-endedly. Recover the guard.
@@ -639,7 +639,7 @@ impl IdentityStore {
     }
 }
 
-fn row_to_principal(row: &rusqlite::Row<'_>) -> rusqlite::Result<Principal> {
+pub(super) fn row_to_principal(row: &rusqlite::Row<'_>) -> rusqlite::Result<Principal> {
     let id: String = row.get(0)?;
     let kind_s: String = row.get(1)?;
     let iss: Option<String> = row.get(2)?;

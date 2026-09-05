@@ -552,7 +552,7 @@ pub trait ApprovalGate: Send + Sync + fmt::Debug {
 pub struct Enclave {
     inference_profile: Option<crate::inference::TrustedInferenceProfile>,
     ssh_profile: Option<crate::ssh::TrustedSshProfile>,
-    /// Only agent-session creation may use this configured complete-review factor.
+    /// Exact session/provisioning ceremonies use this complete-review factor.
     session_approval_factor: ApprovalFactor,
     /// Operation registry (immutable after construction).
     registry: OperationRegistry,
@@ -1088,8 +1088,13 @@ impl Enclave {
         reason: &str,
     ) -> Result<Option<opaque_core::audit::ApproverIdentity>, EnclaveError> {
         let client_summary = ClientSummary::from((identity, client_type));
-        let session_review = operation_label == "agent_session_start";
-        let reviewed_reason = if session_review {
+        let complete_review = matches!(
+            operation_label,
+            "agent_session_start"
+                | "identity.provisioning.bind_start"
+                | "identity.provisioning.mandate_start"
+        );
+        let reviewed_reason = if complete_review {
             // The caller constructs trusted authority fields and a bounded
             // label. Preserve every reviewed byte; invalid or oversized
             // content must fail rather than hide authority by truncation.
@@ -1097,13 +1102,13 @@ impl Enclave {
                 (c.is_control() && c != '\n' && c != '\t')
                     || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
             }) {
-                return Err(EnclaveError::InvalidInput("agent-session review must be complete, bounded, and free of display controls".into()));
+                return Err(EnclaveError::InvalidInput("control review must be complete, bounded, and free of display controls".into()));
             }
             reason.to_owned()
         } else {
             sanitize_for_display(reason, 256)
         };
-        let factor = if session_review {
+        let factor = if complete_review {
             self.session_approval_factor
         } else {
             ApprovalFactor::LocalBio
@@ -1137,7 +1142,7 @@ impl Enclave {
             "Operation: {action_description}\n  {reviewed_reason}\nClient: {}",
             identity
         );
-        // Bind the full agent-session review into request authority as well
+        // Bind the full session/provisioning review into request authority as well
         // as the workstation protocol's exact reviewed-content signature.
         let synth = OperationRequest {
             principal: None,
@@ -1149,7 +1154,7 @@ impl Enclave {
             secret_ref_names: vec![],
             created_at: std::time::SystemTime::now(),
             expires_at: None,
-            params: if session_review {
+            params: if complete_review {
                 serde_json::json!({"control_review": description})
             } else {
                 serde_json::Value::Null
@@ -3227,6 +3232,110 @@ mod tests {
         }
         assert!(captured.lock().unwrap().is_empty());
         assert!(audit.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn provisioning_review_preserves_exact_terms_with_configured_full_review_factor() {
+        let gate = ControlCaptureGate::default();
+        let captured = gate.captured.clone();
+        let enclave = Enclave::builder()
+            .session_approval_factor(ApprovalFactor::PairedWorkstation)
+            .approval_gate(Box::new(gate))
+            .audit(Arc::new(InMemoryAuditEmitter::new()))
+            .build()
+            .unwrap();
+        let identity = test_request("test", ClientType::Agent).client_identity;
+        let reason = format!(
+            "Tenant: engineering\nProfile terms: {}\nExact subject: issuer|subject\nCumulative budget: 2\nRedelegation: forbidden",
+            "reviewed profile ".repeat(40)
+        );
+        for operation in [
+            "identity.provisioning.bind_start",
+            "identity.provisioning.mandate_start",
+        ] {
+            assert!(matches!(
+                enclave
+                    .request_control_approval(
+                        &identity,
+                        ClientType::Agent,
+                        operation,
+                        "Review provisioning authority",
+                        &reason
+                    )
+                    .await,
+                Err(EnclaveError::ApprovalNotGranted(_))
+            ));
+        }
+        for operation in [
+            "identity.provisioning.mandate_start.other",
+            "identity.provisioning.issue",
+            "identity.role_set",
+        ] {
+            assert!(matches!(
+                enclave
+                    .request_control_approval(
+                        &identity,
+                        ClientType::Agent,
+                        operation,
+                        "Other control",
+                        "Other reason"
+                    )
+                    .await,
+                Err(EnclaveError::ApprovalNotGranted(_))
+            ));
+        }
+        let records = captured.lock().unwrap();
+        for (request, factors, description) in &records[..2] {
+            assert_eq!(factors, &vec![ApprovalFactor::PairedWorkstation]);
+            assert!(description.contains(&reason));
+            assert_eq!(request.params["control_review"], *description);
+            let mut modified = request.clone();
+            modified.params["control_review"] =
+                description.replace("budget: 2", "budget: 3").into();
+            assert_ne!(request.content_hash(), modified.content_hash());
+        }
+        for (request, factors, _) in &records[2..] {
+            assert_eq!(factors, &vec![ApprovalFactor::LocalBio]);
+            assert!(request.params.is_null());
+        }
+    }
+
+    #[tokio::test]
+    async fn provisioning_review_rejects_overflow_or_hidden_terms_before_prompt() {
+        let gate = ControlCaptureGate::default();
+        let captured = gate.captured.clone();
+        let enclave = Enclave::builder()
+            .session_approval_factor(ApprovalFactor::PairedWorkstation)
+            .approval_gate(Box::new(gate))
+            .audit(Arc::new(InMemoryAuditEmitter::new()))
+            .build()
+            .unwrap();
+        let identity = test_request("test", ClientType::Agent).client_identity;
+        for operation in [
+            "identity.provisioning.bind_start",
+            "identity.provisioning.mandate_start",
+        ] {
+            for reason in [
+                "".into(),
+                "x".repeat(8193),
+                "Group: legitimate\u{202e}hidden".into(),
+                "Subject: normal\0other".into(),
+            ] {
+                assert!(matches!(
+                    enclave
+                        .request_control_approval(
+                            &identity,
+                            ClientType::Agent,
+                            operation,
+                            "Review provisioning",
+                            &reason
+                        )
+                        .await,
+                    Err(EnclaveError::InvalidInput(_))
+                ));
+            }
+        }
+        assert!(captured.lock().unwrap().is_empty());
     }
 
     // -- Approval gate error path --

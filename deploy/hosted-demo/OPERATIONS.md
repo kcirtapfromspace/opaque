@@ -145,7 +145,10 @@ identity to increase capacity. Model concurrency remains one.
 The model-choice release accepts only a catalog alias at admission.
 `DEMO_MODEL_IDS` enables a comma-separated subset of that catalog for new joins;
 `DEMO_DEFAULT_MODEL` must be in the enabled subset. The legacy default is
-`gemma4-e2b`. A catalog entry does not mean its backend is running or qualified.
+`gemma4-e2b`; the checked-in public configuration now defaults new joins to
+`qwen35-4b` after the September 5 exploration qualification. Existing leases
+retain their selected model. A catalog entry does not mean its backend is
+running or qualified for every kind of question.
 The browser never supplies the backend URL, model file, credentials or Pod
 configuration. A lease's `model_id` cannot change once queued or admitted.
 
@@ -193,6 +196,16 @@ infer that the previously stalled service becomes healthy just by restoring
 its replica count. Actual qualification and current rollout status belong in
 [CREDIT-VALIDATION.md](CREDIT-VALIDATION.md).
 
+Keep `--cache-ram 0` on the Qwen service. The pinned server otherwise defaults
+to an 8192 MiB cross-request prompt cache, exceeding the container's entire
+5500 MiB allowance. Repeated exploration qualification observed an OOM kill
+under that default. The active context remains 2048 tokens and one inference
+slot; disabling the optional RAM cache does not require another GPU or a larger
+memory limit. Apply model configuration changes only after confirming no active
+demo workspaces or inference requests, and verify readiness and memory behavior
+before qualification resumes. The September 5 exploration record tracks this
+change separately from the web application rollout.
+
 ## Validate, then open requests
 
 Run local tests before deployment:
@@ -209,14 +222,21 @@ For public probes, do not add visitor cookies or controller credentials:
 curl --fail --silent --show-error "$WORKER_ORIGIN/demo/api/config"
 curl --silent --show-error -o /dev/null -w '%{http_code}\n' "$WORKER_ORIGIN/workspace"
 curl --silent --show-error -o /dev/null -w '%{http_code}\n' "$WORKER_ORIGIN/internal/work"
-curl --silent --show-error -o /dev/null -w '%{http_code}\n' -X POST "$WORKER_ORIGIN/demo/api/join" -H 'Origin: https://foreign.invalid' -H 'Content-Type: application/json' --data '{"turnstile_token":"invalid"}'
-curl --silent --show-error -o /dev/null -w '%{http_code}\n' -X POST "$WORKER_ORIGIN/demo/api/join" -H "Origin: $WORKER_ORIGIN" -H 'Content-Type: application/json' --data '{"turnstile_token":"invalid"}'
+curl --silent --show-error -o /dev/null -w '%{http_code}\n' -X POST "$WORKER_ORIGIN/demo/api/join" -H 'Origin: https://foreign.invalid' -H 'Content-Type: application/json' --data '{"turnstile_token":"invalid","model_id":"qwen35-4b"}'
+curl --silent --show-error -o /dev/null -w '%{http_code}\n' -X POST "$WORKER_ORIGIN/demo/api/join" -H "Origin: $WORKER_ORIGIN" -H 'Content-Type: application/json' --data '{"turnstile_token":"invalid","model_id":"qwen35-4b"}'
 ```
 
 While paused, config must report `available:false`; workspace and internal routes
 must return 401, foreign Origin 403, and same-origin join 503. Confirm the
 controller can poll the queue through the dedicated route, the admission policy
 accepts only the reviewed runtime, and there are no unexplained slot resources.
+When checking drain, retain terminal session records: their 24-hour history
+expiry can leave `next_alarm_at` set after all work has ended. Under the current
+queue limits, queued, provisioning and ready deadlines are within 30 minutes.
+Check the alarm together with work actions, the retained slot lease and slot
+Pod/Service/Secret resources; a retention alarm alone does not mean a workspace
+is active. Preserve any cleanup fences. Do not clear the queue or reset the
+slot ConfigMap to remove that timer.
 
 Enable only after these checks and real Turnstile configuration are complete:
 

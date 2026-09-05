@@ -158,6 +158,8 @@ impl WorkstationChallenge {
                     | "github.release_manifest"
                     | "inference.fixed_manifest"
                     | "agent_session_start"
+                    | "identity.provisioning.bind_start"
+                    | "identity.provisioning.mandate_start"
             )
             || decode_hex::<32>(&self.nonce).is_err()
             || decode_hex::<32>(&self.content_hash).is_err()
@@ -344,6 +346,55 @@ mod tests {
         review.review_text.push('\0');
         review.challenge.content_hash = review_hash(&review.review_text);
         assert!(review.validate("opq-broker", 101).is_err());
+    }
+
+    #[test]
+    fn provisioning_whitelist_and_signature_bind_exact_ceremony_and_terms() {
+        for operation in [
+            "identity.provisioning.bind_start",
+            "identity.provisioning.mandate_start",
+        ] {
+            let mut review = review();
+            review.challenge.operation = operation.into();
+            review.review_text="Tenant: engineering\nIssuer: exact-subject\nProfile: metrics\nCumulative allowance: 2\nRedelegation: forbidden".into();
+            review.challenge.content_hash = review_hash(&review.review_text);
+            review.validate("opq-broker", 101).unwrap();
+            let key = SigningKey::from_bytes(&[29; 32]);
+            let public = hex(key.verifying_key().as_bytes());
+            let signature = hex(&key
+                .sign(&workstation_decision_bytes(&review.challenge, true))
+                .to_bytes());
+            let mut changed = review.challenge.clone();
+            changed.content_hash =
+                review_hash(&review.review_text.replace("allowance: 2", "allowance: 3"));
+            assert!(
+                verify_signature(
+                    &public,
+                    &signature,
+                    &workstation_decision_bytes(&changed, true)
+                )
+                .is_err()
+            );
+            changed = review.challenge.clone();
+            changed.operation = "agent_session_start".into();
+            assert!(
+                verify_signature(
+                    &public,
+                    &signature,
+                    &workstation_decision_bytes(&changed, true)
+                )
+                .is_err()
+            );
+        }
+        for operation in [
+            "identity.provisioning.issue",
+            "identity.provisioning.mandate_start.other",
+            "identity.role_set",
+        ] {
+            let mut review = review();
+            review.challenge.operation = operation.into();
+            assert!(review.validate("opq-broker", 101).is_err());
+        }
     }
 
     #[test]
