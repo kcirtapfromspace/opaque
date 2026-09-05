@@ -90,6 +90,7 @@ textarea:focus-visible{outline:0}
 textarea::placeholder{color:var(--muted)}
 .composer-bottom{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:12px}
 .composer-hint{font-size:10px;color:var(--muted)}
+.clarification-context{display:flex;align-items:flex-start;gap:12px;border-bottom:1px solid var(--line);padding-bottom:12px;margin-bottom:12px}.clarification-context p{margin:0;flex:1;white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;line-height:1.6}.clarification-reset{background:transparent;border:1px solid var(--line);padding:7px 10px;color:var(--text);white-space:nowrap;font-size:11px}.composer-error{color:var(--red);font-size:12px;line-height:1.6;margin:10px 0 0}
 .send-button,.stop-button,.retry-button{display:inline-flex;align-items:center;justify-content:center;gap:12px;border:1px solid var(--accent);background:var(--accent);color:var(--bg);font-size:12px;font-weight:600;padding:10px 15px;flex-shrink:0}
 .send-button svg{width:14px;height:14px}
 .stop-button{background:transparent;border-color:var(--muted);color:var(--text)}
@@ -189,7 +190,7 @@ body.credit-experience{color-scheme:light;--bg:#f3f5f1;--panel:#fff;--raised:#e9
         <div class="welcome" id="welcome"><h2 id="welcome-title">Ask your metrics.<br><span>Inspect the evidence.</span></h2><p id="welcome-copy">Ask a question in your own words. Scoped metric results arrive here with their source times and the tool calls behind them.</p><div class="suggestions" id="suggestions"></div></div>
       </div>
       <div class="portfolio-guide" id="portfolio-guide" hidden><h3 class="guide-heading">Explore the permission boundary</h3><div class="boundary-questions" id="boundary-questions"></div><p class="guide-note">These questions test access limits. The demo does not expose borrower records or make lending decisions.</p></div>
-      <form class="composer" id="composer"><label for="message">Your question</label><textarea id="message" name="message" rows="3" maxlength="2000" placeholder="Ask about an allowed metric…" required disabled></textarea><div class="composer-bottom"><span class="composer-hint" id="composer-hint">Waiting for an authenticated session.</span><button class="send-button" id="send" type="submit" disabled><span id="send-label">Ask metrics</span> <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2 8h11M8 3l5 5-5 5" stroke="currentColor" stroke-width="1.5"/></svg></button><button class="stop-button" id="stop" type="button" hidden><span class="stop-square"></span>Stop</button></div></form>
+      <form class="composer" id="composer"><div class="clarification-context" id="clarification-context" hidden><p id="clarification-question"></p><button class="clarification-reset" id="new-question" type="button">New question</button></div><label for="message">Your question</label><textarea id="message" name="message" rows="3" maxlength="2000" placeholder="Ask about an allowed metric…" required disabled></textarea><p class="composer-error" id="composer-error" role="alert" hidden></p><div class="composer-bottom"><span class="composer-hint" id="composer-hint">Waiting for an authenticated session.</span><button class="send-button" id="send" type="submit" disabled><span id="send-label">Ask metrics</span> <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2 8h11M8 3l5 5-5 5" stroke="currentColor" stroke-width="1.5"/></svg></button><button class="stop-button" id="stop" type="button" hidden><span class="stop-square"></span>Stop</button></div></form>
       <p class="scope-caption">This session fixes the customer and allowed metric scope. Chat requests cannot change that identity. Results and model text are evidence to inspect, not new permission.</p>
       </div>
       <div class="role-notice" id="role-notice" hidden><h2 id="role-notice-title"></h2><p id="role-notice-copy"></p></div>
@@ -207,7 +208,7 @@ body.credit-experience{color-scheme:light;--bg:#f3f5f1;--panel:#fff;--raised:#e9
 </div>
 <script>
 'use strict';
-var state = {session:null,customerId:null,controller:null,active:null,latest:new Map(),freshnessNodes:[],expiryTimer:null,policyEvents:[],identityKey:null,organizationBusy:false,activityRevision:0,activityLoading:false,activitySignature:null,supportExpired:false,workTask:null,workBusy:false,workLoading:false,workRevision:0,workUnavailable:false,workError:null,workNotice:null};
+var state = {session:null,customerId:null,controller:null,active:null,latest:new Map(),freshnessNodes:[],expiryTimer:null,policyEvents:[],identityKey:null,clarification:null,composerError:null,organizationBusy:false,activityRevision:0,activityLoading:false,activitySignature:null,supportExpired:false,workTask:null,workBusy:false,workLoading:false,workRevision:0,workUnavailable:false,workError:null,workNotice:null};
 var MAX_STREAM_BUFFER = 262144;
 function byId(id) { return document.getElementById(id); }
 function node(tag, className, text) {
@@ -304,13 +305,22 @@ function canChat() {
 }
 function updateComposer() {
   var authorized = canChat() && !state.organizationBusy;
+  if (state.clarification && (!authorized || state.clarification.identityKey !== state.identityKey)) clearClarification();
   byId('message').disabled = !authorized || !!state.controller;
   byId('send').disabled = !authorized || !!state.controller || !byId('message').value.trim();
   byId('send').hidden = !!state.controller;
   byId('stop').hidden = !state.controller;
-  byId('composer-hint').textContent = state.controller ? 'Receiving scoped results. Stop closes this stream.' : authorized ? 'Enter to send · Shift + Enter for a new line' : state.session ? 'This identity does not currently have customer chat access.' : 'An authenticated session is required.';
+  byId('clarification-context').hidden = !state.clarification || !!state.controller;
+  byId('clarification-question').textContent = state.clarification ? 'Answering your previous question: ' + state.clarification.question : '';
+  byId('composer-error').textContent = state.composerError || '';
+  byId('composer-error').hidden = !state.composerError;
+  byId('composer-hint').textContent = state.controller ? 'Receiving scoped results. Stop closes this stream.' : authorized ? state.clarification ? 'Your original question and this clarification will be sent together.' : 'Enter to send · Shift + Enter for a new line' : state.session ? 'This identity does not currently have customer chat access.' : 'An authenticated session is required.';
 }
+function clearClarification() { state.clarification = null; state.composerError = null; byId('clarification-context').hidden = true; byId('clarification-question').textContent = ''; }
+function startNewQuestion() { clearClarification(); updateComposer(); byId('message').focus(); }
+function clarificationMessage(question, replies) { return 'Original question:\n' + question + replies.map(function(reply,index) { return '\n\nUser clarification ' + (index + 1) + ':\n' + reply; }).join(''); }
 function expireSession(message) {
+  clearClarification();
   state.session = null;
   clearWorkTask(); renderWorkTask();
   if (state.controller) state.controller.abort();
@@ -326,6 +336,7 @@ function policyContext(session) {
   return context && context.tenant_id === session.customer.id && typeof context.policy_id === 'string' && typeof context.allowed_tool === 'string' ? context : null;
 }
 function clearConversation() {
+  clearClarification();
   var welcome = byId('welcome'); welcome.hidden = false; byId('conversation').replaceChildren(welcome);
   state.latest.clear(); state.freshnessNodes = []; state.policyEvents = [];
   byId('latest-metrics').replaceChildren(node('p','aside-copy','No metric result yet.'));
@@ -589,7 +600,7 @@ async function loadActivity() {
     if (revision === state.activityRevision) { clearActivity(error.message); byId('activity-status').className = 'activity-status activity-error'; }
   } finally { state.activityLoading = false; byId('activity-refresh').disabled = state.organizationBusy; }
 }
-function fillQuestion(text) { byId('message').value = String(text).slice(0,2000); updateComposer(); byId('message').focus(); }
+function fillQuestion(text) { clearClarification(); byId('message').value = String(text); updateComposer(); byId('message').focus(); }
 function resetPolicyEvidence() { state.policyEvents = []; byId('policy-decisions').replaceChildren(node('p','policy-empty','Waiting for this request’s policy checks. No source access claim has been made.')); }
 function policyProof(event) {
   if (event.source_accessed === true) return 'Authorized source evidence received';
@@ -678,7 +689,7 @@ function renderSession(session) {
   var suggestions = Array.isArray(session.suggested_questions) ? session.suggested_questions.slice(0,datasetContext(session) ? 6 : 3) : metrics.slice(0,2).map(function(metric) { return 'Show me ' + (metric.label || metric.id).toLowerCase() + '.'; });
   suggestions.forEach(function(text) {
     var button = node('button','suggestion',text); button.type = 'button';
-    button.addEventListener('click',function() { byId('message').value = String(text).slice(0,2000); updateComposer(); byId('message').focus(); });
+    button.addEventListener('click',function() { fillQuestion(text); });
     byId('suggestions').appendChild(button);
   });
   renderExperience(session);
@@ -699,7 +710,7 @@ async function loadSession() {
     if (response.status === 401) { expireSession('No active customer session. Sign in to this customer to continue. The sign-in service identifies any fixture or test ceremony.'); return; }
     if (!response.ok) throw new Error('The session service is unavailable. Existing evidence is retained.');
     renderSession(await response.json()); loadActivity(); loadWorkTask();
-  } catch (error) { state.session = null; clearWorkTask(); renderWorkTask(); clearActivity('Session authority could not be confirmed.'); byId('organization-panel').hidden = true; setConnection('Connection unavailable','error'); showPageError(error.message); updateComposer(); }
+  } catch (error) { state.session = null; clearClarification(); clearWorkTask(); renderWorkTask(); clearActivity('Session authority could not be confirmed.'); byId('organization-panel').hidden = true; setConnection('Connection unavailable','error'); showPageError(error.message); updateComposer(); }
   finally { byId('reconnect').disabled = false; }
 }
 function addMessage(kind, text) {
@@ -721,6 +732,7 @@ function addTurn() {
   turn.summary = node('summary','','Tool & evidence trail'); turn.evidence.appendChild(turn.summary);
   turn.trail = node('ol','trail'); turn.evidence.appendChild(turn.trail); turn.element.appendChild(turn.evidence);
   turn.cards = new Map(); turn.done = false; turn.failed = false; turn.events = 0; turn.answer = '';
+  turn.identityKey = state.identityKey;
   return turn;
 }
 function addEvidence(turn, title, detail, evidenceId, observedAt) {
@@ -816,30 +828,37 @@ function receivePortfolioResult(turn, result) {
   card.appendChild(node('p','portfolio-caption','Values and comparisons are computed by the source and validated by the service. Unavailable means no value was supplied; it does not mean zero.'));
   card.appendChild(node('div','portfolio-proof','Complete coverage · History from ' + timestampText(result.history_start) + '\nSource snapshot ' + timestampText(result.as_of) + ' · Latest event ' + timestampText(result.watermark) + '\nReceived ' + timestampText(result.observed_at) + '\nSource ' + result.source_id + ' · Evidence ' + result.evidence_id));
   turn.results.appendChild(card);
-  if (typeof result.answer === 'string') { turn.answer = result.answer; turn.body.textContent = result.answer; }
+  if (typeof result.answer === 'string' && result.partial !== true) { turn.answer = result.answer; turn.body.textContent = result.answer; }
   addEvidence(turn,'Portfolio evidence · opaque_portfolio_query',titles[query.view] + ' · ' + result.rows.length + ' rows · complete coverage',result.evidence_id,result.observed_at);
 }
 function handleEvent(turn, type, data) {
   if (!data || typeof data !== 'object' || turn.done) return;
   if (type === 'status') turn.status.textContent = data.message || 'Working within this session scope…';
+  else if (type === 'interpretation') { turn.body.textContent = 'Interpreting your question: ' + String(data.text || ''); turn.status.textContent = 'Investigating with up to ' + String(data.query_count || 1) + ' authorized queries'; }
   else if (type === 'tool') addEvidence(turn,(data.name || 'Scoped tool') + (data.phase ? ' · ' + data.phase : ''),data.message || '',data.evidence_id,data.observed_at);
   else if (type === 'policy') receivePolicy(turn,data);
   else if (type === 'result') receiveResult(turn,data);
   else if (type === 'portfolio_result') receivePortfolioResult(turn,data);
-  else if (type === 'answer') { turn.answer = typeof data.delta === 'string' ? turn.answer + data.delta : String(data.text || ''); turn.body.textContent = turn.answer; }
-  else if (type === 'error') { turn.failed = true; turn.status.className = 'request-status error'; turn.status.textContent = data.message || 'The scoped request could not complete.'; addEvidence(turn,'Request stopped',data.code || 'request_failed'); if (['session_expired','auth_expired','session_revoked','unauthenticated'].includes(data.code)) expireSession(data.message); }
-  else if (type === 'done') { turn.done = true; if (!turn.failed) { turn.status.textContent = 'Request complete · evidence retained'; turn.status.className = 'request-status'; } if (data.request_id) addEvidence(turn,'Request complete','Request ' + data.request_id); }
+  else if (type === 'answer') { if (data.kind !== 'clarification') clearClarification(); turn.answer = typeof data.delta === 'string' ? turn.answer + data.delta : String(data.text || ''); turn.body.textContent = turn.answer; turn.answerKind = data.kind; if (Array.isArray(data.findings)) data.findings.forEach(function(fact,index) { addEvidence(turn,'Answer source [' + (index + 1) + ']','Validated source finding · ' + String(fact.id || ''),fact.evidence_id); }); }
+  else if (type === 'error') { clearClarification(); turn.failed = true; turn.status.className = 'request-status error'; turn.status.textContent = data.message || 'The scoped request could not complete.'; addEvidence(turn,'Request stopped',data.code || 'request_failed'); if (['session_expired','auth_expired','session_revoked','unauthenticated'].includes(data.code)) expireSession(data.message); }
+  else if (type === 'done') { turn.done = true; if (!turn.failed) { if (turn.answerKind === 'clarification' && turn.question && turn.identityKey === state.identityKey && canChat() && !state.organizationBusy) state.clarification = {identityKey:turn.identityKey,question:turn.question,replies:turn.replies.slice()}; else clearClarification(); turn.status.textContent = turn.answerKind === 'clarification' ? 'Please clarify your question · no source read' : turn.answerKind === 'unsupported' ? 'Outside available data · no source read' : 'Request complete · evidence retained'; turn.status.className = 'request-status'; } if (data.request_id) addEvidence(turn,'Request complete','Request ' + data.request_id); updateComposer(); }
 }
 async function submitMessage(event) {
   if (event) event.preventDefault();
   var message = byId('message').value.trim();
   if (!canChat() || state.organizationBusy || state.controller || !message) return;
   var identityKey = state.identityKey;
-  addMessage('user',message); var turn = addTurn(); state.active = turn;
+  var pending = state.clarification && state.clarification.identityKey === identityKey ? state.clarification : null;
+  var question = pending ? pending.question : message;
+  var replies = pending ? pending.replies.concat([message]) : [];
+  var requestMessage = pending ? clarificationMessage(question,replies) : message;
+  if (new TextEncoder().encode(requestMessage).length > 2000) { state.composerError = pending ? 'The original question and clarification exceed the 2,000-byte limit. Shorten this clarification, or choose New question and restate the complete question. Nothing was sent.' : 'This question exceeds the 2,000-byte limit. Shorten it before sending. Nothing was sent.'; updateComposer(); return; }
+  clearClarification();
+  addMessage('user',message); var turn = addTurn(); turn.question = question; turn.replies = replies; state.active = turn;
   byId('message').value = ''; var controller = new AbortController(); state.controller = controller; updateComposer();
   setConnection('Receiving scoped results','ready');
   try {
-    var response = await fetch('/api/chat',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json',Accept:'text/event-stream'},body:JSON.stringify({message:message}),signal:controller.signal});
+    var response = await fetch('/api/chat',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json',Accept:'text/event-stream'},body:JSON.stringify({message:requestMessage}),signal:controller.signal});
     if (response.status === 401) { expireSession(); throw new Error('The session expired. This request did not complete.'); }
     if (!response.ok) { var issue = await response.json().catch(function() { return {}; }); throw new Error(issue.message || (issue.error && issue.error.message) || 'The request was not accepted (' + response.status + ').'); }
     if (!response.body || !(response.headers.get('content-type') || '').includes('text/event-stream')) throw new Error('The service did not return an event stream.');
@@ -849,6 +868,7 @@ async function submitMessage(event) {
     parser.push(decoder.decode()); parser.finish();
     if (!turn.done && !turn.failed) throw new Error('The connection ended before completion. Existing results are retained; refresh does not rerun this request.');
   } catch (error) {
+    clearClarification();
     turn.status.className = 'request-status ' + (error.name === 'AbortError' ? 'stopped' : 'error');
     turn.status.textContent = error.name === 'AbortError' ? 'Stream stopped. Work already accepted may still finish; displayed evidence is retained.' : error.message;
     controller.abort();
@@ -860,7 +880,8 @@ async function submitMessage(event) {
 }
 function init() {
   byId('composer').addEventListener('submit',submitMessage);
-  byId('message').addEventListener('input',updateComposer);
+  byId('message').addEventListener('input',function() { state.composerError = null; updateComposer(); });
+  byId('new-question').addEventListener('click',startNewQuestion);
   byId('message').addEventListener('keydown',function(event) { if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); submitMessage(); } });
   byId('stop').addEventListener('click',function() { if (state.controller) state.controller.abort(); });
   byId('reconnect').addEventListener('click',loadSession);

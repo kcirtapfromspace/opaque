@@ -9,17 +9,18 @@ function ui() {
   const source = html.split('<script>')[1].split('</script>')[0].replace(/\ninit\(\);\s*$/, '');
   const ids = new Map();
   class Element {
-    constructor(tag) {this.tagName=tag;this.children=[];this.dataset={};this.value='';this.hidden=false;this.isConnected=true;this.textContent='';this.style={};}
+    constructor(tag) {this.tagName=tag;this.children=[];this.dataset={};this.value='';this.hidden=false;this.isConnected=true;this.textContent='';this.style={};this.listeners={};}
     appendChild(child) {this.children.push(child);return child;}
     insertBefore(child, before) {this.children.splice(this.children.indexOf(before),0,child);}
     replaceChildren(...children) {this.children=children;}
     replaceWith(child) {this.isConnected=false;this.replacement=child;}
     setAttribute(key,value) {this[key]=value;}
-    addEventListener() {}
+    addEventListener(type,listener) {this.listeners[type]=listener;}
+    click() {if(this.listeners.click)this.listeners.click();}
     focus() {}
   }
   const document = {body:new Element('body'),createElement:tag=>new Element(tag),getElementById:id=>{if(!ids.has(id)) ids.set(id,new Element('div'));return ids.get(id);}};
-  const context = vm.createContext({document,Date,Intl,Map,AbortController,TextDecoder,console,setTimeout:()=>1,clearTimeout(){},setInterval(){}});
+  const context = vm.createContext({document,Date,Intl,Map,AbortController,TextDecoder,TextEncoder,console,setTimeout:()=>1,clearTimeout(){},setInterval(){}});
   vm.runInContext(source,context);
   context.ids=ids;
   return context;
@@ -268,6 +269,112 @@ test('missing values remain unavailable, with no invented zero or chart height',
 test('portfolio labels and deterministic answer remain plaintext',()=>{
   const app=ui();app.renderSession(portfolioSession());const proof=portfolioEvidence('breakdown'),hostile='<img src=x onerror=alert(1)>';proof.answer=hostile;proof.rows[0].label=hostile;proof.measures[0]={...proof.measures[0],label:hostile};
   const turn=app.addTurn();app.receivePortfolioResult(turn,proof);assert.equal(turn.body.textContent,hostile);assert.ok(allNodes(turn.results).some(n=>n.textContent===hostile));assert.ok(allNodes(turn.results).every(n=>!Object.hasOwn(n,'innerHTML')&&n.tagName!=='img'));
+});
+
+test('exploration tables remain partial until the grounded answer and retain finding receipts',()=>{
+  const app=ui();app.renderSession(portfolioSession());const turn=app.addTurn();
+  const hostile='<img src=x onerror=alert(1)>';
+  app.handleEvent(turn,'interpretation',{text:hostile,query_count:3});
+  assert.equal(turn.body.textContent,'Interpreting your question: '+hostile);
+  assert.match(turn.status.textContent,/3 authorized queries/);
+  const proof=portfolioEvidence('breakdown');proof.partial=true;
+  app.handleEvent(turn,'portfolio_result',proof);
+  assert.equal(turn.body.textContent,'Interpreting your question: '+hostile);
+  assert.equal(turn.results.children.length,1);
+  app.handleEvent(turn,'answer',{kind:'grounded',text:'Computed source observations.',summary_mode:'model_selected_evidence',findings:[{id:'q1:manual_review_rate_percent',evidence_id:proof.evidence_id,text:'Known source finding'}]});
+  assert.equal(turn.body.textContent,'Computed source observations.');
+  assert.ok(allNodes(turn.element).some(node=>node.textContent==='Answer source [1]'));
+  assert.ok(allNodes(turn.element).every(node=>node.tagName!=='img'&&!Object.hasOwn(node,'innerHTML')));
+});
+
+test('clarification and unsupported answers show no-read status without fabricated result cards',()=>{
+  for(const [kind,status] of [['clarification','Please clarify your question · no source read'],['unsupported','Outside available data · no source read']]) {
+    const app=ui();app.renderSession(portfolioSession());const turn=app.addTurn();
+    app.handleEvent(turn,'answer',{kind,text:'A specific follow-up is needed.',source_accessed:false});
+    app.handleEvent(turn,'done',{});
+    assert.equal(turn.status.textContent,status);assert.equal(turn.results.children.length,0);
+    assert.equal(turn.body.textContent,'A specific follow-up is needed.');
+    assert.equal(app.state.latest.size,0);
+  }
+});
+
+function chatReplies(app,replies) {
+  const requests=[];
+  app.loadActivity=async()=>{};
+  app.fetch=async(url,options)=>{
+    assert.equal(url,'/api/chat');requests.push(JSON.parse(options.body));
+    const reply=replies.shift();if(reply instanceof Error)throw reply;
+    const frames=reply.events||[['answer',reply],['done',{}]];
+    let sent=false;
+    return {ok:true,status:200,headers:{get:()=> 'text/event-stream'},body:{getReader:()=>({read:async()=>{
+      if(sent)return {done:true};sent=true;
+      return {done:false,value:Buffer.from(frames.map(([kind,value])=>'event: '+kind+'\ndata: '+JSON.stringify(value)+'\n\n').join(''))};
+    }})}};
+  };
+  return requests;
+}
+
+test('explicit clarification continuation preserves original filters and window using only user text',async()=>{
+  const app=ui();app.renderSession(session());
+  const original='How many flagged auto-loan applications were there in the West during the last half hour?';
+  const requests=chatReplies(app,[{kind:'clarification',text:'MODEL-ONLY: which kind of flags?',source_accessed:false},{kind:'grounded',text:'Known source observations.'},{kind:'grounded',text:'Another answer.'}]);
+  app.byId('message').value=original;await app.submitMessage();
+  assert.equal(app.state.clarification.question,original);assert.equal(app.state.clarification.identityKey,app.state.identityKey);
+  assert.equal(app.byId('clarification-context').hidden,false);assert.match(app.byId('clarification-question').textContent,/West.*half hour/);
+  assert.match(app.byId('composer-hint').textContent,/original question.*clarification.*together/);
+  app.byId('message').value='I mean identity mismatches';await app.submitMessage();
+  assert.deepEqual(requests[1],{message:'Original question:\n'+original+'\n\nUser clarification 1:\nI mean identity mismatches'});
+  assert.ok(!requests[1].message.includes('MODEL-ONLY'));assert.equal(app.state.clarification,null);
+  assert.equal(app.byId('clarification-context').hidden,true);
+  app.byId('message').value='Show application volume';await app.submitMessage();
+  assert.deepEqual(requests[2],{message:'Show application volume'});
+});
+
+test('changing persona or revoking the session clears pending clarification context',async()=>{
+  const app=ui();app.renderSession(organizationSession('customer_analyst',1));
+  const requests=chatReplies(app,[{kind:'clarification',text:'Which measure?',source_accessed:false},{kind:'clarification',text:'Which channel?',source_accessed:false}]);
+  app.byId('message').value='Prior private question';await app.submitMessage();
+  app.renderSession(organizationSession('engineer',2));
+  assert.equal(app.state.clarification,null);assert.equal(app.byId('clarification-question').textContent,'');
+  app.renderSession(organizationSession('customer_analyst',3));
+  app.byId('message').value='A new question';await app.submitMessage();
+  assert.deepEqual(requests[1],{message:'A new question'});
+  app.expireSession('Revoked');assert.equal(app.state.clarification,null);assert.equal(app.byId('clarification-context').hidden,true);
+});
+
+test('New question and suggestion selection explicitly discard pending continuation',async()=>{
+  const app=ui();app.renderSession(session());
+  const requests=chatReplies(app,[{kind:'clarification',text:'Which measure?',source_accessed:false},{kind:'clarification',text:'Which measure?',source_accessed:false},{kind:'grounded',text:'Done.'}]);
+  app.byId('message').value='Original question';await app.submitMessage();
+  app.byId('message').value='Independent draft';app.startNewQuestion();
+  assert.equal(app.state.clarification,null);assert.equal(app.byId('message').value,'Independent draft');
+  await app.submitMessage();assert.deepEqual(requests[1],{message:'Independent draft'});
+  const suggestion=app.byId('suggestions').children[0];suggestion.click();
+  assert.equal(app.state.clarification,null);await app.submitMessage();
+  assert.deepEqual(requests[2],{message:suggestion.textContent});
+});
+
+test('continuation rejects oversized UTF-8 messages without truncating or sending',async()=>{
+  const app=ui();app.renderSession(session());
+  const original='a'.repeat(1800),reply='b'.repeat(200);
+  const requests=chatReplies(app,[{kind:'clarification',text:'Which measure?',source_accessed:false}]);
+  app.byId('message').value=original;await app.submitMessage();
+  app.byId('message').value=reply;await app.submitMessage();
+  assert.equal(requests.length,1);assert.equal(app.byId('message').value,reply);assert.equal(app.state.clarification.question,original);
+  assert.equal(app.byId('composer-error').hidden,false);assert.match(app.byId('composer-error').textContent,/2,000-byte.*Nothing was sent/);
+  app.startNewQuestion();app.byId('message').value='é'.repeat(1001);await app.submitMessage();
+  assert.equal(requests.length,1);assert.equal(app.byId('message').value,'é'.repeat(1001));
+  assert.match(app.byId('composer-error').textContent,/Nothing was sent/);
+});
+
+test('unsupported responses and incomplete or failed streams do not retain clarification',async()=>{
+  for(const response of [{kind:'unsupported',text:'Not available.',source_accessed:false},new Error('Disconnected'),{events:[['answer',{kind:'clarification',text:'Another question?',source_accessed:false}]]}]) {
+    const app=ui();app.renderSession(session());
+    chatReplies(app,[{kind:'clarification',text:'Which measure?',source_accessed:false},response]);
+    app.byId('message').value='Original question';await app.submitMessage();
+    assert.ok(app.state.clarification);app.byId('message').value='Manual reviews';await app.submitMessage();
+    assert.equal(app.state.clarification,null);assert.equal(app.byId('clarification-context').hidden,true);
+  }
 });
 
 test('portfolio policy events require the session explicit tool grant',()=>{

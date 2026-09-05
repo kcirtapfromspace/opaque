@@ -62,6 +62,9 @@ mod infisical;
 mod onepassword;
 #[allow(dead_code)]
 mod pairing;
+mod provisioning_api;
+#[cfg(test)]
+mod provisioning_api_tests;
 mod push;
 mod resource_authority;
 mod sandbox;
@@ -146,6 +149,9 @@ struct DaemonConfig {
     identity: Option<identity::IdentityConfig>,
     #[serde(default)]
     resource_authority: Option<resource_authority::ResourceAuthorityConfig>,
+    /// Explicitly scoped, human-authorized IdP provisioning mandates.
+    #[serde(default)]
+    provisioning: Option<identity::provisioning::ProvisioningConfig>,
 
     /// Approval backend: `"native"` (default — OS biometric/polkit prompt) or
     /// `"insecure_auto_approve"` (tests/e2e ONLY; additionally requires the
@@ -365,6 +371,7 @@ struct DaemonState {
     approval_server_addr: Option<std::net::SocketAddr>,
     /// FIDO2 approval coordination, present when `[approval] fido2` is enabled.
     fido2: Option<Arc<factors::Fido2Approvals>>,
+    provisioning_challenges: provisioning_api::Challenges,
     /// Applied federation bundle context (org, version, teams).
     federation: Arc<federation::FederationStatus>,
     /// Attestation service (posture reports; always present).
@@ -1574,6 +1581,13 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         }
     };
 
+    provisioning_api::initialize(
+        &config,
+        identity_runtime.as_deref(),
+        tenant.as_ref().map(|t| t.binding()),
+    )
+    .map_err(std::io::Error::other)?;
+
     let resource_authority = config
         .resource_authority
         .clone()
@@ -1585,6 +1599,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
                 resource_config,
                 runtime,
                 tenant.as_ref().map(|boundary| boundary.binding()),
+                config.provisioning.clone(),
             )
             .map_err(std::io::Error::other)?;
             let listener = authority.bind()?;
@@ -2106,6 +2121,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         pairing: pairing_manager,
         approval_server_addr,
         fido2: fido2_approvals,
+        provisioning_challenges: provisioning_api::Challenges::default(),
         federation: federation_status,
         attestation,
     });
@@ -3199,24 +3215,19 @@ async fn handle_conn(
         return Ok(());
     };
 
-    let session_id = if state.config.enforce_agent_sessions && client_type == ClientType::Agent {
-        match handshake.session_token.as_deref() {
-            Some(token) => {
-                match validate_agent_session_token(state.as_ref(), token, identity.uid).await {
-                    Some(id) => Some(id),
-                    None => {
-                        warn!("agent session token invalid or expired, closing connection");
-                        return Ok(());
-                    }
-                }
-            }
-            None => {
-                warn!("missing agent session token, closing connection");
-                return Ok(());
-            }
+    let session_id = match handshake_session(
+        &state,
+        handshake.session_token.as_deref(),
+        client_type,
+        identity.uid,
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(()) => {
+            warn!("required or supplied session token invalid, closing connection");
+            return Ok(());
         }
-    } else {
-        None
     };
 
     // Split into read/write halves so we can detect client disconnect during
@@ -3522,6 +3533,25 @@ async fn validate_agent_session_token(
     })
 }
 
+/// Classification cannot erase a credential's delegation. An allowlisted CLI
+/// running inside a service wrapper must retain the verified service context;
+/// supplying a bad token never falls back to an ambient human login.
+async fn handshake_session(
+    state: &DaemonState,
+    token: Option<&str>,
+    client_type: ClientType,
+    uid: u32,
+) -> Result<Option<String>, ()> {
+    match token {
+        Some(token) => validate_agent_session_token(state, token, uid)
+            .await
+            .map(Some)
+            .ok_or(()),
+        None if state.config.enforce_agent_sessions && client_type == ClientType::Agent => Err(()),
+        None => Ok(None),
+    }
+}
+
 /// Methods that build an `OperationRequest` and enter the enclave. These are
 /// the requests that carry (and, under `identity.required`, must carry) a
 /// verified principal context. Introspection and identity methods are exempt.
@@ -3593,6 +3623,9 @@ fn validate_tenant_startup(
 }
 
 fn is_operation_method(method: &str) -> bool {
+    if method.starts_with("identity.provisioning.") {
+        return true;
+    }
     matches!(
         method,
         "execute"
@@ -3766,6 +3799,18 @@ async fn handle_request(
             "this daemon requires agent operations to run under a delegation — \
              run `opaque login`, then wrap the agent with `opaque agent run`",
         );
+    }
+
+    if req.method.starts_with("identity.provisioning.") {
+        return provisioning_api::handle(
+            state,
+            req,
+            identity,
+            client_type,
+            session_id,
+            principal_ctx,
+        )
+        .await;
     }
 
     let wrapper_workspace = if matches!(
@@ -5304,6 +5349,13 @@ async fn handle_request(
                 return Response::err(Some(req.id), "bad_request", "missing 'credential_id'");
             }
             // Like device_revoke: removing an approver is the safe direction.
+            if let (Some(rt), Some(tenant)) = (&state.identity, &state.tenant)
+                && let Err(error) =
+                    rt.store
+                        .revoke_by_credential(tenant.binding(), credential_id, now_unix())
+            {
+                return Response::err(Some(req.id), "revocation_failed", error);
+            }
             match f2.remove_credential(credential_id) {
                 Ok(removed) => {
                     emit_daemon_method_audit(
@@ -7486,7 +7538,7 @@ exe_sha256 = "deadbeef"
         }
     }
 
-    fn build_test_state(audit: Arc<dyn AuditSink>, approve: bool) -> DaemonState {
+    pub(crate) fn build_test_state(audit: Arc<dyn AuditSink>, approve: bool) -> DaemonState {
         let registry = OperationRegistry::new();
         let policy = PolicyEngine::with_rules(vec![]);
         let enclave = Enclave::builder()
@@ -7511,6 +7563,7 @@ exe_sha256 = "deadbeef"
             pairing: None,
             approval_server_addr: None,
             fido2: None,
+            provisioning_challenges: provisioning_api::Challenges::default(),
             federation: Arc::new(federation::FederationStatus::default()),
             attestation: Arc::new(attest::AttestationService::new(
                 ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]),
@@ -7523,6 +7576,59 @@ exe_sha256 = "deadbeef"
                 Arc::new(federation::FederationStatus::default()),
             )),
         }
+    }
+
+    #[tokio::test]
+    async fn supplied_sessions_retain_authority_for_allowlisted_cli_clients() {
+        let audit = Arc::new(opaque_core::audit::InMemoryAuditEmitter::new());
+        let mut state = build_test_state(audit, true);
+        state.config.enforce_agent_sessions = true;
+        state.agent_sessions.write().await.insert(
+            "session".into(),
+            AgentSession {
+                session_id: "session".into(),
+                token: "fixture-session-token".into(),
+                created_by_uid: 42,
+                expires_at: SystemTime::now() + std::time::Duration::from_secs(60),
+                label: None,
+                delegation: None,
+            },
+        );
+        for client in [ClientType::Human, ClientType::Agent] {
+            assert_eq!(
+                handshake_session(&state, Some("fixture-session-token"), client, 42)
+                    .await
+                    .unwrap(),
+                Some("session".into())
+            );
+            assert!(
+                handshake_session(&state, Some("fixture-session-token"), client, 43)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                handshake_session(&state, Some("invalid"), client, 42)
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            handshake_session(&state, None, ClientType::Human, 42)
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(
+            handshake_session(&state, None, ClientType::Agent, 42)
+                .await
+                .is_err()
+        );
+        state.agent_sessions.write().await.clear();
+        assert!(
+            handshake_session(&state, Some("fixture-session-token"), ClientType::Human, 42)
+                .await
+                .is_err()
+        );
     }
 
     #[test]
@@ -7598,6 +7704,7 @@ exe_sha256 = "deadbeef"
             allowed_subjects: vec![],
             required: false,
             service_principals: vec![],
+            persona: None,
         };
         let emitter = Arc::new(opaque_core::audit::InMemoryAuditEmitter::new());
         let runtime = identity::IdentityRuntime::initialize(config, dir.path())
@@ -8234,6 +8341,7 @@ exe_sha256 = "deadbeef"
             allowed_email_domains: vec![],
             allowed_subjects: vec![],
             required,
+            persona: None,
             service_principals: vec![identity::ServicePrincipalConfig {
                 name: "ci".into(),
                 roles: vec!["operator".into()],

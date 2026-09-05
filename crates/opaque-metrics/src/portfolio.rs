@@ -477,6 +477,23 @@ impl PortfolioEvidence {
                             measure.label()
                         ));
                     }
+                    // Keep every grouped value available to the fact selector.
+                    // Extrema alone cannot answer a named pair of interior
+                    // categories, and a missing value must stay unavailable.
+                    findings.push(format!(
+                        "{} by {}: {}.",
+                        measure.label(),
+                        data.query.dimension.expect("validated breakdown").id(),
+                        data.rows
+                            .iter()
+                            .map(|row| format!(
+                                "{}={}",
+                                category_label(&row.key),
+                                display(*measure, row.values[measure])
+                            ))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ));
                 }
             }
             View::Trend => {
@@ -520,8 +537,13 @@ impl PortfolioEvidence {
             })
             .collect::<Vec<_>>();
         findings.push(format!(
-            "Window: {} minutes{}. Filters: {}. Samples: {}.",
+            "Window: {} minute{}{}. Filters: {}. Samples: {}.",
             data.query.window_secs / 60,
+            if data.query.window_secs == 60 {
+                ""
+            } else {
+                "s"
+            },
             if data.query.view == View::Comparison {
                 " versus the preceding equal period"
             } else {

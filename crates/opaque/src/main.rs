@@ -220,6 +220,11 @@ enum Cmd {
         #[command(subcommand)]
         action: IdentityAction,
     },
+    /// Delegate and revoke scoped access provisioning for verified IdP users.
+    Provisioning {
+        #[command(subcommand)]
+        action: ProvisioningAction,
+    },
     /// Manage paired approver devices (second-device approval factor).
     Device {
         #[command(subcommand)]
@@ -397,6 +402,14 @@ enum AgentAction {
         #[arg(long)]
         ttl_secs: Option<u64>,
 
+        /// Delegated human identity, or an explicitly configured autonomous service.
+        #[arg(long, default_value = "delegated", value_parser = ["delegated", "autonomous"])]
+        mode: String,
+
+        /// Configured service name; required only in autonomous mode.
+        #[arg(long, required_if_eq("mode", "autonomous"))]
+        service: Option<String>,
+
         /// Pass an additional environment variable to the child process.
         /// Repeatable. Ignored when --inherit-env is set.
         #[arg(long, value_name = "KEY")]
@@ -445,6 +458,63 @@ enum IdentityAction {
     },
     /// List delegation records (agent sessions bound to principals).
     Delegations,
+}
+
+#[derive(Debug, Subcommand)]
+enum ProvisioningAction {
+    /// Review binding an enrolled FIDO2 key to the logged-in IdP administrator.
+    BindStart { credential_id: String },
+    /// Complete the binding using the assertion produced by a FIDO2 client.
+    BindComplete {
+        challenge_id: String,
+        #[arg(long)]
+        assertion: PathBuf,
+    },
+    /// Review a bounded mandate for a configured autonomous service.
+    MandateStart {
+        #[arg(long)]
+        service: String,
+        #[arg(long)]
+        profile: String,
+        #[arg(long)]
+        ttl_secs: u64,
+        #[arg(long)]
+        max_issuances: u32,
+    },
+    /// Complete a reviewed mandate with an IdP-bound FIDO2 assertion.
+    MandateComplete {
+        challenge_id: String,
+        #[arg(long)]
+        assertion: PathBuf,
+    },
+    /// Issue access as a wrapped autonomous service under an approved mandate.
+    Issue {
+        #[arg(long)]
+        mandate: String,
+        #[arg(long)]
+        issuer: String,
+        #[arg(long)]
+        subject: String,
+        #[arg(long)]
+        ttl_secs: u64,
+        /// Stable UUID for one issuance request; reuse it only when retrying.
+        #[arg(long)]
+        request_id: String,
+    },
+    /// List mandates and issued access visible to the caller.
+    List,
+    /// Inspect one grant and the exact profile revision it approved.
+    Show {
+        #[arg(value_parser = ["mandate", "access"])]
+        kind: String,
+        id: String,
+    },
+    /// Revoke a mandate and its children, or one recipient's access.
+    Revoke {
+        #[arg(value_parser = ["mandate", "access"])]
+        kind: String,
+        id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1771,27 +1841,50 @@ fn session_token_from_env() -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+fn agent_session_start_params(
+    command: &[String],
+    ttl_secs: Option<u64>,
+    mode: &str,
+    service: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let label = command.first().ok_or("agent command must not be empty")?;
+    let mut params = serde_json::json!({"label":label,"mode":mode});
+    match (mode, service) {
+        ("delegated", None) => {}
+        ("autonomous", Some(name)) => {
+            opaque_core::identity::PrincipalKind::Service {
+                name: name.to_owned(),
+            }
+            .validate()
+            .map_err(|_| "invalid configured service name")?;
+            params["service"] = name.into();
+        }
+        ("autonomous", None) => return Err("--mode autonomous requires --service".into()),
+        ("delegated", Some(_)) => {
+            return Err("--service is only valid with --mode autonomous".into());
+        }
+        _ => return Err("agent mode must be delegated or autonomous".into()),
+    }
+    if let Some(ttl) = ttl_secs {
+        params["ttl_secs"] = ttl.into();
+    }
+    Ok(params)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_agent_wrapped(
     sock: &PathBuf,
     command: &[String],
     ttl_secs: Option<u64>,
+    mode: &str,
+    service: Option<&str>,
     inherit_env: bool,
     pass_env: &[String],
     json_output: bool,
 ) -> Result<i32, String> {
-    if command.is_empty() {
-        return Err("agent command must not be empty".into());
-    }
+    let start_params = agent_session_start_params(command, ttl_secs, mode, service)?;
 
     maybe_warn_opaque_mcp_skew(command, json_output);
-
-    let mut start_params = serde_json::json!({
-        "label": command[0],
-    });
-    if let Some(ttl) = ttl_secs {
-        start_params["ttl_secs"] = serde_json::json!(ttl);
-    }
 
     let session_start = call(sock, "agent_session_start", start_params)
         .await
@@ -1803,6 +1896,9 @@ async fn run_agent_wrapped(
     let result = session_start
         .result
         .ok_or_else(|| "agent_session_start returned no result".to_string())?;
+    if mode == "autonomous" && result.get("mode").and_then(|v| v.as_str()) != Some("autonomous") {
+        return Err("broker did not create the requested autonomous identity delegation".into());
+    }
     let session_id = result
         .get("session_id")
         .and_then(|v| v.as_str())
@@ -2481,6 +2577,8 @@ async fn main() {
         action:
             AgentAction::Run {
                 ttl_secs,
+                mode,
+                service,
                 pass_env,
                 inherit_env,
                 clean_env,
@@ -2505,6 +2603,8 @@ async fn main() {
             &sock,
             command,
             *ttl_secs,
+            mode,
+            service.as_deref(),
             *inherit_env,
             pass_env,
             json_output,
@@ -2630,6 +2730,17 @@ async fn main() {
             Err(error) => {
                 if json_output {
                     println!("{}", serde_json::json!({"error": error}));
+                } else {
+                    ui::error(&error);
+                }
+                std::process::exit(EXIT_USAGE);
+            }
+        },
+        Cmd::Provisioning { action } => match provisioning_command_params(action) {
+            Ok(request) => request,
+            Err(error) => {
+                if json_output {
+                    println!("{}", serde_json::json!({"error":error}));
                 } else {
                     ui::error(&error);
                 }
@@ -3115,6 +3226,91 @@ async fn main() {
             std::process::exit(EXIT_DAEMON);
         }
     }
+}
+
+fn provisioning_command_params(
+    action: ProvisioningAction,
+) -> Result<(&'static str, serde_json::Value), String> {
+    use serde_json::json;
+    fn assertion(path: PathBuf) -> Result<serde_json::Value, String> {
+        use std::io::Read;
+        let file = std::fs::File::open(&path).map_err(|_| "cannot open FIDO2 assertion file")?;
+        let mut bytes = Vec::new();
+        file.take(16_385)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "cannot read FIDO2 assertion file")?;
+        if bytes.len() > 16_384 {
+            return Err("FIDO2 assertion file exceeds 16 KiB".into());
+        }
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|_| "invalid FIDO2 assertion JSON")?;
+        let fields = [
+            "credential_id",
+            "authenticator_data",
+            "client_data_json",
+            "signature",
+        ];
+        if value.as_object().is_none_or(|o| {
+            o.len() != fields.len()
+                || fields
+                    .iter()
+                    .any(|f| o.get(*f).and_then(|v| v.as_str()).is_none_or(str::is_empty))
+        }) {
+            return Err(
+                "FIDO2 assertion must contain exactly the four encoded assertion fields".into(),
+            );
+        }
+        Ok(value)
+    }
+    Ok(match action {
+        ProvisioningAction::BindStart { credential_id } => (
+            "identity.provisioning.bind_start",
+            json!({"credential_id":credential_id}),
+        ),
+        ProvisioningAction::BindComplete {
+            challenge_id,
+            assertion: path,
+        } => (
+            "identity.provisioning.bind_complete",
+            json!({"challenge_id":challenge_id,"assertion":assertion(path)?}),
+        ),
+        ProvisioningAction::MandateStart {
+            service,
+            profile,
+            ttl_secs,
+            max_issuances,
+        } => (
+            "identity.provisioning.mandate_start",
+            json!({"service":service,"profile_id":profile,"ttl_secs":ttl_secs,"max_issuances":max_issuances}),
+        ),
+        ProvisioningAction::MandateComplete {
+            challenge_id,
+            assertion: path,
+        } => (
+            "identity.provisioning.mandate_complete",
+            json!({"challenge_id":challenge_id,"assertion":assertion(path)?}),
+        ),
+        ProvisioningAction::Issue {
+            mandate,
+            issuer,
+            subject,
+            ttl_secs,
+            request_id,
+        } => {
+            uuid::Uuid::parse_str(&request_id).map_err(|_| "request-id must be a UUID")?;
+            (
+                "identity.provisioning.issue",
+                json!({"mandate_id":mandate,"recipient_issuer":issuer,"recipient_subject":subject,"ttl_secs":ttl_secs,"request_id":request_id}),
+            )
+        }
+        ProvisioningAction::List => ("identity.provisioning.list", json!({})),
+        ProvisioningAction::Show { kind, id } => {
+            ("identity.provisioning.show", json!({"kind":kind,"id":id}))
+        }
+        ProvisioningAction::Revoke { kind, id } => {
+            ("identity.provisioning.revoke", json!({"kind":kind,"id":id}))
+        }
+    })
 }
 
 fn task_command_params(action: TaskAction) -> Result<(&'static str, serde_json::Value), String> {
@@ -8480,6 +8676,183 @@ BAZ=
             other => panic!("unexpected parse: {other:?}"),
         }
         assert!(Cli::try_parse_from(["opaque", "key", "remove"]).is_err());
+    }
+
+    #[test]
+    fn agent_wrapper_modes_preserve_delegated_default_and_require_exact_service_pairing() {
+        let cli = Cli::try_parse_from(["opaque", "agent", "run", "--", "codex"]).unwrap();
+        let Some(Cmd::Agent {
+            action:
+                AgentAction::Run {
+                    command,
+                    ttl_secs,
+                    mode,
+                    service,
+                    ..
+                },
+        }) = cli.cmd
+        else {
+            panic!("expected agent wrapper");
+        };
+        assert_eq!(mode, "delegated");
+        assert!(service.is_none());
+        assert_eq!(
+            agent_session_start_params(&command, ttl_secs, &mode, service.as_deref()).unwrap(),
+            serde_json::json!({"label":"codex","mode":"delegated"})
+        );
+        let cli = Cli::try_parse_from([
+            "opaque",
+            "agent",
+            "run",
+            "--mode",
+            "autonomous",
+            "--service",
+            "onboarding",
+            "--ttl-secs",
+            "900",
+            "--",
+            "opaque-mcp",
+        ])
+        .unwrap();
+        let Some(Cmd::Agent {
+            action:
+                AgentAction::Run {
+                    command,
+                    ttl_secs,
+                    mode,
+                    service,
+                    ..
+                },
+        }) = cli.cmd
+        else {
+            panic!("expected service wrapper");
+        };
+        assert_eq!(
+            agent_session_start_params(&command, ttl_secs, &mode, service.as_deref()).unwrap(),
+            serde_json::json!({"label":"opaque-mcp","mode":"autonomous","service":"onboarding","ttl_secs":900})
+        );
+        assert!(
+            Cli::try_parse_from([
+                "opaque",
+                "agent",
+                "run",
+                "--mode",
+                "autonomous",
+                "--",
+                "codex"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "opaque",
+                "agent",
+                "run",
+                "--mode",
+                "break_glass",
+                "--",
+                "codex"
+            ])
+            .is_err()
+        );
+        assert!(
+            agent_session_start_params(&command, None, "delegated", Some("onboarding")).is_err()
+        );
+        assert!(agent_session_start_params(&command, None, "autonomous", None).is_err());
+        assert!(
+            agent_session_start_params(&command, None, "autonomous", Some("bad service")).is_err()
+        );
+        assert!(agent_session_start_params(&[], None, "delegated", None).is_err());
+    }
+
+    #[test]
+    fn provisioning_cli_assertions_are_bounded_and_cannot_carry_extra_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("assertion.json");
+        let valid = serde_json::json!({"credential_id":"YQ","authenticator_data":"Yg","client_data_json":"Yw","signature":"ZA"});
+        std::fs::write(&path, serde_json::to_vec(&valid).unwrap()).unwrap();
+        let (method, params) = provisioning_command_params(ProvisioningAction::BindComplete {
+            challenge_id: "exact-challenge".into(),
+            assertion: path.clone(),
+        })
+        .unwrap();
+        assert_eq!(method, "identity.provisioning.bind_complete");
+        assert_eq!(params["assertion"], valid);
+        assert_eq!(params["challenge_id"], "exact-challenge");
+        for invalid in [
+            serde_json::json!([]),
+            serde_json::json!({"credential_id":"YQ"}),
+            {
+                let mut extra = valid.clone();
+                extra["roles"] = serde_json::json!(["admin"]);
+                extra
+            },
+            {
+                let mut empty = valid.clone();
+                empty["signature"] = "".into();
+                empty
+            },
+        ] {
+            std::fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+            assert!(
+                provisioning_command_params(ProvisioningAction::MandateComplete {
+                    challenge_id: "exact-challenge".into(),
+                    assertion: path.clone()
+                })
+                .is_err()
+            );
+        }
+        std::fs::write(&path, vec![b' '; 16_385]).unwrap();
+        assert!(
+            provisioning_command_params(ProvisioningAction::BindComplete {
+                challenge_id: "exact-challenge".into(),
+                assertion: path
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn provisioning_cli_issue_preserves_exact_recipient_and_request_identity() {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let cli = Cli::try_parse_from([
+            "opaque",
+            "provisioning",
+            "issue",
+            "--mandate",
+            "mandate-id",
+            "--issuer",
+            "https://issuer.example",
+            "--subject",
+            "Exact-Subject",
+            "--ttl-secs",
+            "300",
+            "--request-id",
+            &request_id,
+        ])
+        .unwrap();
+        let Some(Cmd::Provisioning { action }) = cli.cmd else {
+            panic!("expected provisioning issue");
+        };
+        let (method, params) = provisioning_command_params(action).unwrap();
+        assert_eq!(method, "identity.provisioning.issue");
+        assert_eq!(
+            params,
+            serde_json::json!({"mandate_id":"mandate-id","recipient_issuer":"https://issuer.example","recipient_subject":"Exact-Subject","ttl_secs":300,"request_id":request_id})
+        );
+        assert!(
+            Cli::try_parse_from(["opaque", "provisioning", "revoke", "role", "admin"]).is_err()
+        );
+        assert!(
+            provisioning_command_params(ProvisioningAction::Issue {
+                mandate: "m".into(),
+                issuer: "i".into(),
+                subject: "s".into(),
+                ttl_secs: 300,
+                request_id: "reuse-anything".into()
+            })
+            .is_err()
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@ PUBLIC_ORIGIN = "https://demo.opaque.info"
 DEMO_ENABLED = "true"
 DEMO_CAPACITY = "1"
 DEMO_MODEL_IDS = "gemma4-e2b,qwen35-4b"
-DEMO_DEFAULT_MODEL = "gemma4-e2b"
+DEMO_DEFAULT_MODEL = "qwen35-4b"
 TURNSTILE_SITE_KEY = "0x4AAAAAAEoQ04XT_P5oVyBR"
 CONTROLLER_ORIGIN = "http://opaque-demo-controller.opaque-demo-system.svc.cluster.local:8080"
 
