@@ -33,8 +33,9 @@ jobs:
       - name: Install Rust
         # Keep in sync with rust-toolchain.toml (the action's RUSTUP_TOOLCHAIN
         # export outranks the file).
-        uses: dtolnay/rust-toolchain@1.120.0
+        uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master
         with:
+          toolchain: "1.95.0"
           targets: ${{ matrix.target }}
 
       - name: Install cross-compilation tools
@@ -152,7 +153,7 @@ jobs:
           args: --latest --strip header
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           body: ${{ steps.changelog.outputs.content }}
           files: |

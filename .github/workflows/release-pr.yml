@@ -34,7 +34,9 @@ jobs:
           # git-cliff reads history back to the last tag.
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@1.120.0
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master
+        with:
+          toolchain: "1.95.0"
 
       - uses: taiki-e/install-action@v2
         with:
@@ -46,7 +48,7 @@ jobs:
 
       - name: Open or update the release PR
         if: steps.prep.outputs.changed == 'true'
-        uses: peter-evans/create-pull-request@v8
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
           branch: release/next
           base: main
