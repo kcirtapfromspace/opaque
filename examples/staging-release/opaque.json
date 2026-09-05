@@ -5,11 +5,11 @@
   "actions": [
     {
       "operation": "github.dispatch_staging_workflow",
-      "repo": "kcirtapfromspace/opaque",
-      "repository_id": 1156844526,
+      "repo": "kcirtapfromspace/opaque-dogfood",
+      "repository_id": 1357845081,
       "workflow_path": ".github/workflows/opaque-staging-release.yml",
       "workflow_ref": "main",
-      "image_repository": "ghcr.io/kcirtapfromspace/opaque",
+      "image_repository": "ghcr.io/kcirtapfromspace/opaque-dogfood",
       "image_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
       "environment": "staging",
       "github_token_ref": "keychain:opaque/github-pat"

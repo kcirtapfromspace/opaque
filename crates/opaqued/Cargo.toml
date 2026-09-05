@@ -38,6 +38,7 @@ chrono = { workspace = true }
 ring = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
+ssh-key = { version = "0.6.7", default-features = false, features = ["std", "ed25519"] }
 axum = { workspace = true }
 rcgen = { workspace = true }
 tokio-rustls = { workspace = true }
@@ -46,6 +47,7 @@ mdns-sd = { workspace = true }
 hyper-util = { workspace = true }
 
 [dev-dependencies]
+opaque-metrics = { path = "../opaque-metrics" }
 opaque-approver = { path = "../opaque-approver" }
 tokio = { workspace = true, features = ["test-util"] }
 wiremock = { workspace = true }

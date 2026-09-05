@@ -212,6 +212,7 @@ impl TaskStore {
                         // finished_at absent rather than inventing evidence.
                         slot.outcome = Some(SlotOutcome {
                             provider_run_id: None,
+                            ssh_receipt: None,
                             inference_receipt: None,
                             state: SlotState::Unknown,
                             code: "interrupted".into(),
@@ -232,6 +233,7 @@ impl TaskStore {
                         slot.state = SlotState::Unknown;
                         slot.outcome = Some(SlotOutcome {
                             provider_run_id: None,
+                            ssh_receipt: None,
                             inference_receipt: None,
                             state: SlotState::Unknown,
                             code: "interrupted".into(),
@@ -593,6 +595,7 @@ impl TaskStore {
                     slot.finished_at = Some(now.max(slot.reserved_at.unwrap_or(now)));
                     slot.outcome = Some(SlotOutcome {
                         provider_run_id: None,
+                        ssh_receipt: None,
                         inference_receipt: None,
                         state: SlotState::Unknown,
                         code: "interrupted".into(),
@@ -1036,6 +1039,7 @@ mod tests {
             state: SlotState::ApiAccepted,
             code: "api_accepted".into(),
             provider_run_id: None,
+            ssh_receipt: None,
             inference_receipt: Some(InferenceReceipt {
                 tenant: binding,
                 profile_sha256: action.profile_sha256.clone(),
@@ -1157,6 +1161,7 @@ mod tests {
     fn accepted() -> SlotOutcome {
         SlotOutcome {
             provider_run_id: None,
+            ssh_receipt: None,
             inference_receipt: None,
             state: SlotState::ApiAccepted,
             code: "api_accepted".into(),
@@ -1413,12 +1418,14 @@ mod tests {
         for (slot, outcome) in task.slots.iter().zip([
             SlotOutcome {
                 provider_run_id: None,
+                ssh_receipt: None,
                 inference_receipt: None,
                 state: SlotState::Unknown,
                 code: "transport_unknown".into(),
             },
             SlotOutcome {
                 provider_run_id: None,
+                ssh_receipt: None,
                 inference_receipt: None,
                 state: SlotState::Rejected,
                 code: "provider_rejected".into(),
@@ -1990,6 +1997,7 @@ mod tests {
                     state: SlotState::ApiAccepted,
                     code: "api_accepted".into(),
                     provider_run_id: Some(17),
+                    ssh_receipt: None,
                     inference_receipt: None,
                 },
                 104,

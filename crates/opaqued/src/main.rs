@@ -63,13 +63,16 @@ mod onepassword;
 #[allow(dead_code)]
 mod pairing;
 mod push;
+mod resource_authority;
 mod sandbox;
 pub mod secret;
+mod ssh;
 mod task_api;
 mod task_store;
 mod tenant;
 mod trust_domain;
 mod vault;
+mod workload_attest;
 mod workspace_process;
 
 use workspace_process::WorkspaceCommandExt;
@@ -92,6 +95,9 @@ struct DaemonConfig {
     /// Sealed, operator-selected model and public source profile.
     #[serde(default)]
     inference: Option<inference::InferenceProfileConfig>,
+    /// One operator-pinned host operation using a Vault SSH signing role.
+    #[serde(default)]
+    ssh: Option<ssh::SshProfileConfig>,
     /// Opt-in fixed-manifest publishing; existing single-write rules keep their floor.
     #[serde(default)]
     enable_task_grants: bool,
@@ -138,6 +144,8 @@ struct DaemonConfig {
     /// Absent = identity features disabled (Phase 0 behavior).
     #[serde(default)]
     identity: Option<identity::IdentityConfig>,
+    #[serde(default)]
+    resource_authority: Option<resource_authority::ResourceAuthorityConfig>,
 
     /// Approval backend: `"native"` (default — OS biometric/polkit prompt) or
     /// `"insecure_auto_approve"` (tests/e2e ONLY; additionally requires the
@@ -335,6 +343,8 @@ Docs: https://opaque.info/
 }
 
 struct DaemonState {
+    /// Immutable attestor binding installed by the Unix listener after privilege drop.
+    workload_attestor: workload_attest::ListenerAttestor,
     tenant: Option<tenant::TenantBoundary>,
     enclave: Arc<Enclave>,
     tasks: Option<Arc<task_store::TaskStore>>,
@@ -835,6 +845,18 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         .transpose()
         .map_err(std::io::Error::other)?;
 
+    let ssh_profile = config
+        .ssh
+        .as_ref()
+        .map(|profile| {
+            let boundary = tenant
+                .as_ref()
+                .ok_or("SSH requires a tenant-bound broker")?;
+            profile.bind(boundary.binding())
+        })
+        .transpose()
+        .map_err(std::io::Error::other)?;
+
     // --- Socket surface ---
     // Split deployments name an explicit socket path in the sealed config
     // (e.g. /run/opaque/opaqued.sock); the daemon still never trusts
@@ -882,6 +904,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
     validate_path_chain(&socket)?;
 
     let listener = UnixListener::bind(&socket)?;
+    let workload_attestor = workload_attest::ListenerAttestor::unix_listener();
     lock_down_socket_path(&socket)?;
     let _socket_guard = SocketGuard::new(socket.clone());
 
@@ -1431,6 +1454,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
     for operation in enclave::release_task_operations()
         .into_iter()
         .chain(enclave::inference_task_operations())
+        .chain(enclave::ssh_task_operations())
     {
         registry
             .register(operation)
@@ -1550,6 +1574,24 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         }
     };
 
+    let resource_authority = config
+        .resource_authority
+        .clone()
+        .map(|resource_config| {
+            let runtime = identity_runtime.clone().ok_or_else(|| {
+                std::io::Error::other("resource authority requires broker identity")
+            })?;
+            let authority = resource_authority::ResourceAuthority::new(
+                resource_config,
+                runtime,
+                tenant.as_ref().map(|boundary| boundary.binding()),
+            )
+            .map_err(std::io::Error::other)?;
+            let listener = authority.bind()?;
+            Ok::<_, std::io::Error>((authority, listener))
+        })
+        .transpose()?;
+
     let sandbox_executor = sandbox::SandboxExecutor::new(audit.clone());
 
     // Execve policy hook handlers.
@@ -1586,6 +1628,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
 
     let mut enclave_builder = Enclave::builder()
         .inference_profile(inference_profile)
+        .ssh_profile(ssh_profile)
         .session_approval_factor(session_approval_factor)
         .registry(registry)
         .policy(policy)
@@ -2049,6 +2092,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
     }
 
     let state = Arc::new(DaemonState {
+        workload_attestor,
         tenant,
         enclave,
         tasks,
@@ -2068,6 +2112,9 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
 
     // Shutdown coordination: watch channel + active connection counter.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    if let Some((authority, listener)) = resource_authority {
+        tokio::spawn(authority.serve(listener, shutdown_rx.clone()));
+    }
     let active_connections = Arc::new(AtomicUsize::new(0));
 
     let shutdown = tokio::signal::ctrl_c();
@@ -3081,36 +3128,31 @@ async fn handle_conn(
 ) -> std::io::Result<()> {
     let fd = stream.as_raw_fd();
     let peer = peer_info_from_fd(fd).ok();
-
     // Peer-uid gate, mode-aware. Shared-uid mode admits only the daemon's own
     // uid (multi-user protection). The enforced split refuses exactly that
     // uid: nothing legitimate runs as the service account except the daemon,
     // so a same-uid peer inside the trust domain is a breach, and everyone
     // else is gated by socket-group membership + the daemon token.
-    match &peer {
-        None => {
-            warn!("peer credentials unavailable, rejecting connection");
+    if let Some(info) = &peer {
+        let daemon_uid = state.workload_attestor.daemon_effective_uid();
+        let enforce = state.config.trust_domain.enforce;
+        if !trust_domain::peer_uid_allowed(info.uid, daemon_uid, enforce) {
+            warn!(
+                "peer uid {} refused ({}), rejecting connection",
+                info.uid,
+                if enforce {
+                    "runs as the daemon's own service account"
+                } else {
+                    "does not match daemon uid"
+                }
+            );
             return Ok(());
-        }
-        Some(info) => {
-            let daemon_uid = unsafe { libc::getuid() };
-            let enforce = state.config.trust_domain.enforce;
-            if !trust_domain::peer_uid_allowed(info.uid, daemon_uid, enforce) {
-                warn!(
-                    "peer uid {} refused ({}), rejecting connection",
-                    info.uid,
-                    if enforce {
-                        "runs as the daemon's own service account"
-                    } else {
-                        "does not match daemon uid"
-                    }
-                );
-                return Ok(());
-            }
         }
     }
 
-    let identity = build_client_identity(peer.as_ref());
+    let Some((identity, workload)) = attest_connection(&state, peer.as_ref()) else {
+        return Ok(());
+    };
 
     // Derive client type once per connection — never from request params.
     let client_type = derive_client_type(&identity, &state.config);
@@ -3131,7 +3173,23 @@ async fn handle_conn(
 
     // --- Handshake: first frame must be a valid daemon token ---
     let handshake = match framed.next().await {
-        Some(Ok(frame)) => validate_handshake(&frame, &state.daemon_token),
+        Some(Ok(frame)) => {
+            if serde_json::from_slice::<serde_json::Value>(&frame)
+                .is_ok_and(|value| workload_attest::has_identity_claim(&value))
+            {
+                emit_daemon_method_audit(
+                    &state,
+                    AuditEventKind::WorkloadAttestationDenied,
+                    "connection.handshake",
+                    &identity,
+                    client_type,
+                    "identity_claim_forbidden",
+                    Some(workload_audit_detail(&workload)),
+                );
+                return Ok(());
+            }
+            validate_handshake(&frame, &state.daemon_token)
+        }
         _ => None,
     };
 
@@ -3189,6 +3247,53 @@ async fn handle_conn(
 
         match next_frame {
             Ok(Some(Ok(frame))) => {
+                let value: serde_json::Value = match serde_json::from_slice(&frame) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        let resp = Response::err(None, "bad_json", "invalid JSON request");
+                        sink.send(Bytes::from(
+                            serde_json::to_vec(&resp).map_err(std::io::Error::other)?,
+                        ))
+                        .await?;
+                        continue;
+                    }
+                };
+                // Claimed identities consume the same budget as other requests,
+                // so repeated refusals cannot bypass the audit flood limit.
+                if !rate_limiter.check() {
+                    warn!("rate limit exceeded for connection");
+                    let resp = Response::err(
+                        value.get("id").and_then(serde_json::Value::as_u64),
+                        "rate_limited",
+                        "too many requests",
+                    );
+                    let out = serde_json::to_vec(&resp).map_err(std::io::Error::other)?;
+                    sink.send(Bytes::from(out)).await?;
+                    continue;
+                }
+                if workload_attest::has_identity_claim(&value) {
+                    emit_daemon_method_audit(
+                        &state,
+                        AuditEventKind::WorkloadAttestationDenied,
+                        "request.attest",
+                        &identity,
+                        client_type,
+                        "identity_claim_forbidden",
+                        Some(workload_audit_detail(&workload)),
+                    );
+                    let resp = Response::err(
+                        value.get("id").and_then(serde_json::Value::as_u64),
+                        "identity_claim_forbidden",
+                        "workload identity is established by the listener",
+                    );
+                    sink.send(Bytes::from(
+                        serde_json::to_vec(&resp).map_err(std::io::Error::other)?,
+                    ))
+                    .await?;
+                    continue;
+                }
+                // Decode the original frame so duplicate envelope fields still
+                // fail closed instead of being overwritten by Value parsing.
                 let req: Request = match serde_json::from_slice(&frame) {
                     Ok(r) => r,
                     Err(e) => {
@@ -3200,15 +3305,6 @@ async fn handle_conn(
                         continue;
                     }
                 };
-
-                // Per-connection rate limiting.
-                if !rate_limiter.check() {
-                    warn!("rate limit exceeded for connection");
-                    let resp = Response::err(Some(req.id), "rate_limited", "too many requests");
-                    let out = serde_json::to_vec(&resp).map_err(std::io::Error::other)?;
-                    sink.send(Bytes::from(out)).await?;
-                    continue;
-                }
 
                 // Session TTL enforcement for wrapped agents.
                 if state.config.enforce_agent_sessions && client_type == ClientType::Agent {
@@ -3227,6 +3323,15 @@ async fn handle_conn(
                 }
 
                 // Never log params (may contain secrets due to client bugs).
+                emit_daemon_method_audit(
+                    &state,
+                    AuditEventKind::WorkloadAttested,
+                    &req.method,
+                    &identity,
+                    client_type,
+                    "attested",
+                    Some(workload_audit_detail(&workload)),
+                );
                 // Task work is bounded by its durable expiry (at most one hour).
                 // Native review plus several provider calls may exceed the
                 // ordinary request timeout; cancellation still seals the ledger.
@@ -3294,6 +3399,10 @@ fn validate_handshake(frame: &[u8], expected_token: &str) -> Option<HandshakePay
         session_token: Option<String>,
     }
 
+    let value: serde_json::Value = serde_json::from_slice(frame).ok()?;
+    if workload_attest::has_identity_claim(&value) {
+        return None;
+    }
     let hs: Handshake = match serde_json::from_slice(frame) {
         Ok(h) => h,
         Err(_) => return None,
@@ -3311,6 +3420,35 @@ fn validate_handshake(frame: &[u8], expected_token: &str) -> Option<HandshakePay
     Some(HandshakePayload {
         session_token: hs.session_token.filter(|s| !s.trim().is_empty()),
     })
+}
+
+/// Existing chained detail column carries the new evidence; no historical
+/// audit serialization or fingerprint changes. Never include caller claims.
+fn workload_audit_detail(workload: &opaque_core::workload::WorkloadIdentity) -> String {
+    serde_json::json!({
+        "attestor": workload.source.as_str(),
+        "strength": workload.strength,
+        "selector_count": workload.selectors.len(),
+    })
+    .to_string()
+}
+
+fn attest_connection(
+    state: &DaemonState,
+    peer: Option<&opaque_core::peer::PeerInfo>,
+) -> Option<(ClientIdentity, opaque_core::workload::WorkloadIdentity)> {
+    let (identity, workload) = state.workload_attestor.attest(peer);
+    if workload.is_attested() {
+        return Some((identity, workload));
+    }
+    state.audit.emit(
+        AuditEvent::new(AuditEventKind::WorkloadAttestationDenied)
+            .with_operation("connection.attest")
+            .with_outcome("attestation_unavailable")
+            .with_detail(workload_audit_detail(&workload)),
+    );
+    warn!("workload attestation unavailable, rejecting connection");
+    None
 }
 
 /// Constant-time byte comparison (prevents timing side channels).
@@ -3441,7 +3579,7 @@ fn validate_tenant_startup(
     {
         return Err("tenant-bound custody requires its tenant configuration".into());
     }
-    if config.inference.is_some()
+    if (config.inference.is_some() || config.ssh.is_some())
         && (config.tenant.is_none()
             || !config.enable_task_grants
             || !config
@@ -3449,7 +3587,7 @@ fn validate_tenant_startup(
                 .as_ref()
                 .is_some_and(|identity| identity.required && !identity.allowed_subjects.is_empty()))
     {
-        return Err("tenant inference requires task grants and identity.required=true with explicit identity.allowed_subjects membership".into());
+        return Err("tenant inference and SSH require task grants and identity.required=true with explicit identity.allowed_subjects membership".into());
     }
     Ok(())
 }
@@ -3465,6 +3603,7 @@ fn is_operation_method(method: &str) -> bool {
             | "exec"
             | "task_plan"
             | "task_plan_inference"
+            | "task_plan_ssh"
             | "task_run"
             | "task_get"
             | "task_list"
@@ -3650,6 +3789,7 @@ async fn handle_request(
     match req.method.as_str() {
         "task_plan"
         | "task_plan_inference"
+        | "task_plan_ssh"
         | "task_run"
         | "task_get"
         | "task_list"
@@ -7357,6 +7497,7 @@ exe_sha256 = "deadbeef"
             .build()
             .unwrap();
         DaemonState {
+            workload_attestor: workload_attest::ListenerAttestor::unix_listener(),
             tenant: None,
             enclave: Arc::new(enclave),
             tasks: None,
@@ -7404,6 +7545,24 @@ exe_sha256 = "deadbeef"
 
     fn make_test_state_with_audit(audit: Arc<dyn AuditSink>) -> DaemonState {
         build_test_state(audit, true)
+    }
+
+    #[test]
+    fn workload_attestation_absence_refuses_dispatch_and_is_audited() {
+        let audit = Arc::new(opaque_core::audit::InMemoryAuditEmitter::new());
+        let state = make_test_state_with_audit(audit.clone());
+        assert!(attest_connection(&state, None).is_none());
+        let events = audit.events_of_kind(AuditEventKind::WorkloadAttestationDenied);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].outcome.as_deref(),
+            Some("attestation_unavailable")
+        );
+        let detail: serde_json::Value =
+            serde_json::from_str(events[0].detail.as_deref().unwrap()).unwrap();
+        assert_eq!(detail["attestor"], "peercred");
+        assert_eq!(detail["strength"], "none");
+        assert_eq!(detail["selector_count"], 0);
     }
 
     fn make_denying_test_state() -> DaemonState {

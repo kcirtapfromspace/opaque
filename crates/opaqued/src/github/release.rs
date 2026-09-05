@@ -369,6 +369,7 @@ pub fn staging_run_title(manifest: &TaskManifest, task_id: &str) -> Result<Strin
 
 fn outcome(state: SlotState, code: &str) -> SlotOutcome {
     SlotOutcome {
+        ssh_receipt: None,
         inference_receipt: None,
         state,
         code: code.into(),
@@ -475,6 +476,7 @@ where
                 return outcome(SlotState::Unknown, "transport_unknown");
             }
             SlotOutcome {
+                ssh_receipt: None,
                 inference_receipt: None,
                 state: SlotState::ApiAccepted,
                 code: "api_accepted".into(),

@@ -86,11 +86,85 @@ pub fn inference_task_operations() -> Vec<OperationDef> {
     vec![parent, child]
 }
 
+pub fn ssh_task_operations() -> Vec<OperationDef> {
+    let mut parent = task_operation();
+    parent.name = opaque_core::ssh::SSH_TASK_OPERATION.into();
+    parent.description = "Approve one tenant-scoped SSH service health check".into();
+    let child = OperationDef {
+        name: opaque_core::ssh::SSH_OPERATION.into(),
+        safety: OperationSafety::Safe,
+        default_approval: ApprovalRequirement::Always,
+        default_factors: vec![ApprovalFactor::LocalBio],
+        description: "Run the fixed health command once on the pinned host".into(),
+        params_schema: None,
+        allowed_target_keys: [
+            "tenant_id",
+            "broker_id",
+            "subject",
+            "delegation_id",
+            "workload_uid",
+            "workload_exe_sha256",
+            "profile_id",
+            "profile_sha256",
+            "destination_host",
+            "destination_port",
+            "host_key_sha256",
+            "vault_role",
+            "vault_ca_sha256",
+            "principal",
+            "login_user",
+            "source_address",
+            "command",
+            "max_session_secs",
+            "grant_id",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+        secret_ref_param_keys: vec!["vault_token_ref".into()],
+    };
+    vec![parent, child]
+}
+
 fn action_request(base: &OperationRequest, action: &TaskAction) -> OperationRequest {
     let mut request = base.clone();
     request.params = serde_json::to_value(action).expect("typed action");
     request.secret_ref_names = action.secret_refs();
     match action {
+        TaskAction::SshHealth(action) => {
+            request.operation = opaque_core::ssh::SSH_OPERATION.into();
+            request.target = HashMap::from([
+                ("tenant_id".into(), action.tenant.tenant_id.to_string()),
+                ("broker_id".into(), action.tenant.broker_id.to_string()),
+                ("subject".into(), action.subject.to_string()),
+                ("delegation_id".into(), action.delegation_id.clone()),
+                ("workload_uid".into(), action.workload_uid.to_string()),
+                ("profile_id".into(), action.profile_id.clone()),
+                ("profile_sha256".into(), action.profile_sha256.clone()),
+                ("destination_host".into(), action.destination_host.clone()),
+                (
+                    "destination_port".into(),
+                    action.destination_port.to_string(),
+                ),
+                ("host_key_sha256".into(), action.host_key_sha256.clone()),
+                ("vault_role".into(), action.vault_role.clone()),
+                ("vault_ca_sha256".into(), action.vault_ca_sha256.clone()),
+                ("principal".into(), action.principal.clone()),
+                ("login_user".into(), action.login_user.clone()),
+                ("source_address".into(), action.source_address.clone()),
+                ("command".into(), action.command.clone()),
+                (
+                    "max_session_secs".into(),
+                    action.max_session_secs.to_string(),
+                ),
+                ("grant_id".into(), action.grant_id.clone()),
+            ]);
+            if let Some(hash) = &action.workload_exe_sha256 {
+                request
+                    .target
+                    .insert("workload_exe_sha256".into(), hash.clone());
+            }
+        }
         TaskAction::Inference(action) => {
             request.operation = "inference.fixed_completion".into();
             request.target = HashMap::from([
@@ -140,12 +214,53 @@ fn action_request(base: &OperationRequest, action: &TaskAction) -> OperationRequ
 pub(super) fn approval_description(
     request: &OperationRequest,
     inference_profile: Option<&crate::inference::TrustedInferenceProfile>,
+    ssh_profile: Option<&crate::ssh::TrustedSshProfile>,
 ) -> Result<String, EnclaveError> {
     let manifest: TaskManifest = serde_json::from_value(request.params["manifest"].clone())
         .map_err(|_| EnclaveError::InvalidInput("invalid task manifest".into()))?;
     manifest
         .validate()
         .map_err(|_| EnclaveError::InvalidInput("invalid task manifest".into()))?;
+    if manifest.is_ssh() {
+        let profile = ssh_profile.ok_or_else(|| {
+            EnclaveError::InvalidInput("trusted SSH destination is unavailable".into())
+        })?;
+        crate::ssh::prepare_ssh_manifest(&mut manifest.clone(), profile)
+            .map_err(|_| EnclaveError::InvalidInput("SSH destination or signer changed".into()))?;
+        let action = manifest.actions[0].as_ssh().expect("validated SSH action");
+        return Ok(format!(
+            "\nTask: {}\n{}Subject: {}\nDelegation session: {}\nObserved workload UID: {}\nExecutable SHA-256: {}\nProfile: {}\nProfile SHA-256: {}\nSSH destination: {}:{}\nHost key SHA-256: {}\nPrincipal: {}\nLogin user: {}\nAllowed source IP: {}\nExact command: {}\nGrant ID: {}\nVault role: {}\nVault CA SHA-256: {}\nVault credential reference: {}\nVault signing API: {}\nVault SSH mount: {}\nHost control API: {}\nHost receipt signer (Ed25519 public key hex): {}\nBroker grant signer file: {}\nAllowance: 1 connection attempt, permanently consumed before dispatch\nSession limit: {} seconds\nExpires: {}\n\nThe broker requests an ephemeral certificate from the configured Vault signer after approval and retains the private key. Shells, caller arguments, PTY, forwarding and subsystems are disabled. A verified host receipt reports only this fixed health observation. Unknown attempts consume allowance and cannot be retried under this task. Cancellation cannot undo a source read already accepted by the host. Host enforcement and the signing key are operator-managed; no hardware enclave attestation is claimed.\n",
+            manifest.title,
+            action.tenant.approval_context(),
+            action.subject,
+            action.delegation_id,
+            action.workload_uid,
+            action
+                .workload_exe_sha256
+                .as_deref()
+                .unwrap_or("unavailable"),
+            action.profile_id,
+            action.profile_sha256,
+            action.destination_host,
+            action.destination_port,
+            action.host_key_sha256,
+            action.principal,
+            action.login_user,
+            action.source_address,
+            action.command,
+            action.grant_id,
+            action.vault_role,
+            action.vault_ca_sha256,
+            action.vault_token_ref,
+            sanitize_for_display(&profile.vault_url, 2048),
+            sanitize_for_display(&profile.vault_mount, 64),
+            sanitize_for_display(&profile.control_url, 2048),
+            profile.receipt_public_key_hex,
+            sanitize_for_display(&profile.grant_signing_key_path.display().to_string(), 4096),
+            action.max_session_secs,
+            request.params["expires_at"],
+        ));
+    }
     if manifest.is_inference() {
         let profile = inference_profile.ok_or_else(|| {
             EnclaveError::InvalidInput("trusted inference destination is unavailable".into())
@@ -207,7 +322,9 @@ pub(super) fn approval_description(
     }
     for (index, action) in manifest.actions.iter().enumerate() {
         match action {
-            TaskAction::Inference(_) => unreachable!("inference review handled above"),
+            TaskAction::Inference(_) | TaskAction::SshHealth(_) => {
+                unreachable!("typed review handled above")
+            }
             TaskAction::PublishSecret(action) => {
                 text.push_str(&format!(
                     "\n{}. {} (id {}) / {}\n   Source: {}\n   Credential: {}\n",
@@ -339,6 +456,22 @@ impl Enclave {
     ) -> Result<(OperationDef, PolicyDecision), String> {
         manifest.validate().map_err(|e| e.to_string())?;
         request.operation = manifest.operation_name().into();
+        if manifest.is_ssh() {
+            let profile = self.ssh_profile()?;
+            crate::ssh::prepare_ssh_manifest(&mut manifest.clone(), profile)?;
+            let action = manifest.actions[0].as_ssh().ok_or("invalid SSH action")?;
+            let principal = request
+                .principal
+                .as_ref()
+                .ok_or("SSH requires authenticated delegation")?;
+            if action.subject != principal.sub
+                || action.delegation_id != principal.jti
+                || action.workload_uid != request.client_identity.uid
+                || action.workload_exe_sha256 != request.client_identity.exe_sha256
+            {
+                return Err("SSH subject, delegation or observed workload changed".into());
+            }
+        }
         if manifest.is_inference() {
             let profile = self.inference_profile()?;
             crate::inference::prepare_inference_manifest(&mut manifest.clone(), profile)?;
@@ -468,6 +601,7 @@ impl Enclave {
             );
             let before_dispatch = || async {
                 let rejected = |code: &str| SlotOutcome {
+                    ssh_receipt: None,
                     inference_receipt: None,
                     provider_run_id: None,
                     state: SlotState::Rejected,
@@ -497,6 +631,15 @@ impl Enclave {
                 Ok(())
             };
             let outcome = match &slot.action {
+                TaskAction::SshHealth(action) => {
+                    crate::ssh::execute_ssh_action(
+                        action,
+                        self.ssh_profile()?,
+                        claimed.expires_at,
+                        before_dispatch,
+                    )
+                    .await
+                }
                 TaskAction::Inference(action) => {
                     let profile = self.inference_profile()?;
                     let execution = crate::inference::execute_inference_action(
@@ -1029,10 +1172,10 @@ mod tests {
             "manifest": fixture.task.manifest, "expires_at": fixture.task.expires_at,
             "inference_destination": {"api_url": "https://untrusted.invalid", "service_uid": Uuid::new_v4()}
         });
-        let reviewed = approval_description(&request, Some(&fixture.profile)).unwrap();
+        let reviewed = approval_description(&request, Some(&fixture.profile), None).unwrap();
         assert!(reviewed.contains(&fixture.profile.api_url));
         assert!(!reviewed.contains("untrusted.invalid"));
-        assert!(approval_description(&request, None).is_err());
+        assert!(approval_description(&request, None, None).is_err());
         for field in 0..5 {
             let mut config = fixture.profile.config.clone();
             match field {
@@ -1043,14 +1186,14 @@ mod tests {
                 _ => config.model_path = "/models/other-location.gguf".into(),
             }
             let changed = config.bind(&fixture.profile.tenant).unwrap();
-            assert!(approval_description(&request, Some(&changed)).is_err());
+            assert!(approval_description(&request, Some(&changed), None).is_err());
             let fresh =
                 crate::inference::public_demo_manifest(&changed, "New recipient grant".into(), 600)
                     .unwrap();
             assert_ne!(fresh.digest().unwrap(), fixture.task.manifest_digest);
             let mut fresh_request = request.clone();
             fresh_request.params["manifest"] = serde_json::to_value(fresh).unwrap();
-            let review = approval_description(&fresh_request, Some(&changed)).unwrap();
+            let review = approval_description(&fresh_request, Some(&changed), None).unwrap();
             assert!(review.contains(&changed.api_url));
             assert!(review.contains(&changed.service_uid.to_string()));
             assert!(review.contains(&changed.server_build));
@@ -1301,5 +1444,350 @@ mod tests {
                 .preflight_task_observation(&request(), &release)
                 .is_err()
         );
+    }
+
+    fn ssh_action_fixture() -> TaskAction {
+        serde_json::from_value(serde_json::json!({
+            "operation":"ssh.service_health",
+            "tenant":{"schema_version":1,"tenant_id":"tenant-a","broker_id":"00000000-0000-4000-8000-000000000001"},
+            "subject":"hum_00000000000000000000000000000001", "delegation_id":"session-1",
+            "workload_uid":501, "profile_id":"fixture-health", "profile_sha256":"a".repeat(64),
+            "destination_host":"192.0.2.1", "destination_port":22, "host_key_sha256":"b".repeat(64),
+            "vault_role":"fixture-health", "vault_ca_sha256":"c".repeat(64), "vault_token_ref":"env:VAULT_SIGNER_TOKEN",
+            "principal":"fixture-health", "login_user":"opaque", "source_address":"192.0.2.2",
+            "command":"opaque-service-health", "max_session_secs":30,
+            "grant_id":"00000000-0000-4000-8000-000000000002"
+        })).unwrap()
+    }
+
+    #[test]
+    fn ssh_policy_checks_every_bound_destination_and_signer_credential() {
+        let action = ssh_action_fixture();
+        let mut base = request();
+        base.secret_ref_names = vec!["env:UNTRUSTED_CALLER_CLAIM".into()];
+        let child = action_request(&base, &action);
+        let mut registry = OperationRegistry::new();
+        for operation in ssh_task_operations() {
+            registry.register(operation).unwrap();
+        }
+        let definition = registry.get(&child.operation).unwrap();
+        assert!(
+            child
+                .target
+                .keys()
+                .all(|key| definition.allowed_target_keys.contains(key))
+        );
+        assert_eq!(child.secret_ref_names, ["env:VAULT_SIGNER_TOKEN"]);
+        let mut allowed = rule("ssh.service_health");
+        allowed.target.fields = child.target.clone();
+        allowed.secret_names =
+            serde_json::from_value(serde_json::json!({"patterns":["env:VAULT_SIGNER_TOKEN"]}))
+                .unwrap();
+        let enclave = Enclave::builder()
+            .registry(registry)
+            .policy(PolicyEngine::with_rules(vec![allowed]))
+            .approval_gate(Box::new(Gate {
+                entered: Arc::new(Notify::new()),
+                release: Arc::new(Notify::new()),
+                calls: Arc::new(AtomicUsize::new(0)),
+                descriptions: Arc::new(Mutex::new(vec![])),
+                approved: false,
+            }))
+            .audit(Arc::new(InMemoryAuditEmitter::new()))
+            .build()
+            .unwrap();
+        enclave.task_request_decision(&child).unwrap();
+        for key in child.target.keys() {
+            let mut changed = child.clone();
+            changed.target.insert(key.clone(), "other-authority".into());
+            assert!(
+                enclave.task_request_decision(&changed).is_err(),
+                "unbound policy target {key}"
+            );
+        }
+        let mut changed = action.clone();
+        changed.as_ssh_mut().unwrap().vault_token_ref = "env:OTHER_TOKEN".into();
+        assert!(
+            enclave
+                .task_request_decision(&action_request(&base, &changed))
+                .is_err()
+        );
+        let manifest = TaskManifest {
+            schema_version: 4,
+            title: "SSH health".into(),
+            expires_in_secs: 300,
+            github_api_url: String::new(),
+            vault_api_url: String::new(),
+            actions: vec![action],
+        };
+        assert!(
+            enclave
+                .preflight_task(&mut base, &manifest)
+                .unwrap_err()
+                .contains("not configured")
+        );
+        assert!(!enclave.handlers.contains_key("ssh.service_health"));
+    }
+
+    fn ssh_request_fixture() -> OperationRequest {
+        let mut request = request();
+        request.principal = Some(
+            serde_json::from_value(serde_json::json!({
+                "sub":"hum_00000000000000000000000000000001", "sub_label":"Fixture operator",
+                "sub_roles":[], "sub_teams":[], "act":"agt_00000000000000000000000000000002",
+                "act_label":"Fixture agent", "mode":"delegated", "jti":"session-1"
+            }))
+            .unwrap(),
+        );
+        request
+    }
+
+    struct SshFixture {
+        _directory: tempfile::TempDir,
+        provider_canary: std::net::TcpListener,
+        profile: crate::ssh::TrustedSshProfile,
+        enclave: Arc<Enclave>,
+        store: Arc<TaskStore>,
+        task: TaskRecord,
+        owner: String,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        calls: Arc<AtomicUsize>,
+        descriptions: Arc<Mutex<Vec<String>>>,
+    }
+    impl SshFixture {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let provider_canary = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            provider_canary.set_nonblocking(true).unwrap();
+            let mut profile = crate::ssh::test_profile();
+            profile.config.vault_url = format!("http://{}", provider_canary.local_addr().unwrap());
+            profile.config.control_url = profile.vault_url.clone();
+            profile.config.allow_loopback_http = true;
+            let request = ssh_request_fixture();
+            let manifest = crate::ssh::health_manifest(
+                &profile,
+                "One fixed service health read".into(),
+                300,
+                request.principal.as_ref().unwrap(),
+                &request.client_identity,
+            )
+            .unwrap();
+            let owner = profile.tenant.owner_key(
+                request.client_identity.uid,
+                request.principal.as_ref().map(|p| &p.sub),
+            );
+            let store = Arc::new(
+                TaskStore::open_for_tenant(
+                    &directory.path().join("ssh-tasks.db"),
+                    Some(profile.tenant.clone()),
+                )
+                .unwrap(),
+            );
+            let task = store.create(&owner, manifest, now_unix()).unwrap();
+            let mut registry = OperationRegistry::new();
+            for operation in ssh_task_operations() {
+                registry.register(operation).unwrap();
+            }
+            let mut child = rule("ssh.service_health");
+            child.target.fields = action_request(&request, &task.manifest.actions[0]).target;
+            child.secret_names =
+                serde_json::from_value(serde_json::json!({"patterns":[profile.vault_token_ref]}))
+                    .unwrap();
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let descriptions = Arc::new(Mutex::new(vec![]));
+            let enclave = Arc::new(
+                Enclave::builder()
+                    .registry(registry)
+                    .policy(PolicyEngine::with_rules(vec![
+                        rule("ssh.health_manifest"),
+                        child,
+                    ]))
+                    .ssh_profile(Some(profile.clone()))
+                    .approval_gate(Box::new(Gate {
+                        entered: entered.clone(),
+                        release: release.clone(),
+                        calls: calls.clone(),
+                        descriptions: descriptions.clone(),
+                        approved: true,
+                    }))
+                    .audit(Arc::new(InMemoryAuditEmitter::new()))
+                    .build()
+                    .unwrap(),
+            );
+            Self {
+                _directory: directory,
+                provider_canary,
+                profile,
+                enclave,
+                store,
+                task,
+                owner,
+                entered,
+                release,
+                calls,
+                descriptions,
+            }
+        }
+        fn run(&self) -> tokio::task::JoinHandle<Result<TaskRecord, String>> {
+            let enclave = self.enclave.clone();
+            let store = self.store.clone();
+            let id = self.task.id.clone();
+            let owner = self.owner.clone();
+            tokio::spawn(async move {
+                enclave
+                    .execute_task(
+                        &store,
+                        &owner,
+                        &id,
+                        ssh_request_fixture(),
+                        TaskApprovalMode::InsecureTest,
+                        || async { Err("SSH delegation withdrawn before signer dispatch".into()) },
+                    )
+                    .await
+            })
+        }
+        fn assert_no_signer_or_host_attempt(&self) -> TaskRecord {
+            let task = self
+                .store
+                .get(&self.task.id, &self.owner, now_unix())
+                .unwrap();
+            assert!(task.slots.iter().all(|slot| slot.reserved_at.is_none()));
+            match self.provider_canary.accept() {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                other => panic!("signer or control API contacted: {other:?}"),
+            }
+            task
+        }
+    }
+
+    #[tokio::test]
+    async fn ssh_approval_reviews_identity_host_vault_session_controls_and_stops_on_lost_delegation()
+     {
+        let fixture = SshFixture::new();
+        let run = fixture.run();
+        tokio::time::timeout(Duration::from_secs(5), fixture.entered.notified())
+            .await
+            .unwrap();
+        {
+            let descriptions = fixture.descriptions.lock().unwrap();
+            let text = &descriptions[0];
+            let action = fixture.task.manifest.actions[0].as_ssh().unwrap();
+            for expected in [
+                fixture.profile.tenant.approval_context(),
+                fixture.profile.vault_url.clone(),
+                fixture.profile.control_url.clone(),
+                fixture.profile.vault_mount.clone(),
+                action.vault_role.clone(),
+                action.vault_ca_sha256.clone(),
+                action.vault_token_ref.clone(),
+                action.profile_sha256.clone(),
+                action.destination_host.clone(),
+                action.destination_port.to_string(),
+                action.host_key_sha256.clone(),
+                action.principal.clone(),
+                action.login_user.clone(),
+                action.source_address.clone(),
+                action.command.clone(),
+                action.grant_id.clone(),
+                action.subject.to_string(),
+                action.delegation_id.clone(),
+                action.workload_uid.to_string(),
+                fixture.profile.receipt_public_key_hex.clone(),
+                fixture.task.manifest_digest.clone(),
+                fixture.task.expires_at.to_string(),
+                "Allowance: 1 connection attempt".into(),
+                "Session limit: 30 seconds".into(),
+                "PTY, forwarding and subsystems are disabled".into(),
+                "Unknown attempts consume allowance".into(),
+                "no hardware enclave attestation is claimed".into(),
+            ] {
+                assert!(text.contains(&expected), "SSH review omitted {expected}");
+            }
+        }
+        fixture.assert_no_signer_or_host_attempt();
+        fixture.release.notify_one();
+        assert!(
+            run.await
+                .unwrap()
+                .unwrap_err()
+                .contains("delegation withdrawn")
+        );
+        let task = fixture.assert_no_signer_or_host_attempt();
+        assert!(task.approved_at.is_some());
+        assert_eq!(task.state, TaskState::Partial);
+        assert!(fixture.run().await.unwrap().is_err());
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn ssh_preflight_rejects_subject_session_workload_profile_and_recipient_drift() {
+        let fixture = SshFixture::new();
+        fixture
+            .enclave
+            .preflight_task(&mut ssh_request_fixture(), &fixture.task.manifest)
+            .unwrap();
+        for field in 0..4 {
+            let mut request = ssh_request_fixture();
+            match field {
+                0 => {
+                    request.principal.as_mut().unwrap().sub =
+                        opaque_core::identity::PrincipalId::parse(
+                            "hum_00000000000000000000000000000003",
+                        )
+                        .unwrap()
+                }
+                1 => request.principal.as_mut().unwrap().jti = "other-session".into(),
+                2 => request.client_identity.uid = 502,
+                _ => request.client_identity.exe_sha256 = Some("b".repeat(64)),
+            }
+            assert!(
+                fixture
+                    .enclave
+                    .preflight_task(&mut request, &fixture.task.manifest)
+                    .is_err()
+            );
+        }
+        let mut request = ssh_request_fixture();
+        request.params = serde_json::json!({"manifest":fixture.task.manifest,"expires_at":fixture.task.expires_at,
+            "ssh_destination":{"vault_url":"https://untrusted.invalid","control_url":"https://untrusted.invalid"}});
+        let reviewed = approval_description(&request, None, Some(&fixture.profile)).unwrap();
+        assert!(!reviewed.contains("untrusted.invalid"));
+        assert!(approval_description(&request, None, None).is_err());
+        for field in 0..6 {
+            let mut profile = fixture.profile.clone();
+            match field {
+                0 => profile.config.vault_url = "https://other-vault.example.test".into(),
+                1 => profile.config.control_url = "https://other-host.example.test".into(),
+                2 => profile.config.vault_role = "other-role".into(),
+                3 => profile.config.vault_token_ref = "env:OTHER_SIGNER_TOKEN".into(),
+                4 => profile.config.destination_host = "192.0.2.3".into(),
+                _ => profile.config.max_session_secs = 15,
+            }
+            profile.validate().unwrap();
+            assert!(approval_description(&request, None, Some(&profile)).is_err());
+            assert_ne!(fixture.profile.digest().unwrap(), profile.digest().unwrap());
+        }
+        fixture.assert_no_signer_or_host_attempt();
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn ssh_policy_change_while_review_waits_seals_without_signing() {
+        let fixture = SshFixture::new();
+        let run = fixture.run();
+        tokio::time::timeout(Duration::from_secs(5), fixture.entered.notified())
+            .await
+            .unwrap();
+        fixture
+            .enclave
+            .swap_policy(PolicyEngine::with_rules(vec![rule("ssh.*")]));
+        fixture.release.notify_one();
+        assert!(run.await.unwrap().unwrap_err().contains("policy changed"));
+        let task = fixture.assert_no_signer_or_host_attempt();
+        assert_eq!(task.approved_at, None);
+        assert_eq!(task.state, TaskState::Partial);
     }
 }

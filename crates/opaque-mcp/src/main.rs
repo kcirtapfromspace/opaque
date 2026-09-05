@@ -545,7 +545,7 @@ mod tests {
         let resp = handle_tools_list(Some(json!(1)));
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 21);
+        assert_eq!(tools.len(), 22);
 
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
 
@@ -561,6 +561,7 @@ mod tests {
         assert!(tool_names.contains(&"opaque_sandbox_list_profiles"));
         assert!(tool_names.contains(&"opaque_secrets_status"));
         assert!(tool_names.contains(&"opaque_task_plan"));
+        assert!(tool_names.contains(&"opaque_task_plan_ssh"));
         assert!(tool_names.contains(&"opaque_task_run"));
         assert!(tool_names.contains(&"opaque_task_get"));
         assert!(tool_names.contains(&"opaque_task_list"));

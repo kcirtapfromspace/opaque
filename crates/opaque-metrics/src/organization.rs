@@ -105,6 +105,7 @@ impl OrganizationConfig {
                 .ok_or("organization member is not admitted to the configured customer")?;
             if !identifier(&member.subject)
                 || !identifier(&member.oauth_client_id)
+                || admission.client_id != member.oauth_client_id
                 || !subjects.insert(&member.subject)
                 || !clients.insert(&member.oauth_client_id)
                 || !roles.insert(member.persona_id.label())

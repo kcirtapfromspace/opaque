@@ -134,6 +134,31 @@ async fn handle_inner(
         let task = store
             .revoke(id, &owner, now_unix())
             .map_err(|e| e.to_string())?;
+        if let Some(action) = task
+            .manifest
+            .actions
+            .first()
+            .and_then(|action| action.as_ssh())
+        {
+            let closed = match state.enclave.ssh_profile() {
+                Ok(profile) => crate::ssh::revoke_ssh_grant(profile, action, task.expires_at)
+                    .await
+                    .is_ok(),
+                Err(_) => false,
+            };
+            state.audit.emit(
+                AuditEvent::new(AuditEventKind::OperationSucceeded)
+                    .with_operation("ssh.revoke")
+                    .with_outcome(if closed {
+                        "host_acknowledged"
+                    } else {
+                        "host_acknowledgement_unavailable"
+                    })
+                    .with_detail(format!(
+                        "task={id}; local authority revoked; host deadline remains enforced"
+                    )),
+            );
+        }
         state.audit.emit(
             AuditEvent::new(AuditEventKind::OperationSucceeded)
                 .with_client(ClientSummary::from((identity, client_type)))
@@ -157,37 +182,58 @@ async fn handle_inner(
         params: serde_json::Value::Null,
         workspace,
     };
-    if matches!(req.method.as_str(), "task_plan" | "task_plan_inference") {
-        let mut manifest: TaskManifest = if req.method == "task_plan_inference" {
-            #[derive(serde::Deserialize)]
-            #[serde(deny_unknown_fields)]
-            struct PlanInference {
-                title: String,
-                expires_in_secs: u64,
-            }
-            let mut input = req.params.clone();
-            // Transport-owned workspace has already been independently verified.
-            if let Some(object) = input.as_object_mut() {
-                object.remove("workspace");
-            }
-            let params: PlanInference =
-                serde_json::from_value(input).map_err(|_| "invalid fixed inference request")?;
-            crate::inference::public_demo_manifest(
-                state.enclave.inference_profile()?,
-                params.title,
-                params.expires_in_secs,
-            )?
-        } else {
-            serde_json::from_value(
-                req.params
-                    .get("manifest")
-                    .cloned()
-                    .ok_or("manifest is required")?,
-            )
-            .map_err(|_| "invalid task manifest shape")?
-        };
-        if manifest.is_inference() {
-            require_inference_identity(state, request.principal.as_ref())?;
+    if matches!(
+        req.method.as_str(),
+        "task_plan" | "task_plan_inference" | "task_plan_ssh"
+    ) {
+        let mut manifest: TaskManifest =
+            if matches!(req.method.as_str(), "task_plan_inference" | "task_plan_ssh") {
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct PlanInference {
+                    title: String,
+                    expires_in_secs: u64,
+                }
+                let mut input = req.params.clone();
+                // Transport-owned workspace has already been independently verified.
+                if let Some(object) = input.as_object_mut() {
+                    object.remove("workspace");
+                }
+                let params: PlanInference =
+                    serde_json::from_value(input).map_err(|_| "invalid fixed inference request")?;
+                if req.method == "task_plan_ssh" {
+                    require_tenant_identity(state, request.principal.as_ref())?;
+                    crate::ssh::health_manifest(
+                        state.enclave.ssh_profile()?,
+                        params.title,
+                        params.expires_in_secs,
+                        request
+                            .principal
+                            .as_ref()
+                            .ok_or("SSH identity unavailable")?,
+                        identity,
+                    )?
+                } else {
+                    crate::inference::public_demo_manifest(
+                        state.enclave.inference_profile()?,
+                        params.title,
+                        params.expires_in_secs,
+                    )?
+                }
+            } else {
+                serde_json::from_value(
+                    req.params
+                        .get("manifest")
+                        .cloned()
+                        .ok_or("manifest is required")?,
+                )
+                .map_err(|_| "invalid task manifest shape")?
+            };
+        if manifest.is_ssh() {
+            require_tenant_identity(state, request.principal.as_ref())?;
+            crate::ssh::prepare_ssh_manifest(&mut manifest, state.enclave.ssh_profile()?)?;
+        } else if manifest.is_inference() {
+            require_tenant_identity(state, request.principal.as_ref())?;
             let boundary = state.tenant.as_ref().ok_or("tenant boundary unavailable")?;
             for action in &manifest.actions {
                 let action = action.as_inference().ok_or("invalid inference action")?;
@@ -205,7 +251,9 @@ async fn handle_inner(
             crate::github::prepare_task_manifest(&mut manifest)?;
         }
         state.enclave.preflight_task(&mut request, &manifest)?;
-        let manifest = if manifest.is_inference() {
+        let manifest = if manifest.is_ssh() {
+            manifest
+        } else if manifest.is_inference() {
             crate::inference::plan_inference_manifest(manifest, state.enclave.inference_profile()?)
                 .await?
         } else if manifest.is_release() {
@@ -275,8 +323,8 @@ async fn handle_inner(
     let stored = store
         .get(id, &owner, now_unix())
         .map_err(|e| e.to_string())?;
-    if stored.manifest.is_inference() {
-        require_inference_identity(state, request.principal.as_ref())?;
+    if stored.manifest.is_inference() || stored.manifest.is_ssh() {
+        require_tenant_identity(state, request.principal.as_ref())?;
     }
     let expected_workspace = request.workspace.clone();
     let approval_mode = if state.config.approval_backend.as_deref() == Some("insecure_auto_approve")
@@ -301,14 +349,13 @@ async fn handle_inner(
     Ok(serde_json::json!({"task": task}))
 }
 
-fn require_inference_identity(
+fn require_tenant_identity(
     state: &DaemonState,
     principal: Option<&PrincipalContext>,
 ) -> Result<(), String> {
     if state.tenant.is_none() || state.identity.is_none() || principal.is_none() {
         return Err(
-            "tenant inference requires an authenticated tenant principal and live delegation"
-                .into(),
+            "tenant tasks require an authenticated tenant principal and live delegation".into(),
         );
     }
     Ok(())

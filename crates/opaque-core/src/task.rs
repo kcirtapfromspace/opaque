@@ -27,14 +27,15 @@ pub struct TaskManifest {
     pub actions: Vec<TaskAction>,
 }
 
-/// V1 secret actions retain their exact wire representation. V2 release
-/// actions carry an explicit operation and cannot be mixed with V1 actions.
+/// Each schema selects one action family. Legacy wire representations stay
+/// unchanged; typed release, inference and SSH actions cannot be mixed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum TaskAction {
     PublishSecret(PublishAction),
     StagingRelease(crate::release::StagingReleaseAction),
     Inference(crate::inference::InferenceAction),
+    SshHealth(crate::ssh::SshHealthAction),
 }
 
 impl From<PublishAction> for TaskAction {
@@ -49,7 +50,25 @@ impl From<crate::release::StagingReleaseAction> for TaskAction {
     }
 }
 
+impl From<crate::ssh::SshHealthAction> for TaskAction {
+    fn from(action: crate::ssh::SshHealthAction) -> Self {
+        Self::SshHealth(action)
+    }
+}
+
 impl TaskAction {
+    pub fn as_ssh(&self) -> Option<&crate::ssh::SshHealthAction> {
+        match self {
+            Self::SshHealth(action) => Some(action),
+            _ => None,
+        }
+    }
+    pub fn as_ssh_mut(&mut self) -> Option<&mut crate::ssh::SshHealthAction> {
+        match self {
+            Self::SshHealth(action) => Some(action),
+            _ => None,
+        }
+    }
     pub fn as_inference(&self) -> Option<&crate::inference::InferenceAction> {
         match self {
             Self::Inference(action) => Some(action),
@@ -90,21 +109,21 @@ impl TaskAction {
         match self {
             Self::PublishSecret(a) => &a.repo,
             Self::StagingRelease(a) => &a.repo,
-            Self::Inference(_) => "",
+            Self::Inference(_) | Self::SshHealth(_) => "",
         }
     }
     pub fn repository_id(&self) -> u64 {
         match self {
             Self::PublishSecret(a) => a.repository_id,
             Self::StagingRelease(a) => a.repository_id,
-            Self::Inference(_) => 0,
+            Self::Inference(_) | Self::SshHealth(_) => 0,
         }
     }
     pub fn github_token_ref(&self) -> Option<&str> {
         match self {
             Self::PublishSecret(a) => a.github_token_ref.as_deref(),
             Self::StagingRelease(a) => a.github_token_ref.as_deref(),
-            Self::Inference(_) => None,
+            Self::Inference(_) | Self::SshHealth(_) => None,
         }
     }
     pub fn secret_refs(&self) -> Vec<String> {
@@ -113,6 +132,9 @@ impl TaskAction {
             .map(str::to_owned)
             .into_iter()
             .collect::<Vec<_>>();
+        if let Self::SshHealth(a) = self {
+            refs.push(a.vault_token_ref.clone());
+        }
         if let Self::PublishSecret(a) = self {
             refs.push(a.value_ref.clone());
         }
@@ -130,6 +152,7 @@ impl TaskAction {
                 Self::PublishSecret(a) => a.secret_name.clone(),
                 Self::StagingRelease(a) => a.workflow_path.clone(),
                 Self::Inference(a) => format!("{:02}", a.ordinal),
+                Self::SshHealth(a) => a.grant_id.clone(),
             },
         )
     }
@@ -176,7 +199,8 @@ pub enum TaskApprovalMode {
 pub enum SlotState {
     Pending,
     Reserved,
-    /// GitHub accepted the write; the secret value cannot be read back.
+    /// Provider acceptance, or authenticated completion for a typed SSH action.
+    /// The action-specific receipt determines what was actually observed.
     ApiAccepted,
     Rejected,
     /// A write may have happened. This slot must never be reused.
@@ -202,6 +226,10 @@ pub struct SlotOutcome {
     /// Provider evidence for a fixed inference slot; never refunds allowance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inference_receipt: Option<crate::inference::InferenceReceipt>,
+    /// Host evidence authenticated by the broker before recording. Older task
+    /// formats omit this field, preserving their wire representation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_receipt: Option<crate::ssh::SshReceipt>,
 }
 
 impl SlotOutcome {
@@ -236,6 +264,22 @@ impl SlotOutcome {
         if !allowed {
             return Err(TaskValidationError::InvalidOutcome);
         }
+        if let Some(receipt) = &self.ssh_receipt {
+            use crate::ssh::SshReceiptCode as Code;
+            let expected = match receipt.code {
+                Code::HealthObserved => (SlotState::ApiAccepted, "api_accepted"),
+                Code::Denied => (SlotState::Rejected, "provider_rejected"),
+                Code::TimedOut => (SlotState::Unknown, "transport_unknown"),
+                Code::Expired => (SlotState::Rejected, "expired"),
+                Code::Revoked => (SlotState::Rejected, "revoked"),
+            };
+            if self.provider_run_id.is_some()
+                || self.inference_receipt.is_some()
+                || (self.state, self.code.as_str()) != expected
+            {
+                return Err(TaskValidationError::InvalidOutcome);
+            }
+        }
         if let Some(receipt) = &self.inference_receipt {
             use crate::inference::InferenceReceiptCode as Code;
             let expected = match receipt.code {
@@ -255,6 +299,16 @@ impl SlotOutcome {
 
     pub fn validate_for_action(&self, action: &TaskAction) -> Result<(), TaskValidationError> {
         self.validate()?;
+        match (action.as_ssh(), &self.ssh_receipt) {
+            (Some(action), Some(receipt)) => receipt
+                .validate(action)
+                .map_err(|_| TaskValidationError::Ssh)?,
+            (None, Some(_)) => return Err(TaskValidationError::Ssh),
+            (Some(_), None) if self.state == SlotState::ApiAccepted => {
+                return Err(TaskValidationError::Ssh);
+            }
+            _ => (),
+        }
         match (action.as_inference(), &self.inference_receipt) {
             (Some(action), Some(receipt)) => receipt
                 .validate(action)
@@ -317,6 +371,15 @@ impl TaskRecord {
             }
         }
         for action in &self.manifest.actions {
+            if let Some(action) = action.as_ssh()
+                && (self.tenant.as_ref() != Some(&action.tenant)
+                    || self.owner_key
+                        != action
+                            .tenant
+                            .owner_key(action.workload_uid, Some(&action.subject)))
+            {
+                return Err(TaskValidationError::Tenant);
+            }
             if let Some(action) = action.as_inference()
                 && self.tenant.as_ref() != Some(&action.tenant)
             {
@@ -326,6 +389,14 @@ impl TaskRecord {
         for slot in &self.slots {
             if let Some(outcome) = &slot.outcome {
                 outcome.validate_for_action(&slot.action)?;
+                if let Some(receipt) = &outcome.ssh_receipt
+                    && (self.approved_at.is_none_or(|at| receipt.started_at < at)
+                        || slot.finished_at.is_none_or(|at| receipt.completed_at > at)
+                        || slot.reserved_at.is_none_or(|at| receipt.started_at < at)
+                        || receipt.completed_at > self.expires_at + 1)
+                {
+                    return Err(TaskValidationError::Ssh);
+                }
                 if let Some(receipt) = &outcome.inference_receipt
                     && (slot.finished_at.is_none_or(|at| receipt.completed_at > at)
                         || slot.reserved_at.is_none_or(|at| receipt.completed_at < at))
@@ -404,9 +475,11 @@ pub struct PinnedVaultRef<'a> {
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum TaskValidationError {
     #[error(
-        "task schema_version must be 1 (secret publishing), 2 (one staging release), or 3 (three fixed inference requests)"
+        "task schema_version must be 1 (secret publishing), 2 (one staging release), 3 (three fixed inference requests), or 4 (one fixed SSH health check)"
     )]
     SchemaVersion,
+    #[error("invalid fixed SSH scope or authenticated host evidence")]
+    Ssh,
     #[error("invalid fixed inference scope or evidence")]
     Inference,
     #[error("task tenant and broker binding does not match its authority")]
@@ -441,7 +514,7 @@ pub enum TaskValidationError {
 
 impl TaskManifest {
     pub fn validate(&self) -> Result<(), TaskValidationError> {
-        if !matches!(self.schema_version, TASK_SCHEMA_VERSION | 2 | 3) {
+        if !matches!(self.schema_version, TASK_SCHEMA_VERSION | 2 | 3 | 4) {
             return Err(TaskValidationError::SchemaVersion);
         }
         if self.title.is_empty()
@@ -457,6 +530,21 @@ impl TaskManifest {
         }
         if self.actions.is_empty() || self.actions.len() > MAX_TASK_ACTIONS {
             return Err(TaskValidationError::ActionCount);
+        }
+        if self.is_ssh() {
+            if !self.github_api_url.is_empty()
+                || !self.vault_api_url.is_empty()
+                || self.actions.len() != 1
+                || self.expires_in_secs > crate::ssh::MAX_SSH_TASK_DURATION_SECS
+            {
+                return Err(TaskValidationError::Ssh);
+            }
+            self.actions[0]
+                .as_ssh()
+                .ok_or(TaskValidationError::Ssh)?
+                .validate()
+                .map_err(|_| TaskValidationError::Ssh)?;
+            return Ok(());
         }
         if self.is_inference() {
             if !self.github_api_url.is_empty()
@@ -518,7 +606,9 @@ impl TaskManifest {
         let canonical = self.canonicalized()?;
         let bytes = serde_json::to_vec(&canonical).expect("manifest contains serializable fields");
         let mut hash = Sha256::new();
-        hash.update(if self.is_inference() {
+        hash.update(if self.is_ssh() {
+            b"opaque.ssh-health-manifest.v4\0".as_slice()
+        } else if self.is_inference() {
             b"opaque.fixed-inference-manifest.v3\0".as_slice()
         } else if self.is_release() {
             b"opaque.github-staging-release.v2\0".as_slice()
@@ -527,6 +617,10 @@ impl TaskManifest {
         });
         hash.update(bytes);
         Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
+    }
+
+    pub fn is_ssh(&self) -> bool {
+        self.schema_version == 4
     }
 
     pub fn is_release(&self) -> bool {
@@ -538,7 +632,9 @@ impl TaskManifest {
     }
 
     pub fn operation_name(&self) -> &'static str {
-        if self.is_inference() {
+        if self.is_ssh() {
+            crate::ssh::SSH_TASK_OPERATION
+        } else if self.is_inference() {
             crate::inference::INFERENCE_TASK_OPERATION
         } else if self.is_release() {
             "github.release_manifest"
@@ -948,6 +1044,7 @@ mod tests {
         assert!(
             SlotOutcome {
                 provider_run_id: None,
+                ssh_receipt: None,
                 inference_receipt: None,
                 state: SlotState::Unknown,
                 code: "transport_unknown".into()
@@ -963,6 +1060,7 @@ mod tests {
             assert!(
                 SlotOutcome {
                     provider_run_id: None,
+                    ssh_receipt: None,
                     inference_receipt: None,
                     state,
                     code: code.into()
@@ -1077,6 +1175,7 @@ mod tests {
         let mut invalid = record.clone();
         invalid.slots[0].outcome = Some(SlotOutcome {
             provider_run_id: None,
+            ssh_receipt: None,
             inference_receipt: None,
             state: SlotState::Unknown,
             code: "raw provider token".into(),
@@ -1210,6 +1309,7 @@ mod tests {
             state: SlotState::ApiAccepted,
             code: "api_accepted".into(),
             provider_run_id: None,
+            ssh_receipt: None,
             inference_receipt: Some(receipt),
         };
         valid.validate_for_action(action).unwrap();

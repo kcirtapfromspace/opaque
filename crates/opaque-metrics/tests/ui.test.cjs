@@ -275,3 +275,73 @@ test('portfolio policy events require the session explicit tool grant',()=>{
   value.policy_context.allowed_tools=['opaque_metrics_query'];assert.throws(()=>app.receivePolicy(turn,policy({tool:'opaque_portfolio_query'})),/did not match/);
   app.receivePolicy(turn,policy({tool:'opaque_metrics_query'}));
 });
+
+function workSession(generation=1) {
+  const value=organizationSession('customer_analyst',generation);
+  value.allowed_metrics=[{id:'manual_review_rate_percent',label:'Manual review rate'}];
+  return value;
+}
+function workTask(value=workSession(),status='planned') {
+  const now=Math.floor(Date.now()/1000);
+  return {task_id:'01234567-89ab-4cde-8fab-0123456789ab',manifest_sha256:'b'.repeat(64),state:status,consumed:['reserved','completed','unknown'].includes(status),simulation:true,notice:'Synthetic demo task. Source credentials stay with the service.',
+    manifest:{operation:'metrics.aggregate.read',tenant_id:value.customer.id,source_id:value.source.label,metrics:['manual_review_rate_percent'],window_secs:60,max_uses:1,created_at:now-5,expires_at:now+295,subject:value.subject.id,client_id:'fixture-analyst-client',persona_generation:value.organization.generation},
+    approval:status==='planned'?null:{kind:'synthetic_demo_confirmation',approved_at:now-3},
+    receipt:status==='completed'?{evidence:'synthetic_source_observed',completed_at:now,evidence_sha256:'c'.repeat(64),result:{tenant_id:value.customer.id,source_id:value.source.label,window_secs:60,as_of:now,watermark:now-1,observed_at:now,metrics:[{name:'manual_review_rate_percent',value:18.4,count:25}]}}:null};
+}
+
+test('task loading only reads status and never approves or executes on render or reload',async()=>{
+  const app=ui(),value=workSession();let calls=[];
+  app.fetch=async(path,options)=>{calls.push({path,options});return {ok:true,status:200,json:async()=>workTask(value)};};
+  app.renderSession(value);assert.equal(calls.length,0);
+  await app.loadWorkTask();await app.loadWorkTask();
+  assert.equal(calls.length,2);assert.ok(calls.every(call=>call.path==='/api/work-task'&&!call.options.method));
+  assert.equal(app.byId('work-approve').hidden,false);assert.equal(app.byId('work-run').hidden,true);assert.equal(app.byId('work-receipt').hidden,true);
+  assert.equal(app.byId('work-notice').textContent,workTask(value).notice);
+});
+
+test('task actions send only the exact reviewed ID and digest and require server confirmation',async()=>{
+  const app=ui(),value=workSession();app.renderSession(value);app.state.workTask=app.validateWorkTask(workTask(value));let calls=[];
+  app.fetch=async(path,options)=>{calls.push({path,options});return {ok:true,status:200,json:async()=>workTask(value,path.endsWith('approve')?'approved':'completed')};};
+  await app.workTaskAction('execute');assert.equal(calls.length,0);
+  await app.workTaskAction('approve');assert.equal(app.state.workTask.state,'approved');assert.equal(app.byId('work-run').hidden,false);
+  await app.workTaskAction('execute');assert.equal(app.state.workTask.state,'completed');assert.equal(app.byId('work-receipt').hidden,false);assert.equal(app.byId('work-value').textContent,'18.4%');
+  assert.deepEqual(calls.map(call=>call.path),['/api/work-task/approve','/api/work-task/execute']);
+  for(const call of calls){assert.deepEqual(JSON.parse(call.options.body),{task_id:app.state.workTask.task_id,manifest_sha256:'b'.repeat(64)});assert.equal(call.options.credentials,'same-origin');assert.equal(call.options.headers.Authorization,undefined);}
+});
+
+test('replay denial displays the actual service error while retaining the confirmed receipt',async()=>{
+  const app=ui(),value=workSession();app.renderSession(value);app.state.workTask=app.validateWorkTask(workTask(value,'completed'));app.renderWorkTask();let calls=0;
+  app.fetch=async()=>{calls++;return {ok:false,status:409,json:async()=>({error:{code:'task_consumed',message:'This one-use task is already consumed.'}})};};
+  await app.workTaskAction('execute');assert.equal(calls,1);assert.equal(app.state.workTask.state,'completed');assert.equal(app.byId('work-receipt').hidden,false);
+  assert.match(app.byId('work-status').textContent,/Replay request denied.*recorded task remains consumed.*task_consumed.*already consumed/);assert.equal(app.byId('work-error').hidden,true);
+});
+
+test('an uncertain action response does not invent completion or automatically retry execution',async()=>{
+  const app=ui(),value=workSession();app.renderSession(value);app.state.workTask=app.validateWorkTask(workTask(value,'approved'));let calls=0;
+  app.fetch=async()=>{calls++;throw new Error('Connection interrupted.');};
+  await app.workTaskAction('execute');assert.equal(calls,1);assert.equal(app.state.workTask,null);assert.equal(app.byId('work-receipt').hidden,true);
+  assert.match(app.byId('work-status').textContent,/outcome is not confirmed/);assert.equal(app.byId('work-refresh').disabled,false);
+});
+
+test('task scope and receipt validation reject altered authority before showing metrics',()=>{
+  const app=ui(),value=workSession();app.renderSession(value);
+  const changes=[t=>t.manifest.tenant_id='cedar-bank',t=>t.manifest.subject='another-subject',t=>t.manifest.source_id='another-source',t=>t.manifest.window_secs=300,t=>t.manifest.max_uses=2,t=>t.manifest.metrics=['borrower_ssn'],t=>t.manifest.expires_at+=1,t=>t.manifest.persona_generation=2,t=>t.approval=null,t=>t.consumed=false,t=>t.receipt.result.tenant_id='cedar-bank',t=>t.receipt.result.metrics[0].value=Infinity];
+  for(const change of changes){const task=workTask(value,'completed');change(task);assert.throws(()=>app.validateWorkTask(task));assert.equal(app.byId('work-receipt').hidden,true);assert.equal(app.byId('work-value').textContent,'');}
+});
+
+test('persona changes clear all task evidence and discard late receipt responses',async()=>{
+  const app=ui(),value=workSession();app.renderSession(value);app.state.workTask=app.validateWorkTask(workTask(value,'completed'));app.renderWorkTask();let resolve;
+  app.fetch=()=>new Promise(done=>resolve=done);const pending=app.loadWorkTask();app.renderSession(organizationSession('engineer',2));
+  assert.equal(app.state.workTask,null);assert.equal(app.byId('work-value').textContent,'');assert.equal(app.byId('work-content').hidden,true);assert.equal(app.byId('work-role').hidden,false);
+  resolve({ok:true,status:200,json:async()=>workTask(value,'completed')});await pending;
+  assert.equal(app.state.workTask,null);assert.equal(app.byId('work-value').textContent,'');
+  let called=false;app.fetch=async()=>{called=true;};await app.loadWorkTask();await app.workTaskAction('execute');assert.equal(called,false);
+  app.renderSession(organizationSession('support',3));await app.loadWorkTask();assert.equal(called,false);assert.equal(app.byId('work-content').hidden,true);
+});
+
+test('returning analyst can display only a revoked older task without its prior receipt',()=>{
+  const app=ui(),earlier=workSession(),current=workSession(3);app.renderSession(current);
+  const revoked=workTask(earlier,'revoked');app.state.workTask=app.validateWorkTask(revoked);app.renderWorkTask();
+  assert.equal(app.byId('work-state').textContent,'revoked');assert.equal(app.byId('work-run').hidden,true);assert.equal(app.byId('work-approve').hidden,true);
+  revoked.receipt=workTask(earlier,'completed').receipt;assert.throws(()=>app.validateWorkTask(revoked),/earlier identity generation/);
+});

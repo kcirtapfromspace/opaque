@@ -1,5 +1,12 @@
 # Tenant-scoped data and model access: readiness
 
+> **Historical evidence — September 4, 2026.** The
+> [private milestone roadmap](roadmap.md) is the current checklist. Later work
+> built and demonstrated a scoped HTTP OAuth/MCP gateway, GPU-backed synthetic
+> analytics and a demo lifecycle controller. The evidence limits and iteration
+> order below describe this earlier inference snapshot. Real-source/production
+> IdP integration, general attestors and bounded SSH retain separate gates.
+
 Opaque now binds a fixed inference task to an authenticated principal, an immutable tenant/broker lineage, a trusted source snapshot, a model destination, and three permanently consumed attempts. This is the first executable slice of the data-governance direction described in [tenant boundaries](../tenant-boundaries.md). The model requests work; the broker grants or denies it.
 
 ## Implemented

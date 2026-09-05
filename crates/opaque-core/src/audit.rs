@@ -126,6 +126,12 @@ pub enum AuditEventKind {
     /// (e.g. an operation succeeded without its required approval being
     /// granted in the chain).
     AuditAlert,
+
+    /// The listener attested a workload before dispatching its request.
+    WorkloadAttested,
+
+    /// Workload attestation failed or a caller tried to assert its identity.
+    WorkloadAttestationDenied,
 }
 
 impl fmt::Display for AuditEventKind {
@@ -162,6 +168,8 @@ impl fmt::Display for AuditEventKind {
             Self::FederationBundleApplied => "federation.bundle_applied",
             Self::FederationBundleRejected => "federation.bundle_rejected",
             Self::AuditAlert => "audit.alert",
+            Self::WorkloadAttested => "workload.attested",
+            Self::WorkloadAttestationDenied => "workload.attestation_denied",
         };
         write!(f, "{s}")
     }
@@ -203,6 +211,8 @@ impl std::str::FromStr for AuditEventKind {
             "federation.bundle_applied" => Ok(Self::FederationBundleApplied),
             "federation.bundle_rejected" => Ok(Self::FederationBundleRejected),
             "audit.alert" => Ok(Self::AuditAlert),
+            "workload.attested" => Ok(Self::WorkloadAttested),
+            "workload.attestation_denied" => Ok(Self::WorkloadAttestationDenied),
             _ => Err(format!("unknown audit event kind: {s}")),
         }
     }
@@ -683,6 +693,7 @@ fn default_level_for_kind(kind: AuditEventKind) -> AuditLevel {
         | AuditEventKind::RateLimited
         | AuditEventKind::AuditDropped
         | AuditEventKind::IdentityLoginFailed
+        | AuditEventKind::WorkloadAttestationDenied
         | AuditEventKind::ExecveDenied => AuditLevel::Warn,
         AuditEventKind::OperationFailed => AuditLevel::Error,
         _ => AuditLevel::Info,
@@ -2312,9 +2323,15 @@ mod tests {
             (AuditEventKind::ExecveAllowed, "execve.allowed"),
             (AuditEventKind::ExecveDenied, "execve.denied"),
             (AuditEventKind::ExecvePrompted, "execve.prompted"),
+            (AuditEventKind::WorkloadAttested, "workload.attested"),
+            (
+                AuditEventKind::WorkloadAttestationDenied,
+                "workload.attestation_denied",
+            ),
         ];
         for (kind, expected) in kinds {
             assert_eq!(format!("{kind}"), expected);
+            assert_eq!(expected.parse::<AuditEventKind>().unwrap(), kind);
         }
     }
 

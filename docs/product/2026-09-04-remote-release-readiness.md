@@ -1,5 +1,12 @@
 # Remote approval and staging-release readiness
 
+> **Historical evidence — September 4, 2026.** Use the
+> [private milestone roadmap](roadmap.md) for the current checklist. Native human
+> review and a real private artifact-smoke dispatch remain M1–M2 gates. Subsequent
+> GPU, OAuth gateway and demo-controller work has been implemented and demonstrated;
+> the “next” and “not implemented by this increment” statements below describe
+> this snapshot. Test counts, task IDs and temporary paths remain historical.
+
 Opaque now has a second bounded task: approve one reviewed staging workflow
 dispatch, then inspect the resulting workflow without granting another attempt.
 The shared task ledger also supports a trusted workstation signing the full

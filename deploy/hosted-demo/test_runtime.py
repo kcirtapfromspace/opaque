@@ -144,6 +144,57 @@ class ContentLengthGateway(BaseHTTPRequestHandler):
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_task_reference_cannot_add_authority_and_proxy_keeps_private_identity(self):
+        value = self.organization_runtime()
+        proxy = self.serve(r.Proxy, value)
+        auth = [("Authorization", "Bearer " + value.config["secret"]), ("Cookie", "forged=identity")]
+        reference = {"task_id": "46e8a66c-2ad6-4a93-a668-976e1a12769c", "manifest_sha256": "d" * 64}
+        with patch.object(r.http.client, "HTTPConnection") as outbound:
+            for path in r.TASK_PATHS:
+                for invalid in ({**reference, "tenant_id": "foreign"}, {**reference, "command": "shell"},
+                                {**reference, "manifest_sha256": "not-a-digest"}, {"task_id": reference["task_id"]}):
+                    self.assertEqual(request(proxy.server_port, path, invalid, auth)[0], 400)
+            outbound.assert_not_called()
+        connection = GatewayConnection(GatewayResponse(b'{"task":{"state":"completed"}}'))
+        with patch.object(r.http.client, "HTTPConnection", return_value=connection):
+            status, headers, _ = request(proxy.server_port, "/api/work-task/execute", reference, auth)
+        self.assertEqual(status, 200)
+        self.assertNotIn(b"Set-Cookie", headers)
+        method, path, body, forwarded = connection.calls[0]
+        self.assertEqual((method, path), ("POST", "/api/work-task/execute"))
+        self.assertEqual(json.loads(body), reference)
+        self.assertEqual(forwarded["Cookie"], value.cookie)
+        self.assertEqual(value.active_requests, 0)
+        self.assertEqual(value.model_unknown, 0, "a source task must not charge the GPU uncertainty fence")
+
+    def test_inflight_task_read_blocks_persona_switch_until_its_receipt_drains(self):
+        value = self.organization_runtime()
+        proxy = self.serve(r.Proxy, value)
+        auth = [("Authorization", "Bearer " + value.config["secret"])]
+        entered, release = threading.Event(), threading.Event()
+        connection = GatewayConnection(GatewayResponse(b'{"task":{"state":"completed"}}'))
+        def response():
+            entered.set()
+            release.wait(3)
+            return connection.response
+        connection.getresponse = response
+        results = []
+        with patch.object(r.http.client, "HTTPConnection", return_value=connection) as outbound:
+            running = threading.Thread(target=lambda: results.append(request(proxy.server_port, "/api/work-task", headers=auth)))
+            running.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                self.assertEqual(value.active_requests, 1)
+                self.assertEqual(request(proxy.server_port, "/api/demo/persona", {"persona_id": "engineer"}, auth)[0], 409)
+                self.assertEqual(outbound.call_count, 1)
+            finally:
+                release.set()
+                running.join(3)
+        self.assertFalse(running.is_alive())
+        self.assertEqual(results[0][0], 200)
+        self.assertEqual(value.persona, "customer_analyst")
+        self.assertEqual(value.active_requests, 0)
+
     def organization_runtime(self):
         value = runtime()
         value.persona_cookies = {persona: "opaque_metrics_8081=private-" + persona

@@ -123,6 +123,12 @@ pub fn secrets_status(
 pub fn safe_tools() -> Vec<ToolDef> {
     vec![
         ToolDef {
+            name: "opaque_task_plan_ssh",
+            description: "Plan one fixed SSH service health operation for the authenticated broker tenant. The broker selects the host, pinned host key, SSH principal, source address, command and session limit from its trusted profile and binds the current delegated identity. Only a review title and task expiry are accepted. Planning issues no SSH certificate and grants no execution authority. Use opaque_task_run for trusted human approval and a single attempt; inspect opaque_task_get for authenticated host evidence.",
+            input_schema: json!({"type":"object","additionalProperties":false,"required":["title","expires_in_secs"],"properties":{"title":{"type":"string","minLength":1,"maxLength":160},"expires_in_secs":{"type":"integer","minimum":1,"maximum":opaque_core::ssh::MAX_SSH_TASK_DURATION_SECS}}}),
+            build_params: |args| json!({"title": args.get("title").cloned().unwrap_or(json!(null)), "expires_in_secs": args.get("expires_in_secs").cloned().unwrap_or(json!(null))}),
+        },
+        ToolDef {
             name: "opaque_task_plan_inference",
             description: "Plan three fixed synthetic public-source model completions in the authenticated tenant. The broker selects the source snapshot, model and exact prompts. No custom SQL, data source, endpoint, tenant or prompt is accepted. Planning is read-only and grants no authority. Human approval is required before execution; each attempt reserves 96 output units and uncertainty stops later requests.",
             input_schema: json!({"type":"object","additionalProperties":false,"required":["title","expires_in_secs"],"properties":{"title":{"type":"string","minLength":1,"maxLength":160},"expires_in_secs":{"type":"integer","minimum":1,"maximum":600}}}),
@@ -136,13 +142,13 @@ pub fn safe_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "opaque_task_run",
-            description: "Request trusted human approval for an immutable planned task and execute its fixed actions once, including secret publishing, staging workflow dispatch or bounded inference. Approval cannot be supplied as a tool argument. Each reserved action permanently consumes its slot; inference attempts reserve 96 output tokens. Failures and unknown outcomes receive no automatic retry or fresh allowance. After a timeout or concurrent run, use opaque_task_get to inspect the receipt. Repeating this call cannot resume a closed task.",
+            description: "Request trusted human approval for an immutable planned task and execute its fixed actions once, including secret publishing, staging workflow dispatch, bounded inference or one fixed SSH service health command. Approval cannot be supplied as a tool argument. Each reserved action permanently consumes its slot; inference attempts reserve 96 output tokens. Failures and unknown outcomes receive no automatic retry or fresh allowance. After a timeout or concurrent run, use opaque_task_get to inspect the receipt. Repeating this call cannot resume a closed task.",
             input_schema: task_id_schema(),
             build_params: task_id_params,
         },
         ToolDef {
             name: "opaque_task_get",
-            description: "Inspect a bounded task's exact targets, source and tenant bindings, digest, approval state, expiry and durable receipt. Interpret evidence by action type: GitHub write or dispatch acceptance, or an observed inference completion with returned text and reported token usage. API acceptance alone does not establish deployment or service health. Secret values cannot be read back. Reserved or unknown slots remain charged. Use this after interrupted runs instead of repeating provider actions.",
+            description: "Inspect a bounded task's exact targets, source and tenant bindings, digest, approval state, expiry and durable receipt. Interpret evidence by action type: GitHub write or dispatch acceptance, an observed inference completion with returned text and reported token usage, or a verified signed host health receipt. API acceptance alone does not establish deployment or service health. Secret values cannot be read back. Reserved or unknown slots remain charged. Use this after interrupted runs instead of repeating provider actions.",
             input_schema: task_id_schema(),
             build_params: task_id_params,
         },
@@ -639,7 +645,7 @@ fn task_plan_schema() -> serde_json::Value {
 fn task_id_schema() -> serde_json::Value {
     json!({
         "type": "object", "additionalProperties": false, "required": ["task_id"],
-        "properties": {"task_id": {"type": "string", "description": "Broker-issued task ID returned by opaque_task_plan or opaque_task_plan_inference"}}
+        "properties": {"task_id": {"type": "string", "description": "Broker-issued task ID returned by opaque_task_plan, opaque_task_plan_inference or opaque_task_plan_ssh"}}
     })
 }
 
@@ -656,6 +662,7 @@ fn task_id_params(args: &serde_json::Value) -> serde_json::Value {
 /// fields in the params built by each tool's `build_params`.
 pub fn tool_to_daemon_method(tool_name: &str) -> Option<&'static str> {
     static MAPPING: &[(&str, &str)] = &[
+        ("opaque_task_plan_ssh", "task_plan_ssh"),
         ("opaque_task_plan_inference", "task_plan_inference"),
         ("opaque_task_plan", "task_plan"),
         ("opaque_task_run", "task_run"),
@@ -705,6 +712,7 @@ mod tests {
             "sandbox.secrets_status",
             "task_plan",
             "task_plan_inference",
+            "task_plan_ssh",
             "task_run",
             "task_get",
             "task_list",
@@ -755,7 +763,7 @@ mod tests {
     #[test]
     fn tool_count() {
         let tools = safe_tools();
-        assert_eq!(tools.len(), 21);
+        assert_eq!(tools.len(), 22);
     }
 
     #[test]
@@ -773,6 +781,35 @@ mod tests {
             assert!(params.get("approved").is_none());
             assert!(params.get("workspace").is_none());
         }
+    }
+
+    #[test]
+    fn ssh_planning_accepts_only_review_text_and_bounded_expiry() {
+        let tool = safe_tools()
+            .into_iter()
+            .find(|tool| tool.name == "opaque_task_plan_ssh")
+            .unwrap();
+        assert_eq!(tool_to_daemon_method(tool.name), Some("task_plan_ssh"));
+        let properties = tool.input_schema["properties"].as_object().unwrap();
+        assert_eq!(properties.len(), 2);
+        assert_eq!(
+            properties["expires_in_secs"]["maximum"],
+            opaque_core::ssh::MAX_SSH_TASK_DURATION_SECS
+        );
+        let params = (tool.build_params)(&json!({
+            "title":"Check the configured service", "expires_in_secs":90,
+            "host":"attacker.example", "principal":"root", "command":"sh",
+            "tenant_id":"foreign", "delegation_id":"forged", "approved":true,
+            "max_session_secs":3600, "private_key":"forged", "manifest":{}
+        }));
+        assert_eq!(
+            params,
+            json!({"title":"Check the configured service", "expires_in_secs":90})
+        );
+        assert_eq!(
+            (tool.build_params)(&json!({})),
+            json!({"title":null,"expires_in_secs":null})
+        );
     }
 
     #[test]

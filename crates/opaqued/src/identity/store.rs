@@ -64,6 +64,16 @@ CREATE TABLE IF NOT EXISTS delegations (
     revoked_at       INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_delegations_sub ON delegations(sub_principal);
+
+-- Resource revocations live with broker identity; gateways never open this DB.
+CREATE TABLE IF NOT EXISTS resource_revocations (
+    issuer TEXT NOT NULL,
+    audience TEXT NOT NULL,
+    jti TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    revoked_at INTEGER NOT NULL,
+    PRIMARY KEY (issuer, audience, jti)
+);
 "#;
 
 /// A human login session row.
@@ -277,6 +287,45 @@ impl IdentityStore {
 
     pub fn get_principal(&self, id: &PrincipalId) -> Result<Option<Principal>, String> {
         self.get_principal_by_str(id.as_str())
+    }
+
+    /// Exact issuer+subject lookup; OAuth access never bootstraps an identity.
+    pub fn get_human_by_subject(
+        &self,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<Option<Principal>, String> {
+        self.lock().query_row(
+            "SELECT id, kind, iss, sub, email, display_name, tool, service_name, roles, created_at, last_seen, disabled FROM principals WHERE kind='human' AND iss=?1 AND sub=?2",
+            params![issuer, subject], row_to_principal,
+        ).optional().map_err(|e| e.to_string())
+    }
+
+    pub fn resource_token_revoked(
+        &self,
+        issuer: &str,
+        audience: &str,
+        jti: &str,
+    ) -> Result<bool, String> {
+        self.lock().query_row(
+            "SELECT EXISTS(SELECT 1 FROM resource_revocations WHERE issuer=?1 AND audience=?2 AND jti=?3)",
+            params![issuer, audience, jti], |row| row.get(0),
+        ).map_err(|e| e.to_string())
+    }
+
+    /// Monotonic and durable. Scoped by issuer and resource, with expiry only
+    /// for retention metadata; checks never forget a revoked token on restart.
+    pub fn revoke_resource_token(
+        &self,
+        issuer: &str,
+        audience: &str,
+        jti: &str,
+        expires_at: i64,
+    ) -> Result<(), String> {
+        self.lock().execute(
+            "INSERT INTO resource_revocations(issuer,audience,jti,expires_at,revoked_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(issuer,audience,jti) DO UPDATE SET expires_at=MAX(expires_at,excluded.expires_at)",
+            params![issuer, audience, jti, expires_at, now_unix()],
+        ).map(|_| ()).map_err(|e| e.to_string())
     }
 
     /// Look up a service principal by its configured name.
@@ -1061,5 +1110,92 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+
+    #[test]
+    fn issuer_subject_lookup_is_exact_and_reads_live_principal_state() {
+        let store = IdentityStore::open_in_memory().unwrap();
+        let principal = store
+            .upsert_human(
+                "https://idp.example",
+                "subject",
+                Some("user@example.com"),
+                None,
+                &BTreeSet::from([Role::Operator]),
+            )
+            .unwrap();
+        assert!(
+            store
+                .get_human_by_subject("https://other.example", "subject")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_human_by_subject("https://idp.example", "other")
+                .unwrap()
+                .is_none()
+        );
+        store.set_roles(&principal.id, &BTreeSet::new()).unwrap();
+        store.set_disabled(&principal.id, true).unwrap();
+        let current = store
+            .get_human_by_subject("https://idp.example", "subject")
+            .unwrap()
+            .unwrap();
+        assert!(current.disabled);
+        assert!(current.roles.is_empty());
+    }
+
+    #[test]
+    fn resource_revocation_is_durable_monotonic_and_issuer_resource_scoped() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("identity.db");
+        {
+            let store = IdentityStore::open(&path).unwrap();
+            assert!(
+                !store
+                    .resource_token_revoked("issuer", "resource", "token")
+                    .unwrap()
+            );
+            store
+                .revoke_resource_token("issuer", "resource", "token", 900)
+                .unwrap();
+            store
+                .revoke_resource_token("issuer", "resource", "token", 100)
+                .unwrap();
+        }
+        let reopened = IdentityStore::open(&path).unwrap();
+        assert!(
+            reopened
+                .resource_token_revoked("issuer", "resource", "token")
+                .unwrap()
+        );
+        assert!(
+            !reopened
+                .resource_token_revoked("other", "resource", "token")
+                .unwrap()
+        );
+        assert!(
+            !reopened
+                .resource_token_revoked("issuer", "other", "token")
+                .unwrap()
+        );
+        assert!(
+            !reopened
+                .resource_token_revoked("issuer", "resource", "other")
+                .unwrap()
+        );
+        let expiry: i64 = reopened
+            .lock()
+            .query_row("SELECT expires_at FROM resource_revocations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(expiry, 900);
     }
 }
