@@ -1,8 +1,9 @@
 //! Vault secret resolver.
 //!
-//! Resolves `vault:<path>#<field>` secret refs using Vault HTTP API.
+//! Resolves `vault:<path>[?version=<positive-integer>]#<field>` secret refs.
 
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -32,7 +33,16 @@ struct LeaseCacheEntry {
     renewable: bool,
 }
 
-static LEASE_CACHE: LazyLock<Mutex<HashMap<String, LeaseCacheEntry>>> =
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct LeaseCacheKey {
+    base_url: String,
+    token_fingerprint: [u8; 32],
+    path: String,
+    field: String,
+    version: Option<NonZeroU64>,
+}
+
+static LEASE_CACHE: LazyLock<Mutex<HashMap<LeaseCacheKey, LeaseCacheEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Clone)]
@@ -53,6 +63,21 @@ enum CacheState {
 struct VaultRef<'a> {
     path: &'a str,
     field: &'a str,
+    version: Option<NonZeroU64>,
+}
+
+/// Validate a reference that binds execution to one Vault KV v2 version.
+/// This performs no network requests and does not resolve credentials.
+#[cfg(test)]
+fn validate_pinned_ref(ref_str: &str) -> Result<(), ResolveError> {
+    let parsed = VaultResolver::parse_ref(ref_str)?;
+    if parsed.version.is_none() {
+        return Err(ResolveError::VaultError(
+            ref_str.to_owned(),
+            "a pinned KV v2 ref requires ?version=<positive-integer> before #<field>".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Resolves `vault:<path>#<field>` refs.
@@ -95,12 +120,34 @@ impl VaultResolver {
             ));
         }
 
-        let (path, field) = rest.split_once('#').ok_or_else(|| {
+        let (path_query, field) = rest.split_once('#').ok_or_else(|| {
             ResolveError::VaultError(
                 ref_str.to_owned(),
                 "expected format vault:<path>#<field>".into(),
             )
         })?;
+
+        let (path, version) = match path_query.split_once('?') {
+            Some((path, query)) => {
+                let version = query.strip_prefix("version=").and_then(|raw| {
+                    if raw.starts_with('0') || !raw.bytes().all(|b| b.is_ascii_digit()) {
+                        return None;
+                    }
+                    raw.parse::<NonZeroU64>().ok().filter(|version| version.get() <= i64::MAX as u64)
+                }).ok_or_else(|| ResolveError::VaultError(
+                    ref_str.to_owned(),
+                    "only ?version=<positive-integer> is supported (no leading zeros or additional parameters)".into(),
+                ))?;
+                if !path.contains("/data/") {
+                    return Err(ResolveError::VaultError(
+                        ref_str.to_owned(),
+                        "pinned refs require a KV v2 path: <mount>/data/<secret>".into(),
+                    ));
+                }
+                (path, Some(version))
+            }
+            None => (path_query, None),
+        };
 
         if path.is_empty() || field.is_empty() {
             return Err(ResolveError::VaultError(
@@ -111,11 +158,11 @@ impl VaultResolver {
 
         if path
             .split('/')
-            .any(|segment| segment.is_empty() || segment == "..")
+            .any(|segment| segment.is_empty() || segment == ".." || segment == ".")
         {
             return Err(ResolveError::VaultError(
                 ref_str.to_owned(),
-                "path must not contain '..' or empty segments".into(),
+                "path must not contain '..', '.', or empty segments".into(),
             ));
         }
 
@@ -127,29 +174,31 @@ impl VaultResolver {
             ));
         }
 
-        Ok(VaultRef { path, field })
-    }
+        if path.contains(['%', '\\']) || field.contains(['#', '?']) {
+            return Err(ResolveError::VaultError(
+                ref_str.to_owned(),
+                "path must be unescaped and field must not contain ref delimiters".into(),
+            ));
+        }
 
-    fn token_fingerprint(token: &str) -> String {
-        let digest = Sha256::digest(token.as_bytes());
-        digest
-            .iter()
-            .take(8)
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-    }
-
-    fn lease_cache_key(&self, token: &str, path: &str, field: &str) -> String {
-        format!(
-            "{}|{}|{}#{}",
-            self.client.base_url(),
-            Self::token_fingerprint(token),
+        Ok(VaultRef {
             path,
-            field
-        )
+            field,
+            version,
+        })
     }
 
-    fn lock_cache() -> std::sync::MutexGuard<'static, HashMap<String, LeaseCacheEntry>> {
+    fn lease_cache_key(&self, token: &str, parsed: &VaultRef<'_>) -> LeaseCacheKey {
+        LeaseCacheKey {
+            base_url: self.client.base_url().to_owned(),
+            token_fingerprint: Sha256::digest(token.as_bytes()).into(),
+            path: parsed.path.to_owned(),
+            field: parsed.field.to_owned(),
+            version: parsed.version,
+        }
+    }
+
+    fn lock_cache() -> std::sync::MutexGuard<'static, HashMap<LeaseCacheKey, LeaseCacheEntry>> {
         LEASE_CACHE.lock().unwrap_or_else(|p| p.into_inner())
     }
 
@@ -172,7 +221,7 @@ impl VaultResolver {
         }
     }
 
-    fn cache_state(key: &str, renew_window_secs: u64) -> CacheState {
+    fn cache_state(key: &LeaseCacheKey, renew_window_secs: u64) -> CacheState {
         let now = Instant::now();
         let mut cache = Self::lock_cache();
         let Some(entry) = cache.get(key).cloned() else {
@@ -200,7 +249,7 @@ impl VaultResolver {
     }
 
     fn store_cached_value(
-        key: String,
+        key: LeaseCacheKey,
         value: String,
         lease_duration_secs: u64,
         lease_id: Option<String>,
@@ -223,7 +272,11 @@ impl VaultResolver {
         );
     }
 
-    fn update_cached_lease_after_renewal(key: &str, prior_lease_id: &str, lease: &VaultLease) {
+    fn update_cached_lease_after_renewal(
+        key: &LeaseCacheKey,
+        prior_lease_id: &str,
+        lease: &VaultLease,
+    ) {
         if lease.lease_duration_secs == 0 {
             return;
         }
@@ -265,9 +318,16 @@ impl SecretResolver for VaultResolver {
             ResolveError::VaultError(ref_str.to_owned(), "access token is not valid UTF-8".into())
         })?;
         let handle = tokio::runtime::Handle::current();
-        let cache_key = self.lease_cache_key(token, parsed.path, parsed.field);
+        let cache_key = self.lease_cache_key(token, &parsed);
         let renew_window_secs = Self::lease_renew_window_secs();
-        match Self::cache_state(&cache_key, renew_window_secs) {
+        // Revalidate pinned KV versions on every execution so a deletion cannot
+        // be masked by a lease cache or a retained plaintext snapshot.
+        let cache_state = if parsed.version.is_some() {
+            CacheState::Miss
+        } else {
+            Self::cache_state(&cache_key, renew_window_secs)
+        };
+        match cache_state {
             CacheState::Hit {
                 value,
                 lease_id,
@@ -315,7 +375,7 @@ impl SecretResolver for VaultResolver {
         let result = tokio::task::block_in_place(|| {
             handle.block_on(async {
                 self.client
-                    .read_secret_field_with_lease(token, parsed.path, parsed.field)
+                    .read_secret_field_at_version(token, parsed.path, parsed.field, parsed.version)
                     .await
                     .map_err(|e| format!("secret read failed: {e}"))
             })
@@ -323,7 +383,9 @@ impl SecretResolver for VaultResolver {
 
         match result {
             Ok(read) => {
-                if let Some(lease) = read.lease {
+                if parsed.version.is_none()
+                    && let Some(lease) = read.lease
+                {
                     Self::store_cached_value(
                         cache_key,
                         read.value.clone(),
@@ -363,8 +425,131 @@ mod tests {
             VaultRef {
                 path: "secret/data/myapp",
                 field: "DATABASE_URL",
+                version: None,
             }
         );
+    }
+
+    #[test]
+    fn pinned_ref_is_typed_and_strict() {
+        let parsed = VaultResolver::parse_ref("vault:kv/data/demo?version=7#FIELD").unwrap();
+        assert_eq!(parsed.path, "kv/data/demo");
+        assert_eq!(parsed.field, "FIELD");
+        assert_eq!(parsed.version, NonZeroU64::new(7));
+        validate_pinned_ref("vault:team/kv/data/demo?version=7#FIELD").unwrap();
+        for invalid in [
+            "vault:kv/data/demo#FIELD",
+            "vault:kv/data/demo?version=0#FIELD",
+            "vault:kv/data/demo?version=07#FIELD",
+            "vault:kv/data/demo?version=+7#FIELD",
+            "vault:kv/data/demo?version=-7#FIELD",
+            "vault:kv/data/demo?version=latest#FIELD",
+            "vault:kv/data/demo?version=18446744073709551616#FIELD",
+            "vault:kv/data/demo?version=9223372036854775808#FIELD",
+            "vault:kv/data/demo?version=7&version=8#FIELD",
+            "vault:kv/data/demo?version=7&other=value#FIELD",
+            "vault:kv/data/demo?other=7#FIELD",
+            "vault:kv/data/demo?version=#FIELD",
+            "vault:kv/demo?version=7#FIELD",
+            "vault:kv/data/?version=7#FIELD",
+            "vault:kv/data/./demo?version=7#FIELD",
+            "vault:kv/data/%2e%2e/demo?version=7#FIELD",
+            "vault:kv/data/demo?version=7#FIELD#extra",
+            "vault:kv/data/demo#FIELD?version=7",
+        ] {
+            assert!(validate_pinned_ref(invalid).is_err(), "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn cache_identity_binds_server_token_path_field_and_version() {
+        let resolver = VaultResolver::with_token_ref(
+            VaultClient::with_base_url("http://127.0.0.1:8200".into()),
+            "env:UNUSED".into(),
+        );
+        let reference = VaultResolver::parse_ref("vault:kv/data/demo?version=7#FIELD").unwrap();
+        let key = resolver.lease_cache_key("first-token", &reference);
+        for different in [
+            "vault:kv/data/other?version=7#FIELD",
+            "vault:kv/data/demo?version=7#OTHER",
+            "vault:kv/data/demo?version=8#FIELD",
+            "vault:kv/data/demo#FIELD",
+        ] {
+            let parsed = VaultResolver::parse_ref(different).unwrap();
+            assert_ne!(key, resolver.lease_cache_key("first-token", &parsed));
+        }
+        assert_ne!(key, resolver.lease_cache_key("second-token", &reference));
+        let other_server = VaultResolver::with_token_ref(
+            VaultClient::with_base_url("http://127.0.0.1:8201".into()),
+            "env:UNUSED".into(),
+        );
+        assert_ne!(key, other_server.lease_cache_key("first-token", &reference));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pinned_resolution_does_not_follow_latest_or_cache_deleted_version() {
+        let _guard = test_lock().await;
+        VaultResolver::clear_cache_for_tests();
+        let server = MockServer::start().await;
+        let client = VaultClient::with_base_url(server.uri());
+        unsafe { std::env::set_var("OPAQUE_TEST_VAULT_PINNED", "disposable-token") };
+        let resolver = VaultResolver::with_token_ref(client, "env:OPAQUE_TEST_VAULT_PINNED".into());
+
+        // Even unexpected lease metadata must never turn a pinned read into a
+        // plaintext cache snapshot that would conceal a later deletion.
+        for latest in [8, 9] {
+            VaultResolver::clear_cache_for_tests();
+            server.reset().await;
+            Mock::given(method("GET"))
+                .and(path("/v1/kv/data/demo"))
+                .respond_with(move |request: &wiremock::Request| {
+                    let pinned = request.url.query_pairs().any(|(k, v)| k == "version" && v == "7");
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "lease_id": "unexpected/lease",
+                        "lease_duration": 600,
+                        "renewable": true,
+                        "data": {
+                            "data": { "FIELD": if pinned { "approved".to_owned() } else { format!("latest-{latest}") } },
+                            "metadata": {
+                                "version": if pinned { 7 } else { latest },
+                                "destroyed": false,
+                                "deletion_time": ""
+                            }
+                        }
+                    }))
+                })
+                .expect(2)
+                .mount(&server).await;
+            assert_eq!(
+                resolver
+                    .resolve("vault:kv/data/demo#FIELD")
+                    .unwrap()
+                    .as_str(),
+                Some(format!("latest-{latest}").as_str())
+            );
+            assert_eq!(
+                resolver
+                    .resolve("vault:kv/data/demo?version=7#FIELD")
+                    .unwrap()
+                    .as_str(),
+                Some("approved")
+            );
+            server.verify().await;
+        }
+
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/kv/data/demo"))
+            .and(wiremock::matchers::query_param("version", "7"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let error = resolver
+            .resolve("vault:kv/data/demo?version=7#FIELD")
+            .unwrap_err();
+        assert!(error.to_string().contains("unavailable"));
+        unsafe { std::env::remove_var("OPAQUE_TEST_VAULT_PINNED") };
     }
 
     #[test]

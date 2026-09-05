@@ -291,6 +291,8 @@ impl GitHubClient {
         let http = reqwest::Client::builder()
             .user_agent(Self::user_agent())
             .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .build()
             .map_err(GitHubApiError::Network)?;
 
@@ -304,6 +306,8 @@ impl GitHubClient {
         let http = reqwest::Client::builder()
             .user_agent(Self::user_agent())
             .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .build()
             .expect("failed to build reqwest client");
 
@@ -503,6 +507,8 @@ impl GitHubClient {
 mod tests {
     use super::*;
 
+    static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn transient_errors_identified() {
         assert!(GitHubApiError::RateLimited.is_transient());
@@ -533,6 +539,7 @@ mod tests {
 
     #[test]
     fn client_default_base_url() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         // Remove env override if set, to test the default.
         let prev = std::env::var(super::GITHUB_API_URL_ENV).ok();
         unsafe { std::env::remove_var(super::GITHUB_API_URL_ENV) };
@@ -548,6 +555,8 @@ mod tests {
 
     #[test]
     fn client_respects_env_override() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let previous = std::env::var(super::GITHUB_API_URL_ENV).ok();
         unsafe {
             std::env::set_var(
                 super::GITHUB_API_URL_ENV,
@@ -556,7 +565,10 @@ mod tests {
         };
         let client = GitHubClient::new().unwrap();
         assert_eq!(client.base_url, "https://github.example.com/api/v3");
-        unsafe { std::env::remove_var(super::GITHUB_API_URL_ENV) };
+        match previous {
+            Some(value) => unsafe { std::env::set_var(super::GITHUB_API_URL_ENV, value) },
+            None => unsafe { std::env::remove_var(super::GITHUB_API_URL_ENV) },
+        }
     }
 
     #[test]
@@ -807,6 +819,60 @@ mod tests {
 
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn secret_write_does_not_follow_redirects() {
+        let server = MockServer::start().await;
+        let destination = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/example/project/actions/secrets/API_KEY"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("Location", format!("{}/redirected", destination.uri())),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let error = GitHubClient::with_base_url(server.uri())
+            .set_secret(
+                "test-token",
+                "example",
+                "project",
+                "API_KEY",
+                "encrypted-test-value",
+                "test-key-id",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, GitHubApiError::UnexpectedStatus(307)));
+        server.verify().await;
+        assert!(destination.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn secret_write_transport_does_not_retry_server_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/example/project/actions/secrets/API_KEY"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let error = GitHubClient::with_base_url(server.uri())
+            .set_secret(
+                "test-token",
+                "example",
+                "project",
+                "API_KEY",
+                "encrypted-test-value",
+                "test-key-id",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, GitHubApiError::ServerError));
+        server.verify().await;
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
 
     #[tokio::test]
     async fn list_secrets_scoped_success() {

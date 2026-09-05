@@ -2,6 +2,8 @@
 //!
 //! Supports extracting fields from both KV v1 and KV v2 style payloads.
 
+use std::num::NonZeroU64;
+
 /// Environment variable to override the default Vault API base URL.
 pub const VAULT_URL_ENV: &str = "OPAQUE_VAULT_URL";
 
@@ -34,6 +36,15 @@ pub enum VaultApiError {
 
     #[error("{0}")]
     InvalidUrlScheme(String),
+
+    #[error("Vault response is missing valid KV v2 version metadata")]
+    MissingVersionMetadata,
+
+    #[error("Vault returned version {actual}, expected pinned version {expected}")]
+    VersionMismatch { expected: u64, actual: u64 },
+
+    #[error("Vault pinned version {0} is deleted, destroyed, or unavailable")]
+    VersionUnavailable(u64),
 }
 
 /// Validate that a URL uses `https://`, allowing `http://` only for localhost.
@@ -95,6 +106,15 @@ fn encode_vault_path(path: &str) -> String {
         .join("/")
 }
 
+fn scalar_field_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
 /// Extract a string field from KV v1/v2 style response payloads.
 fn extract_field_value(body: &serde_json::Value, field: &str) -> Option<String> {
     // KV v2 style: { "data": { "data": { <field>: <value> } } }
@@ -103,22 +123,12 @@ fn extract_field_value(body: &serde_json::Value, field: &str) -> Option<String> 
         .and_then(|v| v.get("data"))
         .and_then(|v| v.get(field))
     {
-        return match v2 {
-            serde_json::Value::String(s) => Some(s.clone()),
-            serde_json::Value::Number(n) => Some(n.to_string()),
-            serde_json::Value::Bool(b) => Some(b.to_string()),
-            _ => None,
-        };
+        return scalar_field_value(v2);
     }
 
     // KV v1 style: { "data": { <field>: <value> } }
     if let Some(v1) = body.get("data").and_then(|v| v.get(field)) {
-        return match v1 {
-            serde_json::Value::String(s) => Some(s.clone()),
-            serde_json::Value::Number(n) => Some(n.to_string()),
-            serde_json::Value::Bool(b) => Some(b.to_string()),
-            _ => None,
-        };
+        return scalar_field_value(v1);
     }
 
     None
@@ -190,6 +200,7 @@ impl VaultClient {
         let http = reqwest::Client::builder()
             .user_agent(Self::user_agent())
             .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(VaultApiError::Network)?;
 
@@ -205,6 +216,7 @@ impl VaultClient {
         let http = reqwest::Client::builder()
             .user_agent(Self::user_agent())
             .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("failed to build reqwest client");
         Self { http, base_url }
@@ -235,6 +247,20 @@ impl VaultClient {
         path: &str,
         field: &str,
     ) -> Result<VaultSecretField, VaultApiError> {
+        self.read_secret_field_at_version(token, path, field, None)
+            .await
+    }
+
+    /// Read one exact KV v2 version, or retain legacy unversioned behavior.
+    /// Pinned reads require verified KV v2 metadata and never fall back to v1
+    /// fields or the latest version. Version zero cannot be represented.
+    pub async fn read_secret_field_at_version(
+        &self,
+        token: &str,
+        path: &str,
+        field: &str,
+        version: Option<NonZeroU64>,
+    ) -> Result<VaultSecretField, VaultApiError> {
         let path_trimmed = path.trim_matches('/');
         if path_trimmed.is_empty() {
             return Err(VaultApiError::NotFound("empty secret path".into()));
@@ -245,14 +271,15 @@ impl VaultClient {
 
         let encoded_path = encode_vault_path(path_trimmed);
         let url = format!("{}/v1/{encoded_path}", self.base_url);
-        let resp = self
+        let mut request = self
             .http
             .get(&url)
             .header("X-Vault-Token", token)
-            .header("Accept", "application/json")
-            .send()
-            .await
-            .map_err(VaultApiError::Network)?;
+            .header("Accept", "application/json");
+        if let Some(version) = version {
+            request = request.query(&[("version", version.get())]);
+        }
+        let resp = request.send().await.map_err(VaultApiError::Network)?;
 
         match resp.status().as_u16() {
             200 => {
@@ -260,7 +287,44 @@ impl VaultClient {
                     .json::<serde_json::Value>()
                     .await
                     .map_err(VaultApiError::Network)?;
-                let value = extract_field_value(&body, field).ok_or_else(|| {
+                let value = if let Some(version) = version {
+                    let metadata = body
+                        .get("data")
+                        .and_then(|data| data.get("metadata"))
+                        .ok_or(VaultApiError::MissingVersionMetadata)?;
+                    let actual = metadata
+                        .get("version")
+                        .and_then(|v| v.as_u64())
+                        .filter(|v| *v > 0)
+                        .ok_or(VaultApiError::MissingVersionMetadata)?;
+                    if actual != version.get() {
+                        return Err(VaultApiError::VersionMismatch {
+                            expected: version.get(),
+                            actual,
+                        });
+                    }
+                    let destroyed = metadata
+                        .get("destroyed")
+                        .and_then(|v| v.as_bool())
+                        .ok_or(VaultApiError::MissingVersionMetadata)?;
+                    let deletion_time = metadata
+                        .get("deletion_time")
+                        .and_then(|v| v.as_str())
+                        .ok_or(VaultApiError::MissingVersionMetadata)?;
+                    if destroyed || !deletion_time.is_empty() {
+                        return Err(VaultApiError::VersionUnavailable(version.get()));
+                    }
+                    let data = body
+                        .get("data")
+                        .and_then(|data| data.get("data"))
+                        .filter(|data| data.is_object())
+                        .ok_or(VaultApiError::VersionUnavailable(version.get()))?;
+                    // Only the KV v2 data object can supply a pinned field.
+                    data.get(field).and_then(scalar_field_value)
+                } else {
+                    extract_field_value(&body, field)
+                }
+                .ok_or_else(|| {
                     VaultApiError::NotFound(format!("field '{field}' at path '{path_trimmed}'"))
                 })?;
                 Ok(VaultSecretField {
@@ -269,7 +333,10 @@ impl VaultClient {
                 })
             }
             401 | 403 => Err(VaultApiError::Unauthorized),
-            404 => Err(VaultApiError::NotFound(format!("path '{path_trimmed}'"))),
+            404 => Err(match version {
+                Some(version) => VaultApiError::VersionUnavailable(version.get()),
+                None => VaultApiError::NotFound(format!("path '{path_trimmed}'")),
+            }),
             429 => Err(VaultApiError::RateLimited),
             500..=599 => Err(VaultApiError::ServerError),
             other => Err(VaultApiError::UnexpectedStatus(other)),
@@ -358,7 +425,7 @@ impl Default for VaultClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{body_json, header, method, path};
+    use wiremock::matchers::{body_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
@@ -453,6 +520,175 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(value, "postgres://example");
+    }
+
+    fn pinned_response() -> serde_json::Value {
+        serde_json::json!({
+            "data": {
+                "data": { "FIELD": "approved-value" },
+                "metadata": { "version": 7, "destroyed": false, "deletion_time": "" }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn pinned_read_sends_version_query_and_verifies_metadata() {
+        let server = MockServer::start().await;
+        let client = VaultClient::with_base_url(server.uri());
+        Mock::given(method("GET"))
+            .and(path("/v1/kv/data/demo"))
+            .and(header("x-vault-token", "disposable-token"))
+            .and(query_param("version", "7"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pinned_response()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let result = client
+            .read_secret_field_at_version(
+                "disposable-token",
+                "kv/data/demo",
+                "FIELD",
+                NonZeroU64::new(7),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.value, "approved-value");
+        assert_eq!(
+            server.received_requests().await.unwrap()[0].url.query(),
+            Some("version=7")
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_read_rejects_wrong_or_missing_version_without_retry() {
+        let server = MockServer::start().await;
+        let client = VaultClient::with_base_url(server.uri());
+        for version in [
+            serde_json::json!(8),
+            serde_json::Value::Null,
+            serde_json::json!("7"),
+        ] {
+            server.reset().await;
+            let mut body = pinned_response();
+            body["data"]["metadata"]["version"] = version.clone();
+            Mock::given(method("GET"))
+                .and(path("/v1/kv/data/demo"))
+                .and(query_param("version", "7"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let err = client
+                .read_secret_field_at_version(
+                    "disposable-token",
+                    "kv/data/demo",
+                    "FIELD",
+                    NonZeroU64::new(7),
+                )
+                .await
+                .unwrap_err();
+            if version == serde_json::json!(8) {
+                assert!(matches!(
+                    err,
+                    VaultApiError::VersionMismatch {
+                        expected: 7,
+                        actual: 8
+                    }
+                ));
+            } else {
+                assert!(matches!(err, VaultApiError::MissingVersionMetadata));
+            }
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            server.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn pinned_read_rejects_deleted_destroyed_and_missing_versions() {
+        let server = MockServer::start().await;
+        let client = VaultClient::with_base_url(server.uri());
+        for (destroyed, deletion_time, status) in [
+            (true, "", 200),
+            (false, "2026-09-01T00:00:00Z", 200),
+            (false, "", 404),
+        ] {
+            server.reset().await;
+            let mut body = pinned_response();
+            // Retaining data in the mocked response proves metadata is enforced
+            // even when a broken backend returns a plaintext value alongside it.
+            body["data"]["metadata"]["destroyed"] = destroyed.into();
+            body["data"]["metadata"]["deletion_time"] = deletion_time.into();
+            Mock::given(method("GET"))
+                .and(path("/v1/kv/data/demo"))
+                .and(query_param("version", "7"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let err = client
+                .read_secret_field_at_version(
+                    "disposable-token",
+                    "kv/data/demo",
+                    "FIELD",
+                    NonZeroU64::new(7),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, VaultApiError::VersionUnavailable(7)));
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            server.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn pinned_read_does_not_fall_back_to_v1_or_nested_fields() {
+        let server = MockServer::start().await;
+        let client = VaultClient::with_base_url(server.uri());
+        let mut body = pinned_response();
+        body["data"]["data"] = serde_json::json!({ "data": { "FIELD": "nested-value" } });
+        body["data"]["FIELD"] = "v1-fallback".into();
+        Mock::given(method("GET"))
+            .and(path("/v1/kv/data/demo"))
+            .and(query_param("version", "7"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let err = client
+            .read_secret_field_at_version(
+                "disposable-token",
+                "kv/data/demo",
+                "FIELD",
+                NonZeroU64::new(7),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VaultApiError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn pinned_read_does_not_follow_redirect_to_latest() {
+        let server = MockServer::start().await;
+        let client = VaultClient::with_base_url(server.uri());
+        Mock::given(method("GET"))
+            .and(path("/v1/kv/data/demo"))
+            .respond_with(
+                ResponseTemplate::new(307).insert_header("Location", "/v1/kv/data/latest"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let err = client
+            .read_secret_field_at_version(
+                "disposable-token",
+                "kv/data/demo",
+                "FIELD",
+                NonZeroU64::new(7),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VaultApiError::UnexpectedStatus(307)));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -1559,35 +1559,10 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         info!("Bitwarden handler enabled ({})", bitwarden_url);
     }
 
-    // AWS handler.
-    //
-    // SECURITY (C6): the current AWS client sends the access key + secret key as
-    // plaintext headers (SigV4 is not yet implemented), which both fails against
-    // real AWS and would exfiltrate the long-lived secret key to whatever host the
-    // endpoint resolves to. It is therefore DISABLED unless the operator explicitly
-    // opts in via OPAQUE_AWS_ALLOW_INSECURE=1 (intended for mock/testing only). The
-    // region is also validated to close a host-injection vector — an unvalidated
-    // value like "foo@evil.com/" would rewrite the request host.
-    if std::env::var("OPAQUE_AWS_ALLOW_INSECURE").as_deref() == Ok("1") {
-        let aws_region = std::env::var(aws::client::AWS_REGION_ENV)
-            .unwrap_or_else(|_| aws::client::DEFAULT_REGION.to_owned());
-        if aws_region.is_empty()
-            || !aws_region
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-        {
-            warn!(
-                "AWS handler disabled: invalid region {:?} (must match [a-z0-9-]+)",
-                aws_region
-            );
-        } else {
-            let sts_url = format!("https://sts.{aws_region}.amazonaws.com");
-            let sm_url = format!("https://secretsmanager.{aws_region}.amazonaws.com");
-            let ssm_url = format!("https://ssm.{aws_region}.amazonaws.com");
-            let aws_client = aws::client::AwsClient::new(&sts_url, &sm_url, &ssm_url)
-                .expect("invalid AWS service URL scheme");
-
-            let aws_ops = [
+    // The unsigned AWS transport is quarantined to explicitly enabled loopback mocks.
+    match aws::client::AwsClient::from_mock_env() {
+        Ok(Some(aws_client)) => {
+            for op in [
                 "aws.get_caller_identity",
                 "aws.assume_role",
                 "aws.list_secrets",
@@ -1599,22 +1574,16 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
                 "aws.put_parameter",
                 "aws.get_parameters_by_path",
                 "aws.delete_parameter",
-            ];
-            for op in aws_ops {
-                let handler = aws::AwsHandler::new(audit.clone(), aws_client.clone());
-                enclave_builder = enclave_builder.handler(op, Box::new(handler));
+            ] {
+                enclave_builder = enclave_builder.handler(
+                    op,
+                    Box::new(aws::AwsHandler::new(audit.clone(), aws_client.clone())),
+                );
             }
-            warn!(
-                "AWS handler enabled in INSECURE mode (region: {}) — plaintext key \
-                 headers, no SigV4. Do not use with real AWS credentials.",
-                aws_region
-            );
+            warn!("AWS loopback mock handler enabled; real AWS signing is not implemented");
         }
-    } else {
-        info!(
-            "AWS handler disabled (set OPAQUE_AWS_ALLOW_INSECURE=1 to enable the \
-             insecure mock client; SigV4 support is pending)"
-        );
+        Ok(None) => info!("AWS handler disabled; signed production transport is not implemented"),
+        Err(_) => return Err(std::io::Error::other("invalid AWS mock configuration")),
     }
 
     // Approval backend selection. The insecure auto-approve backend exists

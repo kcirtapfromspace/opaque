@@ -192,6 +192,8 @@ opaque policy preset github-secrets
 
 ## Docs
 
+- [Try the portfolio demo](https://demo.opaque.info/) — explore synthetic application metrics and scoped analyst, engineer and support views.
+
 - [Docs index](docs/README.md)
 - [Tutorial: your first gated operation](docs/tutorial.md)
 - [Getting started](docs/getting-started.md)
