@@ -33,11 +33,80 @@ provider endpoint is accepted for direct GitHub mode.
 The runtime admission template now accepts the approval variables, requires the
 configured Worker origin and exact callback, and permits the OAuth client
 secret only through the pod's own lease Secret. Render both `${RUNTIME_IMAGE}`
-and `${WORKER_ORIGIN}` before applying the policy. Review the rendered policy,
+and `${WORKER_ORIGIN}` before updating the policy. Review the rendered policy,
 then use the drain and rollout process in [OPERATIONS.md](../OPERATIONS.md).
 Apply the optional controller patch as part of that same reviewed rollout.
 Do not restore an old controller image without checking the persisted queue and
 controller state schema compatibility.
+
+## Narrow rollout inputs
+
+After the immutable image is built and published and the GitHub Secret is ready,
+pause new admission and let existing/queued sessions finish using the existing
+Worker, controller, tunnel, and model services. Confirm both queue reconciliation
+and empty lease resources; an empty namespace alone does not prove a drained
+queue or stopped model work. Never reset the slot ConfigMap generation.
+
+Render the current controller's narrow patch using the verified image digest:
+
+```sh
+export OPAQUE_APPROVAL_ROLLOUT_DIR="$(mktemp -d /private/tmp/opaque-approval-rollout.XXXXXX)"
+python3 deploy/hosted-demo/approval/render-rollout.py \
+  --runtime-image "$RUNTIME_IMAGE" \
+  --output "$OPAQUE_APPROVAL_ROLLOUT_DIR"
+```
+
+The renderer reads the current Deployment, current admission Policy, and local
+admission template. It uses `kubectl create --dry-run=client --validate=false`
+to decode the rendered YAML as JSON. It does not apply changes or read any
+Secret. It preserves the controller's other environment values and rollout
+settings and writes four review files: the controller JSON Patch, the admission
+Policy JSON Patch, the desired Policy YAML, and a safe summary. It rejects inline
+sensitive environment values, unpinned images, or changed public-origin/rollout
+settings. Review all four output files before rollout.
+
+The Policy patch tests the exact live `metadata.resourceVersion` and current
+`spec`, then replaces only `spec`. Kubernetes retains the live metadata,
+including its annotations, labels, UID and managed fields. The YAML is for
+review; use the guarded patch for rollout. This avoids interpreting a stale
+resource version embedded in an earlier `last-applied-configuration` annotation.
+
+With admissions paused, queue/slots drained, and the image and Secret verified,
+the narrow rollout commands are:
+
+```sh
+kubectl --context admin@turingpi patch validatingadmissionpolicy opaque-hosted-demo-runtime \
+  --type=json --dry-run=server \
+  --patch-file "$OPAQUE_APPROVAL_ROLLOUT_DIR/admission-policy.patch.json"
+kubectl --context admin@turingpi -n opaque-demo-system patch deployment opaque-demo-controller \
+  --type=json --dry-run=server \
+  --patch-file "$OPAQUE_APPROVAL_ROLLOUT_DIR/controller-rollout.patch.json"
+kubectl --context admin@turingpi patch validatingadmissionpolicy opaque-hosted-demo-runtime \
+  --type=json --patch-file "$OPAQUE_APPROVAL_ROLLOUT_DIR/admission-policy.patch.json"
+kubectl --context admin@turingpi -n opaque-demo-system patch deployment opaque-demo-controller \
+  --type=json --patch-file "$OPAQUE_APPROVAL_ROLLOUT_DIR/controller-rollout.patch.json"
+kubectl --context admin@turingpi -n opaque-demo-system rollout status \
+  deployment/opaque-demo-controller --timeout=120s
+```
+
+The generation and previous-image/environment checks reject concurrent
+Deployment changes; the resource-version and spec checks reject concurrent
+Policy changes. If either patch fails its guards, read the new state and
+re-render; do not remove the guards. These commands do not change namespace, quota, RBAC, slot
+ConfigMap, tunnel, or model objects. Keep the Worker paused through startup,
+admission-policy positive/negative checks, and callback-asset checks. Record a
+fresh safe state observation and image digest before reopening admission. Then
+verify one controlled real-login/passkey lifecycle immediately; pause admission
+again if any lifecycle check fails.
+
+The September 5 read-only observation was controller generation 8, one ready
+replica with `Recreate`, and tunnel generation 1 with one ready replica. The
+controller and seven-validation admission policy both selected runtime digest
+`sha256:4d2b1844472bb63f7bdfd18bcafb009ee5dcdb80477e3215f9cdeb0dc3623e54`.
+Slot 0 retained state schema 2 and generation 26, with no current lease or
+execution/create fences and no lease Pod/Service/Secret. Public admissions were
+enabled. These observations are not authorization to skip the fresh drain
+checks before a rollout.
 
 ## Build and validation
 

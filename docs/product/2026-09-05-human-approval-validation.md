@@ -43,6 +43,33 @@ with one explicitly ignored interactive browser fixture. Clippy with warnings
 denied and Rust formatting passed. The browser/edge suites passed 138 tests
 including the actual compiled WASM cases; hosted Python tests passed 64 tests.
 The Linux/ARM64 optimized test suite also passed before image packaging.
+After adding the narrow rollout renderer, the hosted Python suite passed 67
+tests. Three additional policy-patch cases then passed with all six renderer
+tests after replacing client-side apply with a guarded spec-only JSON patch.
+Both the policy and controller patches passed Kubernetes server dry-run.
+No live patch was applied. The packaged runtime independently passed its 64 Python tests and a
+binary startup check with networking disabled, a read-only root filesystem,
+and an unprivileged user.
+
+The Linux/ARM64 runtime was published only to the private cluster registry as
+`192.168.25.201:5050/opaque-hosted-demo@sha256:7e33c82086eff061b4360be76b63576be5eddf70651924d1214ff491e3da724f`.
+The registry digest was re-read and matched the built tar manifest. Its source
+snapshot digest is
+`1c34ca9ce8b053532228a61545b2e244ac1c6e966846ee80afa62addc46a41a4`,
+and the stripped binary SHA-256 is
+`daa45c6a8f3c0488f7e78dbe9602b6cec3e77bc75115bcfa5a193d168121d2fa`.
+Inspection found exactly the six intended application files under `/opt/opaque`
+and no internal documentation. Generated binaries and raw build artifacts remain
+outside version control.
+
+A fresh Worker dry-run build and strict documentation build passed. Inspection
+covered the generated Worker bundle and map, both public HTML assets, and all 74
+documentation output files, including search and sitemap. No internal document
+markers or secrets were found. An isolated local Worker served the exact OAuth
+callback with HTTP 200, its matching script-hash CSP, `default-src 'none'`,
+`no-store`, `no-referrer`, and no cookie. Callback path variants, internal-doc
+paths, deployment records, and Worker source/map URLs returned HTTP 404. The
+local Worker was stopped after qualification; nothing was deployed publicly.
 
 To include the actual build-generated module in the UI tests:
 
