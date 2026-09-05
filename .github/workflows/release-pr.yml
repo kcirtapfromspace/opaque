@@ -34,7 +34,7 @@ jobs:
           # git-cliff reads history back to the last tag.
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.120.0
 
       - uses: taiki-e/install-action@v2
         with:

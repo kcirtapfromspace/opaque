@@ -33,7 +33,7 @@ jobs:
       - name: Install Rust
         # Keep in sync with rust-toolchain.toml (the action's RUSTUP_TOOLCHAIN
         # export outranks the file).
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@1.120.0
         with:
           targets: ${{ matrix.target }}
 
