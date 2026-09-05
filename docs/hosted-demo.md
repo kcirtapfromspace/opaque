@@ -72,6 +72,8 @@ You can still ask **“Watch our manual review rate live”** for repeated live 
 
 The **Opaque policy layer** shows the customer, demo role, configured purpose, allowed tool and reported permission checks. An answer does not grant additional access.
 
+**Follow the work** shows the current chat request moving through the Opaque boundary, customer source and evidence return as the service reports each milestone. Open **Inspect this request’s architecture & events** to read the latest reported checks. A tool request alone does not confirm source access; denied or interrupted requests retain the evidence received so far. **Pause motion** stops the animation while the request continues. This view covers portfolio chat; **Run once** has its own task lifecycle and receipt.
+
 ## Explore the scoped identities
 
 **Northstar Financial Systems** is the fictional parent company. Harborlight is this workspace’s assigned customer. **Cedar Community Bank** is a directory entry with no data access. Parent-company membership does not grant access to another customer’s metrics.

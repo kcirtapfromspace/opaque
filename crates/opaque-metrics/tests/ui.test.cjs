@@ -139,6 +139,108 @@ test('source access is shown from an actual source event and new turns reset the
   app.addTurn();assert.equal(app.state.policyEvents.length,0);assert.match(app.byId('policy-decisions').children[0].textContent,/Waiting for this request/);
 });
 
+test('architecture awaits validated policy and source evidence instead of inferring a successful read',()=>{
+  const app=ui();app.renderSession(creditSession());const turn=app.addTurn();
+  app.handleEvent(turn,'status',{message:'Selecting an authorized metrics tool…'});
+  app.handleEvent(turn,'tool',{name:'opaque_metrics_query',phase:'request'});
+  assert.equal(app.state.flow.sourceAccess,null);assert.equal(app.state.flow.hasResult,false);
+  assert.equal(app.byId('flow-source').textContent,'Access not reported');
+  assert.equal(app.byId('flow-stage-policy').dataset.confirmed,'false');
+  const before=app.state.flow.events.length;
+  assert.throws(()=>app.handleEvent(turn,'policy',policy({tenant_id:'other-customer'})),/did not match/);
+  assert.equal(app.state.flow.events.length,before);
+  app.handleEvent(turn,'policy',policy({phase:'tool_check',outcome:'allowed',source_accessed:false}));
+  assert.equal(app.state.flow.sourceAccess,null);
+  app.handleEvent(turn,'policy',policy({phase:'source_read',outcome:'allowed',source_accessed:true}));
+  assert.equal(app.state.flow.sourceAccess,true);assert.equal(app.state.flow.hasResult,false);
+  app.handleEvent(turn,'result',result());app.handleEvent(turn,'done',{});
+  assert.equal(app.state.flow.hasResult,true);assert.equal(app.state.flow.phase,'complete');
+  assert.match(app.byId('flow-status').textContent,/Answer complete/);
+});
+
+test('architecture ignores unknown tools and rejects foreign results before displaying evidence',()=>{
+  const app=ui();app.renderSession(creditSession());const turn=app.addTurn();
+  app.handleEvent(turn,'tool',{name:'private_ungranted_tool',phase:'request'});
+  assert.equal(app.state.flow.tool,null);assert.equal(app.state.flow.events.length,0);
+  assert.throws(()=>app.handleEvent(turn,'result',result({customer_id:'another-customer'})),/authenticated customer scope/);
+  assert.equal(app.state.flow.hasResult,false);assert.equal(app.state.flow.result,'No result yet');
+});
+
+test('later explanation status cannot restart tool-selection motion or regress received evidence',()=>{
+  const app=ui();app.renderSession(creditSession());const turn=app.addTurn();
+  app.handleEvent(turn,'status',{message:'Selecting an authorized metrics tool…'});
+  app.handleEvent(turn,'policy',policy({phase:'source_read',outcome:'allowed',source_accessed:true}));
+  app.handleEvent(turn,'result',result());
+  app.handleEvent(turn,'status',{message:'Explaining the latest authorized snapshot…'});
+  assert.equal(app.state.flow.phase,'evidence');assert.equal(app.state.flow.hasResult,true);assert.equal(app.state.flow.sourceAccess,true);
+  assert.match(app.byId('flow-status').textContent,/Explaining the authorized evidence/);
+  assert.equal(app.state.flow.events.filter(item=>item.text==='Service started tool selection.').length,1);
+  const before=app.state.flow.events.length;app.handleEvent(turn,'status',{message:'An unrecognized service message'});
+  assert.equal(app.state.flow.events.length,before);assert.equal(app.state.flow.phase,'evidence');
+});
+
+test('architecture errors and incomplete streams preserve uncertainty instead of inventing denial or completion',async()=>{
+  const app=ui();app.renderSession(creditSession());let turn=app.addTurn();
+  app.handleEvent(turn,'error',{code:'upstream_failure',message:'The connection ended.'});
+  app.handleEvent(turn,'done',{});
+  assert.equal(app.state.flow.phase,'interrupted');assert.equal(app.state.flow.sourceAccess,null);
+  assert.equal(app.byId('flow-source').textContent,'Source outcome unconfirmed');
+  app.byId('message').value='Show requests';
+  app.fetch=async()=>({ok:true,status:200,headers:{get:()=> 'text/event-stream'},body:{getReader:()=>({read:async()=>({done:true})})}});
+  await app.submitMessage();
+  assert.equal(app.state.flow.phase,'interrupted');assert.equal(app.state.flow.hasResult,false);
+  turn=app.addTurn();app.handleEvent(turn,'done',{});
+  assert.match(app.byId('flow-status').textContent,/No source result was reported/);
+  assert.equal(app.byId('flow-stage-source').dataset.confirmed,'false');
+});
+
+test('architecture denial is check-specific and cannot erase previously received source evidence',()=>{
+  const app=ui();app.renderSession(creditSession());let turn=app.addTurn();
+  app.handleEvent(turn,'policy',policy());
+  assert.equal(app.state.flow.phase,'denied');assert.equal(app.state.flow.sourceAccess,false);
+  assert.match(app.byId('flow-source').textContent,/at denied check/);
+  app.handleEvent(turn,'error',{code:'denied'});app.handleEvent(turn,'done',{});
+  assert.equal(app.state.flow.phase,'denied');
+  turn=app.addTurn();app.handleEvent(turn,'policy',policy({phase:'source_read',outcome:'allowed',source_accessed:true}));
+  app.handleEvent(turn,'result',result());app.handleEvent(turn,'policy',policy());
+  assert.equal(app.state.flow.sourceAccess,true);assert.equal(app.state.flow.hasResult,true);
+  assert.equal(app.byId('flow-source').textContent,'Source evidence received');
+});
+
+test('late validated evidence cannot turn an interrupted or denied stream into success',()=>{
+  for (const terminal of ['interrupted','denied']) {
+    const app=ui();app.renderSession(creditSession());const turn=app.addTurn();
+    if(terminal==='denied')app.handleEvent(turn,'policy',policy());
+    app.handleEvent(turn,'error',{code:'request_failed',message:'Request ended.'});
+    const status=app.byId('flow-status').textContent;
+    app.handleEvent(turn,'policy',policy({phase:'source_read',outcome:'allowed',source_accessed:true}));
+    app.handleEvent(turn,'result',result());app.handleEvent(turn,'status',{message:'Explaining the latest authorized snapshot…'});app.handleEvent(turn,'done',{});
+    assert.equal(app.state.flow.phase,terminal);assert.equal(app.byId('flow-status').textContent,status);
+    assert.equal(app.state.flow.hasResult,true);assert.equal(app.state.flow.sourceAccess,true);
+  }
+});
+
+test('architecture state belongs to the current turn and clears on identity change and expiry',()=>{
+  const app=ui();app.renderSession(organizationSession());const old=app.addTurn();
+  app.handleEvent(old,'policy',policy({phase:'source_read',outcome:'allowed',source_accessed:true}));
+  const current=app.addTurn();app.handleEvent(old,'result',result());
+  assert.equal(app.state.flow.turn,current);assert.equal(app.state.flow.hasResult,false);assert.equal(app.state.flow.events.length,0);
+  app.renderSession(organizationSession('engineer',2));
+  assert.equal(app.state.flow,null);assert.equal(app.byId('flow-panel').hidden,true);assert.equal(app.byId('flow-trace').children.length,0);
+  app.receiveFlow(old,'policy',policy());assert.equal(app.state.flow,null);
+  app.renderSession(organizationSession('customer_analyst',3));app.addTurn();app.expireSession();
+  assert.equal(app.state.flow,null);assert.equal(app.byId('flow-panel').hidden,true);
+});
+
+test('architecture clears immediately while a persona change is pending and rejects late events',async()=>{
+  const app=ui();app.renderSession(organizationSession());const turn=app.addTurn();let release;
+  app.fetch=()=>new Promise(resolve=>{release=resolve;});const changing=app.choosePersona('engineer');
+  assert.equal(app.byId('flow-panel').hidden,true);assert.equal(app.state.flow,null);
+  app.receiveFlow(turn,'policy',policy({phase:'source_read',outcome:'allowed',source_accessed:true}));assert.equal(app.state.flow,null);
+  release({ok:true,json:async()=>organizationSession('engineer',2)});await changing;
+  assert.equal(app.byId('flow-panel').hidden,true);
+});
+
 
 test('session model is read-only and distinct from the actual runtime identity',()=>{
   const app=ui(),value=creditSession();value.model={id:'fixture-approved',label:'Approved fixture model'};value.runtime={kind:'fixture',label:'Actual fixture runtime identity'};

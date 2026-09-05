@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Opaque · Bounded work &amp; portfolio metrics</title>
 <meta name="description" content="Review one bounded task, approve a synthetic metric read, and inspect the service receipt. Explore portfolio chat within its separate session limits.">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 24 24%27%3E%3Cpath fill=%27%23c2e77b%27 d=%27M12 1 2 5v7c0 5 5 9 10 11 5-2 10-6 10-11V5z%27/%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 24 24%27%3E%3Cpath fill=%27%23dcb46d%27 d=%27M2 2h20v4H2zm0 8h8v4H2zm13 0h7v4h-7zM2 18h20v4H2z%27/%3E%3C/svg%3E">
 <style>
 :root{color-scheme:dark;--bg:#0d1117;--panel:#131a20;--raised:#192229;--line:#29343b;--text:#e5e9e4;--dim:#a1ada9;--muted:#71817e;--accent:#c2e77b;--amber:#edc27e;--red:#ffab9e;--mono:'SF Mono','Cascadia Code',Consolas,monospace;--sans:'Avenir Next',Avenir,'Segoe UI',sans-serif}
 *{box-sizing:border-box}
@@ -145,12 +145,71 @@ body.credit-experience{color-scheme:light;--bg:#f3f5f1;--panel:#fff;--raised:#e9
 .work-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:18px}.work-heading h2{font-size:23px;font-weight:500;letter-spacing:-.035em;line-height:1.25;margin:0 0 8px}.work-heading p{font-size:12px;color:var(--dim);margin:0;max-width:590px}.work-state{font:10px var(--mono);color:var(--accent);white-space:nowrap;padding:4px 0;text-transform:uppercase}.work-steps{display:flex;flex-wrap:wrap;gap:9px 21px;margin:18px 0;padding:0;list-style:none;font:10px var(--mono);color:var(--muted)}.work-steps li[aria-current=step]{color:var(--accent)}.work-scope{display:grid;grid-template-columns:1fr 1fr;gap:15px 24px;margin:20px 0}.work-scope div{min-width:0}.work-scope dt{font:9px var(--mono);color:var(--muted);margin-bottom:5px}.work-scope dd{margin:0;font-size:13px;overflow-wrap:anywhere}.work-notice,.work-note{font-size:11px;line-height:1.75;color:var(--dim);margin:14px 0 0}.work-note{color:var(--muted)}.work-review{border-top:1px solid var(--line);padding-top:13px;font-size:11px}.work-review summary{cursor:pointer;color:var(--dim)}.work-review dl{display:grid;grid-template-columns:92px minmax(0,1fr);gap:8px 14px;margin:14px 0;font-size:10px}.work-review dt{color:var(--muted)}.work-review dd{margin:0;color:var(--dim);overflow-wrap:anywhere;font-family:var(--mono)}.work-actions{display:flex;flex-wrap:wrap;align-items:center;gap:9px;margin-top:18px}.work-actions button{min-height:40px}.work-primary{background:var(--accent);color:var(--bg);border:1px solid var(--accent);padding:9px 16px;font-size:12px;font-weight:600;transition:filter .15s}.work-primary:hover:not(:disabled){filter:brightness(.94)}.work-primary:active:not(:disabled){transform:translateY(1px)}.work-error{font-size:12px;color:var(--red);line-height:1.7;overflow-wrap:anywhere;margin:14px 0 0}.work-status{font-size:11px;color:var(--dim);line-height:1.7;margin:13px 0 0}.work-receipt{margin-top:20px;padding-top:19px;border-top:1px solid var(--line)}.work-receipt h3{font-size:13px;font-weight:500;margin:0 0 13px}.work-value{font:30px var(--mono);letter-spacing:-.05em;line-height:1.3;color:var(--accent);margin:0 0 7px}.work-receipt p{font-size:11px;color:var(--dim);line-height:1.8;margin:5px 0}.work-receipt .work-hash{font:9px/1.8 var(--mono);overflow-wrap:anywhere;color:var(--muted)}.credit-experience .work-task{background:#edf2e9;border-color:#c8d7c1;border-top-color:var(--accent)}.credit-experience .work-primary{color:#fff}.work-role{font-size:12px;color:var(--dim);line-height:1.8;margin-top:16px}
 @media(max-width:720px){.work-task{padding:19px 17px;margin-bottom:25px}.work-heading{flex-wrap:wrap;gap:5px}.work-heading h2{font-size:22px}.work-scope{gap:16px}.work-steps{gap:9px 14px}.work-review dl{grid-template-columns:80px minmax(0,1fr)}}
 @media(max-width:420px){.work-scope{grid-template-columns:1fr}.work-actions button{flex:1}.work-actions .retry-button{white-space:normal}.work-steps{font-size:9px}}
+/* Opaque's architectural language: warm paper, amber seals, fine structural lines. */
+:root{--bg:#111310;--panel:#171b15;--raised:#20251d;--line:#333b2e;--text:#eeeee3;--dim:#b2b9a6;--muted:#929b86;--accent:#dcb46d;--amber:#dcb46d;--red:#e2a193;--sans:'Archivo','Avenir Next',Avenir,'Segoe UI',sans-serif;--mono:'IBM Plex Mono','SF Mono','Cascadia Code',Consolas,monospace}
+body.credit-experience{--bg:#f5f3ed;--panel:#fbfaf5;--raised:#eeede5;--line:#d9dacd;--text:#242921;--dim:#5e6558;--muted:#707669;--accent:#80611e;--amber:#80611e;--red:#a03f31}
+::selection{background:var(--accent);color:var(--bg)}
+.wordmark{font-family:var(--sans);font-weight:600;letter-spacing:.16em}
+.credit-experience .provenance,.credit-experience .work-task,.credit-experience .scope-badge{background:var(--raised);border-color:var(--line);border-left-color:var(--accent);color:var(--dim)}
+.credit-experience .work-task{border-top-color:var(--accent)}
+.credit-experience .suggestion,.credit-experience .composer,.security-panel{background:var(--panel)}
+.credit-experience .suggestion:hover{background:var(--raised);border-color:var(--accent)}
+.credit-experience .speaker-mark,.boundary-question{border-color:var(--line)}
+.credit-experience .result-card,.portfolio-result{border-top-color:var(--accent)}
+.portfolio-bar-fill{background:var(--accent)}
+.credit-experience .page-error{background:#f3e8df;border-color:#ddc3b5}
+.work-primary,.send-button,.suggestion,.retry-button,.persona-button{transition:background .18s,border-color .18s,transform .18s; border-radius:4px}
+.work-primary:hover:not(:disabled),.send-button:hover:not(:disabled){transform:translateY(-1px)}
+.work-receipt{animation:receipt-arrive .45s cubic-bezier(.2,.7,.2,1)}
+@keyframes receipt-arrive{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.flow-panel{position:relative;isolation:isolate;margin:0 0 30px;border:1px solid var(--line);background:var(--panel);border-radius:8px;overflow:hidden}
+.flow-heading{display:flex;justify-content:space-between;align-items:start;gap:16px;padding:20px 23px 0}
+.flow-heading h2{font-size:23px;font-weight:500;letter-spacing:-.045em;line-height:1.2;margin:4px 0 0}
+.flow-eyebrow{font:10px var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:0}
+.flow-motion{background:transparent;border:1px solid var(--line);border-radius:4px;color:var(--dim);font:11px var(--mono);padding:8px 10px;white-space:nowrap}
+.flow-motion:hover{border-color:var(--accent);color:var(--text)}
+.flow-art{position:relative;padding:0 22px;background:radial-gradient(ellipse at 50% 48%,color-mix(in srgb,var(--accent) 8%,transparent),transparent 63%)}
+.flow-art svg{display:block;width:100%;height:auto;max-height:240px;overflow:visible}
+.flow-grid{stroke:var(--line);stroke-width:.65;opacity:.55;fill:none}
+.flow-wire{fill:none;stroke:var(--line);stroke-width:1.2}
+.flow-device{fill:var(--panel);stroke:var(--muted);stroke-width:1.3}
+.flow-detail-line{stroke:var(--muted);stroke-width:1;fill:none}
+.flow-fin{fill:var(--raised);stroke:var(--accent);stroke-width:1;transition:fill .35s,opacity .35s}
+.flow-fin-back{opacity:.35}.flow-fin-middle{opacity:.6}
+.flow-seal{fill:var(--accent);opacity:.6;transition:opacity .3s}
+.flow-packet{fill:var(--accent);opacity:0;pointer-events:none}
+.flow-packet .flow-pixel-dim{opacity:.35}.flow-packet .flow-pixel-mid{opacity:.65}
+.flow-panel[data-phase="denied"] .flow-fin,.flow-panel[data-phase="denied"] .flow-seal{stroke:var(--red);fill:color-mix(in srgb,var(--red) 12%,var(--panel))}
+.flow-panel[data-phase="policy"] .flow-seal,.flow-panel[data-phase="evidence"] .flow-seal,.flow-panel[data-phase="complete"] .flow-seal{opacity:1}
+.flow-panel[data-source="reported"] .flow-source{stroke:var(--accent)}
+.flow-denied-mark{stroke:var(--red);stroke-width:2;opacity:0}
+.flow-panel[data-phase="denied"] .flow-denied-mark{opacity:1}
+.flow-labels{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:0;padding:0 23px 18px;list-style:none}
+.flow-labels li{min-width:0}
+.flow-labels strong{font-size:12px;font-weight:500;display:block;color:var(--text)}
+.flow-labels span{font:10px/1.6 var(--mono);color:var(--muted);display:block;margin-top:4px;overflow-wrap:anywhere}
+.flow-labels li[data-confirmed="true"] span{color:var(--accent)}
+.flow-summary{display:flex;align-items:baseline;justify-content:space-between;gap:15px;border-top:1px solid var(--line);padding:13px 23px;background:var(--raised)}
+.flow-status{font-size:12px;color:var(--text);margin:0}
+.flow-status::before{content:'';display:inline-block;width:5px;height:5px;background:var(--accent);margin-right:8px;vertical-align:2px}
+.flow-panel[data-phase="denied"] .flow-status::before{background:var(--red)}
+.flow-summary small{font:10px/1.5 var(--mono);color:var(--dim);white-space:nowrap}
+.flow-evidence{padding:0 23px}
+.flow-evidence summary{padding:14px 0;font-size:12px;color:var(--dim);cursor:pointer}
+.flow-trace{list-style:none;padding:0;margin:0 0 15px;display:grid;gap:9px}
+.flow-trace li{font:11px/1.7 var(--mono);display:grid;grid-template-columns:65px minmax(0,1fr);gap:12px;overflow-wrap:anywhere}
+.flow-trace time{color:var(--muted)}
+.flow-proof{font:11px/1.8 var(--mono);color:var(--dim);margin:0 0 17px;overflow-wrap:anywhere;white-space:pre-line}
+.flow-note{font-size:11px;color:var(--muted);margin:0 0 18px;line-height:1.7}
+@media(max-width:1000px){.flow-heading{padding:18px 18px 0}.flow-heading h2{font-size:21px}.flow-art{padding:0 12px}.flow-labels{padding:0 18px 16px;grid-template-columns:repeat(2,minmax(0,1fr));gap:15px}.flow-summary{padding:12px 18px;flex-wrap:wrap;gap:5px}.flow-evidence{padding:0 18px}}
+@media(max-width:450px){.flow-heading{gap:10px}.flow-heading h2{font-size:20px}.flow-motion{font-size:10px}.flow-art{padding:8px 5px}.flow-heading .flow-eyebrow{font-size:9px}.flow-note{font-size:11px}}
+@media(prefers-reduced-motion:reduce){.work-receipt{animation:none}.flow-panel *{transition:none!important}.flow-packet{display:none}}
 </style>
 </head>
 <body>
 <div class="shell">
   <header class="topbar">
-    <div class="brand"><svg class="brand-mark" viewBox="0 0 28 32" fill="none" aria-hidden="true"><path d="M14 2 3 6v10c0 6 4 10 11 14 7-4 11-8 11-14V6L14 2Z" stroke="currentColor" stroke-width="1.5"/><path d="M14 9 9 11v5c0 3 2 5 5 7 3-2 5-4 5-7v-5l-5-2Z" fill="currentColor"/></svg><span class="wordmark">OPAQUE</span><span class="brand-divider" aria-hidden="true"></span><span class="product-name" id="product-name">Customer metrics</span></div>
+    <div class="brand"><svg class="brand-mark" viewBox="0 0 28 28" fill="none" aria-hidden="true"><path d="M2 3h24v5H2zm0 9h9v4H2zm15 0h9v4h-9zM2 20h24v5H2z" fill="currentColor"/></svg><span class="wordmark">OPAQUE</span><span class="brand-divider" aria-hidden="true"></span><span class="product-name" id="product-name">Customer metrics</span></div>
     <div class="connection" id="connection" data-state="loading" role="status"><span class="connection-dot"></span><span id="connection-label">Checking session</span></div>
   </header>
   <div class="workspace-heading">
@@ -185,6 +244,26 @@ body.credit-experience{color-scheme:light;--bg:#f3f5f1;--panel:#fff;--raised:#e9
         <p class="work-note">This task’s one-read limit applies to Run once; portfolio chat retains its session limits. Changing demo identity invalidates outstanding task authority.</p>
       </section>
       <div id="chat-content">
+      <section class="flow-panel" id="flow-panel" data-phase="idle" data-source="unknown" hidden aria-labelledby="flow-title">
+        <div class="flow-heading"><div><p class="flow-eyebrow">Request architecture / this session</p><h2 id="flow-title">Follow the work.</h2></div><button class="flow-motion" id="flow-motion" type="button" aria-pressed="false">Pause motion</button></div>
+        <div class="flow-art" aria-hidden="true">
+          <svg viewBox="0 0 660 230" fill="none">
+            <path class="flow-grid" d="m40 125 270-100 305 108-277 80Zm55 21L365 45m-180 134L456 77M227 56l307 108M134 89l307 108"/>
+            <path class="flow-wire" d="M102 102h176m99 0h173M550 130v48H99v-47"/>
+            <path class="flow-wire" d="m270 98 8 4-8 4m272-8 8 4-8 4M108 174l-9 4 9 4"/>
+            <g><rect class="flow-device" x="47" y="70" width="70" height="57" rx="5"/><path class="flow-detail-line" d="M47 83h70m-57 17 6 5-6 5m13 0h15M54 77h2m4 0h2m4 0h2"/><path class="flow-wire" d="M69 132h27"/></g>
+            <g><path class="flow-fin flow-fin-back" d="m321 35 41 20v109l-41-20Z"/><path class="flow-fin flow-fin-middle" d="m304 47 41 20v109l-41-20Z"/><path class="flow-fin" d="m287 59 41 20v109l-41-20Z"/><path class="flow-seal" d="m287 99 41 20v21l-41-20Z"/><path class="flow-detail-line" d="m297 80 18 9m-18 2 11 5m-11 48 18 9"/></g>
+            <g><path class="flow-device flow-source" d="M544 80q35-16 70 0v49q-35 16-70 0Z"/><path class="flow-detail-line flow-source" d="M544 80q35 16 70 0m-70 16q35 16 70 0m-70 16q35 16 70 0"/><path class="flow-detail-line" d="M555 126h2m4 0h2"/></g>
+            <g transform="translate(120 98)"><g class="flow-packet" id="flow-packet-request"><path d="M0 0h6v6H0Zm7 0h6v6H7Zm0 7h6v6H7Z"/><path class="flow-pixel-dim" d="M-14 0h5v5h-5Z"/><path class="flow-pixel-mid" d="M-7 7h5v5h-5Z"/></g></g>
+            <g transform="translate(370 98)"><g class="flow-packet" id="flow-packet-source"><path d="M0 0h6v6H0Zm7 0h6v6H7Zm0 7h6v6H7Z"/><path class="flow-pixel-dim" d="M-14 0h5v5h-5Z"/><path class="flow-pixel-mid" d="M-7 7h5v5h-5Z"/></g></g>
+            <g transform="translate(538 174)"><g class="flow-packet" id="flow-packet-evidence"><path d="M0 0h6v6H0Zm7 0h6v6H7Zm0 7h6v6H7Z"/><path class="flow-pixel-dim" d="M22 0h5v5h-5Z"/><path class="flow-pixel-mid" d="M15 7h5v5h-5Z"/></g></g>
+            <path class="flow-denied-mark" d="m260 93 13 18m0-18-13 18"/>
+          </svg>
+        </div>
+        <ol class="flow-labels" aria-label="Observed workflow stages"><li id="flow-stage-request"><strong>01 / Request</strong><span id="flow-request">Waiting</span></li><li id="flow-stage-policy"><strong>02 / Opaque boundary</strong><span id="flow-policy">No check yet</span></li><li id="flow-stage-source"><strong>03 / Customer source</strong><span id="flow-source">Access not reported</span></li><li id="flow-stage-evidence"><strong>04 / Evidence return</strong><span id="flow-result">No result yet</span></li></ol>
+        <div class="flow-summary"><p class="flow-status" id="flow-status" role="status" aria-live="polite">Ask a question to follow its path.</p><small id="flow-signal">Waiting for session events</small></div>
+        <details class="flow-evidence"><summary>Inspect this request’s architecture &amp; events</summary><ol class="flow-trace" id="flow-trace"></ol><p class="flow-proof" id="flow-proof">Only this session’s validated events appear here.</p><p class="flow-note">Chat uses the scoped MCP boundary. The separate one-read task above uses its own confirmation and receipt. An ended answer does not establish runtime shutdown.</p></details>
+      </section>
       <div class="panel-heading"><h2 id="conversation-title">Conversation</h2><span class="quiet-label">Read-only metrics</span></div>
       <div class="conversation" id="conversation" aria-label="Conversation history">
         <div class="welcome" id="welcome"><h2 id="welcome-title">Ask your metrics.<br><span>Inspect the evidence.</span></h2><p id="welcome-copy">Ask a question in your own words. Scoped metric results arrive here with their source times and the tool calls behind them.</p><div class="suggestions" id="suggestions"></div></div>
@@ -208,7 +287,7 @@ body.credit-experience{color-scheme:light;--bg:#f3f5f1;--panel:#fff;--raised:#e9
 </div>
 <script>
 'use strict';
-var state = {session:null,customerId:null,controller:null,active:null,latest:new Map(),freshnessNodes:[],expiryTimer:null,policyEvents:[],identityKey:null,clarification:null,composerError:null,organizationBusy:false,activityRevision:0,activityLoading:false,activitySignature:null,supportExpired:false,workTask:null,workBusy:false,workLoading:false,workRevision:0,workUnavailable:false,workError:null,workNotice:null};
+var state = {session:null,customerId:null,controller:null,active:null,latest:new Map(),freshnessNodes:[],expiryTimer:null,policyEvents:[],identityKey:null,clarification:null,composerError:null,organizationBusy:false,activityRevision:0,activityLoading:false,activitySignature:null,supportExpired:false,workTask:null,workBusy:false,workLoading:false,workRevision:0,workUnavailable:false,workError:null,workNotice:null,flow:null,flowPaused:false,flowVisible:true,flowAnimations:[]};
 var MAX_STREAM_BUFFER = 262144;
 function byId(id) { return document.getElementById(id); }
 function node(tag, className, text) {
@@ -319,9 +398,112 @@ function updateComposer() {
 function clearClarification() { state.clarification = null; state.composerError = null; byId('clarification-context').hidden = true; byId('clarification-question').textContent = ''; }
 function startNewQuestion() { clearClarification(); updateComposer(); byId('message').focus(); }
 function clarificationMessage(question, replies) { return 'Original question:\n' + question + replies.map(function(reply,index) { return '\n\nUser clarification ' + (index + 1) + ':\n' + reply; }).join(''); }
+function cancelFlowMotion() {
+  state.flowAnimations.forEach(function(animation) { animation.cancel(); });
+  state.flowAnimations = [];
+}
+function animateFlow(kind) {
+  var reduced = typeof window !== 'undefined' && window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (state.flowPaused || !state.flowVisible || document.hidden || reduced) return;
+  var sprite = byId('flow-packet-' + kind);
+  if (!sprite || typeof sprite.animate !== 'function') return;
+  // Motion acknowledges an observed milestone; it never schedules the next state.
+  var distance = kind === 'evidence' ? -436 : kind === 'source' ? 166 : 145;
+  var animation = sprite.animate([{transform:'translateX(0)',opacity:0},{offset:.12,opacity:1},{offset:.85,opacity:1},{transform:'translateX(' + distance + 'px)',opacity:0}],{duration:kind === 'evidence' ? 1150 : 800,easing:'cubic-bezier(.2,.65,.25,1)'});
+  state.flowAnimations.push(animation);
+  animation.onfinish = function() { state.flowAnimations = state.flowAnimations.filter(function(item) { return item !== animation; }); };
+}
+function clearFlow() {
+  cancelFlowMotion(); state.flow = null; renderFlow();
+}
+function startFlow(turn) {
+  cancelFlowMotion();
+  state.flow = {turn:turn,identityKey:state.identityKey,phase:'request',status:'Connecting this request…',request:'Started in this browser',policy:'No check yet',source:'Access not reported',result:'No result yet',sourceAccess:null,hasResult:false,tool:null,reason:null,events:[]};
+  renderFlow();
+}
+function flowIsCurrent(turn) {
+  return !!(state.flow && state.flow.turn === turn && state.flow.identityKey === state.identityKey && !state.organizationBusy && canChat());
+}
+function recordFlow(text) {
+  state.flow.events.push({text:text,at:Date.now()/1000});
+  state.flow.events = state.flow.events.slice(-4);
+}
+function renderFlow() {
+  var visible = canChat() && !state.organizationBusy;
+  var panel = byId('flow-panel'), flow = state.flow;
+  panel.hidden = !visible;
+  panel.dataset.phase = flow ? flow.phase : 'idle';
+  panel.dataset.source = flow && flow.sourceAccess === true ? 'reported' : 'unknown';
+  byId('flow-status').textContent = flow ? flow.status : 'Ask a question to follow its path.';
+  byId('flow-signal').textContent = flow && flow.events.length ? 'Updated ' + clockText(flow.events[flow.events.length-1].at) : 'Waiting for session events';
+  ['request','policy','source','result'].forEach(function(key) { byId('flow-' + key).textContent = flow ? flow[key] : {request:'Waiting',policy:'No check yet',source:'Access not reported',result:'No result yet'}[key]; });
+  byId('flow-stage-request').dataset.confirmed = String(!!flow);
+  byId('flow-stage-policy').dataset.confirmed = String(!!flow && flow.policy === 'Allowed check reported');
+  byId('flow-stage-source').dataset.confirmed = String(!!flow && flow.sourceAccess === true);
+  byId('flow-stage-evidence').dataset.confirmed = String(!!flow && flow.hasResult);
+  byId('flow-trace').replaceChildren();
+  if (flow) flow.events.forEach(function(event) { var item = node('li');item.appendChild(node('time','',clockText(event.at)));item.appendChild(node('span','',event.text));byId('flow-trace').appendChild(item); });
+  byId('flow-proof').textContent = flow ? 'tool = ' + (flow.tool || 'not reported') + '\nsource_accessed = ' + (flow.sourceAccess === null ? 'not reported' : String(flow.sourceAccess)) + (flow.reason ? '\nlatest policy reason = ' + flow.reason : '') : 'Only this session’s validated events appear here.';
+  byId('flow-motion').textContent = state.flowPaused ? 'Resume motion' : 'Pause motion';
+  byId('flow-motion').setAttribute('aria-pressed',String(state.flowPaused));
+}
+function receiveFlow(turn, type, data) {
+  if (!flowIsCurrent(turn)) return;
+  var flow = state.flow, motion = null;
+  var stoppedPhase = ['denied','interrupted'].includes(flow.phase) ? flow.phase : null, stoppedStatus = flow.status;
+  if (type === 'status') {
+    if (stoppedPhase) return;
+    if (data.message === 'Selecting an authorized metrics tool…' && !flow.tool && !flow.hasResult) {
+      flow.request = 'Tool selection reported';flow.status = 'Selecting an authorized tool…';recordFlow('Service started tool selection.');motion = 'request';
+    } else if (data.message === 'Explaining the latest authorized snapshot…' && flow.hasResult) {
+      flow.status = 'Explaining the authorized evidence…';recordFlow('Service is explaining the received snapshot.');
+    } else return;
+  } else if (type === 'policy') {
+    // Caller has already validated tenant, policy, tool and phase in receivePolicy.
+    flow.reason = typeof data.reason_code === 'string' ? data.reason_code.slice(0,180) : null;
+    flow.tool = data.tool;
+    if (data.outcome === 'denied') {
+      cancelFlowMotion();
+      flow.phase = 'denied';flow.policy = 'Denied check reported';flow.status = 'Stopped at the reported policy check.';
+      if (flow.sourceAccess !== true) { flow.sourceAccess = data.source_accessed === false ? false : null;flow.source = data.source_accessed === false ? 'No access at denied check' : 'Access not reported'; }
+      recordFlow('Policy denied this check. ' + (data.source_accessed === false ? 'No source access at this check.' : 'Source access not established by this check.'));
+    } else {
+      flow.policy = 'Allowed check reported';flow.phase = 'policy';flow.status = 'Scope check reported by Opaque.';
+      if (data.phase === 'source_read' && data.source_accessed === true) { flow.sourceAccess = true;flow.source = 'Source evidence received';flow.phase = 'source';flow.status = 'Authorized source evidence received.'; }
+      recordFlow({request_check:'Request policy',tool_check:'Tool scope',source_read:'Source evidence'}[data.phase] + ' · allowed');
+    }
+  } else if (type === 'tool') {
+    var context = policyContext(state.session), tools = context && Array.isArray(context.allowed_tools) ? context.allowed_tools : context ? [context.allowed_tool] : [];
+    if (!tools.includes(data.name) || !['request','complete'].includes(data.phase)) return;
+    flow.tool = data.name;
+    if (data.phase === 'request') { flow.request = 'Tool call requested';flow.status = 'Scoped call requested. Awaiting source evidence.';recordFlow('MCP tool call requested; source access is not yet established.');motion = 'source'; }
+    else recordFlow('MCP tool completion reported.');
+  } else if (type === 'result' || type === 'portfolio_result') {
+    // These handlers run only after the existing result validation succeeds.
+    flow.hasResult = true;flow.phase = 'evidence';flow.result = 'Validated result received';flow.status = 'Permitted evidence is ready to inspect.';recordFlow('Validated ' + (type === 'portfolio_result' ? 'portfolio' : 'metric') + ' evidence received.');motion = 'evidence';
+  } else if (type === 'error' || type === 'interrupted') {
+    cancelFlowMotion();
+    if (flow.phase !== 'denied') { flow.phase = 'interrupted';flow.status = 'Request interrupted. Last evidence retained.';if (flow.sourceAccess !== true) flow.source = 'Source outcome unconfirmed'; }
+    recordFlow(flow.phase === 'denied' ? 'Request ended after the denied check.' : 'The stream ended without a confirmed successful outcome.');
+  } else if (type === 'done') {
+    if (turn.failed || flow.phase === 'denied' || flow.phase === 'interrupted') return;
+    flow.phase = 'complete';flow.request = 'Answer ended';flow.status = flow.hasResult ? 'Answer complete. Evidence retained.' : 'Answer ended. No source result was reported.';
+    recordFlow('Application answer ended; runtime shutdown is a separate signal.');
+  } else return;
+  // A late validated result can be retained without turning a failed stream into success.
+  if (stoppedPhase) {flow.phase = stoppedPhase;flow.status = stoppedStatus;motion = null;cancelFlowMotion();}
+  renderFlow();if (motion) animateFlow(motion);
+}
+function initFlowMotion() {
+  byId('flow-motion').addEventListener('click',function() {state.flowPaused = !state.flowPaused;if(state.flowPaused)cancelFlowMotion();renderFlow();});
+  document.addEventListener('visibilitychange',function() {if(document.hidden)cancelFlowMotion();});
+  if (typeof IntersectionObserver !== 'undefined') new IntersectionObserver(function(entries) {state.flowVisible = entries[0].isIntersecting;if(!state.flowVisible)cancelFlowMotion();},{threshold:.1}).observe(byId('flow-panel'));
+  if (window.matchMedia) {var preference = window.matchMedia('(prefers-reduced-motion: reduce)');if(preference.addEventListener)preference.addEventListener('change',function(){if(preference.matches)cancelFlowMotion();});}
+}
 function expireSession(message) {
   clearClarification();
   state.session = null;
+  clearFlow();
   clearWorkTask(); renderWorkTask();
   if (state.controller) state.controller.abort();
   clearActivity('Session unavailable. Check the session before requesting activity.');
@@ -337,6 +519,7 @@ function policyContext(session) {
 }
 function clearConversation() {
   clearClarification();
+  clearFlow();
   var welcome = byId('welcome'); welcome.hidden = false; byId('conversation').replaceChildren(welcome);
   state.latest.clear(); state.freshnessNodes = []; state.policyEvents = [];
   byId('latest-metrics').replaceChildren(node('p','aside-copy','No metric result yet.'));
@@ -402,7 +585,7 @@ function updateSupportCase() {
   if (!support) { state.supportExpired = false; return; }
   var valid = supportCaseValid(org);
   byId('support-case').textContent = valid ? 'Case ' + item.case_id + ' · ' + Math.max(0,Math.ceil((dateValue(item.expires_at).getTime()-Date.now())/1000)) + 's remaining · ' + item.reason : 'Support case expired or unavailable. Start a new case with a reason to request access.';
-  if (!valid && !state.supportExpired) { state.supportExpired = true; clearActivity('Support case is not active. Activity access is closed.'); if (state.controller) state.controller.abort(); }
+  if (!valid && !state.supportExpired) { state.supportExpired = true; clearFlow(); clearActivity('Support case is not active. Activity access is closed.'); if (state.controller) state.controller.abort(); }
   if (valid) state.supportExpired = false;
   updateComposer();
 }
@@ -426,7 +609,7 @@ function toggleSharing() {
 }
 async function changeOrganization(path, body) {
   if (!state.session || state.organizationBusy) return;
-  state.organizationBusy = true; organizationError(null); clearActivity('Confirming the requested organization change…'); clearWorkTask(); renderWorkTask();
+  state.organizationBusy = true; clearFlow(); organizationError(null); clearActivity('Confirming the requested organization change…'); clearWorkTask(); renderWorkTask();
   if (state.controller) state.controller.abort();
   renderOrganization(); updateComposer();
   try {
@@ -697,6 +880,7 @@ function renderSession(session) {
   renderDataset(session);
   renderWorkTask();
   byId('page-error').hidden = true;
+  renderFlow();
   clearTimeout(state.expiryTimer);
   state.expiryTimer = setTimeout(function() { expireSession(); },Math.min(expires.getTime() - Date.now(),2147483647));
   setConnection('Authenticated · ready','ready');
@@ -710,7 +894,7 @@ async function loadSession() {
     if (response.status === 401) { expireSession('No active customer session. Sign in to this customer to continue. The sign-in service identifies any fixture or test ceremony.'); return; }
     if (!response.ok) throw new Error('The session service is unavailable. Existing evidence is retained.');
     renderSession(await response.json()); loadActivity(); loadWorkTask();
-  } catch (error) { state.session = null; clearClarification(); clearWorkTask(); renderWorkTask(); clearActivity('Session authority could not be confirmed.'); byId('organization-panel').hidden = true; setConnection('Connection unavailable','error'); showPageError(error.message); updateComposer(); }
+  } catch (error) { state.session = null; clearClarification(); clearFlow(); clearWorkTask(); renderWorkTask(); clearActivity('Session authority could not be confirmed.'); byId('organization-panel').hidden = true; setConnection('Connection unavailable','error'); showPageError(error.message); updateComposer(); }
   finally { byId('reconnect').disabled = false; }
 }
 function addMessage(kind, text) {
@@ -733,6 +917,7 @@ function addTurn() {
   turn.trail = node('ol','trail'); turn.evidence.appendChild(turn.trail); turn.element.appendChild(turn.evidence);
   turn.cards = new Map(); turn.done = false; turn.failed = false; turn.events = 0; turn.answer = '';
   turn.identityKey = state.identityKey;
+  startFlow(turn);
   return turn;
 }
 function addEvidence(turn, title, detail, evidenceId, observedAt) {
@@ -842,6 +1027,7 @@ function handleEvent(turn, type, data) {
   else if (type === 'answer') { if (data.kind !== 'clarification') clearClarification(); turn.answer = typeof data.delta === 'string' ? turn.answer + data.delta : String(data.text || ''); turn.body.textContent = turn.answer; turn.answerKind = data.kind; if (Array.isArray(data.findings)) data.findings.forEach(function(fact,index) { addEvidence(turn,'Answer source [' + (index + 1) + ']','Validated source finding · ' + String(fact.id || ''),fact.evidence_id); }); }
   else if (type === 'error') { clearClarification(); turn.failed = true; turn.status.className = 'request-status error'; turn.status.textContent = data.message || 'The scoped request could not complete.'; addEvidence(turn,'Request stopped',data.code || 'request_failed'); if (['session_expired','auth_expired','session_revoked','unauthenticated'].includes(data.code)) expireSession(data.message); }
   else if (type === 'done') { turn.done = true; if (!turn.failed) { if (turn.answerKind === 'clarification' && turn.question && turn.identityKey === state.identityKey && canChat() && !state.organizationBusy) state.clarification = {identityKey:turn.identityKey,question:turn.question,replies:turn.replies.slice()}; else clearClarification(); turn.status.textContent = turn.answerKind === 'clarification' ? 'Please clarify your question · no source read' : turn.answerKind === 'unsupported' ? 'Outside available data · no source read' : 'Request complete · evidence retained'; turn.status.className = 'request-status'; } if (data.request_id) addEvidence(turn,'Request complete','Request ' + data.request_id); updateComposer(); }
+  receiveFlow(turn,type,data);
 }
 async function submitMessage(event) {
   if (event) event.preventDefault();
@@ -869,6 +1055,7 @@ async function submitMessage(event) {
     if (!turn.done && !turn.failed) throw new Error('The connection ended before completion. Existing results are retained; refresh does not rerun this request.');
   } catch (error) {
     clearClarification();
+    receiveFlow(turn,'interrupted',{});
     turn.status.className = 'request-status ' + (error.name === 'AbortError' ? 'stopped' : 'error');
     turn.status.textContent = error.name === 'AbortError' ? 'Stream stopped. Work already accepted may still finish; displayed evidence is retained.' : error.message;
     controller.abort();
@@ -879,6 +1066,7 @@ async function submitMessage(event) {
   }
 }
 function init() {
+  initFlowMotion();
   byId('composer').addEventListener('submit',submitMessage);
   byId('message').addEventListener('input',function() { state.composerError = null; updateComposer(); });
   byId('new-question').addEventListener('click',startNewQuestion);
