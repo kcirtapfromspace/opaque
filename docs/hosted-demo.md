@@ -1,6 +1,6 @@
 # Try bounded work with Opaque
 
-Approve the work. Keep authority bounded. Review one task for a fictional credit union, confirm one permitted source read, and inspect the service receipt. Then explore portfolio questions with a real hosted model and test the access boundaries.
+Approve the work. Keep authority bounded. Review one task for a fictional credit union, authenticate to approve one permitted source read, and inspect the service receipt. Then explore portfolio questions with a real hosted model and test the access boundaries.
 
 [Request a demo](https://demo.opaque.info/)
 
@@ -17,16 +17,20 @@ A session lasts **10 minutes** and allows one preview task plus up to **12 portf
 
 Start as the **portfolio analyst**. The bounded task panel fixes one operation: read **manual review rate** from Harborlight’s synthetic source over a **60 second window**, once. Review the customer, acting identity, source, one-read allowance, expiry and manifest digest before confirming it.
 
-1. Select **Confirm this demo task**. The service records your confirmation against the exact task and manifest digest.
-2. Select **Run once**. The service consumes the allowance before requesting the source and reports the persisted result.
-3. Inspect the service receipt’s metric value, sample count, source times and evidence digest.
-4. Select **Test replay denial** to deliberately request another execution. Inspect the service’s denial, then **Check task status** to retrieve its current state.
+1. Select **Review & approve**. The approval window shows the task, customer, acting demo identity, source, deadline and manifest digest. Its local WebAssembly review checks that the displayed manifest matches the digest and one-read limits.
+2. Choose **Passkey or FIDO2 security key**. First use creates a temporary demo credential; a separate authenticator request then approves the task. Opaque verifies the authenticator signature, browser origin, challenge and required user verification before recording approval. A passkey-capable browser over HTTPS is required. Your device may retain the demo passkey after the server session expires; you can remove it from your password manager.
+3. Alternatively, choose **Continue with GitHub** to select your GitHub account and approve the reviewed task. Opaque verifies your public account identity against the pending task. GitHub approval requests no organization, repository or private email permissions.
+4. Select **Run once**. Approval alone does not execute the task. The service consumes the allowance before requesting the source and reports the persisted result.
+5. Inspect the verified approval method and the service receipt’s metric value, sample count, source times and evidence digest.
+6. Select **Test replay denial** to deliberately request another execution. Inspect the service’s denial, then **Check task status** to retrieve its current state.
+
+Closing the window before submitting a proof does not approve the task. If verification was submitted but its response was interrupted, use **Check task status** to learn the outcome. Neither the browser nor the service automatically retries execution.
 
 The task expires after at most **five minutes**, ending sooner if the session ends. Receipt access ends at that deadline too. **Revoke task** closes outstanding task authority; it cannot retract a source request or evidence already received. Reloading the workspace retrieves its state without approving, executing or refilling the task. A source failure can leave a consumed task with an uncertain outcome; it cannot be run again.
 
 Changing demo identity invalidates outstanding task authority. Engineers and support identities cannot approve or execute this task or see its metric receipt. Returning to the analyst does not restore the earlier grant or refill its allowance.
 
-**Your visitor confirmation is a demo interaction.** It is not a verified production identity or a production signed human approval. The displayed receipt records the service’s synthetic source observation; it is not an independently signed host receipt.
+**Human authentication is real; the customer and resource authority remain a demonstration.** A temporary passkey proves control of its authenticator, and GitHub login verifies its stable public account identity. Neither establishes employment, real customer membership or enrollment with a production Opaque broker. The demo service binds verification to this task and records the synthetic source observation. Its execution receipt is not an independently signed host receipt.
 
 This task’s one-read limit applies to **Run once**. Portfolio chat retains its separate session limits and does not inherit new access from task approval.
 

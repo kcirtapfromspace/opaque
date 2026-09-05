@@ -7,8 +7,10 @@ const REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const PUBLIC_PATHS = new Map([['/workspace','workspace'],['/api/session','api/session'],['/api/chat','api/chat'],['/api/organization/activity','api/organization/activity'],['/api/demo/persona','api/demo/persona'],['/api/organization/sharing','api/organization/sharing']]);
 const CONTROL_PATHS = new Set(['api/demo/persona','api/organization/sharing']);
 const TASK_PATHS = new Set(['api/work-task/approve','api/work-task/execute','api/work-task/revoke']);
+const APPROVAL_PATHS = new Set(['api/work-task/approval/start','api/work-task/approval/finish']);
+const TASK_RESPONSE_PATHS = new Set(['api/work-task','api/work-task/approval',...TASK_PATHS,...APPROVAL_PATHS]);
 PUBLIC_PATHS.set('/api/work-task','api/work-task');
-for (const path of TASK_PATHS) PUBLIC_PATHS.set('/'+path,path);
+for (const path of TASK_RESPONSE_PATHS) PUBLIC_PATHS.set('/'+path,path);
 const encoder = new TextEncoder();
 const error = (code,status=400) => Response.json({error:code,message:code.replaceAll('_',' ')},{status,headers:{'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}});
 
@@ -87,19 +89,38 @@ export async function verifyBot(request,env,value) {
   const result=await response.json();
   return result.success===true&&result.action==='demo_join'&&result.hostname===new URL(env.PUBLIC_ORIGIN).hostname;
 }
-async function htmlResponse(response,env) {
+async function htmlResponse(response,env,callback=false) {
   const html=await response.text();
   const hashes=[];
   for(const [,body] of html.matchAll(/<script>([\s\S]*?)<\/script>/g)){
     const bytes=new Uint8Array(await crypto.subtle.digest('SHA-256',encoder.encode(body)));
     hashes.push("'sha256-"+btoa(String.fromCharCode(...bytes))+"'");
   }
-  return new Response(html,{headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer','Content-Security-Policy':`default-src 'none'; script-src ${hashes.join(' ')} https://challenges.cloudflare.com; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`}});
+  const policy=callback
+    ? `default-src 'none'; script-src ${hashes.join(' ')}; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`
+    : `default-src 'none'; script-src ${hashes.join(' ')} https://challenges.cloudflare.com; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`;
+  // The OAuth callback must not acquire analytics or challenge scripts from
+  // intermediary HTML transforms while carrying a short-lived login code.
+  return new Response(html,{headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':callback?'no-store, no-transform':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer','Content-Security-Policy':policy,...(callback?{'X-Robots-Tag':'noindex, noarchive'}:{})}});
+}
+function taskReference(input) {
+  return typeof input.task_id==='string'&&/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(input.task_id)
+    &&typeof input.manifest_sha256==='string'&&ID.test(input.manifest_sha256);
+}
+function approvalBody(path,input) {
+  if(!taskReference(input))return false;
+  const keys=Object.keys(input).sort().join(',');
+  if(path==='api/work-task/approval/start')return keys==='manifest_sha256,method,task_id'&&['passkey','oauth'].includes(input.method);
+  if(typeof input.transaction_id!=='string'||!/^[A-Za-z0-9_-]{1,256}$/.test(input.transaction_id))return false;
+  if(keys==='credential,manifest_sha256,task_id,transaction_id')return !!input.credential&&typeof input.credential==='object'&&!Array.isArray(input.credential);
+  return keys==='code,manifest_sha256,state,task_id,transaction_id'
+    &&typeof input.code==='string'&&input.code.length>0&&encoder.encode(input.code).length<=4096&&!/[\u0000-\u0020\u007f]/.test(input.code)
+    &&typeof input.state==='string'&&/^[A-Za-z0-9_-]{1,512}$/.test(input.state);
 }
 async function authenticatedProxy(request,env,ctx,path,visitorHash) {
   if(!env.CONTROLLER_ORIGIN||!env.CONTROLLER_SECRET)return error('demo_backend_unavailable',503);
   const method=request.method;
-  const writes=path==='api/chat'||CONTROL_PATHS.has(path)||TASK_PATHS.has(path);
+  const writes=path==='api/chat'||CONTROL_PATHS.has(path)||TASK_PATHS.has(path)||APPROVAL_PATHS.has(path);
   if(method!==(writes?'POST':'GET'))return error('method_not_allowed',405);
   if(method==='POST'&&!sameOrigin(request,env))return error('same_origin_required',403);
   let body, reservation, lease;
@@ -126,9 +147,12 @@ async function authenticatedProxy(request,env,ctx,path,visitorHash) {
     }
     if(TASK_PATHS.has(path)) {
       const input=await boundedJSON(request,1024);
-      if(Object.keys(input).sort().join(',')!=='manifest_sha256,task_id'
-        ||typeof input.task_id!=='string'||!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(input.task_id)
-        ||typeof input.manifest_sha256!=='string'||!ID.test(input.manifest_sha256))return error('bounded_task_reference_required');
+      if(Object.keys(input).sort().join(',')!=='manifest_sha256,task_id'||!taskReference(input))return error('bounded_task_reference_required');
+      body=JSON.stringify(input);
+    }
+    if(APPROVAL_PATHS.has(path)) {
+      const input=await boundedJSON(request,path.endsWith('/finish')?16384:1024);
+      if(!approvalBody(path,input))return error('bounded_approval_request_required');
       body=JSON.stringify(input);
     }
     lease=await schedule(env,'authorize',visitorHash);
@@ -142,7 +166,7 @@ async function authenticatedProxy(request,env,ctx,path,visitorHash) {
   const headers=new Headers({'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer'});
   if(reservation)headers.set('Idempotency-Key',reservation.reservation.request_id);
   for(const name of ['Content-Type','Content-Security-Policy'])if(upstream.headers.has(name))headers.set(name,upstream.headers.get(name));
-  if(path==='api/work-task'||TASK_PATHS.has(path)) {
+  if(TASK_RESPONSE_PATHS.has(path)) {
     // The task ledger belongs to the runtime. The edge never retries an action
     // or invents a receipt, and rechecks the visitor lease before disclosure.
     const task=await boundedJSON(upstream,32768);
@@ -253,8 +277,12 @@ export async function handleRequest(request,env,ctx) {
   try {
     const url=new URL(request.url);
     if(url.origin!==env.PUBLIC_ORIGIN)return error('unexpected_demo_origin',421);
-    if(url.search)return error('query_parameters_not_supported');
     const path=url.pathname;
+    if(path==='/approval/callback') {
+      if(request.method!=='GET')return error('method_not_allowed',405);
+      return htmlResponse(await env.ASSETS.fetch(new Request(url.origin+'/approval/callback/index.html')),env,true);
+    }
+    if(url.search)return error('query_parameters_not_supported');
     if(path.startsWith('/internal/')) {
       if(request.headers.get('Authorization')!=='Bearer '+env.CONTROLLER_SECRET||!env.CONTROLLER_SECRET)return error('controller_authority_required',401);
       if(path==='/internal/work'&&request.method==='GET')return Response.json(await schedule(env,'work'),{headers:{'Cache-Control':'no-store'}});

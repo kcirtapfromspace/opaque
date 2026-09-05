@@ -1,0 +1,27 @@
+# Optional strategic-merge patch; apply during the reviewed demo rollout only
+# after creating the GitHub OAuth application owned by opaque-dev and storing
+# its credentials in the opaque-demo-github-oauth Secret. This patch has no
+# credential values; it preserves the existing controller secret.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opaque-demo-controller
+  namespace: opaque-demo-system
+spec:
+  template:
+    spec:
+      containers:
+        - name: controller
+          env:
+            - name: OPAQUE_DEMO_OAUTH_PROVIDER
+              value: github
+            - name: OPAQUE_DEMO_OAUTH_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: opaque-demo-github-oauth
+                  key: client-id
+            - name: OPAQUE_DEMO_OAUTH_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: opaque-demo-github-oauth
+                  key: client-secret

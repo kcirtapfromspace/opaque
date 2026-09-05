@@ -49,6 +49,57 @@ pub enum TaskState {
 pub struct Approval {
     pub kind: String,
     pub approved_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<ApprovalVerification>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalVerification {
+    pub issuer: Option<String>,
+    pub subject: String,
+    pub credential_sha256: Option<String>,
+    pub user_verified: Option<bool>,
+}
+impl Approval {
+    fn is_verified(&self) -> bool {
+        self.verification.as_ref().is_some_and(|verification| {
+            !verification.subject.is_empty()
+                && match self.kind.as_str() {
+                    "webauthn" => {
+                        verification.user_verified == Some(true)
+                            && verification.issuer.is_none()
+                            && verification
+                                .credential_sha256
+                                .as_ref()
+                                .is_some_and(|digest| {
+                                    digest.len() == 64
+                                        && digest.bytes().all(|byte| {
+                                            byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()
+                                        })
+                                })
+                    }
+                    "oidc" => {
+                        verification.user_verified.is_none()
+                            && verification.credential_sha256.is_none()
+                            && verification.issuer.as_ref().is_some_and(|issuer| {
+                                reqwest::Url::parse(issuer).is_ok_and(|url| {
+                                    url.scheme() == "https" && url.host_str().is_some()
+                                })
+                            })
+                    }
+                    "github_oauth" => {
+                        verification.user_verified.is_none()
+                            && verification.credential_sha256.is_none()
+                            && verification.issuer.as_deref() == Some("https://github.com")
+                            && verification
+                                .subject
+                                .bytes()
+                                .all(|byte| byte.is_ascii_digit())
+                    }
+                    _ => false,
+                }
+        })
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -231,7 +282,7 @@ impl Store {
                     created_at: now, expires_at: (now + 300).min(access.expires_at()), subject: access.subject().into(), client_id: access.client_id().into(), persona_generation: epoch };
                 *record = Some(Record { authorizing_jti: access.jti().into(), task: Task { task_id: Uuid::new_v4().to_string(), manifest_sha256: hash(&manifest)?,
                     manifest, state: TaskState::Planned, consumed: false, approval: None, receipt: None, simulation: true,
-                    notice: "Synthetic demo confirmation; one real read of synthetic aggregate data. Production signed human approval is not demonstrated here.".into() } });
+                    notice: "One read of synthetic aggregate data. Approval verifies a passkey or configured OAuth identity; production tenant membership and broker-signed approval are not demonstrated.".into() } });
             }
             let record = record.as_mut().ok_or(Error::Unavailable)?;
             Self::owner(record, access)?;
@@ -246,6 +297,37 @@ impl Store {
         now: i64,
         reference: &TaskReference,
         target: TaskState,
+    ) -> Result<Task, Error> {
+        self.transition_with_approval(access, epoch, now, reference, target, None)
+    }
+    pub fn approve_verified(
+        &mut self,
+        access: &VerifiedAccess,
+        epoch: u64,
+        now: i64,
+        reference: &TaskReference,
+        approval: Approval,
+    ) -> Result<Task, Error> {
+        if approval.approved_at != now || !approval.is_verified() {
+            return Err(Error::Forbidden);
+        }
+        self.transition_with_approval(
+            access,
+            epoch,
+            now,
+            reference,
+            TaskState::Approved,
+            Some(approval),
+        )
+    }
+    fn transition_with_approval(
+        &mut self,
+        access: &VerifiedAccess,
+        epoch: u64,
+        now: i64,
+        reference: &TaskReference,
+        target: TaskState,
+        approval: Option<Approval>,
     ) -> Result<Task, Error> {
         // Commit invalidation independently, including when the subsequent
         // requested transition is denied. A denied request cannot revive a task.
@@ -262,13 +344,16 @@ impl Store {
             Self::reference(record, reference)?;
             match target {
                 TaskState::Approved if record.task.state == TaskState::Planned => {
-                    record.task.approval = Some(Approval {
-                        kind: "synthetic_demo_confirmation".into(),
-                        approved_at: now,
-                    });
+                    record.task.approval = Some(approval.ok_or(Error::Forbidden)?);
                 }
                 TaskState::Reserved
-                    if record.task.state == TaskState::Approved && !record.task.consumed =>
+                    if record.task.state == TaskState::Approved
+                        && !record.task.consumed
+                        && record
+                            .task
+                            .approval
+                            .as_ref()
+                            .is_some_and(Approval::is_verified) =>
                 {
                     record.task.consumed = true;
                 }
@@ -325,5 +410,37 @@ impl Store {
             }
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn github_approval_metadata_requires_pinned_issuer_and_stable_numeric_identity() {
+        let approval = Approval {
+            kind: "github_oauth".into(),
+            approved_at: 100,
+            verification: Some(ApprovalVerification {
+                issuer: Some("https://github.com".into()),
+                subject: "12345".into(),
+                credential_sha256: None,
+                user_verified: None,
+            }),
+        };
+        assert!(approval.is_verified());
+        for mutation in 0..5 {
+            let mut changed = approval.clone();
+            let verification = changed.verification.as_mut().unwrap();
+            match mutation {
+                0 => verification.issuer = Some("https://foreign.example".into()),
+                1 => verification.subject = "mutable-github-handle".into(),
+                2 => verification.subject.clear(),
+                3 => verification.user_verified = Some(true),
+                _ => verification.credential_sha256 = Some("a".repeat(64)),
+            }
+            assert!(!changed.is_verified());
+        }
     }
 }

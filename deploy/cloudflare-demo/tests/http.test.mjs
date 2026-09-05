@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, createHmac } from 'node:crypto';
 import { setImmediate as nextTurn } from 'node:timers/promises';
+import { readFile } from 'node:fs/promises';
+import { runInNewContext } from 'node:vm';
 import { DemoQueue, QueueError } from '../src/queue.mjs';
 import { handleRequest, visitor, localMode } from '../src/http.mjs';
 
@@ -130,6 +132,87 @@ test('bounded task actions preserve reviewed references and reject added authori
   assert.equal(new Headers(f.requests[0].init.headers).get('Cookie'),null);
   assert.equal(f.calls.filter(c=>c.action==='authorize').length,2);
   assert.equal(f.calls.filter(c=>c.action==='reserveChat').length,0);
+});
+
+test('approval proofs have exact routes, bounded bodies, and no browser authority forwarding', async (t) => {
+  const f=fixture(t);await f.ready();
+  f.stream=()=>Response.json({transaction_id:'transaction-123',method:'passkey'});
+  const finish={...TASK_REF,transaction_id:'transaction-123',credential:{id:'credential',response:{attestationObject:'x'.repeat(9000)}}};
+  for(const [path,body] of [
+    ['/api/work-task/approval/start',{...TASK_REF,method:'passkey'}],
+    ['/api/work-task/approval/start',{...TASK_REF,method:'oauth'}],
+    ['/api/work-task/approval/finish',finish],
+    ['/api/work-task/approval/finish',{...TASK_REF,transaction_id:'transaction-123',code:'dex-code',state:'transaction-123'}],
+  ]) {
+    assert.equal((await f.send(path,{method:'POST',body,cookie:null})).status,401);
+    assert.equal((await f.send(path,{method:'POST',body,origin:'https://foreign.example'})).status,403);
+    assert.equal((await f.send(path,{method:'POST',body:{...body,public_origin:'https://foreign.example'}})).status,400);
+    const before=f.requests.length;
+    const response=await f.send(path,{method:'POST',body,headers:{Authorization:'Bearer browser',Cookie:f.cookie+'; opaque_metrics=forged'}});
+    assert.equal(response.status,200);
+    assert.equal(f.requests.length,before+1);
+    assert.deepEqual(JSON.parse(f.requests.at(-1).init.body),body);
+    assert.equal(new Headers(f.requests.at(-1).init.headers).get('Cookie'),null);
+  }
+  assert.equal((await f.send('/api/work-task/approval')).status,200);
+  const dispatched=f.requests.length;
+  for(const body of [{...TASK_REF,method:'webauthn'}, {...TASK_REF,method:'oauth',issuer:'https://evil.example'}])
+    assert.equal((await f.send('/api/work-task/approval/start',{method:'POST',body})).status,400);
+  for(const body of [{...finish,code:'code',state:'state'}, {...finish,credential:[]}, {...finish,transaction_id:'../transaction'}])
+    assert.equal((await f.send('/api/work-task/approval/finish',{method:'POST',body})).status,400);
+  assert.notEqual((await f.send('/api/work-task/approval/finish',{method:'POST',body:{...finish,credential:{padding:'x'.repeat(16384)}}})).status,200);
+  assert.equal((await f.send('/api/work-task/approval/finish')).status,405);
+  assert.equal((await f.send('/api/work-task/approval?issuer=evil')).status,400);
+  assert.equal(f.requests.length,dispatched);
+  assert.equal(f.calls.filter(call=>call.action==='reserveChat').length,0);
+});
+
+test('approval challenge and proof results are withheld after lease expiry', async (t) => {
+  const f=fixture(t);await f.ready();
+  f.stream=()=>{f.now=f.lease.expires_at+1;return Response.json({authorization_url:'https://dex.example/private-challenge'});};
+  const response=await f.send('/api/work-task/approval/start',{method:'POST',body:{...TASK_REF,method:'oauth'}});
+  assert.notEqual(response.status,200);
+  assert.doesNotMatch(await response.text(),/authorization_url|private-challenge/);
+  assert.equal(f.requests.length,1);
+});
+
+test('OAuth popup callback is public only at the exact path and uses hashed scripts with no network capability', async (t) => {
+  const f=fixture(t);
+  const html=await readFile(new URL('../public/approval/callback/index.html',import.meta.url),'utf8');
+  f.env.ASSETS.fetch=async request=>{
+    assert.equal(request.url,'https://demo.example/approval/callback/index.html');
+    return new Response(html);
+  };
+  const response=await f.send('/approval/callback?code=private-code&state=transaction-123',{cookie:null,origin:'https://dex.example'});
+  assert.equal(response.status,200);
+  const policy=response.headers.get('Content-Security-Policy');
+  const script=[...html.matchAll(/<script>([\s\S]*?)<\/script>/g)][0][1];
+  assert.ok(policy.includes("'sha256-"+createHash('sha256').update(script).digest('base64')+"'"));
+  assert.match(policy,/default-src 'none'/);
+  assert.doesNotMatch(policy,/https:|connect-src|frame-src/);
+  assert.equal(response.headers.get('Referrer-Policy'),'no-referrer');
+  assert.equal(response.headers.get('Cache-Control'),'no-store, no-transform');
+  assert.equal(response.headers.get('Set-Cookie'),null);
+  const events=[];
+  const context={URLSearchParams,location:{search:'?code=private-code&state=transaction-123',origin:'https://demo.example'},
+    history:{replaceState:(_state,_title,path)=>events.push(['clear',path])},
+    window:{opener:{postMessage:(message,origin)=>events.push(['message',message,origin])},close:()=>events.push(['close'])}};
+  runInNewContext(script,context);
+  assert.equal(events[0][0],'clear');
+  assert.equal(events[0][1],'/approval/callback');
+  assert.equal(events[1][1].type,'opaque-approval-oauth');
+  assert.equal(events[1][1].code,'private-code');
+  assert.equal(events[1][2],'https://demo.example');
+  assert.equal(events[2][0],'close');
+  for(const search of ['?code=one&code=two&state=transaction-123','?code=code','?code=code&state=bad%20state']) {
+    events.length=0;context.location.search=search;runInNewContext(script,context);
+    assert.deepEqual(events,[['clear','/approval/callback']]);
+  }
+  assert.equal((await f.send('/approval/callback/',{cookie:null})).status,404);
+  assert.equal((await f.send('/approval/callback/index.html',{cookie:null})).status,404);
+  assert.equal((await f.send('/approval/callback',{method:'POST',body:{},cookie:null})).status,405);
+  assert.equal(f.requests.length,0);
+  assert.equal(f.calls.length,0);
 });
 
 test('bounded task receipts are withheld when the visitor lease expires during execution', async (t) => {

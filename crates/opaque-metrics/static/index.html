@@ -145,6 +145,18 @@ body.credit-experience{color-scheme:light;--bg:#f3f5f1;--panel:#fff;--raised:#e9
 .work-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:18px}.work-heading h2{font-size:23px;font-weight:500;letter-spacing:-.035em;line-height:1.25;margin:0 0 8px}.work-heading p{font-size:12px;color:var(--dim);margin:0;max-width:590px}.work-state{font:10px var(--mono);color:var(--accent);white-space:nowrap;padding:4px 0;text-transform:uppercase}.work-steps{display:flex;flex-wrap:wrap;gap:9px 21px;margin:18px 0;padding:0;list-style:none;font:10px var(--mono);color:var(--muted)}.work-steps li[aria-current=step]{color:var(--accent)}.work-scope{display:grid;grid-template-columns:1fr 1fr;gap:15px 24px;margin:20px 0}.work-scope div{min-width:0}.work-scope dt{font:9px var(--mono);color:var(--muted);margin-bottom:5px}.work-scope dd{margin:0;font-size:13px;overflow-wrap:anywhere}.work-notice,.work-note{font-size:11px;line-height:1.75;color:var(--dim);margin:14px 0 0}.work-note{color:var(--muted)}.work-review{border-top:1px solid var(--line);padding-top:13px;font-size:11px}.work-review summary{cursor:pointer;color:var(--dim)}.work-review dl{display:grid;grid-template-columns:92px minmax(0,1fr);gap:8px 14px;margin:14px 0;font-size:10px}.work-review dt{color:var(--muted)}.work-review dd{margin:0;color:var(--dim);overflow-wrap:anywhere;font-family:var(--mono)}.work-actions{display:flex;flex-wrap:wrap;align-items:center;gap:9px;margin-top:18px}.work-actions button{min-height:40px}.work-primary{background:var(--accent);color:var(--bg);border:1px solid var(--accent);padding:9px 16px;font-size:12px;font-weight:600;transition:filter .15s}.work-primary:hover:not(:disabled){filter:brightness(.94)}.work-primary:active:not(:disabled){transform:translateY(1px)}.work-error{font-size:12px;color:var(--red);line-height:1.7;overflow-wrap:anywhere;margin:14px 0 0}.work-status{font-size:11px;color:var(--dim);line-height:1.7;margin:13px 0 0}.work-receipt{margin-top:20px;padding-top:19px;border-top:1px solid var(--line)}.work-receipt h3{font-size:13px;font-weight:500;margin:0 0 13px}.work-value{font:30px var(--mono);letter-spacing:-.05em;line-height:1.3;color:var(--accent);margin:0 0 7px}.work-receipt p{font-size:11px;color:var(--dim);line-height:1.8;margin:5px 0}.work-receipt .work-hash{font:9px/1.8 var(--mono);overflow-wrap:anywhere;color:var(--muted)}.credit-experience .work-task{background:#edf2e9;border-color:#c8d7c1;border-top-color:var(--accent)}.credit-experience .work-primary{color:#fff}.work-role{font-size:12px;color:var(--dim);line-height:1.8;margin-top:16px}
 @media(max-width:720px){.work-task{padding:19px 17px;margin-bottom:25px}.work-heading{flex-wrap:wrap;gap:5px}.work-heading h2{font-size:22px}.work-scope{gap:16px}.work-steps{gap:9px 14px}.work-review dl{grid-template-columns:80px minmax(0,1fr)}}
 @media(max-width:420px){.work-scope{grid-template-columns:1fr}.work-actions button{flex:1}.work-actions .retry-button{white-space:normal}.work-steps{font-size:9px}}
+/* Human approval is a focused, task-bound review surface. */
+.approval-window{color:var(--text);background:var(--panel);border:1px solid var(--line);padding:0;width:min(660px,calc(100% - 32px));max-height:calc(100dvh - 32px);overflow:auto;box-shadow:0 28px 100px #0005}
+.approval-window::backdrop{background:#102019a6;backdrop-filter:blur(5px)}
+.approval-header{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:20px 28px;border-bottom:1px solid var(--line)}
+.approval-brand{font:12px var(--mono);letter-spacing:.1em}.approval-brand span{color:var(--muted);font-size:9px;letter-spacing:.05em;margin-left:12px}.approval-close{border:0;background:transparent;font-size:23px;line-height:1;padding:6px;color:var(--dim)}
+.approval-body{padding:28px}.approval-body h2{font-size:32px;letter-spacing:-.045em;line-height:1.15;font-weight:500;margin:9px 0 12px}.approval-intro{font-size:13px;color:var(--dim);margin:0 0 24px;max-width:490px}.approval-quantity{font:10px var(--mono);color:var(--accent);text-transform:uppercase;letter-spacing:.08em}
+.approval-scope{display:grid;grid-template-columns:1fr 1fr;gap:18px 24px;margin:0;padding:20px;background:var(--raised);border-left:3px solid var(--accent)}
+.approval-scope div{min-width:0}.approval-scope dt{font:9px var(--mono);color:var(--dim);text-transform:uppercase;margin-bottom:5px}.approval-scope dd{font-size:12px;line-height:1.65;overflow-wrap:anywhere;margin:0}.approval-scope .approval-wide{grid-column:1/-1}.approval-scope .approval-wide dd{font:10px/1.7 var(--mono)}
+.approval-binding{margin-top:14px;font-size:11px;color:var(--dim)}.approval-binding summary{cursor:pointer}.approval-binding code{display:block;overflow-wrap:anywhere;font:10px/1.8 var(--mono);margin-top:10px}.approval-check{font:10px/1.7 var(--mono);color:var(--dim);margin:13px 0 24px}
+.approval-methods{border:0;margin:0;padding:0}.approval-methods legend{font-size:13px;font-weight:600;margin-bottom:12px}.approval-method{display:flex;align-items:center;gap:14px;width:100%;text-align:left;background:transparent;border:1px solid var(--line);padding:16px;margin:0 0 10px;color:var(--text);transition:border-color .15s,background .15s}.approval-method:hover:not(:disabled){border-color:var(--accent);background:var(--raised)}.approval-method svg{width:23px;height:23px;color:var(--accent);flex-shrink:0}.approval-method strong{display:block;font-size:13px;font-weight:600}.approval-method small{display:block;font-size:11px;line-height:1.65;color:var(--dim);margin-top:4px}.approval-method .approval-arrow{margin-left:auto;color:var(--accent);font-size:18px}.approval-method:disabled{opacity:.65}
+.approval-progress{font-size:12px;line-height:1.7;color:var(--accent);margin:15px 0 0}.approval-error{font-size:12px;line-height:1.7;color:var(--red);margin:13px 0 0}.approval-footer{border-top:1px solid var(--line);padding:18px 28px;background:var(--bg)}.approval-footer p{font-size:11px;line-height:1.75;color:var(--dim);margin:0}.approval-window button:focus-visible{outline:2px solid var(--accent);outline-offset:3px}.approval-proof{font-size:11px;line-height:1.75;color:var(--accent);overflow-wrap:anywhere;margin:13px 0 0}
+@media(max-width:560px){.approval-header{padding:16px 20px}.approval-body{padding:22px 20px}.approval-body h2{font-size:28px}.approval-scope{padding:16px;gap:15px}.approval-footer{padding:16px 20px}.approval-brand span{display:none}.approval-method{padding:14px 12px}.approval-scope .approval-identity{grid-column:1/-1}}
 /* Opaque's architectural language: warm paper, amber seals, fine structural lines. */
 :root{--bg:#111310;--panel:#171b15;--raised:#20251d;--line:#333b2e;--text:#eeeee3;--dim:#b2b9a6;--muted:#929b86;--accent:#dcb46d;--amber:#dcb46d;--red:#e2a193;--sans:'Archivo','Avenir Next',Avenir,'Segoe UI',sans-serif;--mono:'IBM Plex Mono','SF Mono','Cascadia Code',Consolas,monospace}
 body.credit-experience{--bg:#f5f3ed;--panel:#fbfaf5;--raised:#eeede5;--line:#d9dacd;--text:#242921;--dim:#5e6558;--muted:#707669;--accent:#80611e;--amber:#80611e;--red:#a03f31}
@@ -232,11 +244,12 @@ body.credit-experience{--bg:#f5f3ed;--panel:#fbfaf5;--raised:#eeede5;--line:#d9d
         <div class="work-heading"><div><p class="eyebrow">Bounded work / interactive preview</p><h2 id="work-title">Approve one read. Inspect its receipt.</h2><p>Review exactly what this task may do before it receives authority to run.</p></div><span class="work-state" id="work-state">Checking</span></div>
         <p class="work-role" id="work-role" hidden>This task is available to the portfolio analyst. This identity cannot approve, run or inspect its metric receipt.</p>
         <div id="work-content" hidden>
-          <ol class="work-steps" aria-label="Task lifecycle"><li id="work-step-review">01 Review</li><li id="work-step-approve">02 Confirm</li><li id="work-step-run">03 Run once</li><li id="work-step-receipt">04 Receipt</li></ol>
+          <ol class="work-steps" aria-label="Task lifecycle"><li id="work-step-review">01 Review</li><li id="work-step-approve">02 Human approval</li><li id="work-step-run">03 Run once</li><li id="work-step-receipt">04 Receipt</li></ol>
           <dl class="work-scope"><div><dt>Operation</dt><dd id="work-operation"></dd></div><div><dt>Customer</dt><dd id="work-customer"></dd></div><div><dt>Allowed metric &amp; window</dt><dd id="work-metric"></dd></div><div><dt>Read allowance</dt><dd id="work-allowance"></dd></div><div><dt>Acting identity</dt><dd id="work-subject"></dd></div><div><dt>Authority expires</dt><dd id="work-expiry"></dd></div></dl>
           <details class="work-review"><summary>Inspect the exact task binding</summary><dl><dt>Task</dt><dd id="work-id"></dd><dt>Manifest SHA-256</dt><dd id="work-digest"></dd><dt>Source</dt><dd id="work-source"></dd><dt>Client</dt><dd id="work-client"></dd><dt>Identity generation</dt><dd id="work-generation"></dd></dl></details>
           <p class="work-notice" id="work-notice"></p>
-          <div class="work-actions"><button class="work-primary" id="work-approve" type="button" hidden>Confirm this demo task</button><button class="work-primary" id="work-run" type="button" hidden>Run once</button><button class="retry-button" id="work-replay" type="button" hidden>Test replay denial</button><button class="retry-button" id="work-revoke" type="button" hidden>Revoke task</button></div>
+          <p class="approval-proof" id="work-human-proof" hidden></p>
+          <div class="work-actions"><button class="work-primary" id="work-approve" type="button" hidden>Review &amp; approve</button><button class="work-primary" id="work-run" type="button" hidden>Run once</button><button class="retry-button" id="work-replay" type="button" hidden>Test replay denial</button><button class="retry-button" id="work-revoke" type="button" hidden>Revoke task</button></div>
           <section class="work-receipt" id="work-receipt" hidden aria-labelledby="work-receipt-title"><h3 id="work-receipt-title">Service receipt · synthetic source observed</h3><div class="work-value" id="work-value"></div><p id="work-samples"></p><p id="work-times"></p><p class="work-hash" id="work-evidence"></p><p>Source response recorded by the demo service; this receipt is unsigned.</p></section>
         </div>
         <p class="work-status" id="work-status" role="status" aria-live="polite">Checking this identity’s task access.</p><p class="work-error" id="work-error" role="alert" hidden></p>
@@ -285,6 +298,23 @@ body.credit-experience{--bg:#f5f3ed;--panel:#fbfaf5;--raised:#eeede5;--line:#d9d
   </main>
   <footer class="footer"><span id="footer-product">OPAQUE / CUSTOMER METRICS</span><span>Authority stays scoped. Evidence stays visible.</span></footer>
 </div>
+<dialog class="approval-window" id="approval-window" aria-labelledby="approval-title" aria-describedby="approval-intro">
+  <header class="approval-header"><div class="approval-brand">OPAQUE<span>HUMAN APPROVAL</span></div><button class="approval-close" id="approval-close" type="button" aria-label="Cancel approval">×</button></header>
+  <div class="approval-body">
+    <div class="approval-quantity">One task · one source read</div>
+    <h2 id="approval-title" tabindex="-1">Your approval.<br>This work only.</h2>
+    <p class="approval-intro" id="approval-intro">Authenticate to approve this exact task. Opaque checks your proof before granting its single-use authority.</p>
+    <dl class="approval-scope"><div><dt>Customer</dt><dd id="approval-customer"></dd></div><div><dt>Operation</dt><dd>Read manual review rate<br>60 second window · once</dd></div><div class="approval-identity"><dt>Acting demo identity</dt><dd id="approval-subject"></dd></div><div><dt>Authority expires</dt><dd id="approval-expiry"></dd></div><div class="approval-wide"><dt>Source</dt><dd id="approval-source"></dd></div></dl>
+    <details class="approval-binding"><summary>Review task ID &amp; manifest digest</summary><code id="approval-task-id"></code><code id="approval-digest"></code></details>
+    <p class="approval-check" id="approval-check" role="status">Checking the reviewed manifest…</p>
+    <fieldset class="approval-methods"><legend>Choose how to approve</legend>
+      <button class="approval-method" id="approval-passkey" type="button" disabled><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M14 9a5 5 0 1 0-4 4.9L13 17h3v3h4v-4l-6.1-6.1A5 5 0 0 0 14 9Z" stroke="currentColor" stroke-width="1.5"/><circle cx="8" cy="8" r="1" fill="currentColor"/></svg><span><strong>Passkey or FIDO2 security key</strong><small id="approval-passkey-note">Use your device, password manager or hardware key.</small></span><span class="approval-arrow" aria-hidden="true">↗</span></button>
+      <button class="approval-method" id="approval-oauth" type="button" disabled><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 3 4 6v6c0 4 4 7 8 9 4-2 8-5 8-9V6l-8-3Z" stroke="currentColor" stroke-width="1.5"/><path d="m8 12 3 3 5-6" stroke="currentColor" stroke-width="1.5"/></svg><span><strong id="approval-oauth-title">Continue with GitHub</strong><small id="approval-oauth-note">Confirm with the connected identity provider.</small></span><span class="approval-arrow" aria-hidden="true">↗</span></button>
+    </fieldset>
+    <p class="approval-progress" id="approval-progress" role="status" aria-live="polite"></p><p class="approval-error" id="approval-error" role="alert" hidden></p>
+  </div>
+  <footer class="approval-footer"><p>Human authentication is real. Harborlight and its data are synthetic. A temporary demo passkey proves control of your authenticator, not employment or customer membership. Approval does not run the task.</p></footer>
+</dialog>
 <script>
 'use strict';
 var state = {session:null,customerId:null,controller:null,active:null,latest:new Map(),freshnessNodes:[],expiryTimer:null,policyEvents:[],identityKey:null,clarification:null,composerError:null,organizationBusy:false,activityRevision:0,activityLoading:false,activitySignature:null,supportExpired:false,workTask:null,workBusy:false,workLoading:false,workRevision:0,workUnavailable:false,workError:null,workNotice:null,flow:null,flowPaused:false,flowVisible:true,flowAnimations:[]};
@@ -621,20 +651,208 @@ async function changeOrganization(path, body) {
   } catch (error) { organizationError(error.message); }
   finally { state.organizationBusy = false; renderOrganization(); updateComposer(); if (state.session) { loadActivity(); loadWorkTask(); } }
 }
+var approval = {open:false,revision:0,task:null,identity:null,ready:false,busy:false,capabilities:null,controller:null,popup:null,transaction:null,submitted:false};
+var approvalWasmPromise;
+function approvalReference(task) { return {task_id:task.task_id,manifest_sha256:task.manifest_sha256}; }
+function sortedJSON(value) {
+  if (Array.isArray(value)) return '['+value.map(sortedJSON).join(',')+']';
+  if (value && typeof value === 'object') return '{'+Object.keys(value).sort().map(function(key) { return JSON.stringify(key)+':'+sortedJSON(value[key]); }).join(',')+'}';
+  return JSON.stringify(value);
+}
+async function reviewApprovalManifest(task) {
+  validateWorkTask(task);
+  if (task.state !== 'planned' || task.consumed) throw new Error('This task is no longer awaiting approval. Check task status.');
+  if (typeof task.manifest_canonical_json !== 'string' || task.manifest_canonical_json.length > 8192 || sortedJSON(JSON.parse(task.manifest_canonical_json)) !== sortedJSON(task.manifest)) throw new Error('The review bytes do not match the displayed task. Approval is unavailable.');
+  if (typeof WebAssembly === 'undefined' || typeof crypto === 'undefined' || !crypto.subtle) throw new Error('This browser cannot verify the review. Open the demo in a current browser over HTTPS.');
+  if (!approvalWasmPromise) approvalWasmPromise = WebAssembly.instantiate(new Uint8Array(JSON.parse('__OPAQUE_APPROVAL_WASM_BYTES__')));
+  var module = await approvalWasmPromise;
+  var digest = new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(task.manifest_canonical_json)));
+  var memory = new Uint8Array(module.instance.exports.memory.buffer);
+  memory.set(digest,0); memory.set(Uint8Array.from(task.manifest_sha256.match(/../g),function(byte) { return parseInt(byte,16); }),32);
+  var result = module.instance.exports.review(task.manifest.window_secs,task.manifest.max_uses,task.manifest.created_at,task.manifest.expires_at,Date.now()/1000);
+  if (result !== 0) throw new Error(result === 1 ? 'The manifest digest did not match. Approval is unavailable.' : result === 3 ? 'The task has expired or its time bounds are invalid.' : 'The task exceeded the one-read review limits.');
+}
+function approvalCurrent(revision) {
+  return approval.open && approval.revision === revision && approval.identity === state.identityKey && canWorkTask() && !!state.workTask && state.workTask.task_id === approval.task.task_id && state.workTask.manifest_sha256 === approval.task.manifest_sha256 && state.workTask.state === 'planned' && Date.now() < approval.task.manifest.expires_at*1000;
+}
+function approvalError(message) { byId('approval-error').textContent = message || ''; byId('approval-error').hidden = !message; }
+function renderApproval() {
+  if (!approval.open) return;
+  var valid = approvalCurrent(approval.revision), caps = approval.capabilities;
+  byId('approval-expiry').textContent = timestampText(approval.task.manifest.expires_at)+' · '+Math.max(0,Math.ceil(approval.task.manifest.expires_at-Date.now()/1000))+'s left';
+  byId('approval-passkey').disabled = !valid || !approval.ready || approval.busy || !caps || !caps.passkey || caps.passkey.available !== true || typeof PublicKeyCredential === 'undefined' || typeof navigator === 'undefined' || !navigator.credentials;
+  byId('approval-oauth').disabled = !valid || !approval.ready || approval.busy || !caps || !caps.oauth || caps.oauth.available !== true;
+  if (!valid) {
+    if (approval.controller) approval.controller.abort();
+    if (approval.popup) approval.popup.close();
+    byId('approval-progress').textContent = 'This review expired or its authority changed. Close the window and check task status.';
+  }
+}
+function closeApproval() {
+  var wasSubmitted = approval.submitted;
+  approval.open = false; approval.revision += 1; approval.ready = false; approval.busy = false;
+  if (approval.controller) approval.controller.abort();
+  if (approval.popup) approval.popup.close();
+  approval.controller = null; approval.popup = null; approval.transaction = null; approval.submitted = false;
+  var dialog = byId('approval-window');
+  if (dialog.open) dialog.close();
+  if (wasSubmitted) { state.workTask = null; state.workNotice = 'Verification was submitted. Check task status to confirm its outcome.'; renderWorkTask(); }
+}
+async function openApproval() {
+  if (!canWorkTask() || !state.workTask || state.workBusy || state.workLoading || state.workTask.state !== 'planned') return;
+  var dialog = byId('approval-window');
+  if (typeof dialog.showModal !== 'function') { state.workError = 'This browser cannot display the approval window. Use a current browser.'; renderWorkTask(); return; }
+  closeApproval();
+  approval.open = true; approval.task = JSON.parse(JSON.stringify(state.workTask)); approval.identity = state.identityKey; approval.capabilities = null;
+  var revision = ++approval.revision, task = approval.task;
+  byId('approval-customer').textContent = state.session.customer.display_name+' · '+task.manifest.tenant_id;
+  byId('approval-subject').textContent = task.manifest.subject;
+  byId('approval-source').textContent = task.manifest.source_id;
+  byId('approval-task-id').textContent = 'Task · '+task.task_id;
+  byId('approval-digest').textContent = 'SHA-256 · '+task.manifest_sha256;
+  byId('approval-check').textContent = 'Checking the reviewed manifest…';
+  byId('approval-progress').textContent = ''; approvalError(null);
+  byId('approval-passkey-note').textContent = 'Checking authenticator availability…';
+  byId('approval-oauth-note').textContent = 'Checking identity provider…';
+  dialog.showModal(); byId('approval-title').focus(); renderApproval();
+  try {
+    await reviewApprovalManifest(task);
+    if (!approvalCurrent(revision)) return;
+    byId('approval-check').textContent = 'Manifest matches · one-read bounds checked locally with WASM';
+    var response = await fetch('/api/work-task/approval',{credentials:'same-origin',headers:{Accept:'application/json'},cache:'no-store'});
+    var caps = await response.json();
+    if (!approvalCurrent(revision)) return;
+    if (!response.ok) throw new Error('Approval methods could not be confirmed. Close this window and try again.');
+    approval.capabilities = caps; approval.ready = true;
+    byId('approval-passkey-note').textContent = !caps.passkey || !caps.passkey.available ? 'Passkey verification is not configured for this demo.' : typeof PublicKeyCredential === 'undefined' || typeof navigator === 'undefined' || !navigator.credentials ? 'WebAuthn is unavailable in this browser. Use HTTPS and a current browser.' : 'Use your device, password manager or FIDO2 security key. First use creates a demo passkey.';
+    byId('approval-oauth-title').textContent = caps.oauth && caps.oauth.kind === 'oidc' ? 'Continue with GitHub via Dex' : 'Continue with GitHub';
+    byId('approval-oauth-note').textContent = caps.oauth && caps.oauth.available ? (caps.oauth.kind === 'oidc' ? 'Authenticate through the connected Dex identity provider.' : 'Verify your GitHub identity. No repository or email access is requested.') : 'GitHub login is not connected yet. Passkey approval is available separately.';
+  } catch (error) { if (approval.open && approval.revision === revision) approvalError(error.message); }
+  finally { renderApproval(); }
+}
+function decodeCredentialBytes(value) {
+  var encoded = value.replace(/-/g,'+').replace(/_/g,'/');
+  return Uint8Array.from(atob(encoded),function(char) { return char.charCodeAt(0); });
+}
+function encodeCredentialBytes(value) {
+  return btoa(String.fromCharCode.apply(null,new Uint8Array(value))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+}
+function credentialOptions(raw,registration) {
+  var options = JSON.parse(JSON.stringify(raw));
+  options.challenge = decodeCredentialBytes(options.challenge);
+  if (registration) options.user.id = decodeCredentialBytes(options.user.id);
+  ['allowCredentials','excludeCredentials'].forEach(function(key) { if (options[key]) options[key].forEach(function(item) { item.id = decodeCredentialBytes(item.id); }); });
+  return options;
+}
+function credentialJSON(credential) {
+  if (typeof credential.toJSON === 'function') return credential.toJSON();
+  var response = credential.response, value = {id:credential.id,rawId:encodeCredentialBytes(credential.rawId),type:credential.type,response:{clientDataJSON:encodeCredentialBytes(response.clientDataJSON)},extensions:credential.getClientExtensionResults()};
+  if (response.attestationObject) { value.response.attestationObject = encodeCredentialBytes(response.attestationObject); if (response.getTransports) value.response.transports = response.getTransports(); }
+  if (response.authenticatorData) { value.response.authenticatorData = encodeCredentialBytes(response.authenticatorData); value.response.signature = encodeCredentialBytes(response.signature); value.response.userHandle = response.userHandle ? encodeCredentialBytes(response.userHandle) : null; }
+  return value;
+}
+async function approvalPost(path,body) {
+  var response = await fetch('/api/work-task/approval/'+path,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json',Accept:'application/json'},body:JSON.stringify(body)});
+  var value = await response.json();
+  if (!response.ok) throw new Error(value.error && value.error.message || 'Opaque could not verify this approval. Check task status before trying again.');
+  return value;
+}
+function acceptHumanApproval(value,revision) {
+  if (!approvalCurrent(revision)) return;
+  var checked = validateWorkTask(value);
+  if (checked.task_id !== approval.task.task_id || checked.manifest_sha256 !== approval.task.manifest_sha256 || checked.state !== 'approved' || !checked.approval || !['webauthn','oidc','github_oauth'].includes(checked.approval.kind)) throw new Error('The service did not confirm human approval for the reviewed task.');
+  approval.submitted = false; state.workTask = checked; state.workNotice = 'Opaque verified your human approval. The source read starts only when you choose Run once.';
+  closeApproval(); renderWorkTask(); byId('work-run').focus();
+}
+async function approveWithPasskey() {
+  var revision = approval.revision;
+  if (!approvalCurrent(revision) || !approval.ready || approval.busy || byId('approval-passkey').disabled) return;
+  approval.busy = true; approvalError(null); approval.controller = new AbortController(); renderApproval();
+  try {
+    await reviewApprovalManifest(approval.task);
+    if (!approvalCurrent(revision)) return;
+    var start = await approvalPost('start',Object.assign(approvalReference(approval.task),{method:'passkey'}));
+    for (var attempt = 0; attempt < 2; attempt++) {
+      if (!approvalCurrent(revision)) return;
+      var registration = start.kind === 'registration';
+      if (!registration && start.kind !== 'authentication') throw new Error('The service returned an unsupported authenticator request.');
+      byId('approval-progress').textContent = registration ? 'Create a temporary demo passkey with your authenticator. A separate signature will approve this task.' : 'Use your authenticator to approve the reviewed task. Opaque requires user verification.';
+      var request = {publicKey:credentialOptions(start.public_key,registration),signal:approval.controller.signal};
+      var credential = registration ? await navigator.credentials.create(request) : await navigator.credentials.get(request);
+      if (!approvalCurrent(revision)) return;
+      if (!credential) throw new Error('No authenticator response was received.');
+      byId('approval-progress').textContent = 'Opaque is verifying the authenticator response…';
+      approval.submitted = !registration;
+      var finished = await approvalPost('finish',Object.assign(approvalReference(approval.task),{transaction_id:start.transaction_id,credential:credentialJSON(credential)}));
+      if (!approvalCurrent(revision)) return;
+      if (!registration) { acceptHumanApproval(finished,revision); return; }
+      if (finished.registered !== true) throw new Error('The service did not confirm passkey registration.');
+      start = await approvalPost('start',Object.assign(approvalReference(approval.task),{method:'passkey'}));
+    }
+    throw new Error('Registration did not advance to task approval. Close the window and check task status.');
+  } catch (error) {
+    if (approval.open && approval.revision === revision) {
+      approvalError(['NotAllowedError','AbortError'].includes(error.name) ? 'Authenticator interaction was cancelled or timed out. No approval proof was submitted.' : error.message);
+      byId('approval-progress').textContent = approval.submitted ? 'The final outcome is unconfirmed. Close this window and check task status.' : '';
+    }
+  } finally { if (approval.revision === revision) { approval.busy = false; if (approval.submitted) approval.ready = false; renderApproval(); } }
+}
+async function approveWithOAuth() {
+  var revision = approval.revision;
+  if (!approvalCurrent(revision) || !approval.ready || approval.busy || byId('approval-oauth').disabled) return;
+  // Open synchronously on the user gesture so popup blocking is observable.
+  var popup = window.open('about:blank','opaque-human-approval','popup,width=520,height=720');
+  if (!popup) { approvalError('Allow popups for this site, then select GitHub again.'); return; }
+  approval.popup = popup; approval.busy = true; approvalError(null); renderApproval();
+  byId('approval-progress').textContent = 'Preparing task-bound GitHub login…';
+  try {
+    await reviewApprovalManifest(approval.task);
+    if (!approvalCurrent(revision)) { popup.close(); return; }
+    var started = await approvalPost('start',Object.assign(approvalReference(approval.task),{method:'oauth'}));
+    if (!approvalCurrent(revision)) { popup.close(); return; }
+    var destination = new URL(started.authorization_url);
+    if (destination.protocol !== 'https:' || destination.username || destination.password || destination.searchParams.get('state') !== started.transaction_id) throw new Error('The service returned an invalid identity-provider redirect.');
+    approval.transaction = started.transaction_id; popup.location.href = destination.href;
+    byId('approval-progress').textContent = 'Complete GitHub authentication in the opened window. This approval applies to the reviewed task only.';
+  } catch (error) { popup.close(); if (approval.open && approval.revision === revision) { approval.busy = false; approvalError(error.message); renderApproval(); } }
+}
+async function receiveApprovalOAuth(event) {
+  var revision = approval.revision, data = event.data;
+  if (!approvalCurrent(revision) || !approval.busy || !approval.popup || event.origin !== window.location.origin || event.source !== approval.popup || !data || data.type !== 'opaque-approval-oauth' || data.state !== approval.transaction) return;
+  approval.transaction = null; approval.popup.close(); approval.popup = null;
+  try {
+    if (data.error || typeof data.code !== 'string' || !data.code || data.code.length > 8192) throw new Error('The identity provider did not complete authentication. No task approval was submitted.');
+    approval.submitted = true; byId('approval-progress').textContent = 'Opaque is verifying your identity and the exact task binding…';
+    var finished = await approvalPost('finish',Object.assign(approvalReference(approval.task),{transaction_id:data.state,code:data.code,state:data.state}));
+    acceptHumanApproval(finished,revision);
+  } catch (error) { if (approval.open && approval.revision === revision) { approvalError(error.message); byId('approval-progress').textContent = approval.submitted ? 'Check task status to confirm the final outcome.' : ''; } }
+  finally { if (approval.revision === revision) { approval.busy = false; if (approval.submitted) approval.ready = false; renderApproval(); } }
+}
+function tickApproval() {
+  if (approval.open && approval.popup && approval.popup.closed && approval.transaction) { approval.popup = null; approval.transaction = null; approval.busy = false; byId('approval-progress').textContent = ''; approvalError('The login window was closed. No OAuth approval was submitted.'); }
+  renderApproval();
+}
 function canWorkTask() {
   var org = organizationContext(state.session);
   return !!(org && org.membership.persona_id === 'customer_analyst' && org.active_persona_id === 'customer_analyst' && org.data_entitlement.allowed && !state.organizationBusy);
 }
 function clearWorkTask() {
+  closeApproval();
   state.workRevision += 1; state.workTask = null; state.workBusy = false; state.workLoading = false; state.workUnavailable = false; state.workError = null; state.workNotice = null;
   ['work-value','work-samples','work-times','work-evidence','work-operation','work-customer','work-metric','work-allowance','work-subject','work-expiry','work-id','work-digest','work-source','work-client','work-generation','work-notice'].forEach(function(id) { byId(id).textContent = ''; });
   byId('work-content').hidden = true; byId('work-receipt').hidden = true;
+  byId('work-human-proof').hidden = true; byId('work-human-proof').textContent = '';
 }
 function validateWorkTask(value) {
   var org = organizationContext(state.session), manifest = value && value.manifest;
   if (!canWorkTask() || !value || value.simulation !== true || typeof value.task_id !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value.task_id) || typeof value.manifest_sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(value.manifest_sha256) || !['planned','approved','reserved','completed','unknown','revoked','expired'].includes(value.state) || typeof value.consumed !== 'boolean' || typeof value.notice !== 'string' || !manifest || manifest.operation !== 'metrics.aggregate.read' || manifest.tenant_id !== state.customerId || manifest.subject !== state.session.subject.id || typeof manifest.client_id !== 'string' || !manifest.client_id || typeof manifest.source_id !== 'string' || manifest.source_id !== state.session.source.label || !Array.isArray(manifest.metrics) || manifest.metrics.length !== 1 || manifest.metrics[0] !== 'manual_review_rate_percent' || manifest.window_secs !== 60 || manifest.max_uses !== 1 || !Number.isSafeInteger(manifest.created_at) || !Number.isSafeInteger(manifest.expires_at) || manifest.expires_at <= manifest.created_at || manifest.expires_at - manifest.created_at > 300 || dateValue(manifest.expires_at).getTime() > dateValue(state.session.expires_at).getTime() || !Number.isSafeInteger(manifest.persona_generation) || manifest.persona_generation < 1) throw new Error('The task did not match this analyst’s bounded scope. It was not displayed.');
   if (manifest.persona_generation !== org.generation && (value.state !== 'revoked' || value.receipt !== null)) throw new Error('The task belongs to an earlier identity generation. Its authority and receipt were not displayed.');
-  if (value.approval !== null && (!value.approval || value.approval.kind !== 'synthetic_demo_confirmation' || !Number.isSafeInteger(value.approval.approved_at) || value.approval.approved_at < manifest.created_at || value.approval.approved_at > manifest.expires_at)) throw new Error('The service returned an invalid demo confirmation.');
+  if (value.approval !== null && (!value.approval || !['synthetic_demo_confirmation','webauthn','oidc','github_oauth'].includes(value.approval.kind) || !Number.isSafeInteger(value.approval.approved_at) || value.approval.approved_at < manifest.created_at || value.approval.approved_at > manifest.expires_at)) throw new Error('The service returned an invalid task approval.');
+  if (value.approval && ['webauthn','oidc','github_oauth'].includes(value.approval.kind)) {
+    var verification = value.approval.verification;
+    if (!verification || typeof verification.subject !== 'string' || !verification.subject || (value.approval.kind === 'webauthn' && (verification.user_verified !== true || typeof verification.credential_sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(verification.credential_sha256))) || (['oidc','github_oauth'].includes(value.approval.kind) && (typeof verification.issuer !== 'string' || !verification.issuer.startsWith('https://')))) throw new Error('The service did not report valid human verification evidence.');
+    if (value.approval.kind === 'github_oauth' && (verification.issuer !== 'https://github.com' || !/^[1-9][0-9]{0,19}$/.test(verification.subject))) throw new Error('The service did not report a valid GitHub account identity.');
+  }
   if (['approved','reserved','completed','unknown'].includes(value.state) && !value.approval) throw new Error('The service did not report this task’s required confirmation.');
   if (['reserved','completed','unknown'].includes(value.state) && !value.consumed) throw new Error('The service returned inconsistent task consumption.');
   if (value.receipt !== null) {
@@ -654,7 +872,7 @@ function renderWorkTask() {
   byId('work-error').hidden = !allowed || !state.workError;
   byId('work-error').textContent = allowed ? state.workError || '' : '';
   byId('work-state').textContent = state.organizationBusy ? 'Checking identity' : !allowed ? 'Analyst only' : task ? task.state : 'Awaiting status';
-  byId('work-status').textContent = state.organizationBusy ? 'Confirming the identity change. Earlier task evidence has been cleared.' : !allowed ? 'Task authority and metric receipts are restricted to the analyst identity.' : state.workBusy ? 'Waiting for the service. No automatic execution retry is made.' : state.workLoading ? 'Checking the task’s persisted state…' : state.workNotice || (task ? {planned:'Review the scope above, then confirm this demo task.',approved:'The service recorded your demo confirmation. Run once starts the source read.',reserved:'The one-read allowance is consumed. The service has not reported a completed result.',completed:'The service reported a completed source read. Test replay denial to inspect the one-use boundary.',unknown:'The allowance is consumed and the outcome is uncertain. This task cannot be run again.',revoked:'The service revoked this task. It cannot be approved or run again.',expired:'The service reported that this task expired. It cannot be approved or run again.'}[task.state] : 'Check task status to retrieve this identity’s preview task.');
+  byId('work-status').textContent = state.organizationBusy ? 'Confirming the identity change. Earlier task evidence has been cleared.' : !allowed ? 'Task authority and metric receipts are restricted to the analyst identity.' : state.workBusy ? 'Waiting for the service. No automatic execution retry is made.' : state.workLoading ? 'Checking the task’s persisted state…' : state.workNotice || (task ? {planned:'Review the scope above, then open the human approval window.',approved:'Opaque recorded this task’s approval. Run once starts the source read.',reserved:'The one-read allowance is consumed. The service has not reported a completed result.',completed:'The service reported a completed source read. Test replay denial to inspect the one-use boundary.',unknown:'The allowance is consumed and the outcome is uncertain. This task cannot be run again.',revoked:'The service revoked this task. It cannot be approved or run again.',expired:'The service reported that this task expired. It cannot be approved or run again.'}[task.state] : 'Check task status to retrieve this identity’s preview task.');
   if (!allowed || !task) { byId('work-receipt').hidden = true; return; }
   var manifest = task.manifest, deadline = dateValue(manifest.expires_at).getTime(), seconds = Math.max(0,Math.ceil((deadline-Date.now())/1000));
   byId('work-operation').textContent = 'Read one aggregate snapshot';
@@ -665,6 +883,9 @@ function renderWorkTask() {
   byId('work-expiry').textContent = timestampText(manifest.expires_at) + (seconds ? ' · ' + seconds + 's remaining' : ' · Deadline reached');
   byId('work-id').textContent = task.task_id; byId('work-digest').textContent = task.manifest_sha256; byId('work-source').textContent = manifest.source_id; byId('work-client').textContent = manifest.client_id; byId('work-generation').textContent = manifest.persona_generation;
   byId('work-notice').textContent = task.notice;
+  var proof = task.approval && task.approval.verification;
+  byId('work-human-proof').hidden = !proof;
+  byId('work-human-proof').textContent = proof ? (task.approval.kind === 'webauthn' ? 'Passkey / FIDO2 · user verification checked by Opaque' : (task.approval.kind === 'github_oauth' ? 'GitHub identity verified by Opaque · account ' : 'OIDC identity verified by Opaque · '+proof.issuer+' · ')+proof.subject)+' · '+timestampText(task.approval.approved_at) : '';
   var step = {planned:'review',approved:'run',reserved:'run',completed:'receipt',unknown:'receipt'}[task.state];
   ['review','approve','run','receipt'].forEach(function(name) { byId('work-step-'+name).setAttribute('aria-current',name === step ? 'step' : 'false'); });
   var disabled = state.workBusy || state.workLoading || !!state.workError;
@@ -700,6 +921,7 @@ async function loadWorkTask() {
   } finally { if (revision === state.workRevision) { state.workLoading = false; renderWorkTask(); } }
 }
 async function workTaskAction(action) {
+  if (action === 'approve') return openApproval();
   var task = state.workTask;
   if (!canWorkTask() || !task || state.workBusy || state.workLoading || state.workError || !['approve','execute','revoke'].includes(action)) return;
   if (action === 'approve' && task.state !== 'planned' || action === 'execute' && task.state !== 'approved' && !task.consumed || action === 'revoke' && !['planned','approved','reserved'].includes(task.state)) return;
@@ -1078,7 +1300,13 @@ function init() {
   byId('sharing-toggle').addEventListener('click',toggleSharing);
   byId('activity-refresh').addEventListener('click',loadActivity);
   byId('work-refresh').addEventListener('click',loadWorkTask);
-  byId('work-approve').addEventListener('click',function() { workTaskAction('approve'); });
+  byId('work-approve').addEventListener('click',openApproval);
+  byId('approval-close').addEventListener('click',closeApproval);
+  byId('approval-window').addEventListener('cancel',function(event) { event.preventDefault(); closeApproval(); });
+  byId('approval-passkey').addEventListener('click',approveWithPasskey);
+  byId('approval-oauth').addEventListener('click',approveWithOAuth);
+  window.addEventListener('message',receiveApprovalOAuth);
+  setInterval(tickApproval,1000);
   byId('work-run').addEventListener('click',function() { workTaskAction('execute'); });
   byId('work-replay').addEventListener('click',function() { workTaskAction('execute'); });
   byId('work-revoke').addEventListener('click',function() { workTaskAction('revoke'); });

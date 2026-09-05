@@ -34,7 +34,9 @@ PATHS = {"workspace": "GET", "api/session": "GET", "api/chat": "POST",
          "api/organization/activity": "GET", "api/demo/persona": "POST",
          "api/organization/sharing": "POST", "api/work-task": "GET",
          "api/work-task/approve": "POST", "api/work-task/execute": "POST",
-         "api/work-task/revoke": "POST"}
+         "api/work-task/revoke": "POST", "api/work-task/approval": "GET",
+         "api/work-task/approval/start": "POST", "api/work-task/approval/finish": "POST"}
+TASK_RESPONSE_PATHS = {path for path in PATHS if path.startswith("api/work-task")}
 NAME = re.compile(r"[a-z][a-z0-9-]{0,62}\Z")
 LEASE = re.compile(r"[0-9a-f]{32}\Z")
 IMAGE = re.compile(r"[A-Za-z0-9._:/-]+@sha256:[0-9a-f]{64}\Z")
@@ -154,6 +156,10 @@ class Config:
     namespaces: tuple[str, ...]
     image: str
     poll_seconds: float = 2
+    oauth_issuer: str = ""
+    oauth_client_id: str = ""
+    oauth_client_secret: str = ""
+    oauth_provider: str = ""
 
     def validate(self):
         url = urllib.parse.urlsplit(self.worker_url)
@@ -168,6 +174,18 @@ class Config:
             raise ControllerError("invalid controller credential")
         if not IMAGE.fullmatch(self.image):
             raise ControllerError("runtime image must be digest pinned")
+        if self.oauth_provider or self.oauth_issuer or self.oauth_client_id or self.oauth_client_secret:
+            if (not re.fullmatch(r"[A-Za-z0-9._-]{1,256}", self.oauth_client_id)
+                    or (self.oauth_provider or "oidc") not in {"oidc", "github"}):
+                raise ControllerError("invalid approval OAuth configuration")
+            if self.oauth_provider == "github":
+                if self.oauth_issuer or not self.oauth_client_secret:
+                    raise ControllerError("GitHub approval requires a client secret and fixed provider endpoints")
+            else:
+                issuer = urllib.parse.urlsplit(self.oauth_issuer)
+                if (issuer.scheme != "https" or not issuer.hostname or issuer.username or issuer.password
+                        or issuer.query or issuer.fragment):
+                    raise ControllerError("invalid approval OAuth issuer")
 
 
 def validate_action(action, slots, clock):
@@ -219,9 +237,22 @@ def runtime_resources(config, action, secret, clock):
         "OPAQUE_DEMO_MODEL_PROFILE": selected.profile_id,
         "OPAQUE_DEMO_MODEL_URL": selected.url, "OPAQUE_DEMO_MODEL_ID": selected.model,
         "OPAQUE_DEMO_STATE_DIR": "/tmp/opaque-demo",
+        "OPAQUE_DEMO_APPROVAL_ORIGIN": config.worker_url.rstrip("/"),
         "PYTHONDONTWRITEBYTECODE": "1", "HOME": "/tmp", "TMPDIR": "/tmp",
     }.items()]
     env.append({"name": "OPAQUE_DEMO_PROXY_SECRET", "valueFrom": {"secretKeyRef": {"name": name, "key": "proxy-secret"}}})
+    if config.oauth_client_id:
+        env.extend({"name": key, "value": value} for key, value in {
+            "OPAQUE_DEMO_OAUTH_PROVIDER": config.oauth_provider or "oidc",
+            "OPAQUE_DEMO_OAUTH_CLIENT_ID": config.oauth_client_id,
+            "OPAQUE_DEMO_OAUTH_REDIRECT_URI": config.worker_url.rstrip("/") + "/approval/callback",
+        }.items())
+        if config.oauth_issuer:
+            env.append({"name": "OPAQUE_DEMO_OAUTH_ISSUER", "value": config.oauth_issuer})
+        if config.oauth_client_secret:
+            secret_body["stringData"]["oauth-client-secret"] = config.oauth_client_secret
+            env.append({"name": "OPAQUE_DEMO_OAUTH_CLIENT_SECRET", "valueFrom": {
+                "secretKeyRef": {"name": name, "key": "oauth-client-secret"}}})
     pod = {"apiVersion": "v1", "kind": "Pod", "metadata": meta, "spec": {
         "restartPolicy": "Never", "automountServiceAccountToken": False,
         "serviceAccountName": "opaque-demo-runtime", "enableServiceLinks": False,
@@ -527,7 +558,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
                 length = 0
-            if not 0 < length <= 8192 or self.headers.get("Transfer-Encoding"):
+            limit = 16384 if match[2] == "api/work-task/approval/finish" else 8192
+            if not 0 < length <= limit or self.headers.get("Transfer-Encoding") or len(self.headers.get_all("Content-Length", [])) != 1:
                 self.reject(400)
                 return
             body = self.rfile.read(length)
@@ -560,6 +592,37 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 if body is not None:
                     headers["Content-Type"] = "application/json"
                 with controller.http.open(controller.runtime_url(action, match[2]), self.command, body, headers, timeout=100) as response:
+                    if match[2] in TASK_RESPONSE_PATHS:
+                        chunks, total = [], 0
+                        while True:
+                            chunk = response.read1(4096)
+                            if not chunk:
+                                break
+                            total += len(chunk)
+                            if total > 32768:
+                                raise ControllerError("task response too large")
+                            chunks.append(chunk)
+                        if getattr(response, "length", None) not in (None, 0):
+                            raise ControllerError("incomplete task response")
+                        try:
+                            data = json.loads(b"".join(chunks))
+                        except (ValueError, UnicodeDecodeError):
+                            raise ControllerError("invalid task response") from None
+                        if not isinstance(data, dict) or 300 <= response.status < 400:
+                            raise ControllerError("invalid task response")
+                        controller.find_proxy_action(match[1], int(raw_generation))
+                        if controller.clock() >= expiry:
+                            raise ControllerError("lease expired before task disclosure")
+                        payload = encode_json(data)
+                        self.send_response(response.status)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(payload)))
+                        self.send_header("Cache-Control", "no-store")
+                        self.send_header("X-Content-Type-Options", "nosniff")
+                        self.end_headers()
+                        started = True
+                        self.wfile.write(payload)
+                        return
                     self.send_response(response.status)
                     # Pass only rendering/security metadata, never Set-Cookie or provider credentials.
                     for key in ("Content-Type", "Content-Security-Policy", "X-Content-Type-Options"):
@@ -615,7 +678,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
 def main():
     config = Config(os.environ["OPAQUE_DEMO_WORKER_URL"], os.environ["OPAQUE_DEMO_CONTROLLER_SECRET"],
                     tuple(os.environ.get("OPAQUE_DEMO_SLOT_NAMESPACES", "opaque-demo-slot-0").split(",")),
-                    os.environ["OPAQUE_DEMO_RUNTIME_IMAGE"])
+                    os.environ["OPAQUE_DEMO_RUNTIME_IMAGE"],
+                    oauth_issuer=os.environ.get("OPAQUE_DEMO_OAUTH_ISSUER", ""),
+                    oauth_client_id=os.environ.get("OPAQUE_DEMO_OAUTH_CLIENT_ID", ""),
+                    oauth_client_secret=os.environ.get("OPAQUE_DEMO_OAUTH_CLIENT_SECRET", ""),
+                    oauth_provider=os.environ.get("OPAQUE_DEMO_OAUTH_PROVIDER", ""))
     controller = Controller(config, Kube(config.namespaces))
     threading.Thread(target=controller.run, daemon=True).start()
     ProxyServer(("0.0.0.0", 8080), controller).serve_forever()

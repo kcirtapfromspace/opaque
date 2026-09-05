@@ -123,6 +123,89 @@ def make_controller(slots=1, kube=None, http=None, clock=lambda: NOW):
 
 
 class ControllerTests(unittest.TestCase):
+    def test_github_approval_configuration_requires_private_client_secret_and_no_issuer(self):
+        fields = {"worker_url": "https://demo.example", "controller_secret": "c" * 64,
+                  "namespaces": ("opaque-demo-slot-0",), "image": "registry.example/opaque-demo@sha256:" + "1" * 64,
+                  "oauth_provider": "github", "oauth_client_id": "Ov23-example-fixture", "oauth_client_secret": "private-fixture-value"}
+        config = c.Config(**fields)
+        config.validate()
+        resources = dict(c.runtime_resources(config, action(), "p" * 64, lambda: NOW))
+        env = {item["name"]: item for item in resources["pods"]["spec"]["containers"][0]["env"]}
+        self.assertEqual(env["OPAQUE_DEMO_OAUTH_PROVIDER"]["value"], "github")
+        self.assertEqual(env["OPAQUE_DEMO_OAUTH_CLIENT_ID"]["value"], "Ov23-example-fixture")
+        self.assertEqual(env["OPAQUE_DEMO_OAUTH_REDIRECT_URI"]["value"], "https://demo.example/approval/callback")
+        self.assertNotIn("OPAQUE_DEMO_OAUTH_ISSUER", env)
+        self.assertNotIn("private-fixture-value", json.dumps(resources["pods"]))
+        self.assertEqual(resources["secrets"]["stringData"]["oauth-client-secret"], "private-fixture-value")
+        for invalid in ({"oauth_client_secret": ""}, {"oauth_client_id": ""}, {"oauth_provider": "arbitrary"},
+                        {"oauth_issuer": "https://foreign.example"}, {"oauth_client_id": "client with spaces"}):
+            with self.assertRaises(c.ControllerError):
+                c.Config(**{**fields, **invalid}).validate()
+
+    def test_approval_runtime_configuration_uses_worker_origin_and_secret_reference(self):
+        config = c.Config("https://demo.example", "c" * 64, ("opaque-demo-slot-0",),
+                          "registry.example/opaque-demo@sha256:" + "1" * 64,
+                          oauth_issuer="https://dex.example/api/dex", oauth_client_id="opaque-demo",
+                          oauth_client_secret="private-fixture-value")
+        config.validate()
+        resources = dict(c.runtime_resources(config, action(), "p" * 64, lambda: NOW))
+        env = {item["name"]: item for item in resources["pods"]["spec"]["containers"][0]["env"]}
+        self.assertEqual(env["OPAQUE_DEMO_APPROVAL_ORIGIN"]["value"], "https://demo.example")
+        self.assertEqual(env["OPAQUE_DEMO_OAUTH_REDIRECT_URI"]["value"], "https://demo.example/approval/callback")
+        self.assertEqual(env["OPAQUE_DEMO_OAUTH_CLIENT_SECRET"]["valueFrom"]["secretKeyRef"]["key"], "oauth-client-secret")
+        self.assertNotIn("private-fixture-value", json.dumps(resources["pods"]))
+        self.assertEqual(resources["secrets"]["stringData"]["oauth-client-secret"], "private-fixture-value")
+
+    def test_approval_controller_accepts_bounded_proofs_without_forwarding_browser_authority(self):
+        ctl = make_controller()
+        ctl.handle_action(action())
+        server = self.serve_proxy(ctl)
+        calls = []
+        def open_response(url, method="GET", body=None, headers=None, timeout=10):
+            calls.append((url, method, body, headers))
+            return Response(b'{"transaction_id":"transaction-123"}')
+        ctl.http.open = open_response
+        reference = {"task_id": "46e8a66c-2ad6-4a93-a668-976e1a12769c", "manifest_sha256": "d" * 64}
+        finish = {**reference, "transaction_id": "transaction-123", "credential": {"id": "x" * 9000}}
+        for path, body in (("api/work-task/approval", None),
+                           ("api/work-task/approval/start", {**reference, "method": "oauth"}),
+                           ("api/work-task/approval/finish", finish)):
+            status, headers, payload = self.organization_request(server, ctl, path, body)
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(payload), {"transaction_id": "transaction-123"})
+            self.assertNotIn("Set-Cookie", headers)
+            self.assertNotIn("Cookie", calls[-1][3])
+            self.assertEqual(calls[-1][3]["Authorization"], "Bearer " + ctl.runtime_secret(action()))
+        self.assertEqual(self.organization_request(server, ctl, "api/work-task/approval/finish", {**finish, "credential": {"id": "x" * 16384}})[0], 400)
+        self.assertEqual(self.organization_request(server, ctl, "api/work-task/approval/start?issuer=evil", {**reference, "method": "oauth"})[0], 404)
+        self.assertEqual(len(calls), 3)
+
+    def test_approval_controller_withholds_result_when_lease_expires_during_response(self):
+        clock = [NOW]
+        ctl = make_controller(clock=lambda: clock[0])
+        ctl.handle_action(action())
+        server = self.serve_proxy(ctl)
+        def open_response(*_args, **_kwargs):
+            clock[0] = NOW + 600_001
+            return Response(b'{"authorization_url":"https://dex.example/private-challenge"}')
+        ctl.http.open = open_response
+        status, _, payload = self.organization_request(server, ctl, "api/work-task/approval")
+        self.assertEqual(status, 503)
+        self.assertNotIn(b"private-challenge", payload)
+
+    def test_approval_controller_rejects_incomplete_response_without_disclosing_challenge(self):
+        ctl = make_controller()
+        ctl.handle_action(action())
+        server = self.serve_proxy(ctl)
+        def open_response(*_args, **_kwargs):
+            response = Response(b'{"authorization_url":"https://dex.example/private-challenge"}')
+            response.length = 1
+            return response
+        ctl.http.open = open_response
+        status, _, payload = self.organization_request(server, ctl, "api/work-task/approval")
+        self.assertEqual(status, 503)
+        self.assertNotIn(b"private-challenge", payload)
+
     def serve_proxy(self, controller):
         server = c.ProxyServer(("127.0.0.1", 0), controller)
         threading.Thread(target=server.serve_forever, daemon=True).start()

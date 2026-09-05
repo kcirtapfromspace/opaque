@@ -52,7 +52,14 @@ def request(port, path, body=None, headers=None):
         connection.sendall(head + (body or b""))
         chunks = []
         while True:
-            chunk = connection.recv(65536)
+            try:
+                chunk = connection.recv(65536)
+            except ConnectionResetError:
+                # A rejected oversized request leaves unread client bytes;
+                # preserve the error response already received before reset.
+                if chunks:
+                    break
+                raise
             if not chunk:
                 break
             chunks.append(chunk)
@@ -144,6 +151,71 @@ class ContentLengthGateway(BaseHTTPRequestHandler):
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_approval_routes_bound_proofs_and_keep_identity_private(self):
+        value = self.organization_runtime()
+        proxy = self.serve(r.Proxy, value)
+        auth = [("Authorization", "Bearer " + value.config["secret"]), ("Cookie", "forged=identity")]
+        reference = {"task_id": "46e8a66c-2ad6-4a93-a668-976e1a12769c", "manifest_sha256": "d" * 64}
+        finish = {**reference, "transaction_id": "transaction-123", "credential": {"id": "credential", "response": {"attestationObject": "x" * 9000}}}
+        for path, body in (("/api/work-task/approval", None),
+                           ("/api/work-task/approval/start", {**reference, "method": "oauth"}),
+                           ("/api/work-task/approval/start", {**reference, "method": "passkey"}),
+                           ("/api/work-task/approval/finish", finish),
+                           ("/api/work-task/approval/finish", {**reference, "transaction_id": "transaction-123", "code": "dex-code", "state": "transaction-123"})):
+            connection = GatewayConnection(GatewayResponse(b'{"transaction_id":"transaction-123"}'))
+            with patch.object(r.http.client, "HTTPConnection", return_value=connection):
+                status, headers, _ = request(proxy.server_port, path, body, auth)
+            self.assertEqual(status, 200)
+            self.assertNotIn(b"Set-Cookie", headers)
+            method, forwarded_path, forwarded_body, forwarded = connection.calls[0]
+            self.assertEqual(forwarded_path, path)
+            self.assertEqual(forwarded["Cookie"], value.cookie)
+            self.assertEqual(forwarded["Origin"], "http://127.0.0.1:8081")
+            if body is not None:
+                self.assertEqual(json.loads(forwarded_body), body)
+            self.assertEqual(value.active_requests, 0)
+            self.assertEqual(value.model_unknown, 0)
+        with patch.object(r.http.client, "HTTPConnection") as outbound:
+            for path, body in (("/api/work-task/approval/start", {**reference, "method": "fido"}),
+                               ("/api/work-task/approval/start", {**reference, "method": "oauth", "issuer": "https://evil.example"}),
+                               ("/api/work-task/approval/finish", {**finish, "credential": []}),
+                               ("/api/work-task/approval/finish", {**finish, "state": "state", "code": "code"}),
+                               ("/api/work-task/approval/finish", {**finish, "credential": {"padding": "x" * 16384}})):
+                self.assertEqual(request(proxy.server_port, path, body, auth)[0], 400)
+            self.assertEqual(request(proxy.server_port, "/api/work-task/approval?issuer=evil", headers=auth)[0], 404)
+            outbound.assert_not_called()
+
+    def test_approval_result_is_withheld_if_lease_expires_while_gateway_responds(self):
+        value = self.organization_runtime()
+        proxy = self.serve(r.Proxy, value)
+        auth = [("Authorization", "Bearer " + value.config["secret"])]
+        connection = GatewayConnection(GatewayResponse(b'{"authorization_url":"https://dex.example/private-challenge"}'))
+        def response():
+            value.config["expires_at"] = 1
+            return connection.response
+        connection.getresponse = response
+        with patch.object(r.http.client, "HTTPConnection", return_value=connection):
+            status, _, body = request(proxy.server_port, "/api/work-task/approval", headers=auth)
+        self.assertEqual(status, 410)
+        self.assertNotIn(b"private-challenge", body)
+        self.assertEqual(value.active_requests, 0)
+
+    def test_approval_configuration_passes_only_explicit_provider_environment(self):
+        env = environment()
+        env.update({"OPAQUE_DEMO_APPROVAL_ORIGIN": "https://demo.example", "OPAQUE_DEMO_OAUTH_PROVIDER": "oidc", "OPAQUE_DEMO_OAUTH_ISSUER": "https://dex.example/api/dex",
+                    "OPAQUE_DEMO_OAUTH_CLIENT_ID": "opaque-demo", "OPAQUE_DEMO_OAUTH_CLIENT_SECRET": "private-fixture-value",
+                    "OPAQUE_DEMO_OAUTH_REDIRECT_URI": "https://demo.example/approval/callback", "UNRELATED_SECRET": "must-not-forward"})
+        config = r.configuration(env)
+        self.assertEqual(config["approval_env"], {name: env[name] for name in r.APPROVAL_ENV})
+        github_env = {**env, "OPAQUE_DEMO_OAUTH_PROVIDER": "github"}
+        del github_env["OPAQUE_DEMO_OAUTH_ISSUER"]
+        github = r.configuration(github_env)["approval_env"]
+        self.assertEqual(github["OPAQUE_DEMO_OAUTH_PROVIDER"], "github")
+        self.assertNotIn("OPAQUE_DEMO_OAUTH_ISSUER", github)
+        for origin in ("https://user@demo.example", "https://demo.example/", "https://demo.example?tenant=foreign", "http://public.example"):
+            with self.assertRaises(ValueError):
+                r.configuration({**env, "OPAQUE_DEMO_APPROVAL_ORIGIN": origin})
+
     def test_task_reference_cannot_add_authority_and_proxy_keeps_private_identity(self):
         value = self.organization_runtime()
         proxy = self.serve(r.Proxy, value)
