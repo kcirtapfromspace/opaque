@@ -2209,6 +2209,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "opaque-bounded-work"
+version = "0.2.0"
+dependencies = [
+ "base64 0.22.1",
+ "ed25519-dalek",
+ "jsonwebtoken",
+ "libc",
+ "opaque-core",
+ "opaque-providers",
+ "opaque-sandbox",
+ "opaque-tenant",
+ "rand 0.8.8",
+ "reqwest 0.12.28",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "ssh-key",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "uuid",
+ "wiremock",
+ "zeroize",
+]
+
+[[package]]
 name = "opaque-core"
 version = "0.2.0"
 dependencies = [
@@ -2404,6 +2431,7 @@ dependencies = [
  "mdns-sd",
  "opaque-approval",
  "opaque-approver",
+ "opaque-bounded-work",
  "opaque-core",
  "opaque-federation-runtime",
  "opaque-metrics",

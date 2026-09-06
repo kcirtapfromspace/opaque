@@ -323,3 +323,75 @@ impl IdentityRuntime {
             .is_some_and(|p| !p.disabled && p.has_role(role))
     }
 }
+
+/// `resource_authority.rs` moved to `opaque-bounded-work`, which cannot name
+/// `IdentityRuntime` (this crate has no `lib.rs`, and `identity/` stays
+/// here regardless — see that module's doc comment). This implements the
+/// narrow trait it defines instead, the same "opaqued implements a trait
+/// the extracted crate defines" direction as
+/// `opaque_bounded_work::task_facade::BoundedWorkFacade for Enclave`.
+impl opaque_bounded_work::resource_authority::IdentityAuthority for IdentityRuntime {
+    fn config_issuer(&self) -> &str {
+        &self.config.issuer
+    }
+
+    fn config_required(&self) -> bool {
+        self.config.required
+    }
+
+    fn persona_max_age_secs(&self) -> Option<u64> {
+        self.config.persona.as_ref().map(|p| p.max_age_secs)
+    }
+
+    fn principal_permitted(&self, principal: &opaque_core::identity::Principal) -> bool {
+        IdentityRuntime::principal_permitted(self, principal)
+    }
+
+    fn get_human_by_subject(
+        &self,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<Option<opaque_core::identity::Principal>, String> {
+        self.store.get_human_by_subject(issuer, subject)
+    }
+
+    fn resource_token_revoked(
+        &self,
+        issuer: &str,
+        audience: &str,
+        jti: &str,
+    ) -> Result<bool, String> {
+        self.store.resource_token_revoked(issuer, audience, jti)
+    }
+
+    fn revoke_resource_token(
+        &self,
+        issuer: &str,
+        audience: &str,
+        jti: &str,
+        expires_at: i64,
+    ) -> Result<(), String> {
+        self.store
+            .revoke_resource_token(issuer, audience, jti, expires_at)
+    }
+
+    fn authorize_scopes(
+        &self,
+        binding: &opaque_core::tenant::TenantBinding,
+        recipient: &opaque_core::identity::PrincipalId,
+        now: i64,
+        persona_max_age_secs: u64,
+    ) -> Result<std::collections::BTreeSet<String>, String> {
+        self.store.authorize_scopes(
+            binding,
+            recipient,
+            now,
+            persona_max_age_secs,
+            |p| self.principal_permitted(p),
+        )
+    }
+
+    fn emit_audit(&self, event: opaque_core::audit::AuditEvent) {
+        IdentityRuntime::emit_audit(self, event)
+    }
+}

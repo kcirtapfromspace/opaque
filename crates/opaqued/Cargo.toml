@@ -16,6 +16,7 @@ opaque-providers = { path = "../opaque-providers" }
 opaque-sandbox = { path = "../opaque-sandbox" }
 opaque-tenant = { path = "../opaque-tenant" }
 opaque-federation-runtime = { path = "../opaque-federation-runtime" }
+opaque-bounded-work = { path = "../opaque-bounded-work" }
 bytes = { workspace = true }
 libc = { workspace = true }
 futures-util = { workspace = true }

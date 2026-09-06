@@ -181,7 +181,8 @@ impl TrustedSshProfile {
         Ok(sha256(&bytes))
     }
     fn signing_key(&self) -> Result<SigningKey, String> {
-        super::validate_path_chain(&self.grant_signing_key_path).map_err(|_| unavailable())?;
+        opaque_core::socket::validate_path_chain(&self.grant_signing_key_path)
+            .map_err(|_| unavailable())?;
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -501,7 +502,7 @@ async fn vault_certificate(
     public: &ssh_key::PublicKey,
     expires_at: i64,
 ) -> Result<String, SignFailure> {
-    let token = CompositeResolver::new(crate::default_secret_resolvers())
+    let token = CompositeResolver::new(opaque_providers::default_secret_resolvers())
         .resolve(&profile.vault_token_ref)
         .map_err(|_| SignFailure::Rejected)?;
     token.mlock();
@@ -693,8 +694,18 @@ fn write_private(path: &Path, value: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(test)]
-pub(crate) fn test_profile() -> TrustedSshProfile {
+/// Build a fixture `TrustedSshProfile` for tests.
+///
+/// Plain `pub` (not `#[cfg(test)] pub(crate)`, its shape before this crate
+/// existed) because `opaqued::enclave::task`'s own inline tests — which stay
+/// in `opaqued` since `enclave/task.rs` is a private-type inherent `impl`
+/// that cannot leave that binary crate — call this from a different crate's
+/// test build. `#[cfg(test)]` is per-crate: a dependency compiled normally
+/// never exposes its own `#[cfg(test)]` items to a downstream crate's tests,
+/// so the only way to share this fixture across the new crate boundary is a
+/// always-compiled `pub` function, same trade-off already accepted for
+/// `opaque_approval::pairing::challenge::decision_bytes()`.
+pub fn test_profile() -> TrustedSshProfile {
     let host =
         ssh_key::PrivateKey::random(&mut rand::rngs::OsRng, ssh_key::Algorithm::Ed25519).unwrap();
     let ca =

@@ -457,8 +457,8 @@ impl fmt::Debug for LeaseCache {
 /// All secret-using operations pass through this enclave, via individual
 /// execution or the typed, durably accounted task path.
 pub struct Enclave {
-    inference_profile: Option<crate::inference::TrustedInferenceProfile>,
-    ssh_profile: Option<crate::ssh::TrustedSshProfile>,
+    inference_profile: Option<opaque_bounded_work::inference::TrustedInferenceProfile>,
+    ssh_profile: Option<opaque_bounded_work::ssh::TrustedSshProfile>,
     /// Exact session/provisioning ceremonies use this complete-review factor.
     session_approval_factor: ApprovalFactor,
     /// Operation registry (immutable after construction).
@@ -507,8 +507,8 @@ impl fmt::Debug for Enclave {
 
 /// Builder for constructing an [`Enclave`].
 pub struct EnclaveBuilder {
-    inference_profile: Option<crate::inference::TrustedInferenceProfile>,
-    ssh_profile: Option<crate::ssh::TrustedSshProfile>,
+    inference_profile: Option<opaque_bounded_work::inference::TrustedInferenceProfile>,
+    ssh_profile: Option<opaque_bounded_work::ssh::TrustedSshProfile>,
     session_approval_factor: ApprovalFactor,
     registry: OperationRegistry,
     policy: PolicyEngine,
@@ -548,13 +548,13 @@ impl EnclaveBuilder {
 
     pub fn inference_profile(
         mut self,
-        profile: Option<crate::inference::TrustedInferenceProfile>,
+        profile: Option<opaque_bounded_work::inference::TrustedInferenceProfile>,
     ) -> Self {
         self.inference_profile = profile;
         self
     }
 
-    pub fn ssh_profile(mut self, profile: Option<crate::ssh::TrustedSshProfile>) -> Self {
+    pub fn ssh_profile(mut self, profile: Option<opaque_bounded_work::ssh::TrustedSshProfile>) -> Self {
         self.ssh_profile = profile;
         self
     }
@@ -628,12 +628,12 @@ impl Default for EnclaveBuilder {
 }
 
 impl Enclave {
-    pub fn ssh_profile(&self) -> Result<&crate::ssh::TrustedSshProfile, String> {
+    pub fn ssh_profile(&self) -> Result<&opaque_bounded_work::ssh::TrustedSshProfile, String> {
         self.ssh_profile
             .as_ref()
             .ok_or_else(|| "tenant SSH is not configured".into())
     }
-    pub fn inference_profile(&self) -> Result<&crate::inference::TrustedInferenceProfile, String> {
+    pub fn inference_profile(&self) -> Result<&opaque_bounded_work::inference::TrustedInferenceProfile, String> {
         self.inference_profile
             .as_ref()
             .ok_or_else(|| "tenant inference is not configured".into())

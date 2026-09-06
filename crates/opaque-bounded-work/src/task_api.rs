@@ -1,31 +1,79 @@
 //! Owner-scoped transport for the fixed-manifest task workflow.
-use super::*;
-use opaque_core::enclave_facade::EnclaveFacade;
-use opaque_core::operation::WorkspaceContext;
-use opaque_core::sanitize::{SanitizedResponse, Sanitizer, Unsanitized};
-use opaque_core::task::TaskManifest;
+//!
+//! Moved out of the `opaqued` binary crate, where this used to take
+//! `&DaemonState` directly (the only option available to code living inside
+//! `main.rs`'s own module tree). From a different crate, `DaemonState` and
+//! `Enclave` are not nameable at all (`opaqued` has no `lib.rs`), so `handle`
+//! now takes a [`TaskApiKernel`] bundling the two kernel-facing trait
+//! objects (`opaque_core::enclave_facade::EnclaveFacade` and this crate's
+//! own [`crate::task_facade::BoundedWorkFacade`]) plus the handful of plain
+//! values (`tasks`, `tenant`, `has_identity`, `audit`, `insecure_auto_approve`)
+//! that `opaqued::DaemonState` owns directly and this crate either can now
+//! name outright (`TaskStore` lives here; `opaque_tenant::tenant::TenantBoundary`
+//! is already a public cross-crate type) or only needs as an opaque flag
+//! (`has_identity`, `insecure_auto_approve`).
+//!
+//! One behavioral change versus the pre-move code, made for the same reason
+//! `opaque-providers::github::rpc` already made it: the transport-level,
+//! once-per-request workspace verification (previously this module's own
+//! `verified_workspace`, calling `opaqued::main.rs`'s kernel-side
+//! `verify_workspace`/`workspace_process.rs` machinery directly) is now
+//! computed once by `opaqued::main.rs`'s `handle_request` — the same place
+//! that already computes it for `github`/`gitlab`/`onepassword`/`bitwarden`/
+//! `exec` — and passed into `handle` as the `workspace` parameter. Moved
+//! code reaching back into the daemon for kernel-side subprocess logic would
+//! be exactly the wrong-direction dependency this extraction exists to cut.
+//! The two *re*-verifications this module still performs at later points in
+//! its own control flow (task-reconcile observation, task-execution TOCTOU
+//! recheck) cannot be precomputed the same way — they must run live, after
+//! further async work this module itself does — so those go through
+//! `EnclaveFacade::verify_workspace` instead, the same "live callback into
+//! the kernel" shape already established by `resolve_principal_context`.
 
-pub async fn verified_workspace(
-    params: &serde_json::Value,
-    identity: &ClientIdentity,
-) -> Result<Option<WorkspaceContext>, String> {
-    let Some(value) = params.get("workspace").filter(|v| !v.is_null()) else {
-        return Ok(None);
-    };
-    let mut workspace: WorkspaceContext =
-        serde_json::from_value(value.clone()).map_err(|_| "invalid workspace context")?;
-    if identity.pid.is_none() {
-        return Err("workspace peer pid is unavailable".into());
-    }
-    if let Some(url) = &workspace.remote_url {
-        workspace.remote_url = Some(InputValidator::sanitize_url(url));
-    }
-    workspace.workspace_verified = false;
-    verify_workspace(&workspace, identity.pid)
-        .await
-        .map_err(|_| "workspace verification failed")?;
-    workspace.workspace_verified = true;
-    Ok(Some(workspace))
+use std::collections::HashMap;
+use std::time::SystemTime;
+
+use opaque_core::audit::{AuditEvent, AuditEventKind, AuditSink, ClientSummary};
+use opaque_core::enclave_facade::EnclaveFacade;
+use opaque_core::identity::{PrincipalContext, now_unix};
+use opaque_core::operation::{ClientIdentity, ClientType, OperationRequest, WorkspaceContext};
+use opaque_core::proto::{Request, Response};
+use opaque_core::sanitize::{SanitizedResponse, Sanitizer, Unsanitized};
+use opaque_core::task::{TaskApprovalMode, TaskManifest};
+use uuid::Uuid;
+
+use crate::task_facade::BoundedWorkFacade;
+use crate::task_store::TaskStore;
+
+/// The daemon-owned dependencies `handle` needs beyond the RPC request
+/// itself, gathered once per call by the composition root
+/// (`opaqued::main.rs`). Bundled into one struct rather than passed as
+/// several positional parameters: `facade` and `enclave` are the two
+/// kernel-facing trait objects (see `crate::task_facade` for why there are
+/// two and not one combined bound), and the rest are values
+/// `opaqued::DaemonState` holds directly.
+pub struct TaskApiKernel<'a> {
+    /// `opaque_core::enclave_facade::EnclaveFacade`, implemented by
+    /// `opaqued::DaemonState`: preflight, principal-context resolution, and
+    /// workspace re-verification.
+    pub facade: &'a dyn EnclaveFacade,
+    /// [`BoundedWorkFacade`], implemented by `opaqued::enclave::Enclave`
+    /// directly: `ssh_profile`/`inference_profile`/`execute_task`.
+    pub enclave: &'a dyn BoundedWorkFacade,
+    /// `None` when fixed-manifest tasks are disabled
+    /// (`enable_task_grants = false`).
+    pub tasks: Option<&'a TaskStore>,
+    pub tenant: Option<&'a opaque_tenant::tenant::TenantBoundary>,
+    /// Whether `opaqued::DaemonState.identity` is configured (`[identity]`
+    /// present). `identity::IdentityRuntime` itself stays in `opaqued`, so
+    /// this crate only ever needs its *presence*, never the runtime itself.
+    pub has_identity: bool,
+    pub audit: &'a dyn AuditSink,
+    /// Precomputed by the caller from `DaemonConfig`
+    /// (`approval_backend == "insecure_auto_approve" || workstation_test_mode`):
+    /// trivial config-flag logic that belongs at the composition root, not
+    /// duplicated here.
+    pub insecure_auto_approve: bool,
 }
 
 fn owner_key(identity: &ClientIdentity, principal: Option<&PrincipalContext>) -> String {
@@ -36,14 +84,24 @@ fn owner_key(identity: &ClientIdentity, principal: Option<&PrincipalContext>) ->
 }
 
 pub async fn handle(
-    state: &DaemonState,
+    kernel: &TaskApiKernel<'_>,
     req: &Request,
     identity: &ClientIdentity,
     client_type: ClientType,
     session_id: Option<&str>,
     principal: Option<PrincipalContext>,
+    workspace: Result<Option<WorkspaceContext>, String>,
 ) -> Response {
-    let result = handle_inner(state, req, identity, client_type, session_id, principal).await;
+    let result = handle_inner(
+        kernel,
+        req,
+        identity,
+        client_type,
+        session_id,
+        principal,
+        workspace,
+    )
+    .await;
     let sanitizer = Sanitizer::new();
     let public_receipts = result.as_ref().ok().map(|payload| {
         let render = |value: &serde_json::Value| {
@@ -91,18 +149,21 @@ pub async fn handle(
 }
 
 async fn handle_inner(
-    state: &DaemonState,
+    kernel: &TaskApiKernel<'_>,
     req: &Request,
     identity: &ClientIdentity,
     client_type: ClientType,
     session_id: Option<&str>,
     principal: Option<PrincipalContext>,
+    workspace: Result<Option<WorkspaceContext>, String>,
 ) -> Result<serde_json::Value, String> {
-    let store = state.tasks.as_ref().ok_or("fixed-manifest tasks are disabled; set enable_task_grants = true in the trusted daemon config")?;
+    let store = kernel.tasks.ok_or(
+        "fixed-manifest tasks are disabled; set enable_task_grants = true in the trusted daemon config",
+    )?;
     if identity.uid == u32::MAX {
         return Err("task peer identity is unavailable".into());
     }
-    let owner = match &state.tenant {
+    let owner = match kernel.tenant {
         Some(tenant) => {
             tenant.owner_key(identity.uid, principal.as_ref().map(|context| &context.sub))
         }
@@ -141,13 +202,13 @@ async fn handle_inner(
             .first()
             .and_then(|action| action.as_ssh())
         {
-            let closed = match state.enclave.ssh_profile() {
+            let closed = match kernel.enclave.ssh_profile() {
                 Ok(profile) => crate::ssh::revoke_ssh_grant(profile, action, task.expires_at)
                     .await
                     .is_ok(),
                 Err(_) => false,
             };
-            state.audit.emit(
+            kernel.audit.emit(
                 AuditEvent::new(AuditEventKind::OperationSucceeded)
                     .with_operation("ssh.revoke")
                     .with_outcome(if closed {
@@ -160,7 +221,7 @@ async fn handle_inner(
                     )),
             );
         }
-        state.audit.emit(
+        kernel.audit.emit(
             AuditEvent::new(AuditEventKind::OperationSucceeded)
                 .with_client(ClientSummary::from((identity, client_type)))
                 .with_operation("task.revoke")
@@ -169,7 +230,9 @@ async fn handle_inner(
         );
         return Ok(serde_json::json!({"task": task}));
     }
-    let workspace = verified_workspace(&req.params, identity).await?;
+    // Already verified once, up front, by `opaqued::main.rs`'s
+    // `handle_request` (see this module's doc comment).
+    let workspace = workspace?;
     let mut request = OperationRequest {
         principal,
         request_id: Uuid::new_v4(),
@@ -203,9 +266,9 @@ async fn handle_inner(
                 let params: PlanInference =
                     serde_json::from_value(input).map_err(|_| "invalid fixed inference request")?;
                 if req.method == "task_plan_ssh" {
-                    require_tenant_identity(state, request.principal.as_ref())?;
+                    require_tenant_identity(kernel, request.principal.as_ref())?;
                     crate::ssh::health_manifest(
-                        state.enclave.ssh_profile()?,
+                        kernel.enclave.ssh_profile()?,
                         params.title,
                         params.expires_in_secs,
                         request
@@ -216,7 +279,7 @@ async fn handle_inner(
                     )?
                 } else {
                     crate::inference::public_demo_manifest(
-                        state.enclave.inference_profile()?,
+                        kernel.enclave.inference_profile()?,
                         params.title,
                         params.expires_in_secs,
                     )?
@@ -231,11 +294,11 @@ async fn handle_inner(
                 .map_err(|_| "invalid task manifest shape")?
             };
         if manifest.is_ssh() {
-            require_tenant_identity(state, request.principal.as_ref())?;
-            crate::ssh::prepare_ssh_manifest(&mut manifest, state.enclave.ssh_profile()?)?;
+            require_tenant_identity(kernel, request.principal.as_ref())?;
+            crate::ssh::prepare_ssh_manifest(&mut manifest, kernel.enclave.ssh_profile()?)?;
         } else if manifest.is_inference() {
-            require_tenant_identity(state, request.principal.as_ref())?;
-            let boundary = state.tenant.as_ref().ok_or("tenant boundary unavailable")?;
+            require_tenant_identity(kernel, request.principal.as_ref())?;
+            let boundary = kernel.tenant.ok_or("tenant boundary unavailable")?;
             for action in &manifest.actions {
                 let action = action.as_inference().ok_or("invalid inference action")?;
                 boundary
@@ -244,18 +307,18 @@ async fn handle_inner(
             }
             crate::inference::prepare_inference_manifest(
                 &mut manifest,
-                state.enclave.inference_profile()?,
+                kernel.enclave.inference_profile()?,
             )?;
         } else if manifest.is_release() {
             opaque_providers::github::prepare_staging_release(&mut manifest)?;
         } else {
             opaque_providers::github::prepare_task_manifest(&mut manifest)?;
         }
-        state.preflight_task(&mut request, &manifest)?;
+        kernel.facade.preflight_task(&mut request, &manifest)?;
         let manifest = if manifest.is_ssh() {
             manifest
         } else if manifest.is_inference() {
-            crate::inference::plan_inference_manifest(manifest, state.enclave.inference_profile()?)
+            crate::inference::plan_inference_manifest(manifest, kernel.enclave.inference_profile()?)
                 .await?
         } else if manifest.is_release() {
             opaque_providers::github::plan_staging_release(manifest).await?
@@ -263,10 +326,10 @@ async fn handle_inner(
             opaque_providers::github::plan_task_manifest(manifest).await?
         };
         // Policy may have changed during metadata reads.
-        if resolve_principal_context(state, session_id).await? != request.principal {
+        if kernel.facade.resolve_principal_context(session_id).await? != request.principal {
             return Err("task authority changed during planning".into());
         }
-        state.preflight_task(&mut request, &manifest)?;
+        kernel.facade.preflight_task(&mut request, &manifest)?;
         let task = store
             .create(&owner, manifest, now_unix())
             .map_err(|e| e.to_string())?;
@@ -286,7 +349,9 @@ async fn handle_inner(
         {
             return Err("only an attempted staging dispatch can be reconciled".into());
         }
-        state.preflight_task_observation(&request, &task.manifest)?;
+        kernel
+            .facade
+            .preflight_task_observation(&request, &task.manifest)?;
         let observation = opaque_providers::github::reconcile_staging_release(
             &task.manifest,
             id,
@@ -296,19 +361,23 @@ async fn handle_inner(
                 .and_then(|outcome| outcome.provider_run_id),
         )
         .await?;
-        if resolve_principal_context(state, session_id).await? != request.principal {
+        if kernel.facade.resolve_principal_context(session_id).await? != request.principal {
             return Err("task authority changed during observation".into());
         }
         if let Some(workspace) = &request.workspace {
-            verify_workspace(workspace, identity.pid)
+            kernel
+                .facade
+                .verify_workspace(workspace, identity.pid)
                 .await
                 .map_err(|_| "workspace changed during observation")?;
         }
-        state.preflight_task_observation(&request, &task.manifest)?;
+        kernel
+            .facade
+            .preflight_task_observation(&request, &task.manifest)?;
         let task = store
             .record_release_observation(id, &owner, observation, now_unix())
             .map_err(|e| e.to_string())?;
-        state.audit.emit(
+        kernel.audit.emit(
             AuditEvent::new(AuditEventKind::OperationSucceeded)
                 .with_client(ClientSummary::from((identity, client_type)))
                 .with_operation("github.observe_staging_workflow")
@@ -321,36 +390,49 @@ async fn handle_inner(
         .get(id, &owner, now_unix())
         .map_err(|e| e.to_string())?;
     if stored.manifest.is_inference() || stored.manifest.is_ssh() {
-        require_tenant_identity(state, request.principal.as_ref())?;
+        require_tenant_identity(kernel, request.principal.as_ref())?;
     }
     let expected_workspace = request.workspace.clone();
-    let approval_mode = if state.config.approval_backend.as_deref() == Some("insecure_auto_approve")
-        || state.config.workstation_test_mode
-    {
-        opaque_core::task::TaskApprovalMode::InsecureTest
+    let approval_mode = if kernel.insecure_auto_approve {
+        TaskApprovalMode::InsecureTest
     } else {
-        opaque_core::task::TaskApprovalMode::Native
+        TaskApprovalMode::Native
     };
-    let task = state
+    let task = kernel
         .enclave
-        .execute_task(store, &owner, id, request, approval_mode, || async {
-            let context = resolve_principal_context(state, session_id).await?;
-            if let Some(workspace) = &expected_workspace {
-                verify_workspace(workspace, identity.pid)
-                    .await
-                    .map_err(|_| "workspace changed during task")?;
-            }
-            Ok(context)
-        })
+        .execute_task(
+            store,
+            &owner,
+            id,
+            request,
+            approval_mode,
+            Box::new(move || {
+                // `execute_task`'s `check_context` is `Fn`, callable more
+                // than once, so each invocation gets its own clone rather
+                // than moving the outer `expected_workspace` capture.
+                let expected_workspace = expected_workspace.clone();
+                Box::pin(async move {
+                    let context = kernel.facade.resolve_principal_context(session_id).await?;
+                    if let Some(workspace) = &expected_workspace {
+                        kernel
+                            .facade
+                            .verify_workspace(workspace, identity.pid)
+                            .await
+                            .map_err(|_| "workspace changed during task")?;
+                    }
+                    Ok(context)
+                })
+            }),
+        )
         .await?;
     Ok(serde_json::json!({"task": task}))
 }
 
 fn require_tenant_identity(
-    state: &DaemonState,
+    kernel: &TaskApiKernel<'_>,
     principal: Option<&PrincipalContext>,
 ) -> Result<(), String> {
-    if state.tenant.is_none() || state.identity.is_none() || principal.is_none() {
+    if kernel.tenant.is_none() || !kernel.has_identity || principal.is_none() {
         return Err(
             "tenant tasks require an authenticated tenant principal and live delegation".into(),
         );

@@ -3,11 +3,13 @@
 //! deliberately no generic handler for `github.publish_manifest`.
 
 use super::*;
-use crate::task_store::{TaskStore, TaskStoreError};
+use opaque_bounded_work::task_store::{TaskStore, TaskStoreError};
 use opaque_core::identity::{PrincipalContext, now_unix};
 use opaque_core::task::{
     SlotOutcome, SlotState, TaskAction, TaskApprovalMode, TaskManifest, TaskRecord,
 };
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::Ordering;
 
 pub fn task_operation() -> OperationDef {
@@ -213,8 +215,8 @@ fn action_request(base: &OperationRequest, action: &TaskAction) -> OperationRequ
 
 pub(super) fn approval_description(
     request: &OperationRequest,
-    inference_profile: Option<&crate::inference::TrustedInferenceProfile>,
-    ssh_profile: Option<&crate::ssh::TrustedSshProfile>,
+    inference_profile: Option<&opaque_bounded_work::inference::TrustedInferenceProfile>,
+    ssh_profile: Option<&opaque_bounded_work::ssh::TrustedSshProfile>,
 ) -> Result<String, EnclaveError> {
     let manifest: TaskManifest = serde_json::from_value(request.params["manifest"].clone())
         .map_err(|_| EnclaveError::InvalidInput("invalid task manifest".into()))?;
@@ -225,7 +227,7 @@ pub(super) fn approval_description(
         let profile = ssh_profile.ok_or_else(|| {
             EnclaveError::InvalidInput("trusted SSH destination is unavailable".into())
         })?;
-        crate::ssh::prepare_ssh_manifest(&mut manifest.clone(), profile)
+        opaque_bounded_work::ssh::prepare_ssh_manifest(&mut manifest.clone(), profile)
             .map_err(|_| EnclaveError::InvalidInput("SSH destination or signer changed".into()))?;
         let action = manifest.actions[0].as_ssh().expect("validated SSH action");
         return Ok(format!(
@@ -268,7 +270,7 @@ pub(super) fn approval_description(
         // Derive recipient details directly from trusted broker state. A
         // profile hash is binding evidence, but cannot replace readable
         // destination information in a human review.
-        crate::inference::prepare_inference_manifest(&mut manifest.clone(), profile)
+        opaque_bounded_work::inference::prepare_inference_manifest(&mut manifest.clone(), profile)
             .map_err(|_| EnclaveError::InvalidInput("inference destination changed".into()))?;
         let action = manifest.actions[0]
             .as_inference()
@@ -293,7 +295,7 @@ pub(super) fn approval_description(
         for action in &manifest.actions {
             let action = action.as_inference().expect("validated inference");
             text.push_str(&format!("\n{}. Fixed public source request\n   Prompt SHA-256: {}\n   Credential reference: {}\n", action.ordinal, action.prompt_sha256, action.credential_ref.as_deref().unwrap_or("none")));
-            if let Some(prompt) = crate::inference::demo_prompt(action.ordinal) {
+            if let Some(prompt) = opaque_bounded_work::inference::demo_prompt(action.ordinal) {
                 text.push_str(&format!("   Complete source and prompt: {prompt}\n"));
             }
         }
@@ -458,7 +460,7 @@ impl Enclave {
         request.operation = manifest.operation_name().into();
         if manifest.is_ssh() {
             let profile = self.ssh_profile()?;
-            crate::ssh::prepare_ssh_manifest(&mut manifest.clone(), profile)?;
+            opaque_bounded_work::ssh::prepare_ssh_manifest(&mut manifest.clone(), profile)?;
             let action = manifest.actions[0].as_ssh().ok_or("invalid SSH action")?;
             let principal = request
                 .principal
@@ -474,7 +476,7 @@ impl Enclave {
         }
         if manifest.is_inference() {
             let profile = self.inference_profile()?;
-            crate::inference::prepare_inference_manifest(&mut manifest.clone(), profile)?;
+            opaque_bounded_work::inference::prepare_inference_manifest(&mut manifest.clone(), profile)?;
         }
         request.secret_ref_names = manifest
             .actions
@@ -632,7 +634,7 @@ impl Enclave {
             };
             let outcome = match &slot.action {
                 TaskAction::SshHealth(action) => {
-                    crate::ssh::execute_ssh_action(
+                    opaque_bounded_work::ssh::execute_ssh_action(
                         action,
                         self.ssh_profile()?,
                         claimed.expires_at,
@@ -642,7 +644,7 @@ impl Enclave {
                 }
                 TaskAction::Inference(action) => {
                     let profile = self.inference_profile()?;
-                    let execution = crate::inference::execute_inference_action(
+                    let execution = opaque_bounded_work::inference::execute_inference_action(
                         &claimed.manifest,
                         action,
                         profile,
@@ -703,6 +705,44 @@ impl Enclave {
         store
             .finish_run(id, owner, now_unix())
             .map_err(|e| e.to_string())
+    }
+}
+
+/// `opaque_bounded_work::task_api` cannot name `Enclave` (`opaqued` has no
+/// `lib.rs`), so it depends on this trait instead — the same "narrow trait
+/// defined by the crate that needs it, `opaqued` implements it" direction as
+/// `opaque_bounded_work::resource_authority::IdentityAuthority` for
+/// `identity::IdentityRuntime`. Every method here just delegates to the
+/// matching inherent method above/in `enclave.rs`: Rust always resolves
+/// `self.method()` to an inherent method over a trait method of the same
+/// name, even from within that trait's own `impl` block, so there is no
+/// infinite recursion here.
+impl opaque_bounded_work::task_facade::BoundedWorkFacade for Enclave {
+    fn ssh_profile(&self) -> Result<&opaque_bounded_work::ssh::TrustedSshProfile, String> {
+        self.ssh_profile()
+    }
+
+    fn inference_profile(
+        &self,
+    ) -> Result<&opaque_bounded_work::inference::TrustedInferenceProfile, String> {
+        self.inference_profile()
+    }
+
+    fn execute_task<'a>(
+        &'a self,
+        store: &'a TaskStore,
+        owner: &'a str,
+        id: &'a str,
+        request: OperationRequest,
+        approval_mode: TaskApprovalMode,
+        check_context: opaque_bounded_work::task_facade::CheckContext<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<TaskRecord, String>> + Send + 'a>> {
+        // `check_context: Box<dyn Fn() -> Pin<Box<dyn Future<...> + Send>> + Send + Sync>`
+        // itself implements `Fn() -> Pin<Box<dyn Future<...> + Send>>`, and
+        // that return type implements `Future<Output = ...>` — so it
+        // satisfies the inherent method's generic `F: Fn() -> Fut` bound
+        // directly, with no adapter needed.
+        Box::pin(self.execute_task(store, owner, id, request, approval_mode, check_context))
     }
 }
 
@@ -884,7 +924,7 @@ mod tests {
     struct InferenceFixture {
         _directory: tempfile::TempDir,
         provider_canary: std::net::TcpListener,
-        profile: crate::inference::TrustedInferenceProfile,
+        profile: opaque_bounded_work::inference::TrustedInferenceProfile,
         enclave: Arc<Enclave>,
         audit: Arc<InMemoryAuditEmitter>,
         store: Arc<TaskStore>,
@@ -897,7 +937,7 @@ mod tests {
         descriptions: Arc<Mutex<Vec<String>>>,
     }
 
-    fn inference_rules(profile: &crate::inference::TrustedInferenceProfile) -> Vec<PolicyRule> {
+    fn inference_rules(profile: &opaque_bounded_work::inference::TrustedInferenceProfile) -> Vec<PolicyRule> {
         let parent = rule("inference.fixed_manifest");
         let mut child = rule("inference.fixed_completion");
         child.target.fields = HashMap::from([
@@ -924,7 +964,7 @@ mod tests {
                 Uuid::new_v4(),
             )
             .unwrap();
-            let profile = crate::inference::InferenceProfileConfig {
+            let profile = opaque_bounded_work::inference::InferenceProfileConfig {
                 profile_id: "review-fixture".into(),
                 api_url: format!("http://{}", provider_canary.local_addr().unwrap()),
                 model_id: "public-fixture.gguf".into(),
@@ -933,14 +973,14 @@ mod tests {
                 chat_template_sha256: "b".repeat(64),
                 server_build: "review-fixture-v1".into(),
                 service_uid: Uuid::new_v4(),
-                source_id: crate::inference::DEMO_SOURCE_ID.into(),
-                source_snapshot_sha256: crate::inference::demo_source_snapshot_sha256(),
+                source_id: opaque_bounded_work::inference::DEMO_SOURCE_ID.into(),
+                source_snapshot_sha256: opaque_bounded_work::inference::demo_source_snapshot_sha256(),
                 credential_ref: Some("keychain:opaque/inference-fixture".into()),
                 allow_loopback_http: true,
             }
             .bind(&tenant)
             .unwrap();
-            let manifest = crate::inference::public_demo_manifest(
+            let manifest = opaque_bounded_work::inference::public_demo_manifest(
                 &profile,
                 "Review all three public requests".into(),
                 600,
@@ -1069,7 +1109,7 @@ mod tests {
             }
             for action in &fixture.task.manifest.actions {
                 let action = action.as_inference().unwrap();
-                let prompt = crate::inference::demo_prompt(action.ordinal).unwrap();
+                let prompt = opaque_bounded_work::inference::demo_prompt(action.ordinal).unwrap();
                 assert_eq!(description.matches(prompt).count(), 1);
                 assert!(description.contains(&action.prompt_sha256));
             }
@@ -1192,7 +1232,7 @@ mod tests {
             let changed = config.bind(&fixture.profile.tenant).unwrap();
             assert!(approval_description(&request, Some(&changed), None).is_err());
             let fresh =
-                crate::inference::public_demo_manifest(&changed, "New recipient grant".into(), 600)
+                opaque_bounded_work::inference::public_demo_manifest(&changed, "New recipient grant".into(), 600)
                     .unwrap();
             assert_ne!(fresh.digest().unwrap(), fixture.task.manifest_digest);
             let mut fresh_request = request.clone();
@@ -1549,7 +1589,7 @@ mod tests {
     struct SshFixture {
         _directory: tempfile::TempDir,
         provider_canary: std::net::TcpListener,
-        profile: crate::ssh::TrustedSshProfile,
+        profile: opaque_bounded_work::ssh::TrustedSshProfile,
         enclave: Arc<Enclave>,
         store: Arc<TaskStore>,
         task: TaskRecord,
@@ -1564,12 +1604,12 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let provider_canary = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             provider_canary.set_nonblocking(true).unwrap();
-            let mut profile = crate::ssh::test_profile();
+            let mut profile = opaque_bounded_work::ssh::test_profile();
             profile.config.vault_url = format!("http://{}", provider_canary.local_addr().unwrap());
             profile.config.control_url = profile.vault_url.clone();
             profile.config.allow_loopback_http = true;
             let request = ssh_request_fixture();
-            let manifest = crate::ssh::health_manifest(
+            let manifest = opaque_bounded_work::ssh::health_manifest(
                 &profile,
                 "One fixed service health read".into(),
                 300,
