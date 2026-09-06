@@ -12,7 +12,7 @@ homepage.workspace = true
 tempfile = "3"
 opaque-core = { path = "../opaque-core" }
 opaque-approval = { path = "../opaque-approval" }
-opaque-providers = { path = "../opaque-providers" }
+opaque-providers = { path = "../opaque-providers", features = ["gcp", "azure", "doppler", "infisical"] }
 opaque-sandbox = { path = "../opaque-sandbox" }
 opaque-tenant = { path = "../opaque-tenant" }
 opaque-federation-runtime = { path = "../opaque-federation-runtime" }

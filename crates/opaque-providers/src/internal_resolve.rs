@@ -26,47 +26,66 @@ use opaque_core::secret::SecretValue;
 /// exactly, sourced from sibling provider modules in this crate instead of
 /// `opaqued`'s composition root.
 pub(crate) fn default_secret_resolvers() -> Vec<Box<dyn SecretResolver>> {
+    // `github`/`gitlab` (the only callers of this module) each only require
+    // `vault` outright (see their own feature entries in Cargo.toml);
+    // onepassword/bitwarden/aws are independently optional, so every block
+    // below is individually feature-gated rather than assumed present.
+    #[allow(unused_mut)]
     let mut resolvers: Vec<Box<dyn SecretResolver>> = Vec::new();
 
     // 1Password backend selection:
     // 1. Connect Server URL configured -> use Connect Server
     // 2. `op` CLI found in PATH -> use `op` CLI
     // 3. Neither -> onepassword disabled
-    if let Ok(url) = std::env::var(crate::onepassword::client::CONNECT_URL_ENV) {
-        match crate::onepassword::client::OnePasswordClient::new(&url) {
-            Ok(client) => resolvers.push(Box::new(
-                crate::onepassword::resolve::OnePasswordResolver::new(client),
-            )),
-            Err(e) => tracing::warn!("1Password Connect client disabled: {e}"),
+    #[cfg(feature = "onepassword")]
+    {
+        if let Ok(url) = std::env::var(crate::onepassword::client::CONNECT_URL_ENV) {
+            match crate::onepassword::client::OnePasswordClient::new(&url) {
+                Ok(client) => resolvers.push(Box::new(
+                    crate::onepassword::resolve::OnePasswordResolver::new(client),
+                )),
+                Err(e) => tracing::warn!("1Password Connect client disabled: {e}"),
+            }
+        } else if let Ok(cli) = crate::onepassword::op_cli::OpCliClient::new() {
+            resolvers.push(Box::new(
+                crate::onepassword::resolve::OnePasswordResolver::from_cli(cli),
+            ));
         }
-    } else if let Ok(cli) = crate::onepassword::op_cli::OpCliClient::new() {
-        resolvers.push(Box::new(
-            crate::onepassword::resolve::OnePasswordResolver::from_cli(cli),
-        ));
     }
 
     // Bitwarden backend: available if URL scheme is valid.
-    let bitwarden_url = std::env::var(crate::bitwarden::client::BITWARDEN_URL_ENV)
-        .unwrap_or_else(|_| crate::bitwarden::client::DEFAULT_BASE_URL.to_owned());
-    match crate::bitwarden::client::BitwardenClient::new(&bitwarden_url) {
-        Ok(client) => resolvers.push(Box::new(
-            crate::bitwarden::resolve::BitwardenResolver::new(client),
-        )),
-        Err(e) => tracing::warn!("Bitwarden client disabled: {e}"),
+    #[cfg(feature = "bitwarden")]
+    {
+        let bitwarden_url = std::env::var(crate::bitwarden::client::BITWARDEN_URL_ENV)
+            .unwrap_or_else(|_| crate::bitwarden::client::DEFAULT_BASE_URL.to_owned());
+        match crate::bitwarden::client::BitwardenClient::new(&bitwarden_url) {
+            Ok(client) => resolvers.push(Box::new(
+                crate::bitwarden::resolve::BitwardenResolver::new(client),
+            )),
+            Err(e) => tracing::warn!("Bitwarden client disabled: {e}"),
+        }
     }
 
     // AWS remains disabled until SigV4 exists. Only explicitly configured
     // loopback mocks can be reached by any aws: secret resolution path.
-    match crate::aws::client::AwsClient::from_mock_env() {
-        Ok(Some(client)) => resolvers.push(Box::new(crate::aws::resolve::AwsResolver::new(client))),
-        Ok(None) => {}
-        Err(e) => tracing::warn!("AWS client disabled: {e}"),
+    #[cfg(feature = "aws")]
+    {
+        match crate::aws::client::AwsClient::from_mock_env() {
+            Ok(Some(client)) => {
+                resolvers.push(Box::new(crate::aws::resolve::AwsResolver::new(client)))
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("AWS client disabled: {e}"),
+        }
     }
 
     // Vault backend: available if URL scheme is valid.
-    match crate::vault::client::VaultClient::new() {
-        Ok(client) => resolvers.push(Box::new(crate::vault::resolve::VaultResolver::new(client))),
-        Err(e) => tracing::warn!("Vault client disabled: {e}"),
+    #[cfg(feature = "vault")]
+    {
+        match crate::vault::client::VaultClient::new() {
+            Ok(client) => resolvers.push(Box::new(crate::vault::resolve::VaultResolver::new(client))),
+            Err(e) => tracing::warn!("Vault client disabled: {e}"),
+        }
     }
 
     resolvers

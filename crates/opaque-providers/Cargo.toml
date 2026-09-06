@@ -26,3 +26,27 @@ uuid = { workspace = true }
 [dev-dependencies]
 tempfile = "3"
 wiremock = { workspace = true }
+
+[features]
+# The six providers actually wired into opaqued's `default_secret_resolvers()`
+# / operation registry today. `gcp`, `azure`, `doppler`, and `infisical` are
+# dormant (compiled client/resolver code with zero operations registered and
+# zero handler wiring anywhere) — kept out of `default` so a plain
+# `cargo build -p opaque-providers` doesn't pay for them, while `opaqued`'s
+# own Cargo.toml opts back into all ten explicitly so its shipped behavior is
+# unchanged by this feature system's introduction.
+default = ["github", "gitlab", "onepassword", "bitwarden", "vault", "aws"]
+
+# `github/task.rs` hard-imports `vault::client`/`vault::resolve` directly
+# (staging-release manifest planning resolves a Vault-signed value as part of
+# the same flow), so `github` cannot compile without `vault`.
+github = ["vault"]
+gitlab = []
+onepassword = []
+bitwarden = []
+vault = []
+aws = []
+gcp = []
+azure = []
+doppler = []
+infisical = []
