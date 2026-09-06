@@ -180,7 +180,13 @@ impl fmt::Debug for ExecveCheckHandler {
 
 impl ExecveCheckHandler {
     /// Create a new execve check handler.
-    pub fn new(
+    ///
+    /// `pub(crate)`: only called by `create_execve_handlers` below, which is
+    /// this module's actual public entry point (and the only one `opaqued`
+    /// needs) — `ExecveLeaseCache`/`PendingApproval` are `pub(crate)` too, so
+    /// a `pub fn` here would expose parameter types callers outside this
+    /// crate can't name.
+    pub(crate) fn new(
         audit: Arc<dyn AuditSink>,
         mapper: Arc<ExecveMapper>,
         lease_cache: Arc<ExecveLeaseCache>,
@@ -419,7 +425,9 @@ impl fmt::Debug for ExecveApproveHandler {
 
 impl ExecveApproveHandler {
     /// Create a new execve approve handler.
-    pub fn new(
+    ///
+    /// `pub(crate)`: see `ExecveCheckHandler::new` above — same reasoning.
+    pub(crate) fn new(
         audit: Arc<dyn AuditSink>,
         lease_cache: Arc<ExecveLeaseCache>,
         pending_approvals: Arc<Mutex<HashMap<Uuid, PendingApproval>>>,
@@ -531,7 +539,10 @@ impl OperationHandler for ExecveApproveHandler {
 /// Shared state between ExecveCheckHandler and ExecveApproveHandler.
 ///
 /// Both handlers need access to the same lease cache and pending approvals map.
-pub struct ExecveSharedState {
+///
+/// `pub(crate)`: only used internally by `create_execve_handlers` (and its
+/// own tests); not part of this crate's external API.
+pub(crate) struct ExecveSharedState {
     pub lease_cache: Arc<ExecveLeaseCache>,
     pub pending_approvals: Arc<Mutex<HashMap<Uuid, PendingApproval>>>,
 }

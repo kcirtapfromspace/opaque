@@ -1,0 +1,25 @@
+[package]
+name = "opaque-sandbox"
+version.workspace = true
+edition = "2024"
+publish = false
+description = "Opaque process isolation: Landlock/seccomp/Seatbelt sandboxing, execve policy hooks, and secret-resolver dispatch"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+opaque-core = { path = "../opaque-core" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+landlock = "0.4"
+seccompiler = "0.4"

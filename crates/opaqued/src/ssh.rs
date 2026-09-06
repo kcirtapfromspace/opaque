@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 
-use crate::sandbox::resolve::CompositeResolver;
+use opaque_sandbox::resolve::CompositeResolver;
 use opaque_core::resolver::SecretResolver;
 
 const CONTROL_DOMAIN: &[u8] = b"opaque.ssh-control.v1\0";

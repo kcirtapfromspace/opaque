@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates/opaque-core",
   "crates/opaque-providers",
+  "crates/opaque-sandbox",
   "crates/opaqued",
   "crates/opaque",
   "crates/opaque-approval",

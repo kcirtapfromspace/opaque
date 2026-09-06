@@ -31,6 +31,7 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 
 use opaque_core::operation_handler::OperationHandler;
+use opaque_core::resolver::SecretResolver;
 use opaque_core::secret::SecretValue;
 use resolve::{CompositeResolver, resolve_all};
 
@@ -44,6 +45,19 @@ pub enum DirectExecError {
     Execution(String),
 }
 
+/// Builds the set of provider secret resolvers to wire into the
+/// [`CompositeResolver`] used for each `sandbox.exec` request.
+///
+/// This crate cannot name concrete provider resolver types (that would
+/// recreate the providers-vs-sandbox cycle the crate split exists to avoid),
+/// so the composition root — `opaqued`'s `main.rs`, via its
+/// `default_secret_resolvers()` — supplies this as a plain `fn` pointer to
+/// [`SandboxExecutor::new`]. It is re-invoked on every `sandbox.exec` call
+/// (rather than cached at construction time) to preserve the exact resolver
+/// set that a fresh `CompositeResolver::new(default_secret_resolvers())`
+/// would have produced before the crate split.
+pub type ResolverFactory = fn() -> Vec<Box<dyn SecretResolver>>;
+
 /// The sandbox executor handles `sandbox.exec` operations.
 ///
 /// It loads profiles, resolves secrets, dispatches to the platform sandbox,
@@ -51,6 +65,7 @@ pub enum DirectExecError {
 /// frame channel stored in the operation request's params.
 pub struct SandboxExecutor {
     audit: Arc<dyn AuditSink>,
+    resolver_factory: ResolverFactory,
 }
 
 impl fmt::Debug for SandboxExecutor {
@@ -60,8 +75,14 @@ impl fmt::Debug for SandboxExecutor {
 }
 
 impl SandboxExecutor {
-    pub fn new(audit: Arc<dyn AuditSink>) -> Self {
-        Self { audit }
+    /// `resolver_factory` is the composition root's provider-resolver
+    /// builder (e.g. `opaqued::default_secret_resolvers`), invoked fresh for
+    /// every `sandbox.exec` request. See [`ResolverFactory`].
+    pub fn new(audit: Arc<dyn AuditSink>, resolver_factory: ResolverFactory) -> Self {
+        Self {
+            audit,
+            resolver_factory,
+        }
     }
 
     /// Load and validate a profile by name.
@@ -71,8 +92,11 @@ impl SandboxExecutor {
     }
 
     /// Resolve all secret references in the profile.
-    fn resolve_secrets(profile: &ExecProfile) -> Result<HashMap<String, SecretValue>, String> {
-        let resolver = CompositeResolver::new(crate::default_secret_resolvers());
+    fn resolve_secrets(
+        profile: &ExecProfile,
+        resolver_factory: ResolverFactory,
+    ) -> Result<HashMap<String, SecretValue>, String> {
+        let resolver = CompositeResolver::new(resolver_factory());
         resolve_all(&profile.secrets, &resolver)
             .map_err(|e| format!("secret resolution failed: {e}"))
     }
@@ -112,6 +136,7 @@ impl OperationHandler for SandboxExecutor {
         let request_id = request.request_id;
         let params = request.params.clone();
         let audit = self.audit.clone();
+        let resolver_factory = self.resolver_factory;
 
         Box::pin(async move {
             // Parse params: profile name + command.
@@ -134,7 +159,7 @@ impl OperationHandler for SandboxExecutor {
             let profile = Self::load_profile(&profile_name)?;
 
             // Resolve secret references.
-            let resolved_secrets = Self::resolve_secrets(&profile)?;
+            let resolved_secrets = Self::resolve_secrets(&profile, resolver_factory)?;
 
             // Emit SecretResolved audit events (one per secret, without the value).
             for env_name in resolved_secrets.keys() {
@@ -526,7 +551,7 @@ mod tests {
     #[test]
     fn sandbox_executor_debug_format() {
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let executor = SandboxExecutor::new(audit);
+        let executor = SandboxExecutor::new(audit, Vec::new);
         let debug = format!("{executor:?}");
         assert!(debug.contains("SandboxExecutor"));
     }
@@ -534,7 +559,7 @@ mod tests {
     #[tokio::test]
     async fn missing_profile_param_rejected() {
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let executor = SandboxExecutor::new(audit);
+        let executor = SandboxExecutor::new(audit, Vec::new);
 
         let request = OperationRequest {
             principal: None,
@@ -565,7 +590,7 @@ mod tests {
     #[tokio::test]
     async fn missing_command_param_rejected() {
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let executor = SandboxExecutor::new(audit);
+        let executor = SandboxExecutor::new(audit, Vec::new);
 
         let request = OperationRequest {
             principal: None,
@@ -596,7 +621,7 @@ mod tests {
     #[tokio::test]
     async fn empty_command_rejected() {
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let executor = SandboxExecutor::new(audit);
+        let executor = SandboxExecutor::new(audit, Vec::new);
 
         let request = OperationRequest {
             principal: None,
