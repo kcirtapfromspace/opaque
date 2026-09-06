@@ -12,6 +12,7 @@ homepage.workspace = true
 tempfile = "3"
 opaque-core = { path = "../opaque-core" }
 opaque-approval = { path = "../opaque-approval" }
+opaque-providers = { path = "../opaque-providers" }
 bytes = { workspace = true }
 libc = { workspace = true }
 futures-util = { workspace = true }

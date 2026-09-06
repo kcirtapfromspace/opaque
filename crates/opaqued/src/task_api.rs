@@ -247,9 +247,9 @@ async fn handle_inner(
                 state.enclave.inference_profile()?,
             )?;
         } else if manifest.is_release() {
-            crate::github::prepare_staging_release(&mut manifest)?;
+            opaque_providers::github::prepare_staging_release(&mut manifest)?;
         } else {
-            crate::github::prepare_task_manifest(&mut manifest)?;
+            opaque_providers::github::prepare_task_manifest(&mut manifest)?;
         }
         state.preflight_task(&mut request, &manifest)?;
         let manifest = if manifest.is_ssh() {
@@ -258,9 +258,9 @@ async fn handle_inner(
             crate::inference::plan_inference_manifest(manifest, state.enclave.inference_profile()?)
                 .await?
         } else if manifest.is_release() {
-            crate::github::plan_staging_release(manifest).await?
+            opaque_providers::github::plan_staging_release(manifest).await?
         } else {
-            crate::github::plan_task_manifest(manifest).await?
+            opaque_providers::github::plan_task_manifest(manifest).await?
         };
         // Policy may have changed during metadata reads.
         if resolve_principal_context(state, session_id).await? != request.principal {
@@ -287,7 +287,7 @@ async fn handle_inner(
             return Err("only an attempted staging dispatch can be reconciled".into());
         }
         state.preflight_task_observation(&request, &task.manifest)?;
-        let observation = crate::github::reconcile_staging_release(
+        let observation = opaque_providers::github::reconcile_staging_release(
             &task.manifest,
             id,
             task.slots[0]
