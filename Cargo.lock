@@ -2297,6 +2297,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "opaque-tenant"
+version = "0.2.0"
+dependencies = [
+ "libc",
+ "opaque-approval",
+ "opaque-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "opaque-web"
 version = "0.2.0"
 dependencies = [
@@ -2341,6 +2355,7 @@ dependencies = [
  "opaque-core",
  "opaque-metrics",
  "opaque-providers",
+ "opaque-tenant",
  "p256",
  "rand 0.8.8",
  "rcgen",

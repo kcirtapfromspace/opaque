@@ -8,6 +8,7 @@ members = [
   "crates/opaque-approval",
   "crates/opaque-approve-helper",
   "crates/opaque-approver",
+  "crates/opaque-tenant",
   "crates/opaque-mcp",
   "crates/opaque-web",
   "crates/opaque-metrics",

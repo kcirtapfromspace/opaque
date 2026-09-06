@@ -1,84 +1,34 @@
 //! Human-authorized, persona-bound provisioning. The agent proposes a named
 //! profile; only the broker decides whether a durable child grant may exist.
-use std::{collections::HashMap, sync::Mutex};
-
+//!
+//! The peer-bound challenge ledger, wire DTOs, and pure principal-binding
+//! derivation live in `opaque_tenant::provisioning_api` (shared, daemon-state
+//! free). What remains here is the RPC dispatch and the administrator
+//! authority checks (`admin`/`unchanged`) and startup validation
+//! (`initialize`): all three are irreducibly coupled to the concrete,
+//! SQLite-backed `identity::IdentityRuntime` and `DaemonConfig`, which stay
+//! in this crate (see `opaque_tenant::provisioning_api`'s doc comment for the
+//! full reasoning).
 use opaque_core::{
     audit::AuditEventKind,
     enclave_facade::EnclaveFacade,
-    identity::{
-        AccessMode, Principal, PrincipalContext, PrincipalId, PrincipalKind, Role, now_unix,
-    },
+    identity::{AccessMode, PrincipalContext, Role, now_unix},
     operation::{ClientIdentity, ClientType},
     proto::{Request, Response},
     tenant::TenantBinding,
 };
-use serde::Deserialize;
+use opaque_tenant::provisioning_api::{
+    Admin, BindStart, Complete, Issue, MandateStart, Pending, PendingAction, Revoke, expiry, parse,
+    principal_binding,
+};
 use serde_json::{Value, json};
 
 use crate::{
     DaemonConfig, DaemonState,
     identity::{IdentityRuntime, provisioning::ProvisioningConfig},
 };
-use opaque_approval::fido2::{Fido2Assertion, Fido2PrincipalBinding};
 
 const CHALLENGE_TTL: i64 = 120;
-const MAX_PENDING: usize = 128;
-
-#[derive(Default)]
-pub struct Challenges(Mutex<HashMap<String, Pending>>);
-
-struct Pending {
-    uid: u32,
-    expires_at: i64,
-    challenge: String,
-    binding: Fido2PrincipalBinding,
-    human_session_id: String,
-    issuer_epoch: i64,
-    action: PendingAction,
-}
-
-enum PendingAction {
-    Bind {
-        credential_id: String,
-    },
-    Mandate {
-        service: PrincipalId,
-        profile_id: String,
-        profile_epoch: i64,
-        expires_at: i64,
-        max_issuances: u32,
-    },
-}
-
-impl Challenges {
-    fn insert(&self, pending: Pending) -> Result<String, String> {
-        let mut entries = self.0.lock().map_err(|_| "challenge store unavailable")?;
-        entries.retain(|_, p| p.expires_at > now_unix());
-        if entries.len() >= MAX_PENDING {
-            return Err("too many pending provisioning reviews".into());
-        }
-        let id = uuid::Uuid::new_v4().to_string();
-        entries.insert(id.clone(), pending);
-        Ok(id)
-    }
-
-    // Consume before cryptographic verification: invalid, expired and repeated
-    // submissions can never reuse a human-authorized enrollment window.
-    fn take(&self, id: &str, uid: u32) -> Result<Pending, String> {
-        let mut entries = self.0.lock().map_err(|_| "challenge store unavailable")?;
-        let pending = entries
-            .get(id)
-            .ok_or("unknown or consumed provisioning challenge")?;
-        if pending.uid != uid {
-            return Err("provisioning challenge belongs to another peer".into());
-        }
-        let pending = entries.remove(id).ok_or("challenge already consumed")?;
-        if pending.expires_at <= now_unix() {
-            return Err("provisioning challenge expired; request fresh review".into());
-        }
-        Ok(pending)
-    }
-}
 
 /// Synchronize policy removals even when provisioning has been disabled. A
 /// later configuration restore cannot revive grants from an earlier epoch.
@@ -127,13 +77,6 @@ pub fn initialize(
             .sync_provisioning_admission(|p| rt.principal_permitted(p), now_unix())?;
     }
     Ok(())
-}
-
-#[derive(Clone)]
-struct Admin {
-    principal: Principal,
-    session_id: String,
-    epoch: i64,
 }
 
 fn admin(rt: &IdentityRuntime, ctx: Option<&PrincipalContext>) -> Result<Admin, String> {
@@ -186,68 +129,6 @@ fn unchanged(
         return Err("administrator authority changed; request a new review".into());
     }
     Ok(())
-}
-
-fn principal_binding(
-    admin: &Admin,
-    tenant: &TenantBinding,
-) -> Result<Fido2PrincipalBinding, String> {
-    let PrincipalKind::Human { iss, sub, .. } = &admin.principal.kind else {
-        return Err("human identity required".into());
-    };
-    Ok(Fido2PrincipalBinding {
-        principal_id: admin.principal.id.clone(),
-        issuer: iss.clone(),
-        subject: sub.clone(),
-        tenant_id: tenant.tenant_id.to_string(),
-        broker_id: tenant.broker_id.to_string(),
-    })
-}
-
-fn parse<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, String> {
-    serde_json::from_value(params).map_err(|_| "invalid provisioning parameters".into())
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BindStart {
-    credential_id: String,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MandateStart {
-    service: String,
-    profile_id: String,
-    ttl_secs: u64,
-    max_issuances: u32,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Complete {
-    challenge_id: String,
-    assertion: Fido2Assertion,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Issue {
-    mandate_id: String,
-    recipient_issuer: String,
-    recipient_subject: String,
-    ttl_secs: u64,
-    request_id: String,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Revoke {
-    kind: String,
-    id: String,
-}
-
-fn expiry(ttl: u64) -> Result<i64, String> {
-    now_unix()
-        .checked_add(i64::try_from(ttl).map_err(|_| "invalid TTL")?)
-        .filter(|_| ttl > 0)
-        .ok_or_else(|| "invalid TTL".into())
 }
 
 pub async fn handle(
@@ -597,51 +478,5 @@ async fn handle_inner(
             Ok(json!({"id":args.id,"kind":args.kind,"revoked":true,"actor":acting.principal.id}))
         }
         _ => Err("unknown provisioning method".into()),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn pending(uid: u32, expires_at: i64) -> Pending {
-        Pending {
-            uid,
-            expires_at,
-            challenge: "one-shot".into(),
-            binding: Fido2PrincipalBinding {
-                principal_id: PrincipalId::parse("hum_11111111111111111111111111111111").unwrap(),
-                issuer: "https://idp.example.com".into(),
-                subject: "alice".into(),
-                tenant_id: "test".into(),
-                broker_id: uuid::Uuid::new_v4().to_string(),
-            },
-            human_session_id: "login".into(),
-            issuer_epoch: 1,
-            action: PendingAction::Bind {
-                credential_id: "key".into(),
-            },
-        }
-    }
-    #[test]
-    fn challenges_are_peer_bound_and_single_use() {
-        let challenges = Challenges::default();
-        let id = challenges.insert(pending(42, now_unix() + 60)).unwrap();
-        assert!(challenges.take(&id, 43).is_err());
-        assert!(challenges.take(&id, 42).is_ok());
-        assert!(challenges.take(&id, 42).is_err());
-    }
-    #[test]
-    fn challenge_expiry_and_restart_require_fresh_review() {
-        let challenges = Challenges::default();
-        let id = challenges.insert(pending(42, now_unix())).unwrap();
-        assert!(challenges.take(&id, 42).is_err());
-        assert!(Challenges::default().take(&id, 42).is_err());
-    }
-    #[test]
-    fn parameters_reject_claims_and_redelegation() {
-        assert!(parse::<Issue>(json!({"mandate_id":"m","recipient_issuer":"i","recipient_subject":"s","ttl_secs":60,"request_id":"r","groups":["admin"]})).is_err());
-        assert!(parse::<MandateStart>(json!({"service":"s","profile_id":"p","ttl_secs":60,"max_issuances":1,"redelegation":true})).is_err());
-        assert!(expiry(0).is_err());
-        assert!(expiry(u64::MAX).is_err());
     }
 }
