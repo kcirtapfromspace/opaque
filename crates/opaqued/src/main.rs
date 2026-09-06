@@ -48,7 +48,6 @@ mod resource_authority;
 mod ssh;
 mod task_api;
 mod task_store;
-mod tenant;
 mod trust_domain;
 mod workload_attest;
 mod workspace_process;
@@ -73,7 +72,7 @@ use opaque_core::resolver::SecretResolver;
 struct DaemonConfig {
     /// One immutable tenant per independently isolated broker installation.
     #[serde(default)]
-    tenant: Option<tenant::TenantConfig>,
+    tenant: Option<opaque_tenant::tenant::TenantConfig>,
     /// Sealed, operator-selected model and public source profile.
     #[serde(default)]
     inference: Option<inference::InferenceProfileConfig>,
@@ -330,7 +329,7 @@ Docs: https://opaque.info/
 struct DaemonState {
     /// Immutable attestor binding installed by the Unix listener after privilege drop.
     workload_attestor: workload_attest::ListenerAttestor,
-    tenant: Option<tenant::TenantBoundary>,
+    tenant: Option<opaque_tenant::tenant::TenantBoundary>,
     enclave: Arc<Enclave>,
     tasks: Option<Arc<task_store::TaskStore>>,
     audit: Arc<dyn AuditSink>,
@@ -350,7 +349,7 @@ struct DaemonState {
     approval_server_addr: Option<std::net::SocketAddr>,
     /// FIDO2 approval coordination, present when `[approval] fido2` is enabled.
     fido2: Option<Arc<opaque_approval::factors::Fido2Approvals>>,
-    provisioning_challenges: provisioning_api::Challenges,
+    provisioning_challenges: opaque_tenant::provisioning_api::Challenges,
     /// Applied federation bundle context (org, version, teams).
     federation: Arc<federation::FederationStatus>,
     /// Attestation service (posture reports; always present).
@@ -383,12 +382,18 @@ struct SessionDelegation {
 
 // ---------------------------------------------------------------------------
 // EnclaveFacade: the narrow kernel-facing seam `opaque_core` exposes for
-// transport/dispatch code (`task_api.rs`, `provisioning_api.rs`, the
-// `github` RPC convenience wrapper) that is destined to move out of this
-// binary crate. Implemented for `DaemonState` rather than `Enclave` alone
-// because `resolve_principal_context` needs `agent_sessions`/`identity`/
-// `federation`, which only `DaemonState` owns; the other methods simply
-// delegate to the concrete `Enclave`.
+// transport/dispatch code (`task_api.rs`, the `github` RPC convenience
+// wrapper, and this file's own `provisioning_api.rs`) that either has moved
+// out of this binary crate already or depends on this trait to call back
+// into it. `provisioning_api.rs`'s RPC dispatch stays here — it is
+// irreducibly coupled to the concrete `identity::IdentityRuntime`/
+// `DaemonConfig` (see `opaque_tenant::provisioning_api`'s doc comment) — but
+// still goes through this trait for `request_control_approval`/
+// `resolve_principal_context` so its shared, daemon-state-free half can live
+// in `opaque-tenant`. Implemented for `DaemonState` rather than `Enclave`
+// alone because `resolve_principal_context` needs `agent_sessions`/
+// `identity`/`federation`, which only `DaemonState` owns; the other methods
+// simply delegate to the concrete `Enclave`.
 // ---------------------------------------------------------------------------
 
 impl EnclaveFacade for DaemonState {
@@ -1062,7 +1067,9 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
     let tenant = config
         .tenant
         .as_ref()
-        .map(|tenant_config| tenant::TenantBoundary::open(tenant_config, &state_dir, td.enforce))
+        .map(|tenant_config| {
+            opaque_tenant::tenant::TenantBoundary::open(tenant_config, &state_dir, td.enforce)
+        })
         .transpose()
         .map_err(std::io::Error::other)?;
     let inference_profile = config
@@ -2357,7 +2364,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         pairing: pairing_manager,
         approval_server_addr,
         fido2: fido2_approvals,
-        provisioning_challenges: provisioning_api::Challenges::default(),
+        provisioning_challenges: opaque_tenant::provisioning_api::Challenges::default(),
         federation: federation_status,
         attestation,
     });
@@ -3839,9 +3846,12 @@ fn validate_tenant_startup(
     state_dir: &std::path::Path,
 ) -> Result<(), String> {
     if config.tenant.is_none()
-        && [tenant::BINDING_FILE, tenant::LOCK_FILE]
-            .iter()
-            .any(|name| std::fs::symlink_metadata(state_dir.join(name)).is_ok())
+        && [
+            opaque_tenant::tenant::BINDING_FILE,
+            opaque_tenant::tenant::LOCK_FILE,
+        ]
+        .iter()
+        .any(|name| std::fs::symlink_metadata(state_dir.join(name)).is_ok())
     {
         return Err("tenant-bound custody requires its tenant configuration".into());
     }
@@ -7264,7 +7274,7 @@ exe_sha256 = "deadbeef"
             pairing: None,
             approval_server_addr: None,
             fido2: None,
-            provisioning_challenges: provisioning_api::Challenges::default(),
+            provisioning_challenges: opaque_tenant::provisioning_api::Challenges::default(),
             federation: Arc::new(federation::FederationStatus::default()),
             attestation: Arc::new(attest::AttestationService::new(
                 ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]),
@@ -7334,7 +7344,10 @@ exe_sha256 = "deadbeef"
 
     #[test]
     fn tenant_configuration_cannot_be_removed_from_initialized_custody() {
-        for marker in [tenant::BINDING_FILE, tenant::LOCK_FILE] {
+        for marker in [
+            opaque_tenant::tenant::BINDING_FILE,
+            opaque_tenant::tenant::LOCK_FILE,
+        ] {
             let directory = tempfile::tempdir().unwrap();
             let config = DaemonConfig::default();
             assert!(validate_tenant_startup(&config, directory.path()).is_ok());

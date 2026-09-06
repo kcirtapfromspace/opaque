@@ -23,12 +23,12 @@ use crate::{
         persona::VerifiedPersonaClaims,
         provisioning::{AccessProfile, ProvisioningConfig},
     },
-    tenant::{TenantBoundary, TenantConfig},
 };
 use opaque_approval::fido2::{
     Fido2Assertion, Fido2CredentialStore, Fido2Manager, Fido2RegistrationResponse,
     NoLocalTransport,
 };
+use opaque_tenant::tenant::{TenantBoundary, TenantConfig};
 
 const ISSUER: &str = "https://idp.example.com";
 const RP: &str = "opaque.test";

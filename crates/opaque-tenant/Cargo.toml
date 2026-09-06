@@ -1,0 +1,21 @@
+[package]
+name = "opaque-tenant"
+version.workspace = true
+edition = "2024"
+publish = false
+description = "Opaque tenant custody boundary and delegated IdP provisioning protocol types"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+opaque-core = { path = "../opaque-core" }
+opaque-approval = { path = "../opaque-approval" }
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

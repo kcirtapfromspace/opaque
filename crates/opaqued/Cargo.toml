@@ -14,6 +14,7 @@ opaque-core = { path = "../opaque-core" }
 opaque-approval = { path = "../opaque-approval" }
 opaque-providers = { path = "../opaque-providers" }
 opaque-sandbox = { path = "../opaque-sandbox" }
+opaque-tenant = { path = "../opaque-tenant" }
 bytes = { workspace = true }
 libc = { workspace = true }
 futures-util = { workspace = true }
