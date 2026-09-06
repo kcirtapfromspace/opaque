@@ -2123,6 +2123,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "opaque-approval"
+version = "0.2.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "block2",
+ "chrono",
+ "ed25519-dalek",
+ "futures-util",
+ "getrandom 0.4.3",
+ "hmac",
+ "hyper-util",
+ "jsonwebtoken",
+ "libc",
+ "mdns-sd",
+ "objc2",
+ "objc2-foundation",
+ "objc2-local-authentication",
+ "opaque-approver",
+ "opaque-core",
+ "p256",
+ "rand 0.8.8",
+ "rcgen",
+ "reqwest 0.12.28",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "opaque-approve-helper"
 version = "0.2.0"
 dependencies = [
@@ -2266,7 +2303,6 @@ version = "0.2.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
- "block2",
  "bytes",
  "chrono",
  "crypto_box",
@@ -2274,15 +2310,12 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "glob-match",
- "hmac",
  "hyper-util",
  "jsonwebtoken",
  "landlock",
  "libc",
  "mdns-sd",
- "objc2",
- "objc2-foundation",
- "objc2-local-authentication",
+ "opaque-approval",
  "opaque-approver",
  "opaque-core",
  "opaque-metrics",
