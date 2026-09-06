@@ -671,6 +671,17 @@ impl EnclaveFacade for Enclave {
             )
         })
     }
+
+    fn verify_workspace<'a>(
+        &'a self,
+        claimed: &'a opaque_core::operation::WorkspaceContext,
+        client_pid: Option<i32>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        // Same free function as DaemonState's impl above; this method needs
+        // no DaemonState-owned state, so unlike resolve_principal_context it
+        // isn't a fails-loudly stub.
+        Box::pin(verify_workspace(claimed, client_pid))
+    }
 }
 
 // `default_secret_resolvers()` used to live here (main.rs is the crate's

@@ -403,6 +403,14 @@ mod tests {
         > {
             unimplemented!("not exercised by federation tests")
         }
+
+        fn verify_workspace<'a>(
+            &'a self,
+            _claimed: &'a opaque_core::operation::WorkspaceContext,
+            _client_pid: Option<i32>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            unimplemented!("not exercised by federation tests")
+        }
     }
 
     fn payload_with_rules(version: u64) -> BundlePayload {
