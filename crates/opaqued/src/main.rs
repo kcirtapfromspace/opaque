@@ -34,11 +34,7 @@ use uuid::Uuid;
 /// Name of the daemon token file written next to the socket.
 const DAEMON_TOKEN_FILENAME: &str = "daemon.token";
 
-mod attest;
 mod enclave;
-#[allow(dead_code)]
-mod export;
-mod federation;
 mod identity;
 mod inference;
 mod provisioning_api;
@@ -49,7 +45,6 @@ mod ssh;
 mod task_api;
 mod task_store;
 mod trust_domain;
-mod workload_attest;
 mod workspace_process;
 
 use workspace_process::WorkspaceCommandExt;
@@ -161,16 +156,16 @@ struct DaemonConfig {
 
     /// Federation (`[federation]`): signed policy bundles from an org.
     #[serde(default)]
-    federation: federation::FederationConfig,
+    federation: opaque_federation_runtime::federation::FederationConfig,
 
     /// SIEM export (`[export]`): stream the audit chain off the box.
     #[serde(default)]
-    export: export::ExportConfig,
+    export: opaque_federation_runtime::export::ExportConfig,
 
     /// Continuous attestation (`[attestation]`): periodic posture reports and
     /// verify-before-trust key release.
     #[serde(default)]
-    attestation: attest::AttestationConfig,
+    attestation: opaque_federation_runtime::attest::AttestationConfig,
 }
 
 /// `[approval]` — out-of-band approval factor configuration.
@@ -328,7 +323,7 @@ Docs: https://opaque.info/
 
 struct DaemonState {
     /// Immutable attestor binding installed by the Unix listener after privilege drop.
-    workload_attestor: workload_attest::ListenerAttestor,
+    workload_attestor: opaque_federation_runtime::workload_attest::ListenerAttestor,
     tenant: Option<opaque_tenant::tenant::TenantBoundary>,
     enclave: Arc<Enclave>,
     tasks: Option<Arc<task_store::TaskStore>>,
@@ -351,9 +346,9 @@ struct DaemonState {
     fido2: Option<Arc<opaque_approval::factors::Fido2Approvals>>,
     provisioning_challenges: opaque_tenant::provisioning_api::Challenges,
     /// Applied federation bundle context (org, version, teams).
-    federation: Arc<federation::FederationStatus>,
+    federation: Arc<opaque_federation_runtime::federation::FederationStatus>,
     /// Attestation service (posture reports; always present).
-    attestation: Arc<attest::AttestationService>,
+    attestation: Arc<opaque_federation_runtime::attest::AttestationService>,
 }
 
 #[derive(Debug, Clone)]
@@ -566,6 +561,96 @@ impl EnclaveFacade for DaemonState {
                 jti: d.jti.clone(),
                 human_session_id: d.human_session_id.clone(),
             }))
+        })
+    }
+}
+
+/// A bare `Enclave` also implements the facade directly, for composition-root
+/// code that runs before a `DaemonState` exists — the federation bundle
+/// bootstrap (`opaque_federation_runtime::federation::BundleApplier`) applies the initial bundle while
+/// only `Arc<Enclave>` is in scope, well before `DaemonState` is built.
+///
+/// Every method mirrors an inherent `Enclave` method one-for-one (the same
+/// ones `DaemonState`'s impl above delegates to via `self.enclave.X(...)`),
+/// except `resolve_principal_context`, which needs `DaemonState`-owned
+/// agent-session/identity/federation state that a bare `Enclave` does not
+/// have; that one fails loudly instead of silently returning `Ok(None)`; the
+/// federation bootstrap never calls it.
+impl EnclaveFacade for Enclave {
+    fn preflight_task(
+        &self,
+        request: &mut OperationRequest,
+        manifest: &opaque_core::task::TaskManifest,
+    ) -> Result<(), String> {
+        Enclave::preflight_task(self, request, manifest)
+    }
+
+    fn preflight_task_observation(
+        &self,
+        base: &OperationRequest,
+        manifest: &opaque_core::task::TaskManifest,
+    ) -> Result<(), String> {
+        Enclave::preflight_task_observation(self, base, manifest)
+    }
+
+    fn execute(
+        &self,
+        request: OperationRequest,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = opaque_core::sanitize::SanitizedResponse<
+                        opaque_core::sanitize::Sanitized,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(Enclave::execute(self, request))
+    }
+
+    fn swap_policy(&self, policy: PolicyEngine) -> usize {
+        Enclave::swap_policy(self, policy)
+    }
+
+    fn request_control_approval<'a>(
+        &'a self,
+        identity: &'a ClientIdentity,
+        client_type: ClientType,
+        operation_label: &'a str,
+        action_description: &'a str,
+        reason: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<opaque_core::audit::ApproverIdentity>, String>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            Enclave::request_control_approval(
+                self,
+                identity,
+                client_type,
+                operation_label,
+                action_description,
+                reason,
+            )
+            .await
+            .map_err(|e| e.to_string())
+        })
+    }
+
+    fn resolve_principal_context<'a>(
+        &'a self,
+        _session_id: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<PrincipalContext>, String>> + Send + 'a>> {
+        Box::pin(async move {
+            Err(
+                "resolve_principal_context is unavailable on a bare Enclave facade; it needs \
+                 DaemonState-owned agent-session/identity/federation state"
+                    .to_string(),
+            )
         })
     }
 }
@@ -1143,7 +1228,8 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
     validate_path_chain(&socket)?;
 
     let listener = UnixListener::bind(&socket)?;
-    let workload_attestor = workload_attest::ListenerAttestor::unix_listener();
+    let workload_attestor =
+        opaque_federation_runtime::workload_attest::ListenerAttestor::unix_listener();
     lock_down_socket_path(&socket)?;
     let _socket_guard = SocketGuard::new(socket.clone());
 
@@ -1855,18 +1941,18 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
     let (execve_check_handler, execve_approve_handler) =
         opaque_sandbox::execve_hook::create_execve_handlers(audit.clone(), execve_mapper);
 
-    let github_actions_handler =
-        opaque_providers::github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
-    let github_codespaces_handler =
-        opaque_providers::github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
-    let github_dependabot_handler =
-        opaque_providers::github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
-    let github_org_handler =
-        opaque_providers::github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
-    let github_list_handler =
-        opaque_providers::github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
-    let github_delete_handler =
-        opaque_providers::github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
+    let github_actions_handler = opaque_providers::github::GitHubHandler::new(audit.clone())
+        .map_err(std::io::Error::other)?;
+    let github_codespaces_handler = opaque_providers::github::GitHubHandler::new(audit.clone())
+        .map_err(std::io::Error::other)?;
+    let github_dependabot_handler = opaque_providers::github::GitHubHandler::new(audit.clone())
+        .map_err(std::io::Error::other)?;
+    let github_org_handler = opaque_providers::github::GitHubHandler::new(audit.clone())
+        .map_err(std::io::Error::other)?;
+    let github_list_handler = opaque_providers::github::GitHubHandler::new(audit.clone())
+        .map_err(std::io::Error::other)?;
+    let github_delete_handler = opaque_providers::github::GitHubHandler::new(audit.clone())
+        .map_err(std::io::Error::other)?;
     let gitlab_handler = opaque_providers::gitlab::GitLabHandler::new(audit.clone())
         .map_err(std::io::Error::other)?;
 
@@ -2060,7 +2146,8 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
             .parse()
             .map_err(|e| std::io::Error::other(format!("approval.server_bind invalid: {e}")))?;
 
-        let store = opaque_approval::pairing::store::DeviceStore::new(store_path, store_hmac.to_vec());
+        let store =
+            opaque_approval::pairing::store::DeviceStore::new(store_path, store_hmac.to_vec());
         let pm = Arc::new(opaque_approval::pairing::PairingManager::new(
             server_id,
             pairing_key,
@@ -2130,13 +2217,18 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         }
         let store_hmac =
             opaque_core::keyfile::load_or_create_key_file(&store_path.with_extension("hmac"))?;
-        let store = opaque_approval::fido2::Fido2CredentialStore::new(store_path, store_hmac.to_vec());
+        let store =
+            opaque_approval::fido2::Fido2CredentialStore::new(store_path, store_hmac.to_vec());
         let rp_id = config
             .approval
             .fido2_rp_id
             .clone()
             .unwrap_or_else(|| "opaque.local".into());
-        let manager = opaque_approval::fido2::Fido2Manager::new(store, Box::new(opaque_approval::fido2::NoLocalTransport), rp_id);
+        let manager = opaque_approval::fido2::Fido2Manager::new(
+            store,
+            Box::new(opaque_approval::fido2::NoLocalTransport),
+            rp_id,
+        );
         let approvals = Arc::new(opaque_approval::factors::Fido2Approvals::new(
             manager,
             std::time::Duration::from_secs(config.approval.timeout_secs.unwrap_or(60)),
@@ -2166,24 +2258,30 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
                         })
                 }) as opaque_approval::factors::ApproverResolver
             });
-            registry.register(Arc::new(opaque_approval::factors::LocalBioVerifier::new(resolver)));
+            registry.register(Arc::new(opaque_approval::factors::LocalBioVerifier::new(
+                resolver,
+            )));
 
             if let Some((pm, handle)) = second_device_verifier.clone() {
                 if config.approval.second_device {
-                    registry.register(Arc::new(opaque_approval::factors::PairedDeviceVerifier::new(
-                        pm.clone(),
-                        handle.clone(),
-                    )));
+                    registry.register(Arc::new(
+                        opaque_approval::factors::PairedDeviceVerifier::new(
+                            pm.clone(),
+                            handle.clone(),
+                        ),
+                    ));
                 }
                 if !config.workstation_approvers.is_empty() {
-                    registry.register(Arc::new(opaque_approval::factors::PairedWorkstationVerifier::new(
-                        pm, handle,
-                    )));
+                    registry.register(Arc::new(
+                        opaque_approval::factors::PairedWorkstationVerifier::new(pm, handle),
+                    ));
                 }
             }
 
             if let Some(approvals) = fido2_approvals.clone() {
-                registry.register(Arc::new(opaque_approval::factors::Fido2Verifier::new(approvals)));
+                registry.register(Arc::new(opaque_approval::factors::Fido2Verifier::new(
+                    approvals,
+                )));
             }
 
             registered_factors = registry
@@ -2220,10 +2318,10 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
 
     // --- SIEM export: stream the audit chain off the box ---
     if config.export.configured() {
-        let pump = export::ExportPump::new(
+        let pump = opaque_federation_runtime::export::ExportPump::new(
             config.export.clone(),
             audit_db_path.clone(),
-            export::cursor_path(&home),
+            opaque_federation_runtime::export::cursor_path(&home),
             audit.clone(),
         )
         .map_err(|e| {
@@ -2236,7 +2334,8 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
     }
 
     // --- Federation: signed policy bundles ---
-    let federation_status = Arc::new(federation::FederationStatus::default());
+    let federation_status =
+        Arc::new(opaque_federation_runtime::federation::FederationStatus::default());
     if config.federation.configured() {
         let fed = &config.federation;
         let anchors = fed.anchors()?;
@@ -2247,9 +2346,9 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
                  bundle can never be applied",
             ));
         }
-        let applier = federation::BundleApplier {
+        let applier = opaque_federation_runtime::federation::BundleApplier {
             anchors,
-            state_file: federation::state_path(&home),
+            state_file: opaque_federation_runtime::federation::state_path(&home),
             enclave: enclave.clone(),
             status: federation_status.clone(),
             audit: audit.clone(),
@@ -2300,8 +2399,8 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
     }
 
     // --- Continuous attestation ---
-    let attestation = Arc::new(attest::AttestationService::new(
-        attest::load_or_create_key_in(&state_dir)?,
+    let attestation = Arc::new(opaque_federation_runtime::attest::AttestationService::new(
+        opaque_federation_runtime::attest::load_or_create_key_in(&state_dir)?,
         home.clone(),
         config_path.clone(),
         audit_db_path.clone(),
@@ -2320,7 +2419,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
     // custody material. A refusal is loud but not fatal — the daemon keeps
     // running on the key material it already holds.
     if let Some(url) = config.attestation.key_release_url.clone() {
-        match attest::KeyReleaseClient::new(
+        match opaque_federation_runtime::attest::KeyReleaseClient::new(
             url,
             config.attestation.key_release_authorization.clone(),
         ) {
@@ -2563,14 +2662,6 @@ impl ConnectionRateLimiter {
 // Client identity & type derivation
 // ---------------------------------------------------------------------------
 
-/// Compute the SHA-256 hash of an executable file (hex-encoded).
-fn compute_exe_hash(path: &Path) -> Option<String> {
-    use sha2::{Digest, Sha256};
-    let bytes = std::fs::read(path).ok()?;
-    let hash = Sha256::digest(&bytes);
-    Some(format!("{hash:x}"))
-}
-
 /// Derive the client type from the client identity and daemon config.
 ///
 /// The daemon NEVER trusts a self-declared `client_type` from request params.
@@ -2742,79 +2833,6 @@ fn entry_matches(identity: &ClientIdentity, entry: &HumanClientEntry) -> bool {
     }
 
     true
-}
-
-/// Build a [`ClientIdentity`] from peer credentials obtained via the Unix socket.
-fn build_client_identity(peer: Option<&opaque_core::peer::PeerInfo>) -> ClientIdentity {
-    match peer {
-        Some(info) => {
-            let exe_path = info.pid.and_then(exe_path_for_pid);
-            let exe_sha256 = exe_path.as_ref().and_then(|p| compute_exe_hash(p));
-            ClientIdentity {
-                uid: info.uid,
-                gid: info.gid,
-                pid: info.pid,
-                exe_path,
-                exe_sha256,
-                codesign_team_id: None,
-            }
-        }
-        None => ClientIdentity {
-            uid: u32::MAX,
-            gid: u32::MAX,
-            pid: None,
-            exe_path: None,
-            exe_sha256: None,
-            codesign_team_id: None,
-        },
-    }
-}
-
-/// Resolve the executable path for a given PID.
-fn exe_path_for_pid(pid: i32) -> Option<PathBuf> {
-    #[cfg(target_os = "linux")]
-    {
-        std::fs::read_link(format!("/proc/{pid}/exe")).ok()
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        exe_path_macos(pid)
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = pid;
-        None
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn exe_path_macos(pid: i32) -> Option<PathBuf> {
-    const PROC_PIDPATHINFO_MAXSIZE: u32 = 4096;
-
-    unsafe extern "C" {
-        fn proc_pidpath(
-            pid: libc::c_int,
-            buffer: *mut libc::c_char,
-            buffersize: u32,
-        ) -> libc::c_int;
-    }
-
-    let mut buf = vec![0u8; PROC_PIDPATHINFO_MAXSIZE as usize];
-    let ret = unsafe {
-        proc_pidpath(
-            pid,
-            buf.as_mut_ptr() as *mut libc::c_char,
-            PROC_PIDPATHINFO_MAXSIZE,
-        )
-    };
-    if ret > 0 {
-        let cstr = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr() as *const libc::c_char) };
-        cstr.to_str().ok().map(PathBuf::from)
-    } else {
-        None
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3433,9 +3451,9 @@ async fn handle_conn(
     // --- Handshake: first frame must be a valid daemon token ---
     let handshake = match framed.next().await {
         Some(Ok(frame)) => {
-            if serde_json::from_slice::<serde_json::Value>(&frame)
-                .is_ok_and(|value| workload_attest::has_identity_claim(&value))
-            {
+            if serde_json::from_slice::<serde_json::Value>(&frame).is_ok_and(|value| {
+                opaque_federation_runtime::workload_attest::has_identity_claim(&value)
+            }) {
                 emit_daemon_method_audit(
                     &state,
                     AuditEventKind::WorkloadAttestationDenied,
@@ -3525,7 +3543,7 @@ async fn handle_conn(
                     sink.send(Bytes::from(out)).await?;
                     continue;
                 }
-                if workload_attest::has_identity_claim(&value) {
+                if opaque_federation_runtime::workload_attest::has_identity_claim(&value) {
                     emit_daemon_method_audit(
                         &state,
                         AuditEventKind::WorkloadAttestationDenied,
@@ -3654,7 +3672,7 @@ fn validate_handshake(frame: &[u8], expected_token: &str) -> Option<HandshakePay
     }
 
     let value: serde_json::Value = serde_json::from_slice(frame).ok()?;
-    if workload_attest::has_identity_claim(&value) {
+    if opaque_federation_runtime::workload_attest::has_identity_claim(&value) {
         return None;
     }
     let hs: Handshake = match serde_json::from_slice(frame) {
@@ -6305,27 +6323,6 @@ mod tests {
     }
 
     #[test]
-    fn compute_exe_hash_nonexistent_none() {
-        assert!(compute_exe_hash(Path::new("/nonexistent/binary")).is_none());
-    }
-
-    #[test]
-    fn compute_exe_hash_valid_file() {
-        // Hash the current test binary — always exists during test execution.
-        let exe = std::env::current_exe().expect("current_exe should succeed in tests");
-        let hash = compute_exe_hash(&exe);
-        assert!(hash.is_some(), "hashing current binary should succeed");
-        let h = hash.unwrap();
-        // SHA-256 hex digest is always 64 characters.
-        assert_eq!(h.len(), 64, "expected 64-char hex digest, got {}", h.len());
-        // Should be lowercase hex.
-        assert!(
-            h.chars()
-                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
-        );
-    }
-
-    #[test]
     fn config_empty_all_agents() {
         let config = DaemonConfig::default();
         let id = test_identity();
@@ -7260,7 +7257,8 @@ exe_sha256 = "deadbeef"
             .build()
             .unwrap();
         DaemonState {
-            workload_attestor: workload_attest::ListenerAttestor::unix_listener(),
+            workload_attestor:
+                opaque_federation_runtime::workload_attest::ListenerAttestor::unix_listener(),
             tenant: None,
             enclave: Arc::new(enclave),
             tasks: None,
@@ -7275,8 +7273,10 @@ exe_sha256 = "deadbeef"
             approval_server_addr: None,
             fido2: None,
             provisioning_challenges: opaque_tenant::provisioning_api::Challenges::default(),
-            federation: Arc::new(federation::FederationStatus::default()),
-            attestation: Arc::new(attest::AttestationService::new(
+            federation: Arc::new(
+                opaque_federation_runtime::federation::FederationStatus::default(),
+            ),
+            attestation: Arc::new(opaque_federation_runtime::attest::AttestationService::new(
                 ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]),
                 PathBuf::from("/nonexistent"),
                 PathBuf::from("/nonexistent/config.toml"),
@@ -7284,7 +7284,7 @@ exe_sha256 = "deadbeef"
                 "test".into(),
                 false,
                 vec![],
-                Arc::new(federation::FederationStatus::default()),
+                Arc::new(opaque_federation_runtime::federation::FederationStatus::default()),
             )),
         }
     }
