@@ -40,17 +40,23 @@ mod enclave;
 mod export;
 mod federation;
 mod identity;
-mod inference;
 mod provisioning_api;
 #[cfg(test)]
 mod provisioning_api_tests;
-mod resource_authority;
-mod ssh;
-mod task_api;
-mod task_store;
+#[cfg(test)]
+mod resource_authority_provisioning_tests;
 mod trust_domain;
 mod workload_attest;
 mod workspace_process;
+
+// `task_api`, `task_store`, `ssh`, `resource_authority`, and `inference`
+// moved to the `opaque-bounded-work` crate (the daemon's task-ledger/
+// SSH-execution/inference-brokering surface). `resource_authority`'s former
+// inline `#[cfg(test)] mod provisioning_tests` moved with it conceptually
+// but not literally: it needed the real `identity::IdentityRuntime`, which
+// stays here, so it now lives in this crate as
+// `resource_authority_provisioning_tests` above (declared here rather than
+// nested in a moved file, same wiring pattern as `provisioning_api_tests`).
 
 use workspace_process::WorkspaceCommandExt;
 
@@ -61,7 +67,6 @@ use enclave::{Enclave, NativeApprovalGate};
 use opaque_core::approval_gate::ApprovalGate;
 use opaque_core::enclave_facade::EnclaveFacade;
 use opaque_core::operation_handler::OperationHandler;
-use opaque_core::resolver::SecretResolver;
 
 // ---------------------------------------------------------------------------
 // Daemon configuration
@@ -75,10 +80,10 @@ struct DaemonConfig {
     tenant: Option<opaque_tenant::tenant::TenantConfig>,
     /// Sealed, operator-selected model and public source profile.
     #[serde(default)]
-    inference: Option<inference::InferenceProfileConfig>,
+    inference: Option<opaque_bounded_work::inference::InferenceProfileConfig>,
     /// One operator-pinned host operation using a Vault SSH signing role.
     #[serde(default)]
-    ssh: Option<ssh::SshProfileConfig>,
+    ssh: Option<opaque_bounded_work::ssh::SshProfileConfig>,
     /// Opt-in fixed-manifest publishing; existing single-write rules keep their floor.
     #[serde(default)]
     enable_task_grants: bool,
@@ -126,7 +131,7 @@ struct DaemonConfig {
     #[serde(default)]
     identity: Option<identity::IdentityConfig>,
     #[serde(default)]
-    resource_authority: Option<resource_authority::ResourceAuthorityConfig>,
+    resource_authority: Option<opaque_bounded_work::resource_authority::ResourceAuthorityConfig>,
     /// Explicitly scoped, human-authorized IdP provisioning mandates.
     #[serde(default)]
     provisioning: Option<identity::provisioning::ProvisioningConfig>,
@@ -331,7 +336,7 @@ struct DaemonState {
     workload_attestor: workload_attest::ListenerAttestor,
     tenant: Option<opaque_tenant::tenant::TenantBoundary>,
     enclave: Arc<Enclave>,
-    tasks: Option<Arc<task_store::TaskStore>>,
+    tasks: Option<Arc<opaque_bounded_work::task_store::TaskStore>>,
     audit: Arc<dyn AuditSink>,
     config: DaemonConfig,
     version: &'static str,
@@ -568,69 +573,30 @@ impl EnclaveFacade for DaemonState {
             }))
         })
     }
+
+    /// Re-verify a workspace claim. Delegates to the free function of the
+    /// same name below, which owns the actual bounded-subprocess machinery
+    /// (`workspace_process.rs`) — this trait method exists purely so
+    /// `opaque-bounded-work`'s `task_api` can invoke it as a live TOCTOU
+    /// recheck without depending on `opaqued` directly.
+    fn verify_workspace<'a>(
+        &'a self,
+        claimed: &'a opaque_core::operation::WorkspaceContext,
+        client_pid: Option<i32>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(verify_workspace(claimed, client_pid))
+    }
 }
 
-/// Build the standard set of provider secret resolvers wired into every
-/// `CompositeResolver` the daemon constructs.
-///
-/// Lives here (rather than in `opaque_sandbox::resolve`) because `main.rs`
-/// is the crate's composition root and already depends on every provider
-/// module; `opaque_sandbox::resolve::CompositeResolver` itself only holds
-/// type-erased `Box<dyn SecretResolver>` trait objects, so it never needs to
-/// name a concrete provider type — that would recreate the
-/// providers-vs-sandbox crate cycle this refactor exists to avoid. This fn
-/// is threaded into `opaque_sandbox::SandboxExecutor::new` as a
-/// `ResolverFactory` fn pointer, re-invoked on every `sandbox.exec` request.
-fn default_secret_resolvers() -> Vec<Box<dyn SecretResolver>> {
-    let mut resolvers: Vec<Box<dyn SecretResolver>> = Vec::new();
-
-    // 1Password backend selection:
-    // 1. Connect Server URL configured → use Connect Server
-    // 2. `op` CLI found in PATH → use `op` CLI
-    // 3. Neither → onepassword disabled
-    if let Ok(url) = std::env::var(opaque_providers::onepassword::client::CONNECT_URL_ENV) {
-        match opaque_providers::onepassword::client::OnePasswordClient::new(&url) {
-            Ok(client) => resolvers.push(Box::new(
-                opaque_providers::onepassword::resolve::OnePasswordResolver::new(client),
-            )),
-            Err(e) => tracing::warn!("1Password Connect client disabled: {e}"),
-        }
-    } else if let Ok(cli) = opaque_providers::onepassword::op_cli::OpCliClient::new() {
-        resolvers.push(Box::new(
-            opaque_providers::onepassword::resolve::OnePasswordResolver::from_cli(cli),
-        ));
-    }
-
-    // Bitwarden backend: available if URL scheme is valid.
-    let bitwarden_url = std::env::var(opaque_providers::bitwarden::client::BITWARDEN_URL_ENV)
-        .unwrap_or_else(|_| opaque_providers::bitwarden::client::DEFAULT_BASE_URL.to_owned());
-    match opaque_providers::bitwarden::client::BitwardenClient::new(&bitwarden_url) {
-        Ok(client) => resolvers.push(Box::new(
-            opaque_providers::bitwarden::resolve::BitwardenResolver::new(client),
-        )),
-        Err(e) => tracing::warn!("Bitwarden client disabled: {e}"),
-    }
-
-    // AWS remains disabled until SigV4 exists. Only explicitly configured
-    // loopback mocks can be reached by any aws: secret resolution path.
-    match opaque_providers::aws::client::AwsClient::from_mock_env() {
-        Ok(Some(client)) => resolvers.push(Box::new(
-            opaque_providers::aws::resolve::AwsResolver::new(client),
-        )),
-        Ok(None) => {}
-        Err(e) => tracing::warn!("AWS client disabled: {e}"),
-    }
-
-    // Vault backend: available if URL scheme is valid.
-    match opaque_providers::vault::client::VaultClient::new() {
-        Ok(client) => resolvers.push(Box::new(
-            opaque_providers::vault::resolve::VaultResolver::new(client),
-        )),
-        Err(e) => tracing::warn!("Vault client disabled: {e}"),
-    }
-
-    resolvers
-}
+// `default_secret_resolvers()` used to live here (main.rs is the crate's
+// composition root); it has been promoted to `opaque_providers` because it
+// has zero opaqued-specific dependencies (pure provider-client wiring from
+// env vars) and, after the `opaque-bounded-work` extraction, is needed by
+// `ssh.rs`/`inference/mod.rs` (now in `opaque-bounded-work`) in addition to
+// this file and `opaque_sandbox::SandboxExecutor::new`'s `ResolverFactory`
+// fn pointer — `opaque-providers` is the only non-circular common home for
+// all three call sites (`opaqued`, `opaque-bounded-work`, and transitively
+// `opaque-sandbox` all already depend on it).
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -1706,11 +1672,11 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
     let tasks = if config.enable_task_grants {
         Some(Arc::new(
             match tenant.as_ref() {
-                Some(boundary) => task_store::TaskStore::open_for_tenant(
+                Some(boundary) => opaque_bounded_work::task_store::TaskStore::open_for_tenant(
                     &state_dir.join("tasks.db"),
                     Some(boundary.binding().clone()),
                 ),
-                None => task_store::TaskStore::open(&state_dir.join("tasks.db")),
+                None => opaque_bounded_work::task_store::TaskStore::open(&state_dir.join("tasks.db")),
             }
             .map_err(|e| std::io::Error::other(format!("task ledger unavailable: {e}")))?,
         ))
@@ -1827,11 +1793,11 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
             let runtime = identity_runtime.clone().ok_or_else(|| {
                 std::io::Error::other("resource authority requires broker identity")
             })?;
-            let authority = resource_authority::ResourceAuthority::new(
+            let authority = opaque_bounded_work::resource_authority::ResourceAuthority::new(
                 resource_config,
-                runtime,
+                runtime as Arc<dyn opaque_bounded_work::resource_authority::IdentityAuthority>,
                 tenant.as_ref().map(|boundary| boundary.binding()),
-                config.provisioning.clone(),
+                config.provisioning.is_some(),
             )
             .map_err(std::io::Error::other)?;
             let listener = authority.bind()?;
@@ -1840,7 +1806,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         .transpose()?;
 
     let sandbox_executor =
-        opaque_sandbox::SandboxExecutor::new(audit.clone(), default_secret_resolvers);
+        opaque_sandbox::SandboxExecutor::new(audit.clone(), opaque_providers::default_secret_resolvers);
 
     // Execve policy hook handlers.
     let execve_mapper = Arc::new(ExecveMapper::new(
@@ -3376,6 +3342,37 @@ async fn verify_workspace(
         .map_err(|e| format!("workspace verification task failed: {e}"))?
 }
 
+/// Parse, sanitize, and verify a request's optional `workspace` claim.
+///
+/// Moved here from `opaque_bounded_work::task_api` (previously
+/// `task_api::verified_workspace`): it calls `verify_workspace` above,
+/// kernel-side machinery `opaque-bounded-work` must not reach back into.
+/// `handle_request` now computes this once per request for every method
+/// whose params may carry a `workspace` claim, and passes the result down —
+/// see the call site above.
+async fn verified_workspace(
+    params: &serde_json::Value,
+    identity: &ClientIdentity,
+) -> Result<Option<opaque_core::operation::WorkspaceContext>, String> {
+    let Some(value) = params.get("workspace").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let mut workspace: opaque_core::operation::WorkspaceContext =
+        serde_json::from_value(value.clone()).map_err(|_| "invalid workspace context")?;
+    if identity.pid.is_none() {
+        return Err("workspace peer pid is unavailable".into());
+    }
+    if let Some(url) = &workspace.remote_url {
+        workspace.remote_url = Some(InputValidator::sanitize_url(url));
+    }
+    workspace.workspace_verified = false;
+    verify_workspace(&workspace, identity.pid)
+        .await
+        .map_err(|_| "workspace verification failed")?;
+    workspace.workspace_verified = true;
+    Ok(Some(workspace))
+}
+
 // ---------------------------------------------------------------------------
 // Connection handler
 // ---------------------------------------------------------------------------
@@ -3973,12 +3970,47 @@ async fn handle_request(
         .await;
     }
 
+    // Computed once, up front, for every method whose params may carry a
+    // `workspace` claim: the `github`/`gitlab`/`onepassword`/`bitwarden`/
+    // `exec` family (via `wrapper_workspace` below) and the fixed-manifest
+    // task-planning family (`task_get`/`task_list`/`task_revoke` never look
+    // at `workspace`, so they are deliberately excluded — matching exactly
+    // which methods reached this check before `task_api` moved to
+    // `opaque-bounded-work`). `verified_workspace` (defined below, next to
+    // the `verify_workspace` machinery it wraps) used to live in
+    // `task_api.rs`; it moved here because it calls this file's kernel-side
+    // `verify_workspace`/`workspace_process.rs`, which `opaque-bounded-work`
+    // must not reach back into.
+    let verified_workspace = if matches!(
+        req.method.as_str(),
+        "github"
+            | "gitlab"
+            | "onepassword"
+            | "bitwarden"
+            | "exec"
+            | "task_plan"
+            | "task_plan_inference"
+            | "task_plan_ssh"
+            | "task_run"
+            | "task_reconcile"
+    ) {
+        verified_workspace(&req.params, identity).await
+    } else {
+        Ok(None)
+    };
+    // `github`/`gitlab`/`onepassword`/`bitwarden`/`exec` want the unwrapped
+    // value with one uniform, immediate failure response (unchanged
+    // behavior). The fixed-manifest task family instead gets the `Result`
+    // passed straight through to `task_api::handle`, which funnels a
+    // verification failure into its own `"task_unavailable"` error the same
+    // way it always has — preserving that pre-move behavior exactly rather
+    // than switching it to this uniform response too.
     let wrapper_workspace = if matches!(
         req.method.as_str(),
         "github" | "gitlab" | "onepassword" | "bitwarden" | "exec"
     ) {
-        match task_api::verified_workspace(&req.params, identity).await {
-            Ok(workspace) => workspace,
+        match &verified_workspace {
+            Ok(workspace) => workspace.clone(),
             Err(_) => {
                 return Response::err(
                     Some(req.id),
@@ -4000,13 +4032,26 @@ async fn handle_request(
         | "task_list"
         | "task_revoke"
         | "task_reconcile" => {
-            task_api::handle(
-                state,
+            let insecure_auto_approve = state.config.approval_backend.as_deref()
+                == Some("insecure_auto_approve")
+                || state.config.workstation_test_mode;
+            let kernel = opaque_bounded_work::task_api::TaskApiKernel {
+                facade: state,
+                enclave: state.enclave.as_ref(),
+                tasks: state.tasks.as_deref(),
+                tenant: state.tenant.as_ref(),
+                has_identity: state.identity.is_some(),
+                audit: state.audit.as_ref(),
+                insecure_auto_approve,
+            };
+            opaque_bounded_work::task_api::handle(
+                &kernel,
                 &req,
                 identity,
                 client_type,
                 session_id,
                 principal_ctx,
+                verified_workspace,
             )
             .await
         }

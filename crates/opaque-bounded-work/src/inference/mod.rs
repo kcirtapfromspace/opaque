@@ -236,7 +236,7 @@ fn credential(
         .credential_ref
         .as_deref()
         .map(|reference| {
-            let secret = CompositeResolver::new(crate::default_secret_resolvers())
+            let secret = CompositeResolver::new(opaque_providers::default_secret_resolvers())
                 .resolve(reference)
                 .map_err(|_| unavailable())?;
             secret.mlock();

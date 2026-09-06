@@ -4,6 +4,7 @@ members = [
   "crates/opaque-core",
   "crates/opaque-providers",
   "crates/opaque-sandbox",
+  "crates/opaque-bounded-work",
   "crates/opaqued",
   "crates/opaque",
   "crates/opaque-approval",

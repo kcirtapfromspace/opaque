@@ -93,4 +93,31 @@ pub trait EnclaveFacade: Send + Sync {
         &'a self,
         session_id: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = Result<Option<PrincipalContext>, String>> + Send + 'a>>;
+
+    /// Re-verify a previously-verified workspace claim against the client's
+    /// live process state (a TOCTOU recheck point during long-running task
+    /// planning/execution — the same shape of problem
+    /// `resolve_principal_context` solves for principal liveness). Mirrors
+    /// the free function `verify_workspace` in `opaqued`'s `main.rs`, which
+    /// owns the bounded git-subprocess verifier (`workspace_process.rs`,
+    /// deliberately kernel-side per the release security review that added
+    /// it — a cross-cutting precondition check, not bounded-work-specific
+    /// logic) that has no reason to live in `opaque-core`.
+    ///
+    /// Call sites that only need a *single*, transport-level verification
+    /// (the `github`/`gitlab`/`onepassword`/`bitwarden`/`exec`/task-family
+    /// RPC methods) do not need this method at all: `opaqued::main.rs`'s
+    /// `handle_request` computes that once per request and passes the
+    /// already-verified `WorkspaceContext` down by value. This method exists
+    /// for the small number of call sites (currently: the fixed-manifest
+    /// task API's release-observation reconciliation and task-execution
+    /// paths) that must re-verify *again*, at a point in time chosen by
+    /// their own control flow after further async work — a value computed
+    /// once upfront cannot serve that, only a live callback into the kernel
+    /// can.
+    fn verify_workspace<'a>(
+        &'a self,
+        claimed: &'a crate::operation::WorkspaceContext,
+        client_pid: Option<i32>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 }
