@@ -15,6 +15,7 @@ plan-*.md
 *-explorer.html
 .wrangler/
 .playwright-cli/
+.claude/worktrees/
 output/
 __pycache__/
 *.pyc

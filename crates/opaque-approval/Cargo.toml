@@ -1,0 +1,46 @@
+[package]
+name = "opaque-approval"
+version.workspace = true
+edition = "2024"
+publish = false
+description = "Approval mechanisms for Opaque: device pairing, FIDO2, factor registry, native prompting, and the approval-server relay"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+opaque-core = { path = "../opaque-core" }
+axum = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+ed25519-dalek = { workspace = true }
+futures-util = { workspace = true }
+getrandom = { workspace = true }
+hmac = "0.12"
+hyper-util = { workspace = true }
+jsonwebtoken = { workspace = true }
+libc = { workspace = true }
+mdns-sd = { workspace = true }
+p256 = { workspace = true }
+rcgen = { workspace = true }
+reqwest = { workspace = true }
+rustls = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+opaque-approver = { path = "../opaque-approver" }
+rand = { workspace = true }
+tempfile = "3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6.2"
+objc2 = { version = "0.6.3", default-features = false, features = ["std"] }
+objc2-foundation = "0.3.2"
+objc2-local-authentication = { version = "0.3.2", default-features = false, features = ["std", "block2", "LAContext"] }

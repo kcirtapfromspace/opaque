@@ -5,7 +5,7 @@ use opaque_core::{
     resource_auth::{AuthError, BrokerClient, BrokerClientConfig},
     tenant::{TenantBinding, TenantId},
 };
-use opaque_metrics::server::{App, GatewayConfig, router};
+use opaque_showcase::server::{App, GatewayConfig, router};
 use serde_json::{Value, json};
 use std::{
     os::unix::fs::PermissionsExt,
