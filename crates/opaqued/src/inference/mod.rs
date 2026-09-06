@@ -11,7 +11,7 @@ use opaque_core::task::{SlotOutcome, SlotState, TaskManifest};
 use opaque_core::tenant::TenantBinding;
 use serde::{Deserialize, Serialize};
 
-use crate::sandbox::resolve::CompositeResolver;
+use opaque_sandbox::resolve::CompositeResolver;
 use client::{CompletionResult, InferenceClient};
 use opaque_core::resolver::SecretResolver;
 

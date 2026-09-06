@@ -45,7 +45,6 @@ mod provisioning_api;
 #[cfg(test)]
 mod provisioning_api_tests;
 mod resource_authority;
-mod sandbox;
 mod ssh;
 mod task_api;
 mod task_store;
@@ -569,12 +568,14 @@ impl EnclaveFacade for DaemonState {
 /// Build the standard set of provider secret resolvers wired into every
 /// `CompositeResolver` the daemon constructs.
 ///
-/// Lives here (rather than in `sandbox::resolve`) because `main.rs` is the
-/// crate's composition root and already depends on every provider module;
-/// `sandbox::resolve::CompositeResolver` itself only holds type-erased
-/// `Box<dyn SecretResolver>` trait objects, so it never needs to name a
-/// concrete provider type — that would recreate the providers-vs-sandbox
-/// crate cycle this refactor exists to avoid.
+/// Lives here (rather than in `opaque_sandbox::resolve`) because `main.rs`
+/// is the crate's composition root and already depends on every provider
+/// module; `opaque_sandbox::resolve::CompositeResolver` itself only holds
+/// type-erased `Box<dyn SecretResolver>` trait objects, so it never needs to
+/// name a concrete provider type — that would recreate the
+/// providers-vs-sandbox crate cycle this refactor exists to avoid. This fn
+/// is threaded into `opaque_sandbox::SandboxExecutor::new` as a
+/// `ResolverFactory` fn pointer, re-invoked on every `sandbox.exec` request.
 fn default_secret_resolvers() -> Vec<Box<dyn SecretResolver>> {
     let mut resolvers: Vec<Box<dyn SecretResolver>> = Vec::new();
 
@@ -1831,7 +1832,8 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         })
         .transpose()?;
 
-    let sandbox_executor = sandbox::SandboxExecutor::new(audit.clone());
+    let sandbox_executor =
+        opaque_sandbox::SandboxExecutor::new(audit.clone(), default_secret_resolvers);
 
     // Execve policy hook handlers.
     let execve_mapper = Arc::new(ExecveMapper::new(
@@ -1844,7 +1846,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         config.execve_default.decision,
     );
     let (execve_check_handler, execve_approve_handler) =
-        sandbox::execve_hook::create_execve_handlers(audit.clone(), execve_mapper);
+        opaque_sandbox::execve_hook::create_execve_handlers(audit.clone(), execve_mapper);
 
     let github_actions_handler =
         opaque_providers::github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;

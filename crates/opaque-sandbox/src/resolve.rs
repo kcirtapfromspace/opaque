@@ -67,8 +67,15 @@ impl fmt::Debug for CompositeResolver {
 
 impl CompositeResolver {
     /// Build a composite resolver from an explicit set of provider
-    /// resolvers. Callers outside this module get their provider set from
-    /// `crate::default_secret_resolvers()` (the composition root).
+    /// resolvers. Callers get their provider set from the composition
+    /// root's `default_secret_resolvers()` — e.g. `opaqued`'s, threaded
+    /// through as a [`crate::ResolverFactory`] passed to
+    /// [`crate::SandboxExecutor::new`]. This module never names a concrete
+    /// provider type, so it has no way to build a default provider set
+    /// itself (hence no `Default` impl: an empty-provider default would
+    /// silently under-configure the resolver, and a real one would require
+    /// depending back on `opaque-providers` and every downstream binary's
+    /// composition root, recreating the cycle this crate split avoids).
     pub fn new(providers: Vec<Box<dyn SecretResolver>>) -> Self {
         Self {
             env: EnvResolver,
@@ -82,12 +89,6 @@ impl CompositeResolver {
     #[cfg(test)]
     fn without_onepassword() -> Self {
         Self::new(Vec::new())
-    }
-}
-
-impl Default for CompositeResolver {
-    fn default() -> Self {
-        Self::new(crate::default_secret_resolvers())
     }
 }
 

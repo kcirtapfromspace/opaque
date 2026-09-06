@@ -13,6 +13,7 @@ tempfile = "3"
 opaque-core = { path = "../opaque-core" }
 opaque-approval = { path = "../opaque-approval" }
 opaque-providers = { path = "../opaque-providers" }
+opaque-sandbox = { path = "../opaque-sandbox" }
 bytes = { workspace = true }
 libc = { workspace = true }
 futures-util = { workspace = true }
@@ -54,8 +55,7 @@ tokio = { workspace = true, features = ["test-util"] }
 wiremock = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls"] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-landlock = "0.4"
-seccompiler = "0.4"
+# Landlock/seccomp deps moved to opaque-sandbox (crates/opaque-sandbox), the
+# only place in the workspace that still uses them directly.
 
 # Linux approval is handled by the opaque-approve-helper binary (subprocess).

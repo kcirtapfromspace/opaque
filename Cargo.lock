@@ -2297,6 +2297,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "opaque-sandbox"
+version = "0.2.0"
+dependencies = [
+ "landlock",
+ "libc",
+ "opaque-core",
+ "seccompiler",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "opaque-web"
 version = "0.2.0"
 dependencies = [
@@ -2333,7 +2349,6 @@ dependencies = [
  "glob-match",
  "hyper-util",
  "jsonwebtoken",
- "landlock",
  "libc",
  "mdns-sd",
  "opaque-approval",
@@ -2341,6 +2356,7 @@ dependencies = [
  "opaque-core",
  "opaque-metrics",
  "opaque-providers",
+ "opaque-sandbox",
  "p256",
  "rand 0.8.8",
  "rcgen",
@@ -2348,7 +2364,6 @@ dependencies = [
  "ring",
  "rusqlite",
  "rustls",
- "seccompiler",
  "serde",
  "serde_json",
  "sha2",
