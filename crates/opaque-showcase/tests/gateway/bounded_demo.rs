@@ -1,6 +1,6 @@
 //! HTTP and durable-ledger regressions for the synthetic bounded-work surface.
 use super::*;
-use opaque_metrics::bounded_demo::{Error, Store, TaskReference, TaskState};
+use opaque_showcase::bounded_demo::{Error, Store, TaskReference, TaskState};
 use webauthn_authenticator_rs::{WebauthnAuthenticator, softpasskey::SoftPasskey};
 
 async fn value(response: Response) -> Value {
@@ -18,7 +18,7 @@ fn reference(task: &Value) -> Value {
 }
 fn ledger_approve(
     store: &mut Store,
-    access: &opaque_metrics::auth::VerifiedAccess,
+    access: &opaque_showcase::auth::VerifiedAccess,
     reference: &TaskReference,
 ) {
     let approved_at = now();
@@ -34,10 +34,10 @@ fn ledger_approve(
             2,
             approved_at,
             reference,
-            opaque_metrics::bounded_demo::Approval {
+            opaque_showcase::bounded_demo::Approval {
                 kind: "webauthn".into(),
                 approved_at,
-                verification: Some(opaque_metrics::bounded_demo::ApprovalVerification {
+                verification: Some(opaque_showcase::bounded_demo::ApprovalVerification {
                     issuer: None,
                     subject: "test-fixture".into(),
                     credential_sha256: Some("a".repeat(64)),
@@ -538,7 +538,7 @@ async fn bounded_task_support_case_does_not_grant_analyst_task_authority() {
 async fn bounded_ledger_restart_expiry_key_binding_and_profile_binding() {
     let fixture = Fixture::organization(false).await;
     let token = fixture.persona_token(Persona::CustomerAnalyst);
-    let verifier = opaque_metrics::auth::AuthVerifier::new(fixture.config.auth.clone()).unwrap();
+    let verifier = opaque_showcase::auth::AuthVerifier::new(fixture.config.auth.clone()).unwrap();
     let access = verifier
         .verify_bearer(Some(&format!("Bearer {token}")))
         .unwrap();
@@ -632,14 +632,14 @@ async fn bounded_ledger_restart_expiry_key_binding_and_profile_binding() {
     store
         .transition(&access, 2, now(), &reference, TaskState::Reserved)
         .unwrap();
-    let evidence = opaque_metrics::metrics::MetricsEvidence {
+    let evidence = opaque_showcase::metrics::MetricsEvidence {
         tenant_id: fixture.config.tenant_id.clone(),
         source_id: fixture.config.source.source_id.clone(),
         window_secs: 60,
         as_of: now(),
         watermark: now(),
         observed_at: now(),
-        metrics: vec![opaque_metrics::metrics::MetricRow {
+        metrics: vec![opaque_showcase::metrics::MetricRow {
             name: "manual_review_rate_percent".into(),
             value: 17.25,
             count: 100,
@@ -676,7 +676,7 @@ async fn bounded_ledger_restart_expiry_key_binding_and_profile_binding() {
 async fn legacy_unsigned_approval_cannot_execute_after_upgrade() {
     let fixture = Fixture::organization(false).await;
     let token = fixture.persona_token(Persona::CustomerAnalyst);
-    let verifier = opaque_metrics::auth::AuthVerifier::new(fixture.config.auth.clone()).unwrap();
+    let verifier = opaque_showcase::auth::AuthVerifier::new(fixture.config.auth.clone()).unwrap();
     let access = verifier
         .verify_bearer(Some(&format!("Bearer {token}")))
         .unwrap();

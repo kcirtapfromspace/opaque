@@ -9,7 +9,7 @@ use axum::{
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use opaque_core::tenant::TenantId;
-use opaque_metrics::{
+use opaque_showcase::{
     auth::{Admission, AuthConfig, METRIC_SCOPES},
     chat::ModelConfig,
     experience::{CREDIT_METRICS, Experience},
@@ -111,7 +111,7 @@ impl Fixture {
         let directory = TestDirectory::new();
         // Cargo supplies this public package name to the test process. Using it
         // avoids mutating shared process environment or reading any real secret.
-        assert_eq!(std::env::var("CARGO_PKG_NAME").unwrap(), "opaque-metrics");
+        assert_eq!(std::env::var("CARGO_PKG_NAME").unwrap(), "opaque-showcase");
         let mut config = GatewayConfig {
             broker_authority: None,
             bind,
@@ -184,10 +184,10 @@ impl Fixture {
         }
         if portfolio {
             config.source.allowed_portfolio_measures =
-                opaque_metrics::portfolio::Measure::ALL.to_vec();
+                opaque_showcase::portfolio::Measure::ALL.to_vec();
             let scopes = std::iter::once("portfolio:read".to_string())
                 .chain(
-                    opaque_metrics::portfolio::Measure::ALL
+                    opaque_showcase::portfolio::Measure::ALL
                         .iter()
                         .map(|m| m.scope()),
                 )
@@ -924,7 +924,7 @@ async fn production_configuration_cannot_enable_fixture_model_transport() {
     std::fs::write(&credential_file, [9u8; 32]).unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&credential_file, std::fs::Permissions::from_mode(0o600)).unwrap();
-    config.broker_authority = Some(opaque_metrics::auth::BrokerClientConfig {
+    config.broker_authority = Some(opaque_showcase::auth::BrokerClientConfig {
         socket_path: directory.0.join("resource.sock"),
         credential_file,
         broker_uid: unsafe { libc::geteuid() },
@@ -1101,11 +1101,11 @@ async fn authorized_mcp_uses_only_configured_source_credential_and_returns_bound
     assert_eq!(requests.len(), 1);
     assert_eq!(
         requests[0].headers[header::AUTHORIZATION],
-        "Bearer opaque-metrics"
+        "Bearer opaque-showcase"
     );
     assert!(!String::from_utf8_lossy(&requests[0].body).contains(&token));
     assert!(!response.to_string().contains(&token));
-    assert!(!response.to_string().contains("Bearer opaque-metrics"));
+    assert!(!response.to_string().contains("Bearer opaque-showcase"));
 }
 
 #[tokio::test]
@@ -1705,7 +1705,7 @@ async fn organization_epoch_blocks_queued_results_and_delayed_nested_mcp_after_a
 #[tokio::test]
 async fn organization_pure_state_intersects_case_expiry_epoch_and_preserves_prior_source_evidence()
 {
-    use opaque_metrics::{auth::AuthVerifier, organization::OrganizationState};
+    use opaque_showcase::{auth::AuthVerifier, organization::OrganizationState};
     let fixture = Fixture::organization(false).await;
     let verifier = AuthVerifier::new(fixture.config.auth.clone()).unwrap();
     let token = fixture.persona_token(Persona::Support);
@@ -1830,7 +1830,7 @@ async fn organization_named_directory_customer_is_denied_before_model_and_source
 
 #[tokio::test]
 async fn organization_control_and_activity_budgets_do_not_reset_across_personas() {
-    use opaque_metrics::{auth::AuthVerifier, organization::OrganizationState};
+    use opaque_showcase::{auth::AuthVerifier, organization::OrganizationState};
     let fixture = Fixture::organization(false).await;
     let verifier = AuthVerifier::new(fixture.config.auth.clone()).unwrap();
     let config = fixture.config.organization_demo.as_ref().unwrap();
@@ -2048,7 +2048,7 @@ async fn portfolio_chat_plans_and_selects_computed_findings_with_exact_source_bi
     assert_eq!(fixture.model.received_requests().await.unwrap().len(), 2);
     let calls = fixture.source.received_requests().await.unwrap();
     assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].headers["authorization"], "Bearer opaque-metrics");
+    assert_eq!(calls[0].headers["authorization"], "Bearer opaque-showcase");
     assert!(
         policy_events(&events)
             .iter()

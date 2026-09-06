@@ -81,7 +81,7 @@ async fn natural_paraphrases_use_live_proposals_and_multiple_authorized_reads() 
         for (index, read) in reads.iter().enumerate() {
             assert_eq!(read.url.path(), "/v1/portfolio/query");
             assert_eq!(read.body_json::<Value>().unwrap(), plan["queries"][index]);
-            assert_eq!(read.headers["authorization"], "Bearer opaque-metrics");
+            assert_eq!(read.headers["authorization"], "Bearer opaque-showcase");
             assert_eq!(results[index]["coverage"], "complete");
             assert_eq!(results[index]["partial"], true);
         }
@@ -198,7 +198,7 @@ async fn duplicate_valid_queries_read_once_and_preserve_the_first_query_and_evid
         assert_eq!(reads.len(), 1, "{events}");
         assert_eq!(reads[0].url.path(), "/v1/portfolio/query");
         assert_eq!(reads[0].body_json::<Value>().unwrap(), first);
-        assert_eq!(reads[0].headers["authorization"], "Bearer opaque-metrics");
+        assert_eq!(reads[0].headers["authorization"], "Bearer opaque-showcase");
 
         let results = values(&events, "portfolio_result");
         assert_eq!(results.len(), 1, "{events}");

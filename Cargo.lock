@@ -2309,37 +2309,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "opaque-metrics"
-version = "0.2.0"
-dependencies = [
- "aws-lc-rs",
- "axum",
- "base64 0.22.1",
- "clap",
- "futures-util",
- "getrandom 0.4.3",
- "jsonwebtoken",
- "libc",
- "opaque-core",
- "reqwest 0.12.28",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.20",
- "tokio",
- "tower",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "wat",
- "webauthn-authenticator-rs",
- "webauthn-rs",
- "wiremock",
- "zeroize",
-]
-
-[[package]]
 name = "opaque-providers"
 version = "0.2.0"
 dependencies = [
@@ -2374,6 +2343,37 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "opaque-showcase"
+version = "0.2.0"
+dependencies = [
+ "aws-lc-rs",
+ "axum",
+ "base64 0.22.1",
+ "clap",
+ "futures-util",
+ "getrandom 0.4.3",
+ "jsonwebtoken",
+ "libc",
+ "opaque-core",
+ "reqwest 0.12.28",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.20",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "wat",
+ "webauthn-authenticator-rs",
+ "webauthn-rs",
+ "wiremock",
+ "zeroize",
 ]
 
 [[package]]
@@ -2434,9 +2434,9 @@ dependencies = [
  "opaque-bounded-work",
  "opaque-core",
  "opaque-federation-runtime",
- "opaque-metrics",
  "opaque-providers",
  "opaque-sandbox",
+ "opaque-showcase",
  "opaque-tenant",
  "p256",
  "rand 0.8.8",

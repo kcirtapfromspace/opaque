@@ -52,7 +52,7 @@ mdns-sd = { workspace = true }
 hyper-util = { workspace = true }
 
 [dev-dependencies]
-opaque-metrics = { path = "../opaque-metrics" }
+opaque-showcase = { path = "../opaque-showcase" }
 opaque-approver = { path = "../opaque-approver" }
 tokio = { workspace = true, features = ["test-util"] }
 wiremock = { workspace = true }

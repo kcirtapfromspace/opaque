@@ -1,7 +1,7 @@
 //! Explicit, read-only live model qualification. These synthetic cases prove
 //! planner/selector behavior only, never authenticated source access or consent.
 use clap::Parser;
-use opaque_metrics::{
+use opaque_showcase::{
     chat::{ChatModel, ExplorationPlan, ModelConfig},
     exploration::Finding,
     portfolio::{Dimension, Measure, View},
