@@ -1,5 +1,5 @@
 [package]
-name = "opaque-metrics"
+name = "opaque-showcase"
 version.workspace = true
 edition = "2024"
 publish = false
