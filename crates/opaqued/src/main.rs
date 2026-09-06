@@ -68,7 +68,6 @@ mod provisioning_api_tests;
 mod push;
 mod resource_authority;
 mod sandbox;
-pub mod secret;
 mod ssh;
 mod task_api;
 mod task_store;
@@ -83,7 +82,11 @@ use workspace_process::WorkspaceCommandExt;
 use std::future::Future;
 use std::pin::Pin;
 
-use enclave::{Enclave, NativeApprovalGate, OperationHandler};
+use enclave::{Enclave, NativeApprovalGate};
+use opaque_core::approval_gate::ApprovalGate;
+use opaque_core::enclave_facade::EnclaveFacade;
+use opaque_core::operation_handler::OperationHandler;
+use opaque_core::resolver::SecretResolver;
 
 // ---------------------------------------------------------------------------
 // Daemon configuration
@@ -400,6 +403,244 @@ struct SessionDelegation {
     act: PrincipalId,
     mode: AccessMode,
     human_session_id: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// EnclaveFacade: the narrow kernel-facing seam `opaque_core` exposes for
+// transport/dispatch code (`task_api.rs`, `provisioning_api.rs`, the
+// `github` RPC convenience wrapper) that is destined to move out of this
+// binary crate. Implemented for `DaemonState` rather than `Enclave` alone
+// because `resolve_principal_context` needs `agent_sessions`/`identity`/
+// `federation`, which only `DaemonState` owns; the other methods simply
+// delegate to the concrete `Enclave`.
+// ---------------------------------------------------------------------------
+
+impl EnclaveFacade for DaemonState {
+    fn preflight_task(
+        &self,
+        request: &mut OperationRequest,
+        manifest: &opaque_core::task::TaskManifest,
+    ) -> Result<(), String> {
+        self.enclave.preflight_task(request, manifest)
+    }
+
+    fn preflight_task_observation(
+        &self,
+        base: &OperationRequest,
+        manifest: &opaque_core::task::TaskManifest,
+    ) -> Result<(), String> {
+        self.enclave.preflight_task_observation(base, manifest)
+    }
+
+    fn execute(
+        &self,
+        request: OperationRequest,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = opaque_core::sanitize::SanitizedResponse<
+                        opaque_core::sanitize::Sanitized,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(self.enclave.execute(request))
+    }
+
+    fn swap_policy(&self, policy: PolicyEngine) -> usize {
+        self.enclave.swap_policy(policy)
+    }
+
+    fn request_control_approval<'a>(
+        &'a self,
+        identity: &'a ClientIdentity,
+        client_type: ClientType,
+        operation_label: &'a str,
+        action_description: &'a str,
+        reason: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<opaque_core::audit::ApproverIdentity>, String>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.enclave
+                .request_control_approval(
+                    identity,
+                    client_type,
+                    operation_label,
+                    action_description,
+                    reason,
+                )
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// Resolve the verified principal context bound to an agent session.
+    ///
+    /// Promoted from the free function of the same name that used to live
+    /// here; every existing call site keeps calling the free function below,
+    /// which now just delegates to this trait method.
+    fn resolve_principal_context<'a>(
+        &'a self,
+        session_id: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<PrincipalContext>, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(sid) = session_id else {
+                return Ok(None);
+            };
+            let delegation = {
+                let sessions = self.agent_sessions.read().await;
+                match sessions.get(sid) {
+                    Some(s) if s.expires_at > SystemTime::now() => s.delegation.clone(),
+                    Some(_) => return Err("agent session expired".into()),
+                    None => return Err("agent session no longer exists".into()),
+                }
+            };
+            let Some(d) = delegation else {
+                return Ok(None);
+            };
+            let Some(rt) = self.identity.as_ref() else {
+                return Err("delegated session without an identity runtime".into());
+            };
+
+            let now = now_unix();
+
+            let row = rt
+                .store
+                .get_delegation(&d.jti)
+                .map_err(|e| format!("delegation lookup failed: {e}"))?
+                .ok_or("delegation record missing")?;
+            if row.revoked_at.is_some() {
+                return Err("delegation revoked".into());
+            }
+            if row.expires_at <= now {
+                return Err("delegation expired".into());
+            }
+
+            let sub_principal = rt
+                .store
+                .get_principal(&d.sub)
+                .map_err(|e| format!("principal lookup failed: {e}"))?
+                .ok_or("delegating principal missing")?;
+            if sub_principal.disabled {
+                return Err("delegating principal disabled".into());
+            }
+            if !rt.principal_permitted(&sub_principal) {
+                return Err(
+                    "delegating principal is no longer permitted by identity policy".into(),
+                );
+            }
+            let act_principal = rt
+                .store
+                .get_principal(&d.act)
+                .map_err(|e| format!("principal lookup failed: {e}"))?
+                .ok_or("agent principal missing")?;
+            if act_principal.disabled {
+                return Err("agent principal disabled".into());
+            }
+
+            // Delegated / break-glass access is only as alive as the human login
+            // session it was granted under.
+            if matches!(d.mode, AccessMode::Delegated | AccessMode::BreakGlass) {
+                let hs_id = d
+                    .human_session_id
+                    .as_deref()
+                    .ok_or("delegation missing its human session binding")?;
+                let hs = rt
+                    .store
+                    .get_human_session(hs_id)
+                    .map_err(|e| format!("session lookup failed: {e}"))?
+                    .ok_or("human login session missing")?;
+                if hs.revoked_at.is_some() {
+                    return Err("human login session revoked".into());
+                }
+                if hs.expires_at <= now {
+                    return Err("human login session expired".into());
+                }
+                if hs.idp_issuer != rt.config.issuer {
+                    return Err("human login session issuer is no longer permitted".into());
+                }
+                if hs.principal_id != d.sub {
+                    return Err("human login session does not match the delegation".into());
+                }
+            }
+
+            // Team membership comes from the applied federation bundle, resolved
+            // daemon-side per request (bundle refresh takes effect immediately).
+            let sub_teams = self.federation.teams_of(&sub_principal.display_label());
+
+            Ok(Some(PrincipalContext {
+                sub: d.sub.clone(),
+                sub_label: sub_principal.display_label(),
+                sub_roles: sub_principal.roles.clone(),
+                sub_teams,
+                act: d.act.clone(),
+                act_label: act_principal.display_label(),
+                mode: d.mode,
+                jti: d.jti.clone(),
+                human_session_id: d.human_session_id.clone(),
+            }))
+        })
+    }
+}
+
+/// Build the standard set of provider secret resolvers wired into every
+/// `CompositeResolver` the daemon constructs.
+///
+/// Lives here (rather than in `sandbox::resolve`) because `main.rs` is the
+/// crate's composition root and already depends on every provider module;
+/// `sandbox::resolve::CompositeResolver` itself only holds type-erased
+/// `Box<dyn SecretResolver>` trait objects, so it never needs to name a
+/// concrete provider type — that would recreate the providers-vs-sandbox
+/// crate cycle this refactor exists to avoid.
+fn default_secret_resolvers() -> Vec<Box<dyn SecretResolver>> {
+    let mut resolvers: Vec<Box<dyn SecretResolver>> = Vec::new();
+
+    // 1Password backend selection:
+    // 1. Connect Server URL configured → use Connect Server
+    // 2. `op` CLI found in PATH → use `op` CLI
+    // 3. Neither → onepassword disabled
+    if let Ok(url) = std::env::var(onepassword::client::CONNECT_URL_ENV) {
+        match onepassword::client::OnePasswordClient::new(&url) {
+            Ok(client) => resolvers.push(Box::new(onepassword::resolve::OnePasswordResolver::new(
+                client,
+            ))),
+            Err(e) => tracing::warn!("1Password Connect client disabled: {e}"),
+        }
+    } else if let Ok(cli) = onepassword::op_cli::OpCliClient::new() {
+        resolvers.push(Box::new(
+            onepassword::resolve::OnePasswordResolver::from_cli(cli),
+        ));
+    }
+
+    // Bitwarden backend: available if URL scheme is valid.
+    let bitwarden_url = std::env::var(bitwarden::client::BITWARDEN_URL_ENV)
+        .unwrap_or_else(|_| bitwarden::client::DEFAULT_BASE_URL.to_owned());
+    match bitwarden::client::BitwardenClient::new(&bitwarden_url) {
+        Ok(client) => resolvers.push(Box::new(bitwarden::resolve::BitwardenResolver::new(client))),
+        Err(e) => tracing::warn!("Bitwarden client disabled: {e}"),
+    }
+
+    // AWS remains disabled until SigV4 exists. Only explicitly configured
+    // loopback mocks can be reached by any aws: secret resolution path.
+    match aws::client::AwsClient::from_mock_env() {
+        Ok(Some(client)) => resolvers.push(Box::new(aws::resolve::AwsResolver::new(client))),
+        Ok(None) => {}
+        Err(e) => tracing::warn!("AWS client disabled: {e}"),
+    }
+
+    // Vault backend: available if URL scheme is valid.
+    match vault::client::VaultClient::new() {
+        Ok(client) => resolvers.push(Box::new(vault::resolve::VaultResolver::new(client))),
+        Err(e) => tracing::warn!("Vault client disabled: {e}"),
+    }
+
+    resolvers
 }
 
 // ---------------------------------------------------------------------------
@@ -1906,7 +2147,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
     }
 
     let mut registered_factors: Vec<String> = Vec::new();
-    let approval_gate: Box<dyn enclave::ApprovalGate> = match backend {
+    let approval_gate: Box<dyn ApprovalGate> = match backend {
         ApprovalBackendKind::Native => {
             let mut registry = factors::FactorRegistry::new();
 
@@ -3659,103 +3900,17 @@ fn is_operation_method(method: &str) -> bool {
 ///   from the store so role edits apply immediately.
 /// - `Err(reason)` — the session HAS a delegation that is no longer valid
 ///   (fail closed: the caller must reject operation requests).
+///
+/// Thin wrapper kept so the many existing call sites (in this file and in
+/// `task_api.rs`/`provisioning_api.rs`) don't need to change; the real logic
+/// now lives in `<DaemonState as EnclaveFacade>::resolve_principal_context`
+/// so it is reachable through the trait by code that only has `&dyn
+/// EnclaveFacade`, not a concrete `&DaemonState`.
 async fn resolve_principal_context(
     state: &DaemonState,
     session_id: Option<&str>,
 ) -> Result<Option<PrincipalContext>, String> {
-    let Some(sid) = session_id else {
-        return Ok(None);
-    };
-    let delegation = {
-        let sessions = state.agent_sessions.read().await;
-        match sessions.get(sid) {
-            Some(s) if s.expires_at > SystemTime::now() => s.delegation.clone(),
-            Some(_) => return Err("agent session expired".into()),
-            None => return Err("agent session no longer exists".into()),
-        }
-    };
-    let Some(d) = delegation else {
-        return Ok(None);
-    };
-    let Some(rt) = state.identity.as_ref() else {
-        return Err("delegated session without an identity runtime".into());
-    };
-
-    let now = now_unix();
-
-    let row = rt
-        .store
-        .get_delegation(&d.jti)
-        .map_err(|e| format!("delegation lookup failed: {e}"))?
-        .ok_or("delegation record missing")?;
-    if row.revoked_at.is_some() {
-        return Err("delegation revoked".into());
-    }
-    if row.expires_at <= now {
-        return Err("delegation expired".into());
-    }
-
-    let sub_principal = rt
-        .store
-        .get_principal(&d.sub)
-        .map_err(|e| format!("principal lookup failed: {e}"))?
-        .ok_or("delegating principal missing")?;
-    if sub_principal.disabled {
-        return Err("delegating principal disabled".into());
-    }
-    if !rt.principal_permitted(&sub_principal) {
-        return Err("delegating principal is no longer permitted by identity policy".into());
-    }
-    let act_principal = rt
-        .store
-        .get_principal(&d.act)
-        .map_err(|e| format!("principal lookup failed: {e}"))?
-        .ok_or("agent principal missing")?;
-    if act_principal.disabled {
-        return Err("agent principal disabled".into());
-    }
-
-    // Delegated / break-glass access is only as alive as the human login
-    // session it was granted under.
-    if matches!(d.mode, AccessMode::Delegated | AccessMode::BreakGlass) {
-        let hs_id = d
-            .human_session_id
-            .as_deref()
-            .ok_or("delegation missing its human session binding")?;
-        let hs = rt
-            .store
-            .get_human_session(hs_id)
-            .map_err(|e| format!("session lookup failed: {e}"))?
-            .ok_or("human login session missing")?;
-        if hs.revoked_at.is_some() {
-            return Err("human login session revoked".into());
-        }
-        if hs.expires_at <= now {
-            return Err("human login session expired".into());
-        }
-        if hs.idp_issuer != rt.config.issuer {
-            return Err("human login session issuer is no longer permitted".into());
-        }
-        if hs.principal_id != d.sub {
-            return Err("human login session does not match the delegation".into());
-        }
-    }
-
-    // Team membership comes from the applied federation bundle, resolved
-    // daemon-side per request (bundle refresh takes effect immediately).
-    let sub_teams = state.federation.teams_of(&sub_principal.display_label());
-
-    Ok(Some(PrincipalContext {
-        sub: d.sub.clone(),
-        sub_label: sub_principal.display_label(),
-        sub_roles: sub_principal.roles.clone(),
-        sub_teams,
-        act: d.act.clone(),
-        act_label: act_principal.display_label(),
-        mode: d.mode,
-        jti: d.jti.clone(),
-        human_session_id: d.human_session_id.clone(),
-    }))
+    <DaemonState as EnclaveFacade>::resolve_principal_context(state, session_id).await
 }
 
 async fn handle_request(
@@ -5863,11 +6018,7 @@ async fn handle_request(
                 workspace: wrapper_workspace.clone(),
             };
 
-            state
-                .enclave
-                .execute(op_req)
-                .await
-                .into_proto_response(req.id)
+            state.execute(op_req).await.into_proto_response(req.id)
         }
         "gitlab" => {
             // Convenience wrapper for gitlab.set_ci_variable.
@@ -6375,7 +6526,7 @@ async fn handle_request(
 /// Routes to `github.list_secrets` operation in the enclave.
 async fn handle_github_list_secrets(
     req: &opaque_core::proto::Request,
-    state: &DaemonState,
+    state: &dyn EnclaveFacade,
     identity: &ClientIdentity,
     client_type: ClientType,
     principal_ctx: Option<&PrincipalContext>,
@@ -6435,11 +6586,7 @@ async fn handle_github_list_secrets(
         },
     };
 
-    state
-        .enclave
-        .execute(op_req)
-        .await
-        .into_proto_response(req.id)
+    state.execute(op_req).await.into_proto_response(req.id)
 }
 
 /// Handle `github` method with `action: "delete_secret"`.
@@ -6447,7 +6594,7 @@ async fn handle_github_list_secrets(
 /// Routes to `github.delete_secret` operation in the enclave.
 async fn handle_github_delete_secret(
     req: &opaque_core::proto::Request,
-    state: &DaemonState,
+    state: &dyn EnclaveFacade,
     identity: &ClientIdentity,
     client_type: ClientType,
     principal_ctx: Option<&PrincipalContext>,
@@ -6521,11 +6668,7 @@ async fn handle_github_delete_secret(
         },
     };
 
-    state
-        .enclave
-        .execute(op_req)
-        .await
-        .into_proto_response(req.id)
+    state.execute(op_req).await.into_proto_response(req.id)
 }
 
 // ---------------------------------------------------------------------------
@@ -7513,7 +7656,7 @@ exe_sha256 = "deadbeef"
         approve: bool,
     }
 
-    impl crate::enclave::ApprovalGate for TestApprovalGate {
+    impl ApprovalGate for TestApprovalGate {
         fn request_approval(
             &self,
             _approval_id: uuid::Uuid,
@@ -7522,17 +7665,18 @@ exe_sha256 = "deadbeef"
             _description: &str,
         ) -> std::pin::Pin<
             Box<
-                dyn std::future::Future<Output = Result<crate::enclave::ApprovalOutcome, String>>
-                    + Send
+                dyn std::future::Future<
+                        Output = Result<opaque_core::approval_gate::ApprovalOutcome, String>,
+                    > + Send
                     + '_,
             >,
         > {
             let approve = self.approve;
             Box::pin(async move {
                 Ok(if approve {
-                    crate::enclave::ApprovalOutcome::approved_anonymous()
+                    opaque_core::approval_gate::ApprovalOutcome::approved_anonymous()
                 } else {
-                    crate::enclave::ApprovalOutcome::denied()
+                    opaque_core::approval_gate::ApprovalOutcome::denied()
                 })
             })
         }
@@ -8659,7 +8803,7 @@ exe_sha256 = "deadbeef"
                 formatter.write_str("DisableDuringApproval")
             }
         }
-        impl crate::enclave::ApprovalGate for DisableDuringApproval {
+        impl ApprovalGate for DisableDuringApproval {
             fn request_approval(
                 &self,
                 _: Uuid,
@@ -8669,7 +8813,7 @@ exe_sha256 = "deadbeef"
             ) -> std::pin::Pin<
                 Box<
                     dyn std::future::Future<
-                            Output = Result<crate::enclave::ApprovalOutcome, String>,
+                            Output = Result<opaque_core::approval_gate::ApprovalOutcome, String>,
                         > + Send
                         + '_,
                 >,
@@ -8679,7 +8823,7 @@ exe_sha256 = "deadbeef"
                         .store
                         .set_disabled(&self.principal, true)
                         .unwrap();
-                    Ok(crate::enclave::ApprovalOutcome::approved_anonymous())
+                    Ok(opaque_core::approval_gate::ApprovalOutcome::approved_anonymous())
                 })
             }
         }

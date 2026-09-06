@@ -22,8 +22,8 @@ use std::sync::Arc;
 use opaque_core::audit::{AuditEvent, AuditEventKind, AuditSink};
 use opaque_core::operation::OperationRequest;
 
-use crate::enclave::OperationHandler;
-use crate::sandbox::resolve::{BaseResolver, SecretResolver};
+use opaque_core::operation_handler::OperationHandler;
+use opaque_core::resolver::{BaseResolver, SecretResolver};
 
 use client::BitwardenClient;
 

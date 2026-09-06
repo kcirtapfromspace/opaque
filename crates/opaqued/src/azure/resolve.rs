@@ -8,8 +8,8 @@
 //! resolved via environment variables. The vault URL is constructed from
 //! the vault name or overridden via `OPAQUE_AZURE_VAULT_URL`.
 
-use crate::sandbox::resolve::{ResolveError, SecretResolver};
-use crate::secret::SecretValue;
+use opaque_core::resolver::{ResolveError, SecretResolver};
+use opaque_core::secret::SecretValue;
 
 use super::client::{
     AZURE_CLIENT_ID_ENV, AZURE_CLIENT_SECRET_ENV, AZURE_TENANT_ID_ENV, AZURE_VAULT_URL_ENV,

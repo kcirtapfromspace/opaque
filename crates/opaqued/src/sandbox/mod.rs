@@ -30,8 +30,8 @@ use opaque_core::proto::ExecFrame;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 
-use crate::enclave::OperationHandler;
-use crate::secret::SecretValue;
+use opaque_core::operation_handler::OperationHandler;
+use opaque_core::secret::SecretValue;
 use resolve::{CompositeResolver, resolve_all};
 
 /// Errors from direct (unsandboxed) execution.
@@ -72,7 +72,7 @@ impl SandboxExecutor {
 
     /// Resolve all secret references in the profile.
     fn resolve_secrets(profile: &ExecProfile) -> Result<HashMap<String, SecretValue>, String> {
-        let resolver = CompositeResolver::new();
+        let resolver = CompositeResolver::new(crate::default_secret_resolvers());
         resolve_all(&profile.secrets, &resolver)
             .map_err(|e| format!("secret resolution failed: {e}"))
     }
@@ -492,7 +492,7 @@ mod tests {
 
     #[test]
     fn build_env_combines_secrets_and_literals() {
-        use crate::secret::SecretValue;
+        use opaque_core::secret::SecretValue;
         let profile = test_profile();
         let mut secrets = HashMap::new();
         secrets.insert(
@@ -507,7 +507,7 @@ mod tests {
 
     #[test]
     fn build_env_secrets_override_literals() {
-        use crate::secret::SecretValue;
+        use opaque_core::secret::SecretValue;
         let mut profile = test_profile();
         profile
             .env

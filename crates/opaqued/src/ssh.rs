@@ -23,7 +23,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 
-use crate::sandbox::resolve::{CompositeResolver, SecretResolver};
+use crate::sandbox::resolve::CompositeResolver;
+use opaque_core::resolver::SecretResolver;
 
 const CONTROL_DOMAIN: &[u8] = b"opaque.ssh-control.v1\0";
 const RECEIPT_DOMAIN: &[u8] = b"opaque.ssh-receipt.v1\0";
@@ -500,7 +501,7 @@ async fn vault_certificate(
     public: &ssh_key::PublicKey,
     expires_at: i64,
 ) -> Result<String, SignFailure> {
-    let token = CompositeResolver::new()
+    let token = CompositeResolver::new(crate::default_secret_resolvers())
         .resolve(&profile.vault_token_ref)
         .map_err(|_| SignFailure::Rejected)?;
     token.mlock();

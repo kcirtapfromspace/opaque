@@ -122,7 +122,7 @@ impl AttestationService {
     /// made true.
     pub fn observe(&self) -> (TrustDomainPosture, AuditPosture) {
         let uid = unsafe { libc::geteuid() };
-        let set = crate::trust_domain::custody_paths(
+        let set = opaque_core::trust_domain::custody_paths(
             &self.home,
             &self.config_path,
             self.audit_db.parent().unwrap_or_else(|| Path::new(".")),

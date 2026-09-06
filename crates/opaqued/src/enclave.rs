@@ -22,6 +22,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use opaque_core::approval_gate::{ApprovalGate, ApprovalOutcome};
 use opaque_core::audit::{
     AuditEvent, AuditEventKind, AuditLevel, AuditSink, ClientSummary, TargetSummary,
     WorkspaceSummary,
@@ -30,6 +31,7 @@ use opaque_core::operation::{
     ApprovalFactor, ApprovalRequirement, ClientIdentity, ClientType, OperationDef,
     OperationRegistry, OperationRequest, OperationSafety, validate_params,
 };
+use opaque_core::operation_handler::OperationHandler;
 use opaque_core::policy::{PolicyDecision, PolicyEngine};
 use opaque_core::sanitize::{Sanitized, SanitizedResponse, Sanitizer, Unsanitized};
 use sha2::{Digest, Sha256};
@@ -442,108 +444,13 @@ impl fmt::Debug for LeaseCache {
 }
 
 // ---------------------------------------------------------------------------
-// Operation handler trait
-// ---------------------------------------------------------------------------
-
-/// Trait for operation handlers. Each registered operation has a corresponding
-/// handler that performs the actual work.
-///
-/// Handlers receive the validated request and return a raw JSON payload.
-/// The enclave sanitizes the payload before returning it to the client.
-pub trait OperationHandler: Send + Sync + fmt::Debug {
-    /// Execute the operation. Returns a raw (unsanitized) JSON payload.
-    ///
-    /// The handler must NOT return secret values in the payload. The sanitizer
-    /// provides defense-in-depth, but handlers should be written to avoid
-    /// including secrets in the first place.
-    fn execute(
-        &self,
-        request: &OperationRequest,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + '_>,
-    >;
-}
-
-// ---------------------------------------------------------------------------
-// Approval gate trait
-// ---------------------------------------------------------------------------
-
-/// The result of one approval interaction.
-///
-/// SECURITY INVARIANT: `approver` must only ever be attached by the gate that
-/// actually VERIFIED the identity it names. The local biometric factor proves
-/// device-owner presence and binds the *name* to the active login session
-/// (source `LocalBioSession`). Paired-device / FIDO2 attribution (source
-/// `PairedDevice`) requires real signature verification against the pairing
-/// store — the dormant `approval_server` relays client-supplied device ids
-/// WITHOUT verification and must never be used as an approver source.
-#[derive(Debug, Clone)]
-pub struct ApprovalOutcome {
-    /// Whether the human (or configured backend) approved the request.
-    pub approved: bool,
-    /// The verified approver identity, when the gate could establish one.
-    /// `None` on denial, and on approval paths with no identity binding
-    /// (e.g. biometric passed but nobody is logged in).
-    pub approver: Option<opaque_core::audit::ApproverIdentity>,
-}
-
-impl ApprovalOutcome {
-    /// Approved, with no approver identity binding available.
-    pub fn approved_anonymous() -> Self {
-        Self {
-            approved: true,
-            approver: None,
-        }
-    }
-
-    /// Approved by a verified identity.
-    pub fn approved_by(approver: opaque_core::audit::ApproverIdentity) -> Self {
-        Self {
-            approved: true,
-            approver: Some(approver),
-        }
-    }
-
-    /// Denied.
-    pub fn denied() -> Self {
-        Self {
-            approved: false,
-            approver: None,
-        }
-    }
-}
-
-/// Trait for the approval gate. The enclave calls this to present
-/// operation-bound approval challenges to the user.
-///
-/// Approval is ALWAYS bound to a specific operation request. There is no
-/// generic "approve" endpoint.
-pub trait ApprovalGate: Send + Sync + fmt::Debug {
-    /// Present an approval challenge for the given operation request.
-    ///
-    /// The implementation must:
-    /// - Display the operation, target, client identity, and TTL to the user
-    /// - Use the specified approval factor(s)
-    /// - Return `Ok` with [`ApprovalOutcome`] (approved/denied, plus the
-    ///   verified approver identity when one exists — see the invariant on
-    ///   [`ApprovalOutcome`])
-    /// - Return `Err` if the approval mechanism is unavailable
-    ///
-    /// The `approval_id` is used for audit correlation.
-    fn request_approval(
-        &self,
-        approval_id: Uuid,
-        request: &OperationRequest,
-        factors: &[ApprovalFactor],
-        description: &str,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<ApprovalOutcome, String>> + Send + '_>,
-    >;
-}
-
-// ---------------------------------------------------------------------------
 // Enclave
 // ---------------------------------------------------------------------------
+//
+// `OperationHandler` and `ApprovalGate` (+ its `ApprovalOutcome` return type)
+// now live in `opaque_core::operation_handler` / `opaque_core::approval_gate`
+// (imported above) so provider and approval-backend crates can implement
+// them without depending on this binary crate.
 
 /// The central enforcement funnel.
 ///
