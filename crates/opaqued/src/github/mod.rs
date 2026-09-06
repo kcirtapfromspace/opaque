@@ -33,8 +33,9 @@ use opaque_core::operation::OperationRequest;
 
 use opaque_core::profile::ALLOWED_REF_SCHEMES;
 
-use crate::enclave::OperationHandler;
-use crate::sandbox::resolve::{CompositeResolver, SecretResolver};
+use crate::sandbox::resolve::CompositeResolver;
+use opaque_core::operation_handler::OperationHandler;
+use opaque_core::resolver::SecretResolver;
 
 use client::{GitHubClient, SecretScope};
 use crypto::encrypt_secret;
@@ -183,7 +184,7 @@ async fn set_secret_flow(
     extra_body: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     // 1. Resolve secret value and GitHub PAT.
-    let resolver = CompositeResolver::new();
+    let resolver = CompositeResolver::new(crate::default_secret_resolvers());
 
     let secret_value = resolver
         .resolve(value_ref)
@@ -572,7 +573,7 @@ impl GitHubHandler {
 
         let scope = parse_scope(params)?;
 
-        let resolver = CompositeResolver::new();
+        let resolver = CompositeResolver::new(crate::default_secret_resolvers());
         let github_token = resolver
             .resolve(&github_token_ref)
             .map_err(|e| format!("failed to resolve github_token_ref: {e}"))?;
@@ -642,7 +643,7 @@ impl GitHubHandler {
 
         let scope = parse_scope(params)?;
 
-        let resolver = CompositeResolver::new();
+        let resolver = CompositeResolver::new(crate::default_secret_resolvers());
         let github_token = resolver
             .resolve(&github_token_ref)
             .map_err(|e| format!("failed to resolve github_token_ref: {e}"))?;

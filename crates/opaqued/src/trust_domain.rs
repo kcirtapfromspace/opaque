@@ -22,7 +22,7 @@ use std::ffi::CString;
 use std::io;
 use std::path::Path;
 
-use opaque_core::trust_domain::{CustodyViolation, SystemFs, default_custody_set};
+use opaque_core::trust_domain::{CustodyViolation, SystemFs, custody_paths};
 use tracing::{info, warn};
 
 /// Which peer uids may hold a connection, given the daemon's mode.
@@ -71,44 +71,6 @@ pub fn startup_custody_check_at(
         );
     }
     check_custody(enforce, daemon_uid, &set)
-}
-
-pub fn custody_paths(
-    home: &Path,
-    config_path: &Path,
-    state_dir: &Path,
-) -> Vec<opaque_core::trust_domain::CustodyPath> {
-    let mut set = default_custody_set(home, config_path);
-    for item in &mut set {
-        if matches!(
-            item.label,
-            "daemon config" | "config seal key" | "config seal"
-        ) {
-            continue;
-        }
-        if let Ok(relative) = item.path.strip_prefix(home.join(".opaque")) {
-            item.path = state_dir.join(relative);
-        } else if state_dir != home.join(".opaque")
-            && let Ok(relative) = item.path.strip_prefix(home.join(".config/opaque"))
-        {
-            item.path = state_dir.join("approval").join(relative);
-        }
-    }
-    for name in [
-        "tasks.db",
-        "tasks.db-journal",
-        "tasks.db.writer.lock",
-        "tenant.binding.json",
-        "tenant.binding.lock",
-    ] {
-        set.push(opaque_core::trust_domain::CustodyPath {
-            path: state_dir.join(name),
-            kind: opaque_core::trust_domain::PathKind::File,
-            label: "task ledger",
-        });
-    }
-
-    set
 }
 
 fn check_custody(

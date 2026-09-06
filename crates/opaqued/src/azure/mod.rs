@@ -23,8 +23,8 @@ use std::sync::Arc;
 use opaque_core::audit::{AuditEvent, AuditEventKind, AuditSink};
 use opaque_core::operation::OperationRequest;
 
-use crate::enclave::OperationHandler;
-use crate::sandbox::resolve::SecretResolver;
+use opaque_core::operation_handler::OperationHandler;
+use opaque_core::resolver::SecretResolver;
 
 use client::AzureKeyVaultClient;
 
@@ -241,7 +241,7 @@ impl OperationHandler for AzureHandler {
                     );
 
                     // Resolve the secret value from the ref.
-                    let base = crate::sandbox::resolve::BaseResolver::new();
+                    let base = opaque_core::resolver::BaseResolver::new();
                     let secret_value = base
                         .resolve(value_ref)
                         .map_err(|e| format!("failed to resolve value_ref '{value_ref}': {e}"))?;

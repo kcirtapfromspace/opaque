@@ -1,5 +1,6 @@
 //! Owner-scoped transport for the fixed-manifest task workflow.
 use super::*;
+use opaque_core::enclave_facade::EnclaveFacade;
 use opaque_core::operation::WorkspaceContext;
 use opaque_core::sanitize::{SanitizedResponse, Sanitizer, Unsanitized};
 use opaque_core::task::TaskManifest;
@@ -250,7 +251,7 @@ async fn handle_inner(
         } else {
             crate::github::prepare_task_manifest(&mut manifest)?;
         }
-        state.enclave.preflight_task(&mut request, &manifest)?;
+        state.preflight_task(&mut request, &manifest)?;
         let manifest = if manifest.is_ssh() {
             manifest
         } else if manifest.is_inference() {
@@ -265,7 +266,7 @@ async fn handle_inner(
         if resolve_principal_context(state, session_id).await? != request.principal {
             return Err("task authority changed during planning".into());
         }
-        state.enclave.preflight_task(&mut request, &manifest)?;
+        state.preflight_task(&mut request, &manifest)?;
         let task = store
             .create(&owner, manifest, now_unix())
             .map_err(|e| e.to_string())?;
@@ -285,9 +286,7 @@ async fn handle_inner(
         {
             return Err("only an attempted staging dispatch can be reconciled".into());
         }
-        state
-            .enclave
-            .preflight_task_observation(&request, &task.manifest)?;
+        state.preflight_task_observation(&request, &task.manifest)?;
         let observation = crate::github::reconcile_staging_release(
             &task.manifest,
             id,
@@ -305,9 +304,7 @@ async fn handle_inner(
                 .await
                 .map_err(|_| "workspace changed during observation")?;
         }
-        state
-            .enclave
-            .preflight_task_observation(&request, &task.manifest)?;
+        state.preflight_task_observation(&request, &task.manifest)?;
         let task = store
             .record_release_observation(id, &owner, observation, now_unix())
             .map_err(|e| e.to_string())?;

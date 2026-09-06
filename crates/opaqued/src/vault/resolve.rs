@@ -7,8 +7,8 @@ use std::num::NonZeroU64;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::sandbox::resolve::{BaseResolver, ResolveError, SecretResolver};
-use crate::secret::SecretValue;
+use opaque_core::resolver::{BaseResolver, ResolveError, SecretResolver};
+use opaque_core::secret::SecretValue;
 use sha2::{Digest, Sha256};
 
 use super::client::{VaultClient, VaultLease};

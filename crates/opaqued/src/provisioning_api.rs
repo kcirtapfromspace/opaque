@@ -4,6 +4,7 @@ use std::{collections::HashMap, sync::Mutex};
 
 use opaque_core::{
     audit::AuditEventKind,
+    enclave_facade::EnclaveFacade,
     identity::{
         AccessMode, Principal, PrincipalContext, PrincipalId, PrincipalKind, Role, now_unix,
     },
@@ -415,7 +416,6 @@ async fn handle_inner(
                 )
             };
             state
-                .enclave
                 .request_control_approval(
                     peer,
                     client_type,

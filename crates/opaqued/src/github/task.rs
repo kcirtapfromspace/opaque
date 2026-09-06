@@ -5,9 +5,10 @@ use std::collections::HashMap;
 
 use opaque_core::task::{PublishAction, SlotOutcome, SlotState, TaskManifest};
 
-use crate::sandbox::resolve::{CompositeResolver, SecretResolver};
+use crate::sandbox::resolve::CompositeResolver;
 use crate::vault::client::{DEFAULT_BASE_URL, VAULT_URL_ENV, VaultClient};
 use crate::vault::resolve::{VaultResolver, validate_pinned_ref};
+use opaque_core::resolver::SecretResolver;
 
 use super::client::{
     DEFAULT_GITHUB_API_URL, GITHUB_API_URL_ENV, GitHubApiError, GitHubClient, SecretScope,
@@ -72,7 +73,7 @@ pub async fn plan_task_manifest(mut manifest: TaskManifest) -> Result<TaskManife
     prepare_task_manifest(&mut manifest)?;
     let client = GitHubClient::from_base_url(&manifest.github_api_url)
         .map_err(|_| "GitHub provider configuration unavailable".to_owned())?;
-    let resolver = CompositeResolver::new();
+    let resolver = CompositeResolver::new(crate::default_secret_resolvers());
     for action in &mut manifest.actions {
         let action = action
             .as_publish_mut()
@@ -182,7 +183,8 @@ where
     let Some(token_ref) = action.github_token_ref.as_deref() else {
         return unavailable();
     };
-    let Ok(token) = CompositeResolver::new().resolve(token_ref) else {
+    let Ok(token) = CompositeResolver::new(crate::default_secret_resolvers()).resolve(token_ref)
+    else {
         return unavailable();
     };
     token.mlock();

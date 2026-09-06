@@ -11,8 +11,9 @@ use opaque_core::task::{SlotOutcome, SlotState, TaskManifest};
 use opaque_core::tenant::TenantBinding;
 use serde::{Deserialize, Serialize};
 
-use crate::sandbox::resolve::{CompositeResolver, SecretResolver};
+use crate::sandbox::resolve::CompositeResolver;
 use client::{CompletionResult, InferenceClient};
+use opaque_core::resolver::SecretResolver;
 
 pub const DEMO_SOURCE_ID: &str = "opaque-public-receipts-v1";
 static INFERENCE_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -230,12 +231,12 @@ pub fn public_demo_manifest(
 
 fn credential(
     profile: &TrustedInferenceProfile,
-) -> Result<Option<crate::secret::SecretValue>, String> {
+) -> Result<Option<opaque_core::secret::SecretValue>, String> {
     profile
         .credential_ref
         .as_deref()
         .map(|reference| {
-            let secret = CompositeResolver::new()
+            let secret = CompositeResolver::new(crate::default_secret_resolvers())
                 .resolve(reference)
                 .map_err(|_| unavailable())?;
             secret.mlock();

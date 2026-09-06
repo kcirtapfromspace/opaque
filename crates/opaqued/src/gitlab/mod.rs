@@ -14,8 +14,9 @@ use opaque_core::audit::{AuditEvent, AuditEventKind, AuditSink};
 use opaque_core::operation::OperationRequest;
 use opaque_core::profile::ALLOWED_REF_SCHEMES;
 
-use crate::enclave::OperationHandler;
-use crate::sandbox::resolve::{CompositeResolver, SecretResolver};
+use crate::sandbox::resolve::CompositeResolver;
+use opaque_core::operation_handler::OperationHandler;
+use opaque_core::resolver::SecretResolver;
 
 use client::{GitLabClient, SetCiVariableOptions, SetCiVariableResponse};
 
@@ -150,7 +151,7 @@ impl OperationHandler for GitLabHandler {
                     let gitlab_token_ref = resolve_gitlab_token_ref(&params);
                     validate_value_ref(&gitlab_token_ref)?;
 
-                    let resolver = CompositeResolver::new();
+                    let resolver = CompositeResolver::new(crate::default_secret_resolvers());
                     let secret_value = resolver
                         .resolve(value_ref)
                         .map_err(|e| format!("failed to resolve value_ref: {e}"))?;

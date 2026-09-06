@@ -24,7 +24,7 @@ use std::sync::Arc;
 use opaque_core::audit::{AuditEvent, AuditEventKind, AuditSink};
 use opaque_core::operation::OperationRequest;
 
-use crate::enclave::OperationHandler;
+use opaque_core::operation_handler::OperationHandler;
 
 use client::GcpSecretManagerClient;
 
@@ -243,9 +243,9 @@ impl OperationHandler for GcpHandler {
                     );
 
                     // Resolve the secret value from the ref.
-                    let base = crate::sandbox::resolve::BaseResolver::new();
+                    let base = opaque_core::resolver::BaseResolver::new();
                     let secret_value =
-                        crate::sandbox::resolve::SecretResolver::resolve(&base, value_ref)
+                        opaque_core::resolver::SecretResolver::resolve(&base, value_ref)
                             .map_err(|e| format!("failed to resolve value_ref: {e}"))?;
 
                     let token = self.resolve_token().await?;

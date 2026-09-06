@@ -59,7 +59,7 @@ use opaque_core::execve_map::{ExecveDefaultDecision, ExecveMapper};
 use opaque_core::operation::OperationRequest;
 use uuid::Uuid;
 
-use crate::enclave::OperationHandler;
+use opaque_core::operation_handler::OperationHandler;
 
 // ---------------------------------------------------------------------------
 // Constants

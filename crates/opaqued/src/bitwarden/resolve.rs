@@ -10,8 +10,8 @@
 //! The access token is itself resolved via the base resolver (env + keychain
 //! only) to prevent resolution cycles.
 
-use crate::sandbox::resolve::{BaseResolver, ResolveError, SecretResolver};
-use crate::secret::SecretValue;
+use opaque_core::resolver::{BaseResolver, ResolveError, SecretResolver};
+use opaque_core::secret::SecretValue;
 
 use super::client::BitwardenClient;
 

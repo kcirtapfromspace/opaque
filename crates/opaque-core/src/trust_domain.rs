@@ -353,6 +353,48 @@ pub fn default_custody_set(home: &Path, config_path: &Path) -> Vec<CustodyPath> 
     ]
 }
 
+/// The daemon's custody set adjusted for a split state directory.
+///
+/// `state_dir` may differ from `home.join(".opaque")` when the daemon's
+/// runtime state lives elsewhere (e.g. an isolated service-account layout).
+/// Rewrites [`default_custody_set`]'s paths under the actual state and
+/// pairing-config directories, and appends the fixed-manifest task ledger's
+/// own files (not part of the portable default set, since they are specific
+/// to the daemon's task-store feature).
+pub fn custody_paths(home: &Path, config_path: &Path, state_dir: &Path) -> Vec<CustodyPath> {
+    let mut set = default_custody_set(home, config_path);
+    for item in &mut set {
+        if matches!(
+            item.label,
+            "daemon config" | "config seal key" | "config seal"
+        ) {
+            continue;
+        }
+        if let Ok(relative) = item.path.strip_prefix(home.join(".opaque")) {
+            item.path = state_dir.join(relative);
+        } else if state_dir != home.join(".opaque")
+            && let Ok(relative) = item.path.strip_prefix(home.join(".config/opaque"))
+        {
+            item.path = state_dir.join("approval").join(relative);
+        }
+    }
+    for name in [
+        "tasks.db",
+        "tasks.db-journal",
+        "tasks.db.writer.lock",
+        "tenant.binding.json",
+        "tenant.binding.lock",
+    ] {
+        set.push(CustodyPath {
+            path: state_dir.join(name),
+            kind: PathKind::File,
+            label: "task ledger",
+        });
+    }
+
+    set
+}
+
 /// Tighten permission bits on custody paths the daemon already owns.
 ///
 /// Self-heal for drift (a 0644 key created by an older build, an over-shared

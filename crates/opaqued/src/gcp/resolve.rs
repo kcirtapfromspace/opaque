@@ -10,8 +10,8 @@
 
 use base64::Engine;
 
-use crate::sandbox::resolve::{ResolveError, SecretResolver};
-use crate::secret::SecretValue;
+use opaque_core::resolver::{ResolveError, SecretResolver};
+use opaque_core::secret::SecretValue;
 
 use super::client::GcpSecretManagerClient;
 
