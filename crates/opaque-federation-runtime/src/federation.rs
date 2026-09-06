@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use opaque_core::audit::{AuditEvent, AuditEventKind, AuditLevel, AuditSink};
 use opaque_core::bundle::{self, BundleError, BundleState, Team, VerifiedBundle, parse_anchor};
+use opaque_core::enclave_facade::EnclaveFacade;
 use opaque_core::policy::PolicyEngine;
 use serde::Deserialize;
 use tracing::{info, warn};
@@ -170,10 +171,15 @@ fn now_unix() -> i64 {
 
 /// The stable context for applying bundles: trust anchors, rollback state
 /// location, and the components a successful apply mutates.
+///
+/// `enclave` depends on the kernel-facing [`EnclaveFacade`] trait rather than
+/// a concrete `Enclave`/`DaemonState` — both of those are opaqued-internal
+/// types that cannot be named from this crate. `BundleApplier` only ever
+/// calls `swap_policy`, which the trait covers.
 pub struct BundleApplier {
     pub anchors: Vec<ed25519_dalek::VerifyingKey>,
     pub state_file: PathBuf,
-    pub enclave: Arc<crate::enclave::Enclave>,
+    pub enclave: Arc<dyn EnclaveFacade>,
     pub status: Arc<FederationStatus>,
     pub audit: Arc<dyn AuditSink>,
 }
@@ -305,32 +311,98 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use opaque_core::bundle::{BundlePayload, sign_bundle};
-    use opaque_core::operation::{
-        ApprovalFactor, ApprovalRequirement, OperationDef, OperationSafety,
-    };
     use opaque_core::policy::PolicyRule;
+    use std::future::Future;
+    use std::pin::Pin;
 
-    fn test_enclave() -> crate::enclave::Enclave {
-        let mut registry = opaque_core::operation::OperationRegistry::new();
-        registry
-            .register(OperationDef {
-                name: "test.noop".into(),
-                safety: OperationSafety::Safe,
-                default_approval: ApprovalRequirement::Never,
-                default_factors: vec![ApprovalFactor::LocalBio],
-                description: "noop".into(),
-                params_schema: None,
-                allowed_target_keys: vec![],
-                secret_ref_param_keys: vec![],
-            })
-            .unwrap();
-        crate::enclave::Enclave::builder()
-            .registry(registry)
-            .policy(PolicyEngine::new())
-            .approval_gate(Box::new(crate::enclave::InsecureAutoApproveGate))
-            .audit(Arc::new(opaque_core::audit::TracingAuditEmitter::new()))
-            .build()
-            .unwrap()
+    /// Minimal `EnclaveFacade` test double. `BundleApplier` only ever calls
+    /// `swap_policy` (verified below), so that is the only method with real
+    /// behavior; every other method is unreachable from these tests and
+    /// panics if ever called, so a future test that starts depending on one
+    /// fails loudly instead of silently no-op'ing.
+    struct FakeEnclave {
+        policy: std::sync::RwLock<PolicyEngine>,
+    }
+
+    impl FakeEnclave {
+        fn new() -> Self {
+            Self {
+                policy: std::sync::RwLock::new(PolicyEngine::new()),
+            }
+        }
+    }
+
+    impl EnclaveFacade for FakeEnclave {
+        fn preflight_task(
+            &self,
+            _request: &mut opaque_core::operation::OperationRequest,
+            _manifest: &opaque_core::task::TaskManifest,
+        ) -> Result<(), String> {
+            unimplemented!("not exercised by federation tests")
+        }
+
+        fn preflight_task_observation(
+            &self,
+            _base: &opaque_core::operation::OperationRequest,
+            _manifest: &opaque_core::task::TaskManifest,
+        ) -> Result<(), String> {
+            unimplemented!("not exercised by federation tests")
+        }
+
+        fn execute(
+            &self,
+            _request: opaque_core::operation::OperationRequest,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = opaque_core::sanitize::SanitizedResponse<
+                            opaque_core::sanitize::Sanitized,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            unimplemented!("not exercised by federation tests")
+        }
+
+        fn swap_policy(&self, policy: PolicyEngine) -> usize {
+            let count = policy.rule_count();
+            *self
+                .policy
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = policy;
+            count
+        }
+
+        fn request_control_approval<'a>(
+            &'a self,
+            _identity: &'a opaque_core::operation::ClientIdentity,
+            _client_type: opaque_core::operation::ClientType,
+            _operation_label: &'a str,
+            _action_description: &'a str,
+            _reason: &'a str,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<Option<opaque_core::audit::ApproverIdentity>, String>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            unimplemented!("not exercised by federation tests")
+        }
+
+        fn resolve_principal_context<'a>(
+            &'a self,
+            _session_id: Option<&'a str>,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<Option<opaque_core::identity::PrincipalContext>, String>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            unimplemented!("not exercised by federation tests")
+        }
     }
 
     fn payload_with_rules(version: u64) -> BundlePayload {
@@ -360,7 +432,7 @@ mod tests {
         BundleApplier {
             anchors: vec![key.verifying_key()],
             state_file: dir.join("bundle.state"),
-            enclave: Arc::new(test_enclave()),
+            enclave: Arc::new(FakeEnclave::new()),
             status: Arc::new(FederationStatus::default()),
             audit: Arc::new(opaque_core::audit::TracingAuditEmitter::new()),
         }
