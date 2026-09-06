@@ -4,6 +4,7 @@ members = [
   "crates/opaque-core",
   "crates/opaqued",
   "crates/opaque",
+  "crates/opaque-approval",
   "crates/opaque-approve-helper",
   "crates/opaque-approver",
   "crates/opaque-mcp",

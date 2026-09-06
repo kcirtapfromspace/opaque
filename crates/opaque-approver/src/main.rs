@@ -14,7 +14,11 @@ use std::path::PathBuf;
 
 // One shared native implementation preserves the daemon's full-review and
 // native-authentication requirements without a weaker workstation fallback.
-#[path = "../../opaqued/src/approval.rs"]
+// `approval.rs` lives in the `opaque-approval` crate (extracted from
+// `opaqued`); it has zero `crate::`-relative references, so including it
+// by path here — rather than depending on the crate — is unaffected by
+// which crate it's compiled into.
+#[path = "../../opaque-approval/src/approval.rs"]
 mod native;
 
 #[derive(Parser)]

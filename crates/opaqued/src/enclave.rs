@@ -1471,7 +1471,7 @@ impl Enclave {
 /// Native OS approval gate that delegates to the platform-specific
 /// approval prompt (macOS LocalAuthentication / Linux polkit).
 pub struct NativeApprovalGate {
-    registry: crate::factors::FactorRegistry,
+    registry: opaque_approval::factors::FactorRegistry,
 }
 
 impl std::fmt::Debug for NativeApprovalGate {
@@ -1485,12 +1485,12 @@ impl std::fmt::Debug for NativeApprovalGate {
 /// Resolves the approver identity to bind to a successful local-biometric
 /// approval (re-exported from the factors module for wiring convenience).
 #[cfg(test)]
-pub type ApproverResolver = crate::factors::ApproverResolver;
+pub type ApproverResolver = opaque_approval::factors::ApproverResolver;
 
 impl NativeApprovalGate {
     /// Create a gate over an explicit verifier registry (the daemon builds
     /// one from its configured factors: local, paired device, FIDO2, …).
-    pub fn with_registry(registry: crate::factors::FactorRegistry) -> Self {
+    pub fn with_registry(registry: opaque_approval::factors::FactorRegistry) -> Self {
         Self { registry }
     }
 
@@ -1498,8 +1498,8 @@ impl NativeApprovalGate {
     /// pre-registry shape, kept for tests.
     #[cfg(test)]
     pub fn new() -> Self {
-        let mut registry = crate::factors::FactorRegistry::new();
-        registry.register(Arc::new(crate::factors::LocalBioVerifier::new(None)));
+        let mut registry = opaque_approval::factors::FactorRegistry::new();
+        registry.register(Arc::new(opaque_approval::factors::LocalBioVerifier::new(None)));
         Self { registry }
     }
 
@@ -1507,8 +1507,8 @@ impl NativeApprovalGate {
     /// local-only gate (test builder mirroring the daemon's wiring).
     #[cfg(test)]
     pub fn with_approver_resolver(self, resolver: ApproverResolver) -> Self {
-        let mut registry = crate::factors::FactorRegistry::new();
-        registry.register(Arc::new(crate::factors::LocalBioVerifier::new(Some(
+        let mut registry = opaque_approval::factors::FactorRegistry::new();
+        registry.register(Arc::new(opaque_approval::factors::LocalBioVerifier::new(Some(
             resolver,
         ))));
         Self { registry }
@@ -1525,7 +1525,7 @@ impl ApprovalGate for NativeApprovalGate {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<ApprovalOutcome, String>> + Send + '_>,
     > {
-        let ctx = crate::factors::ApprovalContext {
+        let ctx = opaque_approval::factors::ApprovalContext {
             approval_id,
             request_id: request.request_id,
             operation: request.operation.clone(),
@@ -2016,7 +2016,8 @@ mod tests {
     async fn native_gate_registers_the_local_factor() {
         use opaque_core::operation::ApprovalFactor;
         // The prompt path isn't exercised here (no OS prompt in tests); the
-        // registry's dispatch semantics are covered in factors::tests. Assert
+        // registry's dispatch semantics are covered in opaque_approval::factors
+        // tests. Assert
         // the gate's construction shape: both variants serve LocalBio.
         let resolver: ApproverResolver = Arc::new(|| Some(approver("hum_session")));
         let gate = NativeApprovalGate::new().with_approver_resolver(resolver);

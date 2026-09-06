@@ -34,9 +34,6 @@ use uuid::Uuid;
 /// Name of the daemon token file written next to the socket.
 const DAEMON_TOKEN_FILENAME: &str = "daemon.token";
 
-mod approval;
-#[allow(dead_code)]
-mod approval_server;
 mod attest;
 mod aws;
 #[allow(dead_code)]
@@ -47,10 +44,7 @@ mod doppler;
 mod enclave;
 #[allow(dead_code)]
 mod export;
-mod factors;
 mod federation;
-#[allow(dead_code)]
-mod fido2;
 #[allow(dead_code)]
 mod gcp;
 mod github;
@@ -60,12 +54,9 @@ mod inference;
 #[allow(dead_code)]
 mod infisical;
 mod onepassword;
-#[allow(dead_code)]
-mod pairing;
 mod provisioning_api;
 #[cfg(test)]
 mod provisioning_api_tests;
-mod push;
 mod resource_authority;
 mod sandbox;
 mod ssh;
@@ -165,7 +156,7 @@ struct DaemonConfig {
 
     /// Public keys authorized by the trusted operator to review whole tasks.
     #[serde(default)]
-    workstation_approvers: Vec<pairing::WorkstationApproverConfig>,
+    workstation_approvers: Vec<opaque_approval::pairing::WorkstationApproverConfig>,
 
     /// Downgrades receipt provenance for an automated signing fixture. This
     /// does not bypass any enrollment, signature, expiry or policy check.
@@ -369,11 +360,11 @@ struct DaemonState {
     /// Identity runtime, present when `[identity]` is configured.
     identity: Option<Arc<identity::IdentityRuntime>>,
     /// Pairing manager, present when `[approval] second_device` is enabled.
-    pairing: Option<Arc<pairing::PairingManager>>,
+    pairing: Option<Arc<opaque_approval::pairing::PairingManager>>,
     /// Bound address of the approval server, when running.
     approval_server_addr: Option<std::net::SocketAddr>,
     /// FIDO2 approval coordination, present when `[approval] fido2` is enabled.
-    fido2: Option<Arc<factors::Fido2Approvals>>,
+    fido2: Option<Arc<opaque_approval::factors::Fido2Approvals>>,
     provisioning_challenges: provisioning_api::Challenges,
     /// Applied federation bundle context (org, version, teams).
     federation: Arc<federation::FederationStatus>,
@@ -2013,11 +2004,11 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
     // Second-device factor: pairing manager + approval server, when enabled.
     // Constructed before the gate so the registry can hold the verifier, and
     // stashed in DaemonState for the device_* control methods.
-    let mut pairing_manager: Option<Arc<pairing::PairingManager>> = None;
+    let mut pairing_manager: Option<Arc<opaque_approval::pairing::PairingManager>> = None;
     let mut approval_server_addr: Option<std::net::SocketAddr> = None;
     let mut second_device_verifier: Option<(
-        Arc<pairing::PairingManager>,
-        approval_server::ApprovalServerHandle,
+        Arc<opaque_approval::pairing::PairingManager>,
+        opaque_approval::approval_server::ApprovalServerHandle,
     )> = None;
     if config.approval.second_device || !config.workstation_approvers.is_empty() {
         let state_dir = audit_db_path
@@ -2043,7 +2034,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
             .data_dir
             .as_ref()
             .map(|dir| dir.join("approval/paired_devices.json"))
-            .unwrap_or_else(pairing::store::DeviceStore::default_path);
+            .unwrap_or_else(opaque_approval::pairing::store::DeviceStore::default_path);
         if let Some(parent) = store_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -2058,8 +2049,8 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
             .parse()
             .map_err(|e| std::io::Error::other(format!("approval.server_bind invalid: {e}")))?;
 
-        let store = pairing::store::DeviceStore::new(store_path, store_hmac.to_vec());
-        let pm = Arc::new(pairing::PairingManager::new(
+        let store = opaque_approval::pairing::store::DeviceStore::new(store_path, store_hmac.to_vec());
+        let pm = Arc::new(opaque_approval::pairing::PairingManager::new(
             server_id,
             pairing_key,
             bind.port(),
@@ -2072,12 +2063,12 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
 
         // TLS identity persists so paired devices' fingerprint pin survives
         // restarts (custody set).
-        let tls = approval_server::load_or_create_tls_identity(&state_dir)
+        let tls = opaque_approval::approval_server::load_or_create_tls_identity(&state_dir)
             .map_err(std::io::Error::other)?;
         let fingerprint = tls.fingerprint.clone();
 
-        let server = approval_server::ApprovalServer::new(
-            approval_server::ApprovalServerConfig {
+        let server = opaque_approval::approval_server::ApprovalServer::new(
+            opaque_approval::approval_server::ApprovalServerConfig {
                 bind_addr: bind,
                 tls_cert_der: tls.cert_der,
                 tls_key_der: tls.key_der,
@@ -2096,7 +2087,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         approval_server_addr = Some(addr);
 
         // mDNS is convenience discovery — never fatal.
-        match approval_server::advertise_mdns(addr.port(), &fingerprint) {
+        match opaque_approval::approval_server::advertise_mdns(addr.port(), &fingerprint) {
             Ok(mdns) => {
                 // Keep advertising for the daemon's lifetime.
                 std::mem::forget(mdns);
@@ -2116,26 +2107,26 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
 
     // FIDO2/passkey factor: daemon-side verification over the socket; the
     // authenticator ceremony runs in whatever client drives the key.
-    let mut fido2_approvals: Option<Arc<factors::Fido2Approvals>> = None;
+    let mut fido2_approvals: Option<Arc<opaque_approval::factors::Fido2Approvals>> = None;
     if config.approval.fido2 {
         let store_path = config
             .data_dir
             .as_ref()
             .map(|dir| dir.join("approval/fido2_credentials.json"))
-            .unwrap_or_else(fido2::Fido2CredentialStore::default_path);
+            .unwrap_or_else(opaque_approval::fido2::Fido2CredentialStore::default_path);
         if let Some(parent) = store_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let store_hmac =
             opaque_core::keyfile::load_or_create_key_file(&store_path.with_extension("hmac"))?;
-        let store = fido2::Fido2CredentialStore::new(store_path, store_hmac.to_vec());
+        let store = opaque_approval::fido2::Fido2CredentialStore::new(store_path, store_hmac.to_vec());
         let rp_id = config
             .approval
             .fido2_rp_id
             .clone()
             .unwrap_or_else(|| "opaque.local".into());
-        let manager = fido2::Fido2Manager::new(store, Box::new(fido2::NoLocalTransport), rp_id);
-        let approvals = Arc::new(factors::Fido2Approvals::new(
+        let manager = opaque_approval::fido2::Fido2Manager::new(store, Box::new(opaque_approval::fido2::NoLocalTransport), rp_id);
+        let approvals = Arc::new(opaque_approval::factors::Fido2Approvals::new(
             manager,
             std::time::Duration::from_secs(config.approval.timeout_secs.unwrap_or(60)),
         ));
@@ -2149,7 +2140,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
     let mut registered_factors: Vec<String> = Vec::new();
     let approval_gate: Box<dyn ApprovalGate> = match backend {
         ApprovalBackendKind::Native => {
-            let mut registry = factors::FactorRegistry::new();
+            let mut registry = opaque_approval::factors::FactorRegistry::new();
 
             // Local factor, with login-session approver binding when identity
             // is configured.
@@ -2162,26 +2153,26 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
                             label: p.display_label(),
                             source: opaque_core::audit::ApproverSource::LocalBioSession,
                         })
-                }) as factors::ApproverResolver
+                }) as opaque_approval::factors::ApproverResolver
             });
-            registry.register(Arc::new(factors::LocalBioVerifier::new(resolver)));
+            registry.register(Arc::new(opaque_approval::factors::LocalBioVerifier::new(resolver)));
 
             if let Some((pm, handle)) = second_device_verifier.clone() {
                 if config.approval.second_device {
-                    registry.register(Arc::new(factors::PairedDeviceVerifier::new(
+                    registry.register(Arc::new(opaque_approval::factors::PairedDeviceVerifier::new(
                         pm.clone(),
                         handle.clone(),
                     )));
                 }
                 if !config.workstation_approvers.is_empty() {
-                    registry.register(Arc::new(factors::PairedWorkstationVerifier::new(
+                    registry.register(Arc::new(opaque_approval::factors::PairedWorkstationVerifier::new(
                         pm, handle,
                     )));
                 }
             }
 
             if let Some(approvals) = fido2_approvals.clone() {
-                registry.register(Arc::new(factors::Fido2Verifier::new(approvals)));
+                registry.register(Arc::new(opaque_approval::factors::Fido2Verifier::new(approvals)));
             }
 
             registered_factors = registry
@@ -5399,7 +5390,7 @@ async fn handle_request(
                 .get("label")
                 .and_then(|v| v.as_str())
                 .unwrap_or("hardware key");
-            let response: fido2::Fido2RegistrationResponse = match req
+            let response: opaque_approval::fido2::Fido2RegistrationResponse = match req
                 .params
                 .get("response")
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -5571,7 +5562,7 @@ async fn handle_request(
             if request_id.is_empty() {
                 return Response::err(Some(req.id), "bad_request", "missing 'request_id'");
             }
-            let assertion: fido2::Fido2Assertion = match req
+            let assertion: opaque_approval::fido2::Fido2Assertion = match req
                 .params
                 .get("assertion")
                 .and_then(|v| serde_json::from_value(v.clone()).ok())

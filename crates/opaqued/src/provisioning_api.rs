@@ -17,9 +17,9 @@ use serde_json::{Value, json};
 
 use crate::{
     DaemonConfig, DaemonState,
-    fido2::{Fido2Assertion, Fido2PrincipalBinding},
     identity::{IdentityRuntime, provisioning::ProvisioningConfig},
 };
+use opaque_approval::fido2::{Fido2Assertion, Fido2PrincipalBinding};
 
 const CHALLENGE_TTL: i64 = 120;
 const MAX_PENDING: usize = 128;
