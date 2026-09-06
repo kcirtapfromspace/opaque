@@ -314,6 +314,18 @@ mod tests {
     use opaque_core::audit::InMemoryAuditEmitter;
     use opaque_core::operation::{ClientIdentity, ClientType};
 
+    /// Serializes tests that mutate process-global env vars. Local to this
+    /// module (rather than reusing `gcp`'s copy) so `onepassword`'s tests
+    /// build and run independently of whether the `gcp` feature is enabled.
+    fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("onepassword test env lock poisoned")
+    }
+
     fn make_request(operation: &str, params: serde_json::Value) -> OperationRequest {
         OperationRequest {
             principal: None,
@@ -401,7 +413,7 @@ mod tests {
         MockServer,
         Arc<InMemoryAuditEmitter>,
     ) {
-        let env_guard = crate::gcp::client::test_env_lock();
+        let env_guard = test_env_lock();
         let mock_server = MockServer::start().await;
         let audit = Arc::new(InMemoryAuditEmitter::new());
 
