@@ -11,6 +11,7 @@ homepage.workspace = true
 [dependencies]
 tempfile = "3"
 opaque-core = { path = "../opaque-core" }
+opaque-providers = { path = "../opaque-providers" }
 bytes = { workspace = true }
 libc = { workspace = true }
 futures-util = { workspace = true }

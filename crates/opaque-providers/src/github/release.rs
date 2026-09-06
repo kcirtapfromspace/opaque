@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 
 use super::client::{DEFAULT_GITHUB_API_URL, GITHUB_API_URL_ENV};
 use super::{DEFAULT_GITHUB_TOKEN_REF, GITHUB_TOKEN_REF_ENV};
-use crate::sandbox::resolve::CompositeResolver;
+use crate::internal_resolve::CompositeResolver;
 use opaque_core::resolver::SecretResolver;
 
 const API_VERSION: &str = "2026-03-10";
@@ -334,7 +334,7 @@ pub async fn plan_staging_release(mut manifest: TaskManifest) -> Result<TaskMani
 }
 
 fn credential(action: &StagingReleaseAction) -> Result<opaque_core::secret::SecretValue, String> {
-    let token = CompositeResolver::new(crate::default_secret_resolvers())
+    let token = CompositeResolver::new(crate::internal_resolve::default_secret_resolvers())
         .resolve(action.github_token_ref.as_deref().ok_or_else(unavailable)?)
         .map_err(|_| unavailable())?;
     token.mlock();

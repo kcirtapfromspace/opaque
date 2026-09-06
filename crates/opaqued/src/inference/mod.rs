@@ -136,7 +136,7 @@ impl TrustedInferenceProfile {
                     return Err(unavailable());
                 }
             } else if !reference.starts_with("vault:")
-                || crate::vault::resolve::validate_pinned_ref(reference).is_err()
+                || opaque_providers::vault::resolve::validate_pinned_ref(reference).is_err()
             {
                 return Err(unavailable());
             }

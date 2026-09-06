@@ -654,11 +654,15 @@ impl Enclave {
                     outcome
                 }
                 TaskAction::PublishSecret(action) => {
-                    crate::github::execute_task_action(&claimed.manifest, action, before_dispatch)
-                        .await
+                    opaque_providers::github::execute_task_action(
+                        &claimed.manifest,
+                        action,
+                        before_dispatch,
+                    )
+                    .await
                 }
                 TaskAction::StagingRelease(action) => {
-                    crate::github::dispatch_staging_release(
+                    opaque_providers::github::dispatch_staging_release(
                         &claimed.manifest,
                         action,
                         id,

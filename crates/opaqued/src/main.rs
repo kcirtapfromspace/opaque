@@ -38,12 +38,6 @@ mod approval;
 #[allow(dead_code)]
 mod approval_server;
 mod attest;
-mod aws;
-#[allow(dead_code)]
-mod azure;
-mod bitwarden;
-#[allow(dead_code)]
-mod doppler;
 mod enclave;
 #[allow(dead_code)]
 mod export;
@@ -51,15 +45,8 @@ mod factors;
 mod federation;
 #[allow(dead_code)]
 mod fido2;
-#[allow(dead_code)]
-mod gcp;
-mod github;
-mod gitlab;
 mod identity;
 mod inference;
-#[allow(dead_code)]
-mod infisical;
-mod onepassword;
 #[allow(dead_code)]
 mod pairing;
 mod provisioning_api;
@@ -73,7 +60,6 @@ mod task_api;
 mod task_store;
 mod tenant;
 mod trust_domain;
-mod vault;
 mod workload_attest;
 mod workspace_process;
 
@@ -605,38 +591,44 @@ fn default_secret_resolvers() -> Vec<Box<dyn SecretResolver>> {
     // 1. Connect Server URL configured → use Connect Server
     // 2. `op` CLI found in PATH → use `op` CLI
     // 3. Neither → onepassword disabled
-    if let Ok(url) = std::env::var(onepassword::client::CONNECT_URL_ENV) {
-        match onepassword::client::OnePasswordClient::new(&url) {
-            Ok(client) => resolvers.push(Box::new(onepassword::resolve::OnePasswordResolver::new(
-                client,
-            ))),
+    if let Ok(url) = std::env::var(opaque_providers::onepassword::client::CONNECT_URL_ENV) {
+        match opaque_providers::onepassword::client::OnePasswordClient::new(&url) {
+            Ok(client) => resolvers.push(Box::new(
+                opaque_providers::onepassword::resolve::OnePasswordResolver::new(client),
+            )),
             Err(e) => tracing::warn!("1Password Connect client disabled: {e}"),
         }
-    } else if let Ok(cli) = onepassword::op_cli::OpCliClient::new() {
+    } else if let Ok(cli) = opaque_providers::onepassword::op_cli::OpCliClient::new() {
         resolvers.push(Box::new(
-            onepassword::resolve::OnePasswordResolver::from_cli(cli),
+            opaque_providers::onepassword::resolve::OnePasswordResolver::from_cli(cli),
         ));
     }
 
     // Bitwarden backend: available if URL scheme is valid.
-    let bitwarden_url = std::env::var(bitwarden::client::BITWARDEN_URL_ENV)
-        .unwrap_or_else(|_| bitwarden::client::DEFAULT_BASE_URL.to_owned());
-    match bitwarden::client::BitwardenClient::new(&bitwarden_url) {
-        Ok(client) => resolvers.push(Box::new(bitwarden::resolve::BitwardenResolver::new(client))),
+    let bitwarden_url = std::env::var(opaque_providers::bitwarden::client::BITWARDEN_URL_ENV)
+        .unwrap_or_else(|_| opaque_providers::bitwarden::client::DEFAULT_BASE_URL.to_owned());
+    match opaque_providers::bitwarden::client::BitwardenClient::new(&bitwarden_url) {
+        Ok(client) => resolvers.push(Box::new(
+            opaque_providers::bitwarden::resolve::BitwardenResolver::new(client),
+        )),
         Err(e) => tracing::warn!("Bitwarden client disabled: {e}"),
     }
 
     // AWS remains disabled until SigV4 exists. Only explicitly configured
     // loopback mocks can be reached by any aws: secret resolution path.
-    match aws::client::AwsClient::from_mock_env() {
-        Ok(Some(client)) => resolvers.push(Box::new(aws::resolve::AwsResolver::new(client))),
+    match opaque_providers::aws::client::AwsClient::from_mock_env() {
+        Ok(Some(client)) => resolvers.push(Box::new(
+            opaque_providers::aws::resolve::AwsResolver::new(client),
+        )),
         Ok(None) => {}
         Err(e) => tracing::warn!("AWS client disabled: {e}"),
     }
 
     // Vault backend: available if URL scheme is valid.
-    match vault::client::VaultClient::new() {
-        Ok(client) => resolvers.push(Box::new(vault::resolve::VaultResolver::new(client))),
+    match opaque_providers::vault::client::VaultClient::new() {
+        Ok(client) => resolvers.push(Box::new(
+            opaque_providers::vault::resolve::VaultResolver::new(client),
+        )),
         Err(e) => tracing::warn!("Vault client disabled: {e}"),
     }
 
@@ -1864,23 +1856,23 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         sandbox::execve_hook::create_execve_handlers(audit.clone(), execve_mapper);
 
     let github_actions_handler =
-        github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
+        opaque_providers::github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
     let github_codespaces_handler =
-        github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
+        opaque_providers::github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
     let github_dependabot_handler =
-        github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
+        opaque_providers::github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
     let github_org_handler =
-        github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
+        opaque_providers::github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
     let github_list_handler =
-        github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
+        opaque_providers::github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
     let github_delete_handler =
-        github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
-    let gitlab_handler =
-        gitlab::GitLabHandler::new(audit.clone()).map_err(std::io::Error::other)?;
+        opaque_providers::github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
+    let gitlab_handler = opaque_providers::gitlab::GitLabHandler::new(audit.clone())
+        .map_err(std::io::Error::other)?;
 
     // 1Password handler: prefer Connect Server URL, fall back to `op` CLI.
     let onepassword_connect_url =
-        std::env::var(onepassword::client::CONNECT_URL_ENV).unwrap_or_default();
+        std::env::var(opaque_providers::onepassword::client::CONNECT_URL_ENV).unwrap_or_default();
 
     let mut enclave_builder = Enclave::builder()
         .inference_profile(inference_profile)
@@ -1911,18 +1903,21 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
 
     if !onepassword_connect_url.is_empty() {
         // Connect Server backend (self-hosted REST API).
-        let op_list_vaults_handler =
-            onepassword::OnePasswordHandler::new(audit.clone(), &onepassword_connect_url).map_err(
-                |e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()),
-            )?;
-        let op_list_items_handler =
-            onepassword::OnePasswordHandler::new(audit.clone(), &onepassword_connect_url).map_err(
-                |e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()),
-            )?;
-        let op_read_field_handler =
-            onepassword::OnePasswordHandler::new(audit.clone(), &onepassword_connect_url).map_err(
-                |e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()),
-            )?;
+        let op_list_vaults_handler = opaque_providers::onepassword::OnePasswordHandler::new(
+            audit.clone(),
+            &onepassword_connect_url,
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+        let op_list_items_handler = opaque_providers::onepassword::OnePasswordHandler::new(
+            audit.clone(),
+            &onepassword_connect_url,
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+        let op_read_field_handler = opaque_providers::onepassword::OnePasswordHandler::new(
+            audit.clone(),
+            &onepassword_connect_url,
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
         enclave_builder = enclave_builder
             .handler("onepassword.list_vaults", Box::new(op_list_vaults_handler))
             .handler("onepassword.list_items", Box::new(op_list_items_handler))
@@ -1931,13 +1926,14 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
             "1Password handler enabled via Connect Server ({})",
             onepassword_connect_url
         );
-    } else if let Ok(cli) = onepassword::op_cli::OpCliClient::new() {
+    } else if let Ok(cli) = opaque_providers::onepassword::op_cli::OpCliClient::new() {
         // `op` CLI backend (desktop app + biometric auth).
         let op_list_vaults_handler =
-            onepassword::OnePasswordHandler::from_cli(audit.clone(), cli.clone());
+            opaque_providers::onepassword::OnePasswordHandler::from_cli(audit.clone(), cli.clone());
         let op_list_items_handler =
-            onepassword::OnePasswordHandler::from_cli(audit.clone(), cli.clone());
-        let op_read_field_handler = onepassword::OnePasswordHandler::from_cli(audit.clone(), cli);
+            opaque_providers::onepassword::OnePasswordHandler::from_cli(audit.clone(), cli.clone());
+        let op_read_field_handler =
+            opaque_providers::onepassword::OnePasswordHandler::from_cli(audit.clone(), cli);
         enclave_builder = enclave_builder
             .handler("onepassword.list_vaults", Box::new(op_list_vaults_handler))
             .handler("onepassword.list_items", Box::new(op_list_items_handler))
@@ -1948,21 +1944,24 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
     }
 
     // Bitwarden handler: use configured URL or default.
-    let bitwarden_url = std::env::var(bitwarden::client::BITWARDEN_URL_ENV)
-        .unwrap_or_else(|_| bitwarden::client::DEFAULT_BASE_URL.to_owned());
+    let bitwarden_url = std::env::var(opaque_providers::bitwarden::client::BITWARDEN_URL_ENV)
+        .unwrap_or_else(|_| opaque_providers::bitwarden::client::DEFAULT_BASE_URL.to_owned());
     {
         let bw_list_projects_handler =
-            bitwarden::BitwardenHandler::new(audit.clone(), &bitwarden_url).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
-            })?;
+            opaque_providers::bitwarden::BitwardenHandler::new(audit.clone(), &bitwarden_url)
+                .map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
+                })?;
         let bw_list_secrets_handler =
-            bitwarden::BitwardenHandler::new(audit.clone(), &bitwarden_url).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
-            })?;
+            opaque_providers::bitwarden::BitwardenHandler::new(audit.clone(), &bitwarden_url)
+                .map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
+                })?;
         let bw_read_secret_handler =
-            bitwarden::BitwardenHandler::new(audit.clone(), &bitwarden_url).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
-            })?;
+            opaque_providers::bitwarden::BitwardenHandler::new(audit.clone(), &bitwarden_url)
+                .map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
+                })?;
         enclave_builder = enclave_builder
             .handler(
                 "bitwarden.list_projects",
@@ -1974,7 +1973,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
     }
 
     // The unsigned AWS transport is quarantined to explicitly enabled loopback mocks.
-    match aws::client::AwsClient::from_mock_env() {
+    match opaque_providers::aws::client::AwsClient::from_mock_env() {
         Ok(Some(aws_client)) => {
             for op in [
                 "aws.get_caller_identity",
@@ -1991,7 +1990,10 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
             ] {
                 enclave_builder = enclave_builder.handler(
                     op,
-                    Box::new(aws::AwsHandler::new(audit.clone(), aws_client.clone())),
+                    Box::new(opaque_providers::aws::AwsHandler::new(
+                        audit.clone(),
+                        aws_client.clone(),
+                    )),
                 );
             }
             warn!("AWS loopback mock handler enabled; real AWS signing is not implemented");
@@ -5722,303 +5724,15 @@ async fn handle_request(
                 .into_proto_response(req.id)
         }
         "github" => {
-            // The github method is a convenience wrapper that builds an "execute"
-            // request for the appropriate github.* operation based on the `scope` param.
-            //
-            // The `action` field determines the operation type:
-            // - "list_secrets" → github.list_secrets
-            // - "delete_secret" → github.delete_secret
-            // - (default) → github.set_* (set secret)
-            let action = req
-                .params
-                .get("action")
-                .and_then(|v| v.as_str())
-                .unwrap_or("set_secret");
-
-            // Route list_secrets and delete_secret to their own dispatch paths.
-            if action == "list_secrets" {
-                return handle_github_list_secrets(
-                    &req,
-                    state,
-                    identity,
-                    client_type,
-                    principal_ctx.as_ref(),
-                )
-                .await;
-            }
-            if action == "delete_secret" {
-                return handle_github_delete_secret(
-                    &req,
-                    state,
-                    identity,
-                    client_type,
-                    principal_ctx.as_ref(),
-                )
-                .await;
-            }
-
-            let scope = req
-                .params
-                .get("scope")
-                .and_then(|v| v.as_str())
-                .unwrap_or("repo_actions");
-
-            let secret_name = req
-                .params
-                .get("secret_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-
-            if secret_name.is_empty() {
-                return Response::err(Some(req.id), "bad_request", "missing 'secret_name' field");
-            }
-
-            // Validate secret_name (alphanumeric + underscores).
-            if !secret_name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_')
-            {
-                return Response::err(
-                    Some(req.id),
-                    "bad_request",
-                    "secret_name must be alphanumeric (with underscores)",
-                );
-            }
-
-            let value_ref = req
-                .params
-                .get("value_ref")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-
-            if value_ref.is_empty() {
-                return Response::err(Some(req.id), "bad_request", "missing 'value_ref' field");
-            }
-
-            // Validate value_ref starts with a known scheme.
-            if !opaque_core::profile::ALLOWED_REF_SCHEMES
-                .iter()
-                .any(|s| value_ref.starts_with(s))
-            {
-                return Response::err(
-                    Some(req.id),
-                    "bad_request",
-                    format!(
-                        "value_ref must start with a known scheme ({:?})",
-                        opaque_core::profile::ALLOWED_REF_SCHEMES
-                    ),
-                );
-            }
-
-            // Validate value_ref and github_token_ref for control chars / secret patterns.
-            // This prevents prompt injection in the approval UI via crafted ref strings.
-            let mut refs_to_validate = vec![value_ref.clone()];
-            if let Some(tok) = req.params.get("github_token_ref").and_then(|v| v.as_str()) {
-                refs_to_validate.push(tok.to_owned());
-            }
-            if let Err(e) = InputValidator::validate_secret_ref_names(&refs_to_validate) {
-                return Response::err(
-                    Some(req.id),
-                    "bad_request",
-                    format!("invalid secret ref: {e}"),
-                );
-            }
-
-            // Determine operation name and target based on scope.
-            let (operation, target, op_params) = match scope {
-                "repo_actions" | "env_actions" => {
-                    let repo = req
-                        .params
-                        .get("repo")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_owned();
-                    if repo.is_empty() {
-                        return Response::err(Some(req.id), "bad_request", "missing 'repo' field");
-                    }
-                    if !repo.contains('/') || repo.starts_with('/') || repo.ends_with('/') {
-                        return Response::err(
-                            Some(req.id),
-                            "bad_request",
-                            "repo must be in 'owner/repo' format",
-                        );
-                    }
-
-                    let mut params = serde_json::json!({
-                        "repo": repo,
-                        "secret_name": secret_name,
-                        "value_ref": value_ref,
-                    });
-                    if let Some(tok) = req.params.get("github_token_ref").and_then(|v| v.as_str()) {
-                        params["github_token_ref"] = serde_json::Value::String(tok.into());
-                    }
-                    if let Some(env) = req.params.get("environment").and_then(|v| v.as_str()) {
-                        params["environment"] = serde_json::Value::String(env.into());
-                    }
-                    let mut target = HashMap::from([
-                        ("repo".into(), repo),
-                        ("secret_name".into(), secret_name.clone()),
-                    ]);
-                    if let Some(env) = params.get("environment").and_then(|v| v.as_str()) {
-                        target.insert("environment".into(), env.to_owned());
-                    }
-                    ("github.set_actions_secret", target, params)
-                }
-                "codespaces_user" => {
-                    let mut params = serde_json::json!({
-                        "secret_name": secret_name,
-                        "value_ref": value_ref,
-                    });
-                    if let Some(tok) = req.params.get("github_token_ref").and_then(|v| v.as_str()) {
-                        params["github_token_ref"] = serde_json::Value::String(tok.into());
-                    }
-                    if let Some(ids) = req.params.get("selected_repository_ids") {
-                        params["selected_repository_ids"] = ids.clone();
-                    }
-                    let target = HashMap::from([("secret_name".into(), secret_name.clone())]);
-                    ("github.set_codespaces_secret", target, params)
-                }
-                "codespaces_repo" => {
-                    let repo = req
-                        .params
-                        .get("repo")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_owned();
-                    if repo.is_empty() {
-                        return Response::err(Some(req.id), "bad_request", "missing 'repo' field");
-                    }
-                    if !repo.contains('/') || repo.starts_with('/') || repo.ends_with('/') {
-                        return Response::err(
-                            Some(req.id),
-                            "bad_request",
-                            "repo must be in 'owner/repo' format",
-                        );
-                    }
-
-                    let mut params = serde_json::json!({
-                        "repo": repo,
-                        "secret_name": secret_name,
-                        "value_ref": value_ref,
-                    });
-                    if let Some(tok) = req.params.get("github_token_ref").and_then(|v| v.as_str()) {
-                        params["github_token_ref"] = serde_json::Value::String(tok.into());
-                    }
-                    let target = HashMap::from([
-                        ("repo".into(), repo),
-                        ("secret_name".into(), secret_name.clone()),
-                    ]);
-                    ("github.set_codespaces_secret", target, params)
-                }
-                "dependabot" => {
-                    let repo = req
-                        .params
-                        .get("repo")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_owned();
-                    if repo.is_empty() {
-                        return Response::err(Some(req.id), "bad_request", "missing 'repo' field");
-                    }
-                    if !repo.contains('/') || repo.starts_with('/') || repo.ends_with('/') {
-                        return Response::err(
-                            Some(req.id),
-                            "bad_request",
-                            "repo must be in 'owner/repo' format",
-                        );
-                    }
-
-                    let mut params = serde_json::json!({
-                        "repo": repo,
-                        "secret_name": secret_name,
-                        "value_ref": value_ref,
-                    });
-                    if let Some(tok) = req.params.get("github_token_ref").and_then(|v| v.as_str()) {
-                        params["github_token_ref"] = serde_json::Value::String(tok.into());
-                    }
-                    let target = HashMap::from([
-                        ("repo".into(), repo),
-                        ("secret_name".into(), secret_name.clone()),
-                    ]);
-                    ("github.set_dependabot_secret", target, params)
-                }
-                "org_actions" => {
-                    let org = req
-                        .params
-                        .get("org")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_owned();
-                    if org.is_empty() {
-                        return Response::err(Some(req.id), "bad_request", "missing 'org' field");
-                    }
-
-                    let mut params = serde_json::json!({
-                        "org": org,
-                        "secret_name": secret_name,
-                        "value_ref": value_ref,
-                    });
-                    if let Some(tok) = req.params.get("github_token_ref").and_then(|v| v.as_str()) {
-                        params["github_token_ref"] = serde_json::Value::String(tok.into());
-                    }
-                    if let Some(vis) = req.params.get("visibility").and_then(|v| v.as_str()) {
-                        params["visibility"] = serde_json::Value::String(vis.into());
-                    }
-                    if let Some(ids) = req.params.get("selected_repository_ids") {
-                        params["selected_repository_ids"] = ids.clone();
-                    }
-                    let target = HashMap::from([
-                        ("org".into(), org),
-                        ("secret_name".into(), secret_name.clone()),
-                    ]);
-                    ("github.set_org_secret", target, params)
-                }
-                unknown => {
-                    return Response::err(
-                        Some(req.id),
-                        "bad_request",
-                        format!(
-                            "unknown scope '{}' (expected: repo_actions, env_actions, codespaces_user, codespaces_repo, dependabot, org_actions)",
-                            truncate_for_error(unknown, 64)
-                        ),
-                    );
-                }
-            };
-
-            // Validate target before building OperationRequest.
-            let target = match InputValidator::validate_target(&target) {
-                Ok(t) => t,
-                Err(e) => {
-                    return Response::err(
-                        Some(req.id),
-                        "bad_request",
-                        format!("invalid target: {e}"),
-                    );
-                }
-            };
-
-            let mut secret_refs = vec![value_ref.clone()];
-            if let Some(tok) = op_params.get("github_token_ref").and_then(|v| v.as_str()) {
-                secret_refs.push(tok.to_owned());
-            }
-
-            let op_req = OperationRequest {
-                principal: principal_ctx.clone(),
-                request_id: Uuid::new_v4(),
-                client_identity: identity.clone(),
+            opaque_providers::github::handle_github_rpc(
+                &req,
+                state,
+                identity,
                 client_type,
-                operation: operation.into(),
-                target,
-                secret_ref_names: secret_refs,
-                created_at: SystemTime::now(),
-                expires_at: None,
-                params: op_params,
-                workspace: wrapper_workspace.clone(),
-            };
-
-            state.execute(op_req).await.into_proto_response(req.id)
+                principal_ctx.as_ref(),
+                wrapper_workspace.clone(),
+            )
+            .await
         }
         "gitlab" => {
             // Convenience wrapper for gitlab.set_ci_variable.
@@ -6519,156 +6233,6 @@ async fn handle_request(
         }
         _ => Response::err(Some(req.id), "unknown_method", "unknown method"),
     }
-}
-
-/// Handle `github` method with `action: "list_secrets"`.
-///
-/// Routes to `github.list_secrets` operation in the enclave.
-async fn handle_github_list_secrets(
-    req: &opaque_core::proto::Request,
-    state: &dyn EnclaveFacade,
-    identity: &ClientIdentity,
-    client_type: ClientType,
-    principal_ctx: Option<&PrincipalContext>,
-) -> opaque_core::proto::Response {
-    let scope = req
-        .params
-        .get("scope")
-        .and_then(|v| v.as_str())
-        .unwrap_or("actions");
-
-    let mut op_params = serde_json::json!({ "scope": scope });
-    let mut target = HashMap::new();
-
-    if let Some(repo) = req.params.get("repo").and_then(|v| v.as_str()) {
-        op_params["repo"] = serde_json::Value::String(repo.into());
-        target.insert("repo".into(), repo.to_owned());
-    }
-    if let Some(org) = req.params.get("org").and_then(|v| v.as_str()) {
-        op_params["org"] = serde_json::Value::String(org.into());
-        target.insert("org".into(), org.to_owned());
-    }
-    if let Some(env) = req.params.get("environment").and_then(|v| v.as_str()) {
-        op_params["environment"] = serde_json::Value::String(env.into());
-    }
-    if let Some(tok) = req.params.get("github_token_ref").and_then(|v| v.as_str()) {
-        op_params["github_token_ref"] = serde_json::Value::String(tok.into());
-    }
-
-    // Validate target before building OperationRequest.
-    let target = match InputValidator::validate_target(&target) {
-        Ok(t) => t,
-        Err(e) => {
-            return Response::err(Some(req.id), "bad_request", format!("invalid target: {e}"));
-        }
-    };
-
-    let op_req = OperationRequest {
-        principal: principal_ctx.cloned(),
-        request_id: Uuid::new_v4(),
-        client_identity: identity.clone(),
-        client_type,
-        operation: "github.list_secrets".into(),
-        target,
-        secret_ref_names: vec![],
-        created_at: SystemTime::now(),
-        expires_at: None,
-        params: op_params,
-        workspace: match task_api::verified_workspace(&req.params, identity).await {
-            Ok(workspace) => workspace,
-            Err(_) => {
-                return Response::err(
-                    Some(req.id),
-                    "workspace_verification_failed",
-                    "workspace verification failed",
-                );
-            }
-        },
-    };
-
-    state.execute(op_req).await.into_proto_response(req.id)
-}
-
-/// Handle `github` method with `action: "delete_secret"`.
-///
-/// Routes to `github.delete_secret` operation in the enclave.
-async fn handle_github_delete_secret(
-    req: &opaque_core::proto::Request,
-    state: &dyn EnclaveFacade,
-    identity: &ClientIdentity,
-    client_type: ClientType,
-    principal_ctx: Option<&PrincipalContext>,
-) -> opaque_core::proto::Response {
-    let scope = req
-        .params
-        .get("scope")
-        .and_then(|v| v.as_str())
-        .unwrap_or("actions");
-
-    let secret_name = req
-        .params
-        .get("secret_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_owned();
-
-    if secret_name.is_empty() {
-        return Response::err(Some(req.id), "bad_request", "missing 'secret_name' field");
-    }
-
-    let mut op_params = serde_json::json!({
-        "scope": scope,
-        "secret_name": secret_name,
-    });
-    let mut target = HashMap::from([("secret_name".into(), secret_name.clone())]);
-
-    if let Some(repo) = req.params.get("repo").and_then(|v| v.as_str()) {
-        op_params["repo"] = serde_json::Value::String(repo.into());
-        target.insert("repo".into(), repo.to_owned());
-    }
-    if let Some(org) = req.params.get("org").and_then(|v| v.as_str()) {
-        op_params["org"] = serde_json::Value::String(org.into());
-        target.insert("org".into(), org.to_owned());
-    }
-    if let Some(env) = req.params.get("environment").and_then(|v| v.as_str()) {
-        op_params["environment"] = serde_json::Value::String(env.into());
-    }
-    if let Some(tok) = req.params.get("github_token_ref").and_then(|v| v.as_str()) {
-        op_params["github_token_ref"] = serde_json::Value::String(tok.into());
-    }
-
-    // Validate target before building OperationRequest.
-    let target = match InputValidator::validate_target(&target) {
-        Ok(t) => t,
-        Err(e) => {
-            return Response::err(Some(req.id), "bad_request", format!("invalid target: {e}"));
-        }
-    };
-
-    let op_req = OperationRequest {
-        principal: principal_ctx.cloned(),
-        request_id: Uuid::new_v4(),
-        client_identity: identity.clone(),
-        client_type,
-        operation: "github.delete_secret".into(),
-        target,
-        secret_ref_names: vec![],
-        created_at: SystemTime::now(),
-        expires_at: None,
-        params: op_params,
-        workspace: match task_api::verified_workspace(&req.params, identity).await {
-            Ok(workspace) => workspace,
-            Err(_) => {
-                return Response::err(
-                    Some(req.id),
-                    "workspace_verification_failed",
-                    "workspace verification failed",
-                );
-            }
-        },
-    };
-
-    state.execute(op_req).await.into_proto_response(req.id)
 }
 
 // ---------------------------------------------------------------------------

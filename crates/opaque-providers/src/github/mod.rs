@@ -12,12 +12,14 @@
 pub mod client;
 pub mod crypto;
 pub mod release;
+mod rpc;
 mod task;
 
 pub use release::{
     dispatch_staging_release, plan_staging_release, prepare_staging_release,
     reconcile_staging_release,
 };
+pub use rpc::handle_github_rpc;
 pub use task::{execute_task_action, plan_task_manifest, prepare_task_manifest};
 
 #[cfg(test)]
@@ -33,7 +35,7 @@ use opaque_core::operation::OperationRequest;
 
 use opaque_core::profile::ALLOWED_REF_SCHEMES;
 
-use crate::sandbox::resolve::CompositeResolver;
+use crate::internal_resolve::CompositeResolver;
 use opaque_core::operation_handler::OperationHandler;
 use opaque_core::resolver::SecretResolver;
 
@@ -184,7 +186,7 @@ async fn set_secret_flow(
     extra_body: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     // 1. Resolve secret value and GitHub PAT.
-    let resolver = CompositeResolver::new(crate::default_secret_resolvers());
+    let resolver = CompositeResolver::new(crate::internal_resolve::default_secret_resolvers());
 
     let secret_value = resolver
         .resolve(value_ref)
@@ -573,7 +575,7 @@ impl GitHubHandler {
 
         let scope = parse_scope(params)?;
 
-        let resolver = CompositeResolver::new(crate::default_secret_resolvers());
+        let resolver = CompositeResolver::new(crate::internal_resolve::default_secret_resolvers());
         let github_token = resolver
             .resolve(&github_token_ref)
             .map_err(|e| format!("failed to resolve github_token_ref: {e}"))?;
@@ -643,7 +645,7 @@ impl GitHubHandler {
 
         let scope = parse_scope(params)?;
 
-        let resolver = CompositeResolver::new(crate::default_secret_resolvers());
+        let resolver = CompositeResolver::new(crate::internal_resolve::default_secret_resolvers());
         let github_token = resolver
             .resolve(&github_token_ref)
             .map_err(|e| format!("failed to resolve github_token_ref: {e}"))?;

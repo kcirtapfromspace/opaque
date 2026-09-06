@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "crates/opaque-core",
+  "crates/opaque-providers",
   "crates/opaqued",
   "crates/opaque",
   "crates/opaque-approve-helper",
