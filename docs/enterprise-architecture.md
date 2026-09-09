@@ -65,8 +65,8 @@ rollouts.
 ```
 
 `opaqued` is a composition root, not a monolith: it wires together the
-crates below, dispatches RPC, and owns `enclave.rs` — the enforcement funnel
-every request passes through — plus identity/agent-session/provisioning
+crates below, dispatches RPC, and owns `enclave.rs`, the enforcement funnel
+every request passes through, plus identity/agent-session/provisioning
 glue. Providers, approval, sandboxing, and bounded-work/tenant/federation
 logic each live in their own crate; see [architecture](architecture.md) for
 the full crate table.
@@ -100,7 +100,7 @@ The shared library used by every binary. Selected modules:
 > Azure, Doppler, and Infisical behind Cargo features so an embedder
 > depending on the crate directly can build without them. `opaqued`'s own
 > `Cargo.toml` re-enables all four, so the shipped daemon still compiles
-> every provider in — the feature boundary is at the crate level, not (yet)
+> every provider in. The feature boundary is at the crate level, not (yet)
 > in what ships.
 
 ### Safety Classification
@@ -118,7 +118,7 @@ Every registered operation carries a safety class:
 plaintext secret (e.g. `onepassword.read_field`) is `Reveal` and
 hard-blocked for every client. The MCP server exposes `Safe` operations
 plus a small set of `SensitiveOutput` ones with output withheld (sandbox
-exec, task tools) — see [MCP integration](mcp-integration.md) for the exact
+exec, task tools); see [MCP integration](mcp-integration.md) for the exact
 list. The enclave enforces safety-class restrictions independently either
 way, as defense-in-depth.
 
@@ -136,7 +136,7 @@ Unix domain sockets with length-delimited framing:
    frame size
 4. Frames carry JSON-encoded `Request` and `Response` envelopes
 5. The daemon enforces a bounded connection semaphore, per-connection rate
-   limiting, and an idle timeout — none of these are unbounded
+   limiting, and an idle timeout; none of these are unbounded
 
 ## Deployment Tiers
 
@@ -175,7 +175,7 @@ local modifications are detected. Each developer still runs their own daemon.
 Shipped today:
 
 - Central, signed policy bundles (`opqb1`) distributed to every daemon and
-  verified before use, with anti-rollback and live hot-swap — see
+  verified before use, with anti-rollback and live hot-swap; see
   [Federation](federation.md)
 - Org/team policy namespaces resolved daemon-side from the applied bundle
 - Audit-chain export to SIEM (spool / webhook / TLS syslog), independently
@@ -184,16 +184,16 @@ Shipped today:
   verify-before-trust key-release seam for KMS/SPIRE integration
 - Real principal identity: daemon-owned OIDC login, roles resolved live,
   on-behalf-of delegation tokens, break-glass with a distinct-approver
-  requirement — see [Identity](identity.md)
+  requirement; see [Identity](identity.md)
 - FIDO2 / WebAuthn and paired-device approval factors, verified
   cryptographically (Ed25519/P-256) against a daemon-issued challenge
 
 Not yet shipped:
 
-- **Hardware-rooted attestation** — today's posture attestation is
+- **Hardware-rooted attestation**: today's posture attestation is
   software-only, not a hardware measurement of the running binary. The
   KMS/SPIRE key-release seam is where that plugs in later.
-- **Production IdP/resource-token wiring for `Inference` tasks** — the
+- **Production IdP/resource-token wiring for `Inference` tasks**: the
   tenant/gateway machinery is implemented and fixture-tested; connecting a
   real IdP and data source is still a deployment-specific step (see below
   and [bounded work](bounded-work.md)).
@@ -204,7 +204,7 @@ Not yet shipped:
 
 `Inference` tasks enforce tenant binding, source-snapshot hash, and
 per-task approval out of the box; they don't provision your IdP or connect
-a live data source — that's an operator step. Today's mechanism:
+a live data source; that's an operator step. Today's mechanism:
 `identity.required = true` plus an `identity.allowed_subjects` allowlist
 scoped to your issuer.
 
@@ -217,13 +217,13 @@ scoped to your issuer.
 
 2. **Secret isolation.** Plaintext values exist only in `SecretValue` buffers
    that are zeroized on drop and optionally mlocked. They never appear in
-   audit logs, error messages, or client responses — audit `detail` text is
+   audit logs, error messages, or client responses; audit `detail` text is
    redacted centrally in the sink as a last line of defense.
 
 3. **Client authentication.** Unix peer credentials are verified for every
    connection, and executable path/hash can be pinned in policy rules. A
    macOS Team-ID field exists on `ClientIdentity` but nothing populates it
-   from a real code-signature check yet — `codesign_team_id` policy rules
+   from a real code-signature check yet, so `codesign_team_id` policy rules
    can't match today.
 
 4. **Tamper detection.** The config seal catches unauthorized policy changes
@@ -255,5 +255,5 @@ scoped to your issuer.
 ## Open work
 
 Hardware attestation, IdP/tenant-source wiring, the inert `codesign_team_id`
-field, and the provider feature-gate gap above are the open items — see
+field, and the provider feature-gate gap above are the open items; see
 [deferred roadmap](roadmap-deferred.md) for the rest.

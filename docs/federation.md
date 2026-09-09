@@ -4,7 +4,7 @@ Central, signed control for a fleet of daemons: an org signs its policy once,
 every daemon verifies before applying it, the audit chain streams to your SIEM,
 and each daemon can prove its integrity posture on demand.
 
-Federation builds on the [trust-domain split](deployment.md) — under
+Federation builds on the [trust-domain split](deployment.md): under
 `[trust_domain] enforce = true` the files these features depend on (the bundle
 anti-rollback state, export cursors, attestation key) are custody material the
 agent's uid cannot touch.
@@ -16,7 +16,7 @@ agent's uid cannot touch.
 A bundle is an org's policy as one signed document:
 `opqb1.<payload>.<signature>`. The Ed25519 signature covers the literal payload
 bytes under a domain separator, so there is no canonicalization step to
-disagree about — what was signed is exactly what is verified.
+disagree about: what was signed is exactly what is verified.
 
 ### What a daemon guarantees about a bundle
 
@@ -42,7 +42,7 @@ opaque bundle verify policy.bundle --anchor <hex>   # exits nonzero on failure
 opaque bundle inspect policy.bundle                 # contents, loudly UNVERIFIED
 ```
 
-A manifest is TOML — the same rule shape as the daemon config:
+A manifest is TOML, the same rule shape as the daemon config:
 
 ```toml
 org = "acme"
@@ -82,7 +82,7 @@ refresh_secs = 300
 
 The URL is fetched first and the path serves as a fallback, so a network blip
 cannot strip policy from a running fleet. A bundle that has *expired* is fatal
-as the initial `require_bundle` load but only a warning on refresh — an org
+as the initial `require_bundle` load but only a warning on refresh: an org
 outage must not disarm a running daemon.
 
 Distribution is deliberately dumb: any static host, object store, or git raw
@@ -93,7 +93,7 @@ URL works, because trust comes from the signature rather than the channel.
 ## Org and team namespaces
 
 Bundles carry team rosters. Membership is resolved **daemon-side per request**
-from the applied bundle — never supplied by a client — and a bundle refresh
+from the applied bundle (never supplied by a client), and a bundle refresh
 takes effect immediately.
 
 Rules constrain on teams through the identity block:
@@ -117,7 +117,7 @@ Team membership rides into the audit chain alongside the principal, so
 
 The export pump tails the audit **chain**, not the live event stream, so every
 exported record carries its `sequence_number` and `record_hash`. A SIEM holding
-those records can verify them against the database — the stream is evidence,
+those records can verify them against the database: the stream is evidence,
 not a parallel log that could drift.
 
 ```toml
@@ -133,7 +133,7 @@ batch_size = 256
 
 Each transport keeps its own persisted cursor, so a dead SIEM never stalls the
 others and delivery resumes exactly where it stopped after a restart. Delivery
-is at-least-once — dedupe on `(sequence_number, record_hash)`.
+is at-least-once; dedupe on `(sequence_number, record_hash)`.
 
 TLS syslog requires a CA file. There is no insecure-skip option, because
 shipping an audit trail to an unauthenticated endpoint is not a supported
@@ -145,7 +145,7 @@ The pump also runs a detector with its own cursor. Its rule comes from the
 chain rather than from policy: any request that recorded `approval.required`
 must record `approval.granted` (or a `lease.hit`) before
 `operation.succeeded`. A violation raises an Error-level `audit.alert` event
-into the chain — which then exports like everything else. It is a second
+into the chain, which then exports like everything else. It is a second
 opinion on the enclave, derived from evidence the enclave itself wrote.
 
 ---
@@ -194,7 +194,7 @@ material:
    the nonce it issued, and applies its own posture policy.
 4. Only then does it release the material.
 
-The daemon never sees the release policy — it proves posture and either
+The daemon never sees the release policy: it proves posture and either
 receives material or does not. A refusal is loud but not fatal: the daemon
 keeps running on what it already holds.
 
@@ -205,6 +205,6 @@ flow.
 
 > **Honesty about strength.** This is *software* attestation: it proves a
 > holder of the enrolled key claims this posture, freshly. It is not a
-> hardware measurement of the running binary. What it buys is real but bounded
-> — a daemon whose custody was tampered with cannot silently collect fresh
+> hardware measurement of the running binary. What it buys is real but bounded:
+> a daemon whose custody was tampered with cannot silently collect fresh
 > keys, because the report it must produce carries the violations.

@@ -2,17 +2,17 @@
 
 Phase 1 introduces a **real principal model** on top of the Phase 0 enclave: who a
 request is *for* (a verified human or a declared service), who *acts* (the agent
-workload), and who *approved* it — all recorded in the tamper-evident audit chain.
+workload), and who *approved* it, all recorded in the tamper-evident audit chain.
 
 The core reframe: nothing a local client process claims about itself is trusted,
 because agents drive the same `opaque` CLI a human does. Identity is established
 where an agent cannot follow:
 
-- **Human identity** — proven at the IdP in a browser (OIDC). The daemon owns the
+- **Human identity**: proven at the IdP in a browser (OIDC). The daemon owns the
   entire flow; the CLI only displays a URL.
-- **Presence** — proven by the out-of-band approval act (Phase 0), now attributed
+- **Presence**: proven by the out-of-band approval act (Phase 0), now attributed
   to a principal.
-- **Delegation** — a daemon-signed token binding an agent (`act`) to the principal
+- **Delegation**: a daemon-signed token binding an agent (`act`) to the principal
   it works on behalf of (`sub`), with the effective permission being the
   *intersection* of what the agent session and the delegating principal may do.
 
@@ -29,13 +29,13 @@ where an agent cannot follow:
 Roles attach to principals, not client types (client classification stays
 audit-only, never a security gate):
 
-- `admin` — manage identity: assign roles, register service principals
-- `approver` — may confirm out-of-band approvals
-- `operator` — may run operations (the default working role)
-- `auditor` — read-only access to audit and configuration
+- `admin`: manage identity (assign roles, register service principals)
+- `approver`: may confirm out-of-band approvals
+- `operator`: may run operations (the default working role)
+- `auditor`: read-only access to audit and configuration
 
 Roles are resolved from the identity store **at request time**, never embedded in
-tokens — revoking a role or disabling a principal takes effect immediately.
+tokens: revoking a role or disabling a principal takes effect immediately.
 
 ## Access modes
 
@@ -43,7 +43,7 @@ tokens — revoking a role or disabling a principal takes effect immediately.
 |---|---|---|---|
 | `delegated` | Authenticated human | Required (out-of-band) | Normal agent work on behalf of a person |
 | `autonomous` | Config-declared service principal | Per policy | CI / unattended pipelines |
-| `break_glass` | Authenticated human | Required, from a **distinct** approver | Emergency step-up (fails closed until a distinct-approver factor — a paired device — is available) |
+| `break_glass` | Authenticated human | Required, from a **distinct** approver | Emergency step-up (fails closed until a distinct-approver factor, a paired device, is available) |
 
 ## Configuration
 
@@ -64,7 +64,7 @@ roles = ["operator"]
 
 Register the IdP application as a **native/public client** with loopback redirect
 URIs (RFC 8252). The daemon binds the loopback listener and performs the code
-exchange itself with PKCE — the authorization code never passes through the CLI,
+exchange itself with PKCE. The authorization code never passes through the CLI,
 so an agent driving the CLI cannot complete a login.
 
 ## Commands
@@ -81,15 +81,15 @@ $ opaque identity delegations   # active delegation sessions
 ## Delegation tokens
 
 `opaque agent run` (with `[identity]` configured) mints a **delegation token**
-instead of an opaque session token: `opqd1.<claims>.<sig>` — Ed25519 over
-domain-separated, RFC 8693-shaped claims:
+instead of an opaque session token: `opqd1.<claims>.<sig>` (Ed25519 over
+domain-separated, RFC 8693-shaped claims):
 
 ```json
 { "jti": "…", "sub": "hum_…", "act": "agt_…", "mode": "delegated", "iat": …, "exp": … }
 ```
 
 - Minting still requires a **fresh out-of-band approval** (an agent cannot mint
-  its own session) and — in delegated mode — an unexpired human login session.
+  its own session) and, in delegated mode, an unexpired human login session.
 - The daemon validates signature + expiry + store state on **every** request and
   attaches the verified `PrincipalContext` to the operation. The human session
   expiring or the delegation being revoked kills in-flight agent access.
@@ -115,7 +115,7 @@ access_modes = ["delegated"]
 # principal = "dev@example.com" # pin to one principal (id or label)
 ```
 
-The `roles` constraint applies to the **delegating principal** (`sub`) — this is
+The `roles` constraint applies to the **delegating principal** (`sub`). This is
 how *effective permission = agent ∩ human* is enforced.
 
 ## Audit
@@ -125,7 +125,7 @@ how *effective permission = agent ∩ human* is enforced.
 - Approvals record **who approved** (`approver_json`): the approving principal,
   label, and source. Sources today: `local_bio_session` (presence proven,
   name session-bound), `polkit_account` (polkit-authenticated account),
-  `paired_device` and `fido2` (SIGNATURE-BOUND — the daemon verified the
+  `paired_device` and `fido2` (SIGNATURE-BOUND: the daemon verified the
   approver's cryptographic response to its own challenge before recording).
 - Login, logout, role changes, and delegation issue/revoke are audited events;
   every startup records a `trust_domain.posture` event, so "was the split
@@ -136,16 +136,16 @@ how *effective permission = agent ∩ human* is enforced.
 ## Threat-model honesty
 
 - **Same-uid caveat, now MODE-DEPENDENT:** while the daemon shares the agent's
-  uid (session mode), integrity here is tamper-*evident*, not tamper-*proof* —
+  uid (session mode), integrity here is tamper-*evident*, not tamper-*proof*:
   an adversary holding the uid can read keys and rewrite state. Under the
-  trust-domain split (`[trust_domain] enforce = true` — see
+  trust-domain split (`[trust_domain] enforce = true`; see
   docs/deployment.md), the custody files are unreadable and unwritable at the
   agent's uid and startup fails closed on any violation: the same guarantees
   become tamper-*prevention*, verified end to end by the Linux e2e suite
   (`scripts/linux-harness.sh e2e-split`).
 - **Approver attribution** depends on the factor: `local_bio_session` proves
   presence with a session-bound name; `paired_device`/`fido2` approvers are
-  cryptographically verified — an Ed25519 or P-256 signature over the
+  cryptographically verified: an Ed25519 or P-256 signature over the
   daemon-issued, decision-bound challenge, checked against the pairing or
   credential store before the approval settles.
 - The loopback redirect follows RFC 8252: `state` binds the callback to the

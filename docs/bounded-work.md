@@ -5,7 +5,7 @@ Opaque can hand an agent a **task**: an immutable manifest, approved once as
 a whole, executed once, with a receipt. **plan → review → approve → run →
 inspect**.
 
-A task's authority is a **grant** — the manifest itself, pinned by content
+A task's authority is a **grant**: the manifest itself, pinned by content
 hash. A different manifest is a different task; scope can't change after
 planning.
 
@@ -37,9 +37,9 @@ opaque task plan-ssh --title "Service health on approved host" --expires-in-secs
 opaque task plan-inference --title "Tenant public data inference" --expires-in-secs 600
 ```
 
-Planning resolves everything up front — repo IDs, workflow byte hashes, host
-keys, Vault CA/role bindings — so the reviewer approves resolved facts, not
-names that could still resolve to something else at run time.
+Planning resolves everything up front: repo IDs, workflow byte hashes,
+host keys, Vault CA and role bindings. The reviewer approves resolved
+facts, not names that could still resolve to something else at run time.
 
 ## Reviewing and approving
 
@@ -68,7 +68,7 @@ Planned --run--> Running --> Completed
 ```
 
 A slot charges **atomically before dispatch**, never after. Retry, restart,
-or an ambiguous provider response never refunds it — an uncertain outcome
+or an ambiguous provider response never refunds it; an uncertain outcome
 counts as consumed. `Partial` marks "charged, provider result unconfirmed"
 as its own state, rather than guessing success or failure.
 
@@ -78,20 +78,21 @@ Repository/release work is production-real: manifest format, atomic ledger,
 and `paired_workstation` approval are exercised end-to-end against real
 providers in tests and dogfooding.
 
-Host operations (`SshHealth`) are validated against disposable Vault/OpenSSH
-fixtures — real certs, real host-side guards, real revocation — see
-`examples/bounded-ssh/README.md` for the enforcement table. Provisioning a
+Host operations (`SshHealth`) are validated against disposable
+Vault/OpenSSH fixtures: real certs, real host-side guards, real
+revocation. See `examples/bounded-ssh/README.md` for the enforcement
+table. Provisioning a
 real host and running native approval against it is on you; `opaque task
 plan-ssh` doesn't do that part.
 
-Application-evidence (`Inference`) tasks need a tenant-aware source adapter
-and a real IdP/resource-token contract — see
+Application-evidence (`Inference`) tasks need a tenant-aware source
+adapter and a real IdP/resource-token contract; see
 [enterprise architecture](enterprise-architecture.md). Without that wired
 up, there's no source for the task to read.
 
 ## Related docs
 
-- [Identity](identity.md) — the delegation token an agent session presents when planning a task on a human's behalf
-- Trusted workstation approvals (`crates/opaque-approver/README.md`) — the `paired_workstation` full-manifest review flow
-- [HashiCorp Vault](vault.md) — the SSH certificate signer for `SshHealth` actions
-- [Enterprise architecture](enterprise-architecture.md) — tenant/IdP wiring for `Inference` actions
+- [Identity](identity.md): the delegation token an agent session presents when planning a task on a human's behalf
+- Trusted workstation approvals (`crates/opaque-approver/README.md`): the `paired_workstation` full-manifest review flow
+- [HashiCorp Vault](vault.md): the SSH certificate signer for `SshHealth` actions
+- [Enterprise architecture](enterprise-architecture.md): tenant/IdP wiring for `Inference` actions

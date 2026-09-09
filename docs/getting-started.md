@@ -136,7 +136,7 @@ For Claude Code, the MCP server is the recommended integration path:
 
 2. Start `opaqued` (or install it as a service: `opaque service install`)
 
-3. Ask Claude Code to "list my GitHub secrets for owner/repo" — it will call the `opaque_github_list_secrets` tool via MCP.
+3. Ask Claude Code to "list my GitHub secrets for owner/repo". It will call the `opaque_github_list_secrets` tool via MCP.
 
 See [MCP integration](mcp-integration.md) for full setup.
 
@@ -329,7 +329,7 @@ The daemon writes a local SQLite audit DB at `~/.opaque/audit.db`.
 ./target/release/opaque audit tail --query github --limit 20
 ```
 
-The log is an HMAC hash chain. Verify it — edits, reorderings, deletions, and
+The log is an HMAC hash chain. Verify it. Edits, reorderings, deletions, and
 truncation all fail, and the command exits nonzero:
 
 ```bash
@@ -354,7 +354,7 @@ export transports, and the key-release protocol.
 
 ## Bounded Agent Work
 
-Beyond one-shot operations, an agent can be handed a **task** — an immutable,
+Beyond one-shot operations, an agent can be handed a **task**, an immutable,
 fully-reviewed manifest (publish a secret, dispatch a release, run a fixed
 host check) approved once as a whole and executed once, with a receipt:
 

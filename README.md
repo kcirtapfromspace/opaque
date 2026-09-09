@@ -10,10 +10,10 @@
 ### Approve the work. Keep authority bounded.
 
 Opaque lets a team give an AI coding agent (Codex, Claude Code, etc) a
-**bounded piece of work** — publish a secret, dispatch a release, run a
-fixed host check, read scoped application data — approve exactly what it's
-allowed to do, and inspect the evidence after. LLMs get **operations**,
-never plaintext secret values.
+**bounded piece of work**: publish a secret, dispatch a release, run a
+fixed host check, read scoped application data. You approve exactly what it
+may do and inspect the evidence after. LLMs get **operations**, never
+plaintext secret values.
 
 ## What It Does
 
@@ -21,7 +21,7 @@ Every operation passes through:
 
 **Policy -> Approval -> Execute -> Sanitize -> Audit**
 
-Multi-step work adds **plan -> review -> approve -> run -> inspect** — see
+Multi-step work adds **plan -> review -> approve -> run -> inspect**. See
 [bounded agent work](docs/bounded-work.md).
 
 New here? The [15-minute tutorial](docs/tutorial.md) takes you from install to a
@@ -29,29 +29,29 @@ secret your agent moved but never saw, with an audit chain proving it.
 
 ## Who It's For
 
-Engineering organizations — ten developers and up — whose teams already use
-AI coding agents, and who today either withhold sensitive access from them
-or supervise every action.
+Engineering teams of ten or more whose developers already use AI coding
+agents. Today those teams either keep sensitive access away from the agent
+or watch its every move.
 
 - **Security and platform leads** own policy and custody: what agents may
-  touch, which operations need a human, and the evidence trail an auditor
+  touch, which operations need a human, and an evidence trail an auditor
   or SIEM can verify.
 - **Developers** hand the agent real work, approve the exact scope once,
-  and read the receipt instead of the terminal.
+  and read the receipt.
 - **The agent** (Claude Code, Codex, any MCP client) finishes the task with
-  operations, never plaintext — nothing worth stealing ever enters its
-  process.
+  operations, never plaintext. There is nothing in its process worth
+  stealing.
 
-Opaque is not a secrets manager and not an agent framework — it's the
-authorization and evidence layer between the two you already have, sitting
-in front of GitHub, GitLab, 1Password, Bitwarden, Vault, and AWS.
+Opaque is not another secrets manager or agent framework. It sits in front
+of GitHub, GitLab, 1Password, Bitwarden, Vault, and AWS, decides what may
+pass, and proves what did.
 
 ## Features
 
 - Deny-by-default policy engine with allowlist rules
-- **Bounded agent work**: a pinned task manifest — publish a secret, dispatch a release, run a fixed SSH host check, read scoped data — approved once as a whole, each action charging exactly one slot, with a receipt (`opaque task plan|run|show|reconcile|revoke`, see `docs/bounded-work.md`)
-- **Trust-domain enforcement**: run the daemon as a dedicated service account (or separate container) that exclusively owns every key, database, and config — startup verifies custody and fails closed, turning tamper-evidence into tamper-prevention (`docs/deployment.md`)
-- **Signature-bound approvals**: pluggable factor registry — macOS Touch ID / Linux polkit, paired second device (Ed25519, decision-bound signatures), FIDO2 hardware keys and passkeys (challenge-bound, verified daemon-side), and a trusted-workstation full-manifest reviewer for tasks; the audit chain records *who* approved, cryptographically
+- **Bounded agent work**: a pinned task manifest (publish a secret, dispatch a release, run a fixed SSH host check, read scoped data) approved once as a whole, each action charging exactly one slot, with a receipt (`opaque task plan|run|show|reconcile|revoke`, see `docs/bounded-work.md`)
+- **Trust-domain enforcement**: run the daemon as a dedicated service account (or separate container) that exclusively owns every key, database, and config; startup verifies custody and fails closed, turning tamper-evidence into tamper-prevention (`docs/deployment.md`)
+- **Signature-bound approvals**: a pluggable factor registry with macOS Touch ID / Linux polkit, a paired second device (Ed25519, decision-bound signatures), FIDO2 hardware keys and passkeys (challenge-bound, verified daemon-side), and a trusted-workstation full-manifest reviewer for tasks; the audit chain records *who* approved, cryptographically
 - Identity substrate: daemon-owned OIDC login (PKCE), on-behalf-of delegation tokens, live-resolved roles, segregation of duties
 - Tamper-evident HMAC audit chain (SQLite) with `opaque audit verify`, restart-safe sequencing, and correlation IDs
 - Sandboxed execution: bubblewrap + Landlock + seccomp applied to every exec child; typestate-enforced response sanitization + secret-pattern scrubbing
@@ -221,7 +221,7 @@ opaque policy preset github-secrets
 
 ## Docs
 
-- [Try the portfolio demo](https://demo.opaque.info/) — explore synthetic application metrics and scoped analyst, engineer and support views.
+- [Try the portfolio demo](https://demo.opaque.info/): explore synthetic application metrics and scoped analyst, engineer and support views.
 
 - [Docs index](docs/README.md)
 - [Tutorial: your first gated operation](docs/tutorial.md)

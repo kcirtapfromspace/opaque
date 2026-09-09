@@ -32,10 +32,10 @@
             Codex, and any MCP client.
           </p>
           <p class="op-hero__explanation">
-            For platform and security teams whose developers already run AI coding
-            agents: the agent asks for work, Opaque checks policy, gets human approval
-            out of band, executes against your secrets provider, and returns a
-            sanitized response. Every operation leaves a tamper-evident audit trail.
+            Built for platform and security teams whose developers already run AI
+            coding agents. The agent asks for work. Opaque checks policy, gets human
+            approval out of band, executes against your secrets provider, and returns
+            a sanitized response. Every operation leaves a tamper-evident audit trail.
           </p>
           <div class="op-actions">
             <a class="op-btn op-btn--solid" href="{{ 'getting-started/' | url }}">Get started</a>
@@ -161,11 +161,11 @@
         <div class="op-kicker">
           <h2>Who runs Opaque</h2>
           <p>
-            Engineering organizations &mdash; ten developers and up &mdash; whose teams
-            already use AI coding agents, and who today either withhold sensitive access
-            from them or supervise every action. Opaque is not a secrets manager and not
-            an agent framework: it is the authorization and evidence layer between the
-            two you already have.
+            Engineering teams of ten or more whose developers already use AI coding
+            agents. Today those teams either keep sensitive access away from the agent
+            or watch its every move. Opaque is not another secrets manager or agent
+            framework. It decides what may pass between the two you already have, and
+            proves what did.
           </p>
         </div>
         <div class="op-grid">
@@ -173,26 +173,25 @@
             <h3>The security or platform lead</h3>
             <p>
               Owns policy and custody. Decides what agents may touch and which
-              operations need a human &mdash; and can prove afterward, to an auditor
-              or a SIEM, exactly what happened and who approved it.
+              operations need a human. Can show an auditor, or a SIEM, what happened
+              and who approved it.
             </p>
             <samp>policy &middot; custody &middot; evidence</samp>
           </div>
           <div class="op-cell">
             <h3>The developer</h3>
             <p>
-              Stops supervising every action. Hands the agent real work &mdash; publish
-              the secret, dispatch the release, run the host check &mdash; approves the
-              exact scope once, and reads the receipt instead of the terminal.
+              Stops watching every action. Hands the agent real work: publish the
+              secret, dispatch the release, run the host check. Approves the exact
+              scope once and reads the receipt.
             </p>
-            <samp>approve once &middot; inspect the receipt</samp>
+            <samp>approve once &middot; read the receipt</samp>
           </div>
           <div class="op-cell">
             <h3>The agent</h3>
             <p>
-              Finishes the task. Claude Code or Codex gets operations, never plaintext
-              &mdash; it can complete the work without ever holding anything worth
-              stealing.
+              Finishes the task. Claude Code or Codex gets operations, never
+              plaintext. There is nothing in its process worth stealing.
             </p>
             <samp>operations, never values</samp>
           </div>
@@ -237,8 +236,8 @@
           <li>
             <h3>Sanitize</h3>
             <p>
-              Responses pass typestate-enforced sanitization &mdash; returning an unsanitized
-              response is a compile error &mdash; plus secret-pattern scrubbing.
+              Responses pass typestate-enforced sanitization, then secret-pattern
+              scrubbing. Returning an unsanitized response is a compile error.
             </p>
           </li>
           <li>
@@ -266,8 +265,8 @@
           <div class="op-cell">
             <h3>Trust-domain enforcement</h3>
             <p>
-              Run the daemon under a dedicated service account &mdash; or in a separate
-              container &mdash; that exclusively owns every key, database, and config.
+              Run the daemon under a dedicated service account, or in a separate
+              container, that exclusively owns every key, database, and config.
               Startup fails closed on any custody violation, and connections from the
               daemon's own uid are refused. Tamper-evidence becomes tamper-prevention.
             </p>
@@ -304,7 +303,7 @@
           <div class="op-cell">
             <h3>Identity substrate</h3>
             <p>
-              Humans log in at your IdP over OIDC &mdash; PKCE, loopback redirect, owned by
+              Humans log in at your IdP over OIDC: PKCE, loopback redirect, owned by
               the daemon, so an agent driving the CLI cannot complete a login. Agents act
               on-behalf-of via Ed25519 delegation tokens, roles resolve live at request
               time, and segregation of duties can require a distinct approver.
@@ -316,7 +315,7 @@
             <p>
               Nothing is allowed until a rule allows it: operations, executables,
               workspaces, principals, access modes. Presets cover common agent workflows;
-              anything unmatched is denied &mdash; and audited.
+              anything unmatched is denied, and audited.
             </p>
             <samp>operation_pattern = "github.*"</samp>
           </div>
@@ -340,7 +339,7 @@
             <p>
               The default. The daemon runs as your own user, inside your GUI session, and
               approvals are local: Touch&nbsp;ID on macOS, polkit on Linux. A process
-              sharing your uid could read the chain key and rewrite state &mdash; you would
+              sharing your uid could read the chain key and rewrite state. You would
               detect it after the fact with <code>opaque audit verify</code>.
             </p>
             <samp>~/.opaque, LaunchAgent / systemd --user</samp>
@@ -350,8 +349,8 @@
             <p>
               The daemon runs as a dedicated service account, or in a separate container
               that shares only the socket with the agent. Custody files are unreadable and
-              unwritable at the agent's uid &mdash; in containers they have no path at
-              all &mdash; and startup fails closed on any violation. Approvals move to
+              unwritable at the agent's uid; in containers they have no path at all.
+              Startup fails closed on any violation. Approvals move to
               out-of-band factors: a paired device, a FIDO2 key, a passkey.
             </p>
             <samp>/etc/opaque, LaunchDaemon / systemd / compose / k8s</samp>
@@ -373,7 +372,7 @@
           <h2>One signature governs the fleet</h2>
           <p>
             The guarantees above hold on one machine. These hold across every machine
-            that runs the daemon &mdash; without a server anyone has to trust.
+            that runs the daemon, without a server anyone has to trust.
           </p>
         </div>
         <div class="op-grid">
@@ -382,7 +381,7 @@
             <p>
               Your org signs its policy once; every daemon verifies the signature against
               its trust anchors before the payload is even parsed. Version rollback is
-              refused from custody &mdash; an older bundle, or a different bundle wearing
+              refused from custody: an older bundle, or a different bundle wearing
               a version already applied, never takes effect. Serve it from any static
               host: trust comes from the signature, not the channel.
             </p>
@@ -392,7 +391,7 @@
             <h3>An audit stream your SIEM can verify</h3>
             <p>
               Export tails the hash chain itself, so every record arrives carrying its
-              sequence number and chain hash &mdash; evidence, not a parallel log that
+              sequence number and chain hash. It is evidence, not a parallel log that
               can drift. Spool, webhook, or RFC&nbsp;5424 syslog over TLS, each with its
               own cursor so one dead collector never stalls the rest.
             </p>
@@ -403,7 +402,7 @@
             <p>
               A daemon re-verifies its own custody and audit chain on an interval and
               signs the result against a caller's nonce. A key verifier can demand that
-              proof before releasing custody material &mdash; the seam where KMS or
+              proof before releasing custody material. This is the seam where KMS or
               SPIFFE/SPIRE plugs in. A tampered daemon cannot quietly collect fresh keys.
             </p>
             <samp>$ opaque attest --key &lt;hex&gt;</samp>
@@ -481,7 +480,7 @@
           Kubernetes ship in the repository's <code>deploy/</code> directory.
         </p>
         <p class="op-install-notes">
-          Start with a preset &mdash; <code>opaque init --preset github-secrets</code> &mdash;
+          Start with a preset, <code>opaque init --preset github-secrets</code>,
           then point your agent at the socket.
         </p>
       </div>

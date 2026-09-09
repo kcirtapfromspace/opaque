@@ -24,7 +24,7 @@ Use the OS store for **credentials and private keys**:
 
 - GitHub/GitLab credentials (PATs) if you choose to store them locally
 - Vault tokens / 1Password service tokens (if stored)
-- Opaque server identity private key (used for second-device pairing/transport — desktop-to-desktop Ed25519 today, see [identity](identity.md))
+- Opaque server identity private key (used for second-device pairing/transport: desktop-to-desktop Ed25519 today, see [identity](identity.md))
 - optional: a database encryption key (see below)
 
 macOS: Keychain
@@ -156,7 +156,7 @@ Fields:
 Fields:
 
 - `id` (pk)
-- `kind` (`workstation` — the desktop-to-desktop Ed25519 pairing that ships today; `ios` exists only as the schema's legacy default value and has no shipped mobile app behind it, see [mobile approvals](mobile-approvals.md))
+- `kind` (`workstation`: the desktop-to-desktop Ed25519 pairing that ships today; `ios` exists only as the schema's legacy default value and has no shipped mobile app behind it, see [mobile approvals](mobile-approvals.md))
 - `device_pubkey` (blob/base64)
 - `device_name`
 - `added_at`
