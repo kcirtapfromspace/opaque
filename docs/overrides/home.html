@@ -32,9 +32,10 @@
             Codex, and any MCP client.
           </p>
           <p class="op-hero__explanation">
-            The agent asks for work. Opaque checks policy, gets human approval out of band,
-            executes against your secrets provider, and returns a sanitized response.
-            Every operation leaves a tamper-evident audit trail.
+            For platform and security teams whose developers already run AI coding
+            agents: the agent asks for work, Opaque checks policy, gets human approval
+            out of band, executes against your secrets provider, and returns a
+            sanitized response. Every operation leaves a tamper-evident audit trail.
           </p>
           <div class="op-actions">
             <a class="op-btn op-btn--solid" href="{{ 'getting-started/' | url }}">Get started</a>
@@ -154,6 +155,51 @@
     </section>
 
     <!-- Pipeline -->
+    <!-- Audience -->
+    <section id="op-who">
+      <div class="op-wrap">
+        <div class="op-kicker">
+          <h2>Who runs Opaque</h2>
+          <p>
+            Engineering organizations &mdash; ten developers and up &mdash; whose teams
+            already use AI coding agents, and who today either withhold sensitive access
+            from them or supervise every action. Opaque is not a secrets manager and not
+            an agent framework: it is the authorization and evidence layer between the
+            two you already have.
+          </p>
+        </div>
+        <div class="op-grid">
+          <div class="op-cell">
+            <h3>The security or platform lead</h3>
+            <p>
+              Owns policy and custody. Decides what agents may touch and which
+              operations need a human &mdash; and can prove afterward, to an auditor
+              or a SIEM, exactly what happened and who approved it.
+            </p>
+            <samp>policy &middot; custody &middot; evidence</samp>
+          </div>
+          <div class="op-cell">
+            <h3>The developer</h3>
+            <p>
+              Stops supervising every action. Hands the agent real work &mdash; publish
+              the secret, dispatch the release, run the host check &mdash; approves the
+              exact scope once, and reads the receipt instead of the terminal.
+            </p>
+            <samp>approve once &middot; inspect the receipt</samp>
+          </div>
+          <div class="op-cell">
+            <h3>The agent</h3>
+            <p>
+              Finishes the task. Claude Code or Codex gets operations, never plaintext
+              &mdash; it can complete the work without ever holding anything worth
+              stealing.
+            </p>
+            <samp>operations, never values</samp>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <section id="op-pipeline">
       <div class="op-wrap">
         <div class="op-kicker">

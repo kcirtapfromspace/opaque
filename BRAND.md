@@ -29,6 +29,28 @@ Brand line: landing hero (`docs/overrides/home.html`), `README.md`,
 alongside it in `README.md` and `docs/index.md` only — hero and meta
 description stay brand-line-only, both need to stay short.
 
+## The audience
+
+Every external page names who this is for, early, in this frame:
+
+> Engineering organizations — ten developers and up — whose teams already
+> use AI coding agents, and who today either withhold sensitive access from
+> them or supervise every action.
+
+Three roles, always the same split: the **security or platform lead** owns
+policy, custody, and the evidence trail; the **developer** hands the agent
+real work, approves the exact scope once, and reads the receipt; the
+**agent** finishes the task with operations, never plaintext. Category
+statement, verbatim where the reader might mis-shelve us: *not a secrets
+manager and not an agent framework — the authorization and evidence layer
+between the two you already have.*
+
+Do not claim government, compliance certifications, or a vertical: nothing
+shipped supports those claims. Do not pitch individual hobbyist developers
+as the market; the free-under-10-developers BUSL line is the on-ramp, not
+the audience. Where it lives: `#op-who` on the landing page, "Who It's For"
+in `README.md`, the opening paragraph of `docs/index.md`.
+
 ## The redaction motif
 
 Redaction is the one visual idea. It appears in three forms, and nothing else
