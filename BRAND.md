@@ -33,7 +33,7 @@ description stay brand-line-only; both need to stay short.
 
 Every external page names who this is for, early, in this frame:
 
-> Engineering teams of ten or more whose developers already use AI coding
+> Platform and security teams whose developers already use AI coding
 > agents. Today those teams either keep sensitive access away from the
 > agent or watch its every move.
 
@@ -45,10 +45,12 @@ statement, verbatim where the reader might mis-shelve us: *not another
 secrets manager or agent framework. It decides what may pass between the
 two you already have, and proves what did.*
 
-Do not claim government, compliance certifications, or a vertical: nothing
-shipped supports those claims. Do not pitch individual hobbyist developers
-as the market; the free-under-10-developers BUSL line is the on-ramp, not
-the audience. Where it lives: `#op-who` on the landing page, "Who It's For"
+Size is a journey, not a gate. Never qualify the audience by headcount;
+say "start on one laptop; one signed policy governs a fleet." The
+free-under-10-developers BUSL line is licensing and appears only in the
+licensing footnote. Do not claim government, compliance certifications, or
+a vertical: nothing shipped supports those claims. Do not pitch individual
+hobbyist developers as the market. Where it lives: `#op-who` on the landing page, "Who It's For"
 in `README.md`, the opening paragraph of `docs/index.md`.
 
 ## The voice
