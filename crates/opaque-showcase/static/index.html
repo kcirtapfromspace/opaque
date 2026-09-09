@@ -216,6 +216,8 @@ body.credit-experience{--bg:#f5f3ed;--panel:#fbfaf5;--raised:#eeede5;--line:#d9d
 @media(max-width:1000px){.flow-heading{padding:18px 18px 0}.flow-heading h2{font-size:21px}.flow-art{padding:0 12px}.flow-labels{padding:0 18px 16px;grid-template-columns:repeat(2,minmax(0,1fr));gap:15px}.flow-summary{padding:12px 18px;flex-wrap:wrap;gap:5px}.flow-evidence{padding:0 18px}}
 @media(max-width:450px){.flow-heading{gap:10px}.flow-heading h2{font-size:20px}.flow-motion{font-size:10px}.flow-art{padding:8px 5px}.flow-heading .flow-eyebrow{font-size:9px}.flow-note{font-size:11px}}
 @media(prefers-reduced-motion:reduce){.work-receipt{animation:none}.flow-panel *{transition:none!important}.flow-packet{display:none}}
+
+.pilot-invitation{margin:20px 0 0;padding:17px 0 0;border-top:1px solid var(--line);color:var(--dim);font-size:12px;line-height:1.8}.pilot-invitation p{margin:0}.pilot-invitation a{color:var(--amber);text-underline-offset:4px;margin-left:8px}.pilot-invitation small{display:block;color:var(--muted);font-size:11px}
 </style>
 </head>
 <body>
@@ -282,6 +284,7 @@ body.credit-experience{--bg:#f5f3ed;--panel:#fbfaf5;--raised:#eeede5;--line:#d9d
         <div class="welcome" id="welcome"><h2 id="welcome-title">Ask your metrics.<br><span>Inspect the evidence.</span></h2><p id="welcome-copy">Ask a question in your own words. Scoped metric results arrive here with their source times and the tool calls behind them.</p><div class="suggestions" id="suggestions"></div></div>
       </div>
       <div class="portfolio-guide" id="portfolio-guide" hidden><h3 class="guide-heading">Explore the permission boundary</h3><div class="boundary-questions" id="boundary-questions"></div><p class="guide-note">These questions test access limits. The demo does not expose borrower records or make lending decisions.</p></div>
+      <aside class="pilot-invitation" id="pilot-invitation" hidden aria-label="Optional Opaque pilot"><p>Have a task you still keep from your agent?<a href="/#pilot-result">Discuss a pilot →</a></p><small>Optional. Return to the pilot form in this browser; your demo session stays with you.</small></aside>
       <form class="composer" id="composer"><div class="clarification-context" id="clarification-context" hidden><p id="clarification-question"></p><button class="clarification-reset" id="new-question" type="button">New question</button></div><label for="message">Your question</label><textarea id="message" name="message" rows="3" maxlength="2000" placeholder="Ask about an allowed metric…" required disabled></textarea><p class="composer-error" id="composer-error" role="alert" hidden></p><div class="composer-bottom"><span class="composer-hint" id="composer-hint">Waiting for an authenticated session.</span><button class="send-button" id="send" type="submit" disabled><span id="send-label">Ask metrics</span> <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2 8h11M8 3l5 5-5 5" stroke="currentColor" stroke-width="1.5"/></svg></button><button class="stop-button" id="stop" type="button" hidden><span class="stop-square"></span>Stop</button></div></form>
       <p class="scope-caption">This session fixes the customer and allowed metric scope. Chat requests cannot change that identity. Results and model text are evidence to inspect, not new permission.</p>
       </div>
@@ -317,7 +320,7 @@ body.credit-experience{--bg:#f5f3ed;--panel:#fbfaf5;--raised:#eeede5;--line:#d9d
 </dialog>
 <script>
 'use strict';
-var state = {session:null,customerId:null,controller:null,active:null,latest:new Map(),freshnessNodes:[],expiryTimer:null,policyEvents:[],identityKey:null,clarification:null,composerError:null,organizationBusy:false,activityRevision:0,activityLoading:false,activitySignature:null,supportExpired:false,workTask:null,workBusy:false,workLoading:false,workRevision:0,workUnavailable:false,workError:null,workNotice:null,flow:null,flowPaused:false,flowVisible:true,flowAnimations:[]};
+var state = {pilotUseful:false,session:null,customerId:null,controller:null,active:null,latest:new Map(),freshnessNodes:[],expiryTimer:null,policyEvents:[],identityKey:null,clarification:null,composerError:null,organizationBusy:false,activityRevision:0,activityLoading:false,activitySignature:null,supportExpired:false,workTask:null,workBusy:false,workLoading:false,workRevision:0,workUnavailable:false,workError:null,workNotice:null,flow:null,flowPaused:false,flowVisible:true,flowAnimations:[]};
 var MAX_STREAM_BUFFER = 262144;
 function byId(id) { return document.getElementById(id); }
 function node(tag, className, text) {
@@ -533,6 +536,7 @@ function initFlowMotion() {
 function expireSession(message) {
   clearClarification();
   state.session = null;
+  renderPilotInvitation();
   clearFlow();
   clearWorkTask(); renderWorkTask();
   if (state.controller) state.controller.abort();
@@ -900,6 +904,7 @@ function renderWorkTask() {
     byId('work-samples').textContent = 'Manual review rate · ' + textValue(metric.count) + ' samples · ' + result.window_secs + ' second window';
     byId('work-times').textContent = 'Snapshot ' + timestampText(result.as_of) + ' · latest event ' + timestampText(result.watermark) + ' · observed ' + timestampText(result.observed_at) + ' · completed ' + timestampText(receipt.completed_at);
     byId('work-evidence').textContent = 'Evidence SHA-256 · ' + receipt.evidence_sha256;
+    if (task.state === 'completed' && receipt.evidence === 'synthetic_source_observed') inviteAfterUsefulResult();
   }
 }
 async function loadWorkTask() {
@@ -1059,6 +1064,14 @@ function renderExperience(session) {
   state.policyEvents=[];byId('policy-decisions').replaceChildren(node('p','policy-empty','No request yet. Decisions appear only when the service reports a check.'));
   if (context && context.latest_decision) receivePolicy(null,context.latest_decision);
 }
+function renderPilotInvitation() {
+  var demo = state.session && state.session.demo;
+  byId('pilot-invitation').hidden = !state.pilotUseful || !demo || demo.synthetic !== true || demo.return_url !== '/';
+}
+function inviteAfterUsefulResult() { var demo = state.session && state.session.demo; if (demo && demo.synthetic === true && demo.return_url === '/') state.pilotUseful = true; renderPilotInvitation(); }
+function inviteAfterAnswer(turn) {
+  if (turn.done && !turn.failed && turn.pilotEvidence && turn.identityKey === state.identityKey && typeof turn.answer === 'string' && turn.answer.trim() && !['clarification','unsupported'].includes(turn.answerKind)) inviteAfterUsefulResult();
+}
 function renderSession(session) {
   if (!session.customer || typeof session.customer.id !== 'string' || !session.subject) throw new Error('The server did not provide a complete authenticated customer scope.');
   var org = organizationContext(session);
@@ -1070,7 +1083,7 @@ function renderSession(session) {
   if (state.identityKey && state.identityKey !== identityKey) { if (state.controller) state.controller.abort(); clearConversation(); clearActivity(); clearWorkTask(); byId('support-form').hidden = true; }
   state.identityKey = identityKey;
   state.customerId = session.customer.id;
-  state.session = session;
+  state.session = session;renderPilotInvitation();
   byId('customer-name').textContent = session.customer.display_name || session.customer.id;
   byId('identity-caption').textContent = 'Signed in as ' + (session.subject.display_name || session.subject.id || 'authenticated user');
   byId('customer-id').textContent = session.customer.id;
@@ -1137,7 +1150,7 @@ function addTurn() {
   turn.evidence = node('details','evidence'); turn.evidence.hidden = true;
   turn.summary = node('summary','','Tool & evidence trail'); turn.evidence.appendChild(turn.summary);
   turn.trail = node('ol','trail'); turn.evidence.appendChild(turn.trail); turn.element.appendChild(turn.evidence);
-  turn.cards = new Map(); turn.done = false; turn.failed = false; turn.events = 0; turn.answer = '';
+  turn.cards = new Map(); turn.done = false; turn.failed = false; turn.events = 0; turn.answer = ''; turn.pilotEvidence = false;
   turn.identityKey = state.identityKey;
   startFlow(turn);
   return turn;
@@ -1179,6 +1192,7 @@ function receiveResult(turn, result) {
   if (previous && validDate(previous.observed_at) && validDate(result.observed_at) && dateValue(result.observed_at) < dateValue(previous.observed_at)) {
     addEvidence(turn,'Older observation retained in trail',result.metric_id + ' · ' + timestampText(result.observed_at),result.evidence_id,result.observed_at); return;
   }
+  if (typeof result.value === 'number' && Number.isFinite(result.value) && typeof result.evidence_id === 'string' && result.evidence_id && validDate(result.observed_at)) turn.pilotEvidence = true;
   result.label = result.label || allowed.label || result.metric_id;
   var card = node('div','result-card'); card.appendChild(node('div','result-label',result.label));
   var value = node('div','result-value',textValue(result.value)); if (result.unit) value.appendChild(node('span','result-unit',result.unit)); card.appendChild(value); card.appendChild(metricTime(result));
@@ -1222,6 +1236,7 @@ function portfolioCharts(result) {
 }
 function receivePortfolioResult(turn, result) {
   validatePortfolioResult(result);
+  if (result.evidence_id && result.rows.some(function(row) { return Object.values(row.values).some(function(value) { return typeof value === 'number' && Number.isFinite(value); }); })) turn.pilotEvidence = true;
   var card = node('div','portfolio-result'); var query = result.query; var titles = {summary:'Portfolio summary',trend:'Portfolio trend',breakdown:'Portfolio breakdown',comparison:'Previous-period comparison'};
   card.appendChild(node('h3','',titles[query.view]));
   var filters = Object.keys(query.filters || {}).map(function(id) { return friendlyDimension(id) + ': ' + query.filters[id].replace(/_/g,' '); });
@@ -1250,6 +1265,7 @@ function handleEvent(turn, type, data) {
   else if (type === 'error') { clearClarification(); turn.failed = true; turn.status.className = 'request-status error'; turn.status.textContent = data.message || 'The scoped request could not complete.'; addEvidence(turn,'Request stopped',data.code || 'request_failed'); if (['session_expired','auth_expired','session_revoked','unauthenticated'].includes(data.code)) expireSession(data.message); }
   else if (type === 'done') { turn.done = true; if (!turn.failed) { if (turn.answerKind === 'clarification' && turn.question && turn.identityKey === state.identityKey && canChat() && !state.organizationBusy) state.clarification = {identityKey:turn.identityKey,question:turn.question,replies:turn.replies.slice()}; else clearClarification(); turn.status.textContent = turn.answerKind === 'clarification' ? 'Please clarify your question · no source read' : turn.answerKind === 'unsupported' ? 'Outside available data · no source read' : 'Request complete · evidence retained'; turn.status.className = 'request-status'; } if (data.request_id) addEvidence(turn,'Request complete','Request ' + data.request_id); updateComposer(); }
   receiveFlow(turn,type,data);
+  if (type === 'done') inviteAfterAnswer(turn);
 }
 async function submitMessage(event) {
   if (event) event.preventDefault();

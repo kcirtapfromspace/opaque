@@ -22,9 +22,17 @@ CONTROLLER_ORIGIN = "http://opaque-demo-controller.opaque-demo-system.svc.cluste
 name = "DEMO_SCHEDULER"
 class_name = "DemoScheduler"
 
+[[durable_objects.bindings]]
+name = "LEAD_INBOX"
+class_name = "LeadInbox"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["DemoScheduler"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["LeadInbox"]
 
 [[routes]]
 pattern = "demo.opaque.info"

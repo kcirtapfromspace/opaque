@@ -34,6 +34,52 @@ function session(customer='northstar') {
 function result(extra={}) {return {metric_id:'requests_per_second',value:24,unit:'req/s',observed_at:Date.now()/1000,stale_after_secs:15,evidence_id:'proof-1',...extra};}
 function allNodes(element) {return [element,...element.children.flatMap(allNodes)];}
 
+function hostedSession(value=session()) {return {...value,demo:{synthetic:true,return_url:'/',expires_at:value.expires_at}};}
+
+test('pilot invitation follows a completed answer with scoped source evidence only in the hosted demo',()=>{
+  for(const value of [session(),hostedSession(),{...session(),demo:{synthetic:true,return_url:'https://untrusted.example/'}}]) {
+    const app=ui();app.renderSession(value);const turn=app.addTurn();
+    assert.equal(app.byId('pilot-invitation').hidden,true);
+    app.handleEvent(turn,'result',result());app.handleEvent(turn,'answer',{kind:'grounded',text:'The source observed 24 requests per second.'});
+    assert.equal(app.byId('pilot-invitation').hidden,true);
+    app.handleEvent(turn,'done',{});
+    assert.equal(app.byId('pilot-invitation').hidden,!(value.demo&&value.demo.return_url==='/'));
+    app.expireSession();assert.equal(app.byId('pilot-invitation').hidden,true);
+  }
+  const html=fs.readFileSync(path.join(__dirname,'../static/index.html'),'utf8');
+  assert.match(html,/href="\/#pilot-result">Discuss a pilot/);
+  assert.equal((html.match(/id="pilot-invitation"/g)||[]).length,1);
+});
+
+test('pilot invitation rejects missing evidence, failed answers, clarification and old identity events',()=>{
+  for(const scenario of ['missing','text-value','missing-id','invalid-time','clarification','unsupported','denied','old-identity']) {
+    const app=ui();app.renderSession(hostedSession());const turn=app.addTurn();
+    if(scenario!=='missing')app.handleEvent(turn,'result',result(scenario==='text-value'?{value:'24'}:scenario==='missing-id'?{evidence_id:''}:scenario==='invalid-time'?{observed_at:'invalid'}:{}));
+    app.handleEvent(turn,'answer',{kind:['clarification','unsupported'].includes(scenario)?scenario:'grounded',text:'Answer text'});
+    if(scenario==='denied')app.handleEvent(turn,'error',{code:'scope_denied',message:'Not permitted.'});
+    if(scenario==='old-identity')app.state.identityKey='another-session';
+    app.handleEvent(turn,'done',{});assert.equal(app.byId('pilot-invitation').hidden,true,scenario);
+  }
+});
+
+test('pilot invitation accepts validated portfolio answers but excludes empty observations',()=>{
+  for(const populated of [true,false]) {
+    const app=ui();app.renderSession(hostedSession(portfolioSession()));const turn=app.addTurn(),proof=portfolioEvidence();
+    if(!populated)proof.rows.forEach(row=>{row.sample_count=0;Object.keys(row.values).forEach(key=>row.values[key]=null);});
+    app.handleEvent(turn,'portfolio_result',proof);app.handleEvent(turn,'done',{});
+    assert.equal(app.byId('pilot-invitation').hidden,!populated);
+  }
+});
+
+test('pilot invitation accepts completed validated task receipts without inventing uncertain success',()=>{
+  for(const status of ['planned','approved','reserved','unknown','completed']) {
+    const app=ui(),value=hostedSession(workSession());app.renderSession(value);
+    app.state.workTask=app.validateWorkTask(workTask(value,status));app.renderWorkTask();
+    assert.equal(app.byId('pilot-invitation').hidden,status!=='completed',status);
+  }
+  const app=ui(),value=workSession();app.renderSession(value);app.state.workTask=app.validateWorkTask(workTask(value,'completed'));app.renderWorkTask();assert.equal(app.byId('pilot-invitation').hidden,true);
+});
+
 test('SSE framing survives chunked CRLF, comments and multiline JSON',()=>{
   const app=ui(),events=[];const parser=app.streamParser((type,data)=>events.push({type,data}));
   parser.push(': heartbeat\r\n\r');parser.push('\nevent: result\r\ndata: {"metric_id":\r\ndata: "requests_per_second"}\r\n');parser.push('\r\nevent: done\ndata: {}\n\n');parser.finish();

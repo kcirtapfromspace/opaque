@@ -36,6 +36,9 @@ header{display:flex;justify-content:space-between;align-items:center;gap:24px;mi
 @media(max-width:1020px){.workflow-head{padding:12px}.workflow-tabs{padding-left:10px;padding-right:10px;gap:0}.workflow-tabs button{padding:7px 6px;font-size:9px}.workflow-caption,.workflow-controls{padding-left:12px;padding-right:12px}.workflow-motion-note{display:none}.workflow-note{min-height:57px}.workflow-code{font-size:10px}}
 @media(max-width:760px){.workflow-svg .label{font-size:14px}.workflow-svg .micro{font-size:11px}.workflow-svg .example-label{font-size:11px}.session-card{position:static;max-width:none}.workflow{max-width:570px}.workflow-note{min-height:38px}.workflow-tabs{gap:6px;padding-left:14px}.workflow-tabs button{font-size:10px;padding:7px 8px}.workflow-motion-note{display:block}.workflow-caption,.workflow-controls{padding-left:16px;padding-right:16px}.workflow-code{font-size:11px}.workflow-note{min-height:38px}}
 @media(prefers-reduced-motion:reduce){.workflow *{animation:none!important}.workflow .request-packet,.workflow .return-packet{display:none}.workflow[data-scene="denied"] .stopped-mark{opacity:1}.primary svg{transition:none}.workflow .gate-aperture{opacity:.3}}
+
+.pilot{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:66px;padding:48px 0 56px;border-top:1px solid var(--line);scroll-margin-top:24px}.pilot h2{font-size:clamp(28px,3.2vw,42px);line-height:1.15;letter-spacing:-.045em;font-weight:400;max-width:480px;margin:0 0 20px;text-wrap:balance}.pilot-copy{color:var(--dim);max-width:440px;font-size:13px}.pilot label{display:block;font-size:12px;color:var(--text);margin-bottom:8px}.pilot input[type=email],.pilot textarea{display:block;width:100%;border:1px solid var(--strong);background:var(--panel);color:var(--text);font:14px/1.6 var(--font);padding:12px;border-radius:2px}.pilot textarea{resize:vertical;min-height:130px}.pilot input:focus-visible,.pilot textarea:focus-visible,.pilot h2:focus-visible,.pilot [tabindex]:focus-visible{outline:2px solid var(--amber);outline-offset:4px}.pilot-field{margin-bottom:20px}.pilot-help{font-size:11px;color:var(--quiet);margin:7px 0 0}.pilot .pilot-consent{display:flex;align-items:flex-start;gap:10px;color:var(--dim);line-height:1.7;cursor:pointer}.pilot-consent input{flex:none;margin:5px 0 0;width:16px;height:16px;accent-color:var(--amber)}.pilot-error{font-size:12px;color:var(--red);margin:6px 0 0}.pilot-status{min-height:25px;font-size:12px;color:var(--dim);margin:14px 0 0;overflow-wrap:anywhere}.pilot-status[data-state=error]{color:var(--red)}.pilot-status[data-state=accepted]{color:var(--green)}.pilot-submit{margin-top:18px}.pilot .challenge-box{margin-top:18px}.pilot-verification-retry{background:none;border:0;padding:4px 0;font:11px var(--font);text-decoration:underline;text-underline-offset:3px;color:var(--dim)}
+@media(max-width:760px){.pilot{grid-template-columns:1fr;gap:22px;padding:32px 0 40px}.pilot h2{font-size:34px}.pilot-copy{max-width:560px}.pilot input[type=email],.pilot textarea{font-size:16px}}
 </style>
 </head>
 <body>
@@ -68,6 +71,16 @@ header{display:flex;justify-content:space-between;align-items:center;gap:24px;mi
       <section class="session-card" aria-labelledby="session-title"><div class="card-top"><h2 id="session-title">YOUR DEMO SESSION</h2><span class="service-status" id="availability">Checking service</span></div><div class="card-content"><div class="state-code" id="state-code">CONNECTING</div><h3 class="state-title" id="state-title">Checking availability</h3><p class="state-description" id="state-description">We’re checking the demo service and looking for a session in this browser.</p><div class="state-detail" id="state-detail" hidden><p class="queue-position" id="queue-position" hidden></p><p class="queue-label" id="queue-label" hidden></p><div class="countdown" id="countdown" hidden></div><p class="countdown-caption" id="countdown-caption" hidden></p></div><div class="session-facts"><div><div class="fact-label">SESSION LENGTH</div><div class="fact-value" id="session-length">—</div></div></div><div class="model-selection" id="model-selection" hidden><label for="demo-model-choice">Model for this session</label><select id="demo-model-choice" aria-describedby="model-description model-selection-note" disabled></select><p class="model-description" id="model-description">Checking approved models…</p><p class="model-selection-note" id="model-selection-note">Your choice is fixed when you join. Model choice does not change data permissions or queue priority.</p></div><div class="session-model" id="session-model" hidden><div class="session-model-label">SESSION MODEL</div><div class="session-model-name" id="session-model-name">Not reported</div><div class="session-model-note" id="session-model-note">Fixed for this session.</div></div><div class="verification" id="verification" hidden><p class="verification-label">Complete the bot check to request a workspace.</p><div class="challenge-box" id="bot-verification-widget"></div><p class="verification-status" id="verification-status">Loading verification…</p></div><div class="actions"><button class="primary" id="join" type="button" disabled hidden>Request a demo <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2 8h11M8 3l5 5-5 5" stroke="currentColor" stroke-width="1.5"/></svg></button><a class="primary" id="workspace" href="/workspace" hidden>Open your workspace <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2 8h11M8 3l5 5-5 5" stroke="currentColor" stroke-width="1.5"/></svg></a><button class="secondary" id="cancel" type="button" hidden>Leave the queue</button><button class="secondary" id="retry" type="button" hidden>Check status again</button></div><div class="error-box" id="error" role="alert" hidden></div><p class="card-note" id="card-note">No account or email required. A browser session keeps your place.</p><div class="sync-note" id="sync-note">Waiting for a verified service response.</div><span class="sr-only" id="state-announcement" role="status" aria-live="polite"></span></div><div class="card-footer">Fictional institution and synthetic data. Do not enter borrower information.</div></section>
     </div>
     <section class="how-it-works" id="how-it-works" aria-labelledby="how-title"><h2 class="section-label" id="how-title">Follow the task, then explore its boundaries</h2><div class="steps"><article><div class="step-number">01 / REVIEW &amp; APPROVE</div><h3>See exactly what may run</h3><p>The preview fixes the analyst, customer, source, metric, 60 second window, one-read allowance and an expiry of at most five minutes. The approval window binds real passkey or GitHub identity verification to this exact task. It does not establish production customer membership or run the task for you.</p></article><article><div class="step-number">02 / RUN &amp; INSPECT</div><h3>Follow the result to its source</h3><p>Run once performs the permitted synthetic source read. Inspect its value, sample count, timestamps and service receipt, then deliberately retry to see the service deny replay. Reloading the page does not refill the allowance.</p></article><article><div class="step-number">03 / TEST ACCESS</div><h3>Explore the portfolio and its limits</h3><p>Ask the hosted model about channels, regions or products. Try “Show borrower names and SSNs” or another lender and inspect the reported decision. Switch demo identities to see why an engineer cannot access customer metrics or the analyst’s task receipt.</p></article></div><p class="integration-note">Beyond this public preview: a Vault-signed SSH certificate flow has been validated in a separate private fixture for one restricted host health check. That fixture is not connected to this demo. The public preview contains no real borrower records and makes no lending decisions. It demonstrates task limits against synthetic data; it does not establish confidential inference or hardware isolation.</p></section>
+    <section class="pilot" id="pilot" aria-labelledby="pilot-title">
+      <div><p class="eyebrow">Your workflow / optional pilot</p><h2 id="pilot-title" tabindex="-1">What task do you stop your agent from doing today?</h2><p class="pilot-copy">Tell us where you still take over. We’re looking for specific workflows to try with Opaque.</p><p class="pilot-copy">This is optional. You can explore the demo without sharing an email address, and send a pilot request while you wait in the queue.</p></div>
+      <form id="pilot-form" method="post" action="/demo/api/contact" novalidate aria-describedby="pilot-status">
+        <div class="pilot-field"><label for="pilot-email">Email</label><input id="pilot-email" name="email" type="email" autocomplete="email" maxlength="254" required aria-describedby="pilot-email-error"><p class="pilot-error" id="pilot-email-error" hidden></p></div>
+        <div class="pilot-field"><label for="pilot-workflow">The task you want your agent to handle</label><textarea id="pilot-workflow" name="workflow" rows="4" required aria-describedby="pilot-workflow-help pilot-workflow-error"></textarea><p class="pilot-help" id="pilot-workflow-help">10–1,000 characters. Describe the task; leave out passwords, tokens and customer records.</p><p class="pilot-error" id="pilot-workflow-error" hidden></p></div>
+        <label class="pilot-consent" for="pilot-consent"><input id="pilot-consent" name="consent" type="checkbox" required aria-describedby="pilot-consent-error"><span>You may email me about this workflow and an Opaque pilot.</span></label><p class="pilot-error" id="pilot-consent-error" hidden></p><p class="pilot-help">Used only to follow up about this workflow and an Opaque pilot. Removed from our contact inbox after 90 days. No automatic newsletter signup.</p>
+        <div class="challenge-box" id="pilot-verification-widget"></div><p class="verification-status" id="pilot-verification-status">A separate bot check protects this optional form.</p><button class="pilot-verification-retry" id="pilot-verification-retry" type="button" hidden>Retry pilot verification</button>
+        <button class="primary pilot-submit" id="pilot-submit" type="submit" disabled>Discuss a pilot</button><p class="pilot-status" id="pilot-status" role="status" aria-live="polite" tabindex="-1">Checking whether pilot requests are available.</p>
+      </form>
+    </section>
   </main>
   <footer class="footer"><span>OPAQUE / AUTHORITY FOR THE WORK YOU APPROVE.</span><a href="https://opaque.info/">Back to opaque.info ↗</a></footer>
 </div>
@@ -147,7 +160,7 @@ function updateJoin(){el('join').disabled=model.busy||model.refreshing||!!model.
 function render(){
   var session=model.session,config=model.config;
   if(config){var admissionOpen=config.available===true&&typeof config.turnstile_site_key==='string'&&!!config.turnstile_site_key.trim()&&approvedModels().length>0;el('availability').textContent=admissionOpen?'Requests open':'Requests paused';el('availability').className='service-status'+(admissionOpen?' open':'');el('session-length').textContent=duration(config.session_seconds);}
-  renderModelChoice();
+  renderModelChoice();renderContact();
   if(!session){updateJoin();return;}
   var copy=STATES[session.state];
   el('state-code').textContent=copy.code;el('state-title').textContent=copy.title;el('state-description').textContent=copy.description;
@@ -222,9 +235,9 @@ async function refresh(options){
   try{
     var config=fetchConfig?await request('config',{signal:controller.signal}):model.config;
     if(controller.signal.aborted||document.hidden)return;
+    model.config=config;if(fetchConfig)model.configCheckedAt=Date.now();renderContact();
     var session=validSession(await request('session',{signal:controller.signal}));
     if(controller.signal.aborted||document.hidden)return;
-    model.config=config;if(fetchConfig)model.configCheckedAt=Date.now();
     model.session=session;model.lastSync=Date.now();model.pollFailures=0;clearError(true);render();
   }catch(error){
     if(!controller.signal.aborted){model.pollFailures++;model.forceConfig=true;showError(error.message);el('availability').textContent='Service unavailable';el('availability').className='service-status';el('workspace').hidden=true;}
@@ -304,7 +317,109 @@ function initWorkflow(){
   }
   sync();
 }
-function init(){initWorkflow();el('demo-model-choice').addEventListener('change',function(){chooseModel(this.value);});el('join').addEventListener('click',join);el('cancel').addEventListener('click',cancel);el('retry').addEventListener('click',retryStatus);initPolling();}
+
+// The optional pilot form never participates in admission or session polling.
+var contact={busy:false,accepted:false,token:null,widgetId:null,loading:false,verificationError:false,message:null,entryPoint:'landing',source:{}};
+var CONTACT_SOURCE_KEY='opaque.pilot.source.v1';
+function cleanContactSource(value){
+  var clean={};if(!value||typeof value!=='object'||Array.isArray(value))return clean;
+  ['utm_source','utm_medium','utm_campaign'].forEach(function(key){if(typeof value[key]==='string'&&/^[A-Za-z0-9._~-]{1,64}$/.test(value[key]))clean[key]=value[key];});
+  var host=value.referrer_host;
+  if(typeof host==='string'&&host.length<=253&&host.includes('.')&&host.split('.').every(function(label){return /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(label);})&&/[a-z]/i.test(host.split('.').pop()))clean.referrer_host=host.toLowerCase();
+  return clean;
+}
+function captureContactSource(){
+  var stored={};try{var raw=window.sessionStorage.getItem(CONTACT_SOURCE_KEY);if(raw&&raw.length<=1024)stored=cleanContactSource(JSON.parse(raw));}catch(_error){}
+  var incoming={};try{
+    var params=new URLSearchParams(window.location.search);
+    ['utm_source','utm_medium','utm_campaign'].forEach(function(key){var values=params.getAll(key);if(values.length===1)incoming[key]=values[0];});
+    if(document.referrer){var referrer=new URL(document.referrer);if(['http:','https:'].includes(referrer.protocol)&&referrer.hostname!==window.location.hostname)incoming.referrer_host=referrer.hostname;}
+  }catch(_error){}
+  contact.source=Object.assign({},stored,cleanContactSource(incoming));
+  try{window.sessionStorage.setItem(CONTACT_SOURCE_KEY,JSON.stringify(contact.source));}catch(_error){}
+}
+function focusPilot(){
+  var hash=window.location&&window.location.hash;
+  if(hash!=='#pilot'&&hash!=='#pilot-result')return;
+  contact.entryPoint=hash==='#pilot-result'?'workspace_result':'landing';
+  el('pilot').scrollIntoView({block:'start'});el('pilot-title').focus({preventScroll:true});
+}
+function contactAvailable(){return model.config&&model.config.contact_available===true;}
+function updateContact(){
+  el('pilot-submit').disabled=contact.busy||contact.accepted||!contactAvailable()||!contact.token;
+  el('pilot-submit').textContent=contact.busy?'Saving your request…':'Discuss a pilot';
+  ['pilot-email','pilot-workflow','pilot-consent'].forEach(function(id){el(id).disabled=contact.busy||contact.accepted;});
+  el('pilot-form').setAttribute('aria-busy',String(contact.busy));
+  el('pilot-verification-widget').hidden=contact.accepted;
+  el('pilot-verification-status').hidden=contact.accepted;
+  el('pilot-verification-retry').hidden=!contact.verificationError||contact.accepted||contact.busy;
+}
+function contactMessage(message,state){contact.message={text:message,state:state};el('pilot-status').textContent=message;el('pilot-status').setAttribute('data-state',state);}
+function renderContact(){
+  updateContact();
+  if(!contact.message||contact.message.state==='idle')contactMessage(!model.config?'Checking whether pilot requests are available.':contactAvailable()?'Optional. Your details are sent only when you choose Discuss a pilot.':'Pilot requests are temporarily unavailable. Demo access does not require this form.','idle');
+  if(contactAvailable())ensureContactWidget();
+}
+function resetContactWidget(){contact.token=null;try{if(contact.widgetId!==null&&window.turnstile)window.turnstile.reset(contact.widgetId);}catch(_error){}updateContact();}
+async function ensureContactWidget(){
+  if(!contactAvailable()||contact.accepted||contact.loading||contact.widgetId!==null||contact.verificationError)return;
+  if(typeof model.config.turnstile_site_key!=='string'||!model.config.turnstile_site_key.trim()){el('pilot-verification-status').textContent='Pilot verification is not configured. Your details have not been sent.';return;}
+  contact.loading=true;
+  try{
+    await turnstileScript();if(!contactAvailable()||contact.accepted||contact.widgetId!==null)return;
+    contact.widgetId=window.turnstile.render('#pilot-verification-widget',{sitekey:model.config.turnstile_site_key,theme:'dark',size:'flexible',action:'demo_contact','response-field':false,
+      callback:function(token){contact.token=token;contact.verificationError=false;el('pilot-verification-status').textContent='Pilot verification complete.';updateContact();},
+      'expired-callback':function(){contact.token=null;el('pilot-verification-status').textContent='Pilot verification expired. Complete the check again.';updateContact();},
+      'error-callback':function(){contact.token=null;contact.verificationError=true;el('pilot-verification-status').textContent='Pilot verification was not completed. Retry this check when you are ready.';updateContact();}});
+    el('pilot-verification-status').textContent='Complete this separate check before sending your pilot request.';
+  }catch(_error){contact.verificationError=true;el('pilot-verification-status').textContent='Pilot verification could not load. Your demo session is unchanged.';}
+  finally{contact.loading=false;updateContact();}
+}
+function retryContactVerification(){
+  contact.verificationError=false;
+  if(contact.widgetId!==null){resetContactWidget();el('pilot-verification-status').textContent='Complete the pilot verification again.';}else ensureContactWidget();
+  updateContact();
+}
+function contactFieldError(id,message){el(id+'-error').textContent=message||'';el(id+'-error').hidden=!message;el(id).setAttribute('aria-invalid',String(!!message));}
+function validContactEmail(email){
+  if(email.length>254||!/^[-A-Za-z0-9.!#$%&'*+/=?^_`{|}~]+@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$/.test(email))return false;
+  var parts=email.split('@'),local=parts[0],domain=parts[1];
+  return local.length<=64&&!local.startsWith('.')&&!local.endsWith('.')&&!local.includes('..')&&domain.includes('.')&&domain.split('.').every(function(label){return /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(label);});
+}
+function contactFailureMessage(status,code){
+  if(status===400||status===413)return 'The service did not accept these details. Review your email address, workflow length and consent before sending again. Your details are still here.';
+  if(status===429)return 'Pilot requests are temporarily limited. Your request was not accepted. Keep your details here and try again later with a fresh pilot verification.';
+  if(status===503)return 'Pilot requests are temporarily unavailable. Saving was not confirmed. Keep your details here and try again later with a fresh pilot verification.';
+  if(status===403&&code==='bot_verification_failed')return 'Pilot verification was not accepted. Your details are still here. Complete a fresh pilot verification, then retry when you are ready.';
+  if(status===403&&code==='same_origin_required')return 'This page could not send the request. Saving was not confirmed. Reopen the pilot form from this site before trying again.';
+  return 'We could not confirm that your request was saved. Your details are still here. Complete a fresh pilot verification, then retry when you are ready.';
+}
+async function submitContact(event){
+  if(event)event.preventDefault();if(contact.busy||contact.accepted)return;
+  var email=el('pilot-email').value.trim(),rawWorkflow=el('pilot-workflow').value.replace(/\r\n?/g,'\n'),workflow=rawWorkflow.trim(),first=null;
+  var errors={
+    'pilot-email':validContactEmail(email)?null:'Enter a valid email address, such as name@example.com.',
+    'pilot-workflow':Array.from(workflow).length>=10&&Array.from(workflow).length<=1000&&new TextEncoder().encode(workflow).length<=4000&&!/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\p{Cf}\p{Cs}]/u.test(rawWorkflow)?null:'Describe the task in 10–1,000 characters. Remove any hidden control characters.',
+    'pilot-consent':el('pilot-consent').checked===true?null:'Choose this checkbox if you want us to email you about the workflow and a pilot.'
+  };
+  Object.keys(errors).forEach(function(id){contactFieldError(id,errors[id]);if(errors[id]&&!first)first=id;});
+  if(first){contactMessage('Check the highlighted fields. Nothing was sent.','error');el(first).focus();return;}
+  if(!contactAvailable()){contactMessage('Pilot requests are unavailable. Your details have not been sent.','error');return;}
+  if(!contact.token){contactMessage('Complete the separate pilot verification. Your details have not been sent.','error');return;}
+  var token=contact.token;contact.token=null;contact.busy=true;contactMessage('Sending your request. Saving has not yet been confirmed.','pending');updateContact();
+  var failureMessage=contactFailureMessage(0),controller=new AbortController(),timer=setTimeout(function(){controller.abort();},15000);
+  try{
+    var response=await fetch('/demo/api/contact',{method:'POST',credentials:'same-origin',cache:'no-store',headers:{Accept:'application/json','Content-Type':'application/json'},signal:controller.signal,body:JSON.stringify({email:email,workflow:workflow,consent:true,source:cleanContactSource(contact.source),entry_point:contact.entryPoint,turnstile_token:token})});
+    var data=await response.json().catch(function(){return null;});
+    if(response.status!==202||!data||data.accepted!==true){failureMessage=contactFailureMessage(response.status,data&&data.error);throw new Error('save_unconfirmed');}
+    contact.accepted=true;el('pilot-email').value='';el('pilot-workflow').value='';el('pilot-consent').checked=false;
+    contactMessage('Your request was saved. We may email you about this workflow and an Opaque pilot.','accepted');el('pilot-status').focus();
+  }catch(_error){contactMessage(failureMessage,'error');el('pilot-status').focus();}
+  finally{clearTimeout(timer);contact.busy=false;resetContactWidget();}
+}
+function initContact(){captureContactSource();el('pilot-form').addEventListener('submit',submitContact);el('pilot-verification-retry').addEventListener('click',retryContactVerification);window.addEventListener('hashchange',focusPilot);focusPilot();renderContact();}
+
+function init(){initWorkflow();initContact();el('demo-model-choice').addEventListener('change',function(){chooseModel(this.value);});el('join').addEventListener('click',join);el('cancel').addEventListener('click',cancel);el('retry').addEventListener('click',retryStatus);initPolling();}
 init();
 </script>
 </body>

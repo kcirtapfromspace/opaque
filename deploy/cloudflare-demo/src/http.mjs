@@ -1,4 +1,5 @@
 import { modelConfiguration, requireEnabledModel, sessionModel } from './models.mjs';
+import { LeadError, contactConfigured, landingAttributionAllowed, leadAdminAuthorized, leadBinding, validateContact, validateLeadDelete, validateLeadList } from './leads.mjs';
 
 const COOKIE = '__Host-opaque_demo';
 const LOCAL_COOKIE = 'opaque_demo_local';
@@ -69,7 +70,7 @@ async function schedule(env,action,...args) {
 function view(value) {
   return {state:value.state,position:value.queue_position,expires_at:value.expires_at,session_seconds:600,workspace_url:value.state==='ready'?'/workspace':null,questions_remaining:value.questions_remaining,chat_busy:value.chat_busy,model:sessionModel(value.model_id)};
 }
-export async function verifyBot(request,env,value) {
+export async function verifyBot(request,env,value,action='demo_join') {
   if(localMode(env) && value==='local-demo-test-only')return true;
   if(typeof value!=='string'||!value||value.length>2048)return false;
   const body=new URLSearchParams({secret:env.TURNSTILE_SECRET,response:value,idempotency_key:crypto.randomUUID()});
@@ -80,14 +81,14 @@ export async function verifyBot(request,env,value) {
   try {
     response=await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify',{method:'POST',body,redirect:'manual',signal:botAbort.signal});
   } catch(cause) {
-    console.error('bot_verification_transport_failed',cause.name,String(cause.message).slice(0,200));
+    console.error('bot_verification_transport_failed');
     throw Object.assign(new Error('bot_verification_unavailable'),{code:'bot_verification_unavailable',status:503});
   } finally {
     clearTimeout(botTimeout);
   }
   if(!response.ok)return false;
   const result=await response.json();
-  return result.success===true&&result.action==='demo_join'&&result.hostname===new URL(env.PUBLIC_ORIGIN).hostname;
+  return result.success===true&&result.action===action&&result.hostname===new URL(env.PUBLIC_ORIGIN).hostname;
 }
 async function htmlResponse(response,env,callback=false) {
   const html=await response.text();
@@ -273,6 +274,51 @@ async function authenticatedProxy(request,env,ctx,path,visitorHash) {
   return new Response(stream,{status:upstream.status,headers});
 }
 
+async function leadJSON(request,limit) {
+  try { return await boundedJSON(request,limit); }
+  catch(cause) { throw new LeadError(cause.message==='request_too_large'?'request_too_large':'invalid_contact_request',cause.message==='request_too_large'?413:400); }
+}
+async function leadCall(env,action,input,ipKey) {
+  if(!env.LEAD_INBOX)throw new LeadError('contact_storage_unavailable',503);
+  try {
+    const stub=env.LEAD_INBOX.get(env.LEAD_INBOX.idFromName('pilot-contacts-v1'));
+    const response=await stub.fetch('https://contacts.invalid/',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,input,...(ipKey?{ip_key:ipKey}:{})})});
+    const data=await response.json();
+    if(!response.ok) {
+      const codes={contact_rate_limited:429,contact_inbox_full:503,contact_storage_unavailable:503,invalid_contact_request:400,invalid_lead_list:400,invalid_lead_id:400};
+      const code=Object.hasOwn(codes,data.error)?data.error:'contact_storage_unavailable';
+      throw new LeadError(code,codes[code]);
+    }
+    if(action==='accept'&&data.accepted!==true)throw new LeadError('contact_storage_unavailable',503);
+    return data;
+  } catch(cause) {
+    if(cause instanceof LeadError)throw cause;
+    throw new LeadError('contact_storage_unavailable',503);
+  }
+}
+async function contactRequest(request,env) {
+  if(request.method!=='POST')return error('method_not_allowed',405);
+  if(!sameOrigin(request,env))return error('same_origin_required',403);
+  if(!contactConfigured(env,localMode(env)))return error('contact_unavailable',503);
+  const input=await leadJSON(request,8192);
+  validateContact(input);
+  if(!await verifyBot(request,env,input.turnstile_token,'demo_contact'))return error('bot_verification_failed',403);
+  const ip=request.headers.get('CF-Connecting-IP')||(localMode(env)?'local':'');
+  if(!ip)return error('visitor_network_binding_required',403);
+  await leadCall(env,'accept',input,await leadBinding(ip,env.CONTROLLER_SECRET,'ip'));
+  return Response.json({accepted:true},{status:202,headers:{'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}});
+}
+async function adminLeads(request,env,path) {
+  if(!await leadAdminAuthorized(request,env))return error('lead_admin_authority_required',401);
+  if(request.method!=='POST')return error('method_not_allowed',405);
+  const input=await leadJSON(request,1024);
+  let action;
+  if(path==='/internal/leads/list'){validateLeadList(input);action='list';}
+  else if(path==='/internal/leads/delete'){validateLeadDelete(input);action='delete';}
+  else return error('not_found',404);
+  return Response.json(await leadCall(env,action,input),{headers:{'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}});
+}
+
 export async function handleRequest(request,env,ctx) {
   try {
     const url=new URL(request.url);
@@ -282,7 +328,9 @@ export async function handleRequest(request,env,ctx) {
       if(request.method!=='GET')return error('method_not_allowed',405);
       return htmlResponse(await env.ASSETS.fetch(new Request(url.origin+'/approval/callback/index.html')),env,true);
     }
-    if(url.search)return error('query_parameters_not_supported');
+    if(url.search&&!(path==='/'&&request.method==='GET'&&landingAttributionAllowed(url.search)))return error('query_parameters_not_supported');
+    if(path.startsWith('/internal/leads/'))return await adminLeads(request,env,path);
+    if(path==='/demo/api/contact')return await contactRequest(request,env);
     if(path.startsWith('/internal/')) {
       if(request.headers.get('Authorization')!=='Bearer '+env.CONTROLLER_SECRET||!env.CONTROLLER_SECRET)return error('controller_authority_required',401);
       if(path==='/internal/work'&&request.method==='GET')return Response.json(await schedule(env,'work'),{headers:{'Cache-Control':'no-store'}});
@@ -290,7 +338,7 @@ export async function handleRequest(request,env,ctx) {
       return error('not_found',404);
     }
     if(path==='/'&&request.method==='GET')return htmlResponse(await env.ASSETS.fetch(new Request(url.origin+'/index.html')),env);
-    if(path==='/demo/api/config'&&request.method==='GET')return Response.json({turnstile_site_key:env.TURNSTILE_SITE_KEY||null,session_seconds:600,available:configured(env),...modelConfiguration(env)},{headers:{'Cache-Control':'no-store'}});
+    if(path==='/demo/api/config'&&request.method==='GET')return Response.json({turnstile_site_key:env.TURNSTILE_SITE_KEY||null,session_seconds:600,available:configured(env),contact_available:contactConfigured(env,localMode(env)),...modelConfiguration(env)},{headers:{'Cache-Control':'no-store'}});
     const capability=await visitor(request,env);
     const hash=capability?await digest(capability):null;
     if(path==='/demo/api/session'&&request.method==='GET') {

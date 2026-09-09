@@ -13,6 +13,21 @@ Approve the work. Keep authority bounded. Review one task for a fictional credit
 
 A session lasts **10 minutes** and allows one preview task plus up to **12 portfolio questions**. Reopening the workspace does not extend it. Your selected model stays fixed for the session; changing models requires a new session. Model choice does not change your data permissions.
 
+## Discuss your workflow
+
+The optional **Discuss a pilot** form on the demo entry page asks for your email
+and the task you want to let an agent perform. You can use it while waiting or
+return to it from the invitation shown after a useful workspace result. It does
+not change your place in the queue or require you to finish a demo.
+
+Check the separate permission box if you want Opaque to email you about that
+workflow and a pilot. Your submitted details are kept in a private contact inbox
+and removed from it after 90 days, with basic campaign/referral information and
+where you opened the form retained alongside the request.
+Email is not required to use the demo, and GitHub task approval does not submit
+this form or subscribe you to a mailing list. Do not include credentials or
+private customer information in your workflow description.
+
 ## Review and run one bounded task
 
 Start as the **portfolio analyst**. The bounded task panel fixes one operation: read **manual review rate** from Harborlight’s synthetic source over a **60 second window**, once. Review the customer, acting identity, source, one-read allowance, expiry and manifest digest before confirming it.

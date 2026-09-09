@@ -2,13 +2,14 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import {test} from 'node:test';
+import {validateContact} from '../src/leads.mjs';
 
-function ui({now=Date.now(),hidden=false}={}){
+function ui({now=Date.now(),hidden=false,search='',hash='',referrer='',storage=new Map()}={}){
   const html=fs.readFileSync(new URL('../public/index.html',import.meta.url),'utf8');
   const code=html.split('<script>')[1].split('</script>')[0].replace(/\ninit\(\);\s*$/,'');
   const ids=new Map(),listeners=new Map(),timers=new Map(),backgroundErrors=[];let timerId=0;
-  function element(){return {hidden:false,disabled:false,textContent:'',value:'',children:[],replaceChildren(...children){this.children=children;},appendChild(child){this.children.push(child);},addEventListener(){},remove(){}};}
-  const document={hidden,head:element(),createElement:element,getElementById(id){if(!ids.has(id))ids.set(id,element());return ids.get(id);},addEventListener(type,callback){if(!listeners.has(type))listeners.set(type,[]);listeners.get(type).push(callback);}};
+  function element(){return {hidden:false,disabled:false,checked:false,textContent:'',value:'',children:[],listeners:{},setAttribute(key,value){this[key]=value;},focus(){this.focused=true;},scrollIntoView(){this.scrolled=true;},replaceChildren(...children){this.children=children;},appendChild(child){this.children.push(child);},addEventListener(type,handler){this.listeners[type]=handler;},remove(){}};}
+  const document={hidden,referrer,head:element(),createElement:element,getElementById(id){if(!ids.has(id))ids.set(id,element());return ids.get(id);},addEventListener(type,callback){if(!listeners.has(type))listeners.set(type,[]);listeners.get(type).push(callback);}};
   class TestDate extends Date{constructor(...args){super(...(args.length?args:[now]));}static now(){return now;}}
   function addTimer(callback,delay,repeat){const id=++timerId;timers.set(id,{at:now+delay,callback,repeat});return id;}
   async function settle(){for(let i=0;i<30;i++)await Promise.resolve();assert.deepEqual(backgroundErrors,[]);}
@@ -29,7 +30,8 @@ function ui({now=Date.now(),hidden=false}={}){
     },
     async setHidden(value){document.hidden=value;for(const listener of listeners.get('visibilitychange')||[])listener();await settle();}
   };
-  const context=vm.createContext({document,window:{},Date:TestDate,console,AbortController,testClock,setTimeout:(callback,delay)=>addTimer(callback,delay,0),clearTimeout:id=>timers.delete(id),setInterval:(callback,delay)=>addTimer(callback,delay,delay),clearInterval:id=>timers.delete(id)});
+  const window={location:{search,hash,hostname:'demo.opaque.info'},sessionStorage:{getItem:key=>storage.get(key)||null,setItem:(key,value)=>storage.set(key,value)},addEventListener(type,callback){this[type]=callback;}};
+  const context=vm.createContext({document,window,URL,URLSearchParams,TextEncoder,Date:TestDate,console,AbortController,testClock,setTimeout:(callback,delay)=>addTimer(callback,delay,0),clearTimeout:id=>timers.delete(id),setInterval:(callback,delay)=>addTimer(callback,delay,delay),clearInterval:id=>timers.delete(id)});
   vm.runInContext(code,context);context.model.config={available:true,capacity:1,session_seconds:600,turnstile_site_key:'',models:[{id:'fixture-small',label:'Fixture Small',description:'Small local UI test model.'},{id:'fixture-large',label:'Fixture Large',description:'Large local UI test model.'}],default_model:'fixture-small'};context.model.session={state:'none'};context.renderModelChoice();
   return context;
 }
@@ -334,4 +336,96 @@ test('countdown closes workspace access at expiry even between service polls and
   await app.testClock.setHidden(true);await app.testClock.advance(9000);
   service.fail=true;await app.testClock.setHidden(false);
   assert.equal(app.el('countdown').textContent,'00:00');assert.equal(app.el('workspace').hidden,true);assert.equal(app.model.session.state,'active');
+});
+
+
+function pilotReady(app){
+  app.model.config.contact_available=true;app.model.config.turnstile_site_key='site-key';
+  app.contact.token='contact-proof';app.contact.widgetId='contact-widget';
+  app.el('pilot-email').value='pilot@example.test';app.el('pilot-workflow').value='Publish a reviewed release to our staging service.';app.el('pilot-consent').checked=true;
+}
+test('pilot form is optional, uses unchecked explicit consent and purpose/retention disclosure',()=>{
+  const html=fs.readFileSync(new URL('../public/index.html',import.meta.url),'utf8');
+  assert.match(html,/id="pilot-consent"[^>]*type="checkbox"[^>]*required/);assert.doesNotMatch(html,/id="pilot-consent"[^>]*\schecked/);
+  assert.match(html,/You may email me about this workflow and an Opaque pilot\./);assert.match(html,/Removed from our contact inbox after 90 days/);assert.match(html,/No automatic newsletter signup/);
+  assert.match(html,/form id="pilot-form" method="post"/);assert.match(html,/id="pilot-status" role="status" aria-live="polite"/);
+});
+test('pilot validation requires consent and valid bounded details before any request',async()=>{
+  const app=ui();pilotReady(app);let requests=0;app.fetch=async()=>{requests++;throw Error('not expected');};
+  for(const [id,value] of [['pilot-email','missing-at-sign'],['pilot-workflow','short'],['pilot-workflow','x'.repeat(1001)],['pilot-workflow','A hidden\u202Eworkflow'],['pilot-workflow','A hidden\u0000workflow'],['pilot-workflow','A hidden\u0085workflow']]){
+    pilotReady(app);app.el(id).value=value;await app.submitContact();assert.equal(app.el(id)['aria-invalid'],'true');assert.equal(app.el(id).focused,true);
+  }
+  pilotReady(app);app.el('pilot-consent').checked=false;await app.submitContact();assert.equal(requests,0);assert.equal(app.el('pilot-consent')['aria-invalid'],'true');
+});
+test('pilot email validation matches service rules and points to the email before sending',async()=>{
+  for(const email of ['.pilot@example.test','pilot.@example.test','pi..lot@example.test','é@example.test','pilot@-example.test','pilot@example..test','pilot@localhost','a'.repeat(65)+'@example.test','pilot@'+('a'.repeat(64))+'.test']){
+    const app=ui();pilotReady(app);app.el('pilot-email').value=email;let calls=0;app.fetch=async()=>{calls++;};await app.submitContact();
+    assert.equal(calls,0,email);assert.equal(app.el('pilot-email')['aria-invalid'],'true',email);assert.equal(app.el('pilot-email').focused,true,email);assert.match(app.el('pilot-email-error').textContent,/valid email address/);
+  }
+});
+test('pilot accepts Unicode workflows, tabs and normalized multiline text through the service validator',async()=>{
+  for(const workflow of ['Review the release\r\n\tthen deploy it.\rKeep the receipt.','🧭'.repeat(1000)]){
+    const app=ui();pilotReady(app);app.el('pilot-email').value='Pilot+release@Example.test';app.el('pilot-workflow').value=workflow;let captured;
+    app.fetch=async(_path,options)=>{captured=JSON.parse(options.body);validateContact(captured);return {status:202,json:async()=>({accepted:true})};};await app.submitContact();
+    assert.equal(app.contact.accepted,true);assert.equal(captured.workflow,workflow.replace(/\r\n?/g,'\n'));assert.equal(captured.email,'Pilot+release@Example.test');
+  }
+});
+test('pilot responses distinguish rejected details, rate limits and temporary unavailability without echoing server content',async()=>{
+  for(const [status,code,pattern] of [[400,'invalid_contact_request',/Review your email address/],[429,'contact_rate_limited',/try again later/],[503,'contact_storage_unavailable',/temporarily unavailable/],[403,'bot_verification_failed',/verification was not accepted/]]){
+    const app=ui();pilotReady(app);let calls=0;app.fetch=async()=>{calls++;return {status,json:async()=>({error:code,message:'private@example.test <script>secret</script>'})};};await app.submitContact();
+    const message=app.el('pilot-status').textContent;assert.match(message,pattern);assert.doesNotMatch(message,/private@example|script|secret/);if(status===400)assert.doesNotMatch(message,/fresh pilot verification/);
+    assert.equal(app.contact.accepted,false);assert.equal(app.el('pilot-workflow').value,'Publish a reviewed release to our staging service.');await app.testClock.advance(60000);assert.equal(calls,1);
+  }
+});
+test('pilot only confirms202 accepted:true and preserves details on uncertain/failing replies',async()=>{
+  for(const reply of [{status:200,body:{accepted:true}},{status:202,body:{accepted:false}},{status:500,body:{}},{status:202,body:null}]){
+    const app=ui();pilotReady(app);let calls=0;app.fetch=async()=>{calls++;return {status:reply.status,json:async()=>reply.body};};
+    await app.submitContact();assert.equal(app.contact.accepted,false);assert.equal(app.el('pilot-email').value,'pilot@example.test');assert.equal(app.el('pilot-consent').checked,true);assert.equal(app.contact.token,null);assert.match(app.el('pilot-status').textContent,/could not confirm/);assert.equal(calls,1);
+    app.render();assert.match(app.el('pilot-status').textContent,/could not confirm/);
+  }
+});
+test('pilot submission owns its proof and prevents duplicate requests without blocking admission',async()=>{
+  const app=ui();pilotReady(app);app.model.botToken='join-proof';app.render();let finish,calls=[];
+  app.fetch=(path,options)=>{calls.push({path,options});return new Promise(resolve=>{finish=resolve;});};
+  const pending=app.submitContact();await app.submitContact();assert.equal(calls.length,1);assert.equal(app.contact.busy,true);assert.equal(app.model.busy,false);assert.equal(app.el('join').disabled,false);assert.equal(app.model.botToken,'join-proof');assert.match(app.el('pilot-status').textContent,/not yet been confirmed/);
+  const body=JSON.parse(calls[0].options.body);assert.equal(calls[0].path,'/demo/api/contact');assert.equal(body.turnstile_token,'contact-proof');assert.equal(body.consent,true);assert.equal(body.entry_point,'landing');
+  finish({status:202,json:async()=>({accepted:true})});await pending;assert.equal(app.contact.accepted,true);assert.equal(app.el('pilot-email').value,'');assert.equal(app.el('pilot-workflow').value,'');assert.equal(app.el('pilot-consent').checked,false);assert.match(app.el('pilot-status').textContent,/request was saved/);await app.submitContact();assert.equal(calls.length,1);
+});
+test('pilot timeout remains uncertain and explicit retry requires a fresh proof',async()=>{
+  const app=ui();pilotReady(app);let calls=0;
+  app.fetch=(_path,options)=>{calls++;return new Promise((_resolve,reject)=>options.signal.addEventListener('abort',()=>reject(Error('timeout'))));};
+  const pending=app.submitContact();await app.testClock.advance(15000);await pending;assert.equal(app.contact.busy,false);assert.match(app.el('pilot-status').textContent,/could not confirm/);await app.submitContact();assert.equal(calls,1);assert.match(app.el('pilot-status').textContent,/separate pilot verification/);
+  app.contact.token='fresh-proof';app.fetch=async()=>({status:202,json:async()=>({accepted:true})});await app.submitContact();assert.equal(app.contact.accepted,true);
+});
+test('pilot attribution persists only known bounded slugs/hostname through same-browser workspace return',async()=>{
+  const storage=new Map(),app=ui({storage,search:'?utm_source=launch&utm_medium=direct&utm_campaign=agent.v2~pilot&email=private%40example.test',referrer:'https://reader.example/articles/private?email=a%40b.test#private'});
+  app.captureContactSource();assert.deepEqual(JSON.parse(storage.get(app.CONTACT_SOURCE_KEY)),{utm_source:'launch',utm_medium:'direct',utm_campaign:'agent.v2~pilot',referrer_host:'reader.example'});
+  pilotReady(app);app.fetch=async()=>({status:503,json:async()=>({})});await app.submitContact();assert.doesNotMatch([...storage.values()].join(''),/pilot@example|Publish|consent|token|articles|private/);
+  const returning=ui({storage,hash:'#pilot-result',referrer:'https://demo.opaque.info/workspace?private=yes'});returning.captureContactSource();returning.focusPilot();assert.equal(returning.contact.entryPoint,'workspace_result');assert.equal(returning.el('pilot-title').focused,true);assert.equal(returning.el('pilot').scrolled,true);assert.equal(returning.contact.source.referrer_host,'reader.example');
+  const invalid=ui({search:'?utm_source=first&utm_source=second&utm_medium=https%3A%2F%2Fsecret.example&utm_campaign='+('x'.repeat(65)),storage:new Map()});invalid.captureContactSource();assert.equal(Object.keys(invalid.contact.source).length,0);
+});
+test('blocked attribution storage and malformed prior storage never stop the form or store fields',()=>{
+  const app=ui({search:'?utm_source=launch'});app.window.sessionStorage={getItem(){throw Error('blocked');},setItem(){throw Error('blocked');}};assert.doesNotThrow(()=>app.captureContactSource());assert.equal(app.contact.source.utm_source,'launch');
+  const storage=new Map([['opaque.pilot.source.v1',JSON.stringify({email:'private@example.test',workflow:'secret task',utm_source:'valid'})]]);const other=ui({storage});other.captureContactSource();assert.deepEqual(JSON.parse(storage.get(other.CONTACT_SOURCE_KEY)),{utm_source:'valid'});
+});
+test('pilot drops localhost and IP referrers before submission, including previously stored attribution',async()=>{
+  for(const host of ['localhost','192.168.1.2','[::1]']){
+    const storage=new Map([['opaque.pilot.source.v1',JSON.stringify({utm_source:'launch',referrer_host:host})]]),app=ui({storage,referrer:'http://'+host+'/private?email=private@example.test'});app.captureContactSource();pilotReady(app);let source;
+    app.fetch=async(_path,options)=>{const body=JSON.parse(options.body);source=body.source;validateContact(body);return {status:202,json:async()=>({accepted:true})};};await app.submitContact();
+    assert.equal(app.contact.accepted,true,host);assert.deepEqual(source,{utm_source:'launch'});assert.deepEqual(JSON.parse(storage.get(app.CONTACT_SOURCE_KEY)),{utm_source:'launch'});
+  }
+});
+test('contact works while queued or admissions are paused and never requires an email to join',async()=>{
+  for(const state of ['none','queued','active','expired']){
+    const app=ui();pilotReady(app);app.model.config.available=false;app.model.session=session(state);app.render();assert.equal(app.el('pilot-submit').disabled,false);assert.equal(app.el('pilot-form').hidden,false);
+  }
+  const app=ui();app.model.botToken='join-proof';let body;app.fetch=async(path,options)=>{if(path.endsWith('join'))body=JSON.parse(options.body);return {ok:true,json:async()=>path.endsWith('config')?app.model.config:session('queued')};};await app.join();assert.deepEqual(body,{turnstile_token:'join-proof',model_id:'fixture-small'});assert.equal(app.el('pilot-email').value,'');
+});
+test('pilot verification uses a separate widget/action and errors cannot poison demo state',async()=>{
+  const app=ui();app.model.config.contact_available=true;app.model.config.turnstile_site_key='site';let settings;
+  app.window.turnstile={render(selector,options){assert.equal(selector,'#pilot-verification-widget');settings=options;return 'pilot-id';},reset(){}};
+  app.model.botToken='join-proof';await app.ensureContactWidget();assert.equal(settings.action,'demo_contact');assert.equal(settings['response-field'],false);settings.callback('pilot-proof');assert.equal(app.contact.token,'pilot-proof');assert.equal(app.model.botToken,'join-proof');settings['error-callback']();assert.equal(app.model.error,null);assert.equal(app.model.botToken,'join-proof');assert.equal(app.contact.token,null);assert.equal(app.el('pilot-verification-retry').hidden,false);
+});
+test('contact config survives a session-status failure without adding polling',async()=>{
+  const app=ui(),config={...app.model.config,contact_available:true};app.fetch=async path=>{if(path.endsWith('session'))throw Error('session unavailable');return {ok:true,json:async()=>config};};await app.refresh();assert.equal(app.contactAvailable(),true);assert.equal(app.model.error,'session unavailable');
 });
