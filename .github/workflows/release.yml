@@ -115,7 +115,7 @@ jobs:
         id: tarball
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
-          ARCHIVE="opaque-${TAG}-${{ matrix.target }}.tar.gz"
+          ARCHIVE="opaque-${TAG#v}-${{ matrix.target }}.tar.gz"
           tar czf "$ARCHIVE" \
             -C "target/${{ matrix.target }}/release" \
             opaqued opaque opaque-mcp opaque-approve-helper opaque-web
