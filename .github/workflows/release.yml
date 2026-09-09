@@ -140,6 +140,20 @@ jobs:
       contents: write
       id-token: write
     steps:
+      # Runs before the artifact download below: actions/checkout defaults
+      # to `clean: true`, which git-cleans untracked files -- including the
+      # downloaded/signed artifacts/ directory if this ran after it.
+      - name: Checkout (for changelog)
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Generate changelog
+        uses: orhun/git-cliff-action@v4
+        id: changelog
+        with:
+          args: --latest --strip header
+
       - name: Download artifacts
         uses: actions/download-artifact@v8
         with:
@@ -154,17 +168,6 @@ jobs:
           for file in artifacts/*.tar.gz; do
             cosign sign-blob --yes "$file" --output-signature "${file}.sig" --output-certificate "${file}.pem"
           done
-
-      - name: Checkout (for changelog)
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Generate changelog
-        uses: orhun/git-cliff-action@v4
-        id: changelog
-        with:
-          args: --latest --strip header
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
