@@ -34,6 +34,12 @@ const DEFAULT_TOKEN_REF: &str = "keychain:opaque/doppler-token";
 /// Environment variable to override the default Doppler token ref.
 const TOKEN_REF_ENV: &str = "OPAQUE_DOPPLER_TOKEN_REF";
 
+/// Serializes tests that mutate `TOKEN_REF_ENV`, a process-global env var --
+/// without this, concurrent tests race on whose ref value is visible when
+/// the handler resolves it, and one can see another's cleanup instead.
+#[cfg(test)]
+static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// The Doppler operation handler.
 ///
 /// Handles project/config/secret browsing operations. A single `DopplerHandler`
@@ -477,6 +483,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_projects_via_handler() {
+        let _guard = super::TEST_ENV_LOCK.lock().await;
         let (handler, mock_server, audit) = setup_handler_with_mock().await;
 
         Mock::given(method("GET"))
@@ -510,6 +517,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_configs_via_handler() {
+        let _guard = super::TEST_ENV_LOCK.lock().await;
         let (handler, mock_server, _audit) = setup_handler_with_mock().await;
 
         Mock::given(method("GET"))
@@ -543,6 +551,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_secrets_via_handler() {
+        let _guard = super::TEST_ENV_LOCK.lock().await;
         let (handler, mock_server, _audit) = setup_handler_with_mock().await;
 
         Mock::given(method("GET"))
@@ -576,6 +585,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_secret_via_handler() {
+        let _guard = super::TEST_ENV_LOCK.lock().await;
         let (handler, mock_server, audit) = setup_handler_with_mock().await;
 
         Mock::given(method("GET"))
@@ -618,6 +628,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_secret_via_handler() {
+        let _guard = super::TEST_ENV_LOCK.lock().await;
         let (handler, mock_server, _audit) = setup_handler_with_mock().await;
 
         Mock::given(method("POST"))
@@ -651,6 +662,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_projects_auth_failure() {
+        let _guard = super::TEST_ENV_LOCK.lock().await;
         let (handler, mock_server, _audit) = setup_handler_with_mock().await;
 
         Mock::given(method("GET"))
