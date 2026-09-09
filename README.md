@@ -27,6 +27,25 @@ Multi-step work adds **plan -> review -> approve -> run -> inspect** — see
 New here? The [15-minute tutorial](docs/tutorial.md) takes you from install to a
 secret your agent moved but never saw, with an audit chain proving it.
 
+## Who It's For
+
+Engineering organizations — ten developers and up — whose teams already use
+AI coding agents, and who today either withhold sensitive access from them
+or supervise every action.
+
+- **Security and platform leads** own policy and custody: what agents may
+  touch, which operations need a human, and the evidence trail an auditor
+  or SIEM can verify.
+- **Developers** hand the agent real work, approve the exact scope once,
+  and read the receipt instead of the terminal.
+- **The agent** (Claude Code, Codex, any MCP client) finishes the task with
+  operations, never plaintext — nothing worth stealing ever enters its
+  process.
+
+Opaque is not a secrets manager and not an agent framework — it's the
+authorization and evidence layer between the two you already have, sitting
+in front of GitHub, GitLab, 1Password, Bitwarden, Vault, and AWS.
+
 ## Features
 
 - Deny-by-default policy engine with allowlist rules

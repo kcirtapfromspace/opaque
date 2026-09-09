@@ -10,12 +10,18 @@ hide:
 **Secrets stay secret. Agents stay powerful.**
 **Approve the work. Keep authority bounded.**
 
-Opaque lets a team give an AI coding agent a bounded piece of work —
-publish a secret, dispatch a release, run a fixed host check, read scoped
-data — approve exactly what it's allowed to do, and inspect the evidence
-after. LLMs get operations, never plaintext values. Every operation passes
-through Policy → Approval → Execute → Sanitize → Audit; multi-step work adds
-plan → review → approve → run → inspect.
+For platform and security teams — ten developers and up — whose teams
+already use AI coding agents, and who today either withhold sensitive
+access or supervise every action. Opaque lets you give an agent a bounded
+piece of work — publish a secret, dispatch a release, run a fixed host
+check, read scoped data — approve exactly what it's allowed to do, and
+inspect the evidence after. LLMs get operations, never plaintext values.
+Every operation passes through Policy → Approval → Execute → Sanitize →
+Audit; multi-step work adds plan → review → approve → run → inspect.
+
+Not a secrets manager, not an agent framework — the authorization and
+evidence layer between the two you already have. Security owns policy and
+custody; developers and agents finish the work.
 
 - **Bounded agent work** — a pinned task manifest approved once as a whole;
   each action charges exactly one slot and leaves a receipt.
