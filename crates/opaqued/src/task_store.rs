@@ -352,6 +352,7 @@ impl TaskStore {
         })
     }
 
+    #[cfg(test)]
     pub fn list(&self, owner: &str, now: i64) -> Result<Vec<TaskRecord>, TaskStoreError> {
         validate_owner(owner)?;
         self.validate_owner_boundary(owner)?;
@@ -386,31 +387,72 @@ impl TaskStore {
         cursor: Option<&str>,
     ) -> Result<(Vec<TaskRecord>, bool, Option<String>), TaskStoreError> {
         const PAGE_LIMIT: usize = 96 * 1024;
-        let records = self.list(owner, now)?;
-        let start = if let Some(cursor) = cursor {
-            records
-                .iter()
-                .position(|record| record.id == cursor)
-                .map(|index| index + 1)
-                .ok_or(TaskStoreError::InvalidCursor)?
-        } else {
-            0
-        };
-        let total_remaining = records.len() - start;
+        const ROW_LIMIT: usize = 100;
+        validate_owner(owner)?;
+        self.validate_owner_boundary(owner)?;
+        validate_now(now)?;
+        let mut connection = self.connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let cursor_row = cursor
+            .map(|id| {
+                tx.query_row(
+                    "SELECT rowid FROM bounded_tasks WHERE id = ?1 AND owner_key = ?2",
+                    params![id, owner],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .ok_or(TaskStoreError::InvalidCursor)
+            })
+            .transpose()?;
         let mut page = Vec::new();
+        let mut refreshed = Vec::new();
         let mut bytes = 512;
-        for record in records.into_iter().skip(start) {
-            let size = serde_json::to_vec(&record)?.len() + 1;
-            if bytes + size > PAGE_LIMIT {
-                if page.is_empty() {
-                    return Err(TaskStoreError::ReceiptTooLarge);
+        let mut has_more = false;
+        {
+            // SQLite's owner index includes rowid. A keyset range avoids
+            // decoding or scanning the owner's older history for every page.
+            let sql = if cursor_row.is_some() {
+                "SELECT id, owner_key, record FROM bounded_tasks
+                 WHERE owner_key = ?1 AND rowid < ?2 ORDER BY rowid DESC LIMIT 101"
+            } else {
+                "SELECT id, owner_key, record FROM bounded_tasks
+                 WHERE owner_key = ?1 ORDER BY rowid DESC LIMIT 101"
+            };
+            let mut statement = tx.prepare(sql)?;
+            let mut rows = if let Some(rowid) = cursor_row {
+                statement.query(params![owner, rowid])?
+            } else {
+                statement.query(params![owner])?
+            };
+            while let Some(row) = rows.next()? {
+                if page.len() == ROW_LIMIT {
+                    has_more = true;
+                    break;
                 }
-                break;
+                let mut record = decode_row(row_columns(row)?)?;
+                verify_tenant(&record, self.tenant.as_ref())?;
+                let changed = refresh_expiry(&mut record, now);
+                let size = serde_json::to_vec(&record)?.len() + 1;
+                if bytes + size > PAGE_LIMIT {
+                    if page.is_empty() {
+                        return Err(TaskStoreError::ReceiptTooLarge);
+                    }
+                    has_more = true;
+                    break;
+                }
+                bytes += size;
+                if changed {
+                    refreshed.push(page.len());
+                }
+                page.push(record);
             }
-            bytes += size;
-            page.push(record);
         }
-        let has_more = page.len() < total_remaining;
+        // Refresh only this bounded page. Authority-changing operations also
+        // check expiry independently; listing is not a full-history sweeper.
+        for index in refreshed {
+            save_record(&tx, &page[index])?;
+        }
+        tx.commit()?;
         let next_cursor = if has_more {
             page.last().map(|record| record.id.clone())
         } else {
@@ -1116,6 +1158,101 @@ mod tests {
         assert!(store.get(&task.id, &owner, NOW).is_err());
         assert!(store.list(&owner, NOW).is_err());
         assert!(store.claim(&task.id, &owner, NOW).is_err());
+    }
+
+    #[test]
+    fn pages_do_not_decode_unvisited_history_and_cursors_are_owner_scoped() {
+        let (_directory, store) = fixture();
+        let oldest = store.create(OWNER, manifest(1), NOW).unwrap();
+        let mut connection = store.connection().unwrap();
+        let tx = connection.transaction().unwrap();
+        for i in 1..=1000 {
+            let mut record = oldest.clone();
+            record.id = uuid::Uuid::from_u128(i).to_string();
+            for (index, slot) in record.slots.iter_mut().enumerate() {
+                slot.id = slot_id(&record.id, index);
+            }
+            tx.execute(
+                "INSERT INTO bounded_tasks(id, owner_key, record) VALUES (?1, ?2, ?3)",
+                params![record.id, OWNER, serde_json::to_string(&record).unwrap()],
+            )
+            .unwrap();
+        }
+        tx.execute(
+            "UPDATE bounded_tasks SET record = 'invalid old receipt' WHERE id = ?1",
+            [&oldest.id],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        drop(connection);
+        // The full-history implementation fails here on the old corrupt row.
+        // Bounded pagination reads only the requested page and its lookahead.
+        let (page, more, cursor) = store.list_page(OWNER, NOW, None).unwrap();
+        assert!(more);
+        assert!(!page.is_empty() && page.len() <= 100);
+        let first_ids: std::collections::HashSet<_> =
+            page.iter().map(|record| &record.id).collect();
+        let (next, _, _) = store.list_page(OWNER, NOW, cursor.as_deref()).unwrap();
+        assert!(next.iter().all(|record| !first_ids.contains(&record.id)));
+        assert!(matches!(
+            store.list_page("another-owner", NOW, cursor.as_deref()),
+            Err(TaskStoreError::InvalidCursor)
+        ));
+        assert!(store.get(&oldest.id, OWNER, NOW).is_err());
+        let expired = store.list_page(OWNER, NOW + 601, None).unwrap().0;
+        assert!(
+            expired
+                .iter()
+                .all(|record| record.state == TaskState::Expired)
+        );
+    }
+
+    /// Run explicitly with `cargo test --release --locked -p opaqued
+    /// task_pagination_scales -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "explicit 1k/100k receipt scalability measurement"]
+    fn task_pagination_scales() {
+        for history in [1_000_u128, 100_000] {
+            let (_directory, store) = fixture();
+            let oldest = store.create(OWNER, manifest(1), NOW).unwrap();
+            let mut connection = store.connection().unwrap();
+            let tx = connection.transaction().unwrap();
+            {
+                let mut insert = tx
+                    .prepare("INSERT INTO bounded_tasks(id, owner_key, record) VALUES (?1, ?2, ?3)")
+                    .unwrap();
+                for i in 1..history {
+                    let mut record = oldest.clone();
+                    record.id = uuid::Uuid::from_u128(i).to_string();
+                    for (index, slot) in record.slots.iter_mut().enumerate() {
+                        slot.id = slot_id(&record.id, index);
+                    }
+                    insert
+                        .execute(params![
+                            record.id,
+                            OWNER,
+                            serde_json::to_string(&record).unwrap()
+                        ])
+                        .unwrap();
+                }
+            }
+            tx.commit().unwrap();
+            drop(connection);
+            let started = std::time::Instant::now();
+            let (page, more, cursor) = store.list_page(OWNER, NOW, None).unwrap();
+            let elapsed = started.elapsed();
+            let bytes = serde_json::to_vec(&page).unwrap().len();
+            assert!(more && cursor.is_some());
+            assert!(page.len() <= 100);
+            assert!(bytes < 96 * 1024);
+            println!(
+                "task pagination history={history} rows={} bytes={bytes} first_page_us={}",
+                page.len(),
+                elapsed.as_micros()
+            );
+            let (next, _, _) = store.list_page(OWNER, NOW, cursor.as_deref()).unwrap();
+            assert!(!next.is_empty());
+        }
     }
 
     fn manifest(count: usize) -> TaskManifest {

@@ -1,6 +1,7 @@
 pub mod attest;
 pub mod audit;
 pub mod bundle;
+pub mod capability;
 pub mod execve_map;
 pub mod identity;
 pub mod inference;

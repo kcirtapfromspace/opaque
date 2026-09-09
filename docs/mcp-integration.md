@@ -10,6 +10,8 @@ Claude Code  --MCP/stdio-->  opaque-mcp  --Unix socket-->  opaqued (enclave)
 
 `opaque-mcp` is a thin protocol adapter. It translates MCP JSON-RPC messages into Opaque IPC requests and forwards them to the daemon over the Unix socket. All policy enforcement, approval gating, and audit logging happen inside `opaqued` — the MCP server has no special privileges.
 
+The adapter validates tool arguments against its published schemas and admits up to eight concurrent tool calls. Ping, tool listing, and cancellation remain responsive while calls wait on the broker. Cancellation stops waiting and closes that call's IPC connection; it does not promise to undo work already dispatched. Broker status and task receipt reads have a 30-second deadline, ordinary operations and sandbox execution five minutes, and bounded task execution 61 minutes. A timeout after dispatch reports an uncertain outcome and never triggers an automatic replay.
+
 ## Setup
 
 ### 1. Build

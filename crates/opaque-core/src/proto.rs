@@ -44,6 +44,34 @@ impl Response {
     }
 }
 
+/// Decode one daemon response, requiring the expected request ID and exactly
+/// one result or error. Preserve a legitimate JSON null result as Some(Null),
+/// and return a fixed error that never quotes untrusted response content.
+pub fn decode_response(frame: &[u8], expected_request_id: u64) -> std::io::Result<Response> {
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid daemon response envelope or request ID",
+        )
+    };
+    let value: serde_json::Value = serde_json::from_slice(frame).map_err(|_| invalid())?;
+    let object = value.as_object().ok_or_else(invalid)?;
+    if object.get("id").and_then(serde_json::Value::as_u64) != Some(expected_request_id)
+        || object.contains_key("result") == object.contains_key("error")
+        || object.get("error").is_some_and(|error| !error.is_object())
+    {
+        return Err(invalid());
+    }
+    let has_result = object.contains_key("result");
+    let mut response: Response = serde_json::from_value(value).map_err(|_| invalid())?;
+    // JSON null is a legitimate result; Option<Value> otherwise conflates it
+    // with a missing field and can turn malformed data into a success fallback.
+    if has_result && response.result.is_none() {
+        response.result = Some(serde_json::Value::Null);
+    }
+    Ok(response)
+}
+
 // ---------------------------------------------------------------------------
 // Streaming exec frames
 // ---------------------------------------------------------------------------

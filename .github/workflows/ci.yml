@@ -1,4 +1,4 @@
-name: Rust CI
+name: Code quality CI
 
 on:
   pull_request:
@@ -70,6 +70,90 @@ jobs:
         run: |
           cargo test --locked -p opaqued tests::enforce_agent_sessions_rejects_unwrapped_and_allows_session_token -- --exact 2>&1 | tee /tmp/wrapper-test.out
           grep -q "test result: ok. 1 passed" /tmp/wrapper-test.out
+
+  test-macos:
+    name: Native macOS tests
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@v2
+      - name: Run native workspace tests
+        run: cargo test --locked --workspace
+
+  python:
+    name: Python protocol and controller tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12.11"
+          cache: pip
+          cache-dependency-path: |
+            scripts/requirements-test.txt
+            docs/requirements.txt
+      - name: Install pinned test dependencies
+        run: python -m pip install --disable-pip-version-check -r scripts/requirements-test.txt
+      - name: Run every Python regression without skips
+        # Linux runs the real peer-credential/parent-death cases. Installing the
+        # pinned FIDO2 library makes its API-contract cases mandatory as well.
+        run: |
+          python -B - <<'PYTEST'
+          import sys
+          import unittest
+          for directory in ("scripts", "deploy/hosted-demo"):
+              suite = unittest.TestLoader().discover(directory, pattern="test_*.py")
+              result = unittest.TextTestRunner(verbosity=2).run(suite)
+              if not result.wasSuccessful() or not result.testsRun or result.skipped:
+                  print(f"Required suite {directory}: failures, missing tests, or skipped tests", file=sys.stderr)
+                  sys.exit(1)
+          PYTEST
+
+  javascript:
+    name: JavaScript queue, privacy and browser tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "26.8.1"
+      - name: Run all Node regression suites
+        run: >-
+          node --test
+          deploy/cloudflare-demo/tests/*.test.mjs
+          deploy/cloudflare-docs-privacy/tests/*.test.mjs
+          crates/opaque-metrics/tests/*.test.cjs
+          crates/opaque-web/tests/*.test.cjs
+
+  site-privacy:
+    name: Generated visitor site privacy
+    # This is a read-only build gate in both repositories, including fork PRs.
+    # Publication remains separately guarded in the deployment workflows.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12.11"
+          cache: pip
+          cache-dependency-path: |
+            scripts/requirements-test.txt
+            docs/requirements.txt
+      - name: Install pinned documentation tools
+        run: python -m pip install --disable-pip-version-check -r scripts/requirements-test.txt
+      - name: Check privacy gate regressions
+        run: python -B -m unittest discover -s scripts -p test_check_site_privacy.py
+      - name: Build and inspect all publication artifacts
+        # The temporary source includes private sentinels. It and its generated
+        # site are deliberately never uploaded as a preview or Actions artifact.
+        run: python -B scripts/check_site_privacy.py --build
 
   # Verifies the Linux-only trust-domain guarantees (separate-uid custody,
   # Landlock, seccomp). The probe runs FIRST and fails the job if the runner

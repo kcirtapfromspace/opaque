@@ -110,21 +110,10 @@ pub struct App {
     oauth_approvals: Mutex<HashMap<String, PendingOAuthApproval>>,
     capacity: Arc<Semaphore>,
     revoked: Mutex<BTreeSet<String>>,
-    audit: Mutex<File>,
+    audit: crate::audit_writer::AuditWriter,
     csp: HeaderValue,
-    // Closing this last-held descriptor releases the exclusive lifetime lock.
-    _state_lock: File,
 }
-impl Drop for App {
-    fn drop(&mut self) {
-        // Explicit unlock also releases the lock if a concurrent fork briefly
-        // inherited the open description before its close-on-exec runs.
-        // SAFETY: the descriptor remains live for the duration of this drop.
-        unsafe {
-            libc::flock(self._state_lock.as_raw_fd(), libc::LOCK_UN);
-        }
-    }
-}
+
 fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -409,9 +398,8 @@ impl App {
             oauth_approvals: Mutex::new(HashMap::new()),
             capacity: Arc::new(Semaphore::new(8)),
             revoked: Mutex::new(revoked),
-            audit: Mutex::new(audit),
+            audit: crate::audit_writer::AuditWriter::new(audit, state_lock)?,
             csp,
-            _state_lock: state_lock,
         }))
     }
     fn cookie_name(&self) -> String {
@@ -443,7 +431,7 @@ impl App {
             .verify_bearer(Some(&format!("Bearer {}", token.as_str())))?;
         Ok((token, access))
     }
-    fn audit(
+    async fn audit(
         &self,
         access: &VerifiedAccess,
         operation: &str,
@@ -453,30 +441,34 @@ impl App {
         let hash =
             evidence.map(|e| format!("{:x}", Sha256::digest(serde_json::to_vec(e).unwrap())));
         let record = json!({"at":now(),"event_id":Uuid::new_v4(),"tenant_id":access.tenant_id(),"subject":access.subject(),"operation":operation,"outcome":outcome,"evidence_sha256":hash});
-        let mut file = self.audit.lock().map_err(|_| "audit unavailable")?;
-        writeln!(file, "{record}").map_err(|_| "audit write failed")?;
-        file.sync_data()
-            .map_err(|_| "audit persistence failed".into())
+        self.audit.append(&record).await
     }
-    fn organization_audit(&self, access: &VerifiedAccess, details: &Value) -> Result<(), String> {
-        let record = json!({"at":now(),"event_id":Uuid::new_v4(),"tenant_id":access.tenant_id(),"subject":access.subject(),"details":details});
-        let mut audit = self.audit.lock().map_err(|_| "audit unavailable")?;
-        writeln!(audit, "{record}").map_err(|_| "audit write failed")?;
-        audit
-            .sync_data()
-            .map_err(|_| "audit persistence failed".into())
+    fn organization_record(&self, access: &VerifiedAccess, details: &Value) -> Value {
+        json!({"at":now(),"event_id":Uuid::new_v4(),"tenant_id":access.tenant_id(),"subject":access.subject(),"details":details})
+    }
+    async fn organization_audit(
+        &self,
+        access: &VerifiedAccess,
+        details: &Value,
+    ) -> Result<(), String> {
+        self.audit
+            .append(&self.organization_record(access, details))
+            .await
+    }
+    fn organization_audit_blocking(
+        &self,
+        access: &VerifiedAccess,
+        details: &Value,
+    ) -> Result<(), String> {
+        self.audit
+            .append_blocking(&self.organization_record(access, details))
     }
     fn access_epoch(&self, access: &VerifiedAccess) -> Result<Option<u64>, String> {
         self.auth.check_access(access).map_err(|e| e.to_string())?;
         self.config
             .organization_demo
             .as_ref()
-            .map(|config| {
-                self.organization
-                    .lock()
-                    .map_err(|_| "organization state unavailable".to_string())?
-                    .snapshot(config, access)
-            })
+            .map(|config| try_organization_state(&self.organization)?.snapshot(config, access))
             .transpose()
     }
     fn check_epoch(&self, access: &VerifiedAccess, epoch: Option<u64>) -> Result<(), String> {
@@ -488,15 +480,12 @@ impl App {
     fn check_data(&self, access: &VerifiedAccess, epoch: Option<u64>) -> Result<(), String> {
         self.check_epoch(access, epoch)?;
         if let Some(config) = &self.config.organization_demo {
-            self.organization
-                .lock()
-                .map_err(|_| "organization state unavailable")?
-                .check_data(
-                    config,
-                    access,
-                    epoch.ok_or("Organization authority unavailable")?,
-                    now(),
-                )?;
+            try_organization_state(&self.organization)?.check_data(
+                config,
+                access,
+                epoch.ok_or("Organization authority unavailable")?,
+                now(),
+            )?;
         }
         Ok(())
     }
@@ -506,7 +495,7 @@ impl App {
         kind: &'static str,
         question: Option<&str>,
     ) -> Option<String> {
-        self.organization.lock().ok()?.begin(
+        try_organization_state(&self.organization).ok()?.begin(
             self.config.organization_demo.as_ref()?,
             access,
             kind,
@@ -517,14 +506,14 @@ impl App {
     }
     fn activity_tool(&self, id: &Option<String>, query: &MetricsQuery) {
         if let Some(id) = id
-            && let Ok(mut organization) = self.organization.lock()
+            && let Ok(mut organization) = try_organization_state(&self.organization)
         {
             organization.tool(id, &query.metrics, query.window_secs);
         }
     }
     fn activity_portfolio(&self, id: &Option<String>, query: &PortfolioQuery) {
         if let Some(id) = id
-            && let Ok(mut organization) = self.organization.lock()
+            && let Ok(mut organization) = try_organization_state(&self.organization)
         {
             organization.portfolio_tool(id, query);
         }
@@ -537,7 +526,7 @@ impl App {
         reason: Option<&str>,
     ) {
         if let Some(id) = id
-            && let Ok(mut organization) = self.organization.lock()
+            && let Ok(mut organization) = try_organization_state(&self.organization)
         {
             organization.finish(id, outcome, source, reason);
         }
@@ -723,17 +712,14 @@ async fn session(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
         value["policy_context"] = json!({"tenant_id":access.tenant_id(),"policy_id":CREDIT_POLICY_ID,"persona":"Portfolio analyst","purpose":"Portfolio monitoring","allowed_tool":"opaque_metrics_query","allowed_metrics":allowed_metrics(&access),"latest_decision":app.latest_policy.lock().ok().and_then(|latest|latest.get(access.jti()).cloned())});
     }
     if let Some(config) = &app.config.organization_demo {
-        let organization = app
-            .organization
-            .lock()
-            .map_err(|_| "organization state unavailable")
-            .and_then(|state| {
-                state
-                    .session(config, &access, &app.config.customer_name, now())
-                    .map_err(|_| "Organization identity unavailable")
-            });
-        let Ok(mut organization) = organization else {
-            return organization_error("Organization identity unavailable.");
+        let organization = try_organization_state(&app.organization).and_then(|state| {
+            state
+                .session(config, &access, &app.config.customer_name, now())
+                .map_err(|_| "Organization identity unavailable".to_string())
+        });
+        let mut organization = match organization {
+            Ok(value) => value,
+            Err(message) => return organization_error(&message),
         };
         let can_query = organization
             .pointer("/data_entitlement/allowed")
@@ -795,8 +781,27 @@ async fn session(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     Json(value).into_response()
 }
 
+const ORGANIZATION_UNAVAILABLE: &str =
+    "Organization state is busy or unavailable. Retry after the current transition completes.";
+fn try_organization_state(
+    state: &Mutex<OrganizationState>,
+) -> Result<std::sync::MutexGuard<'_, OrganizationState>, String> {
+    // A durable identity/consent transaction can hold this mutex for the audit
+    // acknowledgment deadline. Async request workers must fail closed, not wait.
+    state
+        .try_lock()
+        .map_err(|_| ORGANIZATION_UNAVAILABLE.to_string())
+}
 fn organization_error(message: &str) -> Response {
-    error(StatusCode::FORBIDDEN, "organization_access_denied", message)
+    if message == ORGANIZATION_UNAVAILABLE {
+        error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "organization_unavailable",
+            message,
+        )
+    } else {
+        error(StatusCode::FORBIDDEN, "organization_access_denied", message)
+    }
 }
 fn work_error(error_value: bounded_demo::Error) -> Response {
     match error_value {
@@ -828,9 +833,7 @@ impl App {
         self.auth.check_access(access).map_err(|_| denied())?;
         query_scope(access, &bounded_demo::query()).map_err(|_| denied())?;
         let config = self.config.organization_demo.as_ref().ok_or_else(denied)?;
-        let state = self
-            .organization
-            .lock()
+        let state = try_organization_state(&self.organization)
             .map_err(|_| bounded_demo::Error::Unavailable)?;
         if config.member(access).map_err(|_| denied())?.persona_id != Persona::CustomerAnalyst {
             return Err(denied());
@@ -1266,7 +1269,7 @@ async fn activate_persona(
     headers: HeaderMap,
     Json(request): Json<PersonaRequest>,
 ) -> Response {
-    let Some(config) = &app.config.organization_demo else {
+    let Some(config) = app.config.organization_demo.clone() else {
         return error(
             StatusCode::NOT_FOUND,
             "not_found",
@@ -1277,18 +1280,20 @@ async fn activate_persona(
         Ok(value) => value,
         Err(e) => return auth_error(&app, e),
     };
-    let result = app
-        .organization
-        .lock()
-        .map_err(|_| "organization state unavailable".to_string())
-        .and_then(|mut state| {
+    let transition_app = app.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let app = transition_app;
+        app.auth
+            .check_access(&access)
+            .map_err(|error| error.to_string())?;
+        try_organization_state(&app.organization).and_then(|mut state| {
             state.activate(
-                config,
+                &config,
                 &access,
                 request.persona_id,
                 request.reason.as_deref(),
                 now(),
-                |details| app.organization_audit(&access, details),
+                |details| app.organization_audit_blocking(&access, details),
             )?;
             // Identity switching never creates a fresh allowance. Persist the
             // revocation while holding the same organization lock used by task
@@ -1301,7 +1306,10 @@ async fn activate_persona(
                     .map_err(|_| "bounded task revocation unavailable".to_string())?;
             }
             Ok(())
-        });
+        })
+    })
+    .await
+    .unwrap_or_else(|_| Err("organization transition worker stopped".into()));
     if let Err(message) = result {
         return organization_error(&message);
     }
@@ -1317,7 +1325,7 @@ async fn organization_sharing(
     headers: HeaderMap,
     Json(request): Json<SharingRequest>,
 ) -> Response {
-    let Some(config) = &app.config.organization_demo else {
+    let Some(config) = app.config.organization_demo.clone() else {
         return error(
             StatusCode::NOT_FOUND,
             "not_found",
@@ -1328,15 +1336,20 @@ async fn organization_sharing(
         Ok(value) => value,
         Err(e) => return auth_error(&app, e),
     };
-    let result = app
-        .organization
-        .lock()
-        .map_err(|_| "organization state unavailable".to_string())
-        .and_then(|mut state| {
-            state.set_sharing(config, &access, request.enabled, |details| {
-                app.organization_audit(&access, details)
+    let transition_app = app.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let app = transition_app;
+        app.auth
+            .check_access(&access)
+            .map_err(|error| error.to_string())?;
+        try_organization_state(&app.organization).and_then(|mut state| {
+            state.set_sharing(&config, &access, request.enabled, |details| {
+                app.organization_audit_blocking(&access, details)
             })
-        });
+        })
+    })
+    .await
+    .unwrap_or_else(|_| Err("organization transition worker stopped".into()));
     if let Err(message) = result {
         return organization_error(&message);
     }
@@ -1354,10 +1367,7 @@ async fn organization_activity(State(app): State<Arc<App>>, headers: HeaderMap) 
         Ok(value) => value,
         Err(e) => return auth_error(&app, e),
     };
-    let result = app
-        .organization
-        .lock()
-        .map_err(|_| "organization state unavailable".to_string())
+    let result = try_organization_state(&app.organization)
         .and_then(|mut state| state.activity(config, &access, &app.config.customer_name, now()));
     if let Err(message) = result {
         return organization_error(&message);
@@ -1375,10 +1385,12 @@ async fn organization_activity(State(app): State<Arc<App>>, headers: HeaderMap) 
                 .organization_demo
                 .as_ref()
                 .ok_or("Organization unavailable")?;
-            app.organization
-                .lock()
-                .map_err(|_| "organization state unavailable".to_string())?
-                .activity(config, &access, &app.config.customer_name, now())
+            try_organization_state(&app.organization)?.activity(
+                config,
+                &access,
+                &app.config.customer_name,
+                now(),
+            )
         });
         let value=result.unwrap_or_else(|_|json!({"error":{"code":"organization_access_denied","message":"Organization authority changed before activity delivery."}}));
         Ok::<_, Infallible>(serde_json::to_vec(&value).unwrap())
@@ -1943,12 +1955,14 @@ async fn mcp(
                     Some(false),
                     Some("customer_entitlement_denied"),
                 );
-                let _ = app.audit(
-                    &access,
-                    "metrics.query",
-                    "denied_customer_entitlement",
-                    None,
-                );
+                let _ = app
+                    .audit(
+                        &access,
+                        "metrics.query",
+                        "denied_customer_entitlement",
+                        None,
+                    )
+                    .await;
                 return organization_error(&message);
             }
             if let Err(e) = query_scope(&access, &arguments) {
@@ -1958,7 +1972,9 @@ async fn mcp(
                     Some(false),
                     Some("metric_scope_denied"),
                 );
-                let _ = app.audit(&access, "metrics.query", "denied_scope", None);
+                let _ = app
+                    .audit(&access, "metrics.query", "denied_scope", None)
+                    .await;
                 return auth_error(&app, e);
             }
             if app.rate(&access).is_err() {
@@ -1971,6 +1987,7 @@ async fn mcp(
             }
             if app
                 .audit(&access, "metrics.query", "authorized", None)
+                .await
                 .is_err()
             {
                 app.finish_activity(&activity, "failed", Some(false), Some("audit_unavailable"));
@@ -1986,9 +2003,19 @@ async fn mcp(
             app.activity_tool(&activity, &arguments);
             let evidence = match app.metrics.query(access.tenant_id(), arguments).await {
                 Ok(v) => v,
+                Err(crate::metrics::MetricsError::SourceBusy) => {
+                    app.finish_activity(&activity, "denied", Some(false), Some("source_capacity"));
+                    return error(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "source_busy",
+                        "Metric source capacity reached.",
+                    );
+                }
                 Err(_) => {
                     app.finish_activity(&activity, "failed", None, Some("source_unavailable"));
-                    let _ = app.audit(&access, "metrics.query", "source_unavailable", None);
+                    let _ = app
+                        .audit(&access, "metrics.query", "source_unavailable", None)
+                        .await;
                     return rpc(
                         id,
                         json!({"isError":true,"content":[{"type":"text","text":"Metric source returned no usable, fresh evidence. No automatic retry was made."}]}),
@@ -2001,6 +2028,7 @@ async fn mcp(
             }
             if app
                 .audit(&access, "metrics.query", "observed", Some(&evidence))
+                .await
                 .is_err()
             {
                 return error(
@@ -2124,12 +2152,28 @@ async fn chat(
             let Ok((event, requires_data)) = rx.recv().await?;
             // Check again at body delivery: revocation must discard evidence that
             // was queued while the consumer was paused or applying backpressure.
-            if app.check_epoch(&access, epoch).is_err()
-                || (requires_data && app.check_data(&access, epoch).is_err())
-            {
+            let authority = app.check_epoch(&access, epoch).and_then(|_| {
+                if requires_data {
+                    app.check_data(&access, epoch)
+                } else {
+                    Ok(())
+                }
+            });
+            if let Err(message) = authority {
                 rx.close();
-                let revoked = Event::default().event("error").data("{\"code\":\"auth_expired\",\"message\":\"Authorization expired or was revoked. The live answer has stopped.\"}");
-                return Some((Ok::<Event, Infallible>(revoked), (rx, app, access, true)));
+                let (code, message) = if message == ORGANIZATION_UNAVAILABLE {
+                    ("organization_unavailable", ORGANIZATION_UNAVAILABLE)
+                } else {
+                    (
+                        "auth_expired",
+                        "Authorization expired or was revoked. The live answer has stopped.",
+                    )
+                };
+                let stopped = Event::default()
+                    .event("error")
+                    .json_data(json!({"code":code,"message":message}))
+                    .unwrap();
+                return Some((Ok::<Event, Infallible>(stopped), (rx, app, access, true)));
             }
             Some((Ok(event), (rx, app, access, false)))
         },
@@ -2264,7 +2308,8 @@ async fn run_chat_inner(
             "organization.customer_query",
             "denied_customer_entitlement",
             None,
-        )?;
+        )
+        .await?;
         app.finish_activity(
             activity,
             "denied",
@@ -2293,7 +2338,8 @@ async fn run_chat_inner(
             .is_some_and(|config| config.foreign_customer_requested(message))
         {
             let reason = "The named customer is a directory entry only. Organization membership does not grant access to its metrics; this session can read only its assigned customer's aggregates.";
-            app.audit(access, "portfolio.policy", "customer_scope_denied", None)?;
+            app.audit(access, "portfolio.policy", "customer_scope_denied", None)
+                .await?;
             app.finish_activity(
                 activity,
                 "denied",
@@ -2312,7 +2358,8 @@ async fn run_chat_inner(
             return Err(reason.into());
         }
         if let Some(denial) = credit_request_denial(message) {
-            app.audit(access, "portfolio.policy", denial.reason_code, None)?;
+            app.audit(access, "portfolio.policy", denial.reason_code, None)
+                .await?;
             app.finish_activity(activity, "denied", Some(false), Some(denial.reason_code));
             policy_event(
                 (app, access, tx),
@@ -2335,7 +2382,8 @@ async fn run_chat_inner(
                 Some(false),
                 Some("unsupported_watch_query"),
             );
-            app.audit(access, "portfolio.policy", "unsupported_watch_query", None)?;
+            app.audit(access, "portfolio.policy", "unsupported_watch_query", None)
+                .await?;
             policy_event(
                 (app, access, tx),
                 "request_check",
@@ -2351,7 +2399,8 @@ async fn run_chat_inner(
             && let Err(message) =
                 crate::chat::deny_explicit_out_of_scope_metrics(message, &allowed_metrics(access))
         {
-            app.audit(access, "portfolio.policy", "metric_scope_denied", None)?;
+            app.audit(access, "portfolio.policy", "metric_scope_denied", None)
+                .await?;
             app.finish_activity(activity, "denied", Some(false), Some("metric_scope_denied"));
             policy_event(
                 (app, access, tx),
@@ -2372,7 +2421,8 @@ async fn run_chat_inner(
     )
     .await?;
     // A separate explain scope authorizes this configured model destination.
-    app.audit(access, "metrics.explain", "authorized", None)?;
+    app.audit(access, "metrics.explain", "authorized", None)
+        .await?;
     // Each chat is a short-lived MCP client. Negotiate the stateless transport
     // and retrieve its scoped tool catalog before asking the model to plan.
     let initialized = app.http.post(format!("{}/mcp", app.config.public_origin))
@@ -2538,7 +2588,8 @@ async fn run_chat_inner(
         .map_err(|e| e.to_string())?;
     let answer = app.model.answer(message, &evidence).await?;
     app.check_data(access, epoch)?;
-    app.audit(access, "metrics.explain", "observed", Some(&evidence))?;
+    app.audit(access, "metrics.explain", "observed", Some(&evidence))
+        .await?;
     emit(tx, "answer", json!({"text":answer})).await?;
     Ok(())
 }
@@ -2561,7 +2612,9 @@ async fn portfolio_mcp(
             Some(false),
             Some("portfolio_scope_denied"),
         );
-        let _ = app.audit(access, "portfolio.query", "denied_scope", None);
+        let _ = app
+            .audit(access, "portfolio.query", "denied_scope", None)
+            .await;
         return organization_error(&message);
     }
     if app.rate(access).is_err() {
@@ -2573,6 +2626,7 @@ async fn portfolio_mcp(
     }
     if app
         .audit(access, "portfolio.query", "authorized", None)
+        .await
         .is_err()
     {
         return error(
@@ -2590,9 +2644,19 @@ async fn portfolio_mcp(
     app.activity_portfolio(&activity, &query);
     let evidence = match app.metrics.query_portfolio(access.tenant_id(), query).await {
         Ok(evidence) => evidence,
+        Err(crate::metrics::MetricsError::SourceBusy) => {
+            app.finish_activity(&activity, "denied", Some(false), Some("source_capacity"));
+            return error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "source_busy",
+                "Portfolio source capacity reached.",
+            );
+        }
         Err(_) => {
             app.finish_activity(&activity, "failed", None, Some("source_unavailable"));
-            let _ = app.audit(access, "portfolio.query", "source_unavailable", None);
+            let _ = app
+                .audit(access, "portfolio.query", "source_unavailable", None)
+                .await;
             return rpc(
                 id,
                 json!({"isError":true,"content":[{"type":"text","text":"Portfolio source returned no complete, fresh aggregate evidence. No automatic retry was made."}]}),
@@ -2606,7 +2670,7 @@ async fn portfolio_mcp(
     {
         return organization_error(&message);
     }
-    if portfolio_audit(app, access, &evidence).is_err() {
+    if portfolio_audit(app, access, &evidence).await.is_err() {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
             "audit_unavailable",
@@ -2621,7 +2685,7 @@ async fn portfolio_mcp(
         json!({"isError":false,"structuredContent":evidence,"content":[{"type":"text","text":serde_json::to_string(&evidence).unwrap()}]}),
     )
 }
-fn portfolio_audit(
+async fn portfolio_audit(
     app: &App,
     access: &VerifiedAccess,
     evidence: &PortfolioEvidence,
@@ -2630,7 +2694,7 @@ fn portfolio_audit(
         "{:x}",
         Sha256::digest(serde_json::to_vec(evidence).map_err(|_| "Evidence encoding failed")?)
     );
-    app.organization_audit(access,&json!({"operation":"portfolio.query","outcome":"observed","source_id":evidence.source_id,"query":evidence.snapshot.query,"as_of":evidence.snapshot.as_of,"watermark":evidence.snapshot.watermark,"evidence_sha256":digest}))
+    app.organization_audit(access,&json!({"operation":"portfolio.query","outcome":"observed","source_id":evidence.source_id,"query":evidence.snapshot.query,"as_of":evidence.snapshot.as_of,"watermark":evidence.snapshot.watermark,"evidence_sha256":digest})).await
 }
 async fn run_portfolio_chat(
     app: &Arc<App>,
@@ -2737,7 +2801,7 @@ async fn run_portfolio_chat(
         policy_event_for((app,access,tx,portfolio::TOOL),"source_read","allowed","source_evidence_received","Complete portfolio aggregates received from the authorized customer source. Answers are computed from this evidence.",true).await?;
         app.check_data(access, epoch)?;
         portfolio_scope(app, access, query)?;
-        portfolio_audit(app, access, &evidence)?;
+        portfolio_audit(app, access, &evidence).await?;
         let mut presentation = evidence.presentation(&evidence_id);
         presentation["partial"] = json!(true);
         emit(tx, "portfolio_result", presentation).await?;
@@ -2782,8 +2846,28 @@ async fn run_portfolio_chat(
         .iter()
         .map(|f| f.evidence_id.clone())
         .collect::<Vec<_>>();
-    app.organization_audit(access,&json!({"operation":"portfolio.answer","outcome":"grounded","finding_ids":ids,"evidence_ids":evidence_ids,"computed_fallback":fallback}))?;
+    app.organization_audit(access,&json!({"operation":"portfolio.answer","outcome":"grounded","finding_ids":ids,"evidence_ids":evidence_ids,"computed_fallback":fallback})).await?;
     verify_disclosure()?;
     emit(tx, "answer", json!({"text":text,"kind":"grounded","summary_mode":if fallback {"computed_fallback"} else {"model_selected_evidence"},"findings":selected,"evidence_ids":evidence_ids})).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod concurrency_tests {
+    use super::*;
+    #[test]
+    fn organization_reads_and_control_admission_fail_closed_while_a_transaction_owns_state() {
+        let state = Mutex::new(OrganizationState::default());
+        let transaction = state.lock().unwrap();
+        let error = try_organization_state(&state)
+            .err()
+            .expect("must not wait for the transaction");
+        assert_eq!(error, ORGANIZATION_UNAVAILABLE);
+        assert_eq!(
+            organization_error(&error).status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        drop(transaction);
+        assert!(try_organization_state(&state).is_ok());
+    }
 }

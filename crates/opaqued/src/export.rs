@@ -743,6 +743,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn json_export_cursor_and_chain_survive_partial_and_full_retention() {
+        for prune_all in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("audit.db");
+            let sink = SqliteAuditSink::new(db.clone(), 0).unwrap();
+            let mut first = AuditEvent::new(AuditEventKind::RequestReceived);
+            first.ts_utc_ms = 1;
+            sink.emit(first);
+            let mut second = AuditEvent::new(AuditEventKind::RequestReceived);
+            if prune_all {
+                second.ts_utc_ms = 2;
+            }
+            sink.emit(second);
+            sink.close().unwrap();
+            let spool = dir.path().join("audit.jsonl");
+            let pump = pump_for(
+                dir.path(),
+                ExportConfig {
+                    spool_path: Some(spool.clone()),
+                    ..Default::default()
+                },
+                db.clone(),
+            );
+            let mut detector = ApprovalDetector::default();
+            assert_eq!(pump.run_once(&mut detector).await.unwrap(), 2);
+            let initial = std::fs::read_to_string(&spool).unwrap();
+            let old: Vec<ExportRecord> = initial
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let reopened = SqliteAuditSink::new(db.clone(), 1).unwrap();
+            reopened.emit(
+                AuditEvent::new(AuditEventKind::OperationStarted).with_operation("after-retention"),
+            );
+            reopened.close().unwrap();
+            assert!(opaque_core::audit::verify_audit_chain(&db).unwrap().ok);
+            assert_eq!(
+                pump.run_once(&mut detector).await.unwrap(),
+                1,
+                "existing cursors must see the next row after a full prune"
+            );
+            assert_eq!(pump.run_once(&mut detector).await.unwrap(), 0);
+            let exported = std::fs::read_to_string(&spool).unwrap();
+            assert!(exported.starts_with(&initial));
+            let records: Vec<ExportRecord> = exported
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(records.len(), 3);
+            assert_eq!(records[2].sequence_number, 2);
+            assert!(records[2].rowid > old[1].rowid);
+            let retained = read_rows_after(&db, 0, 10).unwrap();
+            for record in retained {
+                let original = records
+                    .iter()
+                    .find(|candidate| candidate.event_id == record.event_id)
+                    .unwrap();
+                assert_eq!(
+                    original.record_hash, record.record_hash,
+                    "retention must preserve externally exported authenticators"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn webhook_failure_holds_cursor_then_delivers() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};

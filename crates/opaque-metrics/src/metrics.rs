@@ -24,6 +24,7 @@ pub const METRIC_NAMES: &[&str] = &[
 const MAX_BODY_BYTES: usize = 32 * 1024;
 const MAX_SAMPLE_COUNT: u64 = 1_000_000_000_000;
 const CLOCK_SKEW_SECS: i64 = 5;
+const MAX_PROVIDER_REQUESTS: usize = 8;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -97,6 +98,8 @@ pub enum MetricsError {
     SourceRejected,
     #[error("metrics source is unavailable")]
     SourceUnavailable,
+    #[error("metrics source request capacity reached")]
+    SourceBusy,
     #[error("metrics source returned invalid or stale evidence")]
     InvalidEvidence,
 }
@@ -110,6 +113,9 @@ struct TrustedSource {
 pub struct MetricsClient {
     http: reqwest::Client,
     sources: BTreeMap<String, TrustedSource>,
+    // Independent from browser-chat admission: nested chat MCP reads must not
+    // need another permit from the already occupied chat pool.
+    capacity: tokio::sync::Semaphore,
 }
 
 impl MetricsClient {
@@ -125,6 +131,10 @@ impl MetricsClient {
         query
             .validate(&source.config.allowed_portfolio_measures)
             .map_err(|_| MetricsError::InvalidQuery)?;
+        let _permit = self
+            .capacity
+            .try_acquire()
+            .map_err(|_| MetricsError::SourceBusy)?;
         let mut url = source.query_url.clone();
         url.set_path("/v1/portfolio/query");
         let mut response = self
@@ -233,7 +243,11 @@ impl MetricsClient {
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|_| MetricsError::Configuration)?;
-        Ok(Self { http, sources })
+        Ok(Self {
+            http,
+            sources,
+            capacity: tokio::sync::Semaphore::new(MAX_PROVIDER_REQUESTS),
+        })
     }
 
     /// `verified_tenant` must originate in the server's verified auth context,
@@ -248,6 +262,10 @@ impl MetricsClient {
             .get(verified_tenant)
             .ok_or(MetricsError::TenantUnavailable)?;
         let requested = validate_query(&source.config, &request)?;
+        let _permit = self
+            .capacity
+            .try_acquire()
+            .map_err(|_| MetricsError::SourceBusy)?;
         let mut response = self
             .http
             .post(source.query_url.clone())

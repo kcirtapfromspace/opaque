@@ -1,3 +1,5 @@
+//! Shared native review and authentication for the daemon and workstation approver.
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]

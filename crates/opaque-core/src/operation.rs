@@ -173,6 +173,9 @@ pub enum RegistryError {
 
     #[error("unknown operation: {0}")]
     UnknownOperation(String),
+
+    #[error("invalid parameter schema for operation {0}")]
+    InvalidSchema(String),
 }
 
 /// Central registry of all valid operations.
@@ -182,6 +185,7 @@ pub enum RegistryError {
 #[derive(Debug, Clone)]
 pub struct OperationRegistry {
     ops: HashMap<String, OperationDef>,
+    validators: HashMap<String, std::sync::Arc<jsonschema::Validator>>,
 }
 
 impl OperationRegistry {
@@ -189,6 +193,7 @@ impl OperationRegistry {
     pub fn new() -> Self {
         Self {
             ops: HashMap::new(),
+            validators: HashMap::new(),
         }
     }
 
@@ -198,8 +203,38 @@ impl OperationRegistry {
         if self.ops.contains_key(&def.name) {
             return Err(RegistryError::AlreadyRegistered(def.name.clone()));
         }
+        if let Some(schema) = &def.params_schema {
+            let validator = jsonschema::validator_for(schema)
+                .map_err(|_| RegistryError::InvalidSchema(def.name.clone()))?;
+            self.validators
+                .insert(def.name.clone(), std::sync::Arc::new(validator));
+        }
         self.ops.insert(def.name.clone(), def);
         Ok(())
+    }
+
+    /// Validate with the schema compiled during registration. Registry clones
+    /// share validators; requests never compile immutable schema definitions.
+    pub fn validate_params(
+        &self,
+        operation: &str,
+        params: &serde_json::Value,
+    ) -> Result<(), Vec<String>> {
+        if !self.ops.contains_key(operation) {
+            return Err(vec![format!("unknown operation: {operation}")]);
+        }
+        let Some(validator) = self.validators.get(operation) else {
+            return Ok(());
+        };
+        let errors: Vec<_> = validator
+            .iter_errors(params)
+            .map(|e| e.to_string())
+            .collect();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 
     /// Look up an operation by name.
@@ -504,6 +539,53 @@ impl fmt::Debug for OperationRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schemas_are_validated_at_registration_and_shared_by_registry_clones() {
+        let mut registry = OperationRegistry::new();
+        let mut def = OperationDef {
+            name: "test.schema".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Never,
+            default_factors: vec![],
+            description: "fixture".into(),
+            params_schema: Some(serde_json::json!({"type": 7})),
+            allowed_target_keys: vec![],
+            secret_ref_param_keys: vec![],
+        };
+        assert!(matches!(
+            registry.register(def.clone()),
+            Err(RegistryError::InvalidSchema(_))
+        ));
+        assert!(registry.is_empty());
+        def.params_schema = Some(serde_json::json!({
+            "type":"object", "required":["value"], "additionalProperties":false,
+            "properties":{"value":{"type":"integer", "minimum":0}}
+        }));
+        registry.register(def).unwrap();
+        let cloned = registry.clone();
+        assert!(std::sync::Arc::ptr_eq(
+            &registry.validators["test.schema"],
+            &cloned.validators["test.schema"]
+        ));
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!([]),
+            serde_json::json!({"value":-1}),
+        ] {
+            assert!(registry.validate_params("test.schema", &value).is_err());
+        }
+        assert!(
+            registry
+                .validate_params("test.schema", &serde_json::json!({"value":0}))
+                .is_ok()
+        );
+        assert!(
+            registry
+                .validate_params("missing", &serde_json::Value::Null)
+                .is_err()
+        );
+    }
 
     #[test]
     fn registry_register_and_lookup() {

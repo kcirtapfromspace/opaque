@@ -451,3 +451,64 @@ async fn absent_portfolio_permission_or_unscoped_measure_never_contacts_source()
     }
     assert!(server.received_requests().await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn provider_capacity_bounds_both_endpoints_and_releases_after_cancellation() {
+    use std::sync::Arc;
+    let source = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(snapshot("tenant-a"))
+                .set_delay(Duration::from_secs(30)),
+        )
+        .mount(&source)
+        .await;
+    let mut source_config = config(source.uri(), "tenant-a");
+    source_config.allowed_portfolio_measures = crate::portfolio::Measure::ALL.to_vec();
+    let client = Arc::new(client(vec![source_config]));
+    let requests = (0..MAX_PROVIDER_REQUESTS)
+        .map(|_| {
+            let client = client.clone();
+            tokio::spawn(async move { client.query("tenant-a", query()).await })
+        })
+        .collect::<Vec<_>>();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while source.received_requests().await.unwrap().len() < MAX_PROVIDER_REQUESTS {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        client.query("tenant-a", query()).await.unwrap_err(),
+        MetricsError::SourceBusy
+    );
+    let portfolio = serde_json::from_value(
+        json!({"view":"summary","window_secs":3600,"measures":["application_count"]}),
+    )
+    .unwrap();
+    assert_eq!(
+        client
+            .query_portfolio("tenant-a", portfolio)
+            .await
+            .unwrap_err(),
+        MetricsError::SourceBusy
+    );
+    assert_eq!(
+        source.received_requests().await.unwrap().len(),
+        MAX_PROVIDER_REQUESTS
+    );
+    for request in requests {
+        request.abort();
+        let _ = request.await;
+    }
+    assert_eq!(client.capacity.available_permits(), MAX_PROVIDER_REQUESTS);
+    source.reset().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(snapshot("tenant-a")))
+        .expect(1)
+        .mount(&source)
+        .await;
+    assert!(client.query("tenant-a", query()).await.is_ok());
+}

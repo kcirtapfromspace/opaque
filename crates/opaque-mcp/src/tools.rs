@@ -661,41 +661,29 @@ fn task_id_params(args: &serde_json::Value) -> serde_json::Value {
 /// route to the correct enclave operation based on `action`/`scope`
 /// fields in the params built by each tool's `build_params`.
 pub fn tool_to_daemon_method(tool_name: &str) -> Option<&'static str> {
-    static MAPPING: &[(&str, &str)] = &[
-        ("opaque_task_plan_ssh", "task_plan_ssh"),
-        ("opaque_task_plan_inference", "task_plan_inference"),
-        ("opaque_task_plan", "task_plan"),
-        ("opaque_task_run", "task_run"),
-        ("opaque_task_get", "task_get"),
-        ("opaque_task_list", "task_list"),
-        ("opaque_task_revoke", "task_revoke"),
-        ("opaque_task_reconcile", "task_reconcile"),
-        ("opaque_github_set_actions_secret", "github"),
-        ("opaque_github_set_codespaces_secret", "github"),
-        ("opaque_github_set_dependabot_secret", "github"),
-        ("opaque_github_set_org_secret", "github"),
-        ("opaque_github_list_secrets", "github"),
-        ("opaque_github_delete_secret", "github"),
-        ("opaque_gitlab_set_ci_variable", "gitlab"),
-        ("opaque_onepassword_list_vaults", "onepassword"),
-        ("opaque_onepassword_list_items", "onepassword"),
-        ("opaque_bitwarden_list_projects", "bitwarden"),
-        ("opaque_bitwarden_list_secrets", "bitwarden"),
-        ("opaque_sandbox_exec", "sandbox.exec"),
-        // opaque_sandbox_list_profiles is handled client-side (no daemon call)
-        ("opaque_sandbox_list_profiles", "sandbox.list_profiles"),
-        // opaque_secrets_status is handled client-side (no daemon call)
-        ("opaque_secrets_status", "sandbox.secrets_status"),
-    ];
-    MAPPING
-        .iter()
-        .find(|(k, _)| *k == tool_name)
-        .map(|(_, v)| *v)
+    opaque_core::capability::tool_to_daemon_method(tool_name)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_catalog_matches_shared_routes_exactly() {
+        let names: std::collections::BTreeSet<_> =
+            safe_tools().into_iter().map(|tool| tool.name).collect();
+        let routes: std::collections::BTreeSet<_> = opaque_core::capability::MCP_ROUTES
+            .iter()
+            .map(|route| route.0)
+            .collect();
+        assert_eq!(names, routes);
+        assert!(opaque_core::capability::mcp_exposes("sandbox.exec"));
+        assert!(!opaque_core::capability::mcp_exposes(
+            "onepassword.read_field"
+        ));
+        assert!(!opaque_core::capability::mcp_exposes("unknown.operation"));
+    }
+
     use std::collections::HashSet;
 
     #[test]

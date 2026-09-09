@@ -2136,22 +2136,19 @@ dependencies = [
 name = "opaque-approver"
 version = "0.2.0"
 dependencies = [
- "block2",
  "clap",
  "ed25519-dalek",
  "getrandom 0.4.3",
  "libc",
- "objc2",
- "objc2-foundation",
  "objc2-local-authentication",
  "opaque-core",
+ "opaque-native-approval",
  "reqwest 0.12.28",
  "rustls",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
  "zeroize",
 ]
@@ -2196,6 +2193,7 @@ version = "0.2.0"
 dependencies = [
  "bytes",
  "futures-util",
+ "jsonschema",
  "opaque-core",
  "serde",
  "serde_json",
@@ -2239,6 +2237,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "opaque-native-approval"
+version = "0.2.0"
+dependencies = [
+ "block2",
+ "libc",
+ "objc2",
+ "objc2-foundation",
+ "objc2-local-authentication",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "opaque-web"
 version = "0.2.0"
 dependencies = [
@@ -2266,7 +2281,6 @@ version = "0.2.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
- "block2",
  "bytes",
  "chrono",
  "crypto_box",
@@ -2280,12 +2294,10 @@ dependencies = [
  "landlock",
  "libc",
  "mdns-sd",
- "objc2",
- "objc2-foundation",
- "objc2-local-authentication",
  "opaque-approver",
  "opaque-core",
  "opaque-metrics",
+ "opaque-native-approval",
  "p256",
  "rand 0.8.8",
  "rcgen",

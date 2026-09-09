@@ -102,6 +102,11 @@ impl AwsHandler {
 }
 
 impl OperationHandler for AwsHandler {
+    fn fixture_only(&self) -> bool {
+        // AwsClient deliberately has no production SigV4 transport.
+        true
+    }
+
     fn execute(
         &self,
         request: &OperationRequest,

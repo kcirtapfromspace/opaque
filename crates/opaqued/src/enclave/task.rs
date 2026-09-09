@@ -10,6 +10,29 @@ use opaque_core::task::{
 };
 use std::sync::atomic::Ordering;
 
+const PUBLISH_CHILD_OPERATION: &str = "github.set_actions_secret";
+
+/// Capability metadata for the typed task transport, kept with its operation
+/// definitions. Registration alone does not install a task ledger or profile.
+pub(super) fn enabled_operation_names(
+    task_grants_enabled: bool,
+    inference_configured: bool,
+    ssh_configured: bool,
+) -> HashSet<String> {
+    if !task_grants_enabled {
+        return HashSet::new();
+    }
+    let mut operations = HashSet::from([task_operation().name, PUBLISH_CHILD_OPERATION.to_owned()]);
+    operations.extend(release_task_operations().into_iter().map(|def| def.name));
+    if inference_configured {
+        operations.extend(inference_task_operations().into_iter().map(|def| def.name));
+    }
+    if ssh_configured {
+        operations.extend(ssh_task_operations().into_iter().map(|def| def.name));
+    }
+    operations
+}
+
 pub fn task_operation() -> OperationDef {
     OperationDef {
         name: "github.publish_manifest".into(),
@@ -186,7 +209,7 @@ fn action_request(base: &OperationRequest, action: &TaskAction) -> OperationRequ
             ]);
         }
         TaskAction::PublishSecret(action) => {
-            request.operation = "github.set_actions_secret".into();
+            request.operation = PUBLISH_CHILD_OPERATION.into();
             request.target = HashMap::from([
                 ("repo".into(), action.repo.clone()),
                 ("secret_name".into(), action.secret_name.clone()),
@@ -415,9 +438,9 @@ impl Enclave {
         {
             return Err("task has an unexpected target".into());
         }
-        if let Some(schema) = &definition.params_schema {
-            validate_params(schema, &request.params).map_err(|_| "task parameters are invalid")?;
-        }
+        self.registry
+            .validate_params(&request.operation, &request.params)
+            .map_err(|_| "task parameters are invalid")?;
         self.check_safety_constraints(request, &definition)
             .map_err(|_| "task violates an operation safety constraint")?;
         let mut decision = self
@@ -599,6 +622,7 @@ impl Enclave {
                     .with_request_hash(&claimed.manifest_digest)
                     .with_detail(format!("task={id} slot={}", slot.id)),
             );
+            self.confirm_audit(false).await.map_err(|e| e.to_string())?;
             let before_dispatch = || async {
                 let rejected = |code: &str| SlotOutcome {
                     ssh_receipt: None,
@@ -692,6 +716,9 @@ impl Enclave {
                     now_unix(),
                 )
                 .map_err(|e| e.to_string())?;
+            // The receipt is already durable even if the secondary audit
+            // barrier fails. Stop subsequent effects and expose no success.
+            self.confirm_audit(true).await.map_err(|e| e.to_string())?;
             if !accepted {
                 break;
             }

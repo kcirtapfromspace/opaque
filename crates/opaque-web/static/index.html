@@ -324,6 +324,7 @@ header{
   color:var(--muted);
   font-style:italic;
 }
+.audit-refresh-error{padding:8px 12px;color:var(--amber);font-size:11px}
 .audit-paused-banner{
   display:none;
   align-items:center;
@@ -844,6 +845,11 @@ var state = {
   lastAuditSequence: -1,
   auditError: null,
   auditAvailable: null,
+  auditFilterKey: null,
+  auditGeneration: 0,
+  auditRefreshRequested: false,
+  auditRefreshPromise: null,
+  auditRenderPending: false,
   tasksData: [],
   tasksLoaded: false,
   tasksCursor: null,
@@ -1281,9 +1287,22 @@ function renderAuditList() {
     return;
   }
 
+  if (state.auditError) {
+    list.appendChild(el('div', {className:'audit-refresh-error', role:'status'},
+      'Refresh failed: ' + state.auditError + ' Showing previously confirmed events.'));
+  }
   for (var i = 0; i < state.auditEvents.length; i++) {
     list.appendChild(buildAuditEventRow(state.auditEvents[i], i));
   }
+}
+
+function scheduleAuditRender() {
+  if (state.auditRenderPending) return;
+  state.auditRenderPending = true;
+  requestAnimationFrame(function() {
+    state.auditRenderPending = false;
+    renderAuditList();
+  });
 }
 
 function prependAuditEvent(event) {
@@ -1309,7 +1328,7 @@ function prependAuditEvent(event) {
     state.auditEvents = state.auditEvents.slice(0, 200);
   }
 
-  renderAuditList();
+  scheduleAuditRender();
 }
 
 function toggleEventDetail(index) {
@@ -1344,45 +1363,88 @@ function togglePause() {
 }
 
 function clearAudit() {
+  state.auditGeneration++;
+  state.auditRefreshRequested = false;
   state.auditEvents = [];
   state.auditBuffer = [];
   state.expandedEvent = null;
   renderAuditList();
 }
 
+function auditFilterParams() {
+  var params = new URLSearchParams();
+  [['kind', 'filter-kind'], ['operation', 'filter-operation'],
+   ['outcome', 'filter-outcome'], ['q', 'filter-q']].forEach(function(pair) {
+    var value = document.getElementById(pair[1]).value.trim();
+    if (value) params.set(pair[0], value);
+  });
+  params.set('limit', '100');
+  return params.toString();
+}
+
 function applyFilters() {
   if (state.mode !== 'demo' && state.auditAvailable === false) {
+    state.auditGeneration++;
+    state.auditRefreshRequested = false;
     state.auditError = 'Audit history is unavailable in the selected client state. No local audit source is available.';
     state.auditEvents = [];
     renderAuditList();
     return Promise.resolve();
   }
-  var kind = document.getElementById('filter-kind').value;
-  var operation = document.getElementById('filter-operation').value.trim();
-  var outcome = document.getElementById('filter-outcome').value;
-  var q = document.getElementById('filter-q').value.trim();
-
-  var params = new URLSearchParams();
-  if (kind) params.set('kind', kind);
-  if (operation) params.set('operation', operation);
-  if (outcome) params.set('outcome', outcome);
-  if (q) params.set('q', q);
-  params.set('limit', '100');
-
-  return apiJson('/api/audit?' + params.toString()).then(function(data) {
-    state.auditError = null;
-    state.auditEvents = (data.events || []).filter(matchesAuditFilters);
-    state.auditBuffer = [];
-    state.expandedEvent = null;
-    for (var event of state.auditEvents) {
-      if (Number.isFinite(event.sequence_number)) state.lastAuditSequence = Math.max(state.lastAuditSequence || 0, event.sequence_number);
+  var key = auditFilterParams();
+  if (key !== state.auditFilterKey) {
+    state.auditFilterKey = key;
+    state.auditGeneration++;
+  }
+  state.auditRefreshRequested = true;
+  if (state.auditRefreshPromise) return state.auditRefreshPromise;
+  // One request in flight; a burst requests at most one follow-up snapshot.
+  // Only SQLite applies FTS semantics. Never merge unfiltered stream rows into
+  // a full-text result or let an obsolete filter replace the current view.
+  state.auditRefreshPromise = Promise.resolve().then(async function() {
+    try {
+      while (state.auditRefreshRequested) {
+        state.auditRefreshRequested = false;
+        var generation = state.auditGeneration;
+        var params = state.auditFilterKey;
+        var streamSequence = state.lastAuditSequence;
+        try {
+          var data = await apiJson('/api/audit?' + params);
+          if (generation !== state.auditGeneration || params !== auditFilterParams()) continue;
+          var events = (data.events || []).filter(matchesAuditFilters);
+          if (!document.getElementById('filter-q').value.trim()) {
+            // Preserve events received after this read began. The snapshot
+            // cannot establish that a concurrently delivered row is absent.
+            var newer = state.auditEvents.filter(function(event) {
+              return event.sequence_number > streamSequence && matchesAuditFilters(event);
+            });
+            var seen = new Set(newer.map(function(event) { return event.event_id; }));
+            events = newer.concat(events.filter(function(event) { return !seen.has(event.event_id); })).slice(0, 200);
+          }
+          state.auditError = null;
+          state.auditEvents = events;
+          state.auditBuffer = state.auditBuffer.filter(function(event) { return event.sequence_number > streamSequence; });
+          state.expandedEvent = null;
+          // Bootstrap once from the initial snapshot. Later snapshots never
+          // advance the stream consumption cursor or hide an unconsumed event.
+          if (state.lastAuditSequence === -1) {
+            for (var event of events) {
+              if (Number.isFinite(event.sequence_number)) state.lastAuditSequence = Math.max(state.lastAuditSequence, event.sequence_number);
+            }
+          }
+          scheduleAuditRender();
+        } catch (error) {
+          if (generation !== state.auditGeneration || params !== auditFilterParams()) continue;
+          state.auditError = error.message;
+          // Retain the last confirmed evidence when a refresh fails.
+          scheduleAuditRender();
+        }
+      }
+    } finally {
+      state.auditRefreshPromise = null;
     }
-    renderAuditList();
-  }).catch(function(error) {
-    state.auditError = error.message;
-    state.auditEvents = [];
-    renderAuditList();
   });
+  return state.auditRefreshPromise;
 }
 
 function matchesAuditFilters(event) {
@@ -1432,7 +1494,7 @@ async function connectSSE() {
           // FTS semantics belong to SQLite; refresh the query instead of locally
           // approximating it or injecting unmatched stream events into results.
           if (document.getElementById('filter-q').value.trim()) {
-            state.lastAuditSequence = event.sequence_number;
+            state.lastAuditSequence = Math.max(state.lastAuditSequence, event.sequence_number);
             if (!state.auditPaused) applyFilters();
           } else { state.auditError = null; prependAuditEvent(event); }
         }
@@ -1803,6 +1865,8 @@ function loadOperations() {
 function renderOperations(operations) {
   var container = document.getElementById('operations-content');
   container.textContent = '';
+  container.appendChild(el('p', {className:'op-card-desc'},
+    'Availability describes the configured handler. Authorization and approval are evaluated for each request; defaults do not grant permission.'));
 
   // Group by provider
   var groups = {};
@@ -1853,12 +1917,19 @@ function renderOperations(operations) {
       var mcpClass = o.mcp_exposed ? 'exposed' : 'internal';
       var mcpLabel = o.mcp_exposed ? 'MCP' : 'Internal';
 
-      var approvalText = o.default_approval || '--';
+      var approvalText = 'Default approval: ' + (o.default_approval || 'unavailable');
+      var availability = {
+        enabled: 'Handler enabled',
+        disabled: 'Handler disabled',
+        fixture_only: 'Fixture only — no production transport',
+        synthetic: 'Synthetic demo example',
+      }[o.availability] || 'Availability unavailable';
 
       var card = el('div', { className: 'op-card' }, [
         el('div', { className: 'op-card-info' }, [
           el('span', { className: 'op-card-name' }, o.name || '--'),
           el('span', { className: 'op-card-desc' }, o.description || ''),
+          el('span', { className: 'op-card-desc' }, availability),
         ]),
         el('span', { className: 'safety-badge ' + safetyClass }, safetyLabel),
         el('span', { className: 'mcp-badge ' + mcpClass }, mcpLabel),

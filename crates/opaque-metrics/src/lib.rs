@@ -1,4 +1,5 @@
 mod approval_oauth;
+mod audit_writer;
 pub mod auth;
 pub mod bounded_demo;
 pub mod chat;

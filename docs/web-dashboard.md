@@ -36,6 +36,8 @@ The default URL is `http://127.0.0.1:7380`. Start the daemon separately with mat
 
 The dashboard never turns missing data, daemon failures, or API authentication errors into synthetic activity. It polls daemon status every ten seconds and resumes the audit stream after disconnections.
 
+The live operation catalog comes from the selected daemon's registry and configured handlers. Availability distinguishes enabled, disabled, and fixture-only operations. Approval labels describe defaults; policy permission is evaluated for each request. Demo catalog entries are synthetic, and a disconnected daemon cannot supply a live catalog. Audit catch-up drains bounded pages immediately and polls every 500 ms after reaching the tail; dashboard refreshes are coalesced and rendering is batched per animation frame.
+
 ## Views
 
 **Tasks** is the default. Large histories are paginated; use **Older receipts** and **Newest receipts** to move between pages. It lists only the tasks returned by the daemon's scoped `task_list` API. Expand a task to inspect its manifest digest, creation/expiry/approval times, each exact repository and secret name, pinned source references, and per-slot receipt. No secret values are displayed. Each approved task records its own **Native approval**, **Paired workstation approval**, or **INSECURE TEST APPROVAL** provenance; switching the current daemon backend does not relabel historical test receipts. Legacy receipts without provenance say **Approval mode unavailable**. The view distinguishes:

@@ -14,8 +14,7 @@ use std::path::PathBuf;
 
 // One shared native implementation preserves the daemon's full-review and
 // native-authentication requirements without a weaker workstation fallback.
-#[path = "../../opaqued/src/approval.rs"]
-mod native;
+use opaque_native_approval as native;
 
 #[derive(Parser)]
 #[command(

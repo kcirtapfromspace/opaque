@@ -11,6 +11,7 @@ homepage.workspace = true
 [dependencies]
 tempfile = "3"
 opaque-core = { path = "../opaque-core" }
+opaque-native-approval = { path = "../opaque-native-approval" }
 bytes = { workspace = true }
 libc = { workspace = true }
 futures-util = { workspace = true }
@@ -52,12 +53,6 @@ opaque-approver = { path = "../opaque-approver" }
 tokio = { workspace = true, features = ["test-util"] }
 wiremock = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls"] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-block2 = "0.6.2"
-objc2 = { version = "0.6.3", default-features = false, features = ["std"] }
-objc2-foundation = "0.3.2"
-objc2-local-authentication = { version = "0.3.2", default-features = false, features = ["std", "block2", "LAContext"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"

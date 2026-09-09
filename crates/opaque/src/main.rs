@@ -16,6 +16,8 @@ use opaque_core::socket::{socket_path, verify_socket_safety};
 use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
+#[cfg(test)]
+mod ipc_tests;
 mod service;
 mod setup;
 mod ui;
@@ -1170,7 +1172,7 @@ struct PublishManifestSummary {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_github_publish_env(
-    sock: &PathBuf,
+    sock: &Path,
     repo: &str,
     env_file: &Path,
     value_ref_template: &str,
@@ -1449,7 +1451,7 @@ fn run_github_build_manifest(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_github_publish_manifest(
-    sock: &PathBuf,
+    sock: &Path,
     manifest_file: &Path,
     repo_override: Option<&str>,
     github_token_ref: Option<&str>,
@@ -1675,7 +1677,7 @@ fn open_browser(url: &str) -> bool {
 /// The auth code and tokens never pass through this CLI — the daemon owns
 /// the loopback redirect and the code exchange. This process only learns
 /// the outcome.
-async fn run_login(sock: &PathBuf, no_browser: bool, json_output: bool) -> Result<i32, String> {
+async fn run_login(sock: &Path, no_browser: bool, json_output: bool) -> Result<i32, String> {
     let resp = call(sock, "identity.login_start", serde_json::Value::Null)
         .await
         .map_err(|e| format!("Connection failed: {e}"))?;
@@ -1873,7 +1875,7 @@ fn agent_session_start_params(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_agent_wrapped(
-    sock: &PathBuf,
+    sock: &Path,
     command: &[String],
     ttl_secs: Option<u64>,
     mode: &str,
@@ -3661,121 +3663,165 @@ fn resolve_workspace_context() -> Option<serde_json::Value> {
     }))
 }
 
-/// Maximum number of connection retry attempts.
+/// Retries are allowed only while establishing a connection. Once request
+/// delivery starts, a transport failure cannot establish whether work executed.
 const MAX_RETRIES: u32 = 3;
-/// Initial retry delay (doubles each attempt).
 const INITIAL_RETRY_MS: u64 = 200;
 
+fn request_timeout(method: &str) -> Duration {
+    match method {
+        // Leave time for approval and the daemon's bounded execution.
+        "exec" | "execute" => Duration::from_secs(300),
+        // The daemon allows an hour for a task; include a transport margin.
+        "task_run" => Duration::from_secs(3660),
+        "ping"
+        | "operations"
+        | "version"
+        | "whoami"
+        | "leases"
+        | "task_get"
+        | "task_list"
+        | "identity.login_status"
+        | "identity.principal_list"
+        | "identity.delegation_list"
+        | "identity.provisioning.list"
+        | "identity.provisioning.show"
+        | "fido2_list"
+        | "fido2_pending"
+        | "device_list"
+        | "agent_session_list"
+        | "attestation_report" => Duration::from_secs(30),
+        // Provider operations may require an interactive approval first.
+        _ => Duration::from_secs(300),
+    }
+}
+
 async fn call(
-    sock: &PathBuf,
+    sock: &Path,
     method: &str,
     mut params: serde_json::Value,
 ) -> std::io::Result<Response> {
-    // These wrappers participate in repo-scoped policy. Always derive context
-    // from the CLI's actual cwd; callers cannot replace it in tool arguments.
     if method == "github" || method.starts_with("task_") {
         params["workspace"] = resolve_workspace_context().unwrap_or(serde_json::Value::Null);
     }
-    // Verify socket ownership and permissions before connecting.
-    verify_socket_safety(sock)?;
+    call_with_timeout(sock, method, params, request_timeout(method)).await
+}
 
-    // Read daemon token before connecting.
-    let daemon_token = read_daemon_token(sock)?;
+async fn call_with_timeout(
+    sock: &Path,
+    method: &str,
+    params: serde_json::Value,
+    deadline: Duration,
+) -> std::io::Result<Response> {
+    let mut dispatched = false;
+    let exchange = async {
+        let stream = tokio::time::timeout(Duration::from_secs(30), connect_with_retries(sock))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "connection timed out")
+            })??;
+        let daemon_token = read_daemon_token(sock)?;
+        call_once(stream, method, params, &daemon_token, &mut dispatched).await
+    };
+    let result = tokio::time::timeout(deadline, exchange)
+        .await
+        .unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("request timed out after {} seconds", deadline.as_secs()),
+            ))
+        });
+    result.map_err(|error| {
+        if dispatched {
+            std::io::Error::new(
+                error.kind(),
+                format!("{error}; outcome unknown: the request may have executed. It was not retried. Inspect the task receipt or operation audit before taking further action"),
+            )
+        } else {
+            error
+        }
+    })
+}
 
-    // Retry connection with exponential backoff (200ms → 400ms → 800ms).
-    let mut last_err = None;
+async fn connect_with_retries(sock: &Path) -> std::io::Result<UnixStream> {
     for attempt in 0..=MAX_RETRIES {
         if attempt > 0 {
-            let delay = INITIAL_RETRY_MS * 2u64.pow(attempt - 1);
-            tokio::time::sleep(Duration::from_millis(delay)).await;
+            tokio::time::sleep(Duration::from_millis(
+                INITIAL_RETRY_MS * 2u64.pow(attempt - 1),
+            ))
+            .await;
         }
-
-        match call_once(sock, method, &params, &daemon_token).await {
-            Ok(resp) => return Ok(resp),
-            Err(e) => {
-                // Only retry on connection-related errors, not protocol errors.
+        // A daemon may still be creating its socket. Retry missing sockets,
+        // but never connect or send credentials until ownership/modes validate.
+        let connection = match verify_socket_safety(sock) {
+            Ok(()) => UnixStream::connect(sock).await,
+            Err(error) => Err(error),
+        };
+        match connection {
+            Ok(stream) => return Ok(stream),
+            Err(error) => {
                 let retryable = matches!(
-                    e.kind(),
+                    error.kind(),
                     std::io::ErrorKind::ConnectionRefused
                         | std::io::ErrorKind::ConnectionReset
                         | std::io::ErrorKind::NotFound
                         | std::io::ErrorKind::TimedOut
-                        | std::io::ErrorKind::BrokenPipe
                 );
-                // A task_run may have crossed the dispatch boundary before
-                // the connection failed. Inspect its durable receipt instead
-                // of silently issuing another execution request.
-                if !retryable || attempt == MAX_RETRIES || method == "task_run" {
-                    return Err(e);
+                if !retryable || attempt == MAX_RETRIES {
+                    return Err(std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "Cannot connect to Opaque daemon at {}: {error}. Start it with opaque service install or opaqued",
+                            sock.display()
+                        ),
+                    ));
                 }
-                last_err = Some(e);
             }
         }
     }
-
-    Err(last_err.unwrap_or_else(|| std::io::Error::other("connection failed after retries")))
+    unreachable!("every connection attempt returns or advances")
 }
 
-/// Single connection attempt — no retries.
+/// One established connection, with no replay at any point in the exchange.
 async fn call_once(
-    sock: &PathBuf,
+    stream: UnixStream,
     method: &str,
-    params: &serde_json::Value,
+    params: serde_json::Value,
     daemon_token: &str,
+    dispatched: &mut bool,
 ) -> std::io::Result<Response> {
-    let stream = tokio::time::timeout(Duration::from_secs(30), UnixStream::connect(sock))
-        .await
-        .map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("connection timed out: {}", sock.display()),
-            )
-        })?
-        .map_err(|e| {
-            std::io::Error::new(
-                e.kind(),
-                format!(
-                    "Cannot connect to Opaque daemon at {}. Start it with:\n    opaque service install    # recommended: auto-start on login\n    opaqued                   # or run directly in a terminal",
-                    sock.display()
-                ),
-            )
-        })?;
-
+    let req = Request {
+        id: 1,
+        method: method.to_string(),
+        params,
+    };
+    let out = serde_json::to_vec(&req).map_err(std::io::Error::other)?;
+    if out.len() > opaque_core::MAX_FRAME_LENGTH {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "request exceeds the IPC frame limit",
+        ));
+    }
     let codec = LengthDelimitedCodec::builder()
         .max_frame_length(opaque_core::MAX_FRAME_LENGTH)
         .new_codec();
     let mut framed = Framed::new(stream, codec);
-
-    // Send handshake as the first frame.
-    let mut handshake = serde_json::json!({
-        "handshake": "v1",
-        "daemon_token": daemon_token,
-    });
+    let mut handshake = serde_json::json!({ "handshake": "v1", "daemon_token": daemon_token });
     if let Some(session_token) = session_token_from_env() {
         handshake["session_token"] = serde_json::Value::String(session_token);
     }
     let hs_bytes = serde_json::to_vec(&handshake).map_err(std::io::Error::other)?;
     framed.send(Bytes::from(hs_bytes)).await?;
-
-    let req = Request {
-        id: 1,
-        method: method.to_string(),
-        params: params.clone(),
-    };
-    let out = serde_json::to_vec(&req).map_err(std::io::Error::other)?;
+    // Mark before send: partial writes and cancellation are ambiguous too.
+    *dispatched = true;
     framed.send(Bytes::from(out)).await?;
-
-    let Some(frame) = framed.next().await else {
-        return Err(std::io::Error::new(
+    let frame = framed.next().await.ok_or_else(|| {
+        std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
-            "no response from daemon (handshake may have been rejected)",
-        ));
-    };
-    let frame = frame?;
-
-    let resp: Response = serde_json::from_slice(&frame)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    Ok(resp)
+            "daemon closed without a response",
+        )
+    })??;
+    opaque_core::proto::decode_response(&frame, req.id)
 }
 
 // ---------------------------------------------------------------------------
@@ -6374,66 +6420,14 @@ async fn run_doctor() {
 
 /// Attempt a lightweight ping to the daemon. Returns Ok(()) on success.
 async fn try_ping(sock: &Path) -> Result<(), String> {
-    // Verify socket safety first.
-    verify_socket_safety(sock).map_err(|e| format!("{e}"))?;
-
-    // Read daemon token.
-    let daemon_token = read_daemon_token(sock).map_err(|e| format!("{e}"))?;
-
-    // Connect.
-    let stream = UnixStream::connect(sock).await.map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound
-            || e.kind() == std::io::ErrorKind::ConnectionRefused
-        {
-            format!(
-                "daemon not found at {}. Is the daemon running? Try: opaque service start",
-                sock.display()
-            )
-        } else {
-            format!("connect failed: {e}")
-        }
-    })?;
-
-    let codec = LengthDelimitedCodec::builder()
-        .max_frame_length(opaque_core::MAX_FRAME_LENGTH)
-        .new_codec();
-    let mut framed = Framed::new(stream, codec);
-
-    // Handshake.
-    let mut handshake = serde_json::json!({
-        "handshake": "v1",
-        "daemon_token": daemon_token,
-    });
-    if let Some(session_token) = session_token_from_env() {
-        handshake["session_token"] = serde_json::Value::String(session_token);
-    }
-    let hs_bytes = serde_json::to_vec(&handshake).map_err(|e| format!("serialize: {e}"))?;
-    framed
-        .send(Bytes::from(hs_bytes))
-        .await
-        .map_err(|e| format!("send handshake: {e}"))?;
-
-    // Send ping.
-    let req = Request {
-        id: 1,
-        method: "ping".to_string(),
-        params: serde_json::Value::Null,
-    };
-    let out = serde_json::to_vec(&req).map_err(|e| format!("serialize: {e}"))?;
-    framed
-        .send(Bytes::from(out))
-        .await
-        .map_err(|e| format!("send ping: {e}"))?;
-
-    // Read response.
-    let frame = framed
-        .next()
-        .await
-        .ok_or_else(|| "no response".to_string())?
-        .map_err(|e| format!("read: {e}"))?;
-
-    let resp: Response =
-        serde_json::from_slice(&frame).map_err(|e| format!("parse response: {e}"))?;
+    let resp = call_with_timeout(
+        sock,
+        "ping",
+        serde_json::Value::Null,
+        request_timeout("ping"),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
 
     if let Some(err) = resp.error {
         return Err(format!(
@@ -6446,7 +6440,7 @@ async fn try_ping(sock: &Path) -> Result<(), String> {
 
 /// Query daemon version over IPC.
 async fn try_daemon_version(sock: &Path) -> Result<String, String> {
-    let resp = call(&sock.to_path_buf(), "version", serde_json::Value::Null)
+    let resp = call(sock, "version", serde_json::Value::Null)
         .await
         .map_err(|e| format!("{e}"))?;
     if let Some(err) = resp.error {

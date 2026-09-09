@@ -342,7 +342,7 @@ mod integration_tests {
         sink.emit(
             AuditEvent::new(AuditEventKind::OperationSucceeded).with_operation("test.second"),
         );
-        sink.flush(std::time::Duration::from_secs(2));
+        sink.flush(std::time::Duration::from_secs(2)).unwrap();
         let response = fixture
             .app()
             .oneshot(authenticated("/api/audit"))
@@ -419,6 +419,82 @@ mod integration_tests {
                 .await
                 .unwrap();
         })
+    }
+
+    #[tokio::test]
+    async fn operation_inventory_never_substitutes_examples_for_a_disconnected_daemon() {
+        let fixture = Fixture::new(false);
+        let response = fixture
+            .app()
+            .oneshot(authenticated("/api/operations"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = json_body(response).await;
+        assert!(body.get("operations").is_none());
+        assert!(body["error"].as_str().unwrap().contains("disconnected"));
+    }
+
+    #[tokio::test]
+    async fn demo_operation_inventory_is_explicitly_synthetic() {
+        let fixture = Fixture::new(true);
+        let response = fixture
+            .app()
+            .oneshot(authenticated("/api/operations"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["mode"], "demo");
+        let operations = body["operations"].as_array().unwrap();
+        assert!(!operations.is_empty());
+        assert!(
+            operations
+                .iter()
+                .all(|operation| operation["availability"] == "synthetic"
+                    && operation["policy_status"] == "synthetic")
+        );
+    }
+
+    #[tokio::test]
+    async fn live_operation_inventory_preserves_the_selected_daemons_capability_status() {
+        let fixture = Fixture::new(false);
+        let payload = serde_json::json!({"mode":"live", "operations":[
+            {"name":"fixture.custom", "safety":"SensitiveOutput", "availability":"enabled",
+             "mcp_exposed":false, "policy_status":"evaluated_per_request"},
+            {"name":"aws.create_secret", "safety":"Safe", "availability":"disabled",
+             "mcp_exposed":true, "policy_status":"evaluated_per_request"},
+            {"name":"fixture.mock", "safety":"Safe", "availability":"fixture_only",
+             "mcp_exposed":false, "policy_status":"evaluated_per_request"}
+        ]});
+        let server = daemon_response(&fixture, "operations", payload.clone()).await;
+        let response = fixture
+            .app()
+            .oneshot(authenticated("/api/operations"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await, payload);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_daemon_inventory_fails_instead_of_returning_a_partial_catalog() {
+        let fixture = Fixture::new(false);
+        let server = daemon_response(
+            &fixture,
+            "operations",
+            serde_json::json!({"operations":null}),
+        )
+        .await;
+        let response = fixture
+            .app()
+            .oneshot(authenticated("/api/operations"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(json_body(response).await.get("operations").is_none());
+        server.await.unwrap();
     }
 
     #[tokio::test]

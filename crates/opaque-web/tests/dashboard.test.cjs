@@ -128,3 +128,103 @@ test('inference output is a text child, not executable HTML', () => {
   const cells = seen.filter(node => node.tag === 'td');
   assert.deepEqual(cells.slice(0, 3).map(cell => cell.attrs['data-label']), ['Fixed prompt / pinned source', 'Receipt', 'Evidence']);
 });
+
+function auditDashboard(query = '') {
+  const ui = dashboard();
+  const fields = {'filter-kind': '', 'filter-operation': '', 'filter-outcome': '', 'filter-q': query};
+  ui.document.getElementById = id => ({value: fields[id]});
+  ui.URLSearchParams = URLSearchParams;
+  ui.state.mode = 'live';
+  ui.state.auditAvailable = true;
+  ui.state.lastAuditSequence = 100;
+  const frames = [];
+  ui.requestAnimationFrame = callback => frames.push(callback);
+  let renders = 0;
+  ui.renderAuditList = () => { renders++; };
+  const pending = [];
+  ui.apiJson = path => new Promise((resolve, reject) => pending.push({path, resolve, reject}));
+  return {ui, fields, pending, frames, renders: () => renders};
+}
+const nextTurn = () => new Promise(resolve => setImmediate(resolve));
+
+test('audit refresh bursts are single-flight and cannot install responses out of order', async () => {
+  const {ui, pending} = auditDashboard('deploy');
+  const work = ui.applyFilters();
+  await nextTurn();
+  assert.equal(pending.length, 1);
+  for (let i = 0; i < 100; i++) ui.applyFilters();
+  assert.equal(pending.length, 1);
+  pending[0].resolve({events: [{event_id: 'old', sequence_number: 101}]});
+  await nextTurn();
+  assert.equal(pending.length, 2);
+  pending[1].resolve({events: [{event_id: 'new', sequence_number: 102}]});
+  await work;
+  assert.equal(ui.state.auditEvents[0].event_id, 'new');
+  assert.equal(ui.state.lastAuditSequence, 100, 'snapshot does not advance stream consumption');
+});
+
+test('obsolete audit filters cannot install success or failure over the current view', async () => {
+  const {ui, fields, pending} = auditDashboard('old');
+  const work = ui.applyFilters();
+  await nextTurn();
+  fields['filter-q'] = 'new';
+  ui.applyFilters();
+  pending[0].resolve({events: [{event_id: 'obsolete', sequence_number: 101}]});
+  await nextTurn();
+  assert.equal(ui.state.auditEvents.length, 0);
+  assert.match(pending[1].path, /q=new/);
+  pending[1].resolve({events: [{event_id: 'current', sequence_number: 102}]});
+  await work;
+  const failed = ui.applyFilters();
+  await nextTurn();
+  pending[2].reject(new Error('storage unavailable'));
+  await failed;
+  assert.equal(ui.state.auditEvents[0].event_id, 'current');
+  assert.equal(ui.state.auditError, 'storage unavailable');
+});
+
+test('snapshot installation preserves concurrently streamed evidence and batches rendering', async () => {
+  const {ui, pending, frames, renders} = auditDashboard();
+  const work = ui.applyFilters();
+  await nextTurn();
+  for (let sequence = 101; sequence <= 200; sequence++) {
+    ui.prependAuditEvent({event_id: String(sequence), sequence_number: sequence});
+  }
+  assert.equal(frames.length, 1);
+  assert.equal(renders(), 0);
+  pending[0].resolve({events: [{event_id: '100', sequence_number: 100}]});
+  await work;
+  assert.equal(ui.state.auditEvents[0].sequence_number, 200);
+  assert.equal(ui.state.auditEvents.length, 101);
+  assert.equal(ui.state.lastAuditSequence, 200);
+  assert.equal(frames.length, 1);
+  frames.shift()();
+  assert.equal(renders(), 1);
+});
+
+test('clearing audit invalidates pending snapshots without starting more work', async () => {
+  const {ui, pending} = auditDashboard();
+  const work = ui.applyFilters();
+  await nextTurn();
+  ui.applyFilters(); // Also discard a coalesced follow-up when clearing.
+  ui.clearAudit();
+  pending[0].resolve({events: [{event_id: 'old', sequence_number: 101}]});
+  await work;
+  assert.equal(ui.state.auditEvents.length, 0);
+  assert.equal(pending.length, 1);
+});
+
+test('operation inventory distinguishes configured, disabled, fixture and synthetic handlers', () => {
+  const ui = dashboard();
+  const container = ui.el('div');
+  ui.document.getElementById = () => container;
+  ui.renderOperations(['enabled', 'disabled', 'fixture_only', 'synthetic', undefined].map((availability, i) => ({
+    name: 'fixture.operation_' + i, provider: 'fixture', safety: 'Safe', mcp_exposed: true,
+    default_approval: 'always', availability,
+  })));
+  const rendered = text(container);
+  for (const label of ['Handler enabled', 'Handler disabled', 'Fixture only — no production transport',
+    'Synthetic demo example', 'Availability unavailable', 'defaults do not grant permission', 'Default approval: always']) {
+    assert.ok(rendered.includes(label), label);
+  }
+});

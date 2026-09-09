@@ -8,6 +8,7 @@
 //! 5. Emitting audit events
 //! 6. Cleaning up secret memory after execution
 
+mod custody;
 pub mod execve_hook;
 pub mod resolve;
 
@@ -27,7 +28,6 @@ use opaque_core::audit::{AuditEvent, AuditEventKind, AuditSink};
 use opaque_core::operation::OperationRequest;
 use opaque_core::profile::{self, ExecProfile};
 use opaque_core::proto::ExecFrame;
-use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 
 use crate::enclave::OperationHandler;
@@ -166,60 +166,13 @@ impl OperationHandler for SandboxExecutor {
             // IMPORTANT: Drain this concurrently while the sandbox runs. If we
             // only collect after completion, the bounded channel can fill up
             // and deadlock output tasks that are awaiting `send()`.
-            let (tx, mut rx) = mpsc::channel::<ExecFrame>(64);
+            let (tx, rx) = mpsc::channel::<ExecFrame>(64);
 
-            /// Maximum bytes of stdout/stderr to capture in the response.
-            /// Output beyond this is counted but not returned.
-            const MAX_CAPTURE_BYTES: usize = 64 * 1024; // 64 KB
-
-            #[derive(Debug, Default)]
-            struct FrameSummary {
-                stdout_len: u64,
-                stderr_len: u64,
-                stdout: String,
-                stderr: String,
-                duration_ms: u64,
-            }
-
-            let summary = Arc::new(Mutex::new(FrameSummary::default()));
-            let summary_rx = summary.clone();
-
-            let drain_task = tokio::spawn(async move {
-                while let Some(frame) = rx.recv().await {
-                    let mut s = summary_rx.lock().await;
-                    match frame {
-                        ExecFrame::Output {
-                            stream: opaque_core::proto::ExecStream::Stdout,
-                            data,
-                        } => {
-                            s.stdout_len = s.stdout_len.saturating_add(data.len() as u64);
-                            if s.stdout.len() < MAX_CAPTURE_BYTES {
-                                let remaining = MAX_CAPTURE_BYTES - s.stdout.len();
-                                s.stdout.push_str(&data[..data.len().min(remaining)]);
-                            }
-                        }
-                        ExecFrame::Output {
-                            stream: opaque_core::proto::ExecStream::Stderr,
-                            data,
-                        } => {
-                            s.stderr_len = s.stderr_len.saturating_add(data.len() as u64);
-                            if s.stderr.len() < MAX_CAPTURE_BYTES {
-                                let remaining = MAX_CAPTURE_BYTES - s.stderr.len();
-                                s.stderr.push_str(&data[..data.len().min(remaining)]);
-                            }
-                        }
-                        ExecFrame::ExecCompleted { duration_ms: d, .. } => s.duration_ms = d,
-                        _ => {}
-                    }
-                }
-            });
-
-            // Dispatch to platform-specific sandbox.
-            let exit_code = execute_platform_sandbox(&profile, command, env, tx).await?;
-
-            // Best-effort: wait for the drain task to finish once the channel closes.
-            // Ignore join errors (panic) and fall back to default zero values.
-            let _ = drain_task.await;
+            // Drain in the same owned future as execution. No plaintext output
+            // copies or detached collector survive cancellation.
+            let (exit_code, s) =
+                summarize_execution(execute_platform_sandbox(&profile, command, env, tx), rx)
+                    .await?;
 
             // Emit SandboxCompleted audit event.
             let completed_event = AuditEvent::new(AuditEventKind::SandboxCompleted)
@@ -229,10 +182,7 @@ impl OperationHandler for SandboxExecutor {
                 .with_detail(format!("profile={profile_name} exit_code={exit_code}"));
             audit.emit(completed_event);
 
-            let s = summary.lock().await;
-
-            let truncated =
-                s.stdout.len() < s.stdout_len as usize || s.stderr.len() < s.stderr_len as usize;
+            let truncated = s.stdout_len > 64 * 1024 || s.stderr_len > 64 * 1024;
 
             // SECURITY (C2): never return captured stdout/stderr *content* to the
             // caller. The child runs with plaintext secrets in its environment and
@@ -250,10 +200,42 @@ impl OperationHandler for SandboxExecutor {
     }
 }
 
-/// Execute a command without platform sandbox, but with environment sanitization.
-///
-/// Clears inherited environment, sets restricted PATH and HOME, injects only
-/// the profile's env vars, and enforces timeouts. OPAQUE_SOCK is never set.
+#[derive(Debug, Default)]
+struct FrameSummary {
+    stdout_len: u64,
+    stderr_len: u64,
+    duration_ms: u64,
+}
+
+async fn summarize_execution(
+    execution: impl Future<Output = Result<i32, String>>,
+    frames: mpsc::Receiver<ExecFrame>,
+) -> Result<(i32, FrameSummary), String> {
+    tokio::try_join!(execution, async { Ok(summarize_frames(frames).await) })
+}
+
+async fn summarize_frames(mut frames: mpsc::Receiver<ExecFrame>) -> FrameSummary {
+    let mut summary = FrameSummary::default();
+    while let Some(frame) = frames.recv().await {
+        match frame {
+            ExecFrame::Output { stream, data } => match stream {
+                opaque_core::proto::ExecStream::Stdout => {
+                    summary.stdout_len = summary.stdout_len.saturating_add(data.len() as u64);
+                }
+                opaque_core::proto::ExecStream::Stderr => {
+                    summary.stderr_len = summary.stderr_len.saturating_add(data.len() as u64);
+                }
+            },
+            ExecFrame::ExecCompleted { duration_ms, .. } => {
+                summary.duration_ms = duration_ms;
+                break;
+            }
+            _ => {}
+        }
+    }
+    summary
+}
+
 /// Execute a command without platform sandbox, but with environment sanitization.
 ///
 /// Clears inherited environment, sets restricted PATH and HOME, injects only
@@ -297,13 +279,18 @@ pub async fn execute_direct(
 
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
+    cmd.process_group(0).kill_on_drop(true);
 
     let mut child = cmd
         .spawn()
         .map_err(|e| DirectExecError::Execution(format!("spawn failed: {e}")))?;
 
     let pid = child.id().unwrap_or(0);
-    let _ = tx.send(ExecFrame::ExecStarted { pid }).await;
+    let mut custody = custody::ProcessCustody::new(pid);
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs);
+    custody::send_frame(&tx, ExecFrame::ExecStarted { pid }, deadline)
+        .await
+        .map_err(|error| DirectExecError::Execution(error.to_string()))?;
 
     let start = std::time::Instant::now();
     let mut total_bytes = 0usize;
@@ -317,14 +304,21 @@ pub async fn execute_direct(
         .take()
         .ok_or_else(|| DirectExecError::Execution("stderr not piped".into()))?;
 
-    let timeout = tokio::time::Duration::from_secs(timeout_secs);
     let mut stdout_buf = vec![0u8; 16384];
     let mut stderr_buf = vec![0u8; 16384];
     let mut stdout_done = false;
     let mut stderr_done = false;
+    let mut process_exit = None;
 
     let exit_code = loop {
+        if stdout_done
+            && stderr_done
+            && let Some(code) = process_exit
+        {
+            break code;
+        }
         tokio::select! {
+            _ = tx.closed() => return Err(DirectExecError::Execution("execution consumer disconnected".into())),
             result = stdout.read(&mut stdout_buf), if !stdout_done => {
                 match result {
                     Ok(0) => stdout_done = true,
@@ -332,10 +326,9 @@ pub async fn execute_direct(
                         total_bytes += n;
                         if total_bytes <= max_output_bytes
                             && let Ok(s) = String::from_utf8(stdout_buf[..n].to_vec()) {
-                                let _ = tx.send(ExecFrame::Output {
-                                    stream: opaque_core::proto::ExecStream::Stdout,
-                                    data: s,
-                                }).await;
+                                custody::send_frame(&tx, ExecFrame::Output {
+                                    stream: opaque_core::proto::ExecStream::Stdout, data: s,
+                                }, deadline).await.map_err(|error| DirectExecError::Execution(error.to_string()))?;
                             }
                     }
                     Err(e) => {
@@ -351,10 +344,9 @@ pub async fn execute_direct(
                         total_bytes += n;
                         if total_bytes <= max_output_bytes
                             && let Ok(s) = String::from_utf8(stderr_buf[..n].to_vec()) {
-                                let _ = tx.send(ExecFrame::Output {
-                                    stream: opaque_core::proto::ExecStream::Stderr,
-                                    data: s,
-                                }).await;
+                                custody::send_frame(&tx, ExecFrame::Output {
+                                    stream: opaque_core::proto::ExecStream::Stderr, data: s,
+                                }, deadline).await.map_err(|error| DirectExecError::Execution(error.to_string()))?;
                             }
                     }
                     Err(e) => {
@@ -363,19 +355,18 @@ pub async fn execute_direct(
                     }
                 }
             }
-            _ = tokio::time::sleep(timeout), if !stdout_done || !stderr_done => {
+            _ = tokio::time::sleep_until(deadline) => {
                 tracing::warn!("execute_direct: timeout after {timeout_secs}s, killing process");
+                custody.kill_group();
                 let _ = child.kill().await;
                 let duration_ms = start.elapsed().as_millis() as u64;
-                let _ = tx.send(ExecFrame::ExecCompleted {
-                    exit_code: -1,
-                    duration_ms,
-                }).await;
+                custody::send_frame(&tx, ExecFrame::ExecCompleted { exit_code: -1, duration_ms }, custody::completion_deadline()).await
+                    .map_err(|error| DirectExecError::Execution(error.to_string()))?;
                 return Ok(-1);
             }
-            status = child.wait(), if stdout_done && stderr_done => {
+            status = custody.wait(&mut child), if process_exit.is_none() => {
                 match status {
-                    Ok(s) => break s.code().unwrap_or(-1),
+                    Ok(s) => process_exit = Some(s.code().unwrap_or(-1)),
                     Err(e) => return Err(DirectExecError::Execution(format!("wait failed: {e}"))),
                 }
             }
@@ -383,12 +374,16 @@ pub async fn execute_direct(
     };
 
     let duration_ms = start.elapsed().as_millis() as u64;
-    let _ = tx
-        .send(ExecFrame::ExecCompleted {
+    custody::send_frame(
+        &tx,
+        ExecFrame::ExecCompleted {
             exit_code,
             duration_ms,
-        })
-        .await;
+        },
+        custody::completion_deadline(),
+    )
+    .await
+    .map_err(|error| DirectExecError::Execution(error.to_string()))?;
 
     Ok(exit_code)
 }
@@ -467,6 +462,37 @@ async fn execute_platform_sandbox(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn output_summary_counts_unicode_across_capture_boundaries_without_copies() {
+        let (tx, rx) = mpsc::channel(2);
+        let output = format!("{}é🙂", "a".repeat(65535));
+        let expected = output.len() as u64;
+        let producer = async move {
+            for stream in [
+                opaque_core::proto::ExecStream::Stdout,
+                opaque_core::proto::ExecStream::Stderr,
+            ] {
+                tx.send(ExecFrame::Output {
+                    stream,
+                    data: output.clone(),
+                })
+                .await
+                .unwrap();
+            }
+            tx.send(ExecFrame::ExecCompleted {
+                exit_code: 0,
+                duration_ms: 17,
+            })
+            .await
+            .unwrap();
+        };
+        let (_, summary) = tokio::join!(producer, summarize_frames(rx));
+        assert_eq!(summary.stdout_len, expected);
+        assert_eq!(summary.stderr_len, expected);
+        assert_eq!(summary.duration_ms, 17);
+    }
+
     use std::path::PathBuf;
 
     use opaque_core::audit::InMemoryAuditEmitter;
@@ -652,5 +678,178 @@ mod tests {
         assert!(obj.contains_key("stdout_length"));
         assert!(obj.contains_key("stderr_length"));
         assert!(obj.contains_key("truncated"));
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn completion_and_execution_errors_do_not_wait_for_unrelated_sender_clones() {
+        let (tx, rx) = mpsc::channel(2);
+        tx.send(ExecFrame::ExecCompleted {
+            exit_code: -1,
+            duration_ms: 23,
+        })
+        .await
+        .unwrap();
+        let (exit, summary) = tokio::time::timeout(
+            Duration::from_millis(100),
+            summarize_execution(async { Ok(-1) }, rx),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(exit, -1);
+        assert_eq!(summary.duration_ms, 23);
+        assert!(tx.is_closed());
+        let (tx, rx) = mpsc::channel(2);
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            summarize_execution(async { Err("platform failure".into()) }, rx),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap_err(), "platform failure");
+        assert!(tx.is_closed());
+    }
+
+    #[tokio::test]
+    async fn output_activity_and_closed_pipes_do_not_extend_direct_execution_deadline() {
+        for script in [
+            "while :; do printf x; sleep 0.01; done",
+            "exec 1>&- 2>&-; sleep 30",
+        ] {
+            let (tx, rx) = mpsc::channel(64);
+            let command = ["/bin/sh".into(), "-c".into(), script.into()];
+            let execution = execute_direct(&command, HashMap::new(), 1, 1024, tx, None);
+            let (result, _) = tokio::time::timeout(Duration::from_secs(3), async {
+                tokio::join!(execution, summarize_frames(rx))
+            })
+            .await
+            .expect("the original deadline must cover output and child wait");
+            assert_eq!(result.unwrap(), -1);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_direct_execution_reaps_the_owned_process() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let invocation = tokio::spawn(async move {
+            execute_direct(
+                &["/bin/sleep".into(), "30".into()],
+                HashMap::new(),
+                30,
+                1024,
+                tx,
+                None,
+            )
+            .await
+        });
+        let ExecFrame::ExecStarted { pid } = rx.recv().await.unwrap() else {
+            panic!("missing start");
+        };
+        invocation.abort();
+        assert!(invocation.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            // SAFETY: signal zero observes only this disposable fixture PID.
+            while unsafe { libc::kill(pid as i32, 0) } == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled child must be killed and reaped");
+    }
+
+    #[tokio::test]
+    async fn direct_leader_exit_kills_descendants_holding_inherited_pipes() {
+        let (tx, rx) = mpsc::channel(4);
+        let command = [
+            "/bin/sh".into(),
+            "-c".into(),
+            "sleep 30 & printf done; exit 0".into(),
+        ];
+        let (result, summary) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                execute_direct(&command, HashMap::new(), 30, 1024, tx, None),
+                summarize_frames(rx)
+            )
+        })
+        .await
+        .expect("leader exit must terminate descendants and drain their pipes promptly");
+        assert_eq!(result.unwrap(), 0);
+        assert_eq!(summary.stdout_len, 4);
+    }
+
+    #[tokio::test]
+    async fn disconnected_direct_consumer_terminates_quiet_child() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let invocation = tokio::spawn(async move {
+            execute_direct(
+                &["/bin/sleep".into(), "30".into()],
+                HashMap::new(),
+                30,
+                1024,
+                tx,
+                None,
+            )
+            .await
+        });
+        let ExecFrame::ExecStarted { pid } = rx.recv().await.unwrap() else {
+            panic!("missing start")
+        };
+        drop(rx);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), invocation)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert_process_reaped(pid).await;
+    }
+
+    #[tokio::test]
+    async fn backpressured_direct_output_preserves_execution_deadline() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let invocation = tokio::spawn(async move {
+            execute_direct(
+                &[
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "printf output; sleep 30".into(),
+                ],
+                HashMap::new(),
+                1,
+                1024,
+                tx,
+                None,
+            )
+            .await
+        });
+        // ExecStarted fills the channel; the first output blocks its sender.
+        let error = tokio::time::timeout(Duration::from_secs(3), invocation)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("frame delivery timed out"));
+        let ExecFrame::ExecStarted { pid } = rx.recv().await.unwrap() else {
+            panic!("missing start")
+        };
+        assert_process_reaped(pid).await;
+    }
+
+    async fn assert_process_reaped(pid: u32) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            // SAFETY: signal zero observes only this disposable fixture PID.
+            while unsafe { libc::kill(pid as i32, 0) } == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("owned child must be killed and reaped");
     }
 }

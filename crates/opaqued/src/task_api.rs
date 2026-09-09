@@ -1,8 +1,16 @@
 //! Owner-scoped transport for the fixed-manifest task workflow.
-use super::*;
+use crate::{DaemonState, resolve_principal_context, verify_workspace};
+use opaque_core::audit::{AuditEvent, AuditEventKind, ClientSummary};
+use opaque_core::identity::{PrincipalContext, now_unix};
 use opaque_core::operation::WorkspaceContext;
+use opaque_core::operation::{ClientIdentity, ClientType, OperationRequest};
+use opaque_core::proto::{Request, Response};
 use opaque_core::sanitize::{SanitizedResponse, Sanitizer, Unsanitized};
 use opaque_core::task::TaskManifest;
+use opaque_core::validate::InputValidator;
+use std::collections::HashMap;
+use std::time::SystemTime;
+use uuid::Uuid;
 
 pub async fn verified_workspace(
     params: &serde_json::Value,
@@ -44,49 +52,23 @@ pub async fn handle(
 ) -> Response {
     let result = handle_inner(state, req, identity, client_type, session_id, principal).await;
     let sanitizer = Sanitizer::new();
-    let public_receipts = result.as_ref().ok().map(|payload| {
-        let render = |value: &serde_json::Value| {
-            let record =
-                serde_json::from_value(value.clone()).map_err(|_| "invalid task receipt")?;
-            sanitizer.sanitize_task_record(&record)
-        };
-        if let Some(task) = payload.get("task") {
-            render(task).map(|task| serde_json::json!({"task": task}))
-        } else if let Some(tasks) = payload.get("tasks").and_then(|v| v.as_array()) {
-            tasks
-                .iter()
-                .map(render)
-                .collect::<Result<Vec<_>, _>>()
-                .map(|tasks| serde_json::json!({"tasks": tasks}))
-        } else {
-            Err("invalid task response".into())
-        }
-    });
-    let raw = match result {
-        Ok(payload) => SanitizedResponse::<Unsanitized>::from_payload(payload),
-        Err(message) => SanitizedResponse::<Unsanitized>::from_error(
-            "task_unavailable",
-            message,
-            serde_json::Value::Null,
-        ),
-    };
-    let mut sanitized = sanitizer.sanitize_response(raw);
-    match public_receipts {
-        Some(Ok(receipts)) => {
-            for (key, value) in receipts.as_object().expect("typed receipt wrapper") {
-                sanitized.payload[key] = value.clone();
-            }
-        }
-        Some(Err(_)) => {
-            return Response::err(
+    match result {
+        Ok(payload) => match sanitizer.sanitize_task_response(payload) {
+            Ok(response) => response.into_proto_response(req.id),
+            Err(_) => Response::err(
                 Some(req.id),
                 "task_unavailable",
                 "invalid task receipt integrity",
-            );
-        }
-        None => {}
+            ),
+        },
+        Err(message) => sanitizer
+            .sanitize_response(SanitizedResponse::<Unsanitized>::from_error(
+                "task_unavailable",
+                message,
+                serde_json::Value::Null,
+            ))
+            .into_proto_response(req.id),
     }
-    sanitized.into_proto_response(req.id)
 }
 
 async fn handle_inner(

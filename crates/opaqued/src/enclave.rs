@@ -17,7 +17,7 @@
 //! 8. Emit audit events at each step
 //! 9. Return sanitized response
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -28,7 +28,7 @@ use opaque_core::audit::{
 };
 use opaque_core::operation::{
     ApprovalFactor, ApprovalRequirement, ClientIdentity, ClientType, OperationDef,
-    OperationRegistry, OperationRequest, OperationSafety, validate_params,
+    OperationRegistry, OperationRequest, OperationSafety,
 };
 use opaque_core::policy::{PolicyDecision, PolicyEngine};
 use opaque_core::sanitize::{Sanitized, SanitizedResponse, Sanitizer, Unsanitized};
@@ -36,6 +36,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
+mod audit_durability;
 mod task;
 pub use task::{
     inference_task_operations, release_task_operations, ssh_task_operations, task_operation,
@@ -451,6 +452,12 @@ impl fmt::Debug for LeaseCache {
 /// Handlers receive the validated request and return a raw JSON payload.
 /// The enclave sanitizes the payload before returning it to the client.
 pub trait OperationHandler: Send + Sync + fmt::Debug {
+    /// Whether this implementation only supports explicit test endpoints.
+    /// Capability status comes from the installed handler, not its name.
+    fn fixture_only(&self) -> bool {
+        false
+    }
+
     /// Execute the operation. Returns a raw (unsanitized) JSON payload.
     ///
     /// The handler must NOT return secret values in the payload. The sanitizer
@@ -566,6 +573,9 @@ pub struct Enclave {
     /// Operation handlers, keyed by operation name.
     handlers: HashMap<String, Box<dyn OperationHandler>>,
 
+    /// Operations supported by the configured bounded-task transport.
+    task_operations: HashSet<String>,
+
     /// Approval gate (native OS prompts, iOS, FIDO2).
     approval_gate: Box<dyn ApprovalGate>,
 
@@ -600,6 +610,7 @@ impl fmt::Debug for Enclave {
 
 /// Builder for constructing an [`Enclave`].
 pub struct EnclaveBuilder {
+    task_grants_enabled: bool,
     inference_profile: Option<crate::inference::TrustedInferenceProfile>,
     ssh_profile: Option<crate::ssh::TrustedSshProfile>,
     session_approval_factor: ApprovalFactor,
@@ -615,6 +626,7 @@ impl EnclaveBuilder {
     /// Create a new builder.
     pub fn new() -> Self {
         Self {
+            task_grants_enabled: false,
             inference_profile: None,
             ssh_profile: None,
             session_approval_factor: ApprovalFactor::LocalBio,
@@ -636,6 +648,13 @@ impl EnclaveBuilder {
     /// Set the policy engine.
     pub fn policy(mut self, policy: PolicyEngine) -> Self {
         self.policy = policy;
+        self
+    }
+
+    /// Record whether the daemon installed the bounded-task ledger/transport.
+    /// Profile-dependent task capabilities also require their trusted profile.
+    pub fn task_grants_enabled(mut self, enabled: bool) -> Self {
+        self.task_grants_enabled = enabled;
         self
     }
 
@@ -697,6 +716,11 @@ impl EnclaveBuilder {
             return Err("agent-session approval requires local_bio or paired_workstation".into());
         }
         Ok(Enclave {
+            task_operations: task::enabled_operation_names(
+                self.task_grants_enabled,
+                self.inference_profile.is_some(),
+                self.ssh_profile.is_some(),
+            ),
             inference_profile: self.inference_profile,
             ssh_profile: self.ssh_profile,
             session_approval_factor: self.session_approval_factor,
@@ -734,6 +758,46 @@ impl Enclave {
     /// Create a builder for constructing an enclave.
     pub fn builder() -> EnclaveBuilder {
         EnclaveBuilder::new()
+    }
+
+    /// Registry and configured execution-path facts only. Policy is evaluated
+    /// against the actual principal, target and parameters for each request.
+    pub fn operation_catalog(&self) -> Vec<serde_json::Value> {
+        let mut operations: Vec<_> = self
+            .registry
+            .iter()
+            .map(|def| {
+                let handler = self.handlers.get(&def.name);
+                let task_enabled = self.task_operations.contains(&def.name);
+                let availability = match (handler, task_enabled) {
+                    (_, true) => "enabled",
+                    (None, false) => "disabled",
+                    (Some(handler), false) if handler.fixture_only() => "fixture_only",
+                    (Some(_), false) => "enabled",
+                };
+                let execution_paths: Vec<_> = [
+                    handler.is_some().then_some("operation"),
+                    task_enabled.then_some("task"),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                serde_json::json!({
+                    "name": def.name,
+                    "provider": def.name.split('.').next().unwrap_or("unknown"),
+                    "safety": format!("{:?}", def.safety),
+                    "default_approval": def.default_approval,
+                    "default_factors": def.default_factors,
+                    "description": def.description,
+                    "mcp_exposed": opaque_core::capability::mcp_exposes(&def.name),
+                    "availability": availability,
+                    "execution_paths": execution_paths,
+                    "policy_status": "evaluated_per_request",
+                })
+            })
+            .collect();
+        operations.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        operations
     }
 
     /// Return a snapshot of active (non-expired) approval leases.
@@ -846,8 +910,9 @@ impl Enclave {
         }
 
         // --- Step 3c: Validate params against schema ---
-        if let Some(ref schema) = op_def.params_schema
-            && let Err(errors) = validate_params(schema, &request.params)
+        if let Err(errors) = self
+            .registry
+            .validate_params(&request.operation, &request.params)
         {
             let err = EnclaveError::InvalidParams(errors.join("; "));
             return self.emit_and_sanitize_error(
@@ -1001,6 +1066,9 @@ impl Enclave {
             }
         };
 
+        if let Err(error) = self.confirm_audit(false).await {
+            return self.error_to_sanitized(&error);
+        }
         let op_start = Instant::now();
         let result = handler.execute(&request).await;
         let op_latency = op_start.elapsed();
@@ -1024,6 +1092,9 @@ impl Enclave {
                         .with_secret_names(request.secret_ref_names.clone()),
                 );
 
+                if let Err(error) = self.confirm_audit(true).await {
+                    return self.error_to_sanitized(&error);
+                }
                 sanitized
             }
             Err(err_msg) => {
@@ -1185,6 +1256,7 @@ impl Enclave {
                     granted = granted.with_approver(approver.clone());
                 }
                 self.audit.emit(granted);
+                self.confirm_audit(false).await?;
                 Ok(outcome.approver)
             }
             Ok(_) => {
@@ -2340,7 +2412,7 @@ mod tests {
 
         assert_eq!(resp.error_code(), Some("safety_violation"));
         // Verify error message reflects v1 hard-block.
-        let msg = resp.error_message.as_deref().unwrap_or("");
+        let msg = resp.error_message().unwrap_or("");
         assert!(msg.contains("not permitted in v1"));
     }
 
@@ -2392,7 +2464,7 @@ mod tests {
         let resp = enclave.execute(req).await;
 
         assert_eq!(resp.error_code(), Some("safety_violation"));
-        let msg = resp.error_message.as_deref().unwrap_or("");
+        let msg = resp.error_message().unwrap_or("");
         assert!(msg.contains("not permitted in v1"));
     }
 
@@ -2449,7 +2521,7 @@ mod tests {
 
         assert_eq!(resp.error_code(), Some("operation_failed"));
         // The error message should be sanitized.
-        let msg = resp.error_message.as_deref().unwrap_or("");
+        let msg = resp.error_message().unwrap_or("");
         assert!(!msg.contains("p4ss"));
         assert!(!msg.contains("/Users/alice"));
     }
@@ -3860,6 +3932,95 @@ mod tests {
 
     // -- Handler execution receives correct request --
 
+    mod audit_barrier_tests {
+        use super::*;
+        use opaque_core::audit::AuditFlushError;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct InjectedAudit {
+            calls: AtomicUsize,
+            fail_at: usize,
+        }
+        impl AuditSink for InjectedAudit {
+            fn emit(&self, _: AuditEvent) {}
+            fn flush(&self, _: Duration) -> Result<(), AuditFlushError> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) + 1 == self.fail_at {
+                    Err(AuditFlushError::Storage("injected failure".into()))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn control_approval_cannot_grant_authority_without_durable_evidence() {
+            let audit = Arc::new(InjectedAudit {
+                calls: AtomicUsize::new(0),
+                fail_at: 1,
+            });
+            let enclave = Enclave::builder()
+                .registry(test_registry())
+                .policy(test_policy())
+                .approval_gate(Box::new(AlwaysApproveGate))
+                .audit(audit)
+                .build()
+                .unwrap();
+            let result = enclave
+                .request_control_approval(
+                    &test_identity(),
+                    ClientType::Human,
+                    "agent_session_start",
+                    "Fixture session",
+                    "Fixture review",
+                )
+                .await;
+            assert!(result.unwrap_err().to_string().contains("not dispatched"));
+        }
+
+        #[tokio::test]
+        async fn missing_evidence_prevents_dispatch_and_success_disclosure() {
+            for (fail_at, effects, succeeded) in [(1, 0, false), (2, 1, false), (0, 1, true)] {
+                let audit = Arc::new(InjectedAudit {
+                    calls: AtomicUsize::new(0),
+                    fail_at,
+                });
+                let received = Arc::new(Mutex::new(Vec::new()));
+                let enclave = Enclave::builder()
+                    .registry(test_registry())
+                    .policy(test_policy())
+                    .handler(
+                        "github.set_actions_secret",
+                        Box::new(RecordingHandler {
+                            received: received.clone(),
+                        }),
+                    )
+                    .approval_gate(Box::new(AlwaysApproveGate))
+                    .audit(audit.clone())
+                    .build()
+                    .unwrap();
+                let response = enclave
+                    .execute(test_request("github.set_actions_secret", ClientType::Agent))
+                    .await;
+                assert_eq!(received.lock().unwrap().len(), effects);
+                assert_eq!(response.error_code().is_none(), succeeded);
+                assert_eq!(
+                    audit.calls.load(Ordering::SeqCst),
+                    if fail_at == 1 { 1 } else { 2 }
+                );
+                if !succeeded {
+                    assert!(response.payload().is_null());
+                    let message = response.error_message().unwrap();
+                    assert!(message.contains(if effects == 0 {
+                        "not dispatched"
+                    } else {
+                        "outcome unknown"
+                    }));
+                }
+            }
+        }
+    }
+
     /// A handler that records the request it received.
     #[derive(Debug)]
     struct RecordingHandler {
@@ -4534,7 +4695,7 @@ mod tests {
         let resp = enclave.execute(req).await;
 
         assert_eq!(resp.error_code(), Some("policy_denied"));
-        let msg = resp.error_message.as_deref().unwrap_or("");
+        let msg = resp.error_message().unwrap_or("");
         assert!(
             msg.contains("opaque policy simulate"),
             "policy denied message should contain simulate hint, got: {msg}"
@@ -4554,7 +4715,7 @@ mod tests {
         let resp = enclave.execute(req).await;
 
         assert_eq!(resp.error_code(), Some("approval_not_granted"));
-        let msg = resp.error_message.as_deref().unwrap_or("");
+        let msg = resp.error_message().unwrap_or("");
         assert!(
             msg.contains("local_bio"),
             "approval error should contain the factor name, got: {msg}"
@@ -4573,11 +4734,221 @@ mod tests {
         let req = test_request("github.set_actions_secret", ClientType::Agent);
         let resp = enclave.execute(req).await;
 
-        let msg = resp.error_message.as_deref().unwrap_or("");
+        let msg = resp.error_message().unwrap_or("");
         if cfg!(target_os = "macos") {
             assert!(
                 msg.contains("Touch ID"),
                 "on macOS, approval error should mention Touch ID, got: {msg}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod operation_catalog_tests {
+    use super::test_support::{AlwaysDenyGate, StubHandler};
+    use super::*;
+    use opaque_core::{
+        audit::InMemoryAuditEmitter,
+        operation::{ApprovalRequirement, OperationSafety},
+    };
+
+    #[test]
+    fn catalog_distinguishes_task_transport_and_profile_requirements() {
+        let ssh_profile = crate::ssh::test_profile();
+        let inference_profile = crate::inference::InferenceProfileConfig {
+            profile_id: "catalog-fixture".into(),
+            api_url: "https://inference.example.test".into(),
+            model_id: "public-fixture.gguf".into(),
+            model_path: "/models/public-fixture.gguf".into(),
+            model_artifact_sha256: "a".repeat(64),
+            chat_template_sha256: "b".repeat(64),
+            server_build: "catalog-fixture-v1".into(),
+            service_uid: Uuid::new_v4(),
+            source_id: crate::inference::DEMO_SOURCE_ID.into(),
+            source_snapshot_sha256: crate::inference::demo_source_snapshot_sha256(),
+            credential_ref: None,
+            allow_loopback_http: false,
+        }
+        .bind(&ssh_profile.tenant)
+        .unwrap();
+
+        for task_enabled in [false, true] {
+            for inference_configured in [false, true] {
+                for ssh_configured in [false, true] {
+                    let mut registry = OperationRegistry::new();
+                    for operation in [task_operation()]
+                        .into_iter()
+                        .chain(release_task_operations())
+                        .chain(inference_task_operations())
+                        .chain(ssh_task_operations())
+                    {
+                        registry.register(operation).unwrap();
+                    }
+                    // The publish child has both a direct handler and a typed
+                    // task path; unrelated names must not acquire capabilities.
+                    for name in ["github.set_actions_secret", "github.unimplemented_manifest"] {
+                        let mut operation = task_operation();
+                        operation.name = name.into();
+                        registry.register(operation).unwrap();
+                    }
+                    let enclave = Enclave::builder()
+                        .registry(registry)
+                        .task_grants_enabled(task_enabled)
+                        .inference_profile(inference_configured.then(|| inference_profile.clone()))
+                        .ssh_profile(ssh_configured.then(|| ssh_profile.clone()))
+                        .handler(
+                            "github.set_actions_secret",
+                            Box::new(StubHandler {
+                                response: serde_json::json!({}),
+                            }),
+                        )
+                        .approval_gate(Box::new(AlwaysDenyGate))
+                        .audit(Arc::new(InMemoryAuditEmitter::new()))
+                        .build()
+                        .unwrap();
+                    let catalog: HashMap<_, _> = enclave
+                        .operation_catalog()
+                        .into_iter()
+                        .map(|row| (row["name"].as_str().unwrap().to_owned(), row))
+                        .collect();
+                    for (name, expected_enabled) in [
+                        ("github.publish_manifest", task_enabled),
+                        ("github.release_manifest", task_enabled),
+                        ("github.dispatch_staging_workflow", task_enabled),
+                        ("github.observe_staging_workflow", task_enabled),
+                        (
+                            "inference.fixed_manifest",
+                            task_enabled && inference_configured,
+                        ),
+                        (
+                            "inference.fixed_completion",
+                            task_enabled && inference_configured,
+                        ),
+                        (
+                            opaque_core::ssh::SSH_TASK_OPERATION,
+                            task_enabled && ssh_configured,
+                        ),
+                        (
+                            opaque_core::ssh::SSH_OPERATION,
+                            task_enabled && ssh_configured,
+                        ),
+                        ("github.unimplemented_manifest", false),
+                    ] {
+                        let row = &catalog[name];
+                        assert_eq!(
+                            row["availability"],
+                            if expected_enabled {
+                                "enabled"
+                            } else {
+                                "disabled"
+                            },
+                            "{name}: tasks={task_enabled}, inference={inference_configured}, ssh={ssh_configured}"
+                        );
+                        assert_eq!(
+                            row["execution_paths"],
+                            if expected_enabled {
+                                serde_json::json!(["task"])
+                            } else {
+                                serde_json::json!([])
+                            }
+                        );
+                        assert_eq!(row["policy_status"], "evaluated_per_request");
+                        assert_eq!(row["mcp_exposed"], false);
+                    }
+                    let publish = &catalog["github.set_actions_secret"];
+                    assert_eq!(publish["availability"], "enabled");
+                    assert_eq!(
+                        publish["execution_paths"],
+                        if task_enabled {
+                            serde_json::json!(["operation", "task"])
+                        } else {
+                            serde_json::json!(["operation"])
+                        }
+                    );
+                    assert_eq!(publish["mcp_exposed"], true);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_reports_registered_handlers_without_claiming_policy_permission() {
+        let mut registry = OperationRegistry::new();
+        for name in [
+            "test.disabled",
+            "aws.create_secret",
+            "github.set_actions_secret",
+            "onepassword.read_field",
+        ] {
+            registry
+                .register(OperationDef {
+                    name: name.into(),
+                    safety: if name == "onepassword.read_field" {
+                        OperationSafety::Reveal
+                    } else {
+                        OperationSafety::Safe
+                    },
+                    default_approval: ApprovalRequirement::Always,
+                    default_factors: vec![],
+                    description: format!("Registry description for {name}"),
+                    params_schema: None,
+                    allowed_target_keys: vec![],
+                    secret_ref_param_keys: vec![],
+                })
+                .unwrap();
+        }
+        let handler = || {
+            Box::new(StubHandler {
+                response: serde_json::json!({}),
+            })
+        };
+        let enclave = Enclave::builder()
+            .registry(registry)
+            .handler(
+                "aws.create_secret",
+                Box::new(crate::aws::AwsHandler::new(
+                    Arc::new(InMemoryAuditEmitter::new()),
+                    crate::aws::client::AwsClient::new_single("http://127.0.0.1:1"),
+                )),
+            )
+            .handler("github.set_actions_secret", handler())
+            .handler("onepassword.read_field", handler())
+            .handler("unregistered.handler", handler())
+            .approval_gate(Box::new(AlwaysDenyGate))
+            .audit(Arc::new(InMemoryAuditEmitter::new()))
+            .build()
+            .unwrap();
+        let rows = enclave.operation_catalog();
+        assert_eq!(rows.len(), 4);
+        let names = rows
+            .iter()
+            .map(|row| row["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "aws.create_secret",
+                "github.set_actions_secret",
+                "onepassword.read_field",
+                "test.disabled"
+            ]
+        );
+        assert_eq!(rows[0]["availability"], "fixture_only");
+        assert_eq!(rows[1]["availability"], "enabled");
+        assert_eq!(rows[3]["availability"], "disabled");
+        assert_eq!(rows[1]["mcp_exposed"], true);
+        assert_eq!(rows[2]["mcp_exposed"], false);
+        assert_eq!(rows[2]["safety"], "Reveal");
+        assert_eq!(rows[1]["provider"], "github");
+        for row in rows {
+            assert_eq!(row["policy_status"], "evaluated_per_request");
+            assert_eq!(row["default_approval"], "always");
+            assert!(
+                row["description"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("Registry description")
             );
         }
     }

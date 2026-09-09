@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::SystemTime;
 
 use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use opaque_core::audit::{
     AuditEvent, AuditEventKind, AuditSink, ClientSummary, MultiAuditSink, SqliteAuditSink,
     TracingAuditEmitter,
@@ -34,7 +34,7 @@ use uuid::Uuid;
 /// Name of the daemon token file written next to the socket.
 const DAEMON_TOKEN_FILENAME: &str = "daemon.token";
 
-mod approval;
+use opaque_native_approval as approval;
 #[allow(dead_code)]
 mod approval_server;
 mod attest;
@@ -42,6 +42,7 @@ mod aws;
 #[allow(dead_code)]
 mod azure;
 mod bitwarden;
+mod connection;
 #[allow(dead_code)]
 mod doppler;
 mod enclave;
@@ -1496,24 +1497,23 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         retention_days
     );
 
-    // Integrity (H8): verify the tamper-evident audit chain at startup. A break
-    // means the log was altered while the daemon was down — alert loudly. This is
-    // detection, not prevention: at a shared uid the chain key is agent-readable;
-    // running the daemon under a dedicated service account makes it a hard guarantee.
+    // Recheck the read-only verification path before accepting requests. The
+    // sink also verifies before migration/retention. Integrity failures stop
+    // startup; operators must preserve and investigate the original evidence.
     match opaque_core::audit::verify_audit_chain(&audit_db_path) {
         Ok(v) if v.ok => {
             info!("audit chain verified ({} records)", v.records_checked);
         }
         Ok(v) => {
-            tracing::error!(
-                records_checked = v.records_checked,
-                first_bad_sequence = ?v.first_bad_sequence,
-                "AUDIT CHAIN INTEGRITY FAILURE \u{2014} the audit log was tampered with: {}",
+            return Err(std::io::Error::other(format!(
+                "audit chain integrity failure: {}",
                 v.detail.as_deref().unwrap_or("chain mismatch")
-            );
+            )));
         }
         Err(e) => {
-            warn!("could not verify audit chain at startup: {e}");
+            return Err(std::io::Error::other(format!(
+                "could not verify audit chain at startup: {e}"
+            )));
         }
     }
     let audit: Arc<dyn AuditSink> = Arc::new(MultiAuditSink::new(vec![tracing_sink, sqlite_sink]));
@@ -1642,6 +1642,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         std::env::var(onepassword::client::CONNECT_URL_ENV).unwrap_or_default();
 
     let mut enclave_builder = Enclave::builder()
+        .task_grants_enabled(tasks.is_some())
         .inference_profile(inference_profile)
         .ssh_profile(ssh_profile)
         .session_approval_factor(session_approval_factor)
@@ -2021,7 +2022,9 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
                 // The rejection was just audited; emission is asynchronous and
                 // the process is about to exit without running destructors, so
                 // make the security event durable before leaving.
-                audit.flush(std::time::Duration::from_secs(5));
+                if let Err(error) = audit.flush(std::time::Duration::from_secs(5)) {
+                    tracing::error!(%error, "federation rejection could not be durably audited");
+                }
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     format!(
@@ -2160,14 +2163,12 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
                 };
                 let state = state.clone();
                 let conn_shutdown_rx = shutdown_rx.clone();
-                let conn_counter = active_connections.clone();
-                conn_counter.fetch_add(1, Ordering::SeqCst);
+                let guard = connection::Guard::new(active_connections.clone(), permit);
                 tokio::spawn(async move {
-                    let _permit = permit;
+                    let _connection = guard;
                     if let Err(e) = handle_conn(state, stream, conn_shutdown_rx).await {
                         warn!("connection error: {e}");
                     }
-                    conn_counter.fetch_sub(1, Ordering::SeqCst);
                 });
             }
         }
@@ -2197,7 +2198,7 @@ fn truncate_for_error(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_owned()
     } else {
-        format!("{}...", &s[..max_len])
+        format!("{}...", opaque_core::validate::truncate_utf8(s, max_len))
     }
 }
 
@@ -3188,8 +3189,8 @@ async fn handle_conn(
     let mut framed = Framed::new(stream, codec);
 
     // --- Handshake: first frame must be a valid daemon token ---
-    let handshake = match framed.next().await {
-        Some(Ok(frame)) => {
+    let handshake = match connection::read_handshake(&mut framed, &mut shutdown_rx).await? {
+        Some(frame) => {
             if serde_json::from_slice::<serde_json::Value>(&frame)
                 .is_ok_and(|value| workload_attest::has_identity_claim(&value))
             {
@@ -3262,9 +3263,10 @@ async fn handle_conn(
                     Ok(value) => value,
                     Err(_) => {
                         let resp = Response::err(None, "bad_json", "invalid JSON request");
-                        sink.send(Bytes::from(
-                            serde_json::to_vec(&resp).map_err(std::io::Error::other)?,
-                        ))
+                        connection::send(
+                            &mut sink,
+                            Bytes::from(serde_json::to_vec(&resp).map_err(std::io::Error::other)?),
+                        )
                         .await?;
                         continue;
                     }
@@ -3279,7 +3281,7 @@ async fn handle_conn(
                         "too many requests",
                     );
                     let out = serde_json::to_vec(&resp).map_err(std::io::Error::other)?;
-                    sink.send(Bytes::from(out)).await?;
+                    connection::send(&mut sink, Bytes::from(out)).await?;
                     continue;
                 }
                 if workload_attest::has_identity_claim(&value) {
@@ -3297,9 +3299,10 @@ async fn handle_conn(
                         "identity_claim_forbidden",
                         "workload identity is established by the listener",
                     );
-                    sink.send(Bytes::from(
-                        serde_json::to_vec(&resp).map_err(std::io::Error::other)?,
-                    ))
+                    connection::send(
+                        &mut sink,
+                        Bytes::from(serde_json::to_vec(&resp).map_err(std::io::Error::other)?),
+                    )
                     .await?;
                     continue;
                 }
@@ -3312,7 +3315,7 @@ async fn handle_conn(
                         let resp = Response::err(None, "bad_json", "invalid JSON request");
                         let bytes = serde_json::to_vec(&resp)
                             .unwrap_or_else(|_| b"{\"error\":\"encode\"}".to_vec());
-                        let _ = sink.send(Bytes::from(bytes)).await;
+                        let _ = connection::send(&mut sink, Bytes::from(bytes)).await;
                         continue;
                     }
                 };
@@ -3372,14 +3375,14 @@ async fn handle_conn(
                     }
                 };
                 let out = serde_json::to_vec(&resp).map_err(std::io::Error::other)?;
-                sink.send(Bytes::from(out)).await?;
+                connection::send(&mut sink, Bytes::from(out)).await?;
             }
             Ok(Some(Err(e))) => {
                 warn!("bad frame from client: {e}");
                 let resp = Response::err(None, "bad_frame", "malformed frame");
                 let bytes = serde_json::to_vec(&resp)
                     .unwrap_or_else(|_| b"{\"error\":\"encode\"}".to_vec());
-                let _ = sink.send(Bytes::from(bytes)).await;
+                let _ = connection::send(&mut sink, Bytes::from(bytes)).await;
                 return Err(e);
             }
             Ok(None) => break, // Client disconnected
@@ -3853,6 +3856,12 @@ async fn handle_request(
         "ping" => Response::ok(
             req.id,
             serde_json::json!({ "ok": true, "api_version": opaque_core::API_VERSION }),
+        ),
+        "operations" => Response::ok(
+            req.id,
+            serde_json::json!({
+                "mode": "live", "operations": state.enclave.operation_catalog(),
+            }),
         ),
         "version" => {
             let federation = state.federation.current().map(|a| {

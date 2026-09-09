@@ -295,6 +295,7 @@ pub async fn execute(
     // Generate and write the Seatbelt profile to a temp file.
     let profile_content = generate_seatbelt_profile(&config);
     let profile_path = write_temp_profile(&profile_content)?;
+    let _profile_cleanup = TempProfile(profile_path.clone());
 
     // Build the sandbox-exec command.
     let mut cmd = tokio::process::Command::new("sandbox-exec");
@@ -329,12 +330,16 @@ pub async fn execute(
     cmd.stderr(std::process::Stdio::piped());
     cmd.stdin(std::process::Stdio::null());
 
+    cmd.process_group(0).kill_on_drop(true);
     let mut child = cmd
         .spawn()
         .map_err(|e| SandboxError::Spawn(e.to_string()))?;
 
     let pid = child.id().unwrap_or(0);
-    let _ = tx.send(ExecFrame::ExecStarted { pid }).await;
+    let mut custody = super::custody::ProcessCustody::new(pid);
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(config.timeout_secs);
+    super::custody::send_frame(&tx, ExecFrame::ExecStarted { pid }, deadline).await?;
 
     let start = std::time::Instant::now();
 
@@ -352,32 +357,68 @@ pub async fn execute(
     let tx_err = tx.clone();
     let max_bytes = config.max_output_bytes;
 
-    let stdout_task = tokio::spawn(stream_output(stdout, tx_out, ExecStream::Stdout, max_bytes));
-    let stderr_task = tokio::spawn(stream_output(stderr, tx_err, ExecStream::Stderr, max_bytes));
+    let stdout_task = tokio::spawn(stream_output(
+        stdout,
+        tx_out,
+        ExecStream::Stdout,
+        max_bytes,
+        deadline,
+    ));
+    let stderr_task = tokio::spawn(stream_output(
+        stderr,
+        tx_err,
+        ExecStream::Stderr,
+        max_bytes,
+        deadline,
+    ));
+    custody.reader(&stdout_task);
+    custody.reader(&stderr_task);
 
     // Wait for child with timeout.
-    let timeout = std::time::Duration::from_secs(config.timeout_secs);
+
     let exit_status = tokio::select! {
-        result = child.wait() => {
+        _ = tx.closed() => return Err(SandboxError::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "execution consumer disconnected"))),
+        result = custody.wait(&mut child) => {
             result.map_err(SandboxError::Io)?
         }
-        _ = tokio::time::sleep(timeout) => {
+        _ = tokio::time::sleep_until(deadline) => {
+            custody.kill_group();
             let _ = child.kill().await;
             let _ = child.wait().await;
             let duration_ms = start.elapsed().as_millis() as u64;
-            let _ = tx.send(ExecFrame::ExecCompleted {
+            super::custody::send_frame(&tx, ExecFrame::ExecCompleted {
                 exit_code: -1,
                 duration_ms,
-            }).await;
+            }, super::custody::completion_deadline()).await?;
             // Clean up temp profile.
             let _ = std::fs::remove_file(&profile_path);
             return Ok(-1);
         }
     };
 
-    // Wait for output streaming to complete.
-    let _ = stdout_task.await;
-    let _ = stderr_task.await;
+    // Descendants may retain inherited pipes after the main child exits. The
+    // original deadline also bounds reader completion; errors are never hidden.
+    match tokio::time::timeout_at(deadline, async {
+        stdout_task.await.map_err(std::io::Error::other)??;
+        stderr_task.await.map_err(std::io::Error::other)?
+    })
+    .await
+    {
+        Ok(result) => result.map_err(SandboxError::Io)?,
+        Err(_) => {
+            custody.kill_group();
+            super::custody::send_frame(
+                &tx,
+                ExecFrame::ExecCompleted {
+                    exit_code: -1,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                },
+                super::custody::completion_deadline(),
+            )
+            .await?;
+            return Ok(-1);
+        }
+    }
 
     let exit_code = exit_status.code().unwrap_or(-1);
     let duration_ms = start.elapsed().as_millis() as u64;
@@ -391,23 +432,43 @@ pub async fn execute(
     // to exit 65 to force the re-run. Never execute the command outside the sandbox
     // based on an attacker-influenced exit code.
 
-    let _ = tx
-        .send(ExecFrame::ExecCompleted {
+    super::custody::send_frame(
+        &tx,
+        ExecFrame::ExecCompleted {
             exit_code,
             duration_ms,
-        })
-        .await;
+        },
+        super::custody::completion_deadline(),
+    )
+    .await?;
 
     Ok(exit_code)
 }
 
-/// Write the Seatbelt profile to a temporary file.
+struct TempProfile(PathBuf);
+impl Drop for TempProfile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Each invocation owns a unique private profile, including on cancellation.
 fn write_temp_profile(content: &str) -> Result<PathBuf, SandboxError> {
-    let dir = std::env::temp_dir();
-    let filename = format!("opaque-sandbox-{}.sb", std::process::id());
-    let path = dir.join(filename);
-    std::fs::write(&path, content)
-        .map_err(|e| SandboxError::ProfileGeneration(format!("failed to write profile: {e}")))?;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = std::env::temp_dir().join(format!("opaque-sandbox-{}.sb", uuid::Uuid::new_v4()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| SandboxError::ProfileGeneration(format!("failed to create profile: {e}")))?;
+    if let Err(error) = file.write_all(content.as_bytes()) {
+        let _ = std::fs::remove_file(&path);
+        return Err(SandboxError::ProfileGeneration(format!(
+            "failed to write profile: {error}"
+        )));
+    }
     Ok(path)
 }
 
@@ -417,7 +478,8 @@ async fn stream_output(
     tx: mpsc::Sender<ExecFrame>,
     stream: ExecStream,
     max_bytes: usize,
-) {
+    deadline: tokio::time::Instant,
+) -> std::io::Result<()> {
     let mut buf = vec![0u8; OUTPUT_CHUNK_SIZE];
     let mut total = 0usize;
 
@@ -430,16 +492,23 @@ async fn stream_output(
                     let allowed = n.saturating_sub(total - max_bytes);
                     if allowed > 0 {
                         let data = String::from_utf8_lossy(&buf[..allowed]).into_owned();
-                        let _ = tx.send(ExecFrame::Output { stream, data }).await;
+                        super::custody::send_frame(
+                            &tx,
+                            ExecFrame::Output { stream, data },
+                            deadline,
+                        )
+                        .await?;
                     }
                     break;
                 }
                 let data = String::from_utf8_lossy(&buf[..n]).into_owned();
-                let _ = tx.send(ExecFrame::Output { stream, data }).await;
+                super::custody::send_frame(&tx, ExecFrame::Output { stream, data }, deadline)
+                    .await?;
             }
-            Err(_) => break,
+            Err(error) => return Err(error),
         }
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -614,5 +683,49 @@ mod tests {
     fn probe_sandbox_exec_returns_bool() {
         // Should not panic regardless of macOS version.
         let _works = probe_sandbox_exec();
+    }
+}
+
+#[cfg(test)]
+mod reader_lifecycle_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn output_delivery_errors_are_reported_to_the_execution_owner() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(ExecFrame::ExecStarted { pid: 0 }).await.unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let error = stream_output(
+            &b"output"[..],
+            tx.clone(),
+            ExecStream::Stdout,
+            1024,
+            deadline,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        rx.recv().await.unwrap();
+        drop(rx);
+        let error = stream_output(&b"output"[..], tx, ExecStream::Stdout, 1024, deadline)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+
+        struct FailedReader;
+        impl tokio::io::AsyncRead for FailedReader {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Err(std::io::Error::other("injected read failure")))
+            }
+        }
+        let (tx, _rx) = mpsc::channel(1);
+        let error = stream_output(FailedReader, tx, ExecStream::Stdout, 1024, deadline)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
     }
 }

@@ -1,9 +1,16 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
+
+use futures_util::future::{AbortHandle, Abortable, BoxFuture};
+use futures_util::stream::FuturesUnordered;
+use futures_util::{FutureExt, StreamExt};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tracing::{debug, error, info, warn};
+use tokio::io::AsyncWriteExt;
+use tokio_util::codec::{Decoder, FramedRead, LinesCodec, LinesCodecError};
+use tracing::{debug, error, info};
 
 mod daemon_client;
 mod tools;
@@ -75,6 +82,23 @@ impl JsonRpcResponse {
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const INTERNAL_ERROR: i64 = -32603;
+const INVALID_REQUEST: i64 = -32600;
+const SERVER_BUSY: i64 = -32000;
+const MAX_IN_FLIGHT: usize = 8;
+
+fn tool_definitions() -> &'static [(tools::ToolDef, jsonschema::Validator)] {
+    static DEFINITIONS: OnceLock<Vec<(tools::ToolDef, jsonschema::Validator)>> = OnceLock::new();
+    DEFINITIONS.get_or_init(|| {
+        tools::safe_tools()
+            .into_iter()
+            .map(|tool| {
+                let validator = jsonschema::validator_for(&tool.input_schema)
+                    .expect("built-in MCP input schema must compile");
+                (tool, validator)
+            })
+            .collect()
+    })
+}
 
 fn maybe_handle_cli_flag() -> bool {
     let mut args = std::env::args().skip(1);
@@ -124,10 +148,10 @@ fn handle_initialize(id: Option<serde_json::Value>) -> JsonRpcResponse {
 
 /// Handle `tools/list` — return the hard-coded Safe tool list.
 fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
-    let tool_defs = tools::safe_tools();
+    let tool_defs = tool_definitions();
     let tools_json: Vec<serde_json::Value> = tool_defs
         .iter()
-        .map(|t| {
+        .map(|(t, _)| {
             json!({
                 "name": t.name,
                 "description": t.description,
@@ -157,40 +181,54 @@ async fn handle_tools_call(
         .cloned()
         .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
 
-    // Handle client-side tools that don't need daemon communication.
+    if !arguments.is_object() {
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "tool arguments must be a JSON object");
+    }
+    let Some((tool_def, validator)) = tool_definitions()
+        .iter()
+        .find(|(tool, _)| tool.name == tool_name)
+    else {
+        return JsonRpcResponse::error(
+            id,
+            INVALID_PARAMS,
+            format!(
+                "unknown tool: {}",
+                opaque_core::validate::truncate_utf8(tool_name, 64)
+            ),
+        );
+    };
+    if !validator.is_valid(&arguments) {
+        // Validation errors can quote supplied values. Keep those out of logs
+        // and model-facing responses; the published schema describes the contract.
+        return JsonRpcResponse::error(
+            id,
+            INVALID_PARAMS,
+            "tool arguments do not match the input schema",
+        );
+    }
+    // Blocking lookups hold a separate bounded permit even if their caller is
+    // cancelled, since aborting an async task cannot stop a blocking syscall.
     match tool_name {
         "opaque_sandbox_list_profiles" => {
-            return handle_list_profiles(id);
+            let response_id = id.clone();
+            return blocking_lookup(move || handle_list_profiles(id))
+                .await
+                .unwrap_or_else(|message| {
+                    JsonRpcResponse::error(response_id, SERVER_BUSY, message)
+                });
         }
         "opaque_secrets_status" => {
-            return handle_secrets_status(id, &arguments);
+            let response_id = id.clone();
+            return blocking_lookup(move || handle_secrets_status(id, &arguments))
+                .await
+                .unwrap_or_else(|message| {
+                    JsonRpcResponse::error(response_id, SERVER_BUSY, message)
+                });
         }
         _ => {}
     }
-
-    // Look up the daemon IPC method for this tool.
-    let daemon_method = match tools::tool_to_daemon_method(tool_name) {
-        Some(m) => m,
-        None => {
-            return JsonRpcResponse::error(
-                id,
-                INVALID_PARAMS,
-                format!("unknown tool: {}", &tool_name[..tool_name.len().min(64)]),
-            );
-        }
-    };
-
-    // Find the tool definition to build daemon params.
-    let tool_defs = tools::safe_tools();
-    let tool_def = match tool_defs.iter().find(|t| t.name == tool_name) {
-        Some(t) => t,
-        None => {
-            return JsonRpcResponse::error(
-                id,
-                INTERNAL_ERROR,
-                format!("tool definition not found: {tool_name}"),
-            );
-        }
+    let Some(daemon_method) = tools::tool_to_daemon_method(tool_name) else {
+        return JsonRpcResponse::error(id, INTERNAL_ERROR, "tool has no daemon method");
     };
 
     // Build daemon IPC params.
@@ -199,10 +237,16 @@ async fn handle_tools_call(
         // Workspace claims come from this MCP server's actual process cwd,
         // never the model's tool arguments. The daemon verifies the claim
         // against this process before using repo-scoped policy.
-        daemon_params["workspace"] = std::env::current_dir()
-            .ok()
-            .and_then(|cwd| collect_workspace_context(&cwd))
-            .unwrap_or(serde_json::Value::Null);
+        daemon_params["workspace"] = match blocking_lookup(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(|cwd| collect_workspace_context(&cwd))
+        })
+        .await
+        {
+            Ok(workspace) => workspace.unwrap_or(serde_json::Value::Null),
+            Err(message) => return JsonRpcResponse::error(id, SERVER_BUSY, message),
+        };
     }
 
     debug!(
@@ -252,7 +296,15 @@ async fn handle_tools_call(
                             serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string())
                         }
                     }
-                    None => "Operation completed successfully.".to_string(),
+                    None => {
+                        return JsonRpcResponse::ok(
+                            id,
+                            json!({
+                                "content": [{"type":"text", "text":"Broker response is missing a result; execution outcome is unknown."}],
+                                "isError": true
+                            }),
+                        );
+                    }
                 };
                 JsonRpcResponse::ok(
                     id,
@@ -280,6 +332,34 @@ async fn handle_tools_call(
             )
         }
     }
+}
+
+async fn blocking_lookup<T: Send + 'static>(
+    lookup: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, &'static str> {
+    blocking_lookup_with_deadline(lookup, std::time::Duration::from_secs(30)).await
+}
+
+async fn blocking_lookup_with_deadline<T: Send + 'static>(
+    lookup: impl FnOnce() -> T + Send + 'static,
+    deadline: std::time::Duration,
+) -> Result<T, &'static str> {
+    static SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    let permit = SLOTS
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT)))
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| "local lookup capacity is occupied")?;
+    let worker = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        lookup()
+    });
+    // Stop waiting even if the filesystem or native lookup stalls. The worker
+    // still owns its permit until it exits, so timeouts cannot grow the pool.
+    tokio::time::timeout(deadline, worker)
+        .await
+        .map_err(|_| "local lookup timed out")?
+        .map_err(|_| "local lookup failed")
 }
 
 fn collect_workspace_context(cwd: &std::path::Path) -> Option<serde_json::Value> {
@@ -373,7 +453,8 @@ fn format_sandbox_exec_response(
         return JsonRpcResponse::ok(
             id,
             json!({
-                "content": [{"type": "text", "text": "Sandbox execution completed (no output)."}]
+                "content": [{"type": "text", "text": "Broker response is missing the sandbox result; execution outcome is unknown."}],
+                "isError": true
             }),
         );
     };
@@ -443,93 +524,166 @@ async fn main() {
     // Allow socket path override via env var or CLI arg.
     let socket_override = std::env::var("OPAQUE_SOCK").ok().map(PathBuf::from);
     let client = DaemonClient::new(socket_override);
+    let _ = tool_definitions();
 
-    let stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
-    let reader = BufReader::new(stdin);
-    let mut lines = reader.lines();
-
-    while let Ok(Some(raw_line)) = lines.next_line().await {
-        let line = raw_line.trim().to_string();
-        if line.is_empty() {
-            continue;
-        }
-
-        let request: JsonRpcRequest = match serde_json::from_str(&line) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("invalid JSON-RPC: {e}");
-                let resp = JsonRpcResponse::error(None, -32700, format!("parse error: {e}"));
-                let out = match serde_json::to_string(&resp) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        warn!("failed to serialize error response: {e}");
-                        continue;
-                    }
-                };
-                let _ = stdout.write_all(out.as_bytes()).await;
-                let _ = stdout.write_all(b"\n").await;
-                let _ = stdout.flush().await;
-                continue;
-            }
-        };
-
-        if request.jsonrpc != "2.0" {
-            warn!("invalid jsonrpc version: {}", request.jsonrpc);
-        }
-
-        let response = match request.method.as_str() {
-            "initialize" => handle_initialize(request.id),
-            "notifications/initialized" => {
-                // This is a notification (no id), no response needed.
-                debug!("received initialized notification");
-                continue;
-            }
-            "tools/list" => handle_tools_list(request.id),
-            "tools/call" => handle_tools_call(request.id, &request.params, &client).await,
-            "ping" => JsonRpcResponse::ok(request.id, json!({})),
-            method => {
-                // Notifications (no id) should not get error responses.
-                if request.id.is_none() {
-                    debug!("ignoring notification: {method}");
-                    continue;
-                }
-                JsonRpcResponse::error(
-                    request.id,
-                    METHOD_NOT_FOUND,
-                    format!("method not found: {method}"),
-                )
-            }
-        };
-
-        let out = match serde_json::to_string(&response) {
-            Ok(s) => s,
-            Err(e) => {
-                error!("failed to serialize response: {e}");
-                continue;
-            }
-        };
-
-        if let Err(e) = stdout.write_all(out.as_bytes()).await {
-            error!("failed to write to stdout: {e}");
-            break;
-        }
-        if let Err(e) = stdout.write_all(b"\n").await {
-            error!("failed to write newline: {e}");
-            break;
-        }
-        if let Err(e) = stdout.flush().await {
-            error!("failed to flush stdout: {e}");
-            break;
-        }
+    if let Err(error) = run_transport(tokio::io::stdin(), tokio::io::stdout(), client).await {
+        error!(%error, "MCP transport stopped");
     }
 
     info!("opaque-mcp shutting down");
 }
 
+/// Oversized or non-UTF-8 lines are recoverable protocol items. Returning a
+/// decoder error would terminate FramedRead and discard the next valid request.
+type McpLine = Result<String, &'static str>;
+struct McpLines(LinesCodec);
+impl Decoder for McpLines {
+    type Item = McpLine;
+    type Error = std::io::Error;
+
+    fn decode(&mut self, source: &mut bytes::BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        Self::classify(self.0.decode(source))
+    }
+
+    fn decode_eof(
+        &mut self,
+        source: &mut bytes::BytesMut,
+    ) -> Result<Option<Self::Item>, Self::Error> {
+        Self::classify(self.0.decode_eof(source))
+    }
+}
+impl McpLines {
+    fn classify(
+        result: Result<Option<String>, LinesCodecError>,
+    ) -> std::io::Result<Option<McpLine>> {
+        match result {
+            Ok(line) => Ok(line.map(Ok)),
+            Err(LinesCodecError::MaxLineLengthExceeded) => {
+                Ok(Some(Err("MCP frame exceeds the size limit")))
+            }
+            Err(LinesCodecError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData => {
+                Ok(Some(Err("MCP frame is not UTF-8")))
+            }
+            Err(LinesCodecError::Io(error)) => Err(error),
+        }
+    }
+}
+
+/// Keep the reader and control messages independent of potentially slow tool
+/// calls. Pending work is bounded; overload never creates an unbounded queue.
+async fn run_transport(
+    input: impl tokio::io::AsyncRead + Unpin,
+    mut output: impl tokio::io::AsyncWrite + Unpin,
+    client: DaemonClient,
+) -> std::io::Result<()> {
+    type Completion = (String, Option<JsonRpcResponse>);
+    let mut lines = FramedRead::new(
+        input,
+        McpLines(LinesCodec::new_with_max_length(
+            opaque_core::MAX_FRAME_LENGTH,
+        )),
+    );
+    let mut pending: FuturesUnordered<BoxFuture<'static, Completion>> = FuturesUnordered::new();
+    let mut cancellations: HashMap<String, AbortHandle> = HashMap::new();
+    loop {
+        let response = tokio::select! {
+            completed = pending.next(), if !pending.is_empty() => {
+                let (key, response) = completed.expect("nonempty pending set");
+                cancellations.remove(&key);
+                response
+            }
+            line = lines.next() => {
+                let Some(line) = line else {
+                    // EOF ends the session. Dropping pending calls stops waiting;
+                    // it does not roll back requests already sent to the broker.
+                    break;
+                };
+                match line {
+                    Err(error) => return Err(error),
+                    Ok(Err(message)) => Some(JsonRpcResponse::error(None, -32700, message)),
+                    Ok(Ok(line)) => {
+                        if line.trim().is_empty() { continue; }
+                        match serde_json::from_str::<JsonRpcRequest>(&line) {
+                            Err(_) => Some(JsonRpcResponse::error(None, -32700, "invalid JSON-RPC request")),
+                            Ok(request) => {
+                                if request.jsonrpc != "2.0" || request.id.as_ref().is_some_and(|id| !id.is_string() && !id.is_number()) {
+                                    Some(JsonRpcResponse::error(None, INVALID_REQUEST, "invalid JSON-RPC version or request ID"))
+                                } else if request.id.is_none() {
+                                    if request.method == "notifications/cancelled"
+                                        && let Some(id) = request.params.get("requestId")
+                                        && let Some(handle) = cancellations.get(&id.to_string())
+                                    {
+                                        // Stops waiting; already-dispatched work is not undone.
+                                        handle.abort();
+                                    }
+                                    None
+                                } else {
+                                    let key = request.id.as_ref().expect("checked ID").to_string();
+                                    if cancellations.contains_key(&key) {
+                                        Some(JsonRpcResponse::error(request.id, INVALID_REQUEST, "request ID is already in use"))
+                                    } else {
+                                        match request.method.as_str() {
+                                            "initialize" => Some(handle_initialize(request.id)),
+                                            "ping" => Some(JsonRpcResponse::ok(request.id, json!({}))),
+                                            "tools/list" => Some(handle_tools_list(request.id)),
+                                            "tools/call" if pending.len() >= MAX_IN_FLIGHT => Some(JsonRpcResponse::error(request.id, SERVER_BUSY, "too many in-flight tool calls")),
+                                            "tools/call" => {
+                                                let (handle, registration) = AbortHandle::new_pair();
+                                                cancellations.insert(key.clone(), handle);
+                                                let client = client.clone();
+                                                pending.push(async move {
+                                                    let result = Abortable::new(handle_tools_call(request.id, &request.params, &client), registration).await.ok();
+                                                    (key, result)
+                                                }.boxed());
+                                                None
+                                            }
+                                            _ => Some(JsonRpcResponse::error(request.id, METHOD_NOT_FOUND, "method not found")),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            else => break,
+        };
+        if let Some(response) = response {
+            let mut bytes = serde_json::to_vec(&response).map_err(std::io::Error::other)?;
+            bytes.push(b'\n');
+            // A client that stops consuming cannot retain the server forever.
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                output.write_all(&bytes).await?;
+                output.flush().await
+            })
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "MCP response delivery timed out",
+                )
+            })??;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stalled_local_lookup_has_a_terminal_response() {
+        let (release, gate) = std::sync::mpsc::sync_channel(1);
+        let result = blocking_lookup_with_deadline(
+            move || gate.recv().unwrap(),
+            std::time::Duration::from_millis(20),
+        )
+        .await;
+        assert_eq!(result, Err("local lookup timed out"));
+        // Release the actual worker; a timeout does not cancel its syscall.
+        release.send(()).unwrap();
+    }
 
     #[test]
     fn initialize_response_has_tools_capability() {
@@ -724,7 +878,8 @@ mod tests {
         let resp = format_sandbox_exec_response(Some(json!(1)), None);
         let r = resp.result.unwrap();
         let content = r["content"].as_array().unwrap();
-        assert!(content[0]["text"].as_str().unwrap().contains("no output"));
+        assert!(content[0]["text"].as_str().unwrap().contains("missing"));
+        assert_eq!(r["isError"], true);
     }
 
     #[test]
@@ -748,17 +903,6 @@ mod tests {
         assert_eq!(r["isError"], true);
         let text = r["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("missing required parameter"));
-    }
-
-    #[test]
-    fn unknown_tool_name_is_truncated_in_error() {
-        // Verify that the truncation logic used for unknown tool names works.
-        let long_name = "a".repeat(200);
-        let truncated = &long_name[..long_name.len().min(64)];
-        assert_eq!(truncated.len(), 64);
-        // The format string in handle_tools_call uses this pattern:
-        let msg = format!("unknown tool: {}", truncated);
-        assert_eq!(msg.len(), "unknown tool: ".len() + 64);
     }
 
     #[test]
