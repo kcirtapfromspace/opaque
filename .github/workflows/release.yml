@@ -84,28 +84,42 @@ jobs:
               "target/${{ matrix.target }}/release/$bin"
           done
 
-      - name: Create tarball
-        id: tarball
-        run: |
-          TAG="${GITHUB_REF#refs/tags/}"
-          ARCHIVE="opaque-${TAG}-${{ matrix.target }}.tar.gz"
-          tar czf "$ARCHIVE" \
-            -C "target/${{ matrix.target }}/release" \
-            opaqued opaque opaque-mcp opaque-approve-helper opaque-web
-          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
-
-      - name: Notarize macOS tarball
+      - name: Notarize macOS binaries
         if: contains(matrix.target, 'apple-darwin')
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          xcrun notarytool submit "${{ steps.tarball.outputs.archive }}" \
+          # notarytool only accepts .zip/.pkg/.dmg, not the .tar.gz we ship —
+          # zip the signed binaries just for submission. Standalone binaries
+          # can't be stapled (that only applies to .app/.pkg/.dmg), so
+          # Gatekeeper looks the ticket up online by CDHash on first run;
+          # the ticket applies regardless of which archive format we later
+          # distribute the same signed bytes in.
+          NOTARIZE_ZIP="notarize-${{ matrix.target }}.zip"
+          zip -j "$NOTARIZE_ZIP" \
+            target/${{ matrix.target }}/release/opaqued \
+            target/${{ matrix.target }}/release/opaque \
+            target/${{ matrix.target }}/release/opaque-mcp \
+            target/${{ matrix.target }}/release/opaque-approve-helper \
+            target/${{ matrix.target }}/release/opaque-web
+          xcrun notarytool submit "$NOTARIZE_ZIP" \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_ID_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
             --wait
+          rm -f "$NOTARIZE_ZIP"
+
+      - name: Create tarball
+        id: tarball
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          ARCHIVE="opaque-${TAG#v}-${{ matrix.target }}.tar.gz"
+          tar czf "$ARCHIVE" \
+            -C "target/${{ matrix.target }}/release" \
+            opaqued opaque opaque-mcp opaque-approve-helper opaque-web
+          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
 
       - name: Generate SHA256 checksum
         run: shasum -a 256 "${{ steps.tarball.outputs.archive }}" > "${{ steps.tarball.outputs.archive }}.sha256"
@@ -126,6 +140,20 @@ jobs:
       contents: write
       id-token: write
     steps:
+      # Runs before the artifact download below: actions/checkout defaults
+      # to `clean: true`, which git-cleans untracked files -- including the
+      # downloaded/signed artifacts/ directory if this ran after it.
+      - name: Checkout (for changelog)
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Generate changelog
+        uses: orhun/git-cliff-action@v4
+        id: changelog
+        with:
+          args: --latest --strip header
+
       - name: Download artifacts
         uses: actions/download-artifact@v8
         with:
@@ -140,17 +168,6 @@ jobs:
           for file in artifacts/*.tar.gz; do
             cosign sign-blob --yes "$file" --output-signature "${file}.sig" --output-certificate "${file}.pem"
           done
-
-      - name: Checkout (for changelog)
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Generate changelog
-        uses: orhun/git-cliff-action@v4
-        id: changelog
-        with:
-          args: --latest --strip header
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
