@@ -196,7 +196,7 @@ jobs:
         # same reason for running before the root-gated steps.
         run: |
           cargo test --locked -p opaqued --test provider_e2e 2>&1 | tee /tmp/prov-e2e.out
-          grep -q "test result: ok. 2 passed" /tmp/prov-e2e.out
+          grep -q "test result: ok. 10 passed" /tmp/prov-e2e.out
 
       - name: Multi-uid isolation suite (custody + privilege drop, as root)
         run: ./scripts/linux-harness.sh isolation
