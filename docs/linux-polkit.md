@@ -2,8 +2,8 @@
 
 Opaque uses a **two-step approval flow** on Linux:
 
-1. **Intent dialog** (zenity/kdialog) — displays the operation details so the user knows what they are approving
-2. **Polkit authentication** — system password/biometric prompt via PolicyKit
+1. **Intent dialog** (zenity/kdialog): displays the operation details so the user knows what they are approving
+2. **Polkit authentication**: system password/biometric prompt via PolicyKit
 
 This two-step design exists because most polkit auth agents do not display the operation `details` HashMap, which would otherwise result in blind approvals where the user authenticates without seeing what operation they are authorizing.
 
@@ -37,9 +37,9 @@ The policy uses `auth_self` for active sessions:
 </defaults>
 ```
 
-- `allow_any=no` — Denies requests from non-local sessions
-- `allow_inactive=no` — Denies requests from inactive sessions (SSH, screen locked on some setups)
-- `allow_active=auth_self` — Requires the user to authenticate with their own password
+- `allow_any=no`: Denies requests from non-local sessions
+- `allow_inactive=no`: Denies requests from inactive sessions (SSH, screen locked on some setups)
+- `allow_active=auth_self`: Requires the user to authenticate with their own password
 
 ## Supported Desktops
 
@@ -65,5 +65,5 @@ systemctl --user enable --now opaqued.service
 ## Notes
 
 - Approval leases ("approve for N minutes") are implemented as daemon-side TTL grants, not by weakening the polkit policy to `auth_self_keep`.
-- If you need to test without a graphical session, you cannot — this is by design. The daemon requires a display server and a polkit agent.
+- If you need to test without a graphical session, you cannot; this is by design. The daemon requires a display server and a polkit agent.
 - Tiling WM users (Sway, i3, etc.) must ensure a polkit agent is running. Common choices: `polkit-gnome-authentication-agent-1` or `lxpolkit`.

@@ -1,11 +1,11 @@
 # Deferred
 
-Out of scope for the current release, not "coming soon" — each needs its own
+Out of scope for the current release, not "coming soon": each needs its own
 threat model, evidence, or customer pull before it's worth building.
 
 ## iOS second-device approvals (Face ID)
 
-Design only — see [mobile approvals](mobile-approvals.md). No iOS app ships.
+Design only; see [mobile approvals](mobile-approvals.md). No iOS app ships.
 The paired-second-device factor that does ship is desktop-to-desktop
 (Ed25519), not mobile.
 

@@ -12,14 +12,14 @@ guide is scoped by which one you choose:
 | | **Session mode** (default) | **Trust-domain split** |
 |---|---|---|
 | Daemon runs as | your own user, in your GUI session | a dedicated service account (`opaque`), as a system service |
-| Integrity posture | tamper-**evident** — an agent sharing your uid can read the audit chain key and rewrite state; you detect it after the fact | tamper-**prevented** — custody files are unreadable/unwritable at the agent's uid, verified at every startup (fail closed) |
-| Approval factors | local biometric (macOS `LocalAuthentication`), polkit — both need your GUI session | out-of-band factors that don't need the daemon to own a session: paired second device, FIDO2 key, passkey |
+| Integrity posture | tamper-**evident**: an agent sharing your uid can read the audit chain key and rewrite state; you detect it after the fact | tamper-**prevented**: custody files are unreadable/unwritable at the agent's uid, verified at every startup (fail closed) |
+| Approval factors | local biometric (macOS `LocalAuthentication`), polkit; both need your GUI session | out-of-band factors that don't need the daemon to own a session: paired second device, FIDO2 key, passkey |
 | Service manager | LaunchAgent / systemd **user** service | LaunchDaemon / systemd **system** service (`deploy/`) |
 | Config | `~/.opaque/config.toml` | `/etc/opaque/config.toml` with `[trust_domain] enforce = true` (see `deploy/config.trust-domain.example.toml`) |
 
 **Session-mode constraint:** the daemon must run inside an interactive GUI
 session, because `LocalAuthentication` and polkit present dialogs there.
-Headless, SSH, CI, and container environments fail closed *in session mode* —
+Headless, SSH, CI, and container environments fail closed *in session mode*;
 they are exactly what the trust-domain split is for.
 
 ---
@@ -27,7 +27,7 @@ they are exactly what the trust-domain split is for.
 ## Trust-Domain Split (Service-Account Mode)
 
 The split moves `opaqued` under a principal the agent can never be: a
-dedicated service account that exclusively owns every custody file — the
+dedicated service account that exclusively owns every custody file: the
 audit database and its chain key, the identity store and delegation signing
 key, the config and its seal, the pairing store, and the profiles directory.
 
@@ -56,7 +56,7 @@ of `deploy/systemd/opaqued.service` and `deploy/launchd/com.opaque.opaqued.plist
 
 In containers the split gets stronger: the daemon and the agent run in
 separate containers that share ONLY the socket volume, so the custody files
-have no path inside the agent container at all — not merely unreadable,
+have no path inside the agent container at all: not merely unreadable,
 nonexistent.
 
 - **Compose:** `deploy/docker/compose.yaml` + `bootstrap.sh` (one-shot root
@@ -65,13 +65,13 @@ nonexistent.
   stack end to end: sealed bootstrap, enforced custody at startup,
   cross-container ping, custody invisibility from the agent, the exact
   0750/0660/0640 socket surface, and refusal of a daemon-uid client.
-- **Kubernetes:** `deploy/k8s/opaque.yaml` — separate ServiceAccounts (the
+- **Kubernetes:** `deploy/k8s/opaque.yaml`: separate ServiceAccounts (the
   agent container automounts no API token), runAsUser split (7381/7382),
   socket via a memory emptyDir with `supplementalGroups: [7999]`, custody on
   a PVC mounted only by the daemon container, read-only root filesystems,
   all capabilities dropped.
 - **Group mechanics that bite:** a non-root daemon can chgrp the socket
-  surface only to a group in its own supplementary set — grant it via
+  surface only to a group in its own supplementary set; grant it via
   `group_add` (compose), `supplementalGroups` (k8s), or
   `SupplementaryGroups=` (systemd). `trust_domain.socket_group` accepts a
   numeric gid for container environments with no named groups.
@@ -89,8 +89,8 @@ before connecting.
 
 > **Approval factors in split mode:** the daemon no longer owns a GUI session,
 > so session-bound prompts (LocalBio, polkit) cannot fire from it. Configure
-> an out-of-band factor — paired second device, FIDO2 hardware key, or
-> passkey — so approvals carry a cryptographic approver signature instead.
+> an out-of-band factor (paired second device, FIDO2 hardware key, or
+> passkey) so approvals carry a cryptographic approver signature instead.
 
 ---
 
@@ -161,8 +161,8 @@ Use `SMAppService.agent(plistName:)` (macOS 13+) to register the LaunchAgent fro
 A LaunchDaemon runs with no GUI session. Touch ID is unreachable.
 `canEvaluatePolicy` would fail on every request. **LaunchDaemon is
 architecturally incompatible with session mode.** The trust-domain split
-(`deploy/launchd/com.opaque.opaqued.plist`) *is* a LaunchDaemon — under a
-dedicated non-root account — and pairs with out-of-band approval factors
+(`deploy/launchd/com.opaque.opaqued.plist`) *is* a LaunchDaemon, under a
+dedicated non-root account, and pairs with out-of-band approval factors
 instead of `LocalAuthentication`.
 
 ### Code Signing Requirements
@@ -176,7 +176,7 @@ codesign --sign "Developer ID Application: ..." \
   /usr/local/bin/opaqued
 ```
 
-Minimal entitlements (no special entitlements needed — `LocalAuthentication` does not require an entitlement when called from a user-session process):
+Minimal entitlements (no special entitlements needed; `LocalAuthentication` does not require an entitlement when called from a user-session process):
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -196,7 +196,7 @@ Notarize via `notarytool` so Gatekeeper does not quarantine the binary on first 
 | Screen locked | Touch ID dialog appears on lock screen (macOS handles this natively) | Works |
 | Lid closed (clamshell mode) | No Touch ID sensor; `DeviceOwnerAuthentication` falls back to password dialog | Works |
 | No biometric hardware (Mac Mini, older MacBook Pro) | Password dialog only | Works |
-| Fast User Switching (background user) | Dialog appears on the user's desktop, may fail if user is not the console user | Needs testing — daemon should `canEvaluatePolicy` before each approval |
+| Fast User Switching (background user) | Dialog appears on the user's desktop, may fail if user is not the console user | Needs testing: daemon should `canEvaluatePolicy` before each approval |
 | Remote Desktop / VNC | No Touch ID sensor; password fallback | Works but weaker |
 
 ### Session Detection (Daemon Startup)
@@ -211,8 +211,8 @@ The daemon must verify it is running in a usable GUI session before binding the 
 
 Linux approval uses a two-step flow (implemented in `approval.rs`):
 
-1. **Intent dialog** — Shows the operation details (what the user is approving) via `zenity --question` or `kdialog --yesno`. Falls back to TTY if `isatty(STDIN_FILENO)`.
-2. **Polkit authentication** — System authentication dialog (password / fingerprint) via `CheckAuthorization` with `AllowUserInteraction`.
+1. **Intent dialog**: Shows the operation details (what the user is approving) via `zenity --question` or `kdialog --yesno`. Falls back to TTY if `isatty(STDIN_FILENO)`.
+2. **Polkit authentication**: System authentication dialog (password / fingerprint) via `CheckAuthorization` with `AllowUserInteraction`.
 
 This separation exists because most polkit auth agents do not display the `details` HashMap, meaning the user would authenticate without seeing what operation they are approving (a blind approval). The intent dialog solves this by showing details in a UI we control, while polkit handles only the authentication.
 
@@ -246,7 +246,7 @@ Functional, but the user must ensure a polkit agent is running (tiling WMs do no
 | Desktop | Intent Dialog | Polkit Agent | User Action Required |
 |---------|--------------|--------------|---------------------|
 | **Sway / Hyprland / wlroots** | `zenity` (runs under XWayland) | Must manually start `polkit-gnome-authentication-agent-1` or equivalent | Add to compositor autostart config |
-| **i3 / dwm / other X11 WMs** | `zenity` | Same — no polkit agent by default | Add to `.xinitrc` or session autostart |
+| **i3 / dwm / other X11 WMs** | `zenity` | Same: no polkit agent by default | Add to `.xinitrc` or session autostart |
 
 #### Tier 4: Unsupported (Fail Closed)
 
@@ -263,7 +263,7 @@ The daemon must refuse to start in these environments.
 Some polkit auth agents (notably GNOME's) cache credentials for a short period (typically 5 minutes). Within that window, the polkit authentication step may auto-succeed without the user re-entering their password.
 
 **This is acceptable** because:
-- The intent dialog (zenity/kdialog) still appears for every approval — the user always sees what they are approving
+- The intent dialog (zenity/kdialog) still appears for every approval; the user always sees what they are approving
 - The credential cache is a polkit agent feature outside Opaque's control
 - Disabling it requires modifying system polkit configuration, which is out of scope
 - The user explicitly confirmed intent in step 1; the polkit step provides authentication, not intent
@@ -327,9 +327,9 @@ The policy uses `auth_self` for active sessions (user must authenticate with the
 
 The daemon must verify the following at startup before binding the socket:
 
-1. **Display server** — `$DISPLAY` or `$WAYLAND_DISPLAY` must be set.
-2. **Intent dialog binary** — `zenity` or `kdialog` must be in `$PATH`.
-3. **Polkit availability** — The `org.freedesktop.PolicyKit1` service must be reachable on the system D-Bus.
+1. **Display server**: `$DISPLAY` or `$WAYLAND_DISPLAY` must be set.
+2. **Intent dialog binary**: `zenity` or `kdialog` must be in `$PATH`.
+3. **Polkit availability**: The `org.freedesktop.PolicyKit1` service must be reachable on the system D-Bus.
 
 If any check fails, log the specific missing component and exit non-zero. Do not silently degrade to a mode where approvals are skipped.
 
@@ -349,7 +349,7 @@ Every approval is cryptographically bound to the operation it authorizes via SHA
 
 ### 3. Approval leases are daemon-side TTL grants, never a weaker OS policy
 
-`require = "first_use"` grants a lease after the first approval — a `lease_ttl` (default 10 min, capped at 60) during which the same operation/target skips the dialog. `require = "always"` never grants one. Leases live in the daemon's in-memory cache and don't change what the OS mechanism itself verifies — see [Linux polkit](linux-polkit.md#notes) on `auth_self_keep`.
+`require = "first_use"` grants a lease after the first approval: a `lease_ttl` (default 10 min, capped at 60) during which the same operation/target skips the dialog. `require = "always"` never grants one. Leases live in the daemon's in-memory cache and don't change what the OS mechanism itself verifies; see [Linux polkit](linux-polkit.md#notes) on `auth_self_keep`.
 
 ### 4. Fail closed
 

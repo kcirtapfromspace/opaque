@@ -1,8 +1,8 @@
 # Architecture
 
 Opaque lets a team give an agent a bounded piece of work, keep control while
-it runs, and inspect the evidence after. Every capability — secrets,
-identity, policy, certificates, receipts — serves one progression:
+it runs, and inspect the evidence after. Every capability (secrets,
+identity, policy, certificates, receipts) serves one progression:
 
 **Policy → Approval → Execute → Sanitize → Audit**, and for multi-step work,
 **plan → review → approve → run → inspect** (see [bounded work](bounded-work.md)).
@@ -23,8 +23,8 @@ same `opaque` CLI a human does.
 - Tamper-evidence over the whole record: every audit event HMAC-chains;
   federated fleets export that chain to a SIEM in independently verifiable form.
 - Bounded, inspectable work: a multi-step task is a pinned manifest approved
-  once, each action charging one slot, with a receipt — not an open-ended
-  credential handed to the agent.
+  once, each action charging one slot, with a receipt. It is not an
+  open-ended credential handed to the agent.
 
 ## 2. Threat model
 
@@ -37,12 +37,12 @@ anything it can read. Opaque doesn't claim otherwise. What it does claim:
    compile error, not a runtime check someone can forget.
 2. **A malicious agent runtime is resisted, not just an honest one.** The
    daemon executes secret-using operations itself. Client classification
-   (human vs. agent) is audit-only, never a security gate — an agent can
+   (human vs. agent) is audit-only, never a security gate; an agent can
    present the same executable path and peer credentials a human's terminal
    does. Sandboxed exec (Landlock/seccomp on Linux, Seatbelt on macOS)
    bounds an agent-driven command when exec mode is used at all.
 3. **A compromised daemon-uid process is bounded by trust-domain
-   separation**, not by this codebase alone — see [deployment](deployment.md).
+   separation**, not by this codebase alone. See [deployment](deployment.md).
 
 ## 3. Crates
 
@@ -58,7 +58,7 @@ together and runs the RPC dispatch loop.
 | `opaque-approval` | Device pairing, FIDO2, factor registry, native prompting, approval-server relay |
 | `opaque-native-approval` | Native review/auth shared by the daemon and the workstation approver |
 | `opaque-approve-helper` | Linux polkit review helper |
-| `opaque-approver` | Trusted paired-workstation full-manifest approver — a separate binary for a separate machine (`crates/opaque-approver/README.md`) |
+| `opaque-approver` | Trusted paired-workstation full-manifest approver, a separate binary for a separate machine (`crates/opaque-approver/README.md`) |
 | `opaque-sandbox` | Landlock/seccomp/Seatbelt isolation, execve hooks, composite secret-resolver dispatch |
 | `opaque-bounded-work` | The [task](bounded-work.md) ledger, SSH certificate execution, inference brokering |
 | `opaque-tenant` | Tenant custody boundary, delegated IdP provisioning types |
@@ -93,7 +93,7 @@ flowchart LR
   agent's own uid, so a compromised agent account can read the HMAC key or
   rewrite the DB. `opaque audit verify` and startup verification detect
   this; they don't prevent it. A dedicated service account or separate
-  container turns it into a hard guarantee — see [deployment](deployment.md).
+  container turns it into a hard guarantee. See [deployment](deployment.md).
 - **Untrusted:** the LLM and its tool runtime, arbitrary agent-run commands,
   dependencies pulled in at run time.
 
@@ -102,12 +102,12 @@ flowchart LR
 Client identity is derived, never self-declared: Unix socket peer
 credentials (uid/gid/pid) plus executable path and SHA-256. (macOS Team-ID
 matching exists in policy but nothing populates it from a real code-signature
-check yet — treat it as inert.) Client type classification is **audit-only**
-— it never gates a decision, since an agent drives the same CLI a human does.
+check yet; treat it as inert.) Client type classification is **audit-only**.
+It never gates a decision, since an agent drives the same CLI a human does.
 
 Real authority comes from [identity](identity.md): a verified human (OIDC
 login, daemon-owned), an agent workload, or a config-declared service
-principal, with roles resolved live at request time — never embedded in a
+principal, with roles resolved live at request time, never embedded in a
 token, so revocation is immediate. Delegated access is the intersection of
 what the agent session and the delegating human may do.
 
@@ -130,22 +130,22 @@ Approval is required on first use of a (client, operation, target) tuple, on
 policy-flagged high-risk actions, and after lease expiry. The factor
 registry is pluggable and challenge-bound:
 
-- **Local biometric** — macOS Touch ID; Linux polkit with a pre-auth intent
+- **Local biometric**: macOS Touch ID; Linux polkit with a pre-auth intent
   dialog (`zenity`/`kdialog`) shown before the OS prompt.
-- **Paired second device** — Ed25519, decision-bound signatures.
-- **FIDO2** — hardware keys and passkeys, verified daemon-side.
-- **Paired workstation** — a separate machine reviews the entire task
+- **Paired second device**: Ed25519, decision-bound signatures.
+- **FIDO2**: hardware keys and passkeys, verified daemon-side.
+- **Paired workstation**: a separate machine reviews the entire task
   manifest and signs a decision; see [bounded work](bounded-work.md) and
   `crates/opaque-approver/README.md`.
 
 No interactive session or configured factor reachable (headless, no
-display, no paired device) fails closed — never an unapproved fallback. See
+display, no paired device) fails closed, never an unapproved fallback. See
 [deployment](deployment.md) for platform session-detection requirements.
 
 ## 7. Sandboxed execution
 
 `opaque exec` is the compatibility path for humans running existing dev
-tools with secrets injected as env vars — not a hard guarantee if the agent
+tools with secrets injected as env vars. It is not a hard guarantee if the agent
 picks the command. `opaque-sandbox` applies Landlock + seccomp (Linux) or
 Seatbelt (macOS) to every exec child; typestate sanitization and
 secret-pattern scrubbing apply regardless of sandbox mode.
@@ -173,9 +173,9 @@ material. See [federation](federation.md).
 
 ## 10. Audit
 
-Every operation — approval requested/granted/denied and by which factor,
-executed and its target/status, provider fetches (metadata only, never
-values) — is an append-only, HMAC-chained SQLite row. `opaque audit verify`
+Every operation is an append-only, HMAC-chained SQLite row: approval
+requested, granted or denied and by which factor, execution with its
+target and status, provider fetches (metadata only, never values). `opaque audit verify`
 detects edits, reordering, deletion, or tail truncation; the daemon
 re-verifies at startup and raises a CRITICAL alert on break. SIEM export
 (spool, webhook, TLS syslog) carries each record's sequence number and hash,
@@ -186,7 +186,7 @@ so the exported stream verifies independently against the source database.
 GitHub Actions/Codespaces secrets, GitLab CI variables, 1Password, Bitwarden
 Secrets Manager, HashiCorp Vault, AWS Secrets Manager. GCP, Azure, Doppler,
 and Infisical are feature-gated in `opaque-providers`, but `opaqued` enables
-all four anyway — so today's shipped binary compiles in all ten regardless.
+all four anyway, so today's shipped binary compiles in all ten regardless.
 
 ## 12. Platforms
 
@@ -196,12 +196,12 @@ all four anyway — so today's shipped binary compiles in all ten regardless.
 | Linux | x86_64, aarch64 | Fully supported |
 
 macOS runs the daemon as a LaunchAgent in a GUI session (never a
-LaunchDaemon — native approval prompts require it); Linux runs it as a
+LaunchDaemon; native approval prompts require it). Linux runs it as a
 systemd user service in a graphical session with a polkit auth agent. See
 [deployment](deployment.md).
 
 ## Deferred
 
 iOS second-device approvals (FaceID) and a general-purpose interactive
-tenant runtime remain out of scope for now — see the
+tenant runtime remain out of scope for now. See the
 [deferred roadmap](roadmap-deferred.md).

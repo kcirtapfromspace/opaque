@@ -62,13 +62,13 @@ Lists accessible Bitwarden projects (names only).
 
 Lists secret names in a project (no values).
 
-- **Params**: `project` (optional — filter by project name)
+- **Params**: `project` (optional; filter by project name)
 - **Approval**: `first_use` (recommended)
 - **Result**: `{ "secrets": [{ "key": "...", "id": "...", "project": "..." }] }`
 
 ### `bitwarden.read_secret` (`REVEAL`)
 
-Reads a secret value. **Hard-blocked in v1** — this operation returns plaintext and is never allowed for agent clients.
+Reads a secret value. **Hard-blocked in v1**: this operation returns plaintext and is never allowed for agent clients.
 
 - Human-only interactive use is possible if explicitly enabled in policy with `client_types = ["human"]`.
 

@@ -289,38 +289,38 @@ Result:
 
 Notes:
 
-- Hard-blocked in v1. Returns plaintext secrets — should not be enabled for agent workflows. Reserved for interactive human-only flows with explicit friction.
+- Hard-blocked in v1. Returns plaintext secrets; should not be enabled for agent workflows. Reserved for interactive human-only flows with explicit friction.
 
 ### `aws.*` (AWS STS / Secrets Manager / SSM Parameter Store)
 
-Registered by default, but **the real signed AWS transport isn't implemented**. The handler only activates with `OPAQUE_AWS_ALLOW_INSECURE=1` plus an explicit loopback `OPAQUE_AWS_MOCK_URL` — an unsigned mock transport for local testing. Without both, every `aws.*` call fails closed; there's no SigV4 signing against real AWS endpoints today.
+Registered by default, but **the real signed AWS transport isn't implemented**. The handler only activates with `OPAQUE_AWS_ALLOW_INSECURE=1` plus an explicit loopback `OPAQUE_AWS_MOCK_URL`, an unsigned mock transport for local testing. Without both, every `aws.*` call fails closed; there's no SigV4 signing against real AWS endpoints today.
 
 Invoke through the generic dispatcher, e.g. `opaque execute aws.get_caller_identity`.
 
 STS:
 
-- `aws.get_caller_identity` (`SAFE`) — account, ARN, user ID. No inputs.
-- `aws.assume_role` (`SENSITIVE_OUTPUT`) — inputs `role_arn`, optional `session_name`. Returns temporary credentials.
+- `aws.get_caller_identity` (`SAFE`): account, ARN, user ID. No inputs.
+- `aws.assume_role` (`SENSITIVE_OUTPUT`): inputs `role_arn`, optional `session_name`. Returns temporary credentials.
 
 Secrets Manager:
 
-- `aws.list_secrets` (`SAFE`) — no inputs. Lists secret names.
-- `aws.get_secret_value` (`REVEAL`) — input `secret_id`. Hard-blocked for agent clients (see notes above).
-- `aws.create_secret` (`SAFE`) — inputs `name`, `value`, optional `description`.
-- `aws.put_secret_value` (`SAFE`) — inputs `secret_id`, `value`.
-- `aws.delete_secret` (`SAFE`) — input `secret_id`. Schedules deletion.
+- `aws.list_secrets` (`SAFE`): no inputs. Lists secret names.
+- `aws.get_secret_value` (`REVEAL`): input `secret_id`. Hard-blocked for agent clients (see notes above).
+- `aws.create_secret` (`SAFE`): inputs `name`, `value`, optional `description`.
+- `aws.put_secret_value` (`SAFE`): inputs `secret_id`, `value`.
+- `aws.delete_secret` (`SAFE`): input `secret_id`. Schedules deletion.
 
 SSM Parameter Store:
 
-- `aws.get_parameter` (`REVEAL`) — input `name`. Hard-blocked for agent clients.
-- `aws.put_parameter` (`SAFE`) — inputs `name`, `value`, optional `type`, `overwrite`.
-- `aws.get_parameters_by_path` (`SAFE`) — input `path`, optional `with_decryption`. Lists parameters under a path.
-- `aws.delete_parameter` (`SAFE`) — input `name`.
+- `aws.get_parameter` (`REVEAL`): input `name`. Hard-blocked for agent clients.
+- `aws.put_parameter` (`SAFE`): inputs `name`, `value`, optional `type`, `overwrite`.
+- `aws.get_parameters_by_path` (`SAFE`): input `path`, optional `with_decryption`. Lists parameters under a path.
+- `aws.delete_parameter` (`SAFE`): input `name`.
 
 Notes:
 
-- `REVEAL` operations (`aws.get_secret_value`, `aws.get_parameter`) are never allowed for agent clients — the same global policy hard-block that applies to `onepassword.read_field` and `bitwarden.read_secret`.
-- GCP, Azure, Doppler, and Infisical have compiled client/resolver scaffolding behind opt-in Cargo features but **zero operations registered and zero handler wiring** — they are dormant, not "coming soon."
+- `REVEAL` operations (`aws.get_secret_value`, `aws.get_parameter`) are never allowed for agent clients: the same global policy hard-block that applies to `onepassword.read_field` and `bitwarden.read_secret`.
+- GCP, Azure, Doppler, and Infisical have compiled client/resolver scaffolding behind opt-in Cargo features but **zero operations registered and zero handler wiring**: they are dormant, not "coming soon."
 
 ## Deferred Specs (Not Implemented In v1)
 

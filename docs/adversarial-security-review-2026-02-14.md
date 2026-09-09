@@ -86,7 +86,7 @@ hard-blocked for every client, agent or human.
 
 **Status: RESOLVED.** `sandbox.exec` is registered
 `OperationSafety::SensitiveOutput`, and the response carries only
-`stdout_length`/`stderr_length` — never captured output content
+`stdout_length`/`stderr_length`, never captured output content
 (`crates/opaque-sandbox/src/lib.rs`, with a regression test asserting the
 response object has no `stdout`/`stderr` keys).
 
@@ -131,7 +131,7 @@ fails closed when patterns are configured but the derived list is empty
 
 **Status: RESOLVED.** `SqliteAuditSink::emit` redacts every event's
 `detail` text through the sanitizer before it is queued for persistence
-(`crates/opaque-core/src/audit.rs`) — exactly the "last line of defense"
+(`crates/opaque-core/src/audit.rs`): exactly the "last line of defense"
 recommended here, applied to all events including sandbox command detail.
 
 ### P1: Approvals and leases are not bound to operation params
@@ -152,7 +152,7 @@ recommended here, applied to all events including sandbox command detail.
 
 **Status: RESOLVED.** `OperationRequest::content_hash()` now includes a
 canonical JSON serialization of `params` (in addition to operation,
-target, secret_ref_names, client identity, and principal context) —
+target, secret_ref_names, client identity, and principal context):
 `crates/opaque-core/src/operation.rs`.
 
 ### P1: Provider base URLs accept insecure schemes (footgun)

@@ -11,8 +11,8 @@ branch. It is written down now.
 > **Approve the work. Keep authority bounded.**
 
 The first pair is the brand line, always two lines in that order. Line one
-makes the promise and performs it: `secret` is present in the markup —
-screen readers and search engines read "Secrets stay secret" — under a
+makes the promise and performs it: `secret` is present in the markup,
+so screen readers and search engines read "Secrets stay secret", under a
 redaction bar. Line two is why anyone tolerates line one: not to lock the
 agent out, but to keep it useful without handing it values.
 
@@ -20,36 +20,45 @@ Do not paraphrase it into "Secrets stay hidden" or "Agents stay productive".
 Do not use line one alone; half the slogan is an unfinished argument.
 
 The second pair is a secondary line, run right after the brand line where
-there's room: it names the mechanism (bounded agent work — see
+there's room: it names the mechanism (bounded agent work, see
 [bounded-work.md](docs/bounded-work.md)), the brand line names the
 guarantee. Alongside, never instead of.
 
 Brand line: landing hero (`docs/overrides/home.html`), `README.md`,
 `docs/index.md`, `site_description` in `mkdocs.yml`. Secondary line: runs
-alongside it in `README.md` and `docs/index.md` only — hero and meta
-description stay brand-line-only, both need to stay short.
+alongside it in `README.md` and `docs/index.md` only. Hero and meta
+description stay brand-line-only; both need to stay short.
 
 ## The audience
 
 Every external page names who this is for, early, in this frame:
 
-> Engineering organizations — ten developers and up — whose teams already
-> use AI coding agents, and who today either withhold sensitive access from
-> them or supervise every action.
+> Engineering teams of ten or more whose developers already use AI coding
+> agents. Today those teams either keep sensitive access away from the
+> agent or watch its every move.
 
-Three roles, always the same split: the **security or platform lead** owns
-policy, custody, and the evidence trail; the **developer** hands the agent
-real work, approves the exact scope once, and reads the receipt; the
+Three roles, always the same split. The **security or platform lead** owns
+policy, custody, and the evidence trail. The **developer** hands the agent
+real work, approves the exact scope once, and reads the receipt. The
 **agent** finishes the task with operations, never plaintext. Category
-statement, verbatim where the reader might mis-shelve us: *not a secrets
-manager and not an agent framework — the authorization and evidence layer
-between the two you already have.*
+statement, verbatim where the reader might mis-shelve us: *not another
+secrets manager or agent framework. It decides what may pass between the
+two you already have, and proves what did.*
 
 Do not claim government, compliance certifications, or a vertical: nothing
 shipped supports those claims. Do not pitch individual hobbyist developers
 as the market; the free-under-10-developers BUSL line is the on-ramp, not
 the audience. Where it lives: `#op-who` on the landing page, "Who It's For"
 in `README.md`, the opening paragraph of `docs/index.md`.
+
+## The voice
+
+Write like the reference sites read (ArcBox, Oleander): short declarative
+sentences, concrete nouns, real numbers, honest hedges stated flat. One
+dash per section at most; prefer a period, comma, or colon. Never the
+"not X, not Y, it's Z" cadence, chained appositives, or clever closers.
+If a sentence works read aloud in one breath, keep it. If it needs the
+dash to breathe, split it.
 
 ## The redaction motif
 
@@ -63,7 +72,7 @@ in the design competes with it:
 | `████` inline blocks | Terminal transcripts, prose | `.t-mask`, or literal block characters |
 
 The bar is drawn in `--op-redact-bg`: warm cream on the graphite ground, near-
-black on the paper ground — a censored document in both directions. It never
+black on the paper ground: a censored document in both directions. It never
 animates on `prefers-reduced-motion`; it is simply already there.
 
 ## Type and color
@@ -89,5 +98,5 @@ short version.
   Audit.
 - Never write "secure" without saying how, and never claim a guarantee the
   daemon does not enforce. The threat model is stated honestly on the site,
-  including what session mode does *not* prevent — that honesty is the brand.
+  including what session mode does *not* prevent. That honesty is the brand.
 - Monospace for anything a machine reads: commands, config keys, refs, IDs.

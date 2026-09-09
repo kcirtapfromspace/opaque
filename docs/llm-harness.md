@@ -28,8 +28,8 @@ Both paths go through the same daemon and policy engine. The MCP server is a thi
 
 ### Bounded Tasks (Multi-Step Work)
 
-For more than one operation — publish a secret *and* dispatch its release,
-or run a fixed host check — plan a single [bounded task](bounded-work.md)
+For more than one operation (publish a secret *and* dispatch its release,
+or run a fixed host check), plan a single [bounded task](bounded-work.md)
 instead of chaining calls: an immutable manifest, approved once, executed
 once, with a receipt. MCP (`opaque_task_plan`, `opaque_task_run`, …) and the
 CLI (`opaque task plan`, `opaque task run`, …) expose the same lifecycle.
@@ -85,7 +85,7 @@ The CLI never sees the resolved secret values *directly*, but secrets can still 
 ## Approvals
 
 Approvals are operation-bound, triggered as part of execution. An LLM tool
-call can request an operation but can't satisfy any factor itself — each
+call can request an operation but can't satisfy any factor itself: each
 completes on hardware or a channel the agent doesn't control.
 
 Implemented factors (see [Policy](policy.md#approval-configuration)):
@@ -93,9 +93,9 @@ Implemented factors (see [Policy](policy.md#approval-configuration)):
 - `local_bio`: native OS prompt (macOS LocalAuthentication, Linux polkit)
 - `fido2`: hardware security key or passkey (FIDO2/WebAuthn)
 - `paired_workstation`: full-manifest review by an enrolled trusted
-  workstation — used for bounded task approval
+  workstation; used for bounded task approval
 - `ios_faceid`: paired second-device approval (Ed25519). Despite the wire
-  name, this ships as desktop-to-desktop pairing, not an iOS app — see
+  name, this ships as desktop-to-desktop pairing, not an iOS app; see
   [mobile approvals](mobile-approvals.md)
 
 ## Handling Common Requests Safely
@@ -135,6 +135,6 @@ Use:
 
 Opaque injects secrets into the sandboxed process environment, but the two
 paths differ downstream: the CLI prints raw stdout/stderr, so `opaque exec`
-can leak anything a command prints — treat it as `SENSITIVE_OUTPUT` and
+can leak anything a command prints; treat it as `SENSITIVE_OUTPUT` and
 avoid commands that echo secrets. The MCP tool withholds output entirely,
 returning only exit code and byte lengths.
