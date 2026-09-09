@@ -208,6 +208,41 @@ change separately from the web application rollout.
 
 ## Validate, then open requests
 
+### Request and storage budgets
+
+The controller polls every 30 seconds while idle and every 2 seconds when work
+is returned. `next_poll_at` and the legacy `next_alarm_at` cap that wait at lease
+expiry or a quarantined cleanup retry. Paused admissions do not stop draining.
+Consecutive queue failures back off from 30 seconds to a maximum of 300 seconds;
+future known deadlines preempt the wait, while an already-passed deadline does
+not force repeated fast retries during an outage. Once capped, recovery may
+take up to five minutes to be detected. Existing proxy/runtime expiry fences
+continue to apply during that wait.
+
+Optional controller environment settings are `OPAQUE_DEMO_POLL_SECONDS` (2),
+`OPAQUE_DEMO_IDLE_POLL_SECONDS` (30), and
+`OPAQUE_DEMO_ERROR_BACKOFF_MAX_SECONDS` (300). All must be finite, with
+`1 <= active <= 30` and `active <= idle <= error maximum <= 300` seconds.
+
+Visible landing pages check idle/terminal sessions every 60 seconds, and
+queued, provisioning, ready, cleaning, and quarantined sessions every 5 seconds.
+Configuration is refreshed at most once a minute during ordinary polling.
+Hidden tabs stop scheduled checks; returning, retrying, or completing an action
+forces a fresh check. Connection failures back off to five minutes. Local
+countdowns still close expired workspace links independently of polling.
+
+The scheduler commits at most one queue-state change per `/internal/work`
+request and changes a storage alarm only when its deadline changes. Identical
+state writes are skipped without dropping the persisted monotonic clock. The
+Durable Object class, queue schema, generations, and cleanup evidence remain
+compatible with the previous release. With no visitors or pending work,
+30-second polling is approximately 2,880 Worker requests and 2,880 queue-state
+writes per day, excluding other account usage and network latency. Measure both
+Worker requests and Durable Object rows written; successful Worker execution
+metrics can still contain handled HTTP 503 responses.
+
+### Validation
+
 Run local tests before deployment:
 
 ```sh

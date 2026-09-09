@@ -49,7 +49,7 @@ function fixture(t, modelIds = ['gemma4-e2b'], defaultModel = 'gemma4-e2b') {
             case 'finishChat': data = result.queue.finishChat(args[0], args[1], result.now); break;
             default: throw new Error('unexpected scheduler action');
           }
-          result.queue.work(result.now); // Mirrors the DO's alarm-arm sweep.
+          if (action !== 'work') result.queue.work(result.now); // Mirrors the DO's alarm-arm sweep.
           return Response.json(data);
         } catch (error) {
           if (!(error instanceof QueueError)) throw error;

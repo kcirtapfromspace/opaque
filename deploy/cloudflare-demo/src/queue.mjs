@@ -78,7 +78,11 @@ export class SqliteQueueStore {
       if (output && typeof output.then === "function") throw new QueueError("async_transaction_forbidden", 503);
       const encoded = JSON.stringify(output.state);
       if (encoded.length > 4 * 1024 * 1024) throw new QueueError("queue_state_exceeded_limit", 503);
-      this.storage.sql.exec("INSERT INTO demo_queue_state (id,value) VALUES (1,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value", encoded);
+      // Preserve every state change, including the monotonic time watermark.
+      // Repeated operations at the same effective time need no identical write.
+      if (encoded !== rows[0].value) {
+        this.storage.sql.exec("INSERT INTO demo_queue_state (id,value) VALUES (1,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value", encoded);
+      }
       return output.result;
     });
   }
@@ -168,9 +172,14 @@ export class DemoQueue {
         });
         occupied.add(slot);
       }
+      const nextAlarmAt = nextAlarm(state, time);
+      const pollDeadlines = state.tickets.filter((ticket) => ticket.state === "quarantined" && ticket.cleanup_retry_at > time).map((ticket) => ticket.cleanup_retry_at);
+      if (nextAlarmAt !== null) pollDeadlines.push(nextAlarmAt);
       return {
         actions: state.tickets.filter((ticket) => ticket.state === "provisioning" || ticket.state === "cleaning" || (ticket.state === "quarantined" && time >= ticket.cleanup_retry_at)).map(action),
-        next_alarm_at: nextAlarm(state, time),
+        next_alarm_at: nextAlarmAt,
+        // Cleanup retries need prompt controller polling, not recurring alarms.
+        next_poll_at: pollDeadlines.length ? Math.min(...pollDeadlines) : null,
       };
     });
   }

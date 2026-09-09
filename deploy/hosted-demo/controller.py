@@ -160,6 +160,8 @@ class Config:
     oauth_client_id: str = ""
     oauth_client_secret: str = ""
     oauth_provider: str = ""
+    idle_poll_seconds: float = 30
+    error_backoff_max_seconds: float = 300
 
     def validate(self):
         url = urllib.parse.urlsplit(self.worker_url)
@@ -174,6 +176,12 @@ class Config:
             raise ControllerError("invalid controller credential")
         if not IMAGE.fullmatch(self.image):
             raise ControllerError("runtime image must be digest pinned")
+        intervals = (self.poll_seconds, self.idle_poll_seconds, self.error_backoff_max_seconds)
+        if (any(type(value) not in (int, float) or not 1 <= value <= 300 for value in intervals)
+                or not self.poll_seconds <= 30
+                or not self.poll_seconds <= self.idle_poll_seconds <= self.error_backoff_max_seconds):
+            # The bounded comparisons also reject NaN and infinite durations.
+            raise ControllerError("invalid controller polling intervals")
         if self.oauth_provider or self.oauth_issuer or self.oauth_client_id or self.oauth_client_secret:
             if (not re.fullmatch(r"[A-Za-z0-9._-]{1,256}", self.oauth_client_id)
                     or (self.oauth_provider or "oidc") not in {"oidc", "github"}):
@@ -279,6 +287,7 @@ class Controller:
         self.locks = [threading.RLock() for _ in config.namespaces]
         self.model_lock = threading.Lock()
         self.stop = threading.Event()
+        self.next_poll_at = None
 
     def load_state(self, slot):
         item = self.kube.get(self.config.namespaces[slot], "configmaps", STATE_NAME)
@@ -479,20 +488,47 @@ class Controller:
                                       headers={"Authorization": "Bearer " + self.config.controller_secret})
         if status != 200 or not isinstance(value, dict) or not isinstance(value.get("actions"), list) or len(value["actions"]) > 2:
             raise ControllerError("invalid queue response")
+        deadlines = (value.get("next_alarm_at"), value.get("next_poll_at"))
+        if any(deadline is not None and (type(deadline) is not int or not 0 <= deadline <= 2**53 - 1)
+               for deadline in deadlines):
+            raise ControllerError("invalid queue deadline")
+        # Empty work can still contain a ready lease's expiry or a quarantined
+        # cleanup retry. Old Workers provide only next_alarm_at. Keep the last
+        # accepted deadline across transport failures so backoff cannot skip it.
+        self.next_poll_at = min((deadline for deadline in deadlines if deadline is not None), default=None)
         for action in value["actions"]:
             try:
                 self.handle_action(action)
             except ControllerError:
                 # Work is durable at the Worker; failure never returns capacity.
                 continue
+        return bool(value["actions"])
+
+    def poll_delay(self, interval, failed=False):
+        if self.next_poll_at is not None:
+            remaining = (self.next_poll_at - self.clock()) / 1000
+            if remaining > 0:
+                return min(interval, remaining)
+            if not failed:
+                # An overdue healthy queue needs prompt reconciliation, with
+                # a positive interval even if it repeatedly returns no work.
+                return min(interval, self.config.poll_seconds)
+        # Once a deadline has passed, an outage still backs off. No cleanup can
+        # be fetched during that outage; local runtime/proxy expiry fences hold.
+        return interval
 
     def run(self):
+        error_delay = self.config.idle_poll_seconds
         while not self.stop.is_set():
             try:
-                self.poll_once()
+                active = self.poll_once()
             except ControllerError:
-                pass
-            self.stop.wait(self.config.poll_seconds)
+                delay = self.poll_delay(error_delay, failed=True)
+                error_delay = min(self.config.error_backoff_max_seconds, error_delay * 2)
+            else:
+                error_delay = self.config.idle_poll_seconds
+                delay = self.poll_delay(self.config.poll_seconds if active else self.config.idle_poll_seconds)
+            self.stop.wait(delay)
 
 
 class ProxyServer(ThreadingHTTPServer):
@@ -679,6 +715,9 @@ def main():
     config = Config(os.environ["OPAQUE_DEMO_WORKER_URL"], os.environ["OPAQUE_DEMO_CONTROLLER_SECRET"],
                     tuple(os.environ.get("OPAQUE_DEMO_SLOT_NAMESPACES", "opaque-demo-slot-0").split(",")),
                     os.environ["OPAQUE_DEMO_RUNTIME_IMAGE"],
+                    poll_seconds=float(os.environ.get("OPAQUE_DEMO_POLL_SECONDS", "2")),
+                    idle_poll_seconds=float(os.environ.get("OPAQUE_DEMO_IDLE_POLL_SECONDS", "30")),
+                    error_backoff_max_seconds=float(os.environ.get("OPAQUE_DEMO_ERROR_BACKOFF_MAX_SECONDS", "300")),
                     oauth_issuer=os.environ.get("OPAQUE_DEMO_OAUTH_ISSUER", ""),
                     oauth_client_id=os.environ.get("OPAQUE_DEMO_OAUTH_CLIENT_ID", ""),
                     oauth_client_secret=os.environ.get("OPAQUE_DEMO_OAUTH_CLIENT_SECRET", ""),

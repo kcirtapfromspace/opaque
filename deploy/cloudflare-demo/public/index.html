@@ -73,7 +73,8 @@ header{display:flex;justify-content:space-between;align-items:center;gap:24px;mi
 </div>
 <script>
 'use strict';
-var model = {config:null,session:null,botToken:null,widgetId:null,widgetPromise:null,busy:false,refreshing:false,pollTimer:null,lastState:null,lastSync:null,error:null,actionError:null,selectedModelId:null,modelSelectionInitialized:false,catalogSignature:null};
+var model = {config:null,session:null,botToken:null,widgetId:null,widgetPromise:null,busy:false,refreshing:false,pollTimer:null,countdownTimer:null,refreshController:null,refreshPending:false,forceConfig:false,configCheckedAt:null,pollFailures:0,lastState:null,lastSync:null,error:null,actionError:null,selectedModelId:null,modelSelectionInitialized:false,catalogSignature:null};
+var FAST_POLL_MS=5000,IDLE_POLL_MS=60000,CONFIG_CACHE_MS=60000,MAX_POLL_MS=300000;
 var STATES = {
   none:{code:'REQUEST A SESSION',title:'Your analyst workspace awaits.',description:'Review one bounded task and explore portfolio chat with synthetic loan application events. Your temporary session fixes the customer and data scope. If there’s a wait, we’ll show your place in the queue.'},
   queued:{code:'IN THE QUEUE',title:'Your place is held.',description:'The service will prepare your workspace when it is your turn. You can leave this page open or return in this browser.'},
@@ -96,7 +97,7 @@ function validSession(value){if(!value||typeof value!=='object'||!Object.hasOwn(
 function renderError(){var message=model.actionError||model.error;el('error').textContent=message||'';el('error').hidden=!message;el('retry').hidden=!message;}
 function showError(message,action){if(action)model.actionError=message;else model.error=message;renderError();}
 function clearError(preserveAction){model.error=null;if(!preserveAction)model.actionError=null;renderError();}
-function retryStatus(){clearError();model.config=null;return refresh();}
+function retryStatus(){clearError();return refresh({forceConfig:true});}
 function updateCountdown(){
   var session=model.session;
   var active=session&&['ready','active'].includes(session.state);
@@ -194,17 +195,55 @@ async function ensureWidget(){
     el('verification-status').textContent='Complete the verification above to continue.';
   }catch(error){el('verification-status').textContent=error.message;showError(error.message);}
 }
-function schedulePoll(){clearTimeout(model.pollTimer);model.pollTimer=setTimeout(refresh,5000);}
-async function refresh(){
-  if(model.busy||model.refreshing){schedulePoll();return;}
-  model.refreshing=true;updateJoin();
-  try{
-    model.config=await request('config');
-    model.session=validSession(await request('session'));model.lastSync=Date.now();clearError(true);render();
-    el('sync-note').textContent='Checked '+new Date(model.lastSync).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})+' · updates every 5 seconds';
-  }catch(error){showError(error.message);el('sync-note').textContent='Status update failed. The last confirmed state is retained.';el('availability').textContent='Service unavailable';el('availability').className='service-status';el('workspace').hidden=true;}
-  finally{model.refreshing=false;updateJoin();schedulePoll();}
+function pollDelay(){
+  var active=model.session&&!terminal(model.session.state);
+  return Math.min(MAX_POLL_MS,(active?FAST_POLL_MS:IDLE_POLL_MS)*Math.pow(2,Math.min(model.pollFailures,6)));
 }
+function updateSyncNote(){
+  var failed=model.pollFailures>0?'Status update failed. The last confirmed state is retained. ':'';
+  if(document.hidden){el('sync-note').textContent=failed+'Checks paused while this tab is hidden. Status refreshes when you return.';return;}
+  if(failed){el('sync-note').textContent=failed+'Retrying in '+pollDelay()/1000+' seconds.';return;}
+  el('sync-note').textContent=model.lastSync===null?'Checking service status.':'Checked '+new Date(model.lastSync).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})+' · updates every '+pollDelay()/1000+' seconds while visible';
+}
+function schedulePoll(){
+  clearTimeout(model.pollTimer);model.pollTimer=null;
+  if(!document.hidden)model.pollTimer=setTimeout(refresh,pollDelay());
+  updateSyncNote();
+}
+async function refresh(options){
+  if(options&&options.forceConfig)model.forceConfig=true;
+  clearTimeout(model.pollTimer);model.pollTimer=null;
+  if(document.hidden){updateSyncNote();return;}
+  if(model.busy||model.refreshing){model.refreshPending=true;schedulePoll();return;}
+  model.refreshPending=false;model.refreshing=true;updateJoin();
+  var controller=new AbortController();model.refreshController=controller;
+  var fetchConfig=model.forceConfig||!model.config||model.configCheckedAt===null||Date.now()-model.configCheckedAt>=CONFIG_CACHE_MS;
+  model.forceConfig=false;
+  try{
+    var config=fetchConfig?await request('config',{signal:controller.signal}):model.config;
+    if(controller.signal.aborted||document.hidden)return;
+    var session=validSession(await request('session',{signal:controller.signal}));
+    if(controller.signal.aborted||document.hidden)return;
+    model.config=config;if(fetchConfig)model.configCheckedAt=Date.now();
+    model.session=session;model.lastSync=Date.now();model.pollFailures=0;clearError(true);render();
+  }catch(error){
+    if(!controller.signal.aborted){model.pollFailures++;model.forceConfig=true;showError(error.message);el('availability').textContent='Service unavailable';el('availability').className='service-status';el('workspace').hidden=true;}
+  }finally{
+    model.refreshing=false;model.refreshController=null;updateJoin();
+    if(model.refreshPending&&!model.busy&&!document.hidden){model.refreshPending=false;await refresh();}
+    else schedulePoll();
+  }
+}
+function startCountdown(){if(!document.hidden&&model.countdownTimer===null)model.countdownTimer=setInterval(updateCountdown,1000);}
+function visibilityChanged(){
+  if(document.hidden){
+    clearTimeout(model.pollTimer);model.pollTimer=null;clearInterval(model.countdownTimer);model.countdownTimer=null;
+    if(model.refreshController)model.refreshController.abort();
+    updateSyncNote();return;
+  }
+  updateCountdown();startCountdown();refresh({forceConfig:true});
+}
+function initPolling(){document.addEventListener('visibilitychange',visibilityChanged);startCountdown();return refresh({forceConfig:true});}
 async function join(){
   if(model.busy||model.refreshing||model.error||!model.botToken||!model.config||!model.config.available||!model.session||!terminal(model.session.state)||!selectedModel())return;
   var selectedId=model.selectedModelId;
@@ -212,7 +251,7 @@ async function join(){
   var failure=null;
   try{await request('join',{method:'POST',headers:{Accept:'application/json','Content-Type':'application/json'},body:JSON.stringify({turnstile_token:token,model_id:selectedId})});}
   catch(error){failure=error.message;}
-  finally{model.busy=false;resetWidget();await refresh();if(failure){showError(failure,true);updateJoin();}}
+  finally{model.busy=false;resetWidget();await refresh({forceConfig:true});if(failure){showError(failure,true);updateJoin();}}
 }
 async function cancel(){
   if(model.busy||model.refreshing||!model.session||!['queued','provisioning','ready','active'].includes(model.session.state))return;
@@ -220,7 +259,7 @@ async function cancel(){
   var failure=null;
   try{await request('cancel',{method:'POST',headers:{Accept:'application/json','Content-Type':'application/json'},body:'{}'});}
   catch(error){failure=error.message;}
-  finally{model.busy=false;await refresh();if(failure){showError(failure,true);updateJoin();}}
+  finally{model.busy=false;await refresh({forceConfig:true});if(failure){showError(failure,true);updateJoin();}}
 }
 
 function initWorkflow(){
@@ -265,7 +304,7 @@ function initWorkflow(){
   }
   sync();
 }
-function init(){initWorkflow();el('demo-model-choice').addEventListener('change',function(){chooseModel(this.value);});el('join').addEventListener('click',join);el('cancel').addEventListener('click',cancel);el('retry').addEventListener('click',retryStatus);document.addEventListener('visibilitychange',function(){if(!document.hidden)refresh();});setInterval(updateCountdown,1000);refresh();}
+function init(){initWorkflow();el('demo-model-choice').addEventListener('change',function(){chooseModel(this.value);});el('join').addEventListener('click',join);el('cancel').addEventListener('click',cancel);el('retry').addEventListener('click',retryStatus);initPolling();}
 init();
 </script>
 </body>

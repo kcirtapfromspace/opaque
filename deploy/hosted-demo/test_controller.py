@@ -92,13 +92,14 @@ class FakeHttp:
         self.health_profile = "gemma4-e2b"
         self.health_fields = {}
         self.actions = []
+        self.next_alarm_at = None
 
     def json(self, url, method="GET", value=None, headers=None, timeout=10):
         if url.endswith("/internal/report"):
             self.reports.append(copy.deepcopy(value))
             return 200, {"ok": True}
         if url.endswith("/internal/work"):
-            return 200, {"actions": self.actions, "next_alarm_at": None}
+            return 200, {"actions": self.actions, "next_alarm_at": self.next_alarm_at}
         if url.endswith("/health"):
             if not self.health_available:
                 raise c.ControllerError("unavailable")
@@ -115,11 +116,166 @@ class FakeHttp:
         return Response(b'data: {"text":"synthetic only"}\n\n')
 
 
-def make_controller(slots=1, kube=None, http=None, clock=lambda: NOW):
+def make_controller(slots=1, kube=None, http=None, clock=lambda: NOW, **config_fields):
     config = c.Config("https://demo.opaque.info", "c" * 64,
                       tuple(f"opaque-demo-slot-{n}" for n in range(slots)),
-                      "registry.example/opaque-demo@sha256:" + "1" * 64)
+                      "registry.example/opaque-demo@sha256:" + "1" * 64, **config_fields)
     return c.Controller(config, kube or FakeKube(slots), http or FakeHttp(), clock)
+
+
+class PollingTests(unittest.TestCase):
+    def scripted(self, responses, *, action_handler=None, **config_fields):
+        clock, delays, requests = [NOW], [], []
+        ctl = make_controller(clock=lambda: clock[0], **config_fields)
+        count = len(responses)
+        responses = iter(responses)
+
+        class Stop:
+            stopped = False
+
+            def is_set(self):
+                return self.stopped
+
+            def wait(self, delay):
+                delays.append(delay)
+                clock[0] += round(delay * 1000)
+                self.stopped = len(delays) == count
+
+        ctl.stop = Stop()
+
+        def queue_response(url, **_kwargs):
+            self.assertTrue(url.endswith("/internal/work"))
+            try:
+                value = next(responses)
+            except StopIteration:
+                ctl.stop.stopped = True
+                raise AssertionError("unexpected extra poll")
+            requests.append(clock[0])
+            if isinstance(value, Exception):
+                raise value
+            return 200, value
+
+        ctl.http.json = queue_response
+        if action_handler is not None:
+            ctl.handle_action = lambda work: action_handler(work, clock)
+        ctl.run()
+        return ctl, delays, requests
+
+    def test_idle_polling_stays_slow_and_actions_resume_fast_polling(self):
+        handled = []
+        _, delays, _ = self.scripted([
+            {"actions": [], "next_alarm_at": None},
+            {"actions": [action("cleanup")], "next_alarm_at": None},
+            {"actions": [], "next_alarm_at": None},
+        ], action_handler=lambda work, _clock: handled.append(work["kind"]))
+        self.assertEqual(delays, [30, 2, 30])
+        self.assertEqual(handled, ["cleanup"])
+
+    def test_failed_action_keeps_fast_retries_and_does_not_skip_other_work(self):
+        handled = []
+        def fail_action(work, _clock):
+            handled.append(work["slot"])
+            raise c.ControllerError("runtime unavailable")
+        _, delays, _ = self.scripted([
+            {"actions": [action(), action(slot=1)], "next_alarm_at": NOW + 100_000},
+        ], action_handler=fail_action)
+        self.assertEqual(handled, [0, 1])
+        self.assertEqual(delays, [2])
+
+    def test_ready_lease_deadline_preempts_idle_wait_with_no_actions(self):
+        _, delays, requests = self.scripted([
+            {"actions": [], "next_alarm_at": NOW + 4250},
+            {"actions": [action("cleanup")], "next_alarm_at": None},
+        ], action_handler=lambda _work, _clock: None)
+        self.assertEqual(delays, [4.25, 2])
+        self.assertEqual(requests[1], NOW + 4250)
+
+    def test_deadline_cap_accounts_for_time_spent_handling_actions(self):
+        def handle(_work, clock):
+            clock[0] += 9000
+        _, delays, _ = self.scripted([
+            {"actions": [action()], "next_alarm_at": NOW + 10_000},
+        ], action_handler=handle)
+        self.assertEqual(delays, [1])
+
+    def test_cleanup_retry_hint_preempts_idle_wait_without_requiring_an_alarm(self):
+        _, delays, _ = self.scripted([
+            {"actions": [], "next_alarm_at": None, "next_poll_at": NOW + 5000},
+            {"actions": [action("cleanup")], "next_alarm_at": None, "next_poll_at": None},
+        ], action_handler=lambda _work, _clock: None)
+        self.assertEqual(delays, [5, 2])
+
+    def test_poll_hint_cannot_defer_an_earlier_lease_or_history_alarm(self):
+        _, delays, _ = self.scripted([
+            {"actions": [], "next_alarm_at": NOW + 3000, "next_poll_at": NOW + 10_000},
+        ])
+        self.assertEqual(delays, [3])
+
+    def test_errors_back_off_to_cap_and_success_resets_backoff(self):
+        failure = c.ControllerError("queue unavailable")
+        _, delays, _ = self.scripted([
+            *([failure] * 6), {"actions": [], "next_alarm_at": None}, failure,
+        ])
+        self.assertEqual(delays, [30, 60, 120, 240, 300, 300, 30, 30])
+
+    def test_backoff_retains_future_deadline_but_continues_after_it_passes(self):
+        failure = c.ControllerError("queue unavailable")
+        ctl, delays, requests = self.scripted([
+            {"actions": [], "next_alarm_at": NOW + 100_000}, failure, failure, failure,
+        ])
+        self.assertEqual(delays, [30, 30, 40, 120])
+        self.assertEqual(requests[-1], NOW + 100_000)
+        self.assertEqual(ctl.next_poll_at, NOW + 100_000)
+
+    def test_healthy_overdue_deadline_retries_without_busy_loop_and_can_clear(self):
+        _, delays, _ = self.scripted([
+            {"actions": [], "next_alarm_at": NOW},
+            {"actions": [], "next_alarm_at": NOW},
+            {"actions": [], "next_alarm_at": None},
+        ])
+        self.assertEqual(delays, [2, 2, 30])
+
+    def test_invalid_queue_deadline_preserves_previous_deadline(self):
+        ctl = make_controller()
+        ctl.next_poll_at = NOW + 100_000
+        for field in ("next_alarm_at", "next_poll_at"):
+            for invalid in (True, -1, 2**53, 1.5, float("inf"), float("nan"), "soon", {}):
+                with self.subTest(field=field, deadline=invalid):
+                    ctl.http.json = lambda *_args, **_kwargs: (200, {"actions": [], field: invalid})
+                    with self.assertRaises(c.ControllerError):
+                        ctl.poll_once()
+                    self.assertEqual(ctl.next_poll_at, NOW + 100_000)
+
+    def test_config_rejects_unbounded_or_inverted_polling_intervals(self):
+        for field in ("poll_seconds", "idle_poll_seconds", "error_backoff_max_seconds"):
+            for invalid in (0, -1, 301, float("inf"), float("nan"), True, "30", None):
+                with self.subTest(field=field, value=invalid), self.assertRaises(c.ControllerError):
+                    make_controller(**{field: invalid})
+        for fields in ({"poll_seconds": 31}, {"poll_seconds": 3, "idle_poll_seconds": 2},
+                       {"idle_poll_seconds": 60, "error_backoff_max_seconds": 30}):
+            with self.subTest(fields=fields), self.assertRaises(c.ControllerError):
+                make_controller(**fields)
+        _, delays, _ = self.scripted([
+            {"actions": [], "next_alarm_at": None}, c.ControllerError("queue unavailable"),
+            c.ControllerError("queue unavailable"),
+        ], poll_seconds=1.5, idle_poll_seconds=10, error_backoff_max_seconds=15)
+        self.assertEqual(delays, [10, 10, 15])
+
+    def test_stop_interrupts_long_idle_wait(self):
+        ctl = make_controller(idle_poll_seconds=300)
+        polled = threading.Event()
+        def queue_response(*_args, **_kwargs):
+            polled.set()
+            return 200, {"actions": [], "next_alarm_at": None}
+        ctl.http.json = queue_response
+        thread = threading.Thread(target=ctl.run, daemon=True)
+        thread.start()
+        try:
+            self.assertTrue(polled.wait(1))
+        finally:
+            ctl.stop.set()
+            thread.join(1)
+        self.assertFalse(thread.is_alive())
 
 
 class ControllerTests(unittest.TestCase):
