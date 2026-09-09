@@ -9,6 +9,8 @@ notes; `scripts/release-prep.sh` stamps the section below at release time.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-09
+
 ### Added
 
 - **Optional pilot contact capture** in the public demo: a visitor can
