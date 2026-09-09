@@ -1,6 +1,6 @@
 # Code quality remediation and validation
 
-Private engineering record, 2026-09-09. Implements the findings in [the review and gap plan](2026-09-09-code-quality-gap-plan.md), against base commit `e49b49e17aab4f1e73d42c8d6cce7b15de0bd711`. This record must remain excluded from public artifacts. Changes are local and uncommitted; no deployment, remote branch, repository setting, or running cluster was modified.
+Private engineering record, 2026-09-09. Implements the findings in [the review and gap plan](2026-09-09-code-quality-gap-plan.md), against base commit `e49b49e17aab4f1e73d42c8d6cce7b15de0bd711`. This record must remain excluded from public artifacts. The remediation was committed locally as `0dab7ef`; the checks below describe that pre-extraction tree. The subsequent merge of the local crate extraction and its separate validation are recorded in [the merge record](2026-09-09-quality-extraction-merge-validation.md). No deployment, remote branch, repository setting, or running cluster was modified.
 
 ## Implemented changes
 
@@ -45,7 +45,7 @@ Host: Apple M1 Ultra, arm64, macOS 26.6.2, Rust 1.95.0. `cargo bench --locked -p
 
 The same release harness initially measured target summaries at 346,719 ns after secret-pattern caching. That exposed remaining per-call URL-regex compilation. Caching those exact patterns reduced the measured median to 1,397 ns. This is a comparison between two local implementations in this change, not a claimed whole-application speedup or comparison against an unmeasured release build of the original commit.
 
-Receipt and SSE load tests have explicit ignored entrypoints so routine correctness checks do not acquire machine-speed-dependent latency budgets. Run the receipt harness with `cargo test --release --locked -p opaqued --bin opaqued task_pagination_scales -- --ignored --nocapture`. It reports history size, returned rows/bytes, and page latency; bounded work is enforced separately by the ordinary regression.
+Receipt and SSE load tests have explicit ignored entrypoints so routine correctness checks do not acquire machine-speed-dependent latency budgets. After the crate extraction, run the receipt harness with `cargo test --release --locked -p opaque-bounded-work --lib task_pagination_scales -- --ignored --nocapture`. It reports history size, returned rows/bytes, and page latency; bounded work is enforced separately by the ordinary regression.
 
 The release receipt run returned 100 rows and 97,201 serialized bytes for both histories: the first page took 1.379 ms with 1,000 stored receipts and 1.120 ms with 100,000. These are single observations, not latency percentiles. The ordinary regression verifies that corrupt unvisited history is not decoded; existing authority-transition tests continue to cover concurrent claim/reservation/revocation.
 

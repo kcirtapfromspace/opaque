@@ -307,7 +307,7 @@ class ChatFixture:
         if not self.openssl:
             raise RuntimeError("OpenSSL is required for the disposable OAuth issuer")
         self.issuer = f"http://127.0.0.1:{args.issuer_port}"
-        self.binary = ROOT / "target/debug/opaque-metrics"
+        self.binary = ROOT / "target/debug/opaque-showcase"
         self.configs = []
         for port in [args.port, args.port + 1, args.issuer_port, args.source_port, args.source_port + 1]:
             with socket.socket() as probe:
@@ -336,9 +336,9 @@ class ChatFixture:
 
     def prepare(self):
         if not self.args.no_build:
-            subprocess.run(["cargo", "build", "--locked", "-p", "opaque-metrics"], cwd=ROOT, env=dict(self.env, CARGO_INCREMENTAL="0"), check=True)
+            subprocess.run(["cargo", "build", "--locked", "-p", "opaque-showcase"], cwd=ROOT, env=dict(self.env, CARGO_INCREMENTAL="0"), check=True)
         if not self.binary.is_file():
-            raise RuntimeError("Build the opaque-metrics native binary before --no-build")
+            raise RuntimeError("Build the opaque-showcase native binary before --no-build")
         public_key = subprocess.run([self.openssl, "pkey", "-in", str(TEST_KEY), "-pubout"], capture_output=True, text=True, check=True).stdout
         for index, suffix in enumerate(["a", "b"]):
             tenant = "synthetic-" + suffix
@@ -358,7 +358,7 @@ class ChatFixture:
         issuer_dir = self.directory / "issuer"
         issuer_dir.mkdir(mode=0o700)
         dump(issuer_dir / "config.json", {"port": self.args.issuer_port, "clients": self.clients, "openssl": self.openssl})
-        dump(self.directory / "binary-digest.json", {"opaque-metrics": hashlib.sha256(self.binary.read_bytes()).hexdigest()})
+        dump(self.directory / "binary-digest.json", {"opaque-showcase": hashlib.sha256(self.binary.read_bytes()).hexdigest()})
 
     def start_gateway(self, index):
         config = self.configs[index]

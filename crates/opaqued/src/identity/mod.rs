@@ -22,7 +22,10 @@ pub mod store;
 use std::path::Path;
 use std::sync::Arc;
 
-use opaque_core::identity::{Role, roles_from_string};
+use opaque_core::audit::{AuditEvent, AuditEventKind, ClientSummary};
+use opaque_core::identity::{PrincipalContext, Role, roles_from_string};
+use opaque_core::operation::{ClientIdentity, ClientType};
+use opaque_core::proto::{Request, Response};
 use serde::Deserialize;
 use tracing::{info, warn};
 
@@ -30,6 +33,8 @@ use login::LoginAttempts;
 use oidc::OidcClient;
 pub use persona::PersonaConfig;
 use store::IdentityStore;
+
+use crate::DaemonState;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -321,5 +326,304 @@ impl IdentityRuntime {
     pub fn current_human_has_role(&self, role: Role) -> bool {
         self.current_human_principal()
             .is_some_and(|p| !p.disabled && p.has_role(role))
+    }
+}
+
+/// `resource_authority.rs` moved to `opaque-bounded-work`, which cannot name
+/// `IdentityRuntime` (this crate has no `lib.rs`, and `identity/` stays
+/// here regardless — see that module's doc comment). This implements the
+/// narrow trait it defines instead, the same "opaqued implements a trait
+/// the extracted crate defines" direction as
+/// `opaque_bounded_work::task_facade::BoundedWorkFacade for Enclave`.
+impl opaque_bounded_work::resource_authority::IdentityAuthority for IdentityRuntime {
+    fn config_issuer(&self) -> &str {
+        &self.config.issuer
+    }
+
+    fn config_required(&self) -> bool {
+        self.config.required
+    }
+
+    fn persona_max_age_secs(&self) -> Option<u64> {
+        self.config.persona.as_ref().map(|p| p.max_age_secs)
+    }
+
+    fn principal_permitted(&self, principal: &opaque_core::identity::Principal) -> bool {
+        IdentityRuntime::principal_permitted(self, principal)
+    }
+
+    fn get_human_by_subject(
+        &self,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<Option<opaque_core::identity::Principal>, String> {
+        self.store.get_human_by_subject(issuer, subject)
+    }
+
+    fn resource_token_revoked(
+        &self,
+        issuer: &str,
+        audience: &str,
+        jti: &str,
+    ) -> Result<bool, String> {
+        self.store.resource_token_revoked(issuer, audience, jti)
+    }
+
+    fn revoke_resource_token(
+        &self,
+        issuer: &str,
+        audience: &str,
+        jti: &str,
+        expires_at: i64,
+    ) -> Result<(), String> {
+        self.store
+            .revoke_resource_token(issuer, audience, jti, expires_at)
+    }
+
+    fn authorize_scopes(
+        &self,
+        binding: &opaque_core::tenant::TenantBinding,
+        recipient: &opaque_core::identity::PrincipalId,
+        now: i64,
+        persona_max_age_secs: u64,
+    ) -> Result<std::collections::BTreeSet<String>, String> {
+        self.store
+            .authorize_scopes(binding, recipient, now, persona_max_age_secs, |p| {
+                self.principal_permitted(p)
+            })
+    }
+
+    fn emit_audit(&self, event: opaque_core::audit::AuditEvent) {
+        IdentityRuntime::emit_audit(self, event)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RPC handlers
+// ---------------------------------------------------------------------------
+
+/// `identity.role_set`: change a principal's roles, gated on a fresh
+/// out-of-band admin approval, a last-admitted-admin lockout guard, and a
+/// TOCTOU recheck of both the acting admin's and target's state after the
+/// approval completes (membership/roles can change while the human is
+/// reviewing).
+///
+/// Extracted verbatim out of `main.rs`'s `handle_request` dispatch (pure
+/// structural move, no behavior change) — this arm alone was ~195 inline
+/// lines, by far the thickest `identity.*` method (contrast
+/// `identity.login_start`'s ~27-line clean delegate, left inline in
+/// `main.rs`).
+pub async fn handle_role_set(
+    state: &DaemonState,
+    req: Request,
+    identity: &ClientIdentity,
+    client_type: ClientType,
+    principal_ctx: Option<PrincipalContext>,
+    session_id: Option<&str>,
+) -> Response {
+    let Some(rt) = state.identity.as_ref() else {
+        return Response::err(
+            Some(req.id),
+            "identity_not_configured",
+            "no [identity] section in the daemon config",
+        );
+    };
+    // An ambient admin login is only a prerequisite. It never permits
+    // another socket holder to mutate roles without fresh approval.
+    let acting_admin = rt
+        .current_human_principal()
+        .filter(|principal| principal.has_role(opaque_core::identity::Role::Admin));
+    let Some(acting_admin) = acting_admin else {
+        return Response::err(
+            Some(req.id),
+            "not_authorized",
+            "role changes require an active admin login session",
+        );
+    };
+    if principal_ctx.as_ref().is_some_and(|context| {
+        !context
+            .sub_roles
+            .contains(&opaque_core::identity::Role::Admin)
+    }) {
+        return Response::err(
+            Some(req.id),
+            "not_authorized",
+            "delegated role changes require an admin subject",
+        );
+    }
+    let principal_id = req
+        .params
+        .get("principal_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| opaque_core::identity::PrincipalId::parse(s).ok());
+    let Some(principal_id) = principal_id else {
+        return Response::err(
+            Some(req.id),
+            "invalid_params",
+            "principal_id must be a valid principal id",
+        );
+    };
+    let roles_param = req.params.get("roles").and_then(|v| v.as_array());
+    let Some(roles_param) = roles_param else {
+        return Response::err(
+            Some(req.id),
+            "invalid_params",
+            "roles must be an array of role names",
+        );
+    };
+    let roles_csv = roles_param
+        .iter()
+        .map(|v| v.as_str())
+        .collect::<Option<Vec<_>>>();
+    let Some(roles_csv) = roles_csv else {
+        return Response::err(
+            Some(req.id),
+            "invalid_params",
+            "every role must be a role name",
+        );
+    };
+    let roles_csv = roles_csv.join(",");
+    let roles = match opaque_core::identity::roles_from_string(&roles_csv) {
+        Ok(r) => r,
+        Err(e) => {
+            return Response::err(Some(req.id), "invalid_params", e.to_string());
+        }
+    };
+    // Only an admitted, enabled human can administer roles through
+    // this flow. Service roles and removed members cannot satisfy the
+    // lockout guard. The store repeats this under its writer lock.
+    let eligible_admin = |principal: &opaque_core::identity::Principal| {
+        matches!(
+            &principal.kind,
+            opaque_core::identity::PrincipalKind::Human { .. }
+        ) && principal.has_role(opaque_core::identity::Role::Admin)
+            && rt.principal_permitted(principal)
+    };
+    let current_eligible_admin_count = || {
+        rt.store
+            .list_principals()
+            .map(|principals| {
+                principals
+                    .iter()
+                    .filter(|principal| eligible_admin(principal))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    let target = rt.store.get_principal(&principal_id).ok().flatten();
+    let target_is_admin = target.as_ref().is_some_and(eligible_admin);
+    if target_is_admin
+        && !roles.contains(&opaque_core::identity::Role::Admin)
+        && current_eligible_admin_count() <= 1
+    {
+        return Response::err(
+            Some(req.id),
+            "last_admin",
+            "cannot remove the admin role from the last admitted human admin",
+        );
+    }
+    let old_roles = target
+        .as_ref()
+        .map(|p| opaque_core::identity::roles_to_string(&p.roles))
+        .unwrap_or_default();
+    let tenant_context = state
+        .tenant
+        .as_ref()
+        .map(|tenant| tenant.binding().approval_context())
+        .unwrap_or_default();
+    let review = format!(
+        "Change principal roles\n{tenant_context}Acting admin: {}\nTarget principal: {}\nPrevious roles: [{}]\nApproved replacement roles: [{}]",
+        acting_admin.id,
+        principal_id,
+        old_roles,
+        opaque_core::identity::roles_to_string(&roles)
+    );
+    if state
+        .enclave
+        .request_control_approval(
+            identity,
+            client_type,
+            "identity.role_set",
+            &review,
+            "This changes the principal's authorization. Apply exactly this replacement role set.",
+        )
+        .await
+        .is_err()
+    {
+        return Response::err(
+            Some(req.id),
+            "permission_denied",
+            "role changes require fresh out-of-band admin approval",
+        );
+    }
+    if crate::resolve_principal_context(state, session_id)
+        .await
+        .ok()
+        .as_ref()
+        != Some(&principal_ctx)
+    {
+        return Response::err(
+            Some(req.id),
+            "authority_changed",
+            "delegation changed during role approval",
+        );
+    }
+    if rt.current_human_principal().is_none_or(|current| {
+        current.id != acting_admin.id || !current.has_role(opaque_core::identity::Role::Admin)
+    }) || rt
+        .store
+        .get_principal(&principal_id)
+        .ok()
+        .flatten()
+        .is_none_or(|current| opaque_core::identity::roles_to_string(&current.roles) != old_roles)
+        || (target_is_admin
+            && !roles.contains(&opaque_core::identity::Role::Admin)
+            && current_eligible_admin_count() <= 1)
+    {
+        return Response::err(
+            Some(req.id),
+            "authority_changed",
+            "identity authority changed during approval; request a fresh review",
+        );
+    }
+    match rt.store.set_reviewed_roles(
+        &acting_admin.id,
+        &principal_id,
+        &old_roles,
+        &roles,
+        |principal| rt.principal_permitted(principal),
+    ) {
+        Ok(()) => {
+            info!(
+                "roles updated for {principal_id}: [{}]",
+                opaque_core::identity::roles_to_string(&roles)
+            );
+            let acting_admin = rt
+                .current_human_principal()
+                .map(|p| p.display_label())
+                .unwrap_or_else(|| "bootstrap".into());
+            state.audit.emit(
+                AuditEvent::new(AuditEventKind::IdentityRoleChanged)
+                    .with_operation("identity.role_set")
+                    .with_client(ClientSummary::from((identity, client_type)))
+                    .with_outcome("ok")
+                    .with_detail(format!(
+                        "principal={principal_id} roles: [{old_roles}] -> [{}] by={acting_admin}",
+                        opaque_core::identity::roles_to_string(&roles)
+                    )),
+            );
+            match rt.store.get_principal(&principal_id) {
+                Ok(Some(p)) => Response::ok(
+                    req.id,
+                    serde_json::json!({
+                        "id": p.id.as_str(),
+                        "label": p.display_label(),
+                        "roles": p.roles.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
+                    }),
+                ),
+                _ => Response::ok(req.id, serde_json::json!({ "updated": true })),
+            }
+        }
+        Err(e) => Response::err(Some(req.id), "invalid_params", e),
     }
 }

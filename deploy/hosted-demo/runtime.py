@@ -245,7 +245,7 @@ class Runtime:
                                           "client_id": c["client_id"], "scopes": c["scopes"]} for c in clients]
         config["organization_demo"] = organization
         fixture.dump(path,config)
-        binary = os.environ.get("OPAQUE_METRICS_BINARY", "/opt/opaque/bin/opaque-metrics")
+        binary = os.environ.get("OPAQUE_METRICS_BINARY", "/opt/opaque/bin/opaque-showcase")
         self.gateway = subprocess.Popen([binary,"--config",str(path)],env={"PATH":os.environ.get("PATH","/usr/bin:/bin"),"OPAQUE_METRICS_SOURCE_KEY":source_secret,**self.config["approval_env"]},stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         deadline=time.monotonic()+15
         while time.monotonic()<deadline:

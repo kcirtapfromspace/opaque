@@ -25,8 +25,8 @@ expected hostname. Production must not set `LOCAL_TEST_MODE` or use test keys.
 
 ## Build and render immutable inputs
 
-Prerequisites: a tested **Linux/ARM64** `opaque-metrics` binary at
-`deploy/hosted-demo/bin/opaque-metrics`, Docker, crane, kubectl, Python with PyYAML,
+Prerequisites: a tested **Linux/ARM64** `opaque-showcase` binary at
+`deploy/hosted-demo/bin/opaque-showcase`, Docker, crane, kubectl, Python with PyYAML,
 and an authenticated Wrangler version supporting the checked-in configuration.
 A macOS binary cannot be used in the runtime image. Use the existing configured
 Docker builder; these instructions do not switch contexts or install runtimes.

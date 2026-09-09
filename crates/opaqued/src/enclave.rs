@@ -22,6 +22,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use opaque_core::approval_gate::{ApprovalGate, ApprovalOutcome};
 use opaque_core::audit::{
     AuditEvent, AuditEventKind, AuditLevel, AuditSink, ClientSummary, TargetSummary,
     WorkspaceSummary,
@@ -30,6 +31,7 @@ use opaque_core::operation::{
     ApprovalFactor, ApprovalRequirement, ClientIdentity, ClientType, OperationDef,
     OperationRegistry, OperationRequest, OperationSafety,
 };
+use opaque_core::operation_handler::OperationHandler;
 use opaque_core::policy::{PolicyDecision, PolicyEngine};
 use opaque_core::sanitize::{Sanitized, SanitizedResponse, Sanitizer, Unsanitized};
 use sha2::{Digest, Sha256};
@@ -443,122 +445,21 @@ impl fmt::Debug for LeaseCache {
 }
 
 // ---------------------------------------------------------------------------
-// Operation handler trait
-// ---------------------------------------------------------------------------
-
-/// Trait for operation handlers. Each registered operation has a corresponding
-/// handler that performs the actual work.
-///
-/// Handlers receive the validated request and return a raw JSON payload.
-/// The enclave sanitizes the payload before returning it to the client.
-pub trait OperationHandler: Send + Sync + fmt::Debug {
-    /// Whether this implementation only supports explicit test endpoints.
-    /// Capability status comes from the installed handler, not its name.
-    fn fixture_only(&self) -> bool {
-        false
-    }
-
-    /// Execute the operation. Returns a raw (unsanitized) JSON payload.
-    ///
-    /// The handler must NOT return secret values in the payload. The sanitizer
-    /// provides defense-in-depth, but handlers should be written to avoid
-    /// including secrets in the first place.
-    fn execute(
-        &self,
-        request: &OperationRequest,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + '_>,
-    >;
-}
-
-// ---------------------------------------------------------------------------
-// Approval gate trait
-// ---------------------------------------------------------------------------
-
-/// The result of one approval interaction.
-///
-/// SECURITY INVARIANT: `approver` must only ever be attached by the gate that
-/// actually VERIFIED the identity it names. The local biometric factor proves
-/// device-owner presence and binds the *name* to the active login session
-/// (source `LocalBioSession`). Paired-device / FIDO2 attribution (source
-/// `PairedDevice`) requires real signature verification against the pairing
-/// store — the dormant `approval_server` relays client-supplied device ids
-/// WITHOUT verification and must never be used as an approver source.
-#[derive(Debug, Clone)]
-pub struct ApprovalOutcome {
-    /// Whether the human (or configured backend) approved the request.
-    pub approved: bool,
-    /// The verified approver identity, when the gate could establish one.
-    /// `None` on denial, and on approval paths with no identity binding
-    /// (e.g. biometric passed but nobody is logged in).
-    pub approver: Option<opaque_core::audit::ApproverIdentity>,
-}
-
-impl ApprovalOutcome {
-    /// Approved, with no approver identity binding available.
-    pub fn approved_anonymous() -> Self {
-        Self {
-            approved: true,
-            approver: None,
-        }
-    }
-
-    /// Approved by a verified identity.
-    pub fn approved_by(approver: opaque_core::audit::ApproverIdentity) -> Self {
-        Self {
-            approved: true,
-            approver: Some(approver),
-        }
-    }
-
-    /// Denied.
-    pub fn denied() -> Self {
-        Self {
-            approved: false,
-            approver: None,
-        }
-    }
-}
-
-/// Trait for the approval gate. The enclave calls this to present
-/// operation-bound approval challenges to the user.
-///
-/// Approval is ALWAYS bound to a specific operation request. There is no
-/// generic "approve" endpoint.
-pub trait ApprovalGate: Send + Sync + fmt::Debug {
-    /// Present an approval challenge for the given operation request.
-    ///
-    /// The implementation must:
-    /// - Display the operation, target, client identity, and TTL to the user
-    /// - Use the specified approval factor(s)
-    /// - Return `Ok` with [`ApprovalOutcome`] (approved/denied, plus the
-    ///   verified approver identity when one exists — see the invariant on
-    ///   [`ApprovalOutcome`])
-    /// - Return `Err` if the approval mechanism is unavailable
-    ///
-    /// The `approval_id` is used for audit correlation.
-    fn request_approval(
-        &self,
-        approval_id: Uuid,
-        request: &OperationRequest,
-        factors: &[ApprovalFactor],
-        description: &str,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<ApprovalOutcome, String>> + Send + '_>,
-    >;
-}
-
-// ---------------------------------------------------------------------------
 // Enclave
 // ---------------------------------------------------------------------------
+//
+// `OperationHandler` and `ApprovalGate` (+ its `ApprovalOutcome` return type)
+// now live in `opaque_core::operation_handler` / `opaque_core::approval_gate`
+// (imported above) so provider and approval-backend crates can implement
+// them without depending on this binary crate.
 
 /// The central enforcement funnel.
 ///
 /// All secret-using operations pass through this enclave, via individual
 /// execution or the typed, durably accounted task path.
 pub struct Enclave {
-    inference_profile: Option<crate::inference::TrustedInferenceProfile>,
-    ssh_profile: Option<crate::ssh::TrustedSshProfile>,
+    inference_profile: Option<opaque_bounded_work::inference::TrustedInferenceProfile>,
+    ssh_profile: Option<opaque_bounded_work::ssh::TrustedSshProfile>,
     /// Exact session/provisioning ceremonies use this complete-review factor.
     session_approval_factor: ApprovalFactor,
     /// Operation registry (immutable after construction).
@@ -611,8 +512,8 @@ impl fmt::Debug for Enclave {
 /// Builder for constructing an [`Enclave`].
 pub struct EnclaveBuilder {
     task_grants_enabled: bool,
-    inference_profile: Option<crate::inference::TrustedInferenceProfile>,
-    ssh_profile: Option<crate::ssh::TrustedSshProfile>,
+    inference_profile: Option<opaque_bounded_work::inference::TrustedInferenceProfile>,
+    ssh_profile: Option<opaque_bounded_work::ssh::TrustedSshProfile>,
     session_approval_factor: ApprovalFactor,
     registry: OperationRegistry,
     policy: PolicyEngine,
@@ -660,13 +561,16 @@ impl EnclaveBuilder {
 
     pub fn inference_profile(
         mut self,
-        profile: Option<crate::inference::TrustedInferenceProfile>,
+        profile: Option<opaque_bounded_work::inference::TrustedInferenceProfile>,
     ) -> Self {
         self.inference_profile = profile;
         self
     }
 
-    pub fn ssh_profile(mut self, profile: Option<crate::ssh::TrustedSshProfile>) -> Self {
+    pub fn ssh_profile(
+        mut self,
+        profile: Option<opaque_bounded_work::ssh::TrustedSshProfile>,
+    ) -> Self {
         self.ssh_profile = profile;
         self
     }
@@ -745,12 +649,14 @@ impl Default for EnclaveBuilder {
 }
 
 impl Enclave {
-    pub fn ssh_profile(&self) -> Result<&crate::ssh::TrustedSshProfile, String> {
+    pub fn ssh_profile(&self) -> Result<&opaque_bounded_work::ssh::TrustedSshProfile, String> {
         self.ssh_profile
             .as_ref()
             .ok_or_else(|| "tenant SSH is not configured".into())
     }
-    pub fn inference_profile(&self) -> Result<&crate::inference::TrustedInferenceProfile, String> {
+    pub fn inference_profile(
+        &self,
+    ) -> Result<&opaque_bounded_work::inference::TrustedInferenceProfile, String> {
         self.inference_profile
             .as_ref()
             .ok_or_else(|| "tenant inference is not configured".into())
@@ -1636,7 +1542,7 @@ impl Enclave {
 /// Native OS approval gate that delegates to the platform-specific
 /// approval prompt (macOS LocalAuthentication / Linux polkit).
 pub struct NativeApprovalGate {
-    registry: crate::factors::FactorRegistry,
+    registry: opaque_approval::factors::FactorRegistry,
 }
 
 impl std::fmt::Debug for NativeApprovalGate {
@@ -1650,12 +1556,12 @@ impl std::fmt::Debug for NativeApprovalGate {
 /// Resolves the approver identity to bind to a successful local-biometric
 /// approval (re-exported from the factors module for wiring convenience).
 #[cfg(test)]
-pub type ApproverResolver = crate::factors::ApproverResolver;
+pub type ApproverResolver = opaque_approval::factors::ApproverResolver;
 
 impl NativeApprovalGate {
     /// Create a gate over an explicit verifier registry (the daemon builds
     /// one from its configured factors: local, paired device, FIDO2, …).
-    pub fn with_registry(registry: crate::factors::FactorRegistry) -> Self {
+    pub fn with_registry(registry: opaque_approval::factors::FactorRegistry) -> Self {
         Self { registry }
     }
 
@@ -1663,8 +1569,10 @@ impl NativeApprovalGate {
     /// pre-registry shape, kept for tests.
     #[cfg(test)]
     pub fn new() -> Self {
-        let mut registry = crate::factors::FactorRegistry::new();
-        registry.register(Arc::new(crate::factors::LocalBioVerifier::new(None)));
+        let mut registry = opaque_approval::factors::FactorRegistry::new();
+        registry.register(Arc::new(opaque_approval::factors::LocalBioVerifier::new(
+            None,
+        )));
         Self { registry }
     }
 
@@ -1672,10 +1580,10 @@ impl NativeApprovalGate {
     /// local-only gate (test builder mirroring the daemon's wiring).
     #[cfg(test)]
     pub fn with_approver_resolver(self, resolver: ApproverResolver) -> Self {
-        let mut registry = crate::factors::FactorRegistry::new();
-        registry.register(Arc::new(crate::factors::LocalBioVerifier::new(Some(
-            resolver,
-        ))));
+        let mut registry = opaque_approval::factors::FactorRegistry::new();
+        registry.register(Arc::new(opaque_approval::factors::LocalBioVerifier::new(
+            Some(resolver),
+        )));
         Self { registry }
     }
 }
@@ -1690,7 +1598,7 @@ impl ApprovalGate for NativeApprovalGate {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<ApprovalOutcome, String>> + Send + '_>,
     > {
-        let ctx = crate::factors::ApprovalContext {
+        let ctx = opaque_approval::factors::ApprovalContext {
             approval_id,
             request_id: request.request_id,
             operation: request.operation.clone(),
@@ -2181,7 +2089,8 @@ mod tests {
     async fn native_gate_registers_the_local_factor() {
         use opaque_core::operation::ApprovalFactor;
         // The prompt path isn't exercised here (no OS prompt in tests); the
-        // registry's dispatch semantics are covered in factors::tests. Assert
+        // registry's dispatch semantics are covered in opaque_approval::factors
+        // tests. Assert
         // the gate's construction shape: both variants serve LocalBio.
         let resolver: ApproverResolver = Arc::new(|| Some(approver("hum_session")));
         let gate = NativeApprovalGate::new().with_approver_resolver(resolver);
@@ -4755,8 +4664,8 @@ mod operation_catalog_tests {
 
     #[test]
     fn catalog_distinguishes_task_transport_and_profile_requirements() {
-        let ssh_profile = crate::ssh::test_profile();
-        let inference_profile = crate::inference::InferenceProfileConfig {
+        let ssh_profile = opaque_bounded_work::ssh::test_profile();
+        let inference_profile = opaque_bounded_work::inference::InferenceProfileConfig {
             profile_id: "catalog-fixture".into(),
             api_url: "https://inference.example.test".into(),
             model_id: "public-fixture.gguf".into(),
@@ -4765,8 +4674,8 @@ mod operation_catalog_tests {
             chat_template_sha256: "b".repeat(64),
             server_build: "catalog-fixture-v1".into(),
             service_uid: Uuid::new_v4(),
-            source_id: crate::inference::DEMO_SOURCE_ID.into(),
-            source_snapshot_sha256: crate::inference::demo_source_snapshot_sha256(),
+            source_id: opaque_bounded_work::inference::DEMO_SOURCE_ID.into(),
+            source_snapshot_sha256: opaque_bounded_work::inference::demo_source_snapshot_sha256(),
             credential_ref: None,
             allow_loopback_http: false,
         }
@@ -4907,9 +4816,14 @@ mod operation_catalog_tests {
             .registry(registry)
             .handler(
                 "aws.create_secret",
-                Box::new(crate::aws::AwsHandler::new(
+                Box::new(opaque_providers::aws::AwsHandler::new(
                     Arc::new(InMemoryAuditEmitter::new()),
-                    crate::aws::client::AwsClient::new_single("http://127.0.0.1:1"),
+                    opaque_providers::aws::client::AwsClient::new(
+                        "http://127.0.0.1:1",
+                        "http://127.0.0.1:1",
+                        "http://127.0.0.1:1",
+                    )
+                    .expect("loopback fixture URLs are valid"),
                 )),
             )
             .handler("github.set_actions_secret", handler())

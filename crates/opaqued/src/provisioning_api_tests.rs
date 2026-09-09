@@ -18,17 +18,16 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     DaemonState,
-    fido2::{
-        Fido2Assertion, Fido2CredentialStore, Fido2Manager, Fido2RegistrationResponse,
-        NoLocalTransport,
-    },
     identity::{
         IdentityConfig, IdentityRuntime, PersonaConfig, ServicePrincipalConfig,
         persona::VerifiedPersonaClaims,
         provisioning::{AccessProfile, ProvisioningConfig},
     },
-    tenant::{TenantBoundary, TenantConfig},
 };
+use opaque_approval::fido2::{
+    Fido2Assertion, Fido2CredentialStore, Fido2Manager, Fido2RegistrationResponse, NoLocalTransport,
+};
+use opaque_tenant::tenant::{TenantBoundary, TenantConfig};
 
 const ISSUER: &str = "https://idp.example.com";
 const RP: &str = "opaque.test";
@@ -180,7 +179,7 @@ impl Fixture {
             crate::tests::build_test_state(Arc::new(InMemoryAuditEmitter::new()), approve);
         state.tenant = Some(tenant);
         state.identity = Some(Arc::new(runtime));
-        state.fido2 = Some(Arc::new(crate::factors::Fido2Approvals::new(
+        state.fido2 = Some(Arc::new(opaque_approval::factors::Fido2Approvals::new(
             fido,
             std::time::Duration::from_secs(120),
         )));

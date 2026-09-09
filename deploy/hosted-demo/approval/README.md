@@ -113,7 +113,7 @@ checks before a rollout.
 The Linux/ARM64 `rust:1.95.0-slim-bookworm` builder needs `libssl-dev` and
 `pkg-config` for `webauthn-rs`; the inspected base image contains only
 `libssl3`. Install the development packages inside the disposable builder,
-then build `cargo build --locked --release -p opaque-metrics`. Keep the Cargo
+then build `cargo build --locked --release -p opaque-showcase`. Keep the Cargo
 target/cache in the existing Docker cache volumes. Copy and strip the resulting
 Linux executable into the ignored `deploy/hosted-demo/bin/` directory before
 building the runtime image. The runtime Dockerfile installs `openssl`, which

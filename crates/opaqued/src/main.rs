@@ -13,8 +13,7 @@ use opaque_core::audit::{
 };
 use opaque_core::execve_map::{ExecveDefault, ExecveMapper, ExecveRule};
 use opaque_core::identity::{
-    AccessMode, DelegationClaims, PrincipalContext, PrincipalId, now_unix, sign_delegation_token,
-    verify_delegation_token,
+    AccessMode, PrincipalContext, PrincipalId, now_unix, verify_delegation_token,
 };
 use opaque_core::operation::{
     ApprovalFactor, ApprovalRequirement, ClientIdentity, ClientType, OperationDef,
@@ -34,57 +33,37 @@ use uuid::Uuid;
 /// Name of the daemon token file written next to the socket.
 const DAEMON_TOKEN_FILENAME: &str = "daemon.token";
 
-use opaque_native_approval as approval;
-#[allow(dead_code)]
-mod approval_server;
-mod attest;
-mod aws;
-#[allow(dead_code)]
-mod azure;
-mod bitwarden;
+mod agent_session;
 mod connection;
-#[allow(dead_code)]
-mod doppler;
 mod enclave;
-#[allow(dead_code)]
-mod export;
-mod factors;
-mod federation;
-#[allow(dead_code)]
-mod fido2;
-#[allow(dead_code)]
-mod gcp;
-mod github;
-mod gitlab;
 mod identity;
-mod inference;
-#[allow(dead_code)]
-mod infisical;
-mod onepassword;
-#[allow(dead_code)]
-mod pairing;
 mod provisioning_api;
 #[cfg(test)]
 mod provisioning_api_tests;
-mod push;
-mod resource_authority;
-mod sandbox;
-pub mod secret;
-mod ssh;
-mod task_api;
-mod task_store;
-mod tenant;
+#[cfg(test)]
+mod resource_authority_provisioning_tests;
+mod rpc_wrappers;
 mod trust_domain;
-mod vault;
-mod workload_attest;
 mod workspace_process;
+
+// `task_api`, `task_store`, `ssh`, `resource_authority`, and `inference`
+// moved to the `opaque-bounded-work` crate (the daemon's task-ledger/
+// SSH-execution/inference-brokering surface). `resource_authority`'s former
+// inline `#[cfg(test)] mod provisioning_tests` moved with it conceptually
+// but not literally: it needed the real `identity::IdentityRuntime`, which
+// stays here, so it now lives in this crate as
+// `resource_authority_provisioning_tests` above (declared here rather than
+// nested in a moved file, same wiring pattern as `provisioning_api_tests`).
 
 use workspace_process::WorkspaceCommandExt;
 
 use std::future::Future;
 use std::pin::Pin;
 
-use enclave::{Enclave, NativeApprovalGate, OperationHandler};
+use enclave::{Enclave, NativeApprovalGate};
+use opaque_core::approval_gate::ApprovalGate;
+use opaque_core::enclave_facade::EnclaveFacade;
+use opaque_core::operation_handler::OperationHandler;
 
 // ---------------------------------------------------------------------------
 // Daemon configuration
@@ -95,13 +74,13 @@ use enclave::{Enclave, NativeApprovalGate, OperationHandler};
 struct DaemonConfig {
     /// One immutable tenant per independently isolated broker installation.
     #[serde(default)]
-    tenant: Option<tenant::TenantConfig>,
+    tenant: Option<opaque_tenant::tenant::TenantConfig>,
     /// Sealed, operator-selected model and public source profile.
     #[serde(default)]
-    inference: Option<inference::InferenceProfileConfig>,
+    inference: Option<opaque_bounded_work::inference::InferenceProfileConfig>,
     /// One operator-pinned host operation using a Vault SSH signing role.
     #[serde(default)]
-    ssh: Option<ssh::SshProfileConfig>,
+    ssh: Option<opaque_bounded_work::ssh::SshProfileConfig>,
     /// Opt-in fixed-manifest publishing; existing single-write rules keep their floor.
     #[serde(default)]
     enable_task_grants: bool,
@@ -149,7 +128,7 @@ struct DaemonConfig {
     #[serde(default)]
     identity: Option<identity::IdentityConfig>,
     #[serde(default)]
-    resource_authority: Option<resource_authority::ResourceAuthorityConfig>,
+    resource_authority: Option<opaque_bounded_work::resource_authority::ResourceAuthorityConfig>,
     /// Explicitly scoped, human-authorized IdP provisioning mandates.
     #[serde(default)]
     provisioning: Option<identity::provisioning::ProvisioningConfig>,
@@ -163,7 +142,7 @@ struct DaemonConfig {
 
     /// Public keys authorized by the trusted operator to review whole tasks.
     #[serde(default)]
-    workstation_approvers: Vec<pairing::WorkstationApproverConfig>,
+    workstation_approvers: Vec<opaque_approval::pairing::WorkstationApproverConfig>,
 
     /// Downgrades receipt provenance for an automated signing fixture. This
     /// does not bypass any enrollment, signature, expiry or policy check.
@@ -184,16 +163,16 @@ struct DaemonConfig {
 
     /// Federation (`[federation]`): signed policy bundles from an org.
     #[serde(default)]
-    federation: federation::FederationConfig,
+    federation: opaque_federation_runtime::federation::FederationConfig,
 
     /// SIEM export (`[export]`): stream the audit chain off the box.
     #[serde(default)]
-    export: export::ExportConfig,
+    export: opaque_federation_runtime::export::ExportConfig,
 
     /// Continuous attestation (`[attestation]`): periodic posture reports and
     /// verify-before-trust key release.
     #[serde(default)]
-    attestation: attest::AttestationConfig,
+    attestation: opaque_federation_runtime::attest::AttestationConfig,
 }
 
 /// `[approval]` — out-of-band approval factor configuration.
@@ -351,10 +330,10 @@ Docs: https://opaque.info/
 
 struct DaemonState {
     /// Immutable attestor binding installed by the Unix listener after privilege drop.
-    workload_attestor: workload_attest::ListenerAttestor,
-    tenant: Option<tenant::TenantBoundary>,
+    workload_attestor: opaque_federation_runtime::workload_attest::ListenerAttestor,
+    tenant: Option<opaque_tenant::tenant::TenantBoundary>,
     enclave: Arc<Enclave>,
-    tasks: Option<Arc<task_store::TaskStore>>,
+    tasks: Option<Arc<opaque_bounded_work::task_store::TaskStore>>,
     audit: Arc<dyn AuditSink>,
     config: DaemonConfig,
     version: &'static str,
@@ -367,16 +346,16 @@ struct DaemonState {
     /// Identity runtime, present when `[identity]` is configured.
     identity: Option<Arc<identity::IdentityRuntime>>,
     /// Pairing manager, present when `[approval] second_device` is enabled.
-    pairing: Option<Arc<pairing::PairingManager>>,
+    pairing: Option<Arc<opaque_approval::pairing::PairingManager>>,
     /// Bound address of the approval server, when running.
     approval_server_addr: Option<std::net::SocketAddr>,
     /// FIDO2 approval coordination, present when `[approval] fido2` is enabled.
-    fido2: Option<Arc<factors::Fido2Approvals>>,
-    provisioning_challenges: provisioning_api::Challenges,
+    fido2: Option<Arc<opaque_approval::factors::Fido2Approvals>>,
+    provisioning_challenges: opaque_tenant::provisioning_api::Challenges,
     /// Applied federation bundle context (org, version, teams).
-    federation: Arc<federation::FederationStatus>,
+    federation: Arc<opaque_federation_runtime::federation::FederationStatus>,
     /// Attestation service (posture reports; always present).
-    attestation: Arc<attest::AttestationService>,
+    attestation: Arc<opaque_federation_runtime::attest::AttestationService>,
 }
 
 #[derive(Debug, Clone)]
@@ -402,6 +381,320 @@ struct SessionDelegation {
     mode: AccessMode,
     human_session_id: Option<String>,
 }
+
+// ---------------------------------------------------------------------------
+// EnclaveFacade: the narrow kernel-facing seam `opaque_core` exposes for
+// transport/dispatch code (`task_api.rs`, the `github` RPC convenience
+// wrapper, and this file's own `provisioning_api.rs`) that either has moved
+// out of this binary crate already or depends on this trait to call back
+// into it. `provisioning_api.rs`'s RPC dispatch stays here — it is
+// irreducibly coupled to the concrete `identity::IdentityRuntime`/
+// `DaemonConfig` (see `opaque_tenant::provisioning_api`'s doc comment) — but
+// still goes through this trait for `request_control_approval`/
+// `resolve_principal_context` so its shared, daemon-state-free half can live
+// in `opaque-tenant`. Implemented for `DaemonState` rather than `Enclave`
+// alone because `resolve_principal_context` needs `agent_sessions`/
+// `identity`/`federation`, which only `DaemonState` owns; the other methods
+// simply delegate to the concrete `Enclave`.
+// ---------------------------------------------------------------------------
+
+impl EnclaveFacade for DaemonState {
+    fn preflight_task(
+        &self,
+        request: &mut OperationRequest,
+        manifest: &opaque_core::task::TaskManifest,
+    ) -> Result<(), String> {
+        self.enclave.preflight_task(request, manifest)
+    }
+
+    fn preflight_task_observation(
+        &self,
+        base: &OperationRequest,
+        manifest: &opaque_core::task::TaskManifest,
+    ) -> Result<(), String> {
+        self.enclave.preflight_task_observation(base, manifest)
+    }
+
+    fn execute(
+        &self,
+        request: OperationRequest,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = opaque_core::sanitize::SanitizedResponse<
+                        opaque_core::sanitize::Sanitized,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(self.enclave.execute(request))
+    }
+
+    fn swap_policy(&self, policy: PolicyEngine) -> usize {
+        self.enclave.swap_policy(policy)
+    }
+
+    fn request_control_approval<'a>(
+        &'a self,
+        identity: &'a ClientIdentity,
+        client_type: ClientType,
+        operation_label: &'a str,
+        action_description: &'a str,
+        reason: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<opaque_core::audit::ApproverIdentity>, String>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.enclave
+                .request_control_approval(
+                    identity,
+                    client_type,
+                    operation_label,
+                    action_description,
+                    reason,
+                )
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// Resolve the verified principal context bound to an agent session.
+    ///
+    /// Promoted from the free function of the same name that used to live
+    /// here; every existing call site keeps calling the free function below,
+    /// which now just delegates to this trait method.
+    fn resolve_principal_context<'a>(
+        &'a self,
+        session_id: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<PrincipalContext>, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(sid) = session_id else {
+                return Ok(None);
+            };
+            let delegation = {
+                let sessions = self.agent_sessions.read().await;
+                match sessions.get(sid) {
+                    Some(s) if s.expires_at > SystemTime::now() => s.delegation.clone(),
+                    Some(_) => return Err("agent session expired".into()),
+                    None => return Err("agent session no longer exists".into()),
+                }
+            };
+            let Some(d) = delegation else {
+                return Ok(None);
+            };
+            let Some(rt) = self.identity.as_ref() else {
+                return Err("delegated session without an identity runtime".into());
+            };
+
+            let now = now_unix();
+
+            let row = rt
+                .store
+                .get_delegation(&d.jti)
+                .map_err(|e| format!("delegation lookup failed: {e}"))?
+                .ok_or("delegation record missing")?;
+            if row.revoked_at.is_some() {
+                return Err("delegation revoked".into());
+            }
+            if row.expires_at <= now {
+                return Err("delegation expired".into());
+            }
+
+            let sub_principal = rt
+                .store
+                .get_principal(&d.sub)
+                .map_err(|e| format!("principal lookup failed: {e}"))?
+                .ok_or("delegating principal missing")?;
+            if sub_principal.disabled {
+                return Err("delegating principal disabled".into());
+            }
+            if !rt.principal_permitted(&sub_principal) {
+                return Err(
+                    "delegating principal is no longer permitted by identity policy".into(),
+                );
+            }
+            let act_principal = rt
+                .store
+                .get_principal(&d.act)
+                .map_err(|e| format!("principal lookup failed: {e}"))?
+                .ok_or("agent principal missing")?;
+            if act_principal.disabled {
+                return Err("agent principal disabled".into());
+            }
+
+            // Delegated / break-glass access is only as alive as the human login
+            // session it was granted under.
+            if matches!(d.mode, AccessMode::Delegated | AccessMode::BreakGlass) {
+                let hs_id = d
+                    .human_session_id
+                    .as_deref()
+                    .ok_or("delegation missing its human session binding")?;
+                let hs = rt
+                    .store
+                    .get_human_session(hs_id)
+                    .map_err(|e| format!("session lookup failed: {e}"))?
+                    .ok_or("human login session missing")?;
+                if hs.revoked_at.is_some() {
+                    return Err("human login session revoked".into());
+                }
+                if hs.expires_at <= now {
+                    return Err("human login session expired".into());
+                }
+                if hs.idp_issuer != rt.config.issuer {
+                    return Err("human login session issuer is no longer permitted".into());
+                }
+                if hs.principal_id != d.sub {
+                    return Err("human login session does not match the delegation".into());
+                }
+            }
+
+            // Team membership comes from the applied federation bundle, resolved
+            // daemon-side per request (bundle refresh takes effect immediately).
+            let sub_teams = self.federation.teams_of(&sub_principal.display_label());
+
+            Ok(Some(PrincipalContext {
+                sub: d.sub.clone(),
+                sub_label: sub_principal.display_label(),
+                sub_roles: sub_principal.roles.clone(),
+                sub_teams,
+                act: d.act.clone(),
+                act_label: act_principal.display_label(),
+                mode: d.mode,
+                jti: d.jti.clone(),
+                human_session_id: d.human_session_id.clone(),
+            }))
+        })
+    }
+
+    /// Re-verify a workspace claim. Delegates to the free function of the
+    /// same name below, which owns the actual bounded-subprocess machinery
+    /// (`workspace_process.rs`) — this trait method exists purely so
+    /// `opaque-bounded-work`'s `task_api` can invoke it as a live TOCTOU
+    /// recheck without depending on `opaqued` directly.
+    fn verify_workspace<'a>(
+        &'a self,
+        claimed: &'a opaque_core::operation::WorkspaceContext,
+        client_pid: Option<i32>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(verify_workspace(claimed, client_pid))
+    }
+}
+
+/// A bare `Enclave` also implements the facade directly, for composition-root
+/// code that runs before a `DaemonState` exists — the federation bundle
+/// bootstrap (`opaque_federation_runtime::federation::BundleApplier`) applies the initial bundle while
+/// only `Arc<Enclave>` is in scope, well before `DaemonState` is built.
+///
+/// Every method mirrors an inherent `Enclave` method one-for-one (the same
+/// ones `DaemonState`'s impl above delegates to via `self.enclave.X(...)`),
+/// except `resolve_principal_context`, which needs `DaemonState`-owned
+/// agent-session/identity/federation state that a bare `Enclave` does not
+/// have; that one fails loudly instead of silently returning `Ok(None)`; the
+/// federation bootstrap never calls it.
+impl EnclaveFacade for Enclave {
+    fn preflight_task(
+        &self,
+        request: &mut OperationRequest,
+        manifest: &opaque_core::task::TaskManifest,
+    ) -> Result<(), String> {
+        Enclave::preflight_task(self, request, manifest)
+    }
+
+    fn preflight_task_observation(
+        &self,
+        base: &OperationRequest,
+        manifest: &opaque_core::task::TaskManifest,
+    ) -> Result<(), String> {
+        Enclave::preflight_task_observation(self, base, manifest)
+    }
+
+    fn execute(
+        &self,
+        request: OperationRequest,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = opaque_core::sanitize::SanitizedResponse<
+                        opaque_core::sanitize::Sanitized,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(Enclave::execute(self, request))
+    }
+
+    fn swap_policy(&self, policy: PolicyEngine) -> usize {
+        Enclave::swap_policy(self, policy)
+    }
+
+    fn request_control_approval<'a>(
+        &'a self,
+        identity: &'a ClientIdentity,
+        client_type: ClientType,
+        operation_label: &'a str,
+        action_description: &'a str,
+        reason: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<opaque_core::audit::ApproverIdentity>, String>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            Enclave::request_control_approval(
+                self,
+                identity,
+                client_type,
+                operation_label,
+                action_description,
+                reason,
+            )
+            .await
+            .map_err(|e| e.to_string())
+        })
+    }
+
+    fn resolve_principal_context<'a>(
+        &'a self,
+        _session_id: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<PrincipalContext>, String>> + Send + 'a>> {
+        Box::pin(async move {
+            Err(
+                "resolve_principal_context is unavailable on a bare Enclave facade; it needs \
+                 DaemonState-owned agent-session/identity/federation state"
+                    .to_string(),
+            )
+        })
+    }
+
+    fn verify_workspace<'a>(
+        &'a self,
+        claimed: &'a opaque_core::operation::WorkspaceContext,
+        client_pid: Option<i32>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        // Same free function as DaemonState's impl above; this method needs
+        // no DaemonState-owned state, so unlike resolve_principal_context it
+        // isn't a fails-loudly stub.
+        Box::pin(verify_workspace(claimed, client_pid))
+    }
+}
+
+// `default_secret_resolvers()` used to live here (main.rs is the crate's
+// composition root); it has been promoted to `opaque_providers` because it
+// has zero opaqued-specific dependencies (pure provider-client wiring from
+// env vars) and, after the `opaque-bounded-work` extraction, is needed by
+// `ssh.rs`/`inference/mod.rs` (now in `opaque-bounded-work`) in addition to
+// this file and `opaque_sandbox::SandboxExecutor::new`'s `ResolverFactory`
+// fn pointer — `opaque-providers` is the only non-circular common home for
+// all three call sites (`opaqued`, `opaque-bounded-work`, and transitively
+// `opaque-sandbox` all already depend on it).
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -838,7 +1131,9 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
     let tenant = config
         .tenant
         .as_ref()
-        .map(|tenant_config| tenant::TenantBoundary::open(tenant_config, &state_dir, td.enforce))
+        .map(|tenant_config| {
+            opaque_tenant::tenant::TenantBoundary::open(tenant_config, &state_dir, td.enforce)
+        })
         .transpose()
         .map_err(std::io::Error::other)?;
     let inference_profile = config
@@ -912,7 +1207,8 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
     validate_path_chain(&socket)?;
 
     let listener = UnixListener::bind(&socket)?;
-    let workload_attestor = workload_attest::ListenerAttestor::unix_listener();
+    let workload_attestor =
+        opaque_federation_runtime::workload_attest::ListenerAttestor::unix_listener();
     lock_down_socket_path(&socket)?;
     let _socket_guard = SocketGuard::new(socket.clone());
 
@@ -1475,11 +1771,13 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
     let tasks = if config.enable_task_grants {
         Some(Arc::new(
             match tenant.as_ref() {
-                Some(boundary) => task_store::TaskStore::open_for_tenant(
+                Some(boundary) => opaque_bounded_work::task_store::TaskStore::open_for_tenant(
                     &state_dir.join("tasks.db"),
                     Some(boundary.binding().clone()),
                 ),
-                None => task_store::TaskStore::open(&state_dir.join("tasks.db")),
+                None => {
+                    opaque_bounded_work::task_store::TaskStore::open(&state_dir.join("tasks.db"))
+                }
             }
             .map_err(|e| std::io::Error::other(format!("task ledger unavailable: {e}")))?,
         ))
@@ -1595,11 +1893,11 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
             let runtime = identity_runtime.clone().ok_or_else(|| {
                 std::io::Error::other("resource authority requires broker identity")
             })?;
-            let authority = resource_authority::ResourceAuthority::new(
+            let authority = opaque_bounded_work::resource_authority::ResourceAuthority::new(
                 resource_config,
-                runtime,
+                runtime as Arc<dyn opaque_bounded_work::resource_authority::IdentityAuthority>,
                 tenant.as_ref().map(|boundary| boundary.binding()),
-                config.provisioning.clone(),
+                config.provisioning.is_some(),
             )
             .map_err(std::io::Error::other)?;
             let listener = authority.bind()?;
@@ -1607,7 +1905,10 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         })
         .transpose()?;
 
-    let sandbox_executor = sandbox::SandboxExecutor::new(audit.clone());
+    let sandbox_executor = opaque_sandbox::SandboxExecutor::new(
+        audit.clone(),
+        opaque_providers::default_secret_resolvers,
+    );
 
     // Execve policy hook handlers.
     let execve_mapper = Arc::new(ExecveMapper::new(
@@ -1620,26 +1921,26 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         config.execve_default.decision,
     );
     let (execve_check_handler, execve_approve_handler) =
-        sandbox::execve_hook::create_execve_handlers(audit.clone(), execve_mapper);
+        opaque_sandbox::execve_hook::create_execve_handlers(audit.clone(), execve_mapper);
 
-    let github_actions_handler =
-        github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
-    let github_codespaces_handler =
-        github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
-    let github_dependabot_handler =
-        github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
-    let github_org_handler =
-        github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
-    let github_list_handler =
-        github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
-    let github_delete_handler =
-        github::GitHubHandler::new(audit.clone()).map_err(std::io::Error::other)?;
-    let gitlab_handler =
-        gitlab::GitLabHandler::new(audit.clone()).map_err(std::io::Error::other)?;
+    let github_actions_handler = opaque_providers::github::GitHubHandler::new(audit.clone())
+        .map_err(std::io::Error::other)?;
+    let github_codespaces_handler = opaque_providers::github::GitHubHandler::new(audit.clone())
+        .map_err(std::io::Error::other)?;
+    let github_dependabot_handler = opaque_providers::github::GitHubHandler::new(audit.clone())
+        .map_err(std::io::Error::other)?;
+    let github_org_handler = opaque_providers::github::GitHubHandler::new(audit.clone())
+        .map_err(std::io::Error::other)?;
+    let github_list_handler = opaque_providers::github::GitHubHandler::new(audit.clone())
+        .map_err(std::io::Error::other)?;
+    let github_delete_handler = opaque_providers::github::GitHubHandler::new(audit.clone())
+        .map_err(std::io::Error::other)?;
+    let gitlab_handler = opaque_providers::gitlab::GitLabHandler::new(audit.clone())
+        .map_err(std::io::Error::other)?;
 
     // 1Password handler: prefer Connect Server URL, fall back to `op` CLI.
     let onepassword_connect_url =
-        std::env::var(onepassword::client::CONNECT_URL_ENV).unwrap_or_default();
+        std::env::var(opaque_providers::onepassword::client::CONNECT_URL_ENV).unwrap_or_default();
 
     let mut enclave_builder = Enclave::builder()
         .task_grants_enabled(tasks.is_some())
@@ -1671,18 +1972,21 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
 
     if !onepassword_connect_url.is_empty() {
         // Connect Server backend (self-hosted REST API).
-        let op_list_vaults_handler =
-            onepassword::OnePasswordHandler::new(audit.clone(), &onepassword_connect_url).map_err(
-                |e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()),
-            )?;
-        let op_list_items_handler =
-            onepassword::OnePasswordHandler::new(audit.clone(), &onepassword_connect_url).map_err(
-                |e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()),
-            )?;
-        let op_read_field_handler =
-            onepassword::OnePasswordHandler::new(audit.clone(), &onepassword_connect_url).map_err(
-                |e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()),
-            )?;
+        let op_list_vaults_handler = opaque_providers::onepassword::OnePasswordHandler::new(
+            audit.clone(),
+            &onepassword_connect_url,
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+        let op_list_items_handler = opaque_providers::onepassword::OnePasswordHandler::new(
+            audit.clone(),
+            &onepassword_connect_url,
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+        let op_read_field_handler = opaque_providers::onepassword::OnePasswordHandler::new(
+            audit.clone(),
+            &onepassword_connect_url,
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
         enclave_builder = enclave_builder
             .handler("onepassword.list_vaults", Box::new(op_list_vaults_handler))
             .handler("onepassword.list_items", Box::new(op_list_items_handler))
@@ -1691,13 +1995,14 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
             "1Password handler enabled via Connect Server ({})",
             onepassword_connect_url
         );
-    } else if let Ok(cli) = onepassword::op_cli::OpCliClient::new() {
+    } else if let Ok(cli) = opaque_providers::onepassword::op_cli::OpCliClient::new() {
         // `op` CLI backend (desktop app + biometric auth).
         let op_list_vaults_handler =
-            onepassword::OnePasswordHandler::from_cli(audit.clone(), cli.clone());
+            opaque_providers::onepassword::OnePasswordHandler::from_cli(audit.clone(), cli.clone());
         let op_list_items_handler =
-            onepassword::OnePasswordHandler::from_cli(audit.clone(), cli.clone());
-        let op_read_field_handler = onepassword::OnePasswordHandler::from_cli(audit.clone(), cli);
+            opaque_providers::onepassword::OnePasswordHandler::from_cli(audit.clone(), cli.clone());
+        let op_read_field_handler =
+            opaque_providers::onepassword::OnePasswordHandler::from_cli(audit.clone(), cli);
         enclave_builder = enclave_builder
             .handler("onepassword.list_vaults", Box::new(op_list_vaults_handler))
             .handler("onepassword.list_items", Box::new(op_list_items_handler))
@@ -1708,21 +2013,24 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
     }
 
     // Bitwarden handler: use configured URL or default.
-    let bitwarden_url = std::env::var(bitwarden::client::BITWARDEN_URL_ENV)
-        .unwrap_or_else(|_| bitwarden::client::DEFAULT_BASE_URL.to_owned());
+    let bitwarden_url = std::env::var(opaque_providers::bitwarden::client::BITWARDEN_URL_ENV)
+        .unwrap_or_else(|_| opaque_providers::bitwarden::client::DEFAULT_BASE_URL.to_owned());
     {
         let bw_list_projects_handler =
-            bitwarden::BitwardenHandler::new(audit.clone(), &bitwarden_url).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
-            })?;
+            opaque_providers::bitwarden::BitwardenHandler::new(audit.clone(), &bitwarden_url)
+                .map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
+                })?;
         let bw_list_secrets_handler =
-            bitwarden::BitwardenHandler::new(audit.clone(), &bitwarden_url).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
-            })?;
+            opaque_providers::bitwarden::BitwardenHandler::new(audit.clone(), &bitwarden_url)
+                .map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
+                })?;
         let bw_read_secret_handler =
-            bitwarden::BitwardenHandler::new(audit.clone(), &bitwarden_url).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
-            })?;
+            opaque_providers::bitwarden::BitwardenHandler::new(audit.clone(), &bitwarden_url)
+                .map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
+                })?;
         enclave_builder = enclave_builder
             .handler(
                 "bitwarden.list_projects",
@@ -1734,7 +2042,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
     }
 
     // The unsigned AWS transport is quarantined to explicitly enabled loopback mocks.
-    match aws::client::AwsClient::from_mock_env() {
+    match opaque_providers::aws::client::AwsClient::from_mock_env() {
         Ok(Some(aws_client)) => {
             for op in [
                 "aws.get_caller_identity",
@@ -1751,7 +2059,10 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
             ] {
                 enclave_builder = enclave_builder.handler(
                     op,
-                    Box::new(aws::AwsHandler::new(audit.clone(), aws_client.clone())),
+                    Box::new(opaque_providers::aws::AwsHandler::new(
+                        audit.clone(),
+                        aws_client.clone(),
+                    )),
                 );
             }
             warn!("AWS loopback mock handler enabled; real AWS signing is not implemented");
@@ -1773,11 +2084,11 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
     // Second-device factor: pairing manager + approval server, when enabled.
     // Constructed before the gate so the registry can hold the verifier, and
     // stashed in DaemonState for the device_* control methods.
-    let mut pairing_manager: Option<Arc<pairing::PairingManager>> = None;
+    let mut pairing_manager: Option<Arc<opaque_approval::pairing::PairingManager>> = None;
     let mut approval_server_addr: Option<std::net::SocketAddr> = None;
     let mut second_device_verifier: Option<(
-        Arc<pairing::PairingManager>,
-        approval_server::ApprovalServerHandle,
+        Arc<opaque_approval::pairing::PairingManager>,
+        opaque_approval::approval_server::ApprovalServerHandle,
     )> = None;
     if config.approval.second_device || !config.workstation_approvers.is_empty() {
         let state_dir = audit_db_path
@@ -1803,7 +2114,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
             .data_dir
             .as_ref()
             .map(|dir| dir.join("approval/paired_devices.json"))
-            .unwrap_or_else(pairing::store::DeviceStore::default_path);
+            .unwrap_or_else(opaque_approval::pairing::store::DeviceStore::default_path);
         if let Some(parent) = store_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -1818,8 +2129,9 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
             .parse()
             .map_err(|e| std::io::Error::other(format!("approval.server_bind invalid: {e}")))?;
 
-        let store = pairing::store::DeviceStore::new(store_path, store_hmac.to_vec());
-        let pm = Arc::new(pairing::PairingManager::new(
+        let store =
+            opaque_approval::pairing::store::DeviceStore::new(store_path, store_hmac.to_vec());
+        let pm = Arc::new(opaque_approval::pairing::PairingManager::new(
             server_id,
             pairing_key,
             bind.port(),
@@ -1832,12 +2144,12 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
 
         // TLS identity persists so paired devices' fingerprint pin survives
         // restarts (custody set).
-        let tls = approval_server::load_or_create_tls_identity(&state_dir)
+        let tls = opaque_approval::approval_server::load_or_create_tls_identity(&state_dir)
             .map_err(std::io::Error::other)?;
         let fingerprint = tls.fingerprint.clone();
 
-        let server = approval_server::ApprovalServer::new(
-            approval_server::ApprovalServerConfig {
+        let server = opaque_approval::approval_server::ApprovalServer::new(
+            opaque_approval::approval_server::ApprovalServerConfig {
                 bind_addr: bind,
                 tls_cert_der: tls.cert_der,
                 tls_key_der: tls.key_der,
@@ -1856,7 +2168,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         approval_server_addr = Some(addr);
 
         // mDNS is convenience discovery — never fatal.
-        match approval_server::advertise_mdns(addr.port(), &fingerprint) {
+        match opaque_approval::approval_server::advertise_mdns(addr.port(), &fingerprint) {
             Ok(mdns) => {
                 // Keep advertising for the daemon's lifetime.
                 std::mem::forget(mdns);
@@ -1876,26 +2188,31 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
 
     // FIDO2/passkey factor: daemon-side verification over the socket; the
     // authenticator ceremony runs in whatever client drives the key.
-    let mut fido2_approvals: Option<Arc<factors::Fido2Approvals>> = None;
+    let mut fido2_approvals: Option<Arc<opaque_approval::factors::Fido2Approvals>> = None;
     if config.approval.fido2 {
         let store_path = config
             .data_dir
             .as_ref()
             .map(|dir| dir.join("approval/fido2_credentials.json"))
-            .unwrap_or_else(fido2::Fido2CredentialStore::default_path);
+            .unwrap_or_else(opaque_approval::fido2::Fido2CredentialStore::default_path);
         if let Some(parent) = store_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let store_hmac =
             opaque_core::keyfile::load_or_create_key_file(&store_path.with_extension("hmac"))?;
-        let store = fido2::Fido2CredentialStore::new(store_path, store_hmac.to_vec());
+        let store =
+            opaque_approval::fido2::Fido2CredentialStore::new(store_path, store_hmac.to_vec());
         let rp_id = config
             .approval
             .fido2_rp_id
             .clone()
             .unwrap_or_else(|| "opaque.local".into());
-        let manager = fido2::Fido2Manager::new(store, Box::new(fido2::NoLocalTransport), rp_id);
-        let approvals = Arc::new(factors::Fido2Approvals::new(
+        let manager = opaque_approval::fido2::Fido2Manager::new(
+            store,
+            Box::new(opaque_approval::fido2::NoLocalTransport),
+            rp_id,
+        );
+        let approvals = Arc::new(opaque_approval::factors::Fido2Approvals::new(
             manager,
             std::time::Duration::from_secs(config.approval.timeout_secs.unwrap_or(60)),
         ));
@@ -1907,9 +2224,9 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
     }
 
     let mut registered_factors: Vec<String> = Vec::new();
-    let approval_gate: Box<dyn enclave::ApprovalGate> = match backend {
+    let approval_gate: Box<dyn ApprovalGate> = match backend {
         ApprovalBackendKind::Native => {
-            let mut registry = factors::FactorRegistry::new();
+            let mut registry = opaque_approval::factors::FactorRegistry::new();
 
             // Local factor, with login-session approver binding when identity
             // is configured.
@@ -1922,26 +2239,32 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
                             label: p.display_label(),
                             source: opaque_core::audit::ApproverSource::LocalBioSession,
                         })
-                }) as factors::ApproverResolver
+                }) as opaque_approval::factors::ApproverResolver
             });
-            registry.register(Arc::new(factors::LocalBioVerifier::new(resolver)));
+            registry.register(Arc::new(opaque_approval::factors::LocalBioVerifier::new(
+                resolver,
+            )));
 
             if let Some((pm, handle)) = second_device_verifier.clone() {
                 if config.approval.second_device {
-                    registry.register(Arc::new(factors::PairedDeviceVerifier::new(
-                        pm.clone(),
-                        handle.clone(),
-                    )));
+                    registry.register(Arc::new(
+                        opaque_approval::factors::PairedDeviceVerifier::new(
+                            pm.clone(),
+                            handle.clone(),
+                        ),
+                    ));
                 }
                 if !config.workstation_approvers.is_empty() {
-                    registry.register(Arc::new(factors::PairedWorkstationVerifier::new(
-                        pm, handle,
-                    )));
+                    registry.register(Arc::new(
+                        opaque_approval::factors::PairedWorkstationVerifier::new(pm, handle),
+                    ));
                 }
             }
 
             if let Some(approvals) = fido2_approvals.clone() {
-                registry.register(Arc::new(factors::Fido2Verifier::new(approvals)));
+                registry.register(Arc::new(opaque_approval::factors::Fido2Verifier::new(
+                    approvals,
+                )));
             }
 
             registered_factors = registry
@@ -1978,10 +2301,10 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
 
     // --- SIEM export: stream the audit chain off the box ---
     if config.export.configured() {
-        let pump = export::ExportPump::new(
+        let pump = opaque_federation_runtime::export::ExportPump::new(
             config.export.clone(),
             audit_db_path.clone(),
-            export::cursor_path(&home),
+            opaque_federation_runtime::export::cursor_path(&home),
             audit.clone(),
         )
         .map_err(|e| {
@@ -1994,7 +2317,8 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
     }
 
     // --- Federation: signed policy bundles ---
-    let federation_status = Arc::new(federation::FederationStatus::default());
+    let federation_status =
+        Arc::new(opaque_federation_runtime::federation::FederationStatus::default());
     if config.federation.configured() {
         let fed = &config.federation;
         let anchors = fed.anchors()?;
@@ -2005,9 +2329,9 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
                  bundle can never be applied",
             ));
         }
-        let applier = federation::BundleApplier {
+        let applier = opaque_federation_runtime::federation::BundleApplier {
             anchors,
-            state_file: federation::state_path(&home),
+            state_file: opaque_federation_runtime::federation::state_path(&home),
             enclave: enclave.clone(),
             status: federation_status.clone(),
             audit: audit.clone(),
@@ -2060,8 +2384,8 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
     }
 
     // --- Continuous attestation ---
-    let attestation = Arc::new(attest::AttestationService::new(
-        attest::load_or_create_key_in(&state_dir)?,
+    let attestation = Arc::new(opaque_federation_runtime::attest::AttestationService::new(
+        opaque_federation_runtime::attest::load_or_create_key_in(&state_dir)?,
         home.clone(),
         config_path.clone(),
         audit_db_path.clone(),
@@ -2080,7 +2404,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
     // custody material. A refusal is loud but not fatal — the daemon keeps
     // running on the key material it already holds.
     if let Some(url) = config.attestation.key_release_url.clone() {
-        match attest::KeyReleaseClient::new(
+        match opaque_federation_runtime::attest::KeyReleaseClient::new(
             url,
             config.attestation.key_release_authorization.clone(),
         ) {
@@ -2124,7 +2448,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         pairing: pairing_manager,
         approval_server_addr,
         fido2: fido2_approvals,
-        provisioning_challenges: provisioning_api::Challenges::default(),
+        provisioning_challenges: opaque_tenant::provisioning_api::Challenges::default(),
         federation: federation_status,
         attestation,
     });
@@ -2321,14 +2645,6 @@ impl ConnectionRateLimiter {
 // Client identity & type derivation
 // ---------------------------------------------------------------------------
 
-/// Compute the SHA-256 hash of an executable file (hex-encoded).
-fn compute_exe_hash(path: &Path) -> Option<String> {
-    use sha2::{Digest, Sha256};
-    let bytes = std::fs::read(path).ok()?;
-    let hash = Sha256::digest(&bytes);
-    Some(format!("{hash:x}"))
-}
-
 /// Derive the client type from the client identity and daemon config.
 ///
 /// The daemon NEVER trusts a self-declared `client_type` from request params.
@@ -2500,79 +2816,6 @@ fn entry_matches(identity: &ClientIdentity, entry: &HumanClientEntry) -> bool {
     }
 
     true
-}
-
-/// Build a [`ClientIdentity`] from peer credentials obtained via the Unix socket.
-fn build_client_identity(peer: Option<&opaque_core::peer::PeerInfo>) -> ClientIdentity {
-    match peer {
-        Some(info) => {
-            let exe_path = info.pid.and_then(exe_path_for_pid);
-            let exe_sha256 = exe_path.as_ref().and_then(|p| compute_exe_hash(p));
-            ClientIdentity {
-                uid: info.uid,
-                gid: info.gid,
-                pid: info.pid,
-                exe_path,
-                exe_sha256,
-                codesign_team_id: None,
-            }
-        }
-        None => ClientIdentity {
-            uid: u32::MAX,
-            gid: u32::MAX,
-            pid: None,
-            exe_path: None,
-            exe_sha256: None,
-            codesign_team_id: None,
-        },
-    }
-}
-
-/// Resolve the executable path for a given PID.
-fn exe_path_for_pid(pid: i32) -> Option<PathBuf> {
-    #[cfg(target_os = "linux")]
-    {
-        std::fs::read_link(format!("/proc/{pid}/exe")).ok()
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        exe_path_macos(pid)
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = pid;
-        None
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn exe_path_macos(pid: i32) -> Option<PathBuf> {
-    const PROC_PIDPATHINFO_MAXSIZE: u32 = 4096;
-
-    unsafe extern "C" {
-        fn proc_pidpath(
-            pid: libc::c_int,
-            buffer: *mut libc::c_char,
-            buffersize: u32,
-        ) -> libc::c_int;
-    }
-
-    let mut buf = vec![0u8; PROC_PIDPATHINFO_MAXSIZE as usize];
-    let ret = unsafe {
-        proc_pidpath(
-            pid,
-            buf.as_mut_ptr() as *mut libc::c_char,
-            PROC_PIDPATHINFO_MAXSIZE,
-        )
-    };
-    if ret > 0 {
-        let cstr = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr() as *const libc::c_char) };
-        cstr.to_str().ok().map(PathBuf::from)
-    } else {
-        None
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3134,6 +3377,37 @@ async fn verify_workspace(
         .map_err(|e| format!("workspace verification task failed: {e}"))?
 }
 
+/// Parse, sanitize, and verify a request's optional `workspace` claim.
+///
+/// Moved here from `opaque_bounded_work::task_api` (previously
+/// `task_api::verified_workspace`): it calls `verify_workspace` above,
+/// kernel-side machinery `opaque-bounded-work` must not reach back into.
+/// `handle_request` now computes this once per request for every method
+/// whose params may carry a `workspace` claim, and passes the result down —
+/// see the call site above.
+async fn verified_workspace(
+    params: &serde_json::Value,
+    identity: &ClientIdentity,
+) -> Result<Option<opaque_core::operation::WorkspaceContext>, String> {
+    let Some(value) = params.get("workspace").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let mut workspace: opaque_core::operation::WorkspaceContext =
+        serde_json::from_value(value.clone()).map_err(|_| "invalid workspace context")?;
+    if identity.pid.is_none() {
+        return Err("workspace peer pid is unavailable".into());
+    }
+    if let Some(url) = &workspace.remote_url {
+        workspace.remote_url = Some(InputValidator::sanitize_url(url));
+    }
+    workspace.workspace_verified = false;
+    verify_workspace(&workspace, identity.pid)
+        .await
+        .map_err(|_| "workspace verification failed")?;
+    workspace.workspace_verified = true;
+    Ok(Some(workspace))
+}
+
 // ---------------------------------------------------------------------------
 // Connection handler
 // ---------------------------------------------------------------------------
@@ -3191,9 +3465,9 @@ async fn handle_conn(
     // --- Handshake: first frame must be a valid daemon token ---
     let handshake = match connection::read_handshake(&mut framed, &mut shutdown_rx).await? {
         Some(frame) => {
-            if serde_json::from_slice::<serde_json::Value>(&frame)
-                .is_ok_and(|value| workload_attest::has_identity_claim(&value))
-            {
+            if serde_json::from_slice::<serde_json::Value>(&frame).is_ok_and(|value| {
+                opaque_federation_runtime::workload_attest::has_identity_claim(&value)
+            }) {
                 emit_daemon_method_audit(
                     &state,
                     AuditEventKind::WorkloadAttestationDenied,
@@ -3284,7 +3558,7 @@ async fn handle_conn(
                     connection::send(&mut sink, Bytes::from(out)).await?;
                     continue;
                 }
-                if workload_attest::has_identity_claim(&value) {
+                if opaque_federation_runtime::workload_attest::has_identity_claim(&value) {
                     emit_daemon_method_audit(
                         &state,
                         AuditEventKind::WorkloadAttestationDenied,
@@ -3414,7 +3688,7 @@ fn validate_handshake(frame: &[u8], expected_token: &str) -> Option<HandshakePay
     }
 
     let value: serde_json::Value = serde_json::from_slice(frame).ok()?;
-    if workload_attest::has_identity_claim(&value) {
+    if opaque_federation_runtime::workload_attest::has_identity_claim(&value) {
         return None;
     }
     let hs: Handshake = match serde_json::from_slice(frame) {
@@ -3606,9 +3880,12 @@ fn validate_tenant_startup(
     state_dir: &std::path::Path,
 ) -> Result<(), String> {
     if config.tenant.is_none()
-        && [tenant::BINDING_FILE, tenant::LOCK_FILE]
-            .iter()
-            .any(|name| std::fs::symlink_metadata(state_dir.join(name)).is_ok())
+        && [
+            opaque_tenant::tenant::BINDING_FILE,
+            opaque_tenant::tenant::LOCK_FILE,
+        ]
+        .iter()
+        .any(|name| std::fs::symlink_metadata(state_dir.join(name)).is_ok())
     {
         return Err("tenant-bound custody requires its tenant configuration".into());
     }
@@ -3662,103 +3939,17 @@ fn is_operation_method(method: &str) -> bool {
 ///   from the store so role edits apply immediately.
 /// - `Err(reason)` — the session HAS a delegation that is no longer valid
 ///   (fail closed: the caller must reject operation requests).
+///
+/// Thin wrapper kept so the many existing call sites (in this file and in
+/// `task_api.rs`/`provisioning_api.rs`) don't need to change; the real logic
+/// now lives in `<DaemonState as EnclaveFacade>::resolve_principal_context`
+/// so it is reachable through the trait by code that only has `&dyn
+/// EnclaveFacade`, not a concrete `&DaemonState`.
 async fn resolve_principal_context(
     state: &DaemonState,
     session_id: Option<&str>,
 ) -> Result<Option<PrincipalContext>, String> {
-    let Some(sid) = session_id else {
-        return Ok(None);
-    };
-    let delegation = {
-        let sessions = state.agent_sessions.read().await;
-        match sessions.get(sid) {
-            Some(s) if s.expires_at > SystemTime::now() => s.delegation.clone(),
-            Some(_) => return Err("agent session expired".into()),
-            None => return Err("agent session no longer exists".into()),
-        }
-    };
-    let Some(d) = delegation else {
-        return Ok(None);
-    };
-    let Some(rt) = state.identity.as_ref() else {
-        return Err("delegated session without an identity runtime".into());
-    };
-
-    let now = now_unix();
-
-    let row = rt
-        .store
-        .get_delegation(&d.jti)
-        .map_err(|e| format!("delegation lookup failed: {e}"))?
-        .ok_or("delegation record missing")?;
-    if row.revoked_at.is_some() {
-        return Err("delegation revoked".into());
-    }
-    if row.expires_at <= now {
-        return Err("delegation expired".into());
-    }
-
-    let sub_principal = rt
-        .store
-        .get_principal(&d.sub)
-        .map_err(|e| format!("principal lookup failed: {e}"))?
-        .ok_or("delegating principal missing")?;
-    if sub_principal.disabled {
-        return Err("delegating principal disabled".into());
-    }
-    if !rt.principal_permitted(&sub_principal) {
-        return Err("delegating principal is no longer permitted by identity policy".into());
-    }
-    let act_principal = rt
-        .store
-        .get_principal(&d.act)
-        .map_err(|e| format!("principal lookup failed: {e}"))?
-        .ok_or("agent principal missing")?;
-    if act_principal.disabled {
-        return Err("agent principal disabled".into());
-    }
-
-    // Delegated / break-glass access is only as alive as the human login
-    // session it was granted under.
-    if matches!(d.mode, AccessMode::Delegated | AccessMode::BreakGlass) {
-        let hs_id = d
-            .human_session_id
-            .as_deref()
-            .ok_or("delegation missing its human session binding")?;
-        let hs = rt
-            .store
-            .get_human_session(hs_id)
-            .map_err(|e| format!("session lookup failed: {e}"))?
-            .ok_or("human login session missing")?;
-        if hs.revoked_at.is_some() {
-            return Err("human login session revoked".into());
-        }
-        if hs.expires_at <= now {
-            return Err("human login session expired".into());
-        }
-        if hs.idp_issuer != rt.config.issuer {
-            return Err("human login session issuer is no longer permitted".into());
-        }
-        if hs.principal_id != d.sub {
-            return Err("human login session does not match the delegation".into());
-        }
-    }
-
-    // Team membership comes from the applied federation bundle, resolved
-    // daemon-side per request (bundle refresh takes effect immediately).
-    let sub_teams = state.federation.teams_of(&sub_principal.display_label());
-
-    Ok(Some(PrincipalContext {
-        sub: d.sub.clone(),
-        sub_label: sub_principal.display_label(),
-        sub_roles: sub_principal.roles.clone(),
-        sub_teams,
-        act: d.act.clone(),
-        act_label: act_principal.display_label(),
-        mode: d.mode,
-        jti: d.jti.clone(),
-        human_session_id: d.human_session_id.clone(),
-    }))
+    <DaemonState as EnclaveFacade>::resolve_principal_context(state, session_id).await
 }
 
 async fn handle_request(
@@ -3816,12 +4007,47 @@ async fn handle_request(
         .await;
     }
 
+    // Computed once, up front, for every method whose params may carry a
+    // `workspace` claim: the `github`/`gitlab`/`onepassword`/`bitwarden`/
+    // `exec` family (via `wrapper_workspace` below) and the fixed-manifest
+    // task-planning family (`task_get`/`task_list`/`task_revoke` never look
+    // at `workspace`, so they are deliberately excluded — matching exactly
+    // which methods reached this check before `task_api` moved to
+    // `opaque-bounded-work`). `verified_workspace` (defined below, next to
+    // the `verify_workspace` machinery it wraps) used to live in
+    // `task_api.rs`; it moved here because it calls this file's kernel-side
+    // `verify_workspace`/`workspace_process.rs`, which `opaque-bounded-work`
+    // must not reach back into.
+    let verified_workspace = if matches!(
+        req.method.as_str(),
+        "github"
+            | "gitlab"
+            | "onepassword"
+            | "bitwarden"
+            | "exec"
+            | "task_plan"
+            | "task_plan_inference"
+            | "task_plan_ssh"
+            | "task_run"
+            | "task_reconcile"
+    ) {
+        verified_workspace(&req.params, identity).await
+    } else {
+        Ok(None)
+    };
+    // `github`/`gitlab`/`onepassword`/`bitwarden`/`exec` want the unwrapped
+    // value with one uniform, immediate failure response (unchanged
+    // behavior). The fixed-manifest task family instead gets the `Result`
+    // passed straight through to `task_api::handle`, which funnels a
+    // verification failure into its own `"task_unavailable"` error the same
+    // way it always has — preserving that pre-move behavior exactly rather
+    // than switching it to this uniform response too.
     let wrapper_workspace = if matches!(
         req.method.as_str(),
         "github" | "gitlab" | "onepassword" | "bitwarden" | "exec"
     ) {
-        match task_api::verified_workspace(&req.params, identity).await {
-            Ok(workspace) => workspace,
+        match &verified_workspace {
+            Ok(workspace) => workspace.clone(),
             Err(_) => {
                 return Response::err(
                     Some(req.id),
@@ -3843,13 +4069,26 @@ async fn handle_request(
         | "task_list"
         | "task_revoke"
         | "task_reconcile" => {
-            task_api::handle(
-                state,
+            let insecure_auto_approve = state.config.approval_backend.as_deref()
+                == Some("insecure_auto_approve")
+                || state.config.workstation_test_mode;
+            let kernel = opaque_bounded_work::task_api::TaskApiKernel {
+                facade: state,
+                enclave: state.enclave.as_ref(),
+                tasks: state.tasks.as_deref(),
+                tenant: state.tenant.as_ref(),
+                has_identity: state.identity.is_some(),
+                audit: state.audit.as_ref(),
+                insecure_auto_approve,
+            };
+            opaque_bounded_work::task_api::handle(
+                &kernel,
                 &req,
                 identity,
                 client_type,
                 session_id,
                 principal_ctx,
+                verified_workspace,
             )
             .await
         }
@@ -4056,199 +4295,8 @@ async fn handle_request(
             }
         }
         "identity.role_set" => {
-            let Some(rt) = state.identity.as_ref() else {
-                return Response::err(
-                    Some(req.id),
-                    "identity_not_configured",
-                    "no [identity] section in the daemon config",
-                );
-            };
-            // An ambient admin login is only a prerequisite. It never permits
-            // another socket holder to mutate roles without fresh approval.
-            let acting_admin = rt
-                .current_human_principal()
-                .filter(|principal| principal.has_role(opaque_core::identity::Role::Admin));
-            let Some(acting_admin) = acting_admin else {
-                return Response::err(
-                    Some(req.id),
-                    "not_authorized",
-                    "role changes require an active admin login session",
-                );
-            };
-            if principal_ctx.as_ref().is_some_and(|context| {
-                !context
-                    .sub_roles
-                    .contains(&opaque_core::identity::Role::Admin)
-            }) {
-                return Response::err(
-                    Some(req.id),
-                    "not_authorized",
-                    "delegated role changes require an admin subject",
-                );
-            }
-            let principal_id = req
-                .params
-                .get("principal_id")
-                .and_then(|v| v.as_str())
-                .and_then(|s| opaque_core::identity::PrincipalId::parse(s).ok());
-            let Some(principal_id) = principal_id else {
-                return Response::err(
-                    Some(req.id),
-                    "invalid_params",
-                    "principal_id must be a valid principal id",
-                );
-            };
-            let roles_param = req.params.get("roles").and_then(|v| v.as_array());
-            let Some(roles_param) = roles_param else {
-                return Response::err(
-                    Some(req.id),
-                    "invalid_params",
-                    "roles must be an array of role names",
-                );
-            };
-            let roles_csv = roles_param
-                .iter()
-                .map(|v| v.as_str())
-                .collect::<Option<Vec<_>>>();
-            let Some(roles_csv) = roles_csv else {
-                return Response::err(
-                    Some(req.id),
-                    "invalid_params",
-                    "every role must be a role name",
-                );
-            };
-            let roles_csv = roles_csv.join(",");
-            let roles = match opaque_core::identity::roles_from_string(&roles_csv) {
-                Ok(r) => r,
-                Err(e) => {
-                    return Response::err(Some(req.id), "invalid_params", e.to_string());
-                }
-            };
-            // Only an admitted, enabled human can administer roles through
-            // this flow. Service roles and removed members cannot satisfy the
-            // lockout guard. The store repeats this under its writer lock.
-            let eligible_admin = |principal: &opaque_core::identity::Principal| {
-                matches!(
-                    &principal.kind,
-                    opaque_core::identity::PrincipalKind::Human { .. }
-                ) && principal.has_role(opaque_core::identity::Role::Admin)
-                    && rt.principal_permitted(principal)
-            };
-            let current_eligible_admin_count = || {
-                rt.store
-                    .list_principals()
-                    .map(|principals| {
-                        principals
-                            .iter()
-                            .filter(|principal| eligible_admin(principal))
-                            .count()
-                    })
-                    .unwrap_or(0)
-            };
-            let target = rt.store.get_principal(&principal_id).ok().flatten();
-            let target_is_admin = target.as_ref().is_some_and(eligible_admin);
-            if target_is_admin
-                && !roles.contains(&opaque_core::identity::Role::Admin)
-                && current_eligible_admin_count() <= 1
-            {
-                return Response::err(
-                    Some(req.id),
-                    "last_admin",
-                    "cannot remove the admin role from the last admitted human admin",
-                );
-            }
-            let old_roles = target
-                .as_ref()
-                .map(|p| opaque_core::identity::roles_to_string(&p.roles))
-                .unwrap_or_default();
-            let tenant_context = state
-                .tenant
-                .as_ref()
-                .map(|tenant| tenant.binding().approval_context())
-                .unwrap_or_default();
-            let review = format!(
-                "Change principal roles\n{tenant_context}Acting admin: {}\nTarget principal: {}\nPrevious roles: [{}]\nApproved replacement roles: [{}]",
-                acting_admin.id,
-                principal_id,
-                old_roles,
-                opaque_core::identity::roles_to_string(&roles)
-            );
-            if state.enclave.request_control_approval(identity, client_type, "identity.role_set", &review, "This changes the principal's authorization. Apply exactly this replacement role set.").await.is_err() {
-                return Response::err(Some(req.id), "permission_denied", "role changes require fresh out-of-band admin approval");
-            }
-            if resolve_principal_context(state, session_id)
+            identity::handle_role_set(state, req, identity, client_type, principal_ctx, session_id)
                 .await
-                .ok()
-                .as_ref()
-                != Some(&principal_ctx)
-            {
-                return Response::err(
-                    Some(req.id),
-                    "authority_changed",
-                    "delegation changed during role approval",
-                );
-            }
-            if rt.current_human_principal().is_none_or(|current| {
-                current.id != acting_admin.id
-                    || !current.has_role(opaque_core::identity::Role::Admin)
-            }) || rt
-                .store
-                .get_principal(&principal_id)
-                .ok()
-                .flatten()
-                .is_none_or(|current| {
-                    opaque_core::identity::roles_to_string(&current.roles) != old_roles
-                })
-                || (target_is_admin
-                    && !roles.contains(&opaque_core::identity::Role::Admin)
-                    && current_eligible_admin_count() <= 1)
-            {
-                return Response::err(
-                    Some(req.id),
-                    "authority_changed",
-                    "identity authority changed during approval; request a fresh review",
-                );
-            }
-            match rt.store.set_reviewed_roles(
-                &acting_admin.id,
-                &principal_id,
-                &old_roles,
-                &roles,
-                |principal| rt.principal_permitted(principal),
-            ) {
-                Ok(()) => {
-                    info!(
-                        "roles updated for {principal_id}: [{}]",
-                        opaque_core::identity::roles_to_string(&roles)
-                    );
-                    let acting_admin = rt
-                        .current_human_principal()
-                        .map(|p| p.display_label())
-                        .unwrap_or_else(|| "bootstrap".into());
-                    state.audit.emit(
-                        AuditEvent::new(AuditEventKind::IdentityRoleChanged)
-                            .with_operation("identity.role_set")
-                            .with_client(ClientSummary::from((identity, client_type)))
-                            .with_outcome("ok")
-                            .with_detail(format!(
-                                "principal={principal_id} roles: [{old_roles}] -> [{}] by={acting_admin}",
-                                opaque_core::identity::roles_to_string(&roles)
-                            )),
-                    );
-                    match rt.store.get_principal(&principal_id) {
-                        Ok(Some(p)) => Response::ok(
-                            req.id,
-                            serde_json::json!({
-                                "id": p.id.as_str(),
-                                "label": p.display_label(),
-                                "roles": p.roles.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
-                            }),
-                        ),
-                        _ => Response::ok(req.id, serde_json::json!({ "updated": true })),
-                    }
-                }
-                Err(e) => Response::err(Some(req.id), "invalid_params", e),
-            }
         }
         "identity.delegation_list" => {
             let Some(rt) = state.identity.as_ref() else {
@@ -4308,580 +4356,10 @@ async fn handle_request(
             }
         }
         "agent_session_start" => {
-            let default_ttl = state.config.agent_session_ttl_secs.unwrap_or(3600);
-            let ttl_secs = req
-                .params
-                .get("ttl_secs")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(default_ttl)
-                .clamp(60, 86_400);
-            let label = req
-                .params
-                .get("label")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_owned());
-            let label_for_audit = label.clone();
-
-            // --- Identity: resolve the delegation subject BEFORE burning a
-            // human approval, so malformed requests fail early and the
-            // approval prompt can name who the session would act for.
-            let mut delegation_plan: Option<(AccessMode, opaque_core::identity::Principal)> = None;
-            if let Some(rt) = state.identity.as_ref() {
-                let mode_s = req
-                    .params
-                    .get("mode")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("delegated");
-                let mode = match mode_s.parse::<AccessMode>() {
-                    Ok(m) => m,
-                    Err(_) => {
-                        return Response::err(
-                            Some(req.id),
-                            "invalid_params",
-                            "mode must be one of: delegated, autonomous, break_glass",
-                        );
-                    }
-                };
-                let sub = match mode {
-                    AccessMode::BreakGlass => {
-                        emit_daemon_method_audit(
-                            state,
-                            AuditEventKind::OperationFailed,
-                            "agent_session_start",
-                            identity,
-                            client_type,
-                            "break_glass_unavailable",
-                            Some(
-                                "break-glass session requested; no distinct-approver factor".into(),
-                            ),
-                        );
-                        return Response::err(
-                            Some(req.id),
-                            "break_glass_unavailable",
-                            "break-glass access requires a distinct-approver factor \
-                             (paired second device), which is not configured",
-                        );
-                    }
-                    AccessMode::Delegated => {
-                        let session = match rt.store.current_human_session() {
-                            Ok(Some(s)) => s,
-                            Ok(None) => {
-                                emit_daemon_method_audit(
-                                    state,
-                                    AuditEventKind::OperationFailed,
-                                    "agent_session_start",
-                                    identity,
-                                    client_type,
-                                    "login_required",
-                                    Some("delegated session requested with no active login".into()),
-                                );
-                                return Response::err(
-                                    Some(req.id),
-                                    "login_required",
-                                    "delegated agent sessions require an active human login — \
-                                     run `opaque login` first",
-                                );
-                            }
-                            Err(e) => {
-                                warn!("identity store error during session mint: {e}");
-                                return Response::err(
-                                    Some(req.id),
-                                    "internal",
-                                    "identity store unavailable",
-                                );
-                            }
-                        };
-                        match rt.store.get_principal(&session.principal_id) {
-                            Ok(Some(p))
-                                if rt.principal_permitted(&p)
-                                    && session.idp_issuer == rt.config.issuer =>
-                            {
-                                p
-                            }
-                            Ok(_) => {
-                                return Response::err(
-                                    Some(req.id),
-                                    "login_required",
-                                    "the logged-in principal is missing or disabled",
-                                );
-                            }
-                            Err(e) => {
-                                warn!("identity store error during session mint: {e}");
-                                return Response::err(
-                                    Some(req.id),
-                                    "internal",
-                                    "identity store unavailable",
-                                );
-                            }
-                        }
-                    }
-                    AccessMode::Autonomous => {
-                        let Some(service) = req.params.get("service").and_then(|v| v.as_str())
-                        else {
-                            return Response::err(
-                                Some(req.id),
-                                "invalid_params",
-                                "autonomous mode requires a 'service' principal name",
-                            );
-                        };
-                        match rt.store.get_service_by_name(service) {
-                            Ok(Some(p)) if rt.principal_permitted(&p) => p,
-                            Ok(_) => {
-                                emit_daemon_method_audit(
-                                    state,
-                                    AuditEventKind::OperationFailed,
-                                    "agent_session_start",
-                                    identity,
-                                    client_type,
-                                    "unknown_service_principal",
-                                    Some(format!(
-                                        "autonomous session requested for unknown service '{}'",
-                                        service.chars().take(64).collect::<String>()
-                                    )),
-                                );
-                                return Response::err(
-                                    Some(req.id),
-                                    "unknown_service_principal",
-                                    "no such service principal — declare it under \
-                                     [[identity.service_principals]] in the daemon config",
-                                );
-                            }
-                            Err(e) => {
-                                warn!("identity store error during session mint: {e}");
-                                return Response::err(
-                                    Some(req.id),
-                                    "internal",
-                                    "identity store unavailable",
-                                );
-                            }
-                        }
-                    }
-                };
-                delegation_plan = Some((mode, sub));
-            }
-
-            // SECURITY (C1/software-first): minting a session token grants a wrapped
-            // agent scoped access, so it must be authorized by a fresh out-of-band
-            // human approval — not by client classification, which an agent can wear.
-            // The agent cannot satisfy the approval, so it cannot mint its own session.
-            let reason = session_approval_reason(
-                state.tenant.as_ref().map(|boundary| boundary.binding()),
-                identity.uid,
-                ttl_secs,
-                delegation_plan.as_ref(),
-                label.as_deref(),
-            );
-            let session_approver = match state
-                .enclave
-                .request_control_approval(
-                    identity,
-                    client_type,
-                    "agent_session_start",
-                    "Create an agent session token",
-                    &reason,
-                )
-                .await
-            {
-                Ok(approver) => approver,
-                Err(e) => {
-                    emit_daemon_method_audit(
-                        state,
-                        AuditEventKind::OperationFailed,
-                        "agent_session_start",
-                        identity,
-                        client_type,
-                        "permission_denied",
-                        Some(format!("session creation not approved: {e}")),
-                    );
-                    return Response::err(
-                        Some(req.id),
-                        "permission_denied",
-                        "creating an agent session requires out-of-band approval",
-                    );
-                }
-            };
-
-            let session_id = Uuid::new_v4().to_string();
-            let expires_at = SystemTime::now()
-                .checked_add(std::time::Duration::from_secs(ttl_secs))
-                .unwrap_or(SystemTime::now());
-
-            // Mint the credential: a signed delegation token when identity is
-            // configured, the legacy opaque hex token otherwise.
-            let (session_token, delegation, mut extra) = match (
-                state.identity.as_ref(),
-                delegation_plan,
-            ) {
-                (Some(rt), Some((mode, sub))) => {
-                    // Membership or principal state may have changed while
-                    // the independent approver reviewed session creation.
-                    let sub = match rt.store.get_principal(&sub.id) {
-                        Ok(Some(current)) if rt.principal_permitted(&current) => current,
-                        _ => {
-                            return Response::err(
-                                Some(req.id),
-                                "identity_not_permitted",
-                                "the delegating principal is no longer permitted by identity policy",
-                            );
-                        }
-                    };
-                    // Re-check the login session didn't expire while the
-                    // human was approving (delegated mode only).
-                    let human_session_id = if mode == AccessMode::Delegated {
-                        match rt.store.current_human_session() {
-                            Ok(Some(s))
-                                if s.principal_id == sub.id && s.idp_issuer == rt.config.issuer =>
-                            {
-                                Some(s.id)
-                            }
-                            _ => {
-                                return Response::err(
-                                    Some(req.id),
-                                    "login_required",
-                                    "the human login session ended before the delegation \
-                                     could be issued — run `opaque login` again",
-                                );
-                            }
-                        }
-                    } else {
-                        None
-                    };
-
-                    let tool = derive_agent_tool_name(label.as_deref(), identity);
-                    let act = match rt.store.upsert_agent(&tool) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            warn!("failed to upsert agent principal: {e}");
-                            return Response::err(
-                                Some(req.id),
-                                "internal",
-                                "identity store unavailable",
-                            );
-                        }
-                    };
-
-                    let now = now_unix();
-                    let claims = DelegationClaims {
-                        jti: session_id.clone(),
-                        sub: sub.id.clone(),
-                        act: act.id.clone(),
-                        mode,
-                        iat: now,
-                        exp: now + ttl_secs as i64,
-                    };
-                    let token = match sign_delegation_token(&claims, &rt.signing) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            warn!("failed to sign delegation token: {e}");
-                            return Response::err(
-                                Some(req.id),
-                                "internal",
-                                "could not mint a delegation token",
-                            );
-                        }
-                    };
-                    let record = identity::store::DelegationRecord {
-                        jti: session_id.clone(),
-                        sub_principal: sub.id.clone(),
-                        act_principal: act.id.clone(),
-                        mode,
-                        human_session_id: human_session_id.clone(),
-                        // Attribute the delegation to the principal who
-                        // approved its minting, when the gate named one.
-                        approved_by: session_approver
-                            .as_ref()
-                            .and_then(|a| PrincipalId::parse(&a.principal_id).ok()),
-                        created_at: now,
-                        expires_at: now + ttl_secs as i64,
-                        revoked_at: None,
-                    };
-                    if let Err(e) = rt.store.record_delegation(&record) {
-                        warn!("failed to record delegation: {e}");
-                        return Response::err(
-                            Some(req.id),
-                            "internal",
-                            "could not record the delegation",
-                        );
-                    }
-
-                    let extra = serde_json::json!({
-                        "mode": mode.as_str(),
-                        "on_behalf_of": sub.id.as_str(),
-                        "on_behalf_of_label": sub.display_label(),
-                    });
-                    (
-                        token,
-                        Some(SessionDelegation {
-                            jti: session_id.clone(),
-                            sub: sub.id.clone(),
-                            act: act.id.clone(),
-                            mode,
-                            human_session_id,
-                        }),
-                        extra,
-                    )
-                }
-                _ => (generate_daemon_token(), None, serde_json::json!({})),
-            };
-
-            let delegation_for_audit = delegation
-                .as_ref()
-                .map(|d| format!(" mode={} sub={}", d.mode, d.sub))
-                .unwrap_or_default();
-
-            let session = AgentSession {
-                session_id: session_id.clone(),
-                token: session_token.clone(),
-                created_by_uid: identity.uid,
-                expires_at,
-                label,
-                delegation: delegation.clone(),
-            };
-            state
-                .agent_sessions
-                .write()
-                .await
-                .insert(session_id.clone(), session);
-
-            let detail = format!(
-                "session_id={} ttl_secs={} label={}{}",
-                session_id,
-                ttl_secs,
-                label_for_audit.as_deref().unwrap_or(""),
-                delegation_for_audit
-            );
-            // A delegated/autonomous mint is a DelegationIssued event carrying
-            // the principal context; a legacy hex-token mint stays a plain
-            // session-start operation event.
-            match &delegation {
-                Some(d) => {
-                    let sub_label = state
-                        .identity
-                        .as_ref()
-                        .and_then(|rt| rt.store.get_principal(&d.sub).ok().flatten())
-                        .map(|p| p.display_label())
-                        .unwrap_or_default();
-                    let ctx = PrincipalContext {
-                        sub: d.sub.clone(),
-                        sub_teams: state.federation.teams_of(&sub_label),
-                        sub_label,
-                        sub_roles: Default::default(),
-                        act: d.act.clone(),
-                        act_label: String::new(),
-                        mode: d.mode,
-                        jti: d.jti.clone(),
-                        human_session_id: d.human_session_id.clone(),
-                    };
-                    state.audit.emit({
-                        let mut ev = AuditEvent::new(AuditEventKind::DelegationIssued)
-                            .with_operation("agent_session_start")
-                            .with_client(
-                                ClientSummary::from((identity, client_type)).with_principal(&ctx),
-                            )
-                            .with_outcome("issued")
-                            .with_detail(detail);
-                        if let Some(ref approver) = session_approver {
-                            ev = ev.with_approver(approver.clone());
-                        }
-                        ev
-                    });
-                }
-                None => emit_daemon_method_audit(
-                    state,
-                    AuditEventKind::OperationSucceeded,
-                    "agent_session_start",
-                    identity,
-                    client_type,
-                    "started",
-                    Some(detail),
-                ),
-            }
-
-            let mut payload = serde_json::json!({
-                "session_id": session_id,
-                "session_token": session_token,
-                "expires_at_utc_ms": system_time_to_unix_ms(expires_at),
-                "ttl_secs": ttl_secs,
-            });
-            if let (Some(obj), Some(extra_obj)) = (payload.as_object_mut(), extra.as_object_mut()) {
-                obj.append(extra_obj);
-            }
-            Response::ok(req.id, payload)
+            agent_session::handle_start(state, req, identity, client_type).await
         }
-        "agent_session_end" => {
-            let end_all = req
-                .params
-                .get("all")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let session_id_param = req.params.get("session_id").and_then(|v| v.as_str());
-
-            if end_all && session_id_param.is_some() {
-                emit_daemon_method_audit(
-                    state,
-                    AuditEventKind::OperationFailed,
-                    "agent_session_end",
-                    identity,
-                    client_type,
-                    "bad_request",
-                    Some("cannot combine all=true with session_id".into()),
-                );
-                return Response::err(
-                    Some(req.id),
-                    "bad_request",
-                    "cannot combine 'all' with 'session_id'",
-                );
-            }
-
-            if end_all {
-                let mut sessions = state.agent_sessions.write().await;
-                let before = sessions.len();
-                let ended_delegations: Vec<SessionDelegation> = sessions
-                    .values()
-                    .filter(|s| s.created_by_uid == identity.uid)
-                    .filter_map(|s| s.delegation.clone())
-                    .collect();
-                sessions.retain(|_, s| s.created_by_uid != identity.uid);
-                let ended_count = before.saturating_sub(sessions.len());
-                drop(sessions);
-                revoke_delegations(state, identity, client_type, &ended_delegations);
-                emit_daemon_method_audit(
-                    state,
-                    AuditEventKind::OperationSucceeded,
-                    "agent_session_end",
-                    identity,
-                    client_type,
-                    "ended_all",
-                    Some(format!("ended_count={ended_count}")),
-                );
-                return Response::ok(
-                    req.id,
-                    serde_json::json!({
-                        "status": "ended",
-                        "all": true,
-                        "ended_count": ended_count,
-                    }),
-                );
-            }
-
-            let Some(session_id) = session_id_param else {
-                emit_daemon_method_audit(
-                    state,
-                    AuditEventKind::OperationFailed,
-                    "agent_session_end",
-                    identity,
-                    client_type,
-                    "bad_request",
-                    Some("missing session_id".into()),
-                );
-                return Response::err(Some(req.id), "bad_request", "missing 'session_id' field");
-            };
-
-            let mut sessions = state.agent_sessions.write().await;
-            let can_delete = if let Some(existing) = sessions.get(session_id) {
-                client_type == ClientType::Human || existing.created_by_uid == identity.uid
-            } else {
-                true
-            };
-            if !can_delete {
-                emit_daemon_method_audit(
-                    state,
-                    AuditEventKind::OperationFailed,
-                    "agent_session_end",
-                    identity,
-                    client_type,
-                    "permission_denied",
-                    Some(format!("session_id={session_id}")),
-                );
-                return Response::err(
-                    Some(req.id),
-                    "permission_denied",
-                    "session belongs to a different uid",
-                );
-            }
-
-            let removed = sessions.remove(session_id);
-            drop(sessions);
-            if let Some(d) = removed.as_ref().and_then(|s| s.delegation.clone()) {
-                revoke_delegations(state, identity, client_type, &[d]);
-            }
-            let label = removed.as_ref().and_then(|s| s.label.clone());
-            let status = if removed.is_some() {
-                "ended"
-            } else {
-                "not_found"
-            };
-            emit_daemon_method_audit(
-                state,
-                AuditEventKind::OperationSucceeded,
-                "agent_session_end",
-                identity,
-                client_type,
-                status,
-                Some(format!("session_id={session_id}")),
-            );
-
-            Response::ok(
-                req.id,
-                serde_json::json!({
-                    "status": status,
-                    "session_id": session_id,
-                    "label": label,
-                }),
-            )
-        }
-        "agent_session_list" => {
-            // NOTE (software-first): no longer gated on client classification, which
-            // is audit-only at a shared uid. The listing is already scoped to the
-            // caller's own uid and hides tokens; restricting it from a co-resident
-            // agent soundly requires the separate-uid split (Lever B).
-            let now = SystemTime::now();
-            let mut sessions = state.agent_sessions.write().await;
-            // Expire old sessions opportunistically.
-            sessions.retain(|_, s| s.expires_at > now);
-
-            let mut visible_sessions: Vec<serde_json::Value> = sessions
-                .values()
-                .filter(|s| s.created_by_uid == identity.uid)
-                .map(|s| {
-                    let ttl_remaining_secs = s
-                        .expires_at
-                        .duration_since(now)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    serde_json::json!({
-                        "session_id": s.session_id,
-                        "label": s.label,
-                        "expires_at_utc_ms": system_time_to_unix_ms(s.expires_at),
-                        "ttl_remaining_secs": ttl_remaining_secs,
-                    })
-                })
-                .collect();
-
-            visible_sessions.sort_by(|a, b| {
-                let a_id = a.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
-                let b_id = b.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
-                a_id.cmp(b_id)
-            });
-
-            emit_daemon_method_audit(
-                state,
-                AuditEventKind::OperationSucceeded,
-                "agent_session_list",
-                identity,
-                client_type,
-                "listed",
-                Some(format!("count={}", visible_sessions.len())),
-            );
-
-            Response::ok(
-                req.id,
-                serde_json::json!({
-                    "count": visible_sessions.len(),
-                    "sessions": visible_sessions,
-                }),
-            )
-        }
+        "agent_session_end" => agent_session::handle_end(state, req, identity, client_type).await,
+        "agent_session_list" => agent_session::handle_list(state, req, identity, client_type).await,
         "leases" => {
             // NOTE (software-first): no longer gated on client classification
             // (audit-only at a shared uid). Read-only lease metadata; a sound
@@ -5253,7 +4731,7 @@ async fn handle_request(
                 .get("label")
                 .and_then(|v| v.as_str())
                 .unwrap_or("hardware key");
-            let response: fido2::Fido2RegistrationResponse = match req
+            let response: opaque_approval::fido2::Fido2RegistrationResponse = match req
                 .params
                 .get("response")
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -5425,7 +4903,7 @@ async fn handle_request(
             if request_id.is_empty() {
                 return Response::err(Some(req.id), "bad_request", "missing 'request_id'");
             }
-            let assertion: fido2::Fido2Assertion = match req
+            let assertion: opaque_approval::fido2::Fido2Assertion = match req
                 .params
                 .get("assertion")
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -5467,1074 +4945,65 @@ async fn handle_request(
             }
         }
         "execute" => {
-            let operation = req
-                .params
-                .get("operation")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-
-            if operation.is_empty() {
-                return Response::err(Some(req.id), "bad_request", "missing 'operation' field");
-            }
-
-            let target: HashMap<String, String> = req
-                .params
-                .get("target")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default();
-
-            let secret_ref_names: Vec<String> = req
-                .params
-                .get("secret_ref_names")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default();
-
-            // --- Input validation (P0): sanitize client-controlled strings ---
-            let target = match InputValidator::validate_target(&target) {
-                Ok(t) => t,
-                Err(e) => {
-                    return Response::err(
-                        Some(req.id),
-                        "bad_request",
-                        format!("invalid target: {e}"),
-                    );
-                }
-            };
-
-            let secret_ref_names =
-                match InputValidator::validate_secret_ref_names(&secret_ref_names) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        return Response::err(
-                            Some(req.id),
-                            "bad_request",
-                            format!("invalid secret_ref_names: {e}"),
-                        );
-                    }
-                };
-
-            // Client type is derived from verified identity — NEVER from params.
-            // Any `client_type` field in params is silently ignored.
-
-            let op_params = req
-                .params
-                .get("params")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-
-            let mut workspace: Option<opaque_core::operation::WorkspaceContext> = req
-                .params
-                .get("workspace")
-                .and_then(|v| serde_json::from_value(v.clone()).ok());
-
-            // Sanitize workspace remote_url to strip embedded credentials.
-            if let Some(ref mut ws) = workspace
-                && let Some(ref url) = ws.remote_url
-            {
-                ws.remote_url = Some(InputValidator::sanitize_url(url));
-            }
-
-            // Verify claimed workspace against actual process state.
-            // verify_workspace is async (offloads blocking git commands to spawn_blocking).
-            if let Some(ref ws) = workspace
-                && let Err(e) = verify_workspace(ws, identity.pid).await
-            {
-                warn!("workspace verification failed: {e}");
-                return Response::err(
-                    Some(req.id),
-                    "workspace_verification_failed",
-                    "workspace verification failed",
-                );
-            }
-
-            // Mark workspace as verified — the daemon confirmed the claimed
-            // workspace state matches the actual process and git state.
-            // Policy rules with workspace constraints will check this flag.
-            if let Some(ref mut ws) = workspace {
-                ws.workspace_verified = true;
-            }
-
-            let op_req = OperationRequest {
-                principal: principal_ctx.clone(),
-                request_id: Uuid::new_v4(),
-                client_identity: identity.clone(),
-                client_type,
-                operation,
-                target,
-                secret_ref_names,
-                created_at: SystemTime::now(),
-                expires_at: None,
-                params: op_params,
-                workspace,
-            };
-
-            state
-                .enclave
-                .execute(op_req)
-                .await
-                .into_proto_response(req.id)
+            rpc_wrappers::handle_execute(state, req, identity, client_type, principal_ctx).await
         }
         "github" => {
-            // The github method is a convenience wrapper that builds an "execute"
-            // request for the appropriate github.* operation based on the `scope` param.
-            //
-            // The `action` field determines the operation type:
-            // - "list_secrets" → github.list_secrets
-            // - "delete_secret" → github.delete_secret
-            // - (default) → github.set_* (set secret)
-            let action = req
-                .params
-                .get("action")
-                .and_then(|v| v.as_str())
-                .unwrap_or("set_secret");
-
-            // Route list_secrets and delete_secret to their own dispatch paths.
-            if action == "list_secrets" {
-                return handle_github_list_secrets(
-                    &req,
-                    state,
-                    identity,
-                    client_type,
-                    principal_ctx.as_ref(),
-                )
-                .await;
-            }
-            if action == "delete_secret" {
-                return handle_github_delete_secret(
-                    &req,
-                    state,
-                    identity,
-                    client_type,
-                    principal_ctx.as_ref(),
-                )
-                .await;
-            }
-
-            let scope = req
-                .params
-                .get("scope")
-                .and_then(|v| v.as_str())
-                .unwrap_or("repo_actions");
-
-            let secret_name = req
-                .params
-                .get("secret_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-
-            if secret_name.is_empty() {
-                return Response::err(Some(req.id), "bad_request", "missing 'secret_name' field");
-            }
-
-            // Validate secret_name (alphanumeric + underscores).
-            if !secret_name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_')
-            {
-                return Response::err(
-                    Some(req.id),
-                    "bad_request",
-                    "secret_name must be alphanumeric (with underscores)",
-                );
-            }
-
-            let value_ref = req
-                .params
-                .get("value_ref")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-
-            if value_ref.is_empty() {
-                return Response::err(Some(req.id), "bad_request", "missing 'value_ref' field");
-            }
-
-            // Validate value_ref starts with a known scheme.
-            if !opaque_core::profile::ALLOWED_REF_SCHEMES
-                .iter()
-                .any(|s| value_ref.starts_with(s))
-            {
-                return Response::err(
-                    Some(req.id),
-                    "bad_request",
-                    format!(
-                        "value_ref must start with a known scheme ({:?})",
-                        opaque_core::profile::ALLOWED_REF_SCHEMES
-                    ),
-                );
-            }
-
-            // Validate value_ref and github_token_ref for control chars / secret patterns.
-            // This prevents prompt injection in the approval UI via crafted ref strings.
-            let mut refs_to_validate = vec![value_ref.clone()];
-            if let Some(tok) = req.params.get("github_token_ref").and_then(|v| v.as_str()) {
-                refs_to_validate.push(tok.to_owned());
-            }
-            if let Err(e) = InputValidator::validate_secret_ref_names(&refs_to_validate) {
-                return Response::err(
-                    Some(req.id),
-                    "bad_request",
-                    format!("invalid secret ref: {e}"),
-                );
-            }
-
-            // Determine operation name and target based on scope.
-            let (operation, target, op_params) = match scope {
-                "repo_actions" | "env_actions" => {
-                    let repo = req
-                        .params
-                        .get("repo")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_owned();
-                    if repo.is_empty() {
-                        return Response::err(Some(req.id), "bad_request", "missing 'repo' field");
-                    }
-                    if !repo.contains('/') || repo.starts_with('/') || repo.ends_with('/') {
-                        return Response::err(
-                            Some(req.id),
-                            "bad_request",
-                            "repo must be in 'owner/repo' format",
-                        );
-                    }
-
-                    let mut params = serde_json::json!({
-                        "repo": repo,
-                        "secret_name": secret_name,
-                        "value_ref": value_ref,
-                    });
-                    if let Some(tok) = req.params.get("github_token_ref").and_then(|v| v.as_str()) {
-                        params["github_token_ref"] = serde_json::Value::String(tok.into());
-                    }
-                    if let Some(env) = req.params.get("environment").and_then(|v| v.as_str()) {
-                        params["environment"] = serde_json::Value::String(env.into());
-                    }
-                    let mut target = HashMap::from([
-                        ("repo".into(), repo),
-                        ("secret_name".into(), secret_name.clone()),
-                    ]);
-                    if let Some(env) = params.get("environment").and_then(|v| v.as_str()) {
-                        target.insert("environment".into(), env.to_owned());
-                    }
-                    ("github.set_actions_secret", target, params)
-                }
-                "codespaces_user" => {
-                    let mut params = serde_json::json!({
-                        "secret_name": secret_name,
-                        "value_ref": value_ref,
-                    });
-                    if let Some(tok) = req.params.get("github_token_ref").and_then(|v| v.as_str()) {
-                        params["github_token_ref"] = serde_json::Value::String(tok.into());
-                    }
-                    if let Some(ids) = req.params.get("selected_repository_ids") {
-                        params["selected_repository_ids"] = ids.clone();
-                    }
-                    let target = HashMap::from([("secret_name".into(), secret_name.clone())]);
-                    ("github.set_codespaces_secret", target, params)
-                }
-                "codespaces_repo" => {
-                    let repo = req
-                        .params
-                        .get("repo")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_owned();
-                    if repo.is_empty() {
-                        return Response::err(Some(req.id), "bad_request", "missing 'repo' field");
-                    }
-                    if !repo.contains('/') || repo.starts_with('/') || repo.ends_with('/') {
-                        return Response::err(
-                            Some(req.id),
-                            "bad_request",
-                            "repo must be in 'owner/repo' format",
-                        );
-                    }
-
-                    let mut params = serde_json::json!({
-                        "repo": repo,
-                        "secret_name": secret_name,
-                        "value_ref": value_ref,
-                    });
-                    if let Some(tok) = req.params.get("github_token_ref").and_then(|v| v.as_str()) {
-                        params["github_token_ref"] = serde_json::Value::String(tok.into());
-                    }
-                    let target = HashMap::from([
-                        ("repo".into(), repo),
-                        ("secret_name".into(), secret_name.clone()),
-                    ]);
-                    ("github.set_codespaces_secret", target, params)
-                }
-                "dependabot" => {
-                    let repo = req
-                        .params
-                        .get("repo")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_owned();
-                    if repo.is_empty() {
-                        return Response::err(Some(req.id), "bad_request", "missing 'repo' field");
-                    }
-                    if !repo.contains('/') || repo.starts_with('/') || repo.ends_with('/') {
-                        return Response::err(
-                            Some(req.id),
-                            "bad_request",
-                            "repo must be in 'owner/repo' format",
-                        );
-                    }
-
-                    let mut params = serde_json::json!({
-                        "repo": repo,
-                        "secret_name": secret_name,
-                        "value_ref": value_ref,
-                    });
-                    if let Some(tok) = req.params.get("github_token_ref").and_then(|v| v.as_str()) {
-                        params["github_token_ref"] = serde_json::Value::String(tok.into());
-                    }
-                    let target = HashMap::from([
-                        ("repo".into(), repo),
-                        ("secret_name".into(), secret_name.clone()),
-                    ]);
-                    ("github.set_dependabot_secret", target, params)
-                }
-                "org_actions" => {
-                    let org = req
-                        .params
-                        .get("org")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_owned();
-                    if org.is_empty() {
-                        return Response::err(Some(req.id), "bad_request", "missing 'org' field");
-                    }
-
-                    let mut params = serde_json::json!({
-                        "org": org,
-                        "secret_name": secret_name,
-                        "value_ref": value_ref,
-                    });
-                    if let Some(tok) = req.params.get("github_token_ref").and_then(|v| v.as_str()) {
-                        params["github_token_ref"] = serde_json::Value::String(tok.into());
-                    }
-                    if let Some(vis) = req.params.get("visibility").and_then(|v| v.as_str()) {
-                        params["visibility"] = serde_json::Value::String(vis.into());
-                    }
-                    if let Some(ids) = req.params.get("selected_repository_ids") {
-                        params["selected_repository_ids"] = ids.clone();
-                    }
-                    let target = HashMap::from([
-                        ("org".into(), org),
-                        ("secret_name".into(), secret_name.clone()),
-                    ]);
-                    ("github.set_org_secret", target, params)
-                }
-                unknown => {
-                    return Response::err(
-                        Some(req.id),
-                        "bad_request",
-                        format!(
-                            "unknown scope '{}' (expected: repo_actions, env_actions, codespaces_user, codespaces_repo, dependabot, org_actions)",
-                            truncate_for_error(unknown, 64)
-                        ),
-                    );
-                }
-            };
-
-            // Validate target before building OperationRequest.
-            let target = match InputValidator::validate_target(&target) {
-                Ok(t) => t,
-                Err(e) => {
-                    return Response::err(
-                        Some(req.id),
-                        "bad_request",
-                        format!("invalid target: {e}"),
-                    );
-                }
-            };
-
-            let mut secret_refs = vec![value_ref.clone()];
-            if let Some(tok) = op_params.get("github_token_ref").and_then(|v| v.as_str()) {
-                secret_refs.push(tok.to_owned());
-            }
-
-            let op_req = OperationRequest {
-                principal: principal_ctx.clone(),
-                request_id: Uuid::new_v4(),
-                client_identity: identity.clone(),
+            opaque_providers::github::handle_github_rpc(
+                &req,
+                state,
+                identity,
                 client_type,
-                operation: operation.into(),
-                target,
-                secret_ref_names: secret_refs,
-                created_at: SystemTime::now(),
-                expires_at: None,
-                params: op_params,
-                workspace: wrapper_workspace.clone(),
-            };
-
-            state
-                .enclave
-                .execute(op_req)
-                .await
-                .into_proto_response(req.id)
+                principal_ctx.as_ref(),
+                wrapper_workspace.clone(),
+            )
+            .await
         }
         "gitlab" => {
-            // Convenience wrapper for gitlab.set_ci_variable.
-            let action = req
-                .params
-                .get("action")
-                .and_then(|v| v.as_str())
-                .unwrap_or("set_ci_variable")
-                .to_owned();
-
-            if action != "set_ci_variable" {
-                return Response::err(
-                    Some(req.id),
-                    "bad_request",
-                    format!(
-                        "unknown action '{}' (expected: set_ci_variable)",
-                        truncate_for_error(&action, 64)
-                    ),
-                );
-            }
-
-            let project = req
-                .params
-                .get("project")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-            if project.is_empty() {
-                return Response::err(Some(req.id), "bad_request", "missing 'project' field");
-            }
-
-            let key = req
-                .params
-                .get("key")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-            if key.is_empty() {
-                return Response::err(Some(req.id), "bad_request", "missing 'key' field");
-            }
-            if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                return Response::err(
-                    Some(req.id),
-                    "bad_request",
-                    "key must be alphanumeric (with underscores)",
-                );
-            }
-
-            let value_ref = req
-                .params
-                .get("value_ref")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-            if value_ref.is_empty() {
-                return Response::err(Some(req.id), "bad_request", "missing 'value_ref' field");
-            }
-            if !opaque_core::profile::ALLOWED_REF_SCHEMES
-                .iter()
-                .any(|s| value_ref.starts_with(s))
-            {
-                return Response::err(
-                    Some(req.id),
-                    "bad_request",
-                    format!(
-                        "value_ref must start with a known scheme ({:?})",
-                        opaque_core::profile::ALLOWED_REF_SCHEMES
-                    ),
-                );
-            }
-
-            let mut refs_to_validate = vec![value_ref.clone()];
-            if let Some(tok) = req.params.get("gitlab_token_ref").and_then(|v| v.as_str()) {
-                refs_to_validate.push(tok.to_owned());
-            }
-            if let Err(e) = InputValidator::validate_secret_ref_names(&refs_to_validate) {
-                return Response::err(
-                    Some(req.id),
-                    "bad_request",
-                    format!("invalid secret ref: {e}"),
-                );
-            }
-
-            let target = HashMap::from([
-                ("project".into(), project.clone()),
-                ("key".into(), key.clone()),
-            ]);
-            let target = match InputValidator::validate_target(&target) {
-                Ok(t) => t,
-                Err(e) => {
-                    return Response::err(
-                        Some(req.id),
-                        "bad_request",
-                        format!("invalid target: {e}"),
-                    );
-                }
-            };
-
-            let mut op_params = serde_json::json!({
-                "project": project,
-                "key": key,
-                "value_ref": value_ref,
-            });
-            if let Some(tok) = req.params.get("gitlab_token_ref").and_then(|v| v.as_str()) {
-                op_params["gitlab_token_ref"] = serde_json::Value::String(tok.to_owned());
-            }
-            if let Some(scope) = req.params.get("environment_scope").and_then(|v| v.as_str()) {
-                op_params["environment_scope"] = serde_json::Value::String(scope.to_owned());
-            }
-            if req.params.get("protected").is_some() {
-                op_params["protected"] = req.params["protected"].clone();
-            }
-            if req.params.get("masked").is_some() {
-                op_params["masked"] = req.params["masked"].clone();
-            }
-            if req.params.get("raw").is_some() {
-                op_params["raw"] = req.params["raw"].clone();
-            }
-            if let Some(variable_type) = req.params.get("variable_type").and_then(|v| v.as_str()) {
-                op_params["variable_type"] = serde_json::Value::String(variable_type.to_owned());
-            }
-
-            let op_req = OperationRequest {
-                principal: principal_ctx.clone(),
-                request_id: Uuid::new_v4(),
-                client_identity: identity.clone(),
+            rpc_wrappers::handle_gitlab(
+                state,
+                req,
+                identity,
                 client_type,
-                operation: "gitlab.set_ci_variable".into(),
-                target,
-                secret_ref_names: vec![],
-                created_at: SystemTime::now(),
-                expires_at: None,
-                params: op_params,
-                workspace: wrapper_workspace.clone(),
-            };
-
-            state
-                .enclave
-                .execute(op_req)
-                .await
-                .into_proto_response(req.id)
+                principal_ctx,
+                wrapper_workspace,
+            )
+            .await
         }
         "onepassword" => {
-            // The onepassword method is a convenience wrapper that builds an
-            // "execute" request for the appropriate onepassword.* operation.
-            let action = req
-                .params
-                .get("action")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-
-            if action.is_empty() {
-                return Response::err(Some(req.id), "bad_request", "missing 'action' field");
-            }
-
-            let (operation, target, op_params) = match action.as_str() {
-                "list_vaults" => (
-                    "onepassword.list_vaults",
-                    HashMap::new(),
-                    serde_json::json!({}),
-                ),
-                "list_items" => {
-                    let vault = req
-                        .params
-                        .get("vault")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_owned();
-
-                    if vault.is_empty() {
-                        return Response::err(Some(req.id), "bad_request", "missing 'vault' field");
-                    }
-
-                    let target = HashMap::from([("vault".into(), vault.clone())]);
-                    (
-                        "onepassword.list_items",
-                        target,
-                        serde_json::json!({ "vault": vault }),
-                    )
-                }
-                "read_field" => {
-                    let vault = req
-                        .params
-                        .get("vault")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_owned();
-                    let item = req
-                        .params
-                        .get("item")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_owned();
-                    let field = req
-                        .params
-                        .get("field")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_owned();
-
-                    if vault.is_empty() {
-                        return Response::err(Some(req.id), "bad_request", "missing 'vault' field");
-                    }
-                    if item.is_empty() {
-                        return Response::err(Some(req.id), "bad_request", "missing 'item' field");
-                    }
-                    if field.is_empty() {
-                        return Response::err(Some(req.id), "bad_request", "missing 'field' field");
-                    }
-
-                    let target = HashMap::from([
-                        ("vault".into(), vault.clone()),
-                        ("item".into(), item.clone()),
-                    ]);
-                    (
-                        "onepassword.read_field",
-                        target,
-                        serde_json::json!({ "vault": vault, "item": item, "field": field }),
-                    )
-                }
-                unknown => {
-                    return Response::err(
-                        Some(req.id),
-                        "bad_request",
-                        format!(
-                            "unknown action '{}' (expected: list_vaults, list_items, read_field)",
-                            truncate_for_error(unknown, 64)
-                        ),
-                    );
-                }
-            };
-
-            // Validate target before building OperationRequest.
-            let target = match InputValidator::validate_target(&target) {
-                Ok(t) => t,
-                Err(e) => {
-                    return Response::err(
-                        Some(req.id),
-                        "bad_request",
-                        format!("invalid target: {e}"),
-                    );
-                }
-            };
-
-            // Build secret_ref_names from the vault/item/field path for read_field.
-            let secret_ref_names = if action == "read_field" {
-                let v = op_params
-                    .get("vault")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let i = op_params.get("item").and_then(|v| v.as_str()).unwrap_or("");
-                let f = op_params
-                    .get("field")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let refs = vec![format!("onepassword:{v}/{i}/{f}")];
-                if let Err(e) = InputValidator::validate_secret_ref_names(&refs) {
-                    return Response::err(
-                        Some(req.id),
-                        "bad_request",
-                        format!("invalid secret ref: {e}"),
-                    );
-                }
-                refs
-            } else {
-                vec![]
-            };
-
-            let op_req = OperationRequest {
-                principal: principal_ctx.clone(),
-                request_id: Uuid::new_v4(),
-                client_identity: identity.clone(),
+            rpc_wrappers::handle_onepassword(
+                state,
+                req,
+                identity,
                 client_type,
-                operation: operation.into(),
-                target,
-                secret_ref_names,
-                created_at: SystemTime::now(),
-                expires_at: None,
-                params: op_params,
-                workspace: wrapper_workspace.clone(),
-            };
-
-            state
-                .enclave
-                .execute(op_req)
-                .await
-                .into_proto_response(req.id)
+                principal_ctx,
+                wrapper_workspace,
+            )
+            .await
         }
         "bitwarden" => {
-            // The bitwarden method is a convenience wrapper that builds an
-            // "execute" request for the appropriate bitwarden.* operation.
-            let action = req
-                .params
-                .get("action")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-
-            if action.is_empty() {
-                return Response::err(Some(req.id), "bad_request", "missing 'action' field");
-            }
-
-            let (operation, target, op_params) = match action.as_str() {
-                "list_projects" => (
-                    "bitwarden.list_projects",
-                    HashMap::new(),
-                    serde_json::json!({}),
-                ),
-                "list_secrets" => {
-                    let project = req
-                        .params
-                        .get("project")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_owned());
-
-                    let target = if let Some(ref p) = project {
-                        HashMap::from([("project".into(), p.clone())])
-                    } else {
-                        HashMap::new()
-                    };
-                    let params = if let Some(ref p) = project {
-                        serde_json::json!({ "project": p })
-                    } else {
-                        serde_json::json!({})
-                    };
-                    ("bitwarden.list_secrets", target, params)
-                }
-                "read_secret" => {
-                    let secret_id = req
-                        .params
-                        .get("secret_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_owned();
-
-                    if secret_id.is_empty() {
-                        return Response::err(
-                            Some(req.id),
-                            "bad_request",
-                            "missing 'secret_id' field",
-                        );
-                    }
-
-                    let target = HashMap::from([("secret_id".into(), secret_id.clone())]);
-                    (
-                        "bitwarden.read_secret",
-                        target,
-                        serde_json::json!({ "secret_id": secret_id }),
-                    )
-                }
-                unknown => {
-                    return Response::err(
-                        Some(req.id),
-                        "bad_request",
-                        format!(
-                            "unknown action '{}' (expected: list_projects, list_secrets, read_secret)",
-                            truncate_for_error(unknown, 64)
-                        ),
-                    );
-                }
-            };
-
-            // Validate target before building OperationRequest.
-            let target = match InputValidator::validate_target(&target) {
-                Ok(t) => t,
-                Err(e) => {
-                    return Response::err(
-                        Some(req.id),
-                        "bad_request",
-                        format!("invalid target: {e}"),
-                    );
-                }
-            };
-
-            // Build secret_ref_names for read_secret.
-            let secret_ref_names = if action == "read_secret" {
-                let sid = op_params
-                    .get("secret_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let refs = vec![format!("bitwarden:{sid}")];
-                if let Err(e) = InputValidator::validate_secret_ref_names(&refs) {
-                    return Response::err(
-                        Some(req.id),
-                        "bad_request",
-                        format!("invalid secret ref: {e}"),
-                    );
-                }
-                refs
-            } else {
-                vec![]
-            };
-
-            let op_req = OperationRequest {
-                principal: principal_ctx.clone(),
-                request_id: Uuid::new_v4(),
-                client_identity: identity.clone(),
+            rpc_wrappers::handle_bitwarden(
+                state,
+                req,
+                identity,
                 client_type,
-                operation: operation.into(),
-                target,
-                secret_ref_names,
-                created_at: SystemTime::now(),
-                expires_at: None,
-                params: op_params,
-                workspace: wrapper_workspace.clone(),
-            };
-
-            state
-                .enclave
-                .execute(op_req)
-                .await
-                .into_proto_response(req.id)
+                principal_ctx,
+                wrapper_workspace,
+            )
+            .await
         }
         "exec" => {
-            // The exec method is a convenience wrapper that builds an "execute"
-            // request for "sandbox.exec" from exec-specific params.
-            let profile = req
-                .params
-                .get("profile")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-
-            if profile.is_empty() {
-                return Response::err(Some(req.id), "bad_request", "missing 'profile' field");
-            }
-
-            let command: Vec<String> = req
-                .params
-                .get("command")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default();
-
-            if command.is_empty() {
-                return Response::err(Some(req.id), "bad_request", "missing 'command' field");
-            }
-
-            // Validate profile name (alphanumeric + hyphens + underscores).
-            if !profile
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-            {
-                return Response::err(
-                    Some(req.id),
-                    "bad_request",
-                    "profile name must be alphanumeric (with hyphens/underscores)",
-                );
-            }
-
-            // Derive secret_ref_names from the profile's secret declarations.
-            let secret_ref_names = opaque_core::profile::load_named_profile(&profile)
-                .map(|p| p.secrets.keys().cloned().collect::<Vec<_>>())
-                .unwrap_or_default();
-
-            let op_req = OperationRequest {
-                principal: principal_ctx.clone(),
-                request_id: Uuid::new_v4(),
-                client_identity: identity.clone(),
+            rpc_wrappers::handle_exec(
+                state,
+                req,
+                identity,
                 client_type,
-                operation: "sandbox.exec".into(),
-                // SECURITY (C3): include the command in `target` so it is rendered
-                // in the approval prompt, covered by allowed_target_keys, and bound
-                // into the content hash and lease key — the approver authorizes the
-                // exact argv, not just the profile name.
-                target: {
-                    let cmd_display = command
-                        .iter()
-                        .map(|a| {
-                            if a.is_empty() || a.chars().any(|c| c.is_whitespace() || c == '"') {
-                                format!("{a:?}")
-                            } else {
-                                a.clone()
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    HashMap::from([
-                        ("profile".into(), profile.clone()),
-                        ("command".into(), cmd_display),
-                    ])
-                },
-                secret_ref_names,
-                created_at: SystemTime::now(),
-                expires_at: None,
-                params: serde_json::json!({
-                    "profile": profile,
-                    "command": command,
-                }),
-                workspace: wrapper_workspace.clone(),
-            };
-
-            state
-                .enclave
-                .execute(op_req)
-                .await
-                .into_proto_response(req.id)
+                principal_ctx,
+                wrapper_workspace,
+            )
+            .await
         }
         _ => Response::err(Some(req.id), "unknown_method", "unknown method"),
     }
-}
-
-/// Handle `github` method with `action: "list_secrets"`.
-///
-/// Routes to `github.list_secrets` operation in the enclave.
-async fn handle_github_list_secrets(
-    req: &opaque_core::proto::Request,
-    state: &DaemonState,
-    identity: &ClientIdentity,
-    client_type: ClientType,
-    principal_ctx: Option<&PrincipalContext>,
-) -> opaque_core::proto::Response {
-    let scope = req
-        .params
-        .get("scope")
-        .and_then(|v| v.as_str())
-        .unwrap_or("actions");
-
-    let mut op_params = serde_json::json!({ "scope": scope });
-    let mut target = HashMap::new();
-
-    if let Some(repo) = req.params.get("repo").and_then(|v| v.as_str()) {
-        op_params["repo"] = serde_json::Value::String(repo.into());
-        target.insert("repo".into(), repo.to_owned());
-    }
-    if let Some(org) = req.params.get("org").and_then(|v| v.as_str()) {
-        op_params["org"] = serde_json::Value::String(org.into());
-        target.insert("org".into(), org.to_owned());
-    }
-    if let Some(env) = req.params.get("environment").and_then(|v| v.as_str()) {
-        op_params["environment"] = serde_json::Value::String(env.into());
-    }
-    if let Some(tok) = req.params.get("github_token_ref").and_then(|v| v.as_str()) {
-        op_params["github_token_ref"] = serde_json::Value::String(tok.into());
-    }
-
-    // Validate target before building OperationRequest.
-    let target = match InputValidator::validate_target(&target) {
-        Ok(t) => t,
-        Err(e) => {
-            return Response::err(Some(req.id), "bad_request", format!("invalid target: {e}"));
-        }
-    };
-
-    let op_req = OperationRequest {
-        principal: principal_ctx.cloned(),
-        request_id: Uuid::new_v4(),
-        client_identity: identity.clone(),
-        client_type,
-        operation: "github.list_secrets".into(),
-        target,
-        secret_ref_names: vec![],
-        created_at: SystemTime::now(),
-        expires_at: None,
-        params: op_params,
-        workspace: match task_api::verified_workspace(&req.params, identity).await {
-            Ok(workspace) => workspace,
-            Err(_) => {
-                return Response::err(
-                    Some(req.id),
-                    "workspace_verification_failed",
-                    "workspace verification failed",
-                );
-            }
-        },
-    };
-
-    state
-        .enclave
-        .execute(op_req)
-        .await
-        .into_proto_response(req.id)
-}
-
-/// Handle `github` method with `action: "delete_secret"`.
-///
-/// Routes to `github.delete_secret` operation in the enclave.
-async fn handle_github_delete_secret(
-    req: &opaque_core::proto::Request,
-    state: &DaemonState,
-    identity: &ClientIdentity,
-    client_type: ClientType,
-    principal_ctx: Option<&PrincipalContext>,
-) -> opaque_core::proto::Response {
-    let scope = req
-        .params
-        .get("scope")
-        .and_then(|v| v.as_str())
-        .unwrap_or("actions");
-
-    let secret_name = req
-        .params
-        .get("secret_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_owned();
-
-    if secret_name.is_empty() {
-        return Response::err(Some(req.id), "bad_request", "missing 'secret_name' field");
-    }
-
-    let mut op_params = serde_json::json!({
-        "scope": scope,
-        "secret_name": secret_name,
-    });
-    let mut target = HashMap::from([("secret_name".into(), secret_name.clone())]);
-
-    if let Some(repo) = req.params.get("repo").and_then(|v| v.as_str()) {
-        op_params["repo"] = serde_json::Value::String(repo.into());
-        target.insert("repo".into(), repo.to_owned());
-    }
-    if let Some(org) = req.params.get("org").and_then(|v| v.as_str()) {
-        op_params["org"] = serde_json::Value::String(org.into());
-        target.insert("org".into(), org.to_owned());
-    }
-    if let Some(env) = req.params.get("environment").and_then(|v| v.as_str()) {
-        op_params["environment"] = serde_json::Value::String(env.into());
-    }
-    if let Some(tok) = req.params.get("github_token_ref").and_then(|v| v.as_str()) {
-        op_params["github_token_ref"] = serde_json::Value::String(tok.into());
-    }
-
-    // Validate target before building OperationRequest.
-    let target = match InputValidator::validate_target(&target) {
-        Ok(t) => t,
-        Err(e) => {
-            return Response::err(Some(req.id), "bad_request", format!("invalid target: {e}"));
-        }
-    };
-
-    let op_req = OperationRequest {
-        principal: principal_ctx.cloned(),
-        request_id: Uuid::new_v4(),
-        client_identity: identity.clone(),
-        client_type,
-        operation: "github.delete_secret".into(),
-        target,
-        secret_ref_names: vec![],
-        created_at: SystemTime::now(),
-        expires_at: None,
-        params: op_params,
-        workspace: match task_api::verified_workspace(&req.params, identity).await {
-            Ok(workspace) => workspace,
-            Err(_) => {
-                return Response::err(
-                    Some(req.id),
-                    "workspace_verification_failed",
-                    "workspace verification failed",
-                );
-            }
-        },
-    };
-
-    state
-        .enclave
-        .execute(op_req)
-        .await
-        .into_proto_response(req.id)
 }
 
 // ---------------------------------------------------------------------------
@@ -6601,27 +5070,6 @@ mod tests {
         };
         let id = test_identity();
         assert_eq!(derive_client_type(&id, &config), ClientType::Agent);
-    }
-
-    #[test]
-    fn compute_exe_hash_nonexistent_none() {
-        assert!(compute_exe_hash(Path::new("/nonexistent/binary")).is_none());
-    }
-
-    #[test]
-    fn compute_exe_hash_valid_file() {
-        // Hash the current test binary — always exists during test execution.
-        let exe = std::env::current_exe().expect("current_exe should succeed in tests");
-        let hash = compute_exe_hash(&exe);
-        assert!(hash.is_some(), "hashing current binary should succeed");
-        let h = hash.unwrap();
-        // SHA-256 hex digest is always 64 characters.
-        assert_eq!(h.len(), 64, "expected 64-char hex digest, got {}", h.len());
-        // Should be lowercase hex.
-        assert!(
-            h.chars()
-                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
-        );
     }
 
     #[test]
@@ -7522,7 +5970,7 @@ exe_sha256 = "deadbeef"
         approve: bool,
     }
 
-    impl crate::enclave::ApprovalGate for TestApprovalGate {
+    impl ApprovalGate for TestApprovalGate {
         fn request_approval(
             &self,
             _approval_id: uuid::Uuid,
@@ -7531,17 +5979,18 @@ exe_sha256 = "deadbeef"
             _description: &str,
         ) -> std::pin::Pin<
             Box<
-                dyn std::future::Future<Output = Result<crate::enclave::ApprovalOutcome, String>>
-                    + Send
+                dyn std::future::Future<
+                        Output = Result<opaque_core::approval_gate::ApprovalOutcome, String>,
+                    > + Send
                     + '_,
             >,
         > {
             let approve = self.approve;
             Box::pin(async move {
                 Ok(if approve {
-                    crate::enclave::ApprovalOutcome::approved_anonymous()
+                    opaque_core::approval_gate::ApprovalOutcome::approved_anonymous()
                 } else {
-                    crate::enclave::ApprovalOutcome::denied()
+                    opaque_core::approval_gate::ApprovalOutcome::denied()
                 })
             })
         }
@@ -7558,7 +6007,8 @@ exe_sha256 = "deadbeef"
             .build()
             .unwrap();
         DaemonState {
-            workload_attestor: workload_attest::ListenerAttestor::unix_listener(),
+            workload_attestor:
+                opaque_federation_runtime::workload_attest::ListenerAttestor::unix_listener(),
             tenant: None,
             enclave: Arc::new(enclave),
             tasks: None,
@@ -7572,9 +6022,11 @@ exe_sha256 = "deadbeef"
             pairing: None,
             approval_server_addr: None,
             fido2: None,
-            provisioning_challenges: provisioning_api::Challenges::default(),
-            federation: Arc::new(federation::FederationStatus::default()),
-            attestation: Arc::new(attest::AttestationService::new(
+            provisioning_challenges: opaque_tenant::provisioning_api::Challenges::default(),
+            federation: Arc::new(
+                opaque_federation_runtime::federation::FederationStatus::default(),
+            ),
+            attestation: Arc::new(opaque_federation_runtime::attest::AttestationService::new(
                 ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]),
                 PathBuf::from("/nonexistent"),
                 PathBuf::from("/nonexistent/config.toml"),
@@ -7582,7 +6034,7 @@ exe_sha256 = "deadbeef"
                 "test".into(),
                 false,
                 vec![],
-                Arc::new(federation::FederationStatus::default()),
+                Arc::new(opaque_federation_runtime::federation::FederationStatus::default()),
             )),
         }
     }
@@ -7642,7 +6094,10 @@ exe_sha256 = "deadbeef"
 
     #[test]
     fn tenant_configuration_cannot_be_removed_from_initialized_custody() {
-        for marker in [tenant::BINDING_FILE, tenant::LOCK_FILE] {
+        for marker in [
+            opaque_tenant::tenant::BINDING_FILE,
+            opaque_tenant::tenant::LOCK_FILE,
+        ] {
             let directory = tempfile::tempdir().unwrap();
             let config = DaemonConfig::default();
             assert!(validate_tenant_startup(&config, directory.path()).is_ok());
@@ -8668,7 +7123,7 @@ exe_sha256 = "deadbeef"
                 formatter.write_str("DisableDuringApproval")
             }
         }
-        impl crate::enclave::ApprovalGate for DisableDuringApproval {
+        impl ApprovalGate for DisableDuringApproval {
             fn request_approval(
                 &self,
                 _: Uuid,
@@ -8678,7 +7133,7 @@ exe_sha256 = "deadbeef"
             ) -> std::pin::Pin<
                 Box<
                     dyn std::future::Future<
-                            Output = Result<crate::enclave::ApprovalOutcome, String>,
+                            Output = Result<opaque_core::approval_gate::ApprovalOutcome, String>,
                         > + Send
                         + '_,
                 >,
@@ -8688,7 +7143,7 @@ exe_sha256 = "deadbeef"
                         .store
                         .set_disabled(&self.principal, true)
                         .unwrap();
-                    Ok(crate::enclave::ApprovalOutcome::approved_anonymous())
+                    Ok(opaque_core::approval_gate::ApprovalOutcome::approved_anonymous())
                 })
             }
         }

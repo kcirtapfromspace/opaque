@@ -1,0 +1,29 @@
+[package]
+name = "opaque-federation-runtime"
+version.workspace = true
+edition = "2024"
+publish = false
+description = "Opaque federation runtime: signed policy bundle federation, SIEM audit export, and continuous posture attestation"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+opaque-core = { path = "../opaque-core" }
+base64 = { workspace = true }
+ed25519-dalek = { workspace = true }
+libc = { workspace = true }
+reqwest = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+toml_edit = { workspace = true }
+wiremock = { workspace = true }

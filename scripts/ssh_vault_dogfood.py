@@ -484,7 +484,7 @@ class Fixture:
         env = os.environ.copy()
         env.update(OPAQUE_SSH_LIVE_PROFILE=str(profile_path), OPAQUE_SSH_LIVE_PREPARE=str(prepare_path),
                    OPAQUE_SSH_VAULT_TOKEN=self.signer_token, OPAQUE_SSH_LIVE_RESULT=str(result_path))
-        command = ["cargo", "test", "-p", "opaqued", "--bin", "opaqued", "ssh::tests::live_vault_host_execution", "--", "--ignored", "--exact"]
+        command = ["cargo", "test", "--locked", "-p", "opaque-bounded-work", "--lib", "ssh::tests::live_vault_host_execution", "--", "--ignored", "--exact"]
         prepared = subprocess.run(command, cwd=ROOT, env=env, capture_output=True, text=True, timeout=300)
         self.write("rust-prepare.log", prepared.stdout + prepared.stderr)
         self.check("Rust validates exact profile key custody and pins", prepared.returncode == 0 and prepare_path.exists())

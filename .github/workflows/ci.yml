@@ -41,7 +41,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run clippy
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
   test:
     runs-on: ubuntu-latest
@@ -61,7 +61,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run workspace tests
-        run: cargo test --locked --workspace
+        run: cargo test --locked --workspace --all-features
 
       - name: Verify wrapper enforcement handshake test
         # --exact needs the full module path; a bare name matches 0 tests and
@@ -82,7 +82,7 @@ jobs:
           toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@v2
       - name: Run native workspace tests
-        run: cargo test --locked --workspace
+        run: cargo test --locked --workspace --all-features
 
   python:
     name: Python protocol and controller tests
@@ -128,7 +128,7 @@ jobs:
           node --test
           deploy/cloudflare-demo/tests/*.test.mjs
           deploy/cloudflare-docs-privacy/tests/*.test.mjs
-          crates/opaque-metrics/tests/*.test.cjs
+          crates/opaque-showcase/tests/*.test.cjs
           crates/opaque-web/tests/*.test.cjs
 
   site-privacy:
