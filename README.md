@@ -29,9 +29,10 @@ secret your agent moved but never saw, with an audit chain proving it.
 
 ## Who It's For
 
-Engineering teams of ten or more whose developers already use AI coding
+Platform and security teams whose developers already use AI coding
 agents. Today those teams either keep sensitive access away from the agent
-or watch its every move.
+or watch its every move. Start on one laptop; one signed policy governs a
+fleet.
 
 - **Security and platform leads** own policy and custody: what agents may
   touch, which operations need a human, and an evidence trail an auditor

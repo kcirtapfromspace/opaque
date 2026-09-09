@@ -10,9 +10,10 @@ hide:
 **Secrets stay secret. Agents stay powerful.**
 **Approve the work. Keep authority bounded.**
 
-Built for platform and security teams of ten developers or more whose
-teams already use AI coding agents. Today those teams either keep
-sensitive access away from the agent or watch its every move. Opaque lets
+Built for platform and security teams whose developers already use AI
+coding agents. Today those teams either keep sensitive access away from
+the agent or watch its every move. Start on one laptop; one signed policy
+governs a fleet. Opaque lets
 you hand the agent a bounded piece of work: publish a secret, dispatch a
 release, run a fixed host check, read scoped data. You approve exactly
 what it may do and inspect the evidence after. LLMs get operations, never
