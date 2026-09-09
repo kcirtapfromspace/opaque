@@ -13,27 +13,51 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
-/// Allowed origin values for local dashboard requests.
-const ALLOWED_ORIGINS: &[&str] = &["http://127.0.0.1:7380", "http://localhost:7380"];
+/// Only the two loopback hostnames at the actual listening port may serve
+/// token-bearing HTML or API responses. Host validation also blocks DNS rebinding.
+#[derive(Clone)]
+pub struct LocalOrigin {
+    hosts: [String; 2],
+    origins: [String; 2],
+}
 
-/// Middleware that validates the `Origin` header on incoming requests.
-///
-/// Requests are allowed if:
-/// - No `Origin` header is present (same-origin browser requests, curl, etc.)
-/// - The `Origin` header matches one of the allowed local origins.
-///
-/// All other origins are rejected with 403 Forbidden.
-pub async fn validate_origin(request: Request, next: Next) -> Response {
-    if let Some(origin) = request.headers().get("origin") {
-        let origin_str = match origin.to_str() {
-            Ok(s) => s,
-            Err(_) => return StatusCode::FORBIDDEN.into_response(),
-        };
-        if !ALLOWED_ORIGINS.contains(&origin_str) {
-            return StatusCode::FORBIDDEN.into_response();
+impl LocalOrigin {
+    pub fn new(port: u16) -> Self {
+        Self {
+            hosts: [format!("127.0.0.1:{port}"), format!("localhost:{port}")],
+            origins: [
+                format!("http://127.0.0.1:{port}"),
+                format!("http://localhost:{port}"),
+            ],
         }
     }
-    next.run(request).await
+}
+
+pub async fn validate_origin(
+    axum::extract::State(local): axum::extract::State<LocalOrigin>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let host = request.headers().get("host").and_then(|v| v.to_str().ok());
+    let allowed_host = host.is_some_and(|host| local.hosts.iter().any(|allowed| allowed == host));
+    let allowed_origin = match request.headers().get("origin") {
+        None => true,
+        Some(origin) => origin
+            .to_str()
+            .is_ok_and(|origin| local.origins.iter().any(|allowed| allowed == origin)),
+    };
+    let mut response = if allowed_host && allowed_origin {
+        next.run(request).await
+    } else {
+        StatusCode::FORBIDDEN.into_response()
+    };
+    let headers = response.headers_mut();
+    headers.insert("cache-control", "no-store".parse().unwrap());
+    headers.insert("referrer-policy", "no-referrer".parse().unwrap());
+    headers.insert("x-content-type-options", "nosniff".parse().unwrap());
+    headers.insert("x-frame-options", "DENY".parse().unwrap());
+    headers.insert("content-security-policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'none'".parse().unwrap());
+    response
 }
 
 /// Shared state holding the auth token for Bearer authentication.
@@ -82,13 +106,26 @@ pub fn generate_token() -> String {
 pub fn write_token_file(dir: &Path, token: &str) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
     let path = dir.join("web.token");
-    std::fs::write(&path, token)?;
-
+    // Create atomically with private permissions; never follow an existing symlink.
+    use std::io::Write;
+    let temp_path = dir.join(format!(".web.token.{}", uuid::Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+    let result = (|| {
+        let mut file = options.open(&temp_path)?;
+        file.write_all(token.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&temp_path, &path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result?;
 
     Ok(path)
 }
@@ -177,7 +214,7 @@ mod tests {
                     require_api_token(state.0, request, next).await
                 },
             ))
-            .layer(axum::middleware::from_fn(validate_origin))
+            .layer(axum::middleware::from_fn_with_state(LocalOrigin::new(7380), validate_origin))
             .with_state(auth)
     }
 
@@ -189,6 +226,7 @@ mod tests {
     async fn rejects_cross_origin_request() {
         let app = test_app("test-token");
         let req = Request::builder()
+            .header("host", "127.0.0.1:7380")
             .uri("/api/status")
             .header("origin", "https://evil.com")
             .header("authorization", "Bearer test-token")
@@ -203,6 +241,7 @@ mod tests {
     async fn allows_localhost_origin() {
         let app = test_app("test-token");
         let req = Request::builder()
+            .header("host", "127.0.0.1:7380")
             .uri("/api/status")
             .header("origin", "http://127.0.0.1:7380")
             .header("authorization", "Bearer test-token")
@@ -217,6 +256,7 @@ mod tests {
     async fn allows_localhost_name_origin() {
         let app = test_app("test-token");
         let req = Request::builder()
+            .header("host", "127.0.0.1:7380")
             .uri("/api/status")
             .header("origin", "http://localhost:7380")
             .header("authorization", "Bearer test-token")
@@ -231,6 +271,7 @@ mod tests {
     async fn allows_no_origin_header() {
         let app = test_app("test-token");
         let req = Request::builder()
+            .header("host", "127.0.0.1:7380")
             .uri("/api/status")
             .header("authorization", "Bearer test-token")
             .body(Body::empty())
@@ -248,6 +289,7 @@ mod tests {
     async fn rejects_api_request_without_token() {
         let app = test_app("secret-token-123");
         let req = Request::builder()
+            .header("host", "127.0.0.1:7380")
             .uri("/api/status")
             .body(Body::empty())
             .unwrap();
@@ -260,6 +302,7 @@ mod tests {
     async fn rejects_api_request_with_wrong_token() {
         let app = test_app("correct-token");
         let req = Request::builder()
+            .header("host", "127.0.0.1:7380")
             .uri("/api/status")
             .header("authorization", "Bearer wrong-token")
             .body(Body::empty())
@@ -273,6 +316,7 @@ mod tests {
     async fn allows_api_request_with_valid_token() {
         let app = test_app("my-secret");
         let req = Request::builder()
+            .header("host", "127.0.0.1:7380")
             .uri("/api/status")
             .header("authorization", "Bearer my-secret")
             .body(Body::empty())
@@ -285,7 +329,11 @@ mod tests {
     #[tokio::test]
     async fn allows_non_api_route_without_token() {
         let app = test_app("some-token");
-        let req = Request::builder().uri("/").body(Body::empty()).unwrap();
+        let req = Request::builder()
+            .header("host", "127.0.0.1:7380")
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);

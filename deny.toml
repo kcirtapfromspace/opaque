@@ -32,6 +32,7 @@ allow = [
     "ISC",
     "MIT",
     "MIT-0",
+    "MPL-2.0",
     "OpenSSL",
     "Unicode-3.0",
     "Unlicense",

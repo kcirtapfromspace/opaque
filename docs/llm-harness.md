@@ -26,6 +26,14 @@ For tools without MCP support (e.g., Codex), the agent runs `opaque ...` CLI com
 
 Both paths go through the same daemon and policy engine. The MCP server is a thin adapter over the same Unix socket IPC.
 
+### Bounded Tasks (Multi-Step Work)
+
+For more than one operation — publish a secret *and* dispatch its release,
+or run a fixed host check — plan a single [bounded task](bounded-work.md)
+instead of chaining calls: an immutable manifest, approved once, executed
+once, with a receipt. MCP (`opaque_task_plan`, `opaque_task_run`, …) and the
+CLI (`opaque task plan`, `opaque task run`, …) expose the same lifecycle.
+
 For stronger local isolation, launch the agent via wrapper mode:
 
 - `opaque agent run -- <agent-command ...>`
@@ -76,16 +84,19 @@ The CLI never sees the resolved secret values *directly*, but secrets can still 
 
 ## Approvals
 
-Approvals are operation-bound and are triggered as part of execution.
+Approvals are operation-bound, triggered as part of execution. An LLM tool
+call can request an operation but can't satisfy any factor itself — each
+completes on hardware or a channel the agent doesn't control.
 
-v1 implemented factor:
+Implemented factors (see [Policy](policy.md#approval-configuration)):
 
 - `local_bio`: native OS prompt (macOS LocalAuthentication, Linux polkit)
-
-Deferred (do not build in v1):
-
-- `ios_faceid` (v3)
-- `fido2` / WebAuthn (v3)
+- `fido2`: hardware security key or passkey (FIDO2/WebAuthn)
+- `paired_workstation`: full-manifest review by an enrolled trusted
+  workstation — used for bounded task approval
+- `ios_faceid`: paired second-device approval (Ed25519). Despite the wire
+  name, this ships as desktop-to-desktop pairing, not an iOS app — see
+  [mobile approvals](mobile-approvals.md)
 
 ## Handling Common Requests Safely
 
@@ -119,6 +130,11 @@ Do not paste secrets into prompts or run `printenv` to verify them.
 
 Use:
 
-- `opaque exec --profile <name> -- <command...>`
+- `opaque exec --profile <name> -- <command...>` (CLI), or
+- the `opaque_sandbox_exec` MCP tool (see [MCP integration](mcp-integration.md#sandbox))
 
-Opaque can inject secrets into the sandboxed process environment. **However**, `sandbox.exec` currently captures and returns stdout/stderr (and the CLI prints it), so an agent can receive any secret that is printed. Treat sandbox output as `SENSITIVE_OUTPUT` and avoid commands that echo secret material.
+Opaque injects secrets into the sandboxed process environment, but the two
+paths differ downstream: the CLI prints raw stdout/stderr, so `opaque exec`
+can leak anything a command prints — treat it as `SENSITIVE_OUTPUT` and
+avoid commands that echo secrets. The MCP tool withholds output entirely,
+returning only exit code and byte lengths.

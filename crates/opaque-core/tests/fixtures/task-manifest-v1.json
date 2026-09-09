@@ -1,0 +1,54 @@
+{
+  "manifest": {
+    "actions": [
+      {
+        "github_token_ref": "env:OPAQUE_DOGFOOD_GH_TOKEN",
+        "repo": "kcirtapfromspace/no_drake_in_the_house",
+        "repository_id": 90002,
+        "secret_name": "OPAQUE_DOGFOOD_APP",
+        "value_ref": "vault:kv/data/dogfood?version=1#REPO_2_APP"
+      },
+      {
+        "github_token_ref": "env:OPAQUE_DOGFOOD_GH_TOKEN",
+        "repo": "kcirtapfromspace/no_drake_in_the_house",
+        "repository_id": 90002,
+        "secret_name": "OPAQUE_DOGFOOD_WORKER",
+        "value_ref": "vault:kv/data/dogfood?version=1#REPO_2_WORKER"
+      },
+      {
+        "github_token_ref": "env:OPAQUE_DOGFOOD_GH_TOKEN",
+        "repo": "kcirtapfromspace/opaque",
+        "repository_id": 90001,
+        "secret_name": "OPAQUE_DOGFOOD_APP",
+        "value_ref": "vault:kv/data/dogfood?version=1#REPO_1_APP"
+      },
+      {
+        "github_token_ref": "env:OPAQUE_DOGFOOD_GH_TOKEN",
+        "repo": "kcirtapfromspace/opaque",
+        "repository_id": 90001,
+        "secret_name": "OPAQUE_DOGFOOD_WORKER",
+        "value_ref": "vault:kv/data/dogfood?version=1#REPO_1_WORKER"
+      },
+      {
+        "github_token_ref": "env:OPAQUE_DOGFOOD_GH_TOKEN",
+        "repo": "Nereus-Data/admachina",
+        "repository_id": 90003,
+        "secret_name": "OPAQUE_DOGFOOD_APP",
+        "value_ref": "vault:kv/data/dogfood?version=1#REPO_3_APP"
+      },
+      {
+        "github_token_ref": "env:OPAQUE_DOGFOOD_GH_TOKEN",
+        "repo": "Nereus-Data/admachina",
+        "repository_id": 90003,
+        "secret_name": "OPAQUE_DOGFOOD_WORKER",
+        "value_ref": "vault:kv/data/dogfood?version=1#REPO_3_WORKER"
+      }
+    ],
+    "expires_in_secs": 3600,
+    "github_api_url": "http://127.0.0.1:59124",
+    "schema_version": 1,
+    "title": "Dogfood: six fixed writes across our three repos",
+    "vault_api_url": "http://127.0.0.1:59124"
+  },
+  "manifest_digest": "fc2ea6f09b16a30deddabc08459b8450c7b14dbc3584998e8d82cb9f52c6dd7a"
+}

@@ -347,9 +347,9 @@ The approval dialog text is built by the enclave from verified `OperationRequest
 
 Every approval is cryptographically bound to the operation it authorizes via SHA-256 content hash (computed over operation name, sorted targets, secret refs, client identity, and workspace). The first 16 hex characters of the hash are displayed in the approval dialog. Approval audit events include the full hash for forensic correlation.
 
-### 3. No approval leases in v1
+### 3. Approval leases are daemon-side TTL grants, never a weaker OS policy
 
-Every sensitive operation triggers a fresh approval dialog. There is no "approve for N minutes" in v1. This is intentionally conservative. Approval leases are deferred to v2+ and will be implemented as daemon-side TTL grants, never by weakening the OS authentication policy.
+`require = "first_use"` grants a lease after the first approval — a `lease_ttl` (default 10 min, capped at 60) during which the same operation/target skips the dialog. `require = "always"` never grants one. Leases live in the daemon's in-memory cache and don't change what the OS mechanism itself verifies — see [Linux polkit](linux-polkit.md#notes) on `auth_self_keep`.
 
 ### 4. Fail closed
 

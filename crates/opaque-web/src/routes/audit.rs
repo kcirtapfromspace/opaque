@@ -1,5 +1,7 @@
 use axum::Json;
 use axum::extract::{Query, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::IntoResponse;
 use opaque_core::audit::{AuditEventKind, AuditFilter, query_audit_db};
 use serde::Deserialize;
 use serde_json::json;
@@ -18,48 +20,56 @@ pub struct AuditParams {
 pub async fn get_audit(
     State(state): State<AppState>,
     Query(params): Query<AuditParams>,
-) -> Json<serde_json::Value> {
-    // Try live mode first.
-    if state.audit_db_path.exists() {
-        let filter = AuditFilter {
-            kind: params
-                .kind
-                .as_deref()
-                .and_then(|k| k.parse::<AuditEventKind>().ok()),
-            operation: params.operation,
-            outcome: params.outcome,
-            text_query: params.q,
-            limit: params.limit.unwrap_or(50),
-            ..Default::default()
-        };
-
-        match query_audit_db(&state.audit_db_path, &filter) {
-            Ok(events) => {
-                let items: Vec<serde_json::Value> = events
-                    .iter()
-                    .map(|e| serde_json::to_value(e).unwrap_or_default())
-                    .collect();
-                return Json(json!({ "mode": "live", "events": items }));
-            }
-            Err(e) => {
-                tracing::warn!("failed to query audit db: {e}");
-            }
+) -> (StatusCode, Json<serde_json::Value>) {
+    if state.demo {
+        return (
+            StatusCode::OK,
+            Json(json!({ "mode": "demo", "events": crate::demo::demo_audit_events() })),
+        );
+    }
+    let kind = match params
+        .kind
+        .as_deref()
+        .map(str::parse::<AuditEventKind>)
+        .transpose()
+    {
+        Ok(kind) => kind,
+        Err(_) => return super::api_error(StatusCode::BAD_REQUEST, "Unknown audit event kind."),
+    };
+    if !state.audit_db_path.exists() {
+        return super::api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Audit database is not available yet. Start the selected daemon and run a task.",
+        );
+    }
+    let filter = AuditFilter {
+        kind,
+        operation: params.operation,
+        outcome: params.outcome,
+        text_query: params.q,
+        limit: params.limit.unwrap_or(100).clamp(1, 500),
+        ..Default::default()
+    };
+    match query_audit_db(&state.audit_db_path, &filter) {
+        Ok(events) => (
+            StatusCode::OK,
+            Json(json!({ "mode": "live", "events": events })),
+        ),
+        Err(e) => {
+            tracing::warn!("failed to query audit db: {e}");
+            super::api_error(
+                StatusCode::BAD_REQUEST,
+                "Audit query failed. Check the search syntax and the selected audit database.",
+            )
         }
     }
-
-    // Fallback: demo mode.
-    let events = crate::demo::demo_audit_events();
-    Json(json!({ "mode": "demo", "events": events }))
 }
 
-pub async fn get_audit_stream(State(state): State<AppState>) -> axum::response::Response {
-    use axum::response::IntoResponse;
-
-    if state.audit_db_path.exists() {
-        crate::sse::audit_sse_stream(state.audit_db_path.clone(), state.cancel.clone())
-            .into_response()
-    } else {
-        // In demo mode, return SSE that sends a hint to use frontend-generated events.
+pub async fn get_audit_stream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if state.demo {
         let stream = futures_util::stream::once(async {
             Ok::<_, std::convert::Infallible>(
                 axum::response::sse::Event::default()
@@ -67,12 +77,27 @@ pub async fn get_audit_stream(State(state): State<AppState>) -> axum::response::
                     .data(r#"{"mode":"demo"}"#),
             )
         });
-        axum::response::sse::Sse::new(stream)
-            .keep_alive(
-                axum::response::sse::KeepAlive::new()
-                    .interval(std::time::Duration::from_secs(15))
-                    .text("ping"),
+        return axum::response::sse::Sse::new(stream).into_response();
+    }
+    let last_seq = match headers.get("last-event-id") {
+        Some(value) => match value.to_str().ok().and_then(|v| v.parse::<i64>().ok()) {
+            Some(value) if value >= -1 => Some(value),
+            _ => {
+                return super::api_error(StatusCode::BAD_REQUEST, "Invalid audit resume cursor.")
+                    .into_response();
+            }
+        },
+        None => None,
+    };
+    match crate::sse::audit_sse_stream(state.audit_db_path, state.cancel, last_seq) {
+        Ok(stream) => stream.into_response(),
+        Err(error) => {
+            tracing::warn!("failed to open audit stream: {error}");
+            super::api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Audit stream unavailable. Check the selected daemon and audit database.",
             )
             .into_response()
+        }
     }
 }

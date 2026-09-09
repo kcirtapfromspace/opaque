@@ -1,5 +1,12 @@
 # Mobile Approvals (QR Pairing + Face ID)
 
+**Status: design proposal — no iOS app ships today.** The shipped
+paired-second-device factor is desktop-to-desktop (Ed25519) — see
+[identity](identity.md). Its wire name is still `ios_faceid`, a leftover
+from this design; no Face ID, QR pairing, or iOS code backs it. Kept below
+for reference — it doesn't describe current behavior. See also
+[deferred](roadmap-deferred.md#ios-second-device-approvals-face-id).
+
 This document describes a second-device approval factor where an iOS app gates approvals with Face ID. The goal is "proof of life" on a separate device, and an approval path that never returns plaintext secrets to the LLM client.
 
 ## 1. Terminology: "Passkey" vs "Device Key"

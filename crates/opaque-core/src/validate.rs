@@ -10,6 +10,11 @@ use std::fmt;
 
 use crate::sanitize::SecretPatterns;
 
+/// Return a prefix within a byte budget without splitting a UTF-8 character.
+pub fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    &value[..value.floor_char_boundary(max_bytes.min(value.len()))]
+}
+
 // ---------------------------------------------------------------------------
 // Validation error
 // ---------------------------------------------------------------------------

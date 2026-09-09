@@ -1,0 +1,37 @@
+[package]
+name = "opaque-bounded-work"
+version.workspace = true
+edition = "2024"
+publish = false
+description = "Opaque bounded agent work: fixed-manifest task ledger, SSH certificate execution, and inference brokering"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+opaque-core = { path = "../opaque-core" }
+opaque-providers = { path = "../opaque-providers" }
+opaque-sandbox = { path = "../opaque-sandbox" }
+opaque-tenant = { path = "../opaque-tenant" }
+base64 = { workspace = true }
+ed25519-dalek = { workspace = true }
+libc = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+zeroize = { workspace = true }
+ssh-key = { version = "0.6.7", default-features = false, features = ["std", "ed25519"] }
+# Real (non-dev) dependency: `ssh.rs`'s `execute_ssh_action` creates a
+# temporary directory for SSH key material at actual certificate-execution
+# time, not just in tests.
+tempfile = "3"
+
+[dev-dependencies]
+jsonwebtoken = { workspace = true }
+wiremock = { workspace = true }

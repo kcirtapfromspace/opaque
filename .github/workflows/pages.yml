@@ -20,6 +20,8 @@ concurrency:
 
 jobs:
   deploy:
+    # Never publish the private dogfood checkout through inherited automation.
+    if: ${{ github.repository == 'kcirtapfromspace/opaque' && github.event.repository.private == false }}
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

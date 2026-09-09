@@ -22,22 +22,27 @@
     <section class="op-hero" id="op-hero">
       <div class="op-wrap op-hero__grid">
         <div class="op-hero__copy">
+          <p class="op-eyebrow"><svg class="op-brand-glyph" viewBox="0 0 28 28" aria-hidden="true"><path d="M2 3h24v5H2zm0 9h9v4H2zm15 0h9v4h-9zM2 20h24v5H2z"/></svg> Authority, by design.</p>
           <h1>
             Secrets stay <span class="op-redacted">secret</span>.<br>
             Agents stay powerful.
           </h1>
           <p class="op-hero__lede">
             Opaque is a <strong>local, approval-gated secrets broker</strong> for Claude Code,
-            Codex, and any MCP client &mdash; the identity-and-policy control plane in front of
-            your secrets provider. The model asks for an operation; the daemon checks policy,
-            takes a human approval out of band, executes, sanitizes the response, and writes
-            the whole thing to a tamper-evident audit chain.
+            Codex, and any MCP client.
+          </p>
+          <p class="op-hero__explanation">
+            The agent asks for work. Opaque checks policy, gets human approval out of band,
+            executes against your secrets provider, and returns a sanitized response.
+            Every operation leaves a tamper-evident audit trail.
           </p>
           <div class="op-actions">
             <a class="op-btn op-btn--solid" href="{{ 'getting-started/' | url }}">Get started</a>
-            <a class="op-btn" href="https://demo.opaque.info/">Try the live demo</a>
+            <a class="op-btn" href="https://demo.opaque.info/">Try a bounded task</a>
             <a class="op-btn" href="{{ config.repo_url }}">View on GitHub</a>
           </div>
+          <p class="op-meta">Approve one aggregate read, run it once, and inspect the result.
+            The hosted demo uses fictional customer data and a disposable demo identity.</p>
           <div class="op-install-line">
             <code>brew install kcirtapfromspace/tap/opaque</code>
             <button class="op-copy" type="button" data-copy="brew install kcirtapfromspace/tap/opaque">Copy</button>
@@ -47,22 +52,103 @@
             macOS (Apple&nbsp;Silicon, Intel) and Linux.
           </p>
         </div>
-        <figure class="op-terminal" role="img"
-                aria-label="Terminal session: an agent-issued opaque command passes policy, a paired-device approval, execution, and sanitization; the secret value is shown redacted; opaque audit verify reports the chain intact.">
-          <figcaption class="op-terminal__bar"><i></i><i></i><i></i>opaqued &mdash; local session</figcaption>
-          <pre aria-hidden="true"><span class="t-dim">$</span> <span class="t-cmd">opaque github set-secret \
-    --repo myorg/api \
-    --secret-name DEPLOY_KEY \
-    --value-ref keychain:opaque/deploy-key</span>
+        <figure class="op-architecture" data-scenario="allowed" data-step="4" aria-labelledby="op-architecture-title">
+          <figcaption class="op-architecture__header">
+            <span id="op-architecture-title">Inside one operation</span>
+            <span class="op-architecture__example">Illustrated daemon example</span>
+          </figcaption>
+          <div class="op-architecture__stage">
+            <svg class="op-architecture__drawing" viewBox="0 0 680 456" role="img" aria-labelledby="op-diagram-title op-diagram-desc">
+              <title id="op-diagram-title">The Opaque authority boundary</title>
+              <desc id="op-diagram-desc">An agent requests an operation. Opaque checks policy and obtains a human approval before accessing the secrets provider. Only a sanitized result returns. This illustration is not connected to a live service.</desc>
+              <defs>
+                <pattern id="op-grid" width="28" height="28" patternUnits="userSpaceOnUse"><path d="M28 0H0V28" fill="none" stroke="currentColor" stroke-width=".5"/></pattern>
+                <linearGradient id="op-face" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#dcb46d" stop-opacity=".21"/><stop offset="1" stop-color="#dcb46d" stop-opacity=".02"/></linearGradient>
+                <linearGradient id="op-fin" x1="0" y1="0" x2="1" y2="0"><stop stop-color="#e8d1a6"/><stop offset=".6" stop-color="#dcb46d"/><stop offset="1" stop-color="#a9864a"/></linearGradient>
+                <radialGradient id="op-aura"><stop stop-color="#dcb46d" stop-opacity=".12"/><stop offset="1" stop-color="#dcb46d" stop-opacity="0"/></radialGradient>
+              </defs>
+              <g aria-hidden="true">
+                <rect width="680" height="456" fill="url(#op-grid)" class="op-art-grid"/>
+                <ellipse cx="350" cy="245" rx="230" ry="215" fill="url(#op-aura)"/>
+                <path class="op-art-ground" d="M126 371 339 273 550 371 337 456Z M173 393 386 294 M220 415 433 316 M268 437 480 338 M174 349 386 447 M220 328 432 426 M267 306 479 405"/>
 
-<span class="t-stage">policy</span>    allow-github-actions-secret  <span class="t-dim">matched</span>
-<span class="t-stage">approval</span>  paired device ed25519        <span class="t-ok">hum_9f42</span>
-<span class="t-stage">execute</span>   github.set_actions_secret    <span class="t-dim">myorg/api</span>
-<span class="t-stage">sanitize</span>  value <span class="t-mask">████████████</span>           <span class="t-dim">scrubbed</span>
-<span class="t-stage">audit</span>     record 4182, hmac chain      <span class="t-dim">appended</span>
+                <!-- The two planes make a boundary, not a box. -->
+                <path class="op-art-plane op-art-plane--back" d="M308 146 434 87V324L308 383Z"/>
+                <path class="op-art-plane" d="M270 126 396 67V304L270 363Z"/>
+                <path class="op-art-plane-edge" d="M270 126V363L308 383 434 324V87L396 67"/>
+                <path class="op-art-plane-edge" d="M270 363 396 304 434 324 M396 304V67 M308 383V146L434 87 M270 126 308 146"/>
+                <path class="op-art-line" d="M120 244H270 M434 244H552"/>
+                <path class="op-art-return" d="M576 278V377Q576 397 556 397H111Q91 397 91 377V280"/>
+                <path class="op-art-approval-line" d="M335 82V149"/>
 
-<span class="t-dim">$</span> <span class="t-cmd">opaque audit verify</span>
-<span class="t-ok">Audit chain intact — 4182 records verified</span></pre>
+                <!-- Opaque's redaction fins open only a narrow operation lane. -->
+                <g class="op-art-fins">
+                  <path d="M284 154 382 108V126L284 172Z"/>
+                  <path d="M284 187 382 141V159L284 205Z"/>
+                  <path d="M284 220 382 174V192L284 238Z"/>
+                  <path d="M284 280 382 234V252L284 298Z"/>
+                  <path d="M284 313 382 267V285L284 331Z"/>
+                </g>
+                <path class="op-art-lane" d="M270 244H434"/>
+                <path class="op-art-lane-edges" d="M270 238H434 M270 250H434"/>
+                <path class="op-art-corner" d="M259 136V120L275 112 M390 58 406 65V81 M260 351V369L276 377 M424 336 444 327V309"/>
+
+                <g class="op-art-agent">
+                  <rect class="op-art-node" x="58" y="212" width="66" height="66" rx="12"/>
+                  <path class="op-art-icon" d="m76 233 10 9-10 9 M94 251h12"/>
+                  <text class="op-art-label" x="91" y="305" text-anchor="middle">Agent</text>
+                  <text class="op-art-micro" x="91" y="324" text-anchor="middle">requests work</text>
+                </g>
+                <g class="op-art-source">
+                  <rect class="op-art-node" x="543" y="212" width="66" height="66" rx="12"/>
+                  <path class="op-art-icon" d="M560 232h32 M560 244h32 M560 256h32"/>
+                  <path class="op-art-source-mask" d="M565 232h22 M565 244h22 M565 256h22"/>
+                  <text class="op-art-label" x="576" y="305" text-anchor="middle">Provider</text>
+                  <text class="op-art-micro" x="576" y="324" text-anchor="middle">holds secrets</text>
+                </g>
+                <g class="op-art-approval">
+                  <rect class="op-art-node" x="317" y="43" width="36" height="36" rx="18"/>
+                  <path class="op-art-icon" d="m327 61 5 5 10-11"/>
+                  <text class="op-art-micro" x="367" y="55">human approval</text>
+                  <text class="op-art-micro op-art-micro--dim" x="367" y="72">out of band</text>
+                </g>
+                <text class="op-art-overline" x="42" y="42">01 / REQUEST</text>
+                <text class="op-art-overline" x="42" y="61">operation + reference</text>
+                <text class="op-art-boundary-label" x="335" y="429" text-anchor="middle">OPAQUE / AUTHORITY BOUNDARY</text>
+                <g class="op-art-packet op-art-packet--request"><rect x="-12" y="-5" width="24" height="10" rx="2"/><path d="M-5-2v4 M0-2v4 M5-2v4"/></g>
+                <g class="op-art-packet op-art-packet--approval"><rect x="-4" y="-4" width="8" height="8" rx="1"/></g>
+                <g class="op-art-packet op-art-packet--evidence"><rect x="-14" y="-8" width="28" height="16" rx="3"/><path d="m-7 0 4 3 6-6 M6 0h3"/></g>
+                <g class="op-art-stop"><circle cx="270" cy="244" r="12"/><path d="m266 240 8 8 M274 240l-8 8"/></g>
+                <g class="op-art-interrupted"><circle cx="474" cy="244" r="12"/><path d="M470 239v10 M478 239v10"/></g>
+                <g class="op-art-result"><rect x="220" y="383" width="225" height="28" rx="5"/><text x="332" y="401" text-anchor="middle">sanitized result · no secret value</text></g>
+              </g>
+            </svg>
+            <div class="op-architecture__switcher" role="group" aria-label="Choose an illustrated outcome" hidden>
+              <button type="button" data-outcome="allowed" aria-pressed="true">Allowed</button>
+              <button type="button" data-outcome="denied" aria-pressed="false">Denied</button>
+              <button type="button" data-outcome="interrupted" aria-pressed="false">Interrupted</button>
+            </div>
+          </div>
+          <div class="op-architecture__trace">
+            <div class="op-architecture__trace-top"><span class="op-architecture__step">05 / AUDIT</span><span class="op-architecture__state">Evidence returned</span></div>
+            <p class="op-architecture__description">The sanitized result returns. The operation is recorded in the audit chain.</p>
+            <div class="op-architecture__progress" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
+            <div class="op-architecture__footer">
+              <code>value_ref <span>keychain:opaque/deploy-key</span></code>
+              <div class="op-architecture__playback" hidden>
+                <button class="op-motion-toggle" type="button" aria-pressed="false" aria-label="Pause architecture animation"><span aria-hidden="true">Ⅱ</span> Pause</button>
+                <button class="op-motion-replay" type="button" aria-label="Replay architecture animation">↺ Replay</button>
+              </div>
+            </div>
+          </div>
+          <details class="op-architecture__code">
+            <summary>Inspect the example command <span aria-hidden="true">↗</span></summary>
+            <pre><code>opaque github set-secret \
+  --repo myorg/api \
+  --secret-name DEPLOY_KEY \
+  --value-ref keychain:opaque/deploy-key</code></pre>
+            <p>This is the local daemon workflow. The hosted demo runs a bounded read against fictional customer data.</p>
+          </details>
         </figure>
       </div>
     </section>
@@ -401,17 +487,127 @@
   </div>
 
   <script>
-    document.querySelectorAll(".op-copy").forEach(function (btn) {
-      btn.addEventListener("click", function () {
-        navigator.clipboard.writeText(btn.getAttribute("data-copy")).then(function () {
-          btn.setAttribute("data-copied", "");
-          btn.textContent = "Copied";
-          window.setTimeout(function () {
-            btn.removeAttribute("data-copied");
-            btn.textContent = "Copy";
-          }, 1600);
+    (function () {
+      document.querySelectorAll(".op-copy").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          if (!navigator.clipboard) return;
+          navigator.clipboard.writeText(btn.getAttribute("data-copy")).then(function () {
+            btn.setAttribute("data-copied", "");
+            btn.textContent = "Copied";
+            window.setTimeout(function () {
+              btn.removeAttribute("data-copied");
+              btn.textContent = "Copy";
+            }, 1600);
+          }).catch(function () { btn.textContent = "Select to copy"; });
         });
       });
-    });
+
+      var scene = document.querySelector(".op-architecture");
+      if (!scene) return;
+      var reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+      var paused = false;
+      var visible = true;
+      var elapsed = 0;
+      var previous = 0;
+      var frame = 0;
+      var duration = 12000;
+      var scenario = "allowed";
+      var step = -1;
+      var toggle = scene.querySelector(".op-motion-toggle");
+      var states = {
+        allowed: [
+          ["01 / POLICY", "Request received", "The agent names an operation and a secret reference. The value stays with its provider."],
+          ["02 / APPROVAL", "One operation, approved", "A human approves this exact operation out of band. The agent cannot approve itself."],
+          ["03 / EXECUTE", "Authority stays bounded", "The daemon executes the approved operation against the secrets provider."],
+          ["04 / SANITIZE", "The value stays secret", "The response is sanitized before it can cross back into the agent's process."],
+          ["05 / AUDIT", "Evidence returned", "The sanitized result returns. The operation is recorded in the audit chain."]
+        ],
+        denied: [
+          ["01 / POLICY", "Request received", "The daemon checks the operation against its deny-by-default policy."],
+          ["01 / POLICY", "Stopped at the boundary", "No rule allows this operation. The request is denied before provider access."],
+          ["DENIED / AUDITED", "No provider access", "The denial is recorded. There is no approval, execution, or secret value returned."]
+        ],
+        interrupted: [
+          ["01 / POLICY", "Request received", "The agent asks the daemon for one scoped operation."],
+          ["02 / APPROVAL", "One operation, approved", "The policy matches and a human approves the operation out of band."],
+          ["03 / EXECUTE", "Execution attempted", "The approved call begins. An attempt alone does not establish a completed operation."],
+          ["INTERRUPTED", "Outcome not confirmed", "The connection ends before a result arrives. Completion and provider effects are unknown."]
+        ]
+      };
+      function showStep(next) {
+        if (next === step) return;
+        step = next;
+        var entry = states[scenario][next];
+        scene.dataset.step = String(next);
+        scene.querySelector(".op-architecture__step").textContent = entry[0];
+        scene.querySelector(".op-architecture__state").textContent = entry[1];
+        scene.querySelector(".op-architecture__description").textContent = entry[2];
+      }
+      function getStep() {
+        var progress = elapsed / duration;
+        if (scenario === "denied") return progress < .2 ? 0 : progress < .38 ? 1 : 2;
+        if (scenario === "interrupted") return progress < .2 ? 0 : progress < .32 ? 1 : progress < .48 ? 2 : 3;
+        return progress < .2 ? 0 : progress < .32 ? 1 : progress < .57 ? 2 : progress < .78 ? 3 : 4;
+      }
+      function tick(now) {
+        if (previous) elapsed = (elapsed + now - previous) % duration;
+        previous = now;
+        showStep(getStep());
+        frame = window.requestAnimationFrame(tick);
+      }
+      function syncPlayback() {
+        window.cancelAnimationFrame(frame);
+        previous = 0;
+        var running = !paused && visible && !document.hidden && !reducedMotion.matches;
+        scene.classList.toggle("is-running", running);
+        scene.classList.toggle("is-static", reducedMotion.matches);
+        toggle.setAttribute("aria-pressed", String(paused));
+        toggle.setAttribute("aria-label", paused ? "Resume architecture animation" : "Pause architecture animation");
+        toggle.innerHTML = paused ? '<span aria-hidden="true">▷</span> Play' : '<span aria-hidden="true">Ⅱ</span> Pause';
+        toggle.disabled = reducedMotion.matches;
+        if (reducedMotion.matches) showStep(states[scenario].length - 1);
+        else if (running) frame = window.requestAnimationFrame(tick);
+      }
+      function restart() {
+        elapsed = 0;
+        previous = 0;
+        step = -1;
+        // Restart CSS and the explanatory trace together, preserving the user's pause choice.
+        scene.classList.remove("is-enhanced");
+        void scene.offsetWidth;
+        scene.classList.add("is-enhanced");
+        var diagramDescriptions = {
+          allowed: "An agent requests an operation. Opaque checks policy and obtains a human approval before accessing the secrets provider. Only a sanitized result returns.",
+          denied: "An agent requests an operation. Opaque denies it at the policy boundary. The provider is not accessed.",
+          interrupted: "An agent requests an operation. Policy and human approval permit an execution attempt, but the connection ends before a result is confirmed. Provider effects remain unknown."
+        };
+        scene.querySelector("#op-diagram-desc").textContent = diagramDescriptions[scenario] + " This illustration is not connected to a live service.";
+        showStep(reducedMotion.matches ? states[scenario].length - 1 : 0);
+        syncPlayback();
+      }
+      scene.querySelectorAll("[data-outcome]").forEach(function (button) {
+        button.addEventListener("click", function () {
+          scenario = button.dataset.outcome;
+          scene.dataset.scenario = scenario;
+          scene.querySelectorAll("[data-outcome]").forEach(function (item) {
+            item.setAttribute("aria-pressed", String(item === button));
+          });
+          restart();
+        });
+      });
+      toggle.addEventListener("click", function () { paused = !paused; syncPlayback(); });
+      scene.querySelector(".op-motion-replay").addEventListener("click", restart);
+      document.addEventListener("visibilitychange", syncPlayback);
+      if (reducedMotion.addEventListener) reducedMotion.addEventListener("change", restart);
+      if ("IntersectionObserver" in window) {
+        new IntersectionObserver(function (entries) {
+          visible = entries[0].isIntersecting;
+          syncPlayback();
+        }, { threshold: .12 }).observe(scene);
+      }
+      scene.querySelector(".op-architecture__switcher").hidden = false;
+      scene.querySelector(".op-architecture__playback").hidden = false;
+      restart();
+    }());
   </script>
 {% endblock %}

@@ -18,9 +18,42 @@ pub fn config_path() -> PathBuf {
         .unwrap_or_else(|_| opaque_home().join("config.toml"))
 }
 
-/// Resolve the audit database path: `~/.opaque/audit.db`.
-pub fn audit_db_path() -> PathBuf {
-    opaque_home().join("audit.db")
+pub struct ResolvedPaths {
+    pub data_dir: PathBuf,
+    pub config: PathBuf,
+    pub audit_db: PathBuf,
+    pub socket: PathBuf,
+}
+
+pub fn resolve_paths(
+    data_dir: Option<PathBuf>,
+    config: Option<PathBuf>,
+    socket: Option<PathBuf>,
+) -> ResolvedPaths {
+    let isolated = data_dir.is_some();
+    let data_dir = data_dir.unwrap_or_else(opaque_home);
+    let config = config.unwrap_or_else(|| {
+        if isolated {
+            data_dir.join("config.toml")
+        } else {
+            config_path()
+        }
+    });
+    let socket = socket.unwrap_or_else(|| {
+        if isolated {
+            data_dir
+                .join("run")
+                .join(opaque_core::socket::DEFAULT_SOCKET_FILENAME)
+        } else {
+            opaque_core::socket::socket_path()
+        }
+    });
+    ResolvedPaths {
+        audit_db: data_dir.join("audit.db"),
+        data_dir,
+        config,
+        socket,
+    }
 }
 
 /// Minimal config struct matching the daemon's `config.toml` format.
@@ -36,11 +69,11 @@ pub struct WebConfig {
     pub agent_session_ttl_secs: Option<u64>,
 }
 
-/// Load and parse the config file. Returns `None` if the file doesn't exist
-/// or fails to parse.
-pub fn load_web_config(path: &Path) -> Option<WebConfig> {
-    let contents = std::fs::read_to_string(path).ok()?;
-    toml_edit::de::from_str(&contents).ok()
+/// Load the selected file without hiding read or parse failures.
+pub fn load_web_config(path: &Path) -> Result<WebConfig, String> {
+    let contents = std::fs::read_to_string(path).map_err(|e| format!("Cannot read config: {e}"))?;
+    toml_edit::de::from_str(&contents)
+        .map_err(|_| "Cannot parse the selected policy config. Check its TOML syntax.".to_string())
 }
 
 #[cfg(test)]
@@ -55,14 +88,14 @@ mod tests {
         let cfg = config_path();
         assert!(cfg.ends_with("config.toml"));
 
-        let db = audit_db_path();
+        let db = resolve_paths(None, None, None).audit_db;
         assert!(db.ends_with("audit.db"));
     }
 
     #[test]
-    fn load_missing_config_returns_none() {
+    fn load_missing_config_returns_error() {
         let result = load_web_config(Path::new("/nonexistent/path/config.toml"));
-        assert!(result.is_none());
+        assert!(result.is_err());
     }
 
     #[test]

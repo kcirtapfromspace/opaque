@@ -398,6 +398,133 @@ async fn drive_login(
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // same serialized real-daemon path as identity tests
+async fn workload_attestor_uses_listener_evidence_and_refuses_claims() {
+    use futures_util::{SinkExt, StreamExt};
+    use opaque_core::audit::{AuditEventKind, AuditFilter, query_audit_db, verify_audit_chain};
+    use tokio_util::codec::{Framed, LengthDelimitedCodec};
+
+    let _serial = serial_guard();
+    let daemon = TestDaemon::spawn("[attestation]\ninterval_secs = 0\n");
+    daemon.call_ok("ping", Value::Null).await;
+
+    // A normal method envelope cannot upgrade the shared-uid observation.
+    let denied = daemon.call("ping", json!({"strength": "strong"})).await;
+    assert_eq!(denied["error"]["code"], "identity_claim_forbidden");
+
+    // Top-level fields must be checked before Request deserialization could
+    // silently discard them. The attempted attestor does not select a plugin.
+    let stream = tokio::net::UnixStream::connect(&daemon.sock).await.unwrap();
+    let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
+    framed
+        .send(
+            serde_json::to_vec(&json!({
+                "handshake": "v1", "daemon_token": daemon.daemon_token,
+            }))
+            .unwrap()
+            .into(),
+        )
+        .await
+        .unwrap();
+    framed
+        .send(
+            serde_json::to_vec(&json!({
+                "id": 8, "method": "ping", "params": null, "attestor": "caller-secret-marker",
+            }))
+            .unwrap()
+            .into(),
+        )
+        .await
+        .unwrap();
+    let frame = tokio::time::timeout(Duration::from_secs(10), framed.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let denied: Value = serde_json::from_slice(&frame).unwrap();
+    assert_eq!(denied["id"], 8);
+    assert_eq!(denied["error"]["code"], "identity_claim_forbidden");
+    // Duplicate envelopes must retain their original parse-error behavior;
+    // a later params object cannot erase an earlier identity claim.
+    framed
+        .send(
+            br#"{"id":9,"method":"ping","params":{"strength":"strong"},"params":null}"#
+                .to_vec()
+                .into(),
+        )
+        .await
+        .unwrap();
+    let frame = tokio::time::timeout(Duration::from_secs(10), framed.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let denied: Value = serde_json::from_slice(&frame).unwrap();
+    assert_eq!(denied["error"]["code"], "bad_json");
+    drop(framed);
+
+    // Identity claims in a handshake close the connection before dispatch.
+    let stream = tokio::net::UnixStream::connect(&daemon.sock).await.unwrap();
+    let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
+    framed
+        .send(
+            serde_json::to_vec(&json!({
+                "handshake": "v1", "daemon_token": daemon.daemon_token,
+                "workload_identity": {"strength": "strong", "source": "caller-secret-marker"},
+            }))
+            .unwrap()
+            .into(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(10), framed.next()).await,
+        Ok(None) | Ok(Some(Err(_)))
+    ));
+    drop(framed);
+
+    let (db, _home) = daemon.shutdown();
+    assert!(verify_audit_chain(&db).unwrap().ok);
+    let events = query_audit_db(&db, &AuditFilter::default()).unwrap();
+    let attested: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == AuditEventKind::WorkloadAttested)
+        .collect();
+    assert_eq!(
+        attested.len(),
+        1,
+        "forged identities must never reach dispatch"
+    );
+    assert_eq!(attested[0].operation.as_deref(), Some("ping"));
+    let client = attested[0].client.as_ref().unwrap();
+    assert_eq!(client.uid, unsafe { libc::geteuid() });
+    assert_eq!(client.pid, Some(std::process::id() as i32));
+    let detail: Value = serde_json::from_str(attested[0].detail.as_deref().unwrap()).unwrap();
+    assert_eq!(detail["attestor"], "peercred");
+    assert_eq!(detail["strength"], "weak");
+    assert_eq!(
+        detail["selector_count"], 4,
+        "real executable observations are required"
+    );
+    let denied: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == AuditEventKind::WorkloadAttestationDenied)
+        .collect();
+    assert_eq!(denied.len(), 3);
+    assert!(
+        denied
+            .iter()
+            .all(|e| e.outcome.as_deref() == Some("identity_claim_forbidden"))
+    );
+    assert!(events.iter().all(|e| {
+        !e.detail
+            .as_deref()
+            .unwrap_or("")
+            .contains("caller-secret-marker")
+    }));
+}
+
+#[tokio::test]
 #[allow(clippy::await_holding_lock)] // deliberate: serialize heavy e2e daemons (current-thread runtime)
 async fn login_end_to_end_against_real_daemon() {
     let _serial = serial_guard();

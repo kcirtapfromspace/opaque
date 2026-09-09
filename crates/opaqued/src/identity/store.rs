@@ -64,6 +64,16 @@ CREATE TABLE IF NOT EXISTS delegations (
     revoked_at       INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_delegations_sub ON delegations(sub_principal);
+
+-- Resource revocations live with broker identity; gateways never open this DB.
+CREATE TABLE IF NOT EXISTS resource_revocations (
+    issuer TEXT NOT NULL,
+    audience TEXT NOT NULL,
+    jti TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    revoked_at INTEGER NOT NULL,
+    PRIMARY KEY (issuer, audience, jti)
+);
 "#;
 
 /// A human login session row.
@@ -279,6 +289,45 @@ impl IdentityStore {
         self.get_principal_by_str(id.as_str())
     }
 
+    /// Exact issuer+subject lookup; OAuth access never bootstraps an identity.
+    pub fn get_human_by_subject(
+        &self,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<Option<Principal>, String> {
+        self.lock().query_row(
+            "SELECT id, kind, iss, sub, email, display_name, tool, service_name, roles, created_at, last_seen, disabled FROM principals WHERE kind='human' AND iss=?1 AND sub=?2",
+            params![issuer, subject], row_to_principal,
+        ).optional().map_err(|e| e.to_string())
+    }
+
+    pub fn resource_token_revoked(
+        &self,
+        issuer: &str,
+        audience: &str,
+        jti: &str,
+    ) -> Result<bool, String> {
+        self.lock().query_row(
+            "SELECT EXISTS(SELECT 1 FROM resource_revocations WHERE issuer=?1 AND audience=?2 AND jti=?3)",
+            params![issuer, audience, jti], |row| row.get(0),
+        ).map_err(|e| e.to_string())
+    }
+
+    /// Monotonic and durable. Scoped by issuer and resource, with expiry only
+    /// for retention metadata; checks never forget a revoked token on restart.
+    pub fn revoke_resource_token(
+        &self,
+        issuer: &str,
+        audience: &str,
+        jti: &str,
+        expires_at: i64,
+    ) -> Result<(), String> {
+        self.lock().execute(
+            "INSERT INTO resource_revocations(issuer,audience,jti,expires_at,revoked_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(issuer,audience,jti) DO UPDATE SET expires_at=MAX(expires_at,excluded.expires_at)",
+            params![issuer, audience, jti, expires_at, now_unix()],
+        ).map(|_| ()).map_err(|e| e.to_string())
+    }
+
     /// Look up a service principal by its configured name.
     pub fn get_service_by_name(&self, name: &str) -> Result<Option<Principal>, String> {
         let conn = self.lock();
@@ -354,6 +403,67 @@ impl IdentityStore {
         Ok(())
     }
 
+    /// Apply exactly the reviewed role replacement under one writer lock.
+    /// Concurrent approvals cannot remove both remaining admins or overwrite
+    /// an intervening role change with an obsolete review.
+    /// `permitted` must inspect immutable runtime membership configuration only;
+    /// it must not call back into this store while its writer lock is held.
+    pub fn set_reviewed_roles(
+        &self,
+        actor: &PrincipalId,
+        id: &PrincipalId,
+        expected: &str,
+        roles: &BTreeSet<Role>,
+        permitted: impl Fn(&Principal) -> bool,
+    ) -> Result<(), String> {
+        let mut conn = self.lock();
+        let transaction = conn.transaction().map_err(|error| error.to_string())?;
+        let eligible_admins = {
+            let mut statement = transaction.prepare(
+                "SELECT id, kind, iss, sub, email, display_name, tool, service_name, \
+                        roles, created_at, last_seen, disabled \
+                 FROM principals WHERE kind='human' AND disabled=0 AND instr(',' || roles || ',', ',admin,') > 0",
+            ).map_err(|error| error.to_string())?;
+            let rows = statement
+                .query_map([], row_to_principal)
+                .map_err(|error| error.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .filter(|principal| permitted(principal))
+                .map(|principal| principal.id)
+                .collect::<Vec<_>>()
+        };
+        let authorized = eligible_admins.contains(actor);
+        let current: Option<String> = transaction
+            .query_row(
+                "SELECT roles FROM principals WHERE id=?1",
+                params![id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some(current) = current else {
+            return Err("no such principal".into());
+        };
+        if !authorized || current != expected {
+            return Err("reviewed identity authority changed".into());
+        }
+        if eligible_admins.contains(id)
+            && !roles.contains(&Role::Admin)
+            && eligible_admins.len() <= 1
+        {
+            return Err("cannot remove the last admitted human admin".into());
+        }
+        transaction
+            .execute(
+                "UPDATE principals SET roles=?1 WHERE id=?2",
+                params![roles_to_string(roles), id.as_str()],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
     /// Number of (non-disabled) human principals — bootstrap check.
     pub fn count_humans(&self) -> Result<u64, String> {
         let conn = self.lock();
@@ -367,6 +477,7 @@ impl IdentityStore {
     }
 
     /// Number of enabled principals holding `role`.
+    #[cfg(test)]
     pub fn count_with_role(&self, role: Role) -> Result<u64, String> {
         let principals = self.list_principals()?;
         Ok(principals
@@ -520,7 +631,7 @@ impl IdentityStore {
             .map_err(|e| e.to_string())
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
+    pub(super) fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
         // A poisoned mutex means a panic mid-write; the connection itself is
         // still usable and refusing all identity ops would fail the daemon
         // open-endedly. Recover the guard.
@@ -528,7 +639,7 @@ impl IdentityStore {
     }
 }
 
-fn row_to_principal(row: &rusqlite::Row<'_>) -> rusqlite::Result<Principal> {
+pub(super) fn row_to_principal(row: &rusqlite::Row<'_>) -> rusqlite::Result<Principal> {
     let id: String = row.get(0)?;
     let kind_s: String = row.get(1)?;
     let iss: Option<String> = row.get(2)?;
@@ -701,6 +812,193 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_reviewed_changes_keep_one_admin_and_refuse_stale_reviews() {
+        let store = std::sync::Arc::new(store());
+        let first = store
+            .upsert_human(
+                "https://idp.example.com",
+                "admin-a",
+                None,
+                None,
+                &admin_roles(),
+            )
+            .unwrap();
+        let second = store
+            .upsert_human(
+                "https://idp.example.com",
+                "admin-b",
+                None,
+                None,
+                &admin_roles(),
+            )
+            .unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut workers = Vec::new();
+        for principal in [first, second] {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.set_reviewed_roles(
+                    &principal.id,
+                    &principal.id,
+                    &roles_to_string(&principal.roles),
+                    &BTreeSet::from([Role::Operator]),
+                    |_| true,
+                )
+            }));
+        }
+        let successes = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(Result::is_ok)
+            .count();
+        assert_eq!(successes, 1);
+        assert_eq!(store.count_with_role(Role::Admin).unwrap(), 1);
+        let admin = store
+            .list_principals()
+            .unwrap()
+            .into_iter()
+            .find(|principal| principal.has_role(Role::Admin))
+            .unwrap();
+        assert!(
+            store
+                .set_reviewed_roles(&admin.id, &admin.id, "operator", &admin_roles(), |_| true)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn reviewed_roles_preserve_last_human_admin_despite_service_agent_or_disabled_admins() {
+        let store = store();
+        let admin = store
+            .upsert_human(
+                "https://idp.example.com",
+                "human-admin",
+                None,
+                None,
+                &admin_roles(),
+            )
+            .unwrap();
+        let service = store.upsert_service("automation-admin").unwrap();
+        let agent = store.upsert_agent("agent-admin").unwrap();
+        for principal in [&service, &agent] {
+            store.set_roles(&principal.id, &admin_roles()).unwrap();
+        }
+        let disabled = store
+            .upsert_human(
+                "https://idp.example.com",
+                "disabled-admin",
+                None,
+                None,
+                &admin_roles(),
+            )
+            .unwrap();
+        store.set_disabled(&disabled.id, true).unwrap();
+        let result = store.set_reviewed_roles(
+            &admin.id,
+            &admin.id,
+            &roles_to_string(&admin.roles),
+            &BTreeSet::from([Role::Operator]),
+            |_| true,
+        );
+        assert!(result.unwrap_err().contains("last admitted human admin"));
+        assert_eq!(
+            store.get_principal(&admin.id).unwrap().unwrap().roles,
+            admin.roles
+        );
+        // Non-human admin roles cannot substitute for the acting human either.
+        for actor in [&service, &agent] {
+            assert!(
+                store
+                    .set_reviewed_roles(
+                        &actor.id,
+                        &admin.id,
+                        &roles_to_string(&admin.roles),
+                        &BTreeSet::from([Role::Operator]),
+                        |_| true,
+                    )
+                    .unwrap_err()
+                    .contains("authority changed")
+            );
+        }
+    }
+
+    #[test]
+    fn reviewed_roles_ignore_removed_subjects_and_reject_removed_acting_admin() {
+        let store = store();
+        let admitted = store
+            .upsert_human(
+                "https://idp.example.com",
+                "admitted-admin",
+                None,
+                None,
+                &admin_roles(),
+            )
+            .unwrap();
+        let removed = store
+            .upsert_human(
+                "https://idp.example.com",
+                "removed-admin",
+                None,
+                None,
+                &admin_roles(),
+            )
+            .unwrap();
+        // This mirrors current broker issuer/subject membership admission,
+        // rather than trusting the membership present when the row was made.
+        let permitted = |principal: &Principal| {
+            matches!(
+                &principal.kind, PrincipalKind::Human { iss, sub, .. }
+                    if iss == "https://idp.example.com" && sub == "admitted-admin"
+            )
+        };
+        let replacement = BTreeSet::from([Role::Operator]);
+        assert!(
+            store
+                .set_reviewed_roles(
+                    &admitted.id,
+                    &admitted.id,
+                    &roles_to_string(&admitted.roles),
+                    &replacement,
+                    permitted,
+                )
+                .unwrap_err()
+                .contains("last admitted human admin")
+        );
+        assert!(
+            store
+                .set_reviewed_roles(
+                    &removed.id,
+                    &admitted.id,
+                    &roles_to_string(&admitted.roles),
+                    &replacement,
+                    permitted,
+                )
+                .unwrap_err()
+                .contains("authority changed")
+        );
+        assert_eq!(
+            store.get_principal(&admitted.id).unwrap().unwrap().roles,
+            admitted.roles
+        );
+        // An admitted human may still remove roles from a departed member.
+        store
+            .set_reviewed_roles(
+                &admitted.id,
+                &removed.id,
+                &roles_to_string(&removed.roles),
+                &replacement,
+                permitted,
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_principal(&removed.id).unwrap().unwrap().roles,
+            replacement
+        );
+    }
+
+    #[test]
     fn set_roles_roundtrip_and_missing_principal_errors() {
         let s = store();
         let p = s.upsert_service("ci").unwrap();
@@ -812,5 +1110,92 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+
+    #[test]
+    fn issuer_subject_lookup_is_exact_and_reads_live_principal_state() {
+        let store = IdentityStore::open_in_memory().unwrap();
+        let principal = store
+            .upsert_human(
+                "https://idp.example",
+                "subject",
+                Some("user@example.com"),
+                None,
+                &BTreeSet::from([Role::Operator]),
+            )
+            .unwrap();
+        assert!(
+            store
+                .get_human_by_subject("https://other.example", "subject")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_human_by_subject("https://idp.example", "other")
+                .unwrap()
+                .is_none()
+        );
+        store.set_roles(&principal.id, &BTreeSet::new()).unwrap();
+        store.set_disabled(&principal.id, true).unwrap();
+        let current = store
+            .get_human_by_subject("https://idp.example", "subject")
+            .unwrap()
+            .unwrap();
+        assert!(current.disabled);
+        assert!(current.roles.is_empty());
+    }
+
+    #[test]
+    fn resource_revocation_is_durable_monotonic_and_issuer_resource_scoped() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("identity.db");
+        {
+            let store = IdentityStore::open(&path).unwrap();
+            assert!(
+                !store
+                    .resource_token_revoked("issuer", "resource", "token")
+                    .unwrap()
+            );
+            store
+                .revoke_resource_token("issuer", "resource", "token", 900)
+                .unwrap();
+            store
+                .revoke_resource_token("issuer", "resource", "token", 100)
+                .unwrap();
+        }
+        let reopened = IdentityStore::open(&path).unwrap();
+        assert!(
+            reopened
+                .resource_token_revoked("issuer", "resource", "token")
+                .unwrap()
+        );
+        assert!(
+            !reopened
+                .resource_token_revoked("other", "resource", "token")
+                .unwrap()
+        );
+        assert!(
+            !reopened
+                .resource_token_revoked("issuer", "other", "token")
+                .unwrap()
+        );
+        assert!(
+            !reopened
+                .resource_token_revoked("issuer", "resource", "other")
+                .unwrap()
+        );
+        let expiry: i64 = reopened
+            .lock()
+            .query_row("SELECT expires_at FROM resource_revocations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(expiry, 900);
     }
 }

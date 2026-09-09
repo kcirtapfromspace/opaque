@@ -7,6 +7,28 @@
 **Scope:** Full source tree (`crates/`), documentation (`docs/`), PRD, configuration, and dependency analysis
 **Codebase Version:** 0.1.0 (pre-release)
 
+> ## Current status (2026-09-09)
+>
+> Reviewed codebase: 0.1.0, 3 crates, pre-approval-flow. Now 14 crates; the
+> existing DONE/PARTIALLY-DONE annotations (§4.1.2, §4.2.1, §8.1, §8.2)
+> still hold per-finding, but these have moved further:
+>
+> - **TA-3 / §3.5 same-uid attacker** — closed under `[trust_domain]
+>   enforce = true`: custody files unreadable/unwritable at the agent's
+>   uid, startup fails closed. See [deployment](deployment.md).
+> - **§3.5 request authentication** — `opqd1` Ed25519 delegation tokens now
+>   bind each request to a verified principal, checked live, revoked
+>   immediately. See [identity](identity.md).
+> - **Approver attribution** (Findings 2.1/2.4) — cryptographic for
+>   `paired_device`/`fido2`: a signature over a decision-bound challenge,
+>   not just a session name.
+> - **§8.1 C-6** (umask race before `bind()`) — still open; the socket's
+>   parent directory is `0700` before bind, which narrows but doesn't close it.
+> - Central policy, SIEM export, posture attestation — shipped, see
+>   [federation](federation.md).
+>
+> Appendix A/B file lists and dependency counts are frozen at 2026-02-12.
+
 ---
 
 ## Table of Contents

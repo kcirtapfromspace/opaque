@@ -122,6 +122,56 @@ pub fn secrets_status(
 /// - Audit trail captures everything
 pub fn safe_tools() -> Vec<ToolDef> {
     vec![
+        ToolDef {
+            name: "opaque_task_plan_ssh",
+            description: "Plan one fixed SSH service health operation for the authenticated broker tenant. The broker selects the host, pinned host key, SSH principal, source address, command and session limit from its trusted profile and binds the current delegated identity. Only a review title and task expiry are accepted. Planning issues no SSH certificate and grants no execution authority. Use opaque_task_run for trusted human approval and a single attempt; inspect opaque_task_get for authenticated host evidence.",
+            input_schema: json!({"type":"object","additionalProperties":false,"required":["title","expires_in_secs"],"properties":{"title":{"type":"string","minLength":1,"maxLength":160},"expires_in_secs":{"type":"integer","minimum":1,"maximum":opaque_core::ssh::MAX_SSH_TASK_DURATION_SECS}}}),
+            build_params: |args| json!({"title": args.get("title").cloned().unwrap_or(json!(null)), "expires_in_secs": args.get("expires_in_secs").cloned().unwrap_or(json!(null))}),
+        },
+        ToolDef {
+            name: "opaque_task_plan_inference",
+            description: "Plan three fixed synthetic public-source model completions in the authenticated tenant. The broker selects the source snapshot, model and exact prompts. No custom SQL, data source, endpoint, tenant or prompt is accepted. Planning is read-only and grants no authority. Human approval is required before execution; each attempt reserves 96 output units and uncertainty stops later requests.",
+            input_schema: json!({"type":"object","additionalProperties":false,"required":["title","expires_in_secs"],"properties":{"title":{"type":"string","minLength":1,"maxLength":160},"expires_in_secs":{"type":"integer","minimum":1,"maximum":600}}}),
+            build_params: |args| json!({"title": args.get("title").cloned().unwrap_or(json!(null)), "expires_in_secs": args.get("expires_in_secs").cloned().unwrap_or(json!(null))}),
+        },
+        ToolDef {
+            name: "opaque_task_plan",
+            description: "Plan an immutable bounded task: schema1 publishes pinned Vault values to exact GitHub secrets; schema2 dispatches one trusted staging workflow with an immutable image digest. The broker resolves provider identities and validates the trusted workflow profile. Planning grants no approval and performs no writes. Present the complete returned scope for trusted human review.",
+            input_schema: task_plan_schema(),
+            build_params: |args| json!({"manifest": args.get("manifest").cloned().unwrap_or(json!(null))}),
+        },
+        ToolDef {
+            name: "opaque_task_run",
+            description: "Request trusted human approval for an immutable planned task and execute its fixed actions once, including secret publishing, staging workflow dispatch, bounded inference or one fixed SSH service health command. Approval cannot be supplied as a tool argument. Each reserved action permanently consumes its slot; inference attempts reserve 96 output tokens. Failures and unknown outcomes receive no automatic retry or fresh allowance. After a timeout or concurrent run, use opaque_task_get to inspect the receipt. Repeating this call cannot resume a closed task.",
+            input_schema: task_id_schema(),
+            build_params: task_id_params,
+        },
+        ToolDef {
+            name: "opaque_task_get",
+            description: "Inspect a bounded task's exact targets, source and tenant bindings, digest, approval state, expiry and durable receipt. Interpret evidence by action type: GitHub write or dispatch acceptance, an observed inference completion with returned text and reported token usage, or a verified signed host health receipt. API acceptance alone does not establish deployment or service health. Secret values cannot be read back. Reserved or unknown slots remain charged. Use this after interrupted runs instead of repeating provider actions.",
+            input_schema: task_id_schema(),
+            build_params: task_id_params,
+        },
+        ToolDef {
+            name: "opaque_task_list",
+            description: "List a bounded page of tasks belonging to the current authenticated owner, including planned work and durable receipts. When has_more is true, pass next_cursor as cursor to retrieve older tasks. Agent session changes do not reset their allowance.",
+            input_schema: json!({"type": "object", "additionalProperties": false, "properties": {
+                "cursor": {"type": "string", "description": "Optional next_cursor task ID returned by the previous page"}
+            }}),
+            build_params: |args| json!({"cursor": args.get("cursor").cloned().unwrap_or(json!(null))}),
+        },
+        ToolDef {
+            name: "opaque_task_revoke",
+            description: "Revoke a task to block future provider actions, including secret writes, workflow dispatch and model generation attempts. Work already authorized for dispatch may still complete; inspect the resulting receipt. Revocation never refunds reserved slots or generation allowances, and never enables a retry.",
+            input_schema: task_id_schema(),
+            build_params: task_id_params,
+        },
+        ToolDef {
+            name: "opaque_task_reconcile",
+            description: "Read and persist correlated staging workflow evidence for an attempted task. This performs read-only provider requests and never dispatches, retries, refunds authority, or rolls back. API acceptance, workflow success and application health are distinct. Failed or ambiguous evidence is returned as a tool error with the receipt preserved.",
+            input_schema: task_id_schema(),
+            build_params: task_id_params,
+        },
         // --- GitHub operations ---
         ToolDef {
             name: "opaque_github_set_actions_secret",
@@ -526,10 +576,9 @@ pub fn safe_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "opaque_secrets_status",
-            description: "Check which Opaque secret references are configured and resolvable, without \
-                           revealing secret values. Returns the status (available/missing) for each secret \
-                           ref in a profile. Use this to diagnose configuration issues before running \
-                           sandbox commands.",
+            description: "List secret reference names, schemes and configured paths from a local Opaque \
+                           profile without resolving values. This parses configuration only: it does not \
+                           check provider connectivity, credential availability or whether a secret exists.",
             input_schema: json!({
                 "type": "object",
                 "required": ["profile"],
@@ -550,6 +599,60 @@ pub fn safe_tools() -> Vec<ToolDef> {
     ]
 }
 
+fn task_plan_schema() -> serde_json::Value {
+    let secret = json!({
+        "type": "object", "additionalProperties": false,
+        "required": ["repo", "secret_name", "value_ref"],
+        "properties": {
+            "repo": {"type":"string"}, "repository_id":{"type":"integer","minimum":0},
+            "secret_name":{"type":"string","pattern":"^[A-Z_][A-Z0-9_]*$","maxLength":100},
+            "value_ref":{"type":"string","description":"Pinned Vault KV v2 reference; never a value"},
+            "github_token_ref":{"type":"string","maxLength":128}
+        }
+    });
+    let release = json!({
+        "type":"object", "additionalProperties":false,
+        "required":["operation","repo","workflow_path","workflow_ref","image_repository","image_digest","environment"],
+        "properties": {
+            "operation":{"const":"github.dispatch_staging_workflow"},
+            "repo":{"type":"string"}, "repository_id":{"type":"integer","minimum":0},
+            "workflow_path":{"type":"string"},"workflow_id":{"type":"integer","minimum":0},
+            "workflow_ref":{"type":"string","description":"Exact trusted branch"},
+            "approved_commit_sha":{"type":"string"},"workflow_sha256":{"type":"string"},
+            "image_repository":{"type":"string"},"image_digest":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},
+            "environment":{"const":"staging"},"github_token_ref":{"type":"string","maxLength":128}
+        }
+    });
+    json!({"type":"object","additionalProperties":false,"required":["manifest"],"properties":{
+        "manifest":{"type":"object","additionalProperties":false,
+            "required":["schema_version","title","expires_in_secs","actions"],
+            "properties":{
+                "schema_version":{"type":"integer","enum":[1,2]},
+                "title":{"type":"string","minLength":1,"maxLength":160},
+                "expires_in_secs":{"type":"integer","minimum":1,"maximum":3600},
+                "github_api_url":{"type":"string"},"vault_api_url":{"type":"string"},
+                "actions":{"type":"array","minItems":1,"maxItems":32}
+            },
+            "allOf":[{
+                "if":{"properties":{"schema_version":{"const":1}}},
+                "then":{"properties":{"actions":{"items":secret}}},
+                "else":{"properties":{"actions":{"maxItems":1,"items":release}}}
+            }]
+        }
+    }})
+}
+
+fn task_id_schema() -> serde_json::Value {
+    json!({
+        "type": "object", "additionalProperties": false, "required": ["task_id"],
+        "properties": {"task_id": {"type": "string", "description": "Broker-issued task ID returned by opaque_task_plan, opaque_task_plan_inference or opaque_task_plan_ssh"}}
+    })
+}
+
+fn task_id_params(args: &serde_json::Value) -> serde_json::Value {
+    json!({"task_id": args.get("task_id").cloned().unwrap_or(json!(null))})
+}
+
 /// Map an MCP tool name to the daemon IPC method that should be called.
 ///
 /// IMPORTANT: This returns the daemon RPC *method* (e.g. `"github"`,
@@ -558,33 +661,29 @@ pub fn safe_tools() -> Vec<ToolDef> {
 /// route to the correct enclave operation based on `action`/`scope`
 /// fields in the params built by each tool's `build_params`.
 pub fn tool_to_daemon_method(tool_name: &str) -> Option<&'static str> {
-    static MAPPING: &[(&str, &str)] = &[
-        ("opaque_github_set_actions_secret", "github"),
-        ("opaque_github_set_codespaces_secret", "github"),
-        ("opaque_github_set_dependabot_secret", "github"),
-        ("opaque_github_set_org_secret", "github"),
-        ("opaque_github_list_secrets", "github"),
-        ("opaque_github_delete_secret", "github"),
-        ("opaque_gitlab_set_ci_variable", "gitlab"),
-        ("opaque_onepassword_list_vaults", "onepassword"),
-        ("opaque_onepassword_list_items", "onepassword"),
-        ("opaque_bitwarden_list_projects", "bitwarden"),
-        ("opaque_bitwarden_list_secrets", "bitwarden"),
-        ("opaque_sandbox_exec", "sandbox.exec"),
-        // opaque_sandbox_list_profiles is handled client-side (no daemon call)
-        ("opaque_sandbox_list_profiles", "sandbox.list_profiles"),
-        // opaque_secrets_status is handled client-side (no daemon call)
-        ("opaque_secrets_status", "sandbox.secrets_status"),
-    ];
-    MAPPING
-        .iter()
-        .find(|(k, _)| *k == tool_name)
-        .map(|(_, v)| *v)
+    opaque_core::capability::tool_to_daemon_method(tool_name)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_catalog_matches_shared_routes_exactly() {
+        let names: std::collections::BTreeSet<_> =
+            safe_tools().into_iter().map(|tool| tool.name).collect();
+        let routes: std::collections::BTreeSet<_> = opaque_core::capability::MCP_ROUTES
+            .iter()
+            .map(|route| route.0)
+            .collect();
+        assert_eq!(names, routes);
+        assert!(opaque_core::capability::mcp_exposes("sandbox.exec"));
+        assert!(!opaque_core::capability::mcp_exposes(
+            "onepassword.read_field"
+        ));
+        assert!(!opaque_core::capability::mcp_exposes("unknown.operation"));
+    }
+
     use std::collections::HashSet;
 
     #[test]
@@ -599,6 +698,14 @@ mod tests {
             "sandbox.exec",
             "sandbox.list_profiles",
             "sandbox.secrets_status",
+            "task_plan",
+            "task_plan_inference",
+            "task_plan_ssh",
+            "task_run",
+            "task_get",
+            "task_list",
+            "task_revoke",
+            "task_reconcile",
         ];
         for tool in &tools {
             let method = tool_to_daemon_method(tool.name)
@@ -644,7 +751,53 @@ mod tests {
     #[test]
     fn tool_count() {
         let tools = safe_tools();
-        assert_eq!(tools.len(), 14);
+        assert_eq!(tools.len(), 22);
+    }
+
+    #[test]
+    fn task_tools_keep_approval_and_workspace_out_of_model_arguments() {
+        for tool in safe_tools()
+            .iter()
+            .filter(|tool| tool.name.starts_with("opaque_task_"))
+        {
+            assert_eq!(tool.input_schema["additionalProperties"], false);
+            assert!(tool.input_schema["properties"].get("approved").is_none());
+            assert!(tool.input_schema["properties"].get("workspace").is_none());
+            let params = (tool.build_params)(
+                &json!({"task_id":"id", "approved":true, "workspace":{"repo_root":"/forged"}}),
+            );
+            assert!(params.get("approved").is_none());
+            assert!(params.get("workspace").is_none());
+        }
+    }
+
+    #[test]
+    fn ssh_planning_accepts_only_review_text_and_bounded_expiry() {
+        let tool = safe_tools()
+            .into_iter()
+            .find(|tool| tool.name == "opaque_task_plan_ssh")
+            .unwrap();
+        assert_eq!(tool_to_daemon_method(tool.name), Some("task_plan_ssh"));
+        let properties = tool.input_schema["properties"].as_object().unwrap();
+        assert_eq!(properties.len(), 2);
+        assert_eq!(
+            properties["expires_in_secs"]["maximum"],
+            opaque_core::ssh::MAX_SSH_TASK_DURATION_SECS
+        );
+        let params = (tool.build_params)(&json!({
+            "title":"Check the configured service", "expires_in_secs":90,
+            "host":"attacker.example", "principal":"root", "command":"sh",
+            "tenant_id":"foreign", "delegation_id":"forged", "approved":true,
+            "max_session_secs":3600, "private_key":"forged", "manifest":{}
+        }));
+        assert_eq!(
+            params,
+            json!({"title":"Check the configured service", "expires_in_secs":90})
+        );
+        assert_eq!(
+            (tool.build_params)(&json!({})),
+            json!({"title":null,"expires_in_secs":null})
+        );
     }
 
     #[test]

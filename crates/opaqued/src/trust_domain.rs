@@ -22,7 +22,7 @@ use std::ffi::CString;
 use std::io;
 use std::path::Path;
 
-use opaque_core::trust_domain::{CustodyViolation, SystemFs, default_custody_set};
+use opaque_core::trust_domain::{CustodyViolation, SystemFs, custody_paths};
 use tracing::{info, warn};
 
 /// Which peer uids may hold a connection, given the daemon's mode.
@@ -46,13 +46,23 @@ pub fn peer_uid_allowed(peer_uid: u32, daemon_uid: u32, enforce: bool) -> bool {
 /// then verifies. In enforce mode any surviving violation is fatal; otherwise
 /// each is logged, making the daemon's actual security posture visible
 /// without breaking shared-uid developer setups.
+#[cfg(test)]
 pub fn startup_custody_check(
     enforce: bool,
     home: &Path,
     config_path: &Path,
 ) -> io::Result<Vec<CustodyViolation>> {
+    startup_custody_check_at(enforce, home, config_path, &home.join(".opaque"))
+}
+
+pub fn startup_custody_check_at(
+    enforce: bool,
+    home: &Path,
+    config_path: &Path,
+    state_dir: &Path,
+) -> io::Result<Vec<CustodyViolation>> {
     let daemon_uid = unsafe { libc::geteuid() };
-    let set = default_custody_set(home, config_path);
+    let set = custody_paths(home, config_path, state_dir);
 
     for (path, old, new) in opaque_core::trust_domain::tighten_modes(&set, daemon_uid) {
         info!(
@@ -60,8 +70,15 @@ pub fn startup_custody_check(
             path.display()
         );
     }
+    check_custody(enforce, daemon_uid, &set)
+}
 
-    let violations = opaque_core::trust_domain::verify_custody(&set, daemon_uid, &SystemFs);
+fn check_custody(
+    enforce: bool,
+    daemon_uid: u32,
+    set: &[opaque_core::trust_domain::CustodyPath],
+) -> io::Result<Vec<CustodyViolation>> {
+    let violations = opaque_core::trust_domain::verify_custody(set, daemon_uid, &SystemFs);
 
     if violations.is_empty() {
         info!(
@@ -304,6 +321,37 @@ pub fn apply_socket_group(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custom_state_custody_preserves_the_actual_config_location() {
+        let user_root = Path::new("/example/user");
+        let config = user_root.join(".opaque/config.toml");
+        let isolated = Path::new("/example/isolated");
+        let paths = custody_paths(user_root, &config, isolated);
+        assert!(
+            paths
+                .iter()
+                .any(|item| item.label == "daemon config" && item.path == config)
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|item| item.path == isolated.join("attestation.key"))
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|item| item.path == isolated.join("tasks.db.writer.lock"))
+        );
+        for item in paths {
+            if !matches!(
+                item.label,
+                "daemon config" | "config seal key" | "config seal"
+            ) {
+                assert!(item.path.starts_with(isolated), "{}", item.path.display());
+            }
+        }
+    }
 
     const DAEMON_UID: u32 = 500;
 

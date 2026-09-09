@@ -126,6 +126,12 @@ pub enum AuditEventKind {
     /// (e.g. an operation succeeded without its required approval being
     /// granted in the chain).
     AuditAlert,
+
+    /// The listener attested a workload before dispatching its request.
+    WorkloadAttested,
+
+    /// Workload attestation failed or a caller tried to assert its identity.
+    WorkloadAttestationDenied,
 }
 
 impl fmt::Display for AuditEventKind {
@@ -162,6 +168,8 @@ impl fmt::Display for AuditEventKind {
             Self::FederationBundleApplied => "federation.bundle_applied",
             Self::FederationBundleRejected => "federation.bundle_rejected",
             Self::AuditAlert => "audit.alert",
+            Self::WorkloadAttested => "workload.attested",
+            Self::WorkloadAttestationDenied => "workload.attestation_denied",
         };
         write!(f, "{s}")
     }
@@ -203,6 +211,8 @@ impl std::str::FromStr for AuditEventKind {
             "federation.bundle_applied" => Ok(Self::FederationBundleApplied),
             "federation.bundle_rejected" => Ok(Self::FederationBundleRejected),
             "audit.alert" => Ok(Self::AuditAlert),
+            "workload.attested" => Ok(Self::WorkloadAttested),
+            "workload.attestation_denied" => Ok(Self::WorkloadAttestationDenied),
             _ => Err(format!("unknown audit event kind: {s}")),
         }
     }
@@ -292,6 +302,9 @@ pub enum ApproverSource {
     /// the paired-device factor verifier, never from relayed, unverified
     /// device ids.
     PairedDevice,
+    /// An enrolled workstation key signed the full review and decision. The
+    /// broker trusts workstation custody; this is not biometric attestation.
+    PairedWorkstation,
     /// A FIDO2/WebAuthn assertion (hardware key or passkey) over the approval
     /// challenge was verified against the stored credential. Signature-bound.
     Fido2,
@@ -308,6 +321,7 @@ impl fmt::Display for ApproverSource {
         match self {
             Self::LocalBioSession => write!(f, "local_bio_session"),
             Self::PairedDevice => write!(f, "paired_device"),
+            Self::PairedWorkstation => write!(f, "paired_workstation"),
             Self::Fido2 => write!(f, "fido2"),
             Self::PolkitAccount => write!(f, "polkit_account"),
             Self::InsecureAutoApprove => write!(f, "insecure_auto_approve"),
@@ -365,10 +379,10 @@ impl From<(&ClientIdentity, ClientType)> for ClientSummary {
                 .exe_path
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
-            exe_sha256_prefix: id.exe_sha256.as_ref().map(|h| {
-                let len = h.len().min(16);
-                h[..len].to_owned()
-            }),
+            exe_sha256_prefix: id
+                .exe_sha256
+                .as_ref()
+                .map(|h| crate::validate::truncate_utf8(h, 16).to_owned()),
             codesign_team_id: id.codesign_team_id.clone(),
             client_type: ct,
             principal: None,
@@ -679,6 +693,7 @@ fn default_level_for_kind(kind: AuditEventKind) -> AuditLevel {
         | AuditEventKind::RateLimited
         | AuditEventKind::AuditDropped
         | AuditEventKind::IdentityLoginFailed
+        | AuditEventKind::WorkloadAttestationDenied
         | AuditEventKind::ExecveDenied => AuditLevel::Warn,
         AuditEventKind::OperationFailed => AuditLevel::Error,
         _ => AuditLevel::Info,
@@ -705,9 +720,26 @@ pub trait AuditSink: Send + Sync + fmt::Debug {
     /// recording a security-relevant event (a refused policy bundle, a
     /// fail-closed startup) would otherwise lose it: `std::process::exit`
     /// runs no destructors, and the writer thread dies mid-flight. Call this
-    /// before any deliberate exit that follows an `emit`. Default: no-op for
-    /// sinks that write synchronously.
-    fn flush(&self, _timeout: std::time::Duration) {}
+    /// before any deliberate exit that follows an `emit`. A successful result
+    /// means all prior events committed; timeout, storage failure or dropped
+    /// events are explicit errors. Synchronous sinks return success by default.
+    fn flush(&self, _timeout: std::time::Duration) -> Result<(), AuditFlushError> {
+        Ok(())
+    }
+}
+
+/// A flush never reports success after the sink has lost an event. Failure is
+/// sticky for the lifetime of that sink, even when subsequent writes succeed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AuditFlushError {
+    #[error("audit flush timed out before all accepted events were committed")]
+    Timeout,
+    #[error("audit persistence failed: {0}")]
+    Storage(String),
+    #[error("audit sink is closed")]
+    Closed,
+    #[error("audit events were lost due to channel backpressure")]
+    Backpressure,
 }
 
 // ---------------------------------------------------------------------------
@@ -882,40 +914,14 @@ fn hmac_key_path(db_path: &Path) -> PathBuf {
 /// unreadable at the agent's uid and ownership-verified at every startup — which
 /// closes that gap; see docs/deployment.md.
 fn load_or_create_hmac_key(db_path: &Path) -> Result<[u8; 32], AuditError> {
-    let path = hmac_key_path(db_path);
-    if let Ok(bytes) = std::fs::read(&path)
-        && bytes.len() == 32
-    {
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&bytes);
-        return Ok(key);
-    }
-    // Generate 32 bytes from two v4 UUIDs (crypto-random via getrandom).
-    let mut key = [0u8; 32];
-    key[..16].copy_from_slice(Uuid::new_v4().as_bytes());
-    key[16..].copy_from_slice(Uuid::new_v4().as_bytes());
-    write_key_file(&path, &key)?;
-    Ok(key)
+    Ok(crate::keyfile::load_or_create_key_file(&hmac_key_path(
+        db_path,
+    ))?)
 }
 
-#[cfg(unix)]
-fn write_key_file(path: &Path, key: &[u8; 32]) -> Result<(), AuditError> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    f.write_all(key)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_key_file(path: &Path, key: &[u8; 32]) -> Result<(), AuditError> {
-    std::fs::write(path, key)?;
-    Ok(())
+fn load_hmac_key(db_path: &Path) -> Result<[u8; 32], AuditError> {
+    crate::keyfile::load_key_file(&hmac_key_path(db_path))?
+        .ok_or_else(|| AuditError::Other("audit chain key is missing".into()))
 }
 
 /// Deterministic, order-fixed serialization of the persisted fields. `None` renders
@@ -1057,8 +1063,6 @@ fn canon_from_row(
     Ok(canon)
 }
 
-/// Compute the chain for rows that lack a `record_hash` (e.g. a database created
-/// before the chain existed), in rowid (insertion) order.
 /// Record the chain head (tail anchor) so verification can detect truncation of
 /// the newest records. Stored in the same database and written inside the insert
 /// transaction, so it stays consistent with the committed rows.
@@ -1075,7 +1079,12 @@ fn set_chain_head(
     Ok(())
 }
 
-fn backfill_chain(conn: &rusqlite::Connection, key: &[u8; 32]) -> Result<(), rusqlite::Error> {
+// Only called in the atomic migration of a schema which never had hashes.
+// Retention must never recompute a surviving record's authenticator.
+fn migrate_unchained_records(
+    conn: &rusqlite::Transaction<'_>,
+    key: &[u8; 32],
+) -> Result<(), rusqlite::Error> {
     // Only ever called from the sink, after the schema (incl. approver_json)
     // is in place — so the column is always selectable here.
     let sql = format!(
@@ -1142,11 +1151,89 @@ pub struct ChainVerification {
 /// can rewrite the database can still defeat it); it becomes a hard guarantee once
 /// the daemon runs under a dedicated service account that owns the database.
 pub fn verify_audit_chain(db_path: &Path) -> Result<ChainVerification, AuditError> {
-    let key = load_or_create_hmac_key(db_path)?;
-    let conn =
+    let key = load_hmac_key(db_path)?;
+    let mut conn =
         rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    // Databases created before Phase 1 lack approver_json; verification is
-    // read-only and must handle them without migrating.
+    // A snapshot spans the boundary, records and tail checks, including when
+    // a writer commits or retention removes a prefix during verification.
+    let tx = conn.transaction()?;
+    verify_audit_connection(&tx, &key, !table_exists(&tx, "chain_head")?)
+}
+
+fn table_exists(conn: &rusqlite::Connection, name: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+        [name],
+        |row| row.get(0),
+    )
+}
+
+fn boundary_signature(
+    key: &[u8; 32],
+    hash: &str,
+    sequence: i64,
+    high_watermark: i64,
+    rowid: i64,
+) -> String {
+    chain_hash(
+        key,
+        "opaque-audit-retention-boundary-v1",
+        &format!("{sequence}\x1f{high_watermark}\x1f{rowid}\x1f{hash}"),
+    )
+}
+
+/// The last legitimately pruned record remains the predecessor of the first
+/// retained record. Its signature distinguishes retention from an arbitrary
+/// deletion of the front of the log; survivor hashes never change.
+fn retention_boundary(
+    conn: &rusqlite::Connection,
+    key: &[u8; 32],
+) -> Result<Option<(String, i64)>, AuditError> {
+    if !table_exists(conn, "retention_boundary")? {
+        return Ok(None);
+    }
+    let boundary: Option<(String, i64, i64, i64, String)> = conn.query_row(
+        "SELECT previous_hash, previous_sequence, sequence_high_watermark, previous_rowid, authenticator FROM retention_boundary WHERE id=0",
+        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+    ).optional()?;
+    match boundary {
+        Some((hash, sequence, high_watermark, rowid, signature)) => {
+            if sequence < 0
+                || high_watermark < sequence
+                || rowid <= 0
+                || signature != boundary_signature(key, &hash, sequence, high_watermark, rowid)
+            {
+                return Err(AuditError::Other(
+                    "audit retention boundary authentication failed".into(),
+                ));
+            }
+            Ok(Some((hash, sequence)))
+        }
+        None => Ok(None),
+    }
+}
+
+fn verify_audit_connection(
+    conn: &rusqlite::Connection,
+    key: &[u8; 32],
+    allow_legacy_missing_head: bool,
+) -> Result<ChainVerification, AuditError> {
+    let broken = |count, sequence, detail| ChainVerification {
+        ok: false,
+        records_checked: count,
+        first_bad_sequence: sequence,
+        detail: Some(detail),
+    };
+    let boundary = match retention_boundary(conn, key) {
+        Ok(boundary) => boundary,
+        Err(AuditError::Other(detail)) => return Ok(broken(0, None, detail)),
+        Err(error) => return Err(error),
+    };
+    let (mut prev, mut tail_sequence) = match boundary {
+        Some((hash, sequence)) => (hash, Some(sequence)),
+        None => (CHAIN_GENESIS.to_owned(), None),
+    };
+    // Presence-versioned fields keep pre-approver rows valid without re-signing.
     let has_approver = conn
         .prepare("SELECT approver_json FROM audit_events LIMIT 0")
         .is_ok();
@@ -1160,69 +1247,80 @@ pub fn verify_audit_chain(db_path: &Path) -> Result<ChainVerification, AuditErro
     let stored_idx = if has_approver { 19 } else { 18 };
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query([])?;
-    let mut prev = CHAIN_GENESIS.to_string();
-    let mut count = 0u64;
+    let mut count = 0;
     while let Some(row) = rows.next()? {
         let canon = canon_from_row(row, 0, has_approver)?;
         let seq: i64 = row.get(1)?;
         let stored: Option<String> = row.get(stored_idx)?;
-        let expected = chain_hash(&key, &prev, &canon);
+        let expected = chain_hash(key, &prev, &canon);
         match stored {
-            Some(h) if h == expected => {
-                prev = h;
+            Some(hash) if hash == expected && seq >= 0 => {
+                prev = hash;
+                tail_sequence = Some(seq);
                 count += 1;
             }
             _ => {
-                return Ok(ChainVerification {
-                    ok: false,
-                    records_checked: count,
-                    first_bad_sequence: Some(seq.max(0) as u64),
-                    detail: Some(format!(
+                return Ok(broken(
+                    count,
+                    Some(seq.max(0) as u64),
+                    format!(
                         "audit chain broken at record {} (sequence {seq})",
                         count + 1
-                    )),
-                });
+                    ),
+                ));
             }
         }
     }
-
-    // Tail-truncation check: the recorded head anchor must match the actual tail.
-    // Detects deletion of the newest records, which a chain walk alone cannot
-    // (a truncated prefix is itself a valid chain).
-    if let Some((head_hash, head_seq)) = conn
-        .query_row(
-            "SELECT last_hash, last_sequence FROM chain_head WHERE id = 0",
+    let head: Option<(String, i64)> = if table_exists(conn, "chain_head")? {
+        conn.query_row(
+            "SELECT last_hash, last_sequence FROM chain_head WHERE id=0",
             [],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?
-    {
-        let actual_tail: Option<String> = conn
-            .query_row(
-                "SELECT record_hash FROM audit_events ORDER BY rowid DESC LIMIT 1",
-                [],
-                |r| r.get::<_, Option<String>>(0),
-            )
-            .optional()?
-            .flatten();
-        if actual_tail.as_deref() != Some(head_hash.as_str()) {
-            return Ok(ChainVerification {
-                ok: false,
-                records_checked: count,
-                first_bad_sequence: Some(head_seq.max(0) as u64),
-                detail: Some(format!(
-                    "audit log truncated: the newest record(s) up to sequence {head_seq} are missing"
-                )),
-            });
+    } else {
+        None
+    };
+    match head {
+        Some((hash, sequence)) if hash == prev && Some(sequence) == tail_sequence => {}
+        None if tail_sequence.is_none() || allow_legacy_missing_head => {}
+        Some((_, sequence)) => {
+            return Ok(broken(
+                count,
+                Some(sequence.max(0) as u64),
+                "audit log truncated or tail anchor altered".into(),
+            ));
+        }
+        None => {
+            return Ok(broken(
+                count,
+                tail_sequence.map(|seq| seq as u64),
+                "audit tail anchor is missing".into(),
+            ));
         }
     }
-
     Ok(ChainVerification {
         ok: true,
         records_checked: count,
         first_bad_sequence: None,
         detail: None,
     })
+}
+
+fn require_valid_chain(
+    conn: &rusqlite::Connection,
+    key: &[u8; 32],
+    allow_legacy_missing_head: bool,
+) -> Result<(), AuditError> {
+    let verification = verify_audit_connection(conn, key, allow_legacy_missing_head)?;
+    if !verification.ok {
+        return Err(AuditError::Other(
+            verification
+                .detail
+                .unwrap_or_else(|| "audit chain integrity failure".into()),
+        ));
+    }
+    Ok(())
 }
 
 const SCHEMA_SQL: &str = "\
@@ -1249,6 +1347,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
     record_hash TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_ts ON audit_events(ts_utc_ms);
+CREATE INDEX IF NOT EXISTS idx_sequence ON audit_events(sequence_number);
 CREATE INDEX IF NOT EXISTS idx_kind ON audit_events(kind);
 CREATE INDEX IF NOT EXISTS idx_operation ON audit_events(operation);
 CREATE INDEX IF NOT EXISTS idx_request_id ON audit_events(request_id);
@@ -1271,6 +1370,14 @@ END;
 CREATE TRIGGER IF NOT EXISTS audit_events_ad AFTER DELETE ON audit_events BEGIN
     DELETE FROM audit_events_fts WHERE rowid = old.rowid;
 END;
+CREATE TABLE IF NOT EXISTS retention_boundary (
+    id INTEGER PRIMARY KEY CHECK (id = 0),
+    previous_hash TEXT NOT NULL,
+    previous_sequence INTEGER NOT NULL,
+    sequence_high_watermark INTEGER NOT NULL,
+    previous_rowid INTEGER NOT NULL,
+    authenticator TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS chain_head (
     id INTEGER PRIMARY KEY CHECK (id = 0),
     last_hash TEXT NOT NULL,
@@ -1287,38 +1394,72 @@ const RETENTION_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::fro
 ///
 /// Events are sent through a bounded channel and written by a dedicated
 /// background thread to avoid blocking the enclave pipeline.
+struct WriterState {
+    sender: Option<std::sync::mpsc::SyncSender<AuditEvent>>,
+    next_sequence: u64,
+    accepted: u64,
+    settled: u64,
+    failure: Option<AuditFlushError>,
+    stopped: bool,
+}
+
+type WriterProgress = std::sync::Arc<(std::sync::Mutex<WriterState>, std::sync::Condvar)>;
+
 pub struct SqliteAuditSink {
-    sender: std::sync::mpsc::SyncSender<AuditEvent>,
-    next_sequence: AtomicU64,
-    /// Events accepted into the channel — the target `flush` waits for.
-    accepted: AtomicU64,
-    /// Events committed by the writer, with a condvar so `flush` can wait.
-    committed: std::sync::Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
-    /// Counter of events dropped due to channel backpressure.
+    progress: WriterProgress,
+    /// Drops not yet represented by a successfully queued synthetic event.
     dropped_count: std::sync::Arc<AtomicU64>,
+    shutdown_lock: std::sync::Mutex<()>,
     writer_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     drop_monitor_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
-    /// Shared flag used in tests to pause/resume the writer thread.
     writer_pause: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
-    /// Signal to stop the drop-monitor thread (bool=should_stop, condvar for wake).
     monitor_stop: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     sanitizer: crate::sanitize::Sanitizer,
 }
 
 impl fmt::Debug for SqliteAuditSink {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = self.progress.0.lock().unwrap_or_else(|p| p.into_inner());
         f.debug_struct("SqliteAuditSink")
-            .field("next_sequence", &self.next_sequence.load(Ordering::Relaxed))
+            .field("next_sequence", &state.next_sequence)
+            .field("failure", &state.failure)
             .field("dropped_count", &self.dropped_count.load(Ordering::Relaxed))
             .finish()
     }
 }
 
+/// Serialize queue publication and sequence allocation. The writer and flush
+/// observe the same accepted-event count; synthetic events use this path too.
+fn enqueue_event(progress: &WriterProgress, mut event: AuditEvent) -> Result<(), AuditFlushError> {
+    let (lock, cvar) = &**progress;
+    let mut state = lock.lock().unwrap_or_else(|p| p.into_inner());
+    event.sequence_number = state.next_sequence;
+    let result = match &state.sender {
+        Some(sender) => sender.try_send(event).map_err(|error| match error {
+            std::sync::mpsc::TrySendError::Full(_) => AuditFlushError::Backpressure,
+            std::sync::mpsc::TrySendError::Disconnected(_) => AuditFlushError::Closed,
+        }),
+        None => Err(AuditFlushError::Closed),
+    };
+    match &result {
+        Ok(()) => {
+            state.accepted += 1;
+            state.next_sequence += 1;
+        }
+        Err(error) => {
+            state.failure.get_or_insert_with(|| error.clone());
+        }
+    }
+    cvar.notify_all();
+    result
+}
+
 impl SqliteAuditSink {
     /// Open (or create) the audit database at `db_path`.
     ///
-    /// Creates the schema if needed and runs retention cleanup, deleting events
-    /// older than `retention_days`.
+    /// Verifies existing evidence before any maintenance, migrates historical
+    /// schemas atomically, and prunes the expired insertion-order prefix.
+    /// A corrupt established chain prevents the sink from opening.
     pub fn new(db_path: PathBuf, retention_days: u64) -> Result<Self, AuditError> {
         Self::new_with_capacity(db_path, retention_days, 4096)
     }
@@ -1351,159 +1492,151 @@ impl SqliteAuditSink {
             std::fs::create_dir_all(parent)?;
         }
 
-        // Open connection, create schema, run retention cleanup.
-        let conn = rusqlite::Connection::open(&db_path)?;
-        conn.execute_batch(SCHEMA_SQL)?;
-
-        // SECURITY: the audit log is custody material — it records every
-        // operation, client, principal, and approver. SQLite creates the
-        // file with the process umask (0644 typically), and the daemon's
-        // startup custody check runs BEFORE this file exists, so nothing
-        // else would tighten it until the next restart: under
-        // trust_domain.enforce a fresh state dir would leave the log
-        // readable at the agent's uid for the life of that process. Set the
-        // mode here, at creation, before WAL/SHM siblings inherit it.
+        let mut conn = rusqlite::Connection::open(&db_path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600))?;
         }
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "FULL")?;
 
-        // Tamper-evident chain: load the key, migrate databases created before the
-        // chain existed, and (re)build the chain if the column was just added or
-        // retention removed rows from the front — otherwise the remaining rows would
-        // be chained from a now-deleted predecessor and verification would wrongly
-        // report tampering.
-        let hmac_key = load_or_create_hmac_key(&db_path)?;
-        let migrated = conn
-            .prepare("SELECT record_hash FROM audit_events LIMIT 0")
-            .is_err();
-        if migrated {
-            conn.execute("ALTER TABLE audit_events ADD COLUMN record_hash TEXT", [])?;
+        // Schema migration, verification and pruning share a writer transaction.
+        // Never delete or re-sign evidence before checking the existing chain.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let had_events = table_exists(&tx, "audit_events")?;
+        let had_head = table_exists(&tx, "chain_head")?;
+        let had_hashes = had_events
+            && tx
+                .prepare("SELECT record_hash FROM audit_events LIMIT 0")
+                .is_ok();
+        let had_fts = table_exists(&tx, "audit_events_fts")?;
+        let established_chain = had_hashes
+            && tx.query_row("SELECT EXISTS(SELECT 1 FROM audit_events)", [], |row| {
+                row.get::<_, bool>(0)
+            })?
+            || had_head
+                && tx.query_row("SELECT EXISTS(SELECT 1 FROM chain_head)", [], |row| {
+                    row.get::<_, bool>(0)
+                })?;
+        let hmac_key = if established_chain {
+            load_hmac_key(&db_path)?
+        } else {
+            load_or_create_hmac_key(&db_path)?
+        };
+        tx.execute_batch(SCHEMA_SQL)?;
+        if had_events && !had_hashes {
+            tx.execute("ALTER TABLE audit_events ADD COLUMN record_hash TEXT", [])?;
         }
-        // Phase 1: add the approver column to databases created before it.
-        // Deliberately NO backfill/re-anchor — the presence-versioned canon
-        // (see append_optional_chained_field) keeps every pre-existing row's
-        // stored hash valid, so there is no migration step that could absorb
-        // prior tampering.
-        if conn
+        if tx
             .prepare("SELECT approver_json FROM audit_events LIMIT 0")
             .is_err()
         {
-            conn.execute("ALTER TABLE audit_events ADD COLUMN approver_json TEXT", [])?;
+            tx.execute("ALTER TABLE audit_events ADD COLUMN approver_json TEXT", [])?;
         }
-        let deleted = Self::run_retention_cleanup(&conn, retention_days)?;
-        if migrated || deleted > 0 {
-            backfill_chain(&conn, &hmac_key)?;
+        if had_events && !had_hashes {
+            // Pre-chain databases had no authenticators to verify. This one-time
+            // baseline is explicit; a present but NULL/bad hash is corruption.
+            migrate_unchained_records(&tx, &hmac_key)?;
+        } else {
+            require_valid_chain(&tx, &hmac_key, !had_head)?;
+            if !had_head && let Some((hash, sequence)) = tx.query_row(
+                "SELECT record_hash, sequence_number FROM audit_events ORDER BY rowid DESC LIMIT 1",
+                [], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            ).optional()? {
+                set_chain_head(&tx, &hash, sequence)?;
+            }
         }
-
-        // Establish the tail-anchor baseline if this database has never had one
-        // (e.g. upgraded from a build without chain_head). A first-time baseline
-        // cannot mask a prior truncation — there is no earlier anchor to contradict —
-        // and thereafter the anchor is only advanced by the writer.
-        let has_head = conn
-            .query_row("SELECT COUNT(*) FROM chain_head", [], |r| {
-                r.get::<_, i64>(0)
-            })
-            .map(|c| c > 0)
-            .unwrap_or(false);
-        if !has_head
-            && let Some((Some(h), seq)) = conn
-                .query_row(
-                    "SELECT record_hash, sequence_number FROM audit_events ORDER BY rowid DESC LIMIT 1",
-                    [],
-                    |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?)),
-                )
-                .optional()?
-        {
-            set_chain_head(&conn, &h, seq)?;
-        }
-        conn.execute(
-            "INSERT OR IGNORE INTO audit_events_fts(rowid, search_text)
-             SELECT
-                rowid,
-                trim(
-                    coalesce(kind, '') || ' ' ||
-                    coalesce(operation, '') || ' ' ||
-                    coalesce(outcome, '') || ' ' ||
-                    coalesce(detail, '') || ' ' ||
-                    coalesce(target_json, '') || ' ' ||
-                    coalesce(secret_names, '') || ' ' ||
-                    coalesce(request_id, '')
-                )
-             FROM audit_events",
-            [],
-        )?;
-
-        // Resume sequence numbering after the existing tail. Restarting at 0
-        // (the original bug) makes every daemon RESTART write duplicate
-        // sequence numbers into the chain — verification orders by sequence,
-        // so the restarted log reads as scrambled/tampered even though every
-        // record hash still links by insertion order.
-        let next_sequence: u64 = conn
-            .query_row(
-                "SELECT COALESCE(MAX(sequence_number), -1) + 1 FROM audit_events",
+        Self::prune_verified_prefix(&tx, retention_days, &hmac_key)?;
+        // Populate FTS only when introducing the index, not on every restart.
+        if !had_fts {
+            tx.execute(
+                "INSERT OR IGNORE INTO audit_events_fts(rowid, search_text)
+                 SELECT rowid, trim(coalesce(kind, '') || ' ' || coalesce(operation, '') || ' ' ||
+                    coalesce(outcome, '') || ' ' || coalesce(detail, '') || ' ' ||
+                    coalesce(target_json, '') || ' ' || coalesce(secret_names, '') || ' ' ||
+                    coalesce(request_id, '')) FROM audit_events",
                 [],
-                |r| r.get::<_, i64>(0),
-            )
-            .map(|v| v.max(0) as u64)
-            .unwrap_or(0);
-        drop(conn);
+            )?;
+        }
+        let next_sequence: u64 = tx.query_row(
+            "SELECT COALESCE(MAX(sequence_number), -1) + 1 FROM (
+                SELECT sequence_number FROM audit_events UNION ALL SELECT last_sequence FROM chain_head
+                UNION ALL SELECT sequence_high_watermark FROM retention_boundary
+             )", [], |row| row.get(0),
+        )?;
+        let last_hash = tx
+            .query_row("SELECT last_hash FROM chain_head WHERE id=0", [], |row| {
+                row.get(0)
+            })
+            .optional()?
+            .unwrap_or_else(|| CHAIN_GENESIS.to_owned());
+        tx.commit()?;
 
         let (sender, receiver) = std::sync::mpsc::sync_channel::<AuditEvent>(capacity);
-
+        let progress = std::sync::Arc::new((
+            std::sync::Mutex::new(WriterState {
+                sender: Some(sender),
+                next_sequence,
+                accepted: 0,
+                settled: 0,
+                failure: None,
+                stopped: false,
+            }),
+            std::sync::Condvar::new(),
+        ));
         let writer_pause =
             std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let writer_pause_clone = writer_pause.clone();
-
-        let committed =
-            std::sync::Arc::new((std::sync::Mutex::new(0u64), std::sync::Condvar::new()));
-        let writer_committed = committed.clone();
-
-        let writer_path = db_path.clone();
-        let writer_key = hmac_key;
+        let writer_progress = progress.clone();
         let writer_handle = std::thread::Builder::new()
             .name("audit-writer".into())
             .spawn(move || {
                 Self::writer_loop(
-                    &writer_path,
+                    conn,
                     receiver,
                     &writer_pause_clone,
                     retention_days,
-                    writer_key,
-                    &writer_committed,
+                    hmac_key,
+                    last_hash,
+                    &writer_progress,
                 );
             })
-            .map_err(|e| AuditError::Other(format!("failed to spawn writer thread: {e}")))?;
-
+            .map_err(|error| {
+                AuditError::Other(format!("failed to spawn writer thread: {error}"))
+            })?;
         let dropped_count = std::sync::Arc::new(AtomicU64::new(0));
-
-        // Spawn the drop-monitor thread that periodically emits synthetic
-        // AuditDropped events when events have been dropped.
         let monitor_stop =
             std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-        let monitor_sender = sender.clone();
-        let monitor_dropped = dropped_count.clone();
-        let monitor_stop_clone = monitor_stop.clone();
-        let drop_monitor_handle = std::thread::Builder::new()
-            .name("audit-drop-monitor".into())
-            .spawn(move || {
-                Self::drop_monitor_loop(monitor_sender, monitor_dropped, monitor_stop_clone);
-            })
-            .map_err(|e| AuditError::Other(format!("failed to spawn drop monitor thread: {e}")))?;
-
-        Ok(Self {
-            sender,
-            next_sequence: AtomicU64::new(next_sequence),
-            accepted: AtomicU64::new(0),
-            committed,
+        // Construct the owner before starting another thread. If the monitor
+        // cannot start, Drop closes the queue and joins the existing writer.
+        let sink = Self {
+            progress,
             dropped_count,
+            shutdown_lock: std::sync::Mutex::new(()),
             writer_handle: std::sync::Mutex::new(Some(writer_handle)),
-            drop_monitor_handle: std::sync::Mutex::new(Some(drop_monitor_handle)),
+            drop_monitor_handle: std::sync::Mutex::new(None),
             writer_pause,
             monitor_stop,
             sanitizer: crate::sanitize::Sanitizer::new(),
-        })
+        };
+        let monitor_progress = sink.progress.clone();
+        let monitor_dropped = sink.dropped_count.clone();
+        let monitor_stop = sink.monitor_stop.clone();
+        let handle = std::thread::Builder::new()
+            .name("audit-drop-monitor".into())
+            .spawn(move || {
+                Self::drop_monitor_loop(monitor_progress, monitor_dropped, monitor_stop);
+            })
+            .map_err(|error| {
+                AuditError::Other(format!("failed to spawn drop monitor thread: {error}"))
+            })?;
+        *sink
+            .drop_monitor_handle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(handle);
+        Ok(sink)
     }
 
     /// Returns the number of audit events dropped due to channel backpressure.
@@ -1531,197 +1664,187 @@ impl SqliteAuditSink {
         cvar.notify_all();
     }
 
-    /// Manually flush a synthetic `AuditDropped` event if any events have been
-    /// dropped. Resets the counter to 0. Used for testing the periodic flush
-    /// behavior.
     #[cfg(test)]
     pub(crate) fn flush_dropped_events(&self) {
-        let count = self.dropped_count.swap(0, Ordering::SeqCst);
-        if count > 0 {
-            let event = AuditEvent::new(AuditEventKind::AuditDropped)
-                .with_detail(format!(
-                    "{count} audit events dropped due to channel backpressure"
-                ))
-                .with_level(AuditLevel::Warn);
-            // Best-effort send — if the channel is still full, this will also
-            // be dropped, but the counter has been reset so the next period
-            // will try again.
-            let _ = self.sender.try_send(event);
+        Self::report_drops(&self.progress, &self.dropped_count);
+    }
+
+    fn report_drops(progress: &WriterProgress, dropped_count: &AtomicU64) {
+        let count = dropped_count.swap(0, Ordering::SeqCst);
+        if count == 0 {
+            return;
+        }
+        let event = AuditEvent::new(AuditEventKind::AuditDropped)
+            .with_detail(format!(
+                "{count} audit events dropped due to channel backpressure"
+            ))
+            .with_level(AuditLevel::Warn);
+        if enqueue_event(progress, event).is_err() {
+            // An unqueued report must not erase knowledge of the loss.
+            dropped_count.fetch_add(count, Ordering::SeqCst);
         }
     }
 
-    /// Background drop-monitor loop. Every 60 seconds, checks if events have
-    /// been dropped and emits a synthetic `AuditDropped` event.
     fn drop_monitor_loop(
-        sender: std::sync::mpsc::SyncSender<AuditEvent>,
+        progress: WriterProgress,
         dropped_count: std::sync::Arc<AtomicU64>,
         stop: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     ) {
         let (lock, cvar) = &*stop;
         loop {
-            // Wait for 60 seconds or until signalled to stop.
-            {
-                let guard = lock.lock().expect("monitor stop lock poisoned");
-                let (guard, _timeout) = cvar
-                    .wait_timeout(guard, std::time::Duration::from_secs(60))
-                    .expect("monitor stop cvar poisoned");
-                if *guard {
-                    break;
-                }
+            let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+            // Check the predicate before sleeping: close may precede thread start.
+            let (guard, _) = cvar
+                .wait_timeout_while(guard, std::time::Duration::from_secs(60), |stopped| {
+                    !*stopped
+                })
+                .unwrap_or_else(|p| p.into_inner());
+            if *guard {
+                return;
             }
-
-            let count = dropped_count.swap(0, Ordering::SeqCst);
-            if count > 0 {
-                tracing::warn!(
-                    dropped_count = count,
-                    "audit drop monitor: emitting synthetic AuditDropped event"
-                );
-                let event = AuditEvent::new(AuditEventKind::AuditDropped)
-                    .with_detail(format!(
-                        "{count} audit events dropped due to channel backpressure"
-                    ))
-                    .with_level(AuditLevel::Warn);
-                let _ = sender.try_send(event);
-            }
+            drop(guard);
+            Self::report_drops(&progress, &dropped_count);
         }
     }
 
-    /// Background writer loop. Drains the channel and inserts events in batches.
     fn writer_loop(
-        db_path: &Path,
+        mut conn: rusqlite::Connection,
         receiver: std::sync::mpsc::Receiver<AuditEvent>,
         pause: &std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
         retention_days: u64,
         key: [u8; 32],
-        committed: &std::sync::Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
+        mut last_hash: String,
+        progress: &WriterProgress,
     ) {
-        let conn = match rusqlite::Connection::open(db_path) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("audit writer failed to open db: {e}");
-                return;
-            }
-        };
-
-        // WAL mode for better concurrent read performance.
-        let _ = conn.pragma_update(None, "journal_mode", "WAL");
-
-        // Chain head: the last written record's hash, or genesis for an empty log.
-        let mut last_hash: String = conn
-            .query_row(
-                "SELECT record_hash FROM audit_events ORDER BY rowid DESC LIMIT 1",
-                [],
-                |r| r.get::<_, Option<String>>(0),
-            )
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| CHAIN_GENESIS.to_string());
-
-        let mut batch = Vec::with_capacity(64);
+        let mut batch = Vec::with_capacity(256);
         let mut next_retention_cleanup = std::time::Instant::now() + RETENTION_CLEANUP_INTERVAL;
-
         loop {
             let wait = next_retention_cleanup.saturating_duration_since(std::time::Instant::now());
             match receiver.recv_timeout(wait) {
                 Ok(event) => {
-                    // Honor pause flag (for testing).
-                    {
-                        let (lock, cvar) = &**pause;
-                        let mut paused = lock.lock().expect("pause lock poisoned");
-                        while *paused {
-                            paused = cvar.wait(paused).expect("pause cvar poisoned");
-                        }
-                    }
-
+                    let (lock, cvar) = &**pause;
+                    let paused = lock.lock().unwrap_or_else(|p| p.into_inner());
+                    drop(
+                        cvar.wait_while(paused, |paused| *paused)
+                            .unwrap_or_else(|p| p.into_inner()),
+                    );
                     batch.push(event);
-
-                    // Drain any additional pending events without blocking.
                     while batch.len() < 256 {
                         match receiver.try_recv() {
                             Ok(event) => batch.push(event),
                             Err(_) => break,
                         }
                     }
-
-                    if let Err(e) = Self::insert_batch(&conn, &batch, &key, &mut last_hash) {
-                        tracing::error!("audit writer insert failed: {e}");
+                    let result = Self::insert_batch(&conn, &batch, &key, &mut last_hash);
+                    let (lock, cvar) = &**progress;
+                    let mut state = lock.lock().unwrap_or_else(|p| p.into_inner());
+                    if let Err(error) = result {
+                        tracing::error!("audit writer insert failed: {error}");
+                        state
+                            .failure
+                            .get_or_insert_with(|| AuditFlushError::Storage(error.to_string()));
                     }
-                    // Count the batch as settled either way: a failed insert
-                    // is reported above and must not wedge `flush` forever.
-                    {
-                        let (lock, cvar) = &**committed;
-                        let mut done = lock.lock().unwrap_or_else(|p| p.into_inner());
-                        *done += batch.len() as u64;
-                        cvar.notify_all();
-                    }
+                    // Settled is not committed: a failed batch is recorded in
+                    // failure and every later flush must report that loss.
+                    state.settled += batch.len() as u64;
+                    cvar.notify_all();
                     batch.clear();
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
-
             if std::time::Instant::now() >= next_retention_cleanup {
-                match Self::run_retention_cleanup(&conn, retention_days) {
-                    Ok(deleted_rows) => {
-                        if deleted_rows > 0 {
-                            tracing::info!(
-                                deleted_rows,
-                                retention_days,
-                                "audit retention cleanup removed expired rows"
-                            );
-                            // Retention removed rows from the front of the chain;
-                            // re-anchor the remaining rows and reset the head so the
-                            // next write chains correctly (and verify does not report
-                            // a false-positive break).
-                            if let Err(e) = backfill_chain(&conn, &key) {
-                                tracing::error!(
-                                    "audit chain re-anchor after retention failed: {e}"
-                                );
-                            } else {
-                                last_hash = conn
-                                    .query_row(
-                                        "SELECT record_hash FROM audit_events ORDER BY rowid DESC LIMIT 1",
-                                        [],
-                                        |r| r.get::<_, Option<String>>(0),
-                                    )
-                                    .ok()
-                                    .flatten()
-                                    .unwrap_or_else(|| CHAIN_GENESIS.to_string());
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("audit retention cleanup failed: {e}");
-                    }
+                if let Err(error) = Self::run_retention_cleanup(&mut conn, retention_days, &key) {
+                    tracing::error!("audit retention maintenance failed: {error}");
+                    let (lock, cvar) = &**progress;
+                    lock.lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .failure
+                        .get_or_insert_with(|| AuditFlushError::Storage(error.to_string()));
+                    cvar.notify_all();
                 }
                 next_retention_cleanup = std::time::Instant::now() + RETENTION_CLEANUP_INTERVAL;
             }
         }
+        let (lock, cvar) = &**progress;
+        lock.lock().unwrap_or_else(|p| p.into_inner()).stopped = true;
+        cvar.notify_all();
     }
 
     fn retention_cutoff_ms(retention_days: u64) -> i64 {
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_millis() as i64;
-        now - (retention_days as i64) * 86_400 * 1000
+            .as_millis();
+        let retention_ms = u128::from(retention_days) * 86_400_000;
+        now.saturating_sub(retention_ms).min(i64::MAX as u128) as i64
     }
 
     fn run_retention_cleanup(
-        conn: &rusqlite::Connection,
+        conn: &mut rusqlite::Connection,
         retention_days: u64,
-    ) -> Result<usize, rusqlite::Error> {
-        // SECURITY (M23): retention_days = 0 means "keep forever", never "delete
-        // everything". Guard against a config value (user-writable) that would
-        // otherwise wipe the entire audit trail at startup.
+        key: &[u8; 32],
+    ) -> Result<usize, AuditError> {
         if retention_days == 0 {
             return Ok(0);
         }
-        let cutoff_ms = Self::retention_cutoff_ms(retention_days);
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        require_valid_chain(&tx, key, false)?;
+        let deleted = Self::prune_verified_prefix(&tx, retention_days, key)?;
+        tx.commit()?;
+        Ok(deleted)
+    }
+
+    /// Prune only the expired insertion-order prefix. Clock regressions can
+    /// leave an older timestamp after a live record; preserving that row until
+    /// the prefix expires is preferable to rewriting authenticated history.
+    fn prune_verified_prefix(
+        conn: &rusqlite::Transaction<'_>,
+        retention_days: u64,
+        key: &[u8; 32],
+    ) -> Result<usize, AuditError> {
+        if retention_days == 0 {
+            return Ok(0);
+        }
+        let cutoff = Self::retention_cutoff_ms(retention_days);
+        let mut last_expired = None;
+        // Historical writers allocated sequences before enqueueing, allowing
+        // insertion order to differ from sequence order. Preserve every pruned
+        // prefix's maximum so a restart cannot reuse one of those numbers.
+        let mut high_watermark: i64 = conn
+            .query_row(
+                "SELECT sequence_high_watermark FROM retention_boundary WHERE id=0",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(-1);
+        {
+            let mut statement = conn.prepare("SELECT rowid, ts_utc_ms, record_hash, sequence_number FROM audit_events ORDER BY rowid")?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                if row.get::<_, i64>(1)? >= cutoff {
+                    break;
+                }
+                high_watermark = high_watermark.max(row.get::<_, i64>(3)?);
+                last_expired = Some((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ));
+            }
+        }
+        let Some((rowid, hash, sequence)) = last_expired else {
+            return Ok(0);
+        };
         conn.execute(
-            "DELETE FROM audit_events WHERE ts_utc_ms < ?1",
-            rusqlite::params![cutoff_ms],
-        )
+            "INSERT INTO retention_boundary(id, previous_hash, previous_sequence, sequence_high_watermark, previous_rowid, authenticator) VALUES(0, ?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET previous_hash=excluded.previous_hash,
+             previous_sequence=excluded.previous_sequence, sequence_high_watermark=excluded.sequence_high_watermark,
+             previous_rowid=excluded.previous_rowid, authenticator=excluded.authenticator",
+            rusqlite::params![hash, sequence, high_watermark, rowid, boundary_signature(key, &hash, sequence, high_watermark, rowid)],
+        )?;
+        Ok(conn.execute("DELETE FROM audit_events WHERE rowid <= ?1", [rowid])?)
     }
 
     /// Insert a batch of events within a single transaction.
@@ -1732,15 +1855,33 @@ impl SqliteAuditSink {
         last_hash: &mut String,
     ) -> Result<(), rusqlite::Error> {
         let tx = conn.unchecked_transaction()?;
+        let mut candidate_hash = last_hash.clone();
+        // Export transports persist rowid cursors. SQLite reuses rowid 1 when
+        // a table becomes empty, so allocate beyond the authenticated pruned
+        // prefix as well as the surviving tail. Both queries are indexed.
+        let existing_rowid: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(rowid), 0) FROM audit_events",
+            [],
+            |row| row.get(0),
+        )?;
+        let pruned_rowid: i64 = tx
+            .query_row(
+                "SELECT previous_rowid FROM retention_boundary WHERE id=0",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        let mut next_rowid = existing_rowid.max(pruned_rowid);
         {
             let mut stmt = tx.prepare_cached(
-                "INSERT OR IGNORE INTO audit_events (
+                "INSERT INTO audit_events (
                     event_id, sequence_number, ts_utc_ms, level, kind,
                     request_id, approval_id, client_json, operation, safety,
                     target_json, outcome, latency_ms, secret_names,
                     policy_decision, detail, workspace_json, request_hash,
-                    approver_json, record_hash
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                    approver_json, record_hash, rowid
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
             )?;
 
             let mut last_seq: Option<i64> = None;
@@ -1795,7 +1936,10 @@ impl SqliteAuditSink {
                     event.request_hash.as_deref(),
                 );
                 append_optional_chained_field(&mut canon, approver_json.as_deref());
-                let record_hash = chain_hash(key, last_hash, &canon);
+                let record_hash = chain_hash(key, &candidate_hash, &canon);
+                next_rowid = next_rowid.checked_add(1).ok_or_else(|| {
+                    rusqlite::Error::InvalidParameterName("audit rowid exhausted".into())
+                })?;
 
                 let changed = stmt.execute(rusqlite::params![
                     event_id,
@@ -1818,127 +1962,128 @@ impl SqliteAuditSink {
                     event.request_hash,
                     approver_json,
                     record_hash,
+                    next_rowid,
                 ])?;
-                // Only advance the head if the row was actually inserted (a
-                // duplicate event_id is IGNOREd and must not shift the chain).
-                if changed > 0 {
-                    *last_hash = record_hash;
-                    last_seq = Some(event.sequence_number as i64);
+                // Every accepted event needs its own persisted row. Reused IDs
+                // fail explicitly, including retries: no distinct payload may
+                // be mistaken for an already durable event.
+                if changed != 1 {
+                    return Err(rusqlite::Error::InvalidParameterName(
+                        "audit event was not inserted".into(),
+                    ));
                 }
+                candidate_hash = record_hash;
+                last_seq = Some(event.sequence_number as i64);
             }
             // Record the tail anchor in the same transaction so verification can
             // detect truncation of the newest records.
             if let Some(seq) = last_seq {
-                set_chain_head(&tx, last_hash, seq)?;
+                set_chain_head(&tx, &candidate_hash, seq)?;
             }
         }
         tx.commit()?;
+        *last_hash = candidate_hash;
         Ok(())
     }
 
-    /// Flush pending events and join the writer thread.
-    pub fn close(&self) {
-        // Drop the sender by replacing it — but we can't move out of self easily.
-        // Instead, rely on Drop. This method is for explicit shutdown.
-        let handle = self.writer_handle.lock().expect("lock poisoned").take();
-        if let Some(h) = handle {
-            // The sender will be dropped when Self is dropped, closing the channel.
-            // But we need to signal the writer to stop. Since we can't drop sender
-            // from &self, we wait with a timeout — the writer will exit when the
-            // channel is closed on Drop.
-            let _ = h.join();
+    /// Stop accepting events, drain the queue, and join both owned threads.
+    /// Repeated or concurrent calls are safe. Persistence failures remain
+    /// visible after close, including failures that happened before shutdown.
+    pub fn close(&self) -> Result<(), AuditFlushError> {
+        let _shutdown = self.shutdown_lock.lock().unwrap_or_else(|p| p.into_inner());
+        {
+            let (lock, cvar) = &*self.monitor_stop;
+            *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
+            cvar.notify_all();
         }
+        if let Some(handle) = self
+            .drop_monitor_handle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+            && handle.join().is_err()
+        {
+            self.record_thread_failure("audit drop monitor panicked");
+        }
+        // The shared state owns the only sender; taking it disconnects the
+        // channel even while emit/flush callers retain references to the sink.
+        self.progress
+            .0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .sender
+            .take();
+        {
+            let (lock, cvar) = &*self.writer_pause;
+            *lock.lock().unwrap_or_else(|p| p.into_inner()) = false;
+            cvar.notify_all();
+        }
+        if let Some(handle) = self
+            .writer_handle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+            && handle.join().is_err()
+        {
+            self.record_thread_failure("audit writer panicked");
+        }
+        self.flush(std::time::Duration::ZERO)
+    }
+
+    fn record_thread_failure(&self, message: &str) {
+        let (lock, cvar) = &*self.progress;
+        lock.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .failure
+            .get_or_insert_with(|| AuditFlushError::Storage(message.into()));
+        cvar.notify_all();
     }
 }
 
 impl AuditSink for SqliteAuditSink {
     fn emit(&self, mut event: AuditEvent) {
-        event.sequence_number = self.next_sequence.fetch_add(1, Ordering::Relaxed);
-        // Sanitize the detail field to prevent secret leakage into the audit DB.
         if let Some(ref detail) = event.detail {
             event.detail = Some(
                 self.sanitizer
                     .redact_audit_text(detail, crate::sanitize::RedactionLevel::Human),
             );
         }
-        // Non-blocking send. If the channel is full, increment the dropped
-        // counter and log a warning with the event kind.
-        match self.sender.try_send(event) {
-            Ok(()) => {
-                self.accepted.fetch_add(1, Ordering::Relaxed);
+        if let Err(error) = enqueue_event(&self.progress, event) {
+            if error == AuditFlushError::Backpressure {
+                self.dropped_count.fetch_add(1, Ordering::Relaxed);
             }
-            Err(std::sync::mpsc::TrySendError::Full(dropped_event)) => {
-                let prev = self.dropped_count.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(
-                    kind = %dropped_event.kind,
-                    dropped_total = prev + 1,
-                    "audit event dropped due to channel backpressure"
-                );
-            }
-            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
+            tracing::warn!(%error, "audit event was not accepted");
         }
     }
 
-    /// Block until every accepted event has been committed (or `timeout`).
-    fn flush(&self, timeout: std::time::Duration) {
-        let target = self.accepted.load(Ordering::Relaxed);
-        let deadline = std::time::Instant::now() + timeout;
-        let (lock, cvar) = &*self.committed;
-        let mut done = lock.lock().unwrap_or_else(|p| p.into_inner());
-        while *done < target {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    fn flush(&self, timeout: std::time::Duration) -> Result<(), AuditFlushError> {
+        let started = std::time::Instant::now();
+        let (lock, cvar) = &*self.progress;
+        let mut state = lock.lock().unwrap_or_else(|p| p.into_inner());
+        let target = state.accepted;
+        loop {
+            if state.settled >= target {
+                return state.failure.clone().map_or(Ok(()), Err);
+            }
+            if state.stopped {
+                return Err(state.failure.clone().unwrap_or(AuditFlushError::Closed));
+            }
+            let remaining = timeout.saturating_sub(started.elapsed());
             if remaining.is_zero() {
-                tracing::warn!(
-                    committed = *done,
-                    accepted = target,
-                    "audit flush timed out; some events may not be durable"
-                );
-                return;
+                return Err(AuditFlushError::Timeout);
             }
-            let (guard, result) = cvar
-                .wait_timeout(done, remaining)
+            let (guard, _) = cvar
+                .wait_timeout(state, remaining)
                 .unwrap_or_else(|p| p.into_inner());
-            done = guard;
-            if result.timed_out() && *done < target {
-                continue;
-            }
+            state = guard;
         }
     }
 }
 
 impl Drop for SqliteAuditSink {
     fn drop(&mut self) {
-        // Signal the drop-monitor thread to stop and join it.
-        {
-            let (lock, cvar) = &*self.monitor_stop;
-            let mut should_stop = lock.lock().expect("monitor stop lock poisoned");
-            *should_stop = true;
-            cvar.notify_all();
-        }
-        if let Ok(mut guard) = self.drop_monitor_handle.lock()
-            && let Some(h) = guard.take()
-        {
-            let _ = h.join();
-        }
-
-        // Ensure writer is not paused so it can drain.
-        {
-            let (lock, cvar) = &*self.writer_pause;
-            let mut paused = lock.lock().expect("pause lock poisoned");
-            *paused = false;
-            cvar.notify_all();
-        }
-
-        // Drop the sender to signal the writer thread to finish.
-        // We create a dummy channel and swap to effectively drop our sender.
-        let (new_sender, _) = std::sync::mpsc::sync_channel(1);
-        let _ = std::mem::replace(&mut self.sender, new_sender);
-
-        // Join the writer thread.
-        if let Ok(mut guard) = self.writer_handle.lock()
-            && let Some(h) = guard.take()
-        {
-            let _ = h.join();
+        if let Err(error) = self.close() {
+            tracing::error!(%error, "audit sink closed without complete durability");
         }
     }
 }
@@ -2163,10 +2308,15 @@ impl AuditSink for MultiAuditSink {
         }
     }
 
-    fn flush(&self, timeout: std::time::Duration) {
+    fn flush(&self, timeout: std::time::Duration) -> Result<(), AuditFlushError> {
+        let started = std::time::Instant::now();
+        let mut failure = None;
         for sink in &self.sinks {
-            sink.flush(timeout);
+            if let Err(error) = sink.flush(timeout.saturating_sub(started.elapsed())) {
+                failure.get_or_insert(error);
+            }
         }
+        failure.map_or(Ok(()), Err)
     }
 }
 
@@ -2308,9 +2458,15 @@ mod tests {
             (AuditEventKind::ExecveAllowed, "execve.allowed"),
             (AuditEventKind::ExecveDenied, "execve.denied"),
             (AuditEventKind::ExecvePrompted, "execve.prompted"),
+            (AuditEventKind::WorkloadAttested, "workload.attested"),
+            (
+                AuditEventKind::WorkloadAttestationDenied,
+                "workload.attestation_denied",
+            ),
         ];
         for (kind, expected) in kinds {
             assert_eq!(format!("{kind}"), expected);
+            assert_eq!(expected.parse::<AuditEventKind>().unwrap(), kind);
         }
     }
 
@@ -2777,7 +2933,7 @@ mod tests {
             make_test_event(AuditEventKind::FederationBundleRejected)
                 .with_outcome("rollback_refused"),
         );
-        sink.flush(std::time::Duration::from_secs(5));
+        sink.flush(std::time::Duration::from_secs(5)).unwrap();
 
         // Read with a SEPARATE connection while the sink is still alive.
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -2888,74 +3044,46 @@ mod tests {
 
     #[test]
     fn retention_zero_keeps_all() {
-        let db_path = temp_db_path();
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute_batch(SCHEMA_SQL).unwrap();
-        // Insert an ancient row directly.
-        conn.execute(
-            "INSERT INTO audit_events (event_id, sequence_number, ts_utc_ms, level, kind)
-             VALUES ('e1', 1, 1, 'info', 'request.received')",
-            [],
-        )
-        .unwrap();
-
-        // M23: retention_days = 0 means keep forever, never wipe everything.
-        let deleted = SqliteAuditSink::run_retention_cleanup(&conn, 0).unwrap();
-        assert_eq!(deleted, 0);
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM audit_events", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 1, "retention_days=0 must not delete anything");
-
-        // A positive retention with an ancient cutoff still removes the old row.
-        let deleted = SqliteAuditSink::run_retention_cleanup(&conn, 1).unwrap();
-        assert_eq!(deleted, 1);
-
-        let _ = std::fs::remove_file(&db_path);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audit.db");
+        let sink = SqliteAuditSink::new(path.clone(), 0).unwrap();
+        let mut event = make_test_event(AuditEventKind::RequestReceived);
+        event.ts_utc_ms = 1;
+        sink.emit(event);
+        sink.close().unwrap();
+        let key = load_hmac_key(&path).unwrap();
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            SqliteAuditSink::run_retention_cleanup(&mut conn, 0, &key).unwrap(),
+            0
+        );
+        assert_eq!(
+            SqliteAuditSink::run_retention_cleanup(&mut conn, 1, &key).unwrap(),
+            1
+        );
+        assert!(verify_audit_chain(&path).unwrap().ok);
     }
 
     #[test]
-    fn retention_front_deletion_breaks_then_rechain_restores() {
-        // A chain is written, then the oldest row is removed (as retention does).
-        // Front-deletion breaks verification (so an attacker's front-deletion is
-        // caught); re-anchoring — what the writer does after retention — restores a
-        // valid chain so retention itself does not raise a false positive.
-        let db_path = temp_db_path();
-        {
-            let sink = SqliteAuditSink::new(db_path.clone(), 90).unwrap();
+    fn retention_refuses_to_reauthenticate_a_deleted_prefix() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audit.db");
+        let sink = SqliteAuditSink::new(path.clone(), 0).unwrap();
+        for _ in 0..3 {
             sink.emit(make_test_event(AuditEventKind::RequestReceived));
-            sink.emit(make_test_event(AuditEventKind::OperationStarted));
-            sink.emit(make_test_event(AuditEventKind::OperationSucceeded));
-            drop(sink);
         }
-        let key = load_or_create_hmac_key(&db_path).unwrap();
-
-        // Simulate retention deleting the oldest row (front of the chain).
-        {
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            conn.execute(
-                "DELETE FROM audit_events WHERE rowid = (SELECT MIN(rowid) FROM audit_events)",
-                [],
-            )
-            .unwrap();
-        }
-        assert!(
-            !verify_audit_chain(&db_path).unwrap().ok,
-            "front-deletion without re-anchor must break the chain"
-        );
-
-        // Re-anchor (as the writer does after retention) restores validity.
-        {
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            backfill_chain(&conn, &key).unwrap();
-        }
-        assert!(
-            verify_audit_chain(&db_path).unwrap().ok,
-            "re-anchoring after retention must restore a valid chain"
-        );
-
-        let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_file(hmac_key_path(&db_path));
+        sink.close().unwrap();
+        let key = load_hmac_key(&path).unwrap();
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "DELETE FROM audit_events WHERE rowid=(SELECT MIN(rowid) FROM audit_events)",
+            [],
+        )
+        .unwrap();
+        assert!(!verify_audit_chain(&path).unwrap().ok);
+        assert!(SqliteAuditSink::run_retention_cleanup(&mut conn, 1, &key).is_err());
+        assert!(SqliteAuditSink::new(path.clone(), 1).is_err());
+        assert!(!verify_audit_chain(&path).unwrap().ok);
     }
 
     #[test]
@@ -3118,90 +3246,48 @@ mod tests {
 
     #[test]
     fn sqlite_retention_cleanup() {
-        let db_path = temp_db_path();
-
-        // Insert an old event directly.
-        {
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            conn.execute_batch(SCHEMA_SQL).unwrap();
-            let old_ts = 1000i64; // very old timestamp
-            conn.execute(
-                "INSERT INTO audit_events (event_id, sequence_number, ts_utc_ms, level, kind)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![
-                    Uuid::new_v4().to_string(),
-                    0,
-                    old_ts,
-                    "info",
-                    "request.received"
-                ],
-            )
-            .unwrap();
-            let count: i64 = conn
-                .query_row("SELECT COUNT(*) FROM audit_events", [], |row| row.get(0))
-                .unwrap();
-            assert_eq!(count, 1);
-        }
-
-        // Opening with retention_days=90 should clean up the old event.
-        let sink = SqliteAuditSink::new(db_path.clone(), 90).unwrap();
-        drop(sink);
-
-        let filter = AuditFilter::default();
-        let events = query_audit_db(&db_path, &filter).unwrap();
-        assert!(events.is_empty());
-
-        let _ = std::fs::remove_file(&db_path);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audit.db");
+        let sink = SqliteAuditSink::new(path.clone(), 0).unwrap();
+        let mut event = make_test_event(AuditEventKind::RequestReceived);
+        event.ts_utc_ms = 1000;
+        sink.emit(event);
+        sink.close().unwrap();
+        let reopened = SqliteAuditSink::new(path.clone(), 90).unwrap();
+        reopened.close().unwrap();
+        assert!(
+            query_audit_db(&path, &AuditFilter::default())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(verify_audit_chain(&path).unwrap().ok);
     }
 
     #[test]
     fn sqlite_retention_cleanup_runs_periodically_while_running() {
-        let db_path = temp_db_path();
-        let sink = SqliteAuditSink::new(db_path.clone(), 90).unwrap();
-
-        // Insert an old event after startup cleanup has already run.
-        {
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            conn.execute_batch(SCHEMA_SQL).unwrap();
-            conn.execute(
-                "INSERT INTO audit_events (event_id, sequence_number, ts_utc_ms, level, kind)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![
-                    Uuid::new_v4().to_string(),
-                    0,
-                    1000i64,
-                    "info",
-                    "request.received"
-                ],
-            )
-            .unwrap();
-        }
-
-        // Wait for periodic cleanup to purge the old row.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audit.db");
+        let sink = SqliteAuditSink::new(path.clone(), 90).unwrap();
+        let mut event = make_test_event(AuditEventKind::RequestReceived);
+        event.ts_utc_ms = 1000;
+        sink.emit(event);
+        sink.flush(std::time::Duration::from_secs(5)).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        let mut purged = false;
-        while std::time::Instant::now() < deadline {
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            let count: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM audit_events WHERE ts_utc_ms = 1000",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            if count == 0 {
-                purged = true;
+        loop {
+            if query_audit_db(&path, &AuditFilter::default())
+                .unwrap()
+                .is_empty()
+            {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(
+                std::time::Instant::now() < deadline,
+                "periodic cleanup did not run"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        assert!(
-            purged,
-            "expected periodic retention cleanup to purge old rows"
-        );
-
-        drop(sink);
-        let _ = std::fs::remove_file(&db_path);
+        sink.close().unwrap();
+        assert!(verify_audit_chain(&path).unwrap().ok);
     }
 
     #[test]
@@ -3530,7 +3616,17 @@ mod tests {
         assert!(sink.dropped_count() > 0);
 
         sink.resume_writer();
-        // Flush the dropped counter — should reset to 0.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let state = sink.progress.0.lock().unwrap();
+            if state.settled == state.accepted {
+                break;
+            }
+            drop(state);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // The report can now be queued, so resetting its pending count is safe.
         sink.flush_dropped_events();
         assert_eq!(sink.dropped_count(), 0);
 
@@ -3868,42 +3964,47 @@ mod tests {
     }
 
     #[test]
-    fn retention_reanchors_chain_with_approver_rows() {
-        let db_path = temp_db_path();
-        {
-            let sink = SqliteAuditSink::new(db_path.clone(), 90).unwrap();
-            sink.emit(
-                make_test_event(AuditEventKind::ApprovalGranted).with_approver(test_approver()),
-            );
-            sink.emit(make_test_event(AuditEventKind::OperationSucceeded));
-            drop(sink);
-        }
-        // Age the first row far past retention, then reopen (runs cleanup +
-        // re-anchor through the v2 canon path).
-        {
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            conn.execute(
-                "UPDATE audit_events SET ts_utc_ms = 1000 WHERE sequence_number = 0",
+    fn retention_preserves_chain_with_approver_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audit.db");
+        let sink = SqliteAuditSink::new(path.clone(), 0).unwrap();
+        let mut expired =
+            make_test_event(AuditEventKind::ApprovalGranted).with_approver(test_approver());
+        expired.ts_utc_ms = 1000;
+        sink.emit(expired);
+        sink.emit(
+            make_test_event(AuditEventKind::OperationSucceeded).with_approver(test_approver()),
+        );
+        sink.close().unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let old_hash: String = conn
+            .query_row(
+                "SELECT record_hash FROM audit_events WHERE sequence_number=1",
                 [],
+                |row| row.get(0),
             )
             .unwrap();
-        }
-        // The aged row breaks the chain (expected: timestamps are chained).
-        assert!(!verify_audit_chain(&db_path).unwrap().ok);
-        {
-            // Reopen with 1-day retention: the aged row is deleted and the
-            // remaining approver-less row is re-anchored.
-            let sink = SqliteAuditSink::new(db_path.clone(), 1).unwrap();
-            sink.emit(
-                make_test_event(AuditEventKind::ApprovalGranted).with_approver(test_approver()),
-            );
-            drop(sink);
-        }
-        let v = verify_audit_chain(&db_path).unwrap();
-        assert!(v.ok, "re-anchored chain must verify: {:?}", v.detail);
-        assert_eq!(v.records_checked, 2);
-
-        let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_file(hmac_key_path(&db_path));
+        let reopened = SqliteAuditSink::new(path.clone(), 1).unwrap();
+        reopened
+            .emit(make_test_event(AuditEventKind::ApprovalGranted).with_approver(test_approver()));
+        reopened.close().unwrap();
+        let survivor_hash: String = conn
+            .query_row(
+                "SELECT record_hash FROM audit_events WHERE sequence_number=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            old_hash, survivor_hash,
+            "retention must not re-sign surviving records"
+        );
+        let verification = verify_audit_chain(&path).unwrap();
+        assert!(verification.ok, "{:?}", verification.detail);
+        assert_eq!(verification.records_checked, 2);
     }
 }
+
+#[cfg(test)]
+#[path = "audit/regression_tests.rs"]
+mod regression_tests;
