@@ -21,7 +21,7 @@ function ui(wasmBytes) {
     showModal() {this.open=true;}
     close() {this.open=false;}
   }
-  const document = {body:new Element('body'),createElement:tag=>new Element(tag),getElementById:id=>{if(!ids.has(id)) ids.set(id,new Element('div'));return ids.get(id);}};
+  const document = {body:new Element('body'),createElement:tag=>new Element(tag),createTextNode:text=>({textContent:text}),getElementById:id=>{if(!ids.has(id)) ids.set(id,new Element('div'));return ids.get(id);}};
   const context = vm.createContext({document,Date,Intl,Map,AbortController,TextDecoder,TextEncoder,Uint8Array,WebAssembly,crypto:require('node:crypto').webcrypto,atob,btoa,URL,console,setTimeout:()=>1,clearTimeout(){},setInterval(){}});
   vm.runInContext(source,context);
   context.ids=ids;

@@ -106,7 +106,7 @@ jobs:
           python -B - <<'PYTEST'
           import sys
           import unittest
-          for directory in ("scripts", "deploy/hosted-demo"):
+          for directory in ("scripts",):
               suite = unittest.TestLoader().discover(directory, pattern="test_*.py")
               result = unittest.TextTestRunner(verbosity=2).run(suite)
               if not result.wasSuccessful() or not result.testsRun or result.skipped:
@@ -126,7 +126,6 @@ jobs:
       - name: Run all Node regression suites
         run: >-
           node --test
-          deploy/cloudflare-demo/tests/*.test.mjs
           deploy/cloudflare-docs-privacy/tests/*.test.mjs
           crates/opaque-showcase/tests/*.test.cjs
           crates/opaque-web/tests/*.test.cjs

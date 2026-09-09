@@ -404,7 +404,7 @@ pub fn apply_child_restrictions(cmd: &mut tokio::process::Command, prepared: Pre
                 .take()
             {
                 let status = ruleset
-                    .set_no_new_privs(false) // already set above
+                    .no_new_privs(false) // already set above
                     .restrict_self()
                     .map_err(|e| std::io::Error::other(format!("landlock restrict: {e}")))?;
                 if matches!(status.ruleset, landlock::RulesetStatus::NotEnforced) {
