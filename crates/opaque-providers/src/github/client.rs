@@ -563,8 +563,6 @@ impl GitHubClient {
 mod tests {
     use super::*;
 
-    static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn transient_errors_identified() {
         assert!(GitHubApiError::RateLimited.is_transient());
@@ -620,10 +618,7 @@ mod tests {
         };
         let client = GitHubClient::new().unwrap();
         assert_eq!(client.base_url, "https://github.example.com/api/v3");
-        match previous {
-            Some(value) => unsafe { std::env::set_var(super::GITHUB_API_URL_ENV, value) },
-            None => unsafe { std::env::remove_var(super::GITHUB_API_URL_ENV) },
-        }
+        unsafe { std::env::remove_var(super::GITHUB_API_URL_ENV) };
     }
 
     #[test]

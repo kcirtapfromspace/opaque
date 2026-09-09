@@ -7,10 +7,6 @@ docs_dir: docs
 exclude_docs: |
   README.md
   overrides/
-  product/**
-  dogfood.md
-  release-dogfood.md
-  tenant-boundaries.md
 
 theme:
   name: material

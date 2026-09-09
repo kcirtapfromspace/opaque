@@ -1,10 +1,5 @@
 # Opaque
 
-> Private dogfooding workspace: experiments, customer demo operations, app/repository
-> configurations, and validation records live in `kcirtapfromspace/opaque-dogfood`.
-> The public product upstream is `kcirtapfromspace/opaque`; its badges below describe
-> that upstream, not the validation status of this private workspace.
-
 ![CI](https://github.com/kcirtapfromspace/opaque/actions/workflows/ci.yml/badge.svg)
 [![License: BUSL-1.1](https://img.shields.io/badge/License-BUSL--1.1-orange.svg)](LICENSE)
 ![Release](https://img.shields.io/github/v/release/kcirtapfromspace/opaque)
