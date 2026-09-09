@@ -1,8 +1,9 @@
 //! Enclave: the central enforcement funnel for all secret-using operations.
 //!
-//! **Every** operation request flows through [`Enclave::execute()`]. There are
-//! no bypass paths. The type system enforces that only sanitized responses
-//! can be returned to the client.
+//! Individual operations flow through [`Enclave::execute()`]. Immutable task
+//! manifests use `Enclave::execute_task`, which checks every child operation,
+//! obtains a fresh native approval and charges durable slots before dispatch.
+//! Both transport paths sanitize their responses before returning to clients.
 //!
 //! The execution pipeline:
 //!
@@ -16,24 +17,32 @@
 //! 8. Emit audit events at each step
 //! 9. Return sanitized response
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use opaque_core::approval_gate::{ApprovalGate, ApprovalOutcome};
 use opaque_core::audit::{
     AuditEvent, AuditEventKind, AuditLevel, AuditSink, ClientSummary, TargetSummary,
     WorkspaceSummary,
 };
 use opaque_core::operation::{
     ApprovalFactor, ApprovalRequirement, ClientIdentity, ClientType, OperationDef,
-    OperationRegistry, OperationRequest, OperationSafety, validate_params,
+    OperationRegistry, OperationRequest, OperationSafety,
 };
+use opaque_core::operation_handler::OperationHandler;
 use opaque_core::policy::{PolicyDecision, PolicyEngine};
 use opaque_core::sanitize::{Sanitized, SanitizedResponse, Sanitizer, Unsanitized};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
+
+mod audit_durability;
+mod task;
+pub use task::{
+    inference_task_operations, release_task_operations, ssh_task_operations, task_operation,
+};
 
 // ---------------------------------------------------------------------------
 // Server-side secret ref name derivation
@@ -436,114 +445,23 @@ impl fmt::Debug for LeaseCache {
 }
 
 // ---------------------------------------------------------------------------
-// Operation handler trait
-// ---------------------------------------------------------------------------
-
-/// Trait for operation handlers. Each registered operation has a corresponding
-/// handler that performs the actual work.
-///
-/// Handlers receive the validated request and return a raw JSON payload.
-/// The enclave sanitizes the payload before returning it to the client.
-pub trait OperationHandler: Send + Sync + fmt::Debug {
-    /// Execute the operation. Returns a raw (unsanitized) JSON payload.
-    ///
-    /// The handler must NOT return secret values in the payload. The sanitizer
-    /// provides defense-in-depth, but handlers should be written to avoid
-    /// including secrets in the first place.
-    fn execute(
-        &self,
-        request: &OperationRequest,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + '_>,
-    >;
-}
-
-// ---------------------------------------------------------------------------
-// Approval gate trait
-// ---------------------------------------------------------------------------
-
-/// The result of one approval interaction.
-///
-/// SECURITY INVARIANT: `approver` must only ever be attached by the gate that
-/// actually VERIFIED the identity it names. The local biometric factor proves
-/// device-owner presence and binds the *name* to the active login session
-/// (source `LocalBioSession`). Paired-device / FIDO2 attribution (source
-/// `PairedDevice`) requires real signature verification against the pairing
-/// store — the dormant `approval_server` relays client-supplied device ids
-/// WITHOUT verification and must never be used as an approver source.
-#[derive(Debug, Clone)]
-pub struct ApprovalOutcome {
-    /// Whether the human (or configured backend) approved the request.
-    pub approved: bool,
-    /// The verified approver identity, when the gate could establish one.
-    /// `None` on denial, and on approval paths with no identity binding
-    /// (e.g. biometric passed but nobody is logged in).
-    pub approver: Option<opaque_core::audit::ApproverIdentity>,
-}
-
-impl ApprovalOutcome {
-    /// Approved, with no approver identity binding available.
-    pub fn approved_anonymous() -> Self {
-        Self {
-            approved: true,
-            approver: None,
-        }
-    }
-
-    /// Approved by a verified identity.
-    pub fn approved_by(approver: opaque_core::audit::ApproverIdentity) -> Self {
-        Self {
-            approved: true,
-            approver: Some(approver),
-        }
-    }
-
-    /// Denied.
-    pub fn denied() -> Self {
-        Self {
-            approved: false,
-            approver: None,
-        }
-    }
-}
-
-/// Trait for the approval gate. The enclave calls this to present
-/// operation-bound approval challenges to the user.
-///
-/// Approval is ALWAYS bound to a specific operation request. There is no
-/// generic "approve" endpoint.
-pub trait ApprovalGate: Send + Sync + fmt::Debug {
-    /// Present an approval challenge for the given operation request.
-    ///
-    /// The implementation must:
-    /// - Display the operation, target, client identity, and TTL to the user
-    /// - Use the specified approval factor(s)
-    /// - Return `Ok` with [`ApprovalOutcome`] (approved/denied, plus the
-    ///   verified approver identity when one exists — see the invariant on
-    ///   [`ApprovalOutcome`])
-    /// - Return `Err` if the approval mechanism is unavailable
-    ///
-    /// The `approval_id` is used for audit correlation.
-    fn request_approval(
-        &self,
-        approval_id: Uuid,
-        request: &OperationRequest,
-        factors: &[ApprovalFactor],
-        description: &str,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<ApprovalOutcome, String>> + Send + '_>,
-    >;
-}
-
-// ---------------------------------------------------------------------------
 // Enclave
 // ---------------------------------------------------------------------------
+//
+// `OperationHandler` and `ApprovalGate` (+ its `ApprovalOutcome` return type)
+// now live in `opaque_core::operation_handler` / `opaque_core::approval_gate`
+// (imported above) so provider and approval-backend crates can implement
+// them without depending on this binary crate.
 
 /// The central enforcement funnel.
 ///
-/// All secret-using operations MUST pass through `Enclave::execute()`.
-/// The type system guarantees that only sanitized responses are returned.
+/// All secret-using operations pass through this enclave, via individual
+/// execution or the typed, durably accounted task path.
 pub struct Enclave {
+    inference_profile: Option<opaque_bounded_work::inference::TrustedInferenceProfile>,
+    ssh_profile: Option<opaque_bounded_work::ssh::TrustedSshProfile>,
+    /// Exact session/provisioning ceremonies use this complete-review factor.
+    session_approval_factor: ApprovalFactor,
     /// Operation registry (immutable after construction).
     registry: OperationRegistry,
 
@@ -551,9 +469,13 @@ pub struct Enclave {
     /// hot-swap the whole rule set without restarting the daemon; the read
     /// path takes an uncontended read lock per evaluation.
     policy: std::sync::RwLock<PolicyEngine>,
+    policy_generation: std::sync::atomic::AtomicU64,
 
     /// Operation handlers, keyed by operation name.
     handlers: HashMap<String, Box<dyn OperationHandler>>,
+
+    /// Operations supported by the configured bounded-task transport.
+    task_operations: HashSet<String>,
 
     /// Approval gate (native OS prompts, iOS, FIDO2).
     approval_gate: Box<dyn ApprovalGate>,
@@ -589,6 +511,10 @@ impl fmt::Debug for Enclave {
 
 /// Builder for constructing an [`Enclave`].
 pub struct EnclaveBuilder {
+    task_grants_enabled: bool,
+    inference_profile: Option<opaque_bounded_work::inference::TrustedInferenceProfile>,
+    ssh_profile: Option<opaque_bounded_work::ssh::TrustedSshProfile>,
+    session_approval_factor: ApprovalFactor,
     registry: OperationRegistry,
     policy: PolicyEngine,
     handlers: HashMap<String, Box<dyn OperationHandler>>,
@@ -601,6 +527,10 @@ impl EnclaveBuilder {
     /// Create a new builder.
     pub fn new() -> Self {
         Self {
+            task_grants_enabled: false,
+            inference_profile: None,
+            ssh_profile: None,
+            session_approval_factor: ApprovalFactor::LocalBio,
             registry: OperationRegistry::new(),
             policy: PolicyEngine::new(),
             handlers: HashMap::new(),
@@ -619,6 +549,36 @@ impl EnclaveBuilder {
     /// Set the policy engine.
     pub fn policy(mut self, policy: PolicyEngine) -> Self {
         self.policy = policy;
+        self
+    }
+
+    /// Record whether the daemon installed the bounded-task ledger/transport.
+    /// Profile-dependent task capabilities also require their trusted profile.
+    pub fn task_grants_enabled(mut self, enabled: bool) -> Self {
+        self.task_grants_enabled = enabled;
+        self
+    }
+
+    pub fn inference_profile(
+        mut self,
+        profile: Option<opaque_bounded_work::inference::TrustedInferenceProfile>,
+    ) -> Self {
+        self.inference_profile = profile;
+        self
+    }
+
+    pub fn ssh_profile(
+        mut self,
+        profile: Option<opaque_bounded_work::ssh::TrustedSshProfile>,
+    ) -> Self {
+        self.ssh_profile = profile;
+        self
+    }
+
+    /// Choose the trusted review channel for agent-session creation only.
+    /// Other control-plane approvals always retain the local native factor.
+    pub fn session_approval_factor(mut self, factor: ApprovalFactor) -> Self {
+        self.session_approval_factor = factor;
         self
     }
 
@@ -653,9 +613,24 @@ impl EnclaveBuilder {
 
     /// Build the enclave. Returns an error if required components are missing.
     pub fn build(self) -> Result<Enclave, String> {
+        if !matches!(
+            self.session_approval_factor,
+            ApprovalFactor::LocalBio | ApprovalFactor::PairedWorkstation
+        ) {
+            return Err("agent-session approval requires local_bio or paired_workstation".into());
+        }
         Ok(Enclave {
+            task_operations: task::enabled_operation_names(
+                self.task_grants_enabled,
+                self.inference_profile.is_some(),
+                self.ssh_profile.is_some(),
+            ),
+            inference_profile: self.inference_profile,
+            ssh_profile: self.ssh_profile,
+            session_approval_factor: self.session_approval_factor,
             registry: self.registry,
             policy: std::sync::RwLock::new(self.policy),
+            policy_generation: std::sync::atomic::AtomicU64::new(0),
             handlers: self.handlers,
             approval_gate: self.approval_gate.ok_or("approval gate is required")?,
             audit: self.audit.ok_or("audit sink is required")?,
@@ -674,9 +649,61 @@ impl Default for EnclaveBuilder {
 }
 
 impl Enclave {
+    pub fn ssh_profile(&self) -> Result<&opaque_bounded_work::ssh::TrustedSshProfile, String> {
+        self.ssh_profile
+            .as_ref()
+            .ok_or_else(|| "tenant SSH is not configured".into())
+    }
+    pub fn inference_profile(
+        &self,
+    ) -> Result<&opaque_bounded_work::inference::TrustedInferenceProfile, String> {
+        self.inference_profile
+            .as_ref()
+            .ok_or_else(|| "tenant inference is not configured".into())
+    }
     /// Create a builder for constructing an enclave.
     pub fn builder() -> EnclaveBuilder {
         EnclaveBuilder::new()
+    }
+
+    /// Registry and configured execution-path facts only. Policy is evaluated
+    /// against the actual principal, target and parameters for each request.
+    pub fn operation_catalog(&self) -> Vec<serde_json::Value> {
+        let mut operations: Vec<_> = self
+            .registry
+            .iter()
+            .map(|def| {
+                let handler = self.handlers.get(&def.name);
+                let task_enabled = self.task_operations.contains(&def.name);
+                let availability = match (handler, task_enabled) {
+                    (_, true) => "enabled",
+                    (None, false) => "disabled",
+                    (Some(handler), false) if handler.fixture_only() => "fixture_only",
+                    (Some(_), false) => "enabled",
+                };
+                let execution_paths: Vec<_> = [
+                    handler.is_some().then_some("operation"),
+                    task_enabled.then_some("task"),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                serde_json::json!({
+                    "name": def.name,
+                    "provider": def.name.split('.').next().unwrap_or("unknown"),
+                    "safety": format!("{:?}", def.safety),
+                    "default_approval": def.default_approval,
+                    "default_factors": def.default_factors,
+                    "description": def.description,
+                    "mcp_exposed": opaque_core::capability::mcp_exposes(&def.name),
+                    "availability": availability,
+                    "execution_paths": execution_paths,
+                    "policy_status": "evaluated_per_request",
+                })
+            })
+            .collect();
+        operations.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        operations
     }
 
     /// Return a snapshot of active (non-expired) approval leases.
@@ -691,16 +718,19 @@ impl Enclave {
     /// new rule count.
     pub fn swap_policy(&self, policy: PolicyEngine) -> usize {
         let count = policy.rule_count();
-        *self
+        let mut current = self
             .policy
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = policy;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *current = policy;
+        self.policy_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         count
     }
 
     /// Execute an operation request through the full enforcement funnel.
     ///
-    /// This is the **ONLY** path to run any operation. The return type
+    /// This is the path for individual operations. The return type
     /// `SanitizedResponse<Sanitized>` guarantees at compile time that the
     /// response has been sanitized.
     ///
@@ -786,8 +816,9 @@ impl Enclave {
         }
 
         // --- Step 3c: Validate params against schema ---
-        if let Some(ref schema) = op_def.params_schema
-            && let Err(errors) = validate_params(schema, &request.params)
+        if let Err(errors) = self
+            .registry
+            .validate_params(&request.operation, &request.params)
         {
             let err = EnclaveError::InvalidParams(errors.join("; "));
             return self.emit_and_sanitize_error(
@@ -941,6 +972,9 @@ impl Enclave {
             }
         };
 
+        if let Err(error) = self.confirm_audit(false).await {
+            return self.error_to_sanitized(&error);
+        }
         let op_start = Instant::now();
         let result = handler.execute(&request).await;
         let op_latency = op_start.elapsed();
@@ -964,6 +998,9 @@ impl Enclave {
                         .with_secret_names(request.secret_ref_names.clone()),
                 );
 
+                if let Err(error) = self.confirm_audit(true).await {
+                    return self.error_to_sanitized(&error);
+                }
                 sanitized
             }
             Err(err_msg) => {
@@ -1028,6 +1065,31 @@ impl Enclave {
         reason: &str,
     ) -> Result<Option<opaque_core::audit::ApproverIdentity>, EnclaveError> {
         let client_summary = ClientSummary::from((identity, client_type));
+        let complete_review = matches!(
+            operation_label,
+            "agent_session_start"
+                | "identity.provisioning.bind_start"
+                | "identity.provisioning.mandate_start"
+        );
+        let reviewed_reason = if complete_review {
+            // The caller constructs trusted authority fields and a bounded
+            // label. Preserve every reviewed byte; invalid or oversized
+            // content must fail rather than hide authority by truncation.
+            if reason.trim().is_empty() || reason.len() > 8 * 1024 || reason.chars().any(|c| {
+                (c.is_control() && c != '\n' && c != '\t')
+                    || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+            }) {
+                return Err(EnclaveError::InvalidInput("control review must be complete, bounded, and free of display controls".into()));
+            }
+            reason.to_owned()
+        } else {
+            sanitize_for_display(reason, 256)
+        };
+        let factor = if complete_review {
+            self.session_approval_factor
+        } else {
+            ApprovalFactor::LocalBio
+        };
 
         if !self
             .rate_limiter
@@ -1053,8 +1115,12 @@ impl Enclave {
             .await
             .map_err(|_| EnclaveError::ApprovalUnavailable("approval gate closed".into()))?;
 
-        // Synthetic request: the gate needs only identity + description for the
-        // local biometric factor; classification is audit-only.
+        let description = format!(
+            "Operation: {action_description}\n  {reviewed_reason}\nClient: {}",
+            identity
+        );
+        // Bind the full session/provisioning review into request authority as well
+        // as the workstation protocol's exact reviewed-content signature.
         let synth = OperationRequest {
             principal: None,
             request_id: approval_id,
@@ -1065,14 +1131,13 @@ impl Enclave {
             secret_ref_names: vec![],
             created_at: std::time::SystemTime::now(),
             expires_at: None,
-            params: serde_json::Value::Null,
+            params: if complete_review {
+                serde_json::json!({"control_review": description})
+            } else {
+                serde_json::Value::Null
+            },
             workspace: None,
         };
-        let description = format!(
-            "Operation: {action_description}\n  {}\nClient: {}",
-            sanitize_for_display(reason, 256),
-            identity
-        );
 
         self.audit.emit(
             AuditEvent::new(AuditEventKind::ApprovalPresented)
@@ -1083,12 +1148,7 @@ impl Enclave {
 
         let result = self
             .approval_gate
-            .request_approval(
-                approval_id,
-                &synth,
-                &[ApprovalFactor::LocalBio],
-                &description,
-            )
+            .request_approval(approval_id, &synth, &[factor], &description)
             .await;
 
         match result {
@@ -1102,6 +1162,7 @@ impl Enclave {
                     granted = granted.with_approver(approver.clone());
                 }
                 self.audit.emit(granted);
+                self.confirm_audit(false).await?;
                 Ok(outcome.approver)
             }
             Ok(_) => {
@@ -1231,6 +1292,19 @@ impl Enclave {
         // rendering into the approval prompt. This is defense-in-depth: even
         // if upstream validation is bypassed, the prompt cannot be spoofed.
         let mut description = format!("Operation: {}", op_def.description);
+        if matches!(
+            request.operation.as_str(),
+            "github.publish_manifest"
+                | "github.release_manifest"
+                | "inference.fixed_manifest"
+                | "ssh.health_manifest"
+        ) {
+            description.push_str(&task::approval_description(
+                request,
+                self.inference_profile.as_ref(),
+                self.ssh_profile.as_ref(),
+            )?);
+        }
         for (k, v) in &request.target {
             // SECURITY (C3): the command is the security-critical field the approver
             // must actually read, so render it in full (sanitized to a single line)
@@ -1380,6 +1454,7 @@ impl Enclave {
                         ApprovalFactor::LocalBio => "local_bio",
                         ApprovalFactor::IosFaceId => "ios_faceid",
                         ApprovalFactor::Fido2 => "fido2",
+                        ApprovalFactor::PairedWorkstation => "paired_workstation",
                     })
                     .collect();
                 let factor_str = factor_names.join(", ");
@@ -1467,7 +1542,7 @@ impl Enclave {
 /// Native OS approval gate that delegates to the platform-specific
 /// approval prompt (macOS LocalAuthentication / Linux polkit).
 pub struct NativeApprovalGate {
-    registry: crate::factors::FactorRegistry,
+    registry: opaque_approval::factors::FactorRegistry,
 }
 
 impl std::fmt::Debug for NativeApprovalGate {
@@ -1481,12 +1556,12 @@ impl std::fmt::Debug for NativeApprovalGate {
 /// Resolves the approver identity to bind to a successful local-biometric
 /// approval (re-exported from the factors module for wiring convenience).
 #[cfg(test)]
-pub type ApproverResolver = crate::factors::ApproverResolver;
+pub type ApproverResolver = opaque_approval::factors::ApproverResolver;
 
 impl NativeApprovalGate {
     /// Create a gate over an explicit verifier registry (the daemon builds
     /// one from its configured factors: local, paired device, FIDO2, …).
-    pub fn with_registry(registry: crate::factors::FactorRegistry) -> Self {
+    pub fn with_registry(registry: opaque_approval::factors::FactorRegistry) -> Self {
         Self { registry }
     }
 
@@ -1494,8 +1569,10 @@ impl NativeApprovalGate {
     /// pre-registry shape, kept for tests.
     #[cfg(test)]
     pub fn new() -> Self {
-        let mut registry = crate::factors::FactorRegistry::new();
-        registry.register(Arc::new(crate::factors::LocalBioVerifier::new(None)));
+        let mut registry = opaque_approval::factors::FactorRegistry::new();
+        registry.register(Arc::new(opaque_approval::factors::LocalBioVerifier::new(
+            None,
+        )));
         Self { registry }
     }
 
@@ -1503,10 +1580,10 @@ impl NativeApprovalGate {
     /// local-only gate (test builder mirroring the daemon's wiring).
     #[cfg(test)]
     pub fn with_approver_resolver(self, resolver: ApproverResolver) -> Self {
-        let mut registry = crate::factors::FactorRegistry::new();
-        registry.register(Arc::new(crate::factors::LocalBioVerifier::new(Some(
-            resolver,
-        ))));
+        let mut registry = opaque_approval::factors::FactorRegistry::new();
+        registry.register(Arc::new(opaque_approval::factors::LocalBioVerifier::new(
+            Some(resolver),
+        )));
         Self { registry }
     }
 }
@@ -1521,7 +1598,7 @@ impl ApprovalGate for NativeApprovalGate {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<ApprovalOutcome, String>> + Send + '_>,
     > {
-        let ctx = crate::factors::ApprovalContext {
+        let ctx = opaque_approval::factors::ApprovalContext {
             approval_id,
             request_id: request.request_id,
             operation: request.operation.clone(),
@@ -2012,7 +2089,8 @@ mod tests {
     async fn native_gate_registers_the_local_factor() {
         use opaque_core::operation::ApprovalFactor;
         // The prompt path isn't exercised here (no OS prompt in tests); the
-        // registry's dispatch semantics are covered in factors::tests. Assert
+        // registry's dispatch semantics are covered in opaque_approval::factors
+        // tests. Assert
         // the gate's construction shape: both variants serve LocalBio.
         let resolver: ApproverResolver = Arc::new(|| Some(approver("hum_session")));
         let gate = NativeApprovalGate::new().with_approver_resolver(resolver);
@@ -2243,7 +2321,7 @@ mod tests {
 
         assert_eq!(resp.error_code(), Some("safety_violation"));
         // Verify error message reflects v1 hard-block.
-        let msg = resp.error_message.as_deref().unwrap_or("");
+        let msg = resp.error_message().unwrap_or("");
         assert!(msg.contains("not permitted in v1"));
     }
 
@@ -2295,7 +2373,7 @@ mod tests {
         let resp = enclave.execute(req).await;
 
         assert_eq!(resp.error_code(), Some("safety_violation"));
-        let msg = resp.error_message.as_deref().unwrap_or("");
+        let msg = resp.error_message().unwrap_or("");
         assert!(msg.contains("not permitted in v1"));
     }
 
@@ -2352,7 +2430,7 @@ mod tests {
 
         assert_eq!(resp.error_code(), Some("operation_failed"));
         // The error message should be sanitized.
-        let msg = resp.error_message.as_deref().unwrap_or("");
+        let msg = resp.error_message().unwrap_or("");
         assert!(!msg.contains("p4ss"));
         assert!(!msg.contains("/Users/alice"));
     }
@@ -2946,6 +3024,301 @@ mod tests {
         }
     }
 
+    type CapturedControlReview = (OperationRequest, Vec<ApprovalFactor>, String);
+
+    #[derive(Debug, Default)]
+    struct ControlCaptureGate {
+        captured: Arc<Mutex<Vec<CapturedControlReview>>>,
+    }
+
+    impl ApprovalGate for ControlCaptureGate {
+        fn request_approval(
+            &self,
+            _approval_id: Uuid,
+            request: &OperationRequest,
+            factors: &[ApprovalFactor],
+            description: &str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ApprovalOutcome, String>> + Send + '_>,
+        > {
+            self.captured.lock().unwrap().push((
+                request.clone(),
+                factors.to_vec(),
+                description.to_owned(),
+            ));
+            Box::pin(async { Ok(ApprovalOutcome::denied()) })
+        }
+    }
+
+    #[test]
+    fn agent_session_factor_accepts_only_complete_review_factors() {
+        for factor in [ApprovalFactor::Fido2, ApprovalFactor::IosFaceId] {
+            let result = Enclave::builder()
+                .session_approval_factor(factor)
+                .approval_gate(Box::new(ControlCaptureGate::default()))
+                .audit(Arc::new(InMemoryAuditEmitter::new()))
+                .build();
+            assert!(
+                result
+                    .unwrap_err()
+                    .contains("local_bio or paired_workstation")
+            );
+        }
+        for factor in [ApprovalFactor::LocalBio, ApprovalFactor::PairedWorkstation] {
+            assert!(
+                Enclave::builder()
+                    .session_approval_factor(factor)
+                    .approval_gate(Box::new(ControlCaptureGate::default()))
+                    .audit(Arc::new(InMemoryAuditEmitter::new()))
+                    .build()
+                    .is_ok()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_session_factor_selection_never_changes_other_control_approval() {
+        for configured in [None, Some(ApprovalFactor::PairedWorkstation)] {
+            let gate = ControlCaptureGate::default();
+            let captured = gate.captured.clone();
+            let audit = Arc::new(InMemoryAuditEmitter::new());
+            let mut builder = Enclave::builder()
+                .approval_gate(Box::new(gate))
+                .audit(audit.clone());
+            if let Some(factor) = configured {
+                builder = builder.session_approval_factor(factor);
+            }
+            let enclave = builder.build().unwrap();
+            let identity = test_request("test", ClientType::Agent).client_identity;
+            for operation in [
+                "agent_session_start",
+                "device_pair_start",
+                "device_pair_confirm",
+                "fido2_register",
+                "identity.role_set",
+                "agent_session_start.other",
+            ] {
+                let result = enclave
+                    .request_control_approval(
+                        &identity,
+                        ClientType::Agent,
+                        operation,
+                        "Control approval",
+                        "Tenant: test\nTTL: 600 seconds",
+                    )
+                    .await;
+                assert!(matches!(result, Err(EnclaveError::ApprovalNotGranted(_))));
+            }
+            let records = captured.lock().unwrap();
+            assert_eq!(records.len(), 6);
+            assert_eq!(
+                records[0].1,
+                vec![configured.unwrap_or(ApprovalFactor::LocalBio)]
+            );
+            for (_, factors, _) in &records[1..] {
+                assert_eq!(factors, &vec![ApprovalFactor::LocalBio]);
+            }
+            assert_eq!(
+                audit.events_of_kind(AuditEventKind::ApprovalRequired).len(),
+                6
+            );
+            assert_eq!(
+                audit
+                    .events_of_kind(AuditEventKind::ApprovalPresented)
+                    .len(),
+                6
+            );
+            assert_eq!(
+                audit.events_of_kind(AuditEventKind::ApprovalDenied).len(),
+                6
+            );
+            assert!(
+                audit
+                    .events_of_kind(AuditEventKind::ApprovalGranted)
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_session_review_keeps_full_authority_and_binds_request_content() {
+        let gate = ControlCaptureGate::default();
+        let captured = gate.captured.clone();
+        let enclave = Enclave::builder()
+            .session_approval_factor(ApprovalFactor::PairedWorkstation)
+            .approval_gate(Box::new(gate))
+            .audit(Arc::new(InMemoryAuditEmitter::new()))
+            .build()
+            .unwrap();
+        let identity = test_request("test", ClientType::Agent).client_identity;
+        let reason = format!(
+            "Tenant: exact-tenant\nTenant broker: 7f720ac8-fac2-4b5f-966c-ed2de3a738a8\nSubject principal: opaque-human-123\nMode: delegated\nPeer UID: {}\nLabel: {}\nTTL: 600 seconds\nFinal reviewed authority",
+            identity.uid,
+            "label".repeat(100)
+        );
+        let result = enclave
+            .request_control_approval(
+                &identity,
+                ClientType::Agent,
+                "agent_session_start",
+                "Start one delegated agent session",
+                &reason,
+            )
+            .await;
+        assert!(matches!(result, Err(EnclaveError::ApprovalNotGranted(_))));
+        let records = captured.lock().unwrap();
+        let (request, _, description) = &records[0];
+        assert!(description.contains(&reason));
+        assert!(description.contains("Final reviewed authority"));
+        assert_eq!(request.params["control_review"], *description);
+        let original_hash = request.content_hash();
+        let mut changed = request.clone();
+        changed.params["control_review"] = description.replace("600 seconds", "601 seconds").into();
+        assert_ne!(changed.content_hash(), original_hash);
+        let mut changed = request.clone();
+        changed.operation = "device_pair_start".into();
+        assert_ne!(changed.content_hash(), original_hash);
+    }
+
+    #[tokio::test]
+    async fn agent_session_review_rejects_overflow_and_display_controls_without_prompt() {
+        let gate = ControlCaptureGate::default();
+        let captured = gate.captured.clone();
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let enclave = Enclave::builder()
+            .session_approval_factor(ApprovalFactor::PairedWorkstation)
+            .approval_gate(Box::new(gate))
+            .audit(audit.clone())
+            .build()
+            .unwrap();
+        let identity = test_request("test", ClientType::Agent).client_identity;
+        for reason in [
+            "".into(),
+            "x".repeat(8193),
+            "Tenant: a\0hidden".into(),
+            "Tenant: a\u{202e}other".into(),
+        ] {
+            assert!(matches!(
+                enclave
+                    .request_control_approval(
+                        &identity,
+                        ClientType::Agent,
+                        "agent_session_start",
+                        "Start agent session",
+                        &reason
+                    )
+                    .await,
+                Err(EnclaveError::InvalidInput(_))
+            ));
+        }
+        assert!(captured.lock().unwrap().is_empty());
+        assert!(audit.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn provisioning_review_preserves_exact_terms_with_configured_full_review_factor() {
+        let gate = ControlCaptureGate::default();
+        let captured = gate.captured.clone();
+        let enclave = Enclave::builder()
+            .session_approval_factor(ApprovalFactor::PairedWorkstation)
+            .approval_gate(Box::new(gate))
+            .audit(Arc::new(InMemoryAuditEmitter::new()))
+            .build()
+            .unwrap();
+        let identity = test_request("test", ClientType::Agent).client_identity;
+        let reason = format!(
+            "Tenant: engineering\nProfile terms: {}\nExact subject: issuer|subject\nCumulative budget: 2\nRedelegation: forbidden",
+            "reviewed profile ".repeat(40)
+        );
+        for operation in [
+            "identity.provisioning.bind_start",
+            "identity.provisioning.mandate_start",
+        ] {
+            assert!(matches!(
+                enclave
+                    .request_control_approval(
+                        &identity,
+                        ClientType::Agent,
+                        operation,
+                        "Review provisioning authority",
+                        &reason
+                    )
+                    .await,
+                Err(EnclaveError::ApprovalNotGranted(_))
+            ));
+        }
+        for operation in [
+            "identity.provisioning.mandate_start.other",
+            "identity.provisioning.issue",
+            "identity.role_set",
+        ] {
+            assert!(matches!(
+                enclave
+                    .request_control_approval(
+                        &identity,
+                        ClientType::Agent,
+                        operation,
+                        "Other control",
+                        "Other reason"
+                    )
+                    .await,
+                Err(EnclaveError::ApprovalNotGranted(_))
+            ));
+        }
+        let records = captured.lock().unwrap();
+        for (request, factors, description) in &records[..2] {
+            assert_eq!(factors, &vec![ApprovalFactor::PairedWorkstation]);
+            assert!(description.contains(&reason));
+            assert_eq!(request.params["control_review"], *description);
+            let mut modified = request.clone();
+            modified.params["control_review"] =
+                description.replace("budget: 2", "budget: 3").into();
+            assert_ne!(request.content_hash(), modified.content_hash());
+        }
+        for (request, factors, _) in &records[2..] {
+            assert_eq!(factors, &vec![ApprovalFactor::LocalBio]);
+            assert!(request.params.is_null());
+        }
+    }
+
+    #[tokio::test]
+    async fn provisioning_review_rejects_overflow_or_hidden_terms_before_prompt() {
+        let gate = ControlCaptureGate::default();
+        let captured = gate.captured.clone();
+        let enclave = Enclave::builder()
+            .session_approval_factor(ApprovalFactor::PairedWorkstation)
+            .approval_gate(Box::new(gate))
+            .audit(Arc::new(InMemoryAuditEmitter::new()))
+            .build()
+            .unwrap();
+        let identity = test_request("test", ClientType::Agent).client_identity;
+        for operation in [
+            "identity.provisioning.bind_start",
+            "identity.provisioning.mandate_start",
+        ] {
+            for reason in [
+                "".into(),
+                "x".repeat(8193),
+                "Group: legitimate\u{202e}hidden".into(),
+                "Subject: normal\0other".into(),
+            ] {
+                assert!(matches!(
+                    enclave
+                        .request_control_approval(
+                            &identity,
+                            ClientType::Agent,
+                            operation,
+                            "Review provisioning",
+                            &reason
+                        )
+                        .await,
+                    Err(EnclaveError::InvalidInput(_))
+                ));
+            }
+        }
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
     // -- Approval gate error path --
 
     #[tokio::test]
@@ -3467,6 +3840,95 @@ mod tests {
     }
 
     // -- Handler execution receives correct request --
+
+    mod audit_barrier_tests {
+        use super::*;
+        use opaque_core::audit::AuditFlushError;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct InjectedAudit {
+            calls: AtomicUsize,
+            fail_at: usize,
+        }
+        impl AuditSink for InjectedAudit {
+            fn emit(&self, _: AuditEvent) {}
+            fn flush(&self, _: Duration) -> Result<(), AuditFlushError> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) + 1 == self.fail_at {
+                    Err(AuditFlushError::Storage("injected failure".into()))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn control_approval_cannot_grant_authority_without_durable_evidence() {
+            let audit = Arc::new(InjectedAudit {
+                calls: AtomicUsize::new(0),
+                fail_at: 1,
+            });
+            let enclave = Enclave::builder()
+                .registry(test_registry())
+                .policy(test_policy())
+                .approval_gate(Box::new(AlwaysApproveGate))
+                .audit(audit)
+                .build()
+                .unwrap();
+            let result = enclave
+                .request_control_approval(
+                    &test_identity(),
+                    ClientType::Human,
+                    "agent_session_start",
+                    "Fixture session",
+                    "Fixture review",
+                )
+                .await;
+            assert!(result.unwrap_err().to_string().contains("not dispatched"));
+        }
+
+        #[tokio::test]
+        async fn missing_evidence_prevents_dispatch_and_success_disclosure() {
+            for (fail_at, effects, succeeded) in [(1, 0, false), (2, 1, false), (0, 1, true)] {
+                let audit = Arc::new(InjectedAudit {
+                    calls: AtomicUsize::new(0),
+                    fail_at,
+                });
+                let received = Arc::new(Mutex::new(Vec::new()));
+                let enclave = Enclave::builder()
+                    .registry(test_registry())
+                    .policy(test_policy())
+                    .handler(
+                        "github.set_actions_secret",
+                        Box::new(RecordingHandler {
+                            received: received.clone(),
+                        }),
+                    )
+                    .approval_gate(Box::new(AlwaysApproveGate))
+                    .audit(audit.clone())
+                    .build()
+                    .unwrap();
+                let response = enclave
+                    .execute(test_request("github.set_actions_secret", ClientType::Agent))
+                    .await;
+                assert_eq!(received.lock().unwrap().len(), effects);
+                assert_eq!(response.error_code().is_none(), succeeded);
+                assert_eq!(
+                    audit.calls.load(Ordering::SeqCst),
+                    if fail_at == 1 { 1 } else { 2 }
+                );
+                if !succeeded {
+                    assert!(response.payload().is_null());
+                    let message = response.error_message().unwrap();
+                    assert!(message.contains(if effects == 0 {
+                        "not dispatched"
+                    } else {
+                        "outcome unknown"
+                    }));
+                }
+            }
+        }
+    }
 
     /// A handler that records the request it received.
     #[derive(Debug)]
@@ -4142,7 +4604,7 @@ mod tests {
         let resp = enclave.execute(req).await;
 
         assert_eq!(resp.error_code(), Some("policy_denied"));
-        let msg = resp.error_message.as_deref().unwrap_or("");
+        let msg = resp.error_message().unwrap_or("");
         assert!(
             msg.contains("opaque policy simulate"),
             "policy denied message should contain simulate hint, got: {msg}"
@@ -4162,7 +4624,7 @@ mod tests {
         let resp = enclave.execute(req).await;
 
         assert_eq!(resp.error_code(), Some("approval_not_granted"));
-        let msg = resp.error_message.as_deref().unwrap_or("");
+        let msg = resp.error_message().unwrap_or("");
         assert!(
             msg.contains("local_bio"),
             "approval error should contain the factor name, got: {msg}"
@@ -4181,11 +4643,226 @@ mod tests {
         let req = test_request("github.set_actions_secret", ClientType::Agent);
         let resp = enclave.execute(req).await;
 
-        let msg = resp.error_message.as_deref().unwrap_or("");
+        let msg = resp.error_message().unwrap_or("");
         if cfg!(target_os = "macos") {
             assert!(
                 msg.contains("Touch ID"),
                 "on macOS, approval error should mention Touch ID, got: {msg}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod operation_catalog_tests {
+    use super::test_support::{AlwaysDenyGate, StubHandler};
+    use super::*;
+    use opaque_core::{
+        audit::InMemoryAuditEmitter,
+        operation::{ApprovalRequirement, OperationSafety},
+    };
+
+    #[test]
+    fn catalog_distinguishes_task_transport_and_profile_requirements() {
+        let ssh_profile = opaque_bounded_work::ssh::test_profile();
+        let inference_profile = opaque_bounded_work::inference::InferenceProfileConfig {
+            profile_id: "catalog-fixture".into(),
+            api_url: "https://inference.example.test".into(),
+            model_id: "public-fixture.gguf".into(),
+            model_path: "/models/public-fixture.gguf".into(),
+            model_artifact_sha256: "a".repeat(64),
+            chat_template_sha256: "b".repeat(64),
+            server_build: "catalog-fixture-v1".into(),
+            service_uid: Uuid::new_v4(),
+            source_id: opaque_bounded_work::inference::DEMO_SOURCE_ID.into(),
+            source_snapshot_sha256: opaque_bounded_work::inference::demo_source_snapshot_sha256(),
+            credential_ref: None,
+            allow_loopback_http: false,
+        }
+        .bind(&ssh_profile.tenant)
+        .unwrap();
+
+        for task_enabled in [false, true] {
+            for inference_configured in [false, true] {
+                for ssh_configured in [false, true] {
+                    let mut registry = OperationRegistry::new();
+                    for operation in [task_operation()]
+                        .into_iter()
+                        .chain(release_task_operations())
+                        .chain(inference_task_operations())
+                        .chain(ssh_task_operations())
+                    {
+                        registry.register(operation).unwrap();
+                    }
+                    // The publish child has both a direct handler and a typed
+                    // task path; unrelated names must not acquire capabilities.
+                    for name in ["github.set_actions_secret", "github.unimplemented_manifest"] {
+                        let mut operation = task_operation();
+                        operation.name = name.into();
+                        registry.register(operation).unwrap();
+                    }
+                    let enclave = Enclave::builder()
+                        .registry(registry)
+                        .task_grants_enabled(task_enabled)
+                        .inference_profile(inference_configured.then(|| inference_profile.clone()))
+                        .ssh_profile(ssh_configured.then(|| ssh_profile.clone()))
+                        .handler(
+                            "github.set_actions_secret",
+                            Box::new(StubHandler {
+                                response: serde_json::json!({}),
+                            }),
+                        )
+                        .approval_gate(Box::new(AlwaysDenyGate))
+                        .audit(Arc::new(InMemoryAuditEmitter::new()))
+                        .build()
+                        .unwrap();
+                    let catalog: HashMap<_, _> = enclave
+                        .operation_catalog()
+                        .into_iter()
+                        .map(|row| (row["name"].as_str().unwrap().to_owned(), row))
+                        .collect();
+                    for (name, expected_enabled) in [
+                        ("github.publish_manifest", task_enabled),
+                        ("github.release_manifest", task_enabled),
+                        ("github.dispatch_staging_workflow", task_enabled),
+                        ("github.observe_staging_workflow", task_enabled),
+                        (
+                            "inference.fixed_manifest",
+                            task_enabled && inference_configured,
+                        ),
+                        (
+                            "inference.fixed_completion",
+                            task_enabled && inference_configured,
+                        ),
+                        (
+                            opaque_core::ssh::SSH_TASK_OPERATION,
+                            task_enabled && ssh_configured,
+                        ),
+                        (
+                            opaque_core::ssh::SSH_OPERATION,
+                            task_enabled && ssh_configured,
+                        ),
+                        ("github.unimplemented_manifest", false),
+                    ] {
+                        let row = &catalog[name];
+                        assert_eq!(
+                            row["availability"],
+                            if expected_enabled {
+                                "enabled"
+                            } else {
+                                "disabled"
+                            },
+                            "{name}: tasks={task_enabled}, inference={inference_configured}, ssh={ssh_configured}"
+                        );
+                        assert_eq!(
+                            row["execution_paths"],
+                            if expected_enabled {
+                                serde_json::json!(["task"])
+                            } else {
+                                serde_json::json!([])
+                            }
+                        );
+                        assert_eq!(row["policy_status"], "evaluated_per_request");
+                        assert_eq!(row["mcp_exposed"], false);
+                    }
+                    let publish = &catalog["github.set_actions_secret"];
+                    assert_eq!(publish["availability"], "enabled");
+                    assert_eq!(
+                        publish["execution_paths"],
+                        if task_enabled {
+                            serde_json::json!(["operation", "task"])
+                        } else {
+                            serde_json::json!(["operation"])
+                        }
+                    );
+                    assert_eq!(publish["mcp_exposed"], true);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_reports_registered_handlers_without_claiming_policy_permission() {
+        let mut registry = OperationRegistry::new();
+        for name in [
+            "test.disabled",
+            "aws.create_secret",
+            "github.set_actions_secret",
+            "onepassword.read_field",
+        ] {
+            registry
+                .register(OperationDef {
+                    name: name.into(),
+                    safety: if name == "onepassword.read_field" {
+                        OperationSafety::Reveal
+                    } else {
+                        OperationSafety::Safe
+                    },
+                    default_approval: ApprovalRequirement::Always,
+                    default_factors: vec![],
+                    description: format!("Registry description for {name}"),
+                    params_schema: None,
+                    allowed_target_keys: vec![],
+                    secret_ref_param_keys: vec![],
+                })
+                .unwrap();
+        }
+        let handler = || {
+            Box::new(StubHandler {
+                response: serde_json::json!({}),
+            })
+        };
+        let enclave = Enclave::builder()
+            .registry(registry)
+            .handler(
+                "aws.create_secret",
+                Box::new(opaque_providers::aws::AwsHandler::new(
+                    Arc::new(InMemoryAuditEmitter::new()),
+                    opaque_providers::aws::client::AwsClient::new(
+                        "http://127.0.0.1:1",
+                        "http://127.0.0.1:1",
+                        "http://127.0.0.1:1",
+                    )
+                    .expect("loopback fixture URLs are valid"),
+                )),
+            )
+            .handler("github.set_actions_secret", handler())
+            .handler("onepassword.read_field", handler())
+            .handler("unregistered.handler", handler())
+            .approval_gate(Box::new(AlwaysDenyGate))
+            .audit(Arc::new(InMemoryAuditEmitter::new()))
+            .build()
+            .unwrap();
+        let rows = enclave.operation_catalog();
+        assert_eq!(rows.len(), 4);
+        let names = rows
+            .iter()
+            .map(|row| row["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "aws.create_secret",
+                "github.set_actions_secret",
+                "onepassword.read_field",
+                "test.disabled"
+            ]
+        );
+        assert_eq!(rows[0]["availability"], "fixture_only");
+        assert_eq!(rows[1]["availability"], "enabled");
+        assert_eq!(rows[3]["availability"], "disabled");
+        assert_eq!(rows[1]["mcp_exposed"], true);
+        assert_eq!(rows[2]["mcp_exposed"], false);
+        assert_eq!(rows[2]["safety"], "Reveal");
+        assert_eq!(rows[1]["provider"], "github");
+        for row in rows {
+            assert_eq!(row["policy_status"], "evaluated_per_request");
+            assert_eq!(row["default_approval"], "always");
+            assert!(
+                row["description"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("Registry description")
             );
         }
     }

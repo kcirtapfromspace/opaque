@@ -1,6 +1,6 @@
-# Try the portfolio demo
+# Try bounded work with Opaque
 
-Ask an AI assistant about a fictional credit union’s application portfolio, then inspect the permission checks and source evidence behind its answer.
+Approve the work. Keep authority bounded. Review one task for a fictional credit union, authenticate to approve one permitted source read, and inspect the service receipt. Then explore portfolio questions with a real hosted model and test the access boundaries.
 
 [Request a demo](https://demo.opaque.info/)
 
@@ -11,7 +11,43 @@ Ask an AI assistant about a fictional credit union’s application portfolio, th
 3. Open the workspace when the service reports that it is ready. The countdown shows your session’s deadline.
 4. End the session when you finish, or let it expire. The page shows cleanup separately from active access.
 
-A session lasts **10 minutes** and allows up to **12 questions**. Reopening the workspace does not extend it. Your selected model stays fixed for the session; changing models requires a new session. Model choice does not change your data permissions.
+A session lasts **10 minutes** and allows one preview task plus up to **12 portfolio questions**. Reopening the workspace does not extend it. Your selected model stays fixed for the session; changing models requires a new session. Model choice does not change your data permissions.
+
+## Discuss your workflow
+
+The optional **Discuss a pilot** form on the demo entry page asks for your email
+and the task you want to let an agent perform. You can use it while waiting or
+return to it from the invitation shown after a useful workspace result. It does
+not change your place in the queue or require you to finish a demo.
+
+Check the separate permission box if you want Opaque to email you about that
+workflow and a pilot. Your submitted details are kept in a private contact inbox
+and removed from it after 90 days, with basic campaign/referral information and
+where you opened the form retained alongside the request.
+Email is not required to use the demo, and GitHub task approval does not submit
+this form or subscribe you to a mailing list. Do not include credentials or
+private customer information in your workflow description.
+
+## Review and run one bounded task
+
+Start as the **portfolio analyst**. The bounded task panel fixes one operation: read **manual review rate** from Harborlight’s synthetic source over a **60 second window**, once. Review the customer, acting identity, source, one-read allowance, expiry and manifest digest before confirming it.
+
+1. Select **Review & approve**. The approval window shows the task, customer, acting demo identity, source, deadline and manifest digest. Its local WebAssembly review checks that the displayed manifest matches the digest and one-read limits.
+2. Choose **Passkey or FIDO2 security key**. First use creates a temporary demo credential; a separate authenticator request then approves the task. Opaque verifies the authenticator signature, browser origin, challenge and required user verification before recording approval. A passkey-capable browser over HTTPS is required. Your device may retain the demo passkey after the server session expires; you can remove it from your password manager.
+3. Alternatively, choose **Continue with GitHub** to select your GitHub account and approve the reviewed task. Opaque verifies your public account identity against the pending task. GitHub approval requests no organization, repository or private email permissions.
+4. Select **Run once**. Approval alone does not execute the task. The service consumes the allowance before requesting the source and reports the persisted result.
+5. Inspect the verified approval method and the service receipt’s metric value, sample count, source times and evidence digest.
+6. Select **Test replay denial** to deliberately request another execution. Inspect the service’s denial, then **Check task status** to retrieve its current state.
+
+Closing the window before submitting a proof does not approve the task. If verification was submitted but its response was interrupted, use **Check task status** to learn the outcome. Neither the browser nor the service automatically retries execution.
+
+The task expires after at most **five minutes**, ending sooner if the session ends. Receipt access ends at that deadline too. **Revoke task** closes outstanding task authority; it cannot retract a source request or evidence already received. Reloading the workspace retrieves its state without approving, executing or refilling the task. A source failure can leave a consumed task with an uncertain outcome; it cannot be run again.
+
+Changing demo identity invalidates outstanding task authority. Engineers and support identities cannot approve or execute this task or see its metric receipt. Returning to the analyst does not restore the earlier grant or refill its allowance.
+
+**Human authentication is real; the customer and resource authority remain a demonstration.** A temporary passkey proves control of its authenticator, and GitHub login verifies its stable public account identity. Neither establishes employment, real customer membership or enrollment with a production Opaque broker. The demo service binds verification to this task and records the synthetic source observation. Its execution receipt is not an independently signed host receipt.
+
+This task’s one-read limit applies to **Run once**. Portfolio chat retains its separate session limits and does not inherit new access from task approval.
 
 ## Ask a portfolio question
 
@@ -55,6 +91,8 @@ You can still ask **“Watch our manual review rate live”** for repeated live 
 
 The **Opaque policy layer** shows the customer, demo role, configured purpose, allowed tool and reported permission checks. An answer does not grant additional access.
 
+**Follow the work** shows the current chat request moving through the Opaque boundary, customer source and evidence return as the service reports each milestone. Open **Inspect this request’s architecture & events** to read the latest reported checks. A tool request alone does not confirm source access; denied or interrupted requests retain the evidence received so far. **Pause motion** stops the animation while the request continues. This view covers portfolio chat; **Run once** has its own task lifecycle and receipt.
+
 ## Explore the scoped identities
 
 **Northstar Financial Systems** is the fictional parent company. Harborlight is this workspace’s assigned customer. **Cedar Community Bank** is a directory entry with no data access. Parent-company membership does not grant access to another customer’s metrics.
@@ -94,6 +132,10 @@ Try one of these questions:
 > Compare with another lender.
 
 These requests are outside the current demo’s scope. Inspect the reported policy decision rather than relying on the model’s wording. A specific denied check may report no source access; a generic error or interrupted connection does not establish that.
+
+## How this relates to host operations
+
+The same product direction applies to narrow host operations: review a fixed operation, constrain its destination and principal, expire its authority, enforce command and session controls, and retain a receipt. A Vault-signed SSH certificate flow has been validated for a restricted host health check in a separate private fixture. That fixture is not connected to this public demo; the public preview does not issue SSH certificates or operate customer hosts.
 
 ## Use synthetic information only
 

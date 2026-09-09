@@ -16,6 +16,8 @@ use opaque_core::socket::{socket_path, verify_socket_safety};
 use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
+#[cfg(test)]
+mod ipc_tests;
 mod service;
 mod setup;
 mod ui;
@@ -159,6 +161,12 @@ enum Cmd {
         #[command(subcommand)]
         action: GithubAction,
     },
+    /// Plan, approve, and inspect a bounded task (secret publish, staging
+    /// release, SSH host check, or inference).
+    Task {
+        #[command(subcommand)]
+        action: TaskAction,
+    },
     /// Manage GitLab CI/CD variables.
     Gitlab {
         #[command(subcommand)]
@@ -214,6 +222,11 @@ enum Cmd {
     Identity {
         #[command(subcommand)]
         action: IdentityAction,
+    },
+    /// Delegate and revoke scoped access provisioning for verified IdP users.
+    Provisioning {
+        #[command(subcommand)]
+        action: ProvisioningAction,
     },
     /// Manage paired approver devices (second-device approval factor).
     Device {
@@ -392,6 +405,14 @@ enum AgentAction {
         #[arg(long)]
         ttl_secs: Option<u64>,
 
+        /// Delegated human identity, or an explicitly configured autonomous service.
+        #[arg(long, default_value = "delegated", value_parser = ["delegated", "autonomous"])]
+        mode: String,
+
+        /// Configured service name; required only in autonomous mode.
+        #[arg(long, required_if_eq("mode", "autonomous"))]
+        service: Option<String>,
+
         /// Pass an additional environment variable to the child process.
         /// Repeatable. Ignored when --inherit-env is set.
         #[arg(long, value_name = "KEY")]
@@ -440,6 +461,63 @@ enum IdentityAction {
     },
     /// List delegation records (agent sessions bound to principals).
     Delegations,
+}
+
+#[derive(Debug, Subcommand)]
+enum ProvisioningAction {
+    /// Review binding an enrolled FIDO2 key to the logged-in IdP administrator.
+    BindStart { credential_id: String },
+    /// Complete the binding using the assertion produced by a FIDO2 client.
+    BindComplete {
+        challenge_id: String,
+        #[arg(long)]
+        assertion: PathBuf,
+    },
+    /// Review a bounded mandate for a configured autonomous service.
+    MandateStart {
+        #[arg(long)]
+        service: String,
+        #[arg(long)]
+        profile: String,
+        #[arg(long)]
+        ttl_secs: u64,
+        #[arg(long)]
+        max_issuances: u32,
+    },
+    /// Complete a reviewed mandate with an IdP-bound FIDO2 assertion.
+    MandateComplete {
+        challenge_id: String,
+        #[arg(long)]
+        assertion: PathBuf,
+    },
+    /// Issue access as a wrapped autonomous service under an approved mandate.
+    Issue {
+        #[arg(long)]
+        mandate: String,
+        #[arg(long)]
+        issuer: String,
+        #[arg(long)]
+        subject: String,
+        #[arg(long)]
+        ttl_secs: u64,
+        /// Stable UUID for one issuance request; reuse it only when retrying.
+        #[arg(long)]
+        request_id: String,
+    },
+    /// List mandates and issued access visible to the caller.
+    List,
+    /// Inspect one grant and the exact profile revision it approved.
+    Show {
+        #[arg(value_parser = ["mandate", "access"])]
+        kind: String,
+        id: String,
+    },
+    /// Revoke a mandate and its children, or one recipient's access.
+    Revoke {
+        #[arg(value_parser = ["mandate", "access"])]
+        kind: String,
+        id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -526,6 +604,44 @@ enum DeviceAction {
     Revoke {
         /// Device id as shown by `opaque device ls`.
         device_id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TaskAction {
+    /// Plan one fixed host health check using the tenant's Vault SSH signer.
+    PlanSsh {
+        #[arg(long, default_value = "Service health on approved host")]
+        title: String,
+        #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..=300))]
+        expires_in_secs: u64,
+    },
+    /// Plan three fixed public-source completions in the authenticated tenant.
+    PlanInference {
+        #[arg(long, default_value = "Tenant public data inference")]
+        title: String,
+        #[arg(long, default_value_t = 600)]
+        expires_in_secs: u64,
+    },
+    /// Resolve exact repositories and pin a manifest for trusted review.
+    Plan {
+        /// JSON manifest with schema_version, title, expires_in_secs and actions.
+        #[arg(long)]
+        manifest: PathBuf,
+    },
+    /// Request trusted approval and execute this task once.
+    Run { task_id: String },
+    /// Show exact scope, charged slots and provider outcomes.
+    Show { task_id: String },
+    /// Read correlated staging workflow evidence without dispatching again.
+    Reconcile { task_id: String },
+    /// Block future writes; already dispatched writes may still finish.
+    Revoke { task_id: String },
+    /// List tasks belonging to this authenticated owner.
+    List {
+        /// Continue after the task ID returned as next_cursor on a prior page.
+        #[arg(long)]
+        cursor: Option<String>,
     },
 }
 
@@ -1057,7 +1173,7 @@ struct PublishManifestSummary {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_github_publish_env(
-    sock: &PathBuf,
+    sock: &Path,
     repo: &str,
     env_file: &Path,
     value_ref_template: &str,
@@ -1336,7 +1452,7 @@ fn run_github_build_manifest(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_github_publish_manifest(
-    sock: &PathBuf,
+    sock: &Path,
     manifest_file: &Path,
     repo_override: Option<&str>,
     github_token_ref: Option<&str>,
@@ -1562,7 +1678,7 @@ fn open_browser(url: &str) -> bool {
 /// The auth code and tokens never pass through this CLI — the daemon owns
 /// the loopback redirect and the code exchange. This process only learns
 /// the outcome.
-async fn run_login(sock: &PathBuf, no_browser: bool, json_output: bool) -> Result<i32, String> {
+async fn run_login(sock: &Path, no_browser: bool, json_output: bool) -> Result<i32, String> {
     let resp = call(sock, "identity.login_start", serde_json::Value::Null)
         .await
         .map_err(|e| format!("Connection failed: {e}"))?;
@@ -1728,27 +1844,50 @@ fn session_token_from_env() -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_agent_wrapped(
-    sock: &PathBuf,
+fn agent_session_start_params(
     command: &[String],
     ttl_secs: Option<u64>,
+    mode: &str,
+    service: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let label = command.first().ok_or("agent command must not be empty")?;
+    let mut params = serde_json::json!({"label":label,"mode":mode});
+    match (mode, service) {
+        ("delegated", None) => {}
+        ("autonomous", Some(name)) => {
+            opaque_core::identity::PrincipalKind::Service {
+                name: name.to_owned(),
+            }
+            .validate()
+            .map_err(|_| "invalid configured service name")?;
+            params["service"] = name.into();
+        }
+        ("autonomous", None) => return Err("--mode autonomous requires --service".into()),
+        ("delegated", Some(_)) => {
+            return Err("--service is only valid with --mode autonomous".into());
+        }
+        _ => return Err("agent mode must be delegated or autonomous".into()),
+    }
+    if let Some(ttl) = ttl_secs {
+        params["ttl_secs"] = ttl.into();
+    }
+    Ok(params)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_agent_wrapped(
+    sock: &Path,
+    command: &[String],
+    ttl_secs: Option<u64>,
+    mode: &str,
+    service: Option<&str>,
     inherit_env: bool,
     pass_env: &[String],
     json_output: bool,
 ) -> Result<i32, String> {
-    if command.is_empty() {
-        return Err("agent command must not be empty".into());
-    }
+    let start_params = agent_session_start_params(command, ttl_secs, mode, service)?;
 
     maybe_warn_opaque_mcp_skew(command, json_output);
-
-    let mut start_params = serde_json::json!({
-        "label": command[0],
-    });
-    if let Some(ttl) = ttl_secs {
-        start_params["ttl_secs"] = serde_json::json!(ttl);
-    }
 
     let session_start = call(sock, "agent_session_start", start_params)
         .await
@@ -1760,6 +1899,9 @@ async fn run_agent_wrapped(
     let result = session_start
         .result
         .ok_or_else(|| "agent_session_start returned no result".to_string())?;
+    if mode == "autonomous" && result.get("mode").and_then(|v| v.as_str()) != Some("autonomous") {
+        return Err("broker did not create the requested autonomous identity delegation".into());
+    }
     let session_id = result
         .get("session_id")
         .and_then(|v| v.as_str())
@@ -2438,6 +2580,8 @@ async fn main() {
         action:
             AgentAction::Run {
                 ttl_secs,
+                mode,
+                service,
                 pass_env,
                 inherit_env,
                 clean_env,
@@ -2462,6 +2606,8 @@ async fn main() {
             &sock,
             command,
             *ttl_secs,
+            mode,
+            service.as_deref(),
             *inherit_env,
             pass_env,
             json_output,
@@ -2582,6 +2728,28 @@ async fn main() {
         Cmd::Version => ("version", serde_json::Value::Null),
         Cmd::Whoami => ("whoami", serde_json::Value::Null),
         Cmd::Leases => ("leases", serde_json::Value::Null),
+        Cmd::Task { action } => match task_command_params(action) {
+            Ok(request) => request,
+            Err(error) => {
+                if json_output {
+                    println!("{}", serde_json::json!({"error": error}));
+                } else {
+                    ui::error(&error);
+                }
+                std::process::exit(EXIT_USAGE);
+            }
+        },
+        Cmd::Provisioning { action } => match provisioning_command_params(action) {
+            Ok(request) => request,
+            Err(error) => {
+                if json_output {
+                    println!("{}", serde_json::json!({"error":error}));
+                } else {
+                    ui::error(&error);
+                }
+                std::process::exit(EXIT_USAGE);
+            }
+        },
         Cmd::Execute {
             operation,
             target,
@@ -2978,12 +3146,38 @@ async fn main() {
                                 }
                             }
                         }
+                    } else if method.starts_with("task_") {
+                        format_task_response(result);
                     } else {
                         ui::format_response(method, result);
                     }
                 } else if !quiet {
                     ui::success("Done (no result payload)");
                 }
+            }
+            if method == "task_run"
+                && resp
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("task"))
+                    .and_then(|task| task.get("state"))
+                    .and_then(|state| state.as_str())
+                    != Some("completed")
+            {
+                // A successful RPC can still have a partial/unknown receipt.
+                // Preserve its JSON while reporting failure to automation.
+                std::process::exit(EXIT_ERROR);
+            }
+            if method == "task_reconcile"
+                && matches!(
+                    resp.result
+                        .as_ref()
+                        .and_then(|r| r.pointer("/task/release_observation/state"))
+                        .and_then(|s| s.as_str()),
+                    Some("failed" | "ambiguous")
+                )
+            {
+                std::process::exit(EXIT_ERROR);
             }
         }
         Err(e) => {
@@ -3037,6 +3231,360 @@ async fn main() {
     }
 }
 
+fn provisioning_command_params(
+    action: ProvisioningAction,
+) -> Result<(&'static str, serde_json::Value), String> {
+    use serde_json::json;
+    fn assertion(path: PathBuf) -> Result<serde_json::Value, String> {
+        use std::io::Read;
+        let file = std::fs::File::open(&path).map_err(|_| "cannot open FIDO2 assertion file")?;
+        let mut bytes = Vec::new();
+        file.take(16_385)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "cannot read FIDO2 assertion file")?;
+        if bytes.len() > 16_384 {
+            return Err("FIDO2 assertion file exceeds 16 KiB".into());
+        }
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|_| "invalid FIDO2 assertion JSON")?;
+        let fields = [
+            "credential_id",
+            "authenticator_data",
+            "client_data_json",
+            "signature",
+        ];
+        if value.as_object().is_none_or(|o| {
+            o.len() != fields.len()
+                || fields
+                    .iter()
+                    .any(|f| o.get(*f).and_then(|v| v.as_str()).is_none_or(str::is_empty))
+        }) {
+            return Err(
+                "FIDO2 assertion must contain exactly the four encoded assertion fields".into(),
+            );
+        }
+        Ok(value)
+    }
+    Ok(match action {
+        ProvisioningAction::BindStart { credential_id } => (
+            "identity.provisioning.bind_start",
+            json!({"credential_id":credential_id}),
+        ),
+        ProvisioningAction::BindComplete {
+            challenge_id,
+            assertion: path,
+        } => (
+            "identity.provisioning.bind_complete",
+            json!({"challenge_id":challenge_id,"assertion":assertion(path)?}),
+        ),
+        ProvisioningAction::MandateStart {
+            service,
+            profile,
+            ttl_secs,
+            max_issuances,
+        } => (
+            "identity.provisioning.mandate_start",
+            json!({"service":service,"profile_id":profile,"ttl_secs":ttl_secs,"max_issuances":max_issuances}),
+        ),
+        ProvisioningAction::MandateComplete {
+            challenge_id,
+            assertion: path,
+        } => (
+            "identity.provisioning.mandate_complete",
+            json!({"challenge_id":challenge_id,"assertion":assertion(path)?}),
+        ),
+        ProvisioningAction::Issue {
+            mandate,
+            issuer,
+            subject,
+            ttl_secs,
+            request_id,
+        } => {
+            uuid::Uuid::parse_str(&request_id).map_err(|_| "request-id must be a UUID")?;
+            (
+                "identity.provisioning.issue",
+                json!({"mandate_id":mandate,"recipient_issuer":issuer,"recipient_subject":subject,"ttl_secs":ttl_secs,"request_id":request_id}),
+            )
+        }
+        ProvisioningAction::List => ("identity.provisioning.list", json!({})),
+        ProvisioningAction::Show { kind, id } => {
+            ("identity.provisioning.show", json!({"kind":kind,"id":id}))
+        }
+        ProvisioningAction::Revoke { kind, id } => {
+            ("identity.provisioning.revoke", json!({"kind":kind,"id":id}))
+        }
+    })
+}
+
+fn task_command_params(action: TaskAction) -> Result<(&'static str, serde_json::Value), String> {
+    use serde_json::json;
+    Ok(match action {
+        TaskAction::PlanSsh {
+            title,
+            expires_in_secs,
+        } => (
+            "task_plan_ssh",
+            json!({"title": title, "expires_in_secs": expires_in_secs}),
+        ),
+        TaskAction::PlanInference {
+            title,
+            expires_in_secs,
+        } => (
+            "task_plan_inference",
+            json!({"title": title, "expires_in_secs": expires_in_secs}),
+        ),
+        TaskAction::Plan { manifest } => {
+            let metadata = std::fs::metadata(&manifest)
+                .map_err(|error| format!("cannot read manifest {}: {error}", manifest.display()))?;
+            if metadata.len() > (opaque_core::MAX_FRAME_LENGTH - 4096) as u64 {
+                return Err("task manifest exceeds the IPC size limit".into());
+            }
+            let bytes = std::fs::read(&manifest)
+                .map_err(|error| format!("cannot read manifest {}: {error}", manifest.display()))?;
+            // Numeric repository IDs and provider URLs are enriched by the
+            // daemon. Deserialize strictly here without accepting extensions.
+            let manifest: opaque_core::task::TaskManifest = serde_json::from_slice(&bytes)
+                .map_err(|error| format!("invalid task manifest: {error}"))?;
+            ("task_plan", json!({"manifest": manifest}))
+        }
+        TaskAction::Run { task_id } => ("task_run", json!({"task_id": task_id})),
+        TaskAction::Show { task_id } => ("task_get", json!({"task_id": task_id})),
+        TaskAction::Reconcile { task_id } => ("task_reconcile", json!({"task_id": task_id})),
+        TaskAction::Revoke { task_id } => ("task_revoke", json!({"task_id": task_id})),
+        TaskAction::List { cursor } => ("task_list", json!({"cursor": cursor})),
+    })
+}
+
+fn format_task_response(result: &serde_json::Value) {
+    let records: Result<Vec<opaque_core::task::TaskRecord>, _> = if let Some(tasks) =
+        result.get("tasks")
+    {
+        serde_json::from_value(tasks.clone())
+    } else {
+        serde_json::from_value(result.get("task").unwrap_or(result).clone()).map(|task| vec![task])
+    };
+    let records = match records {
+        Ok(records) => records,
+        Err(_) => {
+            ui::error(
+                "Daemon returned an invalid task receipt; use --json to inspect the response.",
+            );
+            return;
+        }
+    };
+    if records.is_empty() {
+        ui::info("No tasks for this authenticated owner.");
+        return;
+    }
+    for task in records {
+        println!("{}", render_task_receipt(&task));
+    }
+    if result.get("has_more").and_then(|value| value.as_bool()) == Some(true)
+        && let Some(cursor) = result.get("next_cursor").and_then(|value| value.as_str())
+    {
+        println!("Older tasks are available. Continue with: opaque task list --cursor {cursor}");
+    }
+}
+
+fn render_task_receipt(task: &opaque_core::task::TaskRecord) -> String {
+    use opaque_core::task::{SlotState, TaskApprovalMode, TaskState};
+    use std::fmt::Write;
+    let state = match task.state {
+        TaskState::Planned => "planned",
+        TaskState::Running => "running",
+        TaskState::Completed => "completed",
+        TaskState::Partial => "partial",
+        TaskState::Revoked => "revoked",
+        TaskState::Expired => "expired",
+    };
+    let charged = task
+        .slots
+        .iter()
+        .filter(|slot| slot.state != SlotState::Pending)
+        .count();
+    let mut output = format!(
+        "{}\nTask: {}\nState: {} | Charged: {}/{} writes\nDigest: {}\nExpires: {} (Unix seconds)\nGitHub: {}\nVault: {}\n",
+        task.manifest.title,
+        task.id,
+        state,
+        charged,
+        task.slots.len(),
+        task.manifest_digest,
+        task.expires_at,
+        task.manifest.github_api_url,
+        task.manifest.vault_api_url,
+    );
+    if task.manifest.is_inference() || task.manifest.is_ssh() {
+        output = format!(
+            "{}\nTask: {}\nState: {} | Charged: {}/{} attempts\nDigest: {}\nExpires: {} (Unix seconds)\n",
+            task.manifest.title,
+            task.id,
+            state,
+            charged,
+            task.slots.len(),
+            task.manifest_digest,
+            task.expires_at
+        );
+    }
+    if let Some(tenant) = &task.tenant {
+        output.push_str(&tenant.approval_context());
+    }
+    if let Some(approved_at) = task.approved_at {
+        let mode = match task.approval_mode {
+            Some(TaskApprovalMode::Native) => "native approval",
+            Some(TaskApprovalMode::PairedWorkstation) => "paired workstation approval",
+            Some(TaskApprovalMode::InsecureTest) => "INSECURE TEST APPROVAL",
+            None => "approval mode unavailable",
+        };
+        let _ = writeln!(output, "Approval: {mode} at {approved_at} (Unix seconds)");
+    } else {
+        output.push_str("Approval: not granted\n");
+    }
+    for slot in &task.slots {
+        let state = match slot.state {
+            SlotState::Pending => "not attempted",
+            SlotState::Reserved => "in flight (charged)",
+            SlotState::ApiAccepted => "API accepted",
+            SlotState::Rejected => "rejected (charged)",
+            SlotState::Unknown => "unknown (charged; do not retry)",
+        };
+        match &slot.action {
+            opaque_core::task::TaskAction::SshHealth(action) => {
+                let _ = writeln!(
+                    output,
+                    "\n  SSH health: {}:{}\n    Host key SHA-256: {}\n    Principal / user: {} / {}\n    Source IP: {}\n    Exact command: {}\n    Session limit: {} seconds\n    Vault signer role: {}\n    Grant: {}\n    Slot: {}\n    Outcome: {}",
+                    action.destination_host,
+                    action.destination_port,
+                    action.host_key_sha256,
+                    action.principal,
+                    action.login_user,
+                    action.source_address,
+                    action.command,
+                    action.max_session_secs,
+                    action.vault_role,
+                    action.grant_id,
+                    slot.id,
+                    if slot.state == SlotState::ApiAccepted {
+                        "authenticated health observation"
+                    } else {
+                        state
+                    }
+                );
+            }
+            opaque_core::task::TaskAction::Inference(action) => {
+                let _ = writeln!(
+                    output,
+                    "\n  Request {} | Model: {}\n    Profile: {}\n    Source: {}\n    Source snapshot SHA-256: {}\n    Prompt SHA-256: {}\n    Output allowance: {} tokens (requested ceiling)\n    Slot: {}\n    Outcome: {}",
+                    action.ordinal,
+                    action.model_id,
+                    action.profile_id,
+                    action.source_id,
+                    action.source_snapshot_sha256,
+                    action.prompt_sha256,
+                    action.options.max_output_tokens,
+                    slot.id,
+                    state
+                );
+            }
+            opaque_core::task::TaskAction::PublishSecret(action) => {
+                let _ = writeln!(
+                    output,
+                    "\n  {} / {} [repository {}]\n    Source: {}\n    Slot: {}\n    Outcome: {}",
+                    action.repo,
+                    action.secret_name,
+                    action.repository_id,
+                    action.value_ref,
+                    slot.id,
+                    state
+                );
+            }
+            opaque_core::task::TaskAction::StagingRelease(action) => {
+                let _ = writeln!(
+                    output,
+                    "\n  {} [repository {}]\n    Workflow: {} [workflow {}]\n    Branch: {}\n    Approved commit: {}\n    Workflow SHA-256: {}\n    Artifact: {}@{}\n    Environment: {}\n    Slot: {}\n    Dispatch outcome: {}",
+                    action.repo,
+                    action.repository_id,
+                    action.workflow_path,
+                    action.workflow_id,
+                    action.workflow_ref,
+                    action.approved_commit_sha,
+                    action.workflow_sha256,
+                    action.image_repository,
+                    action.image_digest,
+                    action.environment,
+                    slot.id,
+                    state
+                );
+            }
+        }
+        if let Some(reference) = slot.action.github_token_ref() {
+            let _ = writeln!(output, "    Credential reference: {reference}");
+        }
+        if let Some(outcome) = &slot.outcome {
+            let _ = writeln!(output, "    Receipt code: {}", outcome.code);
+            if let Some(receipt) = &outcome.ssh_receipt {
+                let _ = writeln!(
+                    output,
+                    "    Authenticated host result: {:?}\n    Signed receipt SHA-256: {}",
+                    receipt.code, receipt.signed_receipt_sha256
+                );
+                if let Some(text) = &receipt.output_text {
+                    let _ = writeln!(output, "    Host output: {text}");
+                }
+            }
+            if let Some(receipt) = &outcome.inference_receipt {
+                let _ = writeln!(
+                    output,
+                    "    Model evidence: {:?}\n    Input tokens: {} | Observed output tokens: {:?}\n    Reserved output units: {}",
+                    receipt.code,
+                    receipt.input_tokens,
+                    receipt.observed_output_tokens,
+                    receipt.reserved_output_tokens
+                );
+                if let Some(text) = &receipt.output_text {
+                    let _ = writeln!(output, "    Model output: {text}");
+                }
+            }
+        }
+    }
+    match task.state {
+        TaskState::Planned => {
+            let _ = writeln!(
+                output,
+                "\nReview the exact scope above, then run: opaque task run {}",
+                task.id
+            );
+        }
+        TaskState::Running => output.push_str(
+            "\nInspect this task again for its receipt. Another run cannot add allowance.\n",
+        ),
+        TaskState::Completed => output.push_str(if task.manifest.is_inference() {
+            "\nThree model completions recorded. Further inference requires a new task and fresh approval. Provider usage does not attest GPU time or hardware isolation.\n"
+        } else if task.manifest.is_release() {
+            "\nDispatch recorded. Use task reconcile to observe the workflow; this does not establish deployment or service health.\n"
+        } else { "\nGitHub accepted these writes; secret values cannot be read back for verification.\n" }),
+        TaskState::Partial | TaskState::Revoked | TaskState::Expired => output.push_str(
+            "\nThis task is closed. Any further operations require a new task and fresh approval.\n",
+        ),
+    }
+    if let Some(observation) = &task.release_observation {
+        let _ = writeln!(
+            output,
+            "\nWorkflow evidence: {:?} ({})\nChecked: {} (Unix seconds)",
+            observation.state, observation.code, observation.checked_at
+        );
+        if let Some(url) = &observation.run_url {
+            let _ = writeln!(
+                output,
+                "Run: {url} (attempt {})",
+                observation.run_attempt.unwrap_or_default()
+            );
+        }
+        output.push_str("Workflow success describes the trusted workflow's checks; it does not independently prove service health.\n");
+    }
+    output
+}
+
 /// Read the daemon token from `<socket_dir>/daemon.token`.
 fn read_daemon_token(sock: &Path) -> std::io::Result<String> {
     let token_path = sock
@@ -3080,7 +3628,11 @@ fn resolve_workspace_context() -> Option<serde_json::Value> {
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+        .map(|o| {
+            opaque_core::validate::InputValidator::sanitize_url(
+                String::from_utf8_lossy(&o.stdout).trim(),
+            )
+        });
 
     let branch = Command::new("git")
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
@@ -3112,113 +3664,165 @@ fn resolve_workspace_context() -> Option<serde_json::Value> {
     }))
 }
 
-/// Maximum number of connection retry attempts.
+/// Retries are allowed only while establishing a connection. Once request
+/// delivery starts, a transport failure cannot establish whether work executed.
 const MAX_RETRIES: u32 = 3;
-/// Initial retry delay (doubles each attempt).
 const INITIAL_RETRY_MS: u64 = 200;
 
+fn request_timeout(method: &str) -> Duration {
+    match method {
+        // Leave time for approval and the daemon's bounded execution.
+        "exec" | "execute" => Duration::from_secs(300),
+        // The daemon allows an hour for a task; include a transport margin.
+        "task_run" => Duration::from_secs(3660),
+        "ping"
+        | "operations"
+        | "version"
+        | "whoami"
+        | "leases"
+        | "task_get"
+        | "task_list"
+        | "identity.login_status"
+        | "identity.principal_list"
+        | "identity.delegation_list"
+        | "identity.provisioning.list"
+        | "identity.provisioning.show"
+        | "fido2_list"
+        | "fido2_pending"
+        | "device_list"
+        | "agent_session_list"
+        | "attestation_report" => Duration::from_secs(30),
+        // Provider operations may require an interactive approval first.
+        _ => Duration::from_secs(300),
+    }
+}
+
 async fn call(
-    sock: &PathBuf,
+    sock: &Path,
+    method: &str,
+    mut params: serde_json::Value,
+) -> std::io::Result<Response> {
+    if method == "github" || method.starts_with("task_") {
+        params["workspace"] = resolve_workspace_context().unwrap_or(serde_json::Value::Null);
+    }
+    call_with_timeout(sock, method, params, request_timeout(method)).await
+}
+
+async fn call_with_timeout(
+    sock: &Path,
     method: &str,
     params: serde_json::Value,
+    deadline: Duration,
 ) -> std::io::Result<Response> {
-    // Verify socket ownership and permissions before connecting.
-    verify_socket_safety(sock)?;
+    let mut dispatched = false;
+    let exchange = async {
+        let stream = tokio::time::timeout(Duration::from_secs(30), connect_with_retries(sock))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "connection timed out")
+            })??;
+        let daemon_token = read_daemon_token(sock)?;
+        call_once(stream, method, params, &daemon_token, &mut dispatched).await
+    };
+    let result = tokio::time::timeout(deadline, exchange)
+        .await
+        .unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("request timed out after {} seconds", deadline.as_secs()),
+            ))
+        });
+    result.map_err(|error| {
+        if dispatched {
+            std::io::Error::new(
+                error.kind(),
+                format!("{error}; outcome unknown: the request may have executed. It was not retried. Inspect the task receipt or operation audit before taking further action"),
+            )
+        } else {
+            error
+        }
+    })
+}
 
-    // Read daemon token before connecting.
-    let daemon_token = read_daemon_token(sock)?;
-
-    // Retry connection with exponential backoff (200ms → 400ms → 800ms).
-    let mut last_err = None;
+async fn connect_with_retries(sock: &Path) -> std::io::Result<UnixStream> {
     for attempt in 0..=MAX_RETRIES {
         if attempt > 0 {
-            let delay = INITIAL_RETRY_MS * 2u64.pow(attempt - 1);
-            tokio::time::sleep(Duration::from_millis(delay)).await;
+            tokio::time::sleep(Duration::from_millis(
+                INITIAL_RETRY_MS * 2u64.pow(attempt - 1),
+            ))
+            .await;
         }
-
-        match call_once(sock, method, &params, &daemon_token).await {
-            Ok(resp) => return Ok(resp),
-            Err(e) => {
-                // Only retry on connection-related errors, not protocol errors.
+        // A daemon may still be creating its socket. Retry missing sockets,
+        // but never connect or send credentials until ownership/modes validate.
+        let connection = match verify_socket_safety(sock) {
+            Ok(()) => UnixStream::connect(sock).await,
+            Err(error) => Err(error),
+        };
+        match connection {
+            Ok(stream) => return Ok(stream),
+            Err(error) => {
                 let retryable = matches!(
-                    e.kind(),
+                    error.kind(),
                     std::io::ErrorKind::ConnectionRefused
                         | std::io::ErrorKind::ConnectionReset
                         | std::io::ErrorKind::NotFound
                         | std::io::ErrorKind::TimedOut
-                        | std::io::ErrorKind::BrokenPipe
                 );
                 if !retryable || attempt == MAX_RETRIES {
-                    return Err(e);
+                    return Err(std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "Cannot connect to Opaque daemon at {}: {error}. Start it with opaque service install or opaqued",
+                            sock.display()
+                        ),
+                    ));
                 }
-                last_err = Some(e);
             }
         }
     }
-
-    Err(last_err.unwrap_or_else(|| std::io::Error::other("connection failed after retries")))
+    unreachable!("every connection attempt returns or advances")
 }
 
-/// Single connection attempt — no retries.
+/// One established connection, with no replay at any point in the exchange.
 async fn call_once(
-    sock: &PathBuf,
+    stream: UnixStream,
     method: &str,
-    params: &serde_json::Value,
+    params: serde_json::Value,
     daemon_token: &str,
+    dispatched: &mut bool,
 ) -> std::io::Result<Response> {
-    let stream = tokio::time::timeout(Duration::from_secs(30), UnixStream::connect(sock))
-        .await
-        .map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("connection timed out: {}", sock.display()),
-            )
-        })?
-        .map_err(|e| {
-            std::io::Error::new(
-                e.kind(),
-                format!(
-                    "Cannot connect to Opaque daemon at {}. Start it with:\n    opaque service install    # recommended: auto-start on login\n    opaqued                   # or run directly in a terminal",
-                    sock.display()
-                ),
-            )
-        })?;
-
+    let req = Request {
+        id: 1,
+        method: method.to_string(),
+        params,
+    };
+    let out = serde_json::to_vec(&req).map_err(std::io::Error::other)?;
+    if out.len() > opaque_core::MAX_FRAME_LENGTH {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "request exceeds the IPC frame limit",
+        ));
+    }
     let codec = LengthDelimitedCodec::builder()
         .max_frame_length(opaque_core::MAX_FRAME_LENGTH)
         .new_codec();
     let mut framed = Framed::new(stream, codec);
-
-    // Send handshake as the first frame.
-    let mut handshake = serde_json::json!({
-        "handshake": "v1",
-        "daemon_token": daemon_token,
-    });
+    let mut handshake = serde_json::json!({ "handshake": "v1", "daemon_token": daemon_token });
     if let Some(session_token) = session_token_from_env() {
         handshake["session_token"] = serde_json::Value::String(session_token);
     }
     let hs_bytes = serde_json::to_vec(&handshake).map_err(std::io::Error::other)?;
     framed.send(Bytes::from(hs_bytes)).await?;
-
-    let req = Request {
-        id: 1,
-        method: method.to_string(),
-        params: params.clone(),
-    };
-    let out = serde_json::to_vec(&req).map_err(std::io::Error::other)?;
+    // Mark before send: partial writes and cancellation are ambiguous too.
+    *dispatched = true;
     framed.send(Bytes::from(out)).await?;
-
-    let Some(frame) = framed.next().await else {
-        return Err(std::io::Error::new(
+    let frame = framed.next().await.ok_or_else(|| {
+        std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
-            "no response from daemon (handshake may have been rejected)",
-        ));
-    };
-    let frame = frame?;
-
-    let resp: Response = serde_json::from_slice(&frame)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    Ok(resp)
+            "daemon closed without a response",
+        )
+    })??;
+    opaque_core::proto::decode_response(&frame, req.id)
 }
 
 // ---------------------------------------------------------------------------
@@ -5817,66 +6421,14 @@ async fn run_doctor() {
 
 /// Attempt a lightweight ping to the daemon. Returns Ok(()) on success.
 async fn try_ping(sock: &Path) -> Result<(), String> {
-    // Verify socket safety first.
-    verify_socket_safety(sock).map_err(|e| format!("{e}"))?;
-
-    // Read daemon token.
-    let daemon_token = read_daemon_token(sock).map_err(|e| format!("{e}"))?;
-
-    // Connect.
-    let stream = UnixStream::connect(sock).await.map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound
-            || e.kind() == std::io::ErrorKind::ConnectionRefused
-        {
-            format!(
-                "daemon not found at {}. Is the daemon running? Try: opaque service start",
-                sock.display()
-            )
-        } else {
-            format!("connect failed: {e}")
-        }
-    })?;
-
-    let codec = LengthDelimitedCodec::builder()
-        .max_frame_length(opaque_core::MAX_FRAME_LENGTH)
-        .new_codec();
-    let mut framed = Framed::new(stream, codec);
-
-    // Handshake.
-    let mut handshake = serde_json::json!({
-        "handshake": "v1",
-        "daemon_token": daemon_token,
-    });
-    if let Some(session_token) = session_token_from_env() {
-        handshake["session_token"] = serde_json::Value::String(session_token);
-    }
-    let hs_bytes = serde_json::to_vec(&handshake).map_err(|e| format!("serialize: {e}"))?;
-    framed
-        .send(Bytes::from(hs_bytes))
-        .await
-        .map_err(|e| format!("send handshake: {e}"))?;
-
-    // Send ping.
-    let req = Request {
-        id: 1,
-        method: "ping".to_string(),
-        params: serde_json::Value::Null,
-    };
-    let out = serde_json::to_vec(&req).map_err(|e| format!("serialize: {e}"))?;
-    framed
-        .send(Bytes::from(out))
-        .await
-        .map_err(|e| format!("send ping: {e}"))?;
-
-    // Read response.
-    let frame = framed
-        .next()
-        .await
-        .ok_or_else(|| "no response".to_string())?
-        .map_err(|e| format!("read: {e}"))?;
-
-    let resp: Response =
-        serde_json::from_slice(&frame).map_err(|e| format!("parse response: {e}"))?;
+    let resp = call_with_timeout(
+        sock,
+        "ping",
+        serde_json::Value::Null,
+        request_timeout("ping"),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
 
     if let Some(err) = resp.error {
         return Err(format!(
@@ -5889,7 +6441,7 @@ async fn try_ping(sock: &Path) -> Result<(), String> {
 
 /// Query daemon version over IPC.
 async fn try_daemon_version(sock: &Path) -> Result<String, String> {
-    let resp = call(&sock.to_path_buf(), "version", serde_json::Value::Null)
+    let resp = call(sock, "version", serde_json::Value::Null)
         .await
         .map_err(|e| format!("{e}"))?;
     if let Some(err) = resp.error {
@@ -8122,9 +8674,325 @@ BAZ=
     }
 
     #[test]
+    fn agent_wrapper_modes_preserve_delegated_default_and_require_exact_service_pairing() {
+        let cli = Cli::try_parse_from(["opaque", "agent", "run", "--", "codex"]).unwrap();
+        let Some(Cmd::Agent {
+            action:
+                AgentAction::Run {
+                    command,
+                    ttl_secs,
+                    mode,
+                    service,
+                    ..
+                },
+        }) = cli.cmd
+        else {
+            panic!("expected agent wrapper");
+        };
+        assert_eq!(mode, "delegated");
+        assert!(service.is_none());
+        assert_eq!(
+            agent_session_start_params(&command, ttl_secs, &mode, service.as_deref()).unwrap(),
+            serde_json::json!({"label":"codex","mode":"delegated"})
+        );
+        let cli = Cli::try_parse_from([
+            "opaque",
+            "agent",
+            "run",
+            "--mode",
+            "autonomous",
+            "--service",
+            "onboarding",
+            "--ttl-secs",
+            "900",
+            "--",
+            "opaque-mcp",
+        ])
+        .unwrap();
+        let Some(Cmd::Agent {
+            action:
+                AgentAction::Run {
+                    command,
+                    ttl_secs,
+                    mode,
+                    service,
+                    ..
+                },
+        }) = cli.cmd
+        else {
+            panic!("expected service wrapper");
+        };
+        assert_eq!(
+            agent_session_start_params(&command, ttl_secs, &mode, service.as_deref()).unwrap(),
+            serde_json::json!({"label":"opaque-mcp","mode":"autonomous","service":"onboarding","ttl_secs":900})
+        );
+        assert!(
+            Cli::try_parse_from([
+                "opaque",
+                "agent",
+                "run",
+                "--mode",
+                "autonomous",
+                "--",
+                "codex"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "opaque",
+                "agent",
+                "run",
+                "--mode",
+                "break_glass",
+                "--",
+                "codex"
+            ])
+            .is_err()
+        );
+        assert!(
+            agent_session_start_params(&command, None, "delegated", Some("onboarding")).is_err()
+        );
+        assert!(agent_session_start_params(&command, None, "autonomous", None).is_err());
+        assert!(
+            agent_session_start_params(&command, None, "autonomous", Some("bad service")).is_err()
+        );
+        assert!(agent_session_start_params(&[], None, "delegated", None).is_err());
+    }
+
+    #[test]
+    fn provisioning_cli_assertions_are_bounded_and_cannot_carry_extra_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("assertion.json");
+        let valid = serde_json::json!({"credential_id":"YQ","authenticator_data":"Yg","client_data_json":"Yw","signature":"ZA"});
+        std::fs::write(&path, serde_json::to_vec(&valid).unwrap()).unwrap();
+        let (method, params) = provisioning_command_params(ProvisioningAction::BindComplete {
+            challenge_id: "exact-challenge".into(),
+            assertion: path.clone(),
+        })
+        .unwrap();
+        assert_eq!(method, "identity.provisioning.bind_complete");
+        assert_eq!(params["assertion"], valid);
+        assert_eq!(params["challenge_id"], "exact-challenge");
+        for invalid in [
+            serde_json::json!([]),
+            serde_json::json!({"credential_id":"YQ"}),
+            {
+                let mut extra = valid.clone();
+                extra["roles"] = serde_json::json!(["admin"]);
+                extra
+            },
+            {
+                let mut empty = valid.clone();
+                empty["signature"] = "".into();
+                empty
+            },
+        ] {
+            std::fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+            assert!(
+                provisioning_command_params(ProvisioningAction::MandateComplete {
+                    challenge_id: "exact-challenge".into(),
+                    assertion: path.clone()
+                })
+                .is_err()
+            );
+        }
+        std::fs::write(&path, vec![b' '; 16_385]).unwrap();
+        assert!(
+            provisioning_command_params(ProvisioningAction::BindComplete {
+                challenge_id: "exact-challenge".into(),
+                assertion: path
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn provisioning_cli_issue_preserves_exact_recipient_and_request_identity() {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let cli = Cli::try_parse_from([
+            "opaque",
+            "provisioning",
+            "issue",
+            "--mandate",
+            "mandate-id",
+            "--issuer",
+            "https://issuer.example",
+            "--subject",
+            "Exact-Subject",
+            "--ttl-secs",
+            "300",
+            "--request-id",
+            &request_id,
+        ])
+        .unwrap();
+        let Some(Cmd::Provisioning { action }) = cli.cmd else {
+            panic!("expected provisioning issue");
+        };
+        let (method, params) = provisioning_command_params(action).unwrap();
+        assert_eq!(method, "identity.provisioning.issue");
+        assert_eq!(
+            params,
+            serde_json::json!({"mandate_id":"mandate-id","recipient_issuer":"https://issuer.example","recipient_subject":"Exact-Subject","ttl_secs":300,"request_id":request_id})
+        );
+        assert!(
+            Cli::try_parse_from(["opaque", "provisioning", "revoke", "role", "admin"]).is_err()
+        );
+        assert!(
+            provisioning_command_params(ProvisioningAction::Issue {
+                mandate: "m".into(),
+                issuer: "i".into(),
+                subject: "s".into(),
+                ttl_secs: 300,
+                request_id: "reuse-anything".into()
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
     fn identity_roles_requires_at_least_one_role() {
         use clap::Parser;
         assert!(Cli::try_parse_from(["opaque", "identity", "roles", "hum_x"]).is_err());
+    }
+
+    #[test]
+    fn ssh_plan_selects_only_title_and_bounded_expiry_without_caller_transport_controls() {
+        let cli = Cli::try_parse_from(["opaque", "task", "plan-ssh"]).unwrap();
+        let Some(Cmd::Task { action }) = cli.cmd else {
+            panic!("expected task")
+        };
+        let (method, params) = task_command_params(action).unwrap();
+        assert_eq!(method, "task_plan_ssh");
+        assert_eq!(
+            params,
+            serde_json::json!({"title":"Service health on approved host","expires_in_secs":300})
+        );
+        for value in ["0", "301", "-1"] {
+            assert!(
+                Cli::try_parse_from(["opaque", "task", "plan-ssh", "--expires-in-secs", value])
+                    .is_err()
+            );
+        }
+        for flag in [
+            "--command",
+            "--host",
+            "--principal",
+            "--private-key",
+            "--vault-role",
+        ] {
+            assert!(
+                Cli::try_parse_from(["opaque", "task", "plan-ssh", flag, "unreviewed"]).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn task_commands_require_broker_ids_and_explicit_manifest_paths() {
+        for (command, method) in [
+            ("run", "task_run"),
+            ("show", "task_get"),
+            ("revoke", "task_revoke"),
+        ] {
+            let cli = Cli::try_parse_from(["opaque", "task", command, "task-123"]).unwrap();
+            let Some(Cmd::Task { action }) = cli.cmd else {
+                panic!("expected task command")
+            };
+            let (actual_method, params) = task_command_params(action).unwrap();
+            assert_eq!(actual_method, method);
+            assert_eq!(params["task_id"], "task-123");
+            assert!(params.get("approved").is_none());
+            assert!(Cli::try_parse_from(["opaque", "task", command]).is_err());
+        }
+        assert!(Cli::try_parse_from(["opaque", "task", "plan"]).is_err());
+        assert_eq!(
+            task_command_params(TaskAction::List { cursor: None })
+                .unwrap()
+                .0,
+            "task_list"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("manifest.json");
+        std::fs::write(&path, r#"{"schema_version":1,"title":"Dogfood","expires_in_secs":600,"actions":[{"repo":"owner/repo","secret_name":"MARKER","value_ref":"vault:kv/data/demo?version=1#MARKER"}]}"#).unwrap();
+        let (method, params) = task_command_params(TaskAction::Plan {
+            manifest: path.clone(),
+        })
+        .unwrap();
+        assert_eq!(method, "task_plan");
+        assert_eq!(params["manifest"]["actions"][0]["repository_id"], 0);
+        let mut invalid = params["manifest"].clone();
+        invalid["approved"] = true.into();
+        std::fs::write(&path, invalid.to_string()).unwrap();
+        assert!(task_command_params(TaskAction::Plan { manifest: path }).is_err());
+    }
+
+    #[test]
+    fn task_receipt_reports_uncertainty_and_exact_authority_without_claiming_verification() {
+        use opaque_core::task::*;
+        let action = PublishAction {
+            repo: "owner/repo".into(),
+            repository_id: 42,
+            secret_name: "MARKER".into(),
+            value_ref: "vault:kv/data/demo?version=7#MARKER".into(),
+            github_token_ref: None,
+        };
+        let manifest = TaskManifest {
+            schema_version: 1,
+            title: "Dogfood".into(),
+            expires_in_secs: 600,
+            github_api_url: "https://api.github.com".into(),
+            vault_api_url: "https://vault.example.com".into(),
+            actions: vec![action.clone().into()],
+        };
+        let mut task = TaskRecord {
+            tenant: None,
+            id: "task-1".into(),
+            manifest_digest: manifest.digest().unwrap(),
+            manifest,
+            owner_key: "owner".into(),
+            created_at: 100,
+            expires_at: 700,
+            approved_at: Some(101),
+            approval_mode: Some(TaskApprovalMode::Native),
+            state: TaskState::Partial,
+            release_observation: None,
+            slots: vec![TaskSlot {
+                id: "task-1:01".into(),
+                action: action.into(),
+                state: SlotState::Unknown,
+                request_id: Some("r".into()),
+                reserved_at: Some(102),
+                finished_at: Some(103),
+                outcome: Some(SlotOutcome {
+                    ssh_receipt: None,
+                    inference_receipt: None,
+                    provider_run_id: None,
+                    state: SlotState::Unknown,
+                    code: "transport_unknown".into(),
+                }),
+            }],
+        };
+        let output = render_task_receipt(&task);
+        for expected in [
+            "owner/repo / MARKER",
+            "repository 42",
+            "version=7#MARKER",
+            "Charged: 1/1",
+            "unknown (charged; do not retry)",
+            "fresh approval",
+            "native approval",
+            &task.manifest_digest,
+        ] {
+            assert!(output.contains(expected), "missing {expected}");
+        }
+        task.approval_mode = Some(TaskApprovalMode::InsecureTest);
+        let output = render_task_receipt(&task);
+        assert!(output.contains("INSECURE TEST APPROVAL"));
+        assert!(!output.contains("native approval"));
+        task.approval_mode = None;
+        assert!(render_task_receipt(&task).contains("approval mode unavailable"));
+        task.approved_at = None;
+        assert!(render_task_receipt(&task).contains("Approval: not granted"));
     }
 
     #[test]

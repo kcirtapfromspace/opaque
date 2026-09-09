@@ -1,0 +1,111 @@
+# Isolated developer dogfood only. Replace data_dir with your own short path.
+# Every permitted write targets one disposable marker name in one named repo.
+data_dir = "/tmp/opaque-live-dogfood"
+enable_task_grants = true
+approval_backend = "native"
+enforce_agent_sessions = false
+require_seal = false
+
+[[rules]]
+name = "review-three-app-dogfood-task"
+operation_pattern = "github.publish_manifest"
+allow = true
+client_types = ["human", "agent"]
+[rules.secret_names]
+patterns = [
+  "keychain:opaque/github-pat",
+  "vault:kv/data/opaque-dogfood?version=1#OPAQUE_MARKER",
+  "vault:kv/data/opaque-dogfood?version=1#OPAQUE_ROTATION",
+  "vault:kv/data/opaque-dogfood?version=1#NDITH_MARKER",
+  "vault:kv/data/opaque-dogfood?version=1#NDITH_ROTATION",
+  "vault:kv/data/opaque-dogfood?version=1#ADANIMA_MARKER",
+  "vault:kv/data/opaque-dogfood?version=1#ADANIMA_ROTATION",
+]
+[rules.approval]
+require = "always"
+factors = ["local_bio"]
+lease_ttl = 0
+
+[[rules]]
+name = "opaque-dogfood-marker"
+operation_pattern = "github.set_actions_secret"
+allow = true
+client_types = ["human", "agent"]
+[rules.target]
+fields = { repo = "kcirtapfromspace/opaque", secret_name = "OPAQUE_DOGFOOD_MARKER" }
+[rules.secret_names]
+patterns = ["keychain:opaque/github-pat", "vault:kv/data/opaque-dogfood?version=1#OPAQUE_MARKER"]
+[rules.approval]
+require = "always"
+factors = ["local_bio"]
+lease_ttl = 0
+
+[[rules]]
+name = "opaque-dogfood-rotation"
+operation_pattern = "github.set_actions_secret"
+allow = true
+client_types = ["human", "agent"]
+[rules.target]
+fields = { repo = "kcirtapfromspace/opaque", secret_name = "OPAQUE_DOGFOOD_ROTATION" }
+[rules.secret_names]
+patterns = ["keychain:opaque/github-pat", "vault:kv/data/opaque-dogfood?version=1#OPAQUE_ROTATION"]
+[rules.approval]
+require = "always"
+factors = ["local_bio"]
+lease_ttl = 0
+
+[[rules]]
+name = "ndith-dogfood-marker"
+operation_pattern = "github.set_actions_secret"
+allow = true
+client_types = ["human", "agent"]
+[rules.target]
+fields = { repo = "kcirtapfromspace/no_drake_in_the_house", secret_name = "OPAQUE_DOGFOOD_MARKER" }
+[rules.secret_names]
+patterns = ["keychain:opaque/github-pat", "vault:kv/data/opaque-dogfood?version=1#NDITH_MARKER"]
+[rules.approval]
+require = "always"
+factors = ["local_bio"]
+lease_ttl = 0
+
+[[rules]]
+name = "ndith-dogfood-rotation"
+operation_pattern = "github.set_actions_secret"
+allow = true
+client_types = ["human", "agent"]
+[rules.target]
+fields = { repo = "kcirtapfromspace/no_drake_in_the_house", secret_name = "OPAQUE_DOGFOOD_ROTATION" }
+[rules.secret_names]
+patterns = ["keychain:opaque/github-pat", "vault:kv/data/opaque-dogfood?version=1#NDITH_ROTATION"]
+[rules.approval]
+require = "always"
+factors = ["local_bio"]
+lease_ttl = 0
+
+[[rules]]
+name = "adanima-dogfood-marker"
+operation_pattern = "github.set_actions_secret"
+allow = true
+client_types = ["human", "agent"]
+[rules.target]
+fields = { repo = "Nereus-Data/admachina", secret_name = "OPAQUE_DOGFOOD_MARKER" }
+[rules.secret_names]
+patterns = ["keychain:opaque/github-pat", "vault:kv/data/opaque-dogfood?version=1#ADANIMA_MARKER"]
+[rules.approval]
+require = "always"
+factors = ["local_bio"]
+lease_ttl = 0
+
+[[rules]]
+name = "adanima-dogfood-rotation"
+operation_pattern = "github.set_actions_secret"
+allow = true
+client_types = ["human", "agent"]
+[rules.target]
+fields = { repo = "Nereus-Data/admachina", secret_name = "OPAQUE_DOGFOOD_ROTATION" }
+[rules.secret_names]
+patterns = ["keychain:opaque/github-pat", "vault:kv/data/opaque-dogfood?version=1#ADANIMA_ROTATION"]
+[rules.approval]
+require = "always"
+factors = ["local_bio"]
+lease_ttl = 0

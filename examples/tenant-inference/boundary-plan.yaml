@@ -1,0 +1,66 @@
+# Design record only. Not a Kubernetes object or a supported Opaque task schema.
+design_version: 1
+status: proposed_synthetic_fixture
+tenant_definition: pending_user_decision
+execution_evidence:
+  local: separate_containers_shared_kernel
+  microvm: unverified_requires_supported_host
+  tee_attestation: not_claimed
+identity:
+  issuer: pending_trusted_configuration
+  audience: pending_trusted_configuration
+  tenant_authority: broker_membership_mapping
+  agent_supplied_tenant_is_authority: false
+tenants:
+  - id: synthetic-a
+    principal: synthetic-subject-a
+    dataset_handle: synthetic-a/orders/v1
+    input_volume: synthetic-a-input
+    output_volume: synthetic-a-output
+    source_access: read_only
+  - id: synthetic-b
+    principal: synthetic-subject-b
+    dataset_handle: synthetic-b/orders/v1
+    input_volume: synthetic-b-input
+    output_volume: synthetic-b-output
+    source_access: read_only
+data:
+  classification: synthetic_only
+  schema: [record_id, product_code, quantity, synthetic_canary]
+  query: trusted_fixed_template
+  max_result_rows: 4
+  max_result_bytes: 4096
+  canary_rule: each_tenant_has_distinct_canary_never_in_other_tenant_output
+model:
+  adapter_contract: pending_implementation
+  disclosure_grant_required: true
+  live_cluster_request: not_performed
+  metadata_candidate: gemma-4-E2B-it-Q3_K_M.gguf
+  weight_digest: unverified
+  current_processor_classification: shared_privileged_synthetic_only
+  max_attempts: 1
+  unknown_result_retry: forbidden
+  expiry_seconds: 300
+network:
+  agent_allowed_destination: authenticated_broker_gateway_only
+  data_source_reachable_from: own_tenant_query_worker_only
+  model_reachable_from: trusted_provider_adapter_only
+  cluster_network_policy_enforcement: unverified
+custody:
+  agent_mounts: [own_workspace]
+  source_credentials: own_tenant_query_worker
+  provider_credentials: trusted_provider_adapter
+  signing_credentials: separate_approver
+  receipt_payload: scoped_metadata_and_hashes_only
+acceptance:
+  - cross_tenant_identity_and_dataset_denied
+  - wrong_audience_expired_and_revoked_token_denied
+  - cross_tenant_volume_and_network_access_denied
+  - direct_source_and_model_access_denied
+  - arbitrary_sql_file_url_and_extension_access_denied
+  - model_disclosure_requires_distinct_scoped_grant
+  - result_rows_bytes_and_output_tokens_bounded
+  - reserved_attempt_persisted_before_dispatch
+  - restart_replay_and_unknown_result_cause_no_second_dispatch
+  - private_canary_absent_from_other_tenant_output_and_receipts
+  - expiry_cleanup_observed_without_recreation

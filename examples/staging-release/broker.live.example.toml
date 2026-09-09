@@ -1,0 +1,57 @@
+# Prepared LIVE broker configuration. No provider credentials or fixture signer.
+# Copy into separately administered broker custody, replace the PUBLIC key below,
+# and seal as the daemon service account before starting. See LIVE-RUNBOOK.md.
+data_dir = "/var/lib/opaque"
+enable_task_grants = true
+require_seal = true
+approval_backend = "native"
+workstation_test_mode = false
+# Dedicated single-workload example: peer-UID ownership plus native approval
+# for every task. This does not demonstrate delegated/session identity.
+# Never apply this setting over an existing deployment requiring sessions.
+enforce_agent_sessions = false
+workstation_approvers = [
+  { public_key_hex = "REPLACE_WITH_ENROLLED_WORKSTATION_PUBLIC_KEY", name = "Staging release reviewer" },
+]
+
+[trust_domain]
+enforce = true
+socket_group = "7999"
+socket_path = "/run/opaque/opaqued.sock"
+
+[approval]
+# Keep loopback for a workstation-local service. For a separate broker host or
+# container, select its intended interface and expose it only over a trusted
+# tunnel/operator network; keep agent IPC separate and pin the TLS certificate.
+server_bind = "127.0.0.1:7381"
+timeout_secs = 300
+
+[[rules]]
+name = "review-one-staging-manifest"
+operation_pattern = "github.release_manifest"
+allow = true
+client_types = ["agent", "human"]
+[rules.approval]
+require = "always"
+factors = ["paired_workstation"]
+lease_ttl = 0
+
+[[rules]]
+name = "dispatch-one-staging-action"
+operation_pattern = "github.dispatch_staging_workflow"
+allow = true
+client_types = ["agent", "human"]
+[rules.approval]
+require = "always"
+factors = ["paired_workstation"]
+lease_ttl = 0
+
+[[rules]]
+name = "observe-staging-without-new-authority"
+operation_pattern = "github.observe_staging_workflow"
+allow = true
+client_types = ["agent", "human"]
+[rules.approval]
+require = "never"
+factors = []
+lease_ttl = 0

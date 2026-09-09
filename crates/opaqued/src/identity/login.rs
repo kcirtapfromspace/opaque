@@ -112,8 +112,16 @@ impl IdentityRuntime {
         let state = random_urlsafe(32);
         let nonce = random_urlsafe(32);
         let verifier = random_urlsafe(48);
-        let auth_url =
-            oidc.build_auth_url(&state, &nonce, &pkce_challenge(&verifier), &redirect_uri);
+        let auth_url = match &self.config.persona {
+            Some(persona) => oidc.build_auth_url_with_persona(
+                &state,
+                &nonce,
+                &pkce_challenge(&verifier),
+                &redirect_uri,
+                persona,
+            )?,
+            None => oidc.build_auth_url(&state, &nonce, &pkce_challenge(&verifier), &redirect_uri),
+        };
 
         // Supersede: abort every previously pending attempt's listener.
         {
@@ -357,7 +365,14 @@ async fn complete_login(
         }
     };
 
-    let verified = match oidc.verify_id_token(&id_token, nonce).await {
+    let verification = match &runtime.config.persona {
+        Some(persona) => {
+            oidc.verify_id_token_with_persona(&id_token, nonce, persona)
+                .await
+        }
+        None => oidc.verify_id_token(&id_token, nonce).await,
+    };
+    let verified = match verification {
         Ok(v) => v,
         Err(e) => {
             warn!("id_token rejected: {e}");
@@ -366,6 +381,16 @@ async fn complete_login(
             };
         }
     };
+
+    // Match the verified issuer-local subject, never a client-supplied tenant
+    // label or email claim. Rejection precedes first-human admin bootstrap.
+    if !runtime.config.allowed_subjects.is_empty()
+        && !runtime.config.allowed_subjects.contains(&verified.sub)
+    {
+        return AttemptOutcome::Failed {
+            reason: "identity subject not permitted by daemon policy".into(),
+        };
+    }
 
     // Email domain allowlist (fail closed when configured and email absent).
     let domains = &runtime.config.allowed_email_domains;
@@ -383,10 +408,13 @@ async fn complete_login(
         }
     }
 
-    // Bootstrap: the very first human gets the full role set; later humans
-    // start as operator and are promoted by an admin.
+    // Existing deployments retain first-human bootstrap and operator defaults.
+    // Persona provisioning admits identity only: it never creates authority.
+    // Establish an explicit administrator before enabling this opt-in mode.
     let first_human = matches!(runtime.store.count_humans(), Ok(0));
-    let initial_roles: BTreeSet<Role> = if first_human {
+    let initial_roles: BTreeSet<Role> = if runtime.config.persona.is_some() {
+        BTreeSet::new()
+    } else if first_human {
         BTreeSet::from([Role::Admin, Role::Approver, Role::Operator])
     } else {
         BTreeSet::from([Role::Operator])
@@ -412,6 +440,25 @@ async fn complete_login(
         return AttemptOutcome::Failed {
             reason: "this identity has been disabled".into(),
         };
+    }
+
+    if runtime.config.persona.is_some() {
+        let persisted = verified
+            .persona
+            .as_ref()
+            .ok_or_else(|| "missing verified persona".to_string())
+            .and_then(|claims| {
+                runtime.store.record_persona_snapshot(
+                    &principal.id,
+                    claims,
+                    opaque_core::identity::now_unix(),
+                )
+            });
+        if persisted.is_err() {
+            return AttemptOutcome::Failed {
+                reason: "fresh identity persona could not be persisted".into(),
+            };
+        }
     }
 
     let session = match runtime.store.create_human_session(
@@ -564,7 +611,9 @@ mod tests {
             redirect_port: None,
             session_ttl_secs: None,
             allowed_email_domains: domains,
+            allowed_subjects: vec![],
             required: false,
+            persona: None,
             service_principals: vec![ServicePrincipalConfig {
                 name: "ci".into(),
                 roles: vec!["operator".into()],
@@ -615,6 +664,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tenant_subject_membership_is_checked_before_admin_bootstrap() {
+        for allowed in [false, true] {
+            let server = MockServer::start().await;
+            mount_discovery(&server, &server.uri()).await;
+            let directory = tempfile::tempdir().unwrap();
+            let subject = base_claims(&server.uri(), "probe")["sub"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let mut config = test_config(&server.uri(), vec![]);
+            config.allowed_subjects = vec![if allowed {
+                subject
+            } else {
+                "different-tenant-member".into()
+            }];
+            let runtime = Arc::new(IdentityRuntime::initialize(config, directory.path()).unwrap());
+            let login = runtime.login_start().await.unwrap();
+            let nonce = query_param(&login.auth_url, "nonce").unwrap();
+            let state = query_param(&login.auth_url, "state").unwrap();
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id_token": sign_id_token(base_claims(&server.uri(), &nonce), "test-key-1"),
+                })))
+                .mount(&server)
+                .await;
+            drive_callback(&login.auth_url, "valid-code", &state).await;
+            let outcome = wait_terminal(&runtime, &login.attempt_id).await;
+            assert_eq!(matches!(outcome, AttemptOutcome::Done { .. }), allowed);
+            assert_eq!(
+                runtime.store.count_humans().unwrap(),
+                if allowed { 1 } else { 0 }
+            );
+            assert_eq!(runtime.current_identity_json().is_some(), allowed);
+            if !allowed {
+                assert!(
+                    matches!(outcome, AttemptOutcome::Failed { reason } if reason.contains("subject"))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn full_login_flow_bootstraps_first_admin() {
         let server = MockServer::start().await;
         mount_discovery(&server, &server.uri()).await;
@@ -653,6 +745,91 @@ mod tests {
 
         // Service principal from config was registered at initialize.
         assert_eq!(rt.store.list_principals().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn persona_login_persists_signed_group_changes_without_default_authority() {
+        let server = MockServer::start().await;
+        mount_discovery(&server, &server.uri()).await;
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config(&server.uri(), vec![]);
+        config.persona = Some(crate::identity::PersonaConfig {
+            groups_claim: "groups".into(),
+            max_age_secs: 60,
+        });
+        let runtime = Arc::new(IdentityRuntime::initialize(config, directory.path()).unwrap());
+        for (index, groups, revision) in [
+            (0, vec!["team-b", "team-a"], 1),
+            (1, vec!["team-a", "team-b", "team-b"], 1),
+            (2, vec![], 2),
+            (3, vec!["team-a", "team-b"], 3),
+        ] {
+            let started = runtime.login_start().await.unwrap();
+            assert_eq!(
+                query_param(&started.auth_url, "max_age").as_deref(),
+                Some("60")
+            );
+            let state = query_param(&started.auth_url, "state").unwrap();
+            let nonce = query_param(&started.auth_url, "nonce").unwrap();
+            let code = format!("persona-{index}");
+            let mut claims = base_claims(&server.uri(), &nonce);
+            claims["groups"] = serde_json::json!(groups);
+            claims["auth_time"] = claims["iat"].clone();
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .and(body_string_contains(format!("code={code}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id_token":sign_id_token(claims,"test-key-1")
+                })))
+                .mount(&server)
+                .await;
+            drive_callback(&started.auth_url, &code, &state).await;
+            assert!(matches!(
+                wait_terminal(&runtime, &started.attempt_id).await,
+                AttemptOutcome::Done { .. }
+            ));
+            let principal = runtime.current_human_principal().unwrap();
+            assert!(principal.roles.is_empty());
+            let snapshot = runtime
+                .store
+                .persona_snapshot(&principal.id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(snapshot.revision, revision);
+            assert!(snapshot.is_fresh(opaque_core::identity::now_unix(), 60));
+        }
+    }
+
+    #[tokio::test]
+    async fn persona_login_missing_fresh_authentication_never_bootstraps_a_principal() {
+        let server = MockServer::start().await;
+        mount_discovery(&server, &server.uri()).await;
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config(&server.uri(), vec![]);
+        config.persona = Some(crate::identity::PersonaConfig {
+            groups_claim: "groups".into(),
+            max_age_secs: 60,
+        });
+        let runtime = Arc::new(IdentityRuntime::initialize(config, directory.path()).unwrap());
+        let started = runtime.login_start().await.unwrap();
+        let state = query_param(&started.auth_url, "state").unwrap();
+        let nonce = query_param(&started.auth_url, "nonce").unwrap();
+        let mut claims = base_claims(&server.uri(), &nonce);
+        claims["groups"] = serde_json::json!(["administrators"]);
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id_token":sign_id_token(claims,"test-key-1")
+            })))
+            .mount(&server)
+            .await;
+        drive_callback(&started.auth_url, "missing-auth-time", &state).await;
+        assert!(matches!(
+            wait_terminal(&runtime, &started.attempt_id).await,
+            AttemptOutcome::Failed { .. }
+        ));
+        assert_eq!(runtime.store.count_humans().unwrap(), 0);
+        assert!(runtime.current_identity_json().is_none());
     }
 
     #[tokio::test]

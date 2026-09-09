@@ -9,6 +9,34 @@ notes; `scripts/release-prep.sh` stamps the section below at release time.
 
 ## [Unreleased]
 
+### Added
+
+- **Optional pilot contact capture** in the public demo: a visitor can
+  request a pilot, stored in an isolated `LeadInbox` SQLite object (v2
+  migration, own admin secret), separate from queue/task authority. Consent
+  required, retention/abuse bounded, save confirmed only after durable write
+
+### Changed
+
+- **`opaqued` split into 7 crates**: ~65k-line monolith is now a ~23k-line
+  composition root over `opaque-core`, `opaque-approval`,
+  `opaque-native-approval`, `opaque-providers`, `opaque-sandbox`,
+  `opaque-bounded-work`, `opaque-tenant`, `opaque-federation-runtime`.
+  1900+ tests and a live-daemon smoke test verified behavior-identical
+- Renamed `opaque-metrics` to `opaque-showcase` (it's demo/sales collateral,
+  not telemetry) and excluded it from `default-members` — use `--workspace`
+  or `-p opaque-showcase` to build it
+
+### Fixed
+
+- Audit retention could delete rows before chain-integrity verification, an
+  acknowledged write could still be lost, a failed operation could retry
+  unsafely; protocol/subprocess lifecycles are now bounded instead of able
+  to stall or panic; receipt/dashboard evidence no longer races under
+  concurrent access
+- The hosted demo polled and wrote to storage continuously while idle,
+  burning Workers usage; polling now backs off idle and writes batch
+
 ## [0.2.0] - 2026-09-03
 
 ### Added

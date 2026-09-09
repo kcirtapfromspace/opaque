@@ -151,3 +151,12 @@ how *effective permission = agent ∩ human* is enforced.
 - The loopback redirect follows RFC 8252: `state` binds the callback to the
   attempt, PKCE binds the code to the daemon, and the ID token's `nonce`, `iss`,
   `aud`, signature, and expiry are all verified against the IdP's JWKS.
+
+## Delegation in bounded work
+
+A delegation token is exactly what an agent session presents when planning
+a [bounded-work task](bounded-work.md) on a human's behalf: `task plan*`
+still requires a fresh out-of-band approval to mint the session, and every
+subsequent `task run`/`show`/`reconcile` call carries the same verified
+`PrincipalContext` described above, so a human logging out or a delegation
+being revoked kills in-flight task access exactly like any other operation.

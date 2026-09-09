@@ -1,384 +1,207 @@
-# Opaque Architecture
+# Architecture
 
-This document proposes an architecture for an approval-gated secrets broker that can be used alongside AI coding tools without disclosing plaintext secrets to the model.
+Opaque lets a team give an agent a bounded piece of work, keep control while
+it runs, and inspect the evidence after. Every capability — secrets,
+identity, policy, certificates, receipts — serves one progression:
 
-## 1. Design Goals
+**Policy → Approval → Execute → Sanitize → Audit**, and for multi-step work,
+**plan → review → approve → run → inspect** (see [bounded work](bounded-work.md)).
 
-- No plaintext secret disclosure to LLM context:
-  - secrets must not be pasted into prompts
-  - secrets must not be returned via tool output
-  - secrets must not appear in logs
-- Proof-of-life + explicit user approval before first use (and optionally per-use):
-  - security key (FIDO2)
-  - local OS biometrics (Touch ID on macOS; Linux varies)
-  - second-device biometric approval (FaceID/TouchID on iOS)
-- Pluggable secret sources:
-  - 1Password
-  - HashiCorp Vault
-  - extendable to other providers
-- Pluggable delivery targets:
-  - "agent-safe" operations (broker performs the operation; model receives sanitized results)
-  - environment/process execution (for human-driven workflows; higher risk if the model can run arbitrary commands)
-  - SaaS secret stores (GitHub Actions secrets, GitHub Codespaces secrets, GitLab CI variables)
-  - Kubernetes secrets (cluster-side) without exposing values to the client
-  - cloud provider access (starting with AWS)
-- Strong auditability: who approved what, when, and for which target.
+LLMs get **operations**, never plaintext secret values. Nothing a local
+client process claims about itself is trusted, since an agent can drive the
+same `opaque` CLI a human does.
 
-## 2. Important Constraint (Reality Check)
+## 1. Design goals
 
-If an LLM agent can run arbitrary commands on your machine and has unconstrained network egress, it can often exfiltrate anything it can read.
+- No plaintext secret disclosure to LLM context: not in prompts, tool
+  output, or logs.
+- Presence, not classification: authority comes from an out-of-band approval
+  act, not from guessing whether a process is "the human" or "the agent."
+- Custody, not just correctness: once [trust-domain enforcement](deployment.md)
+  is on, the daemon's keys, database, and config belong to an identity the
+  agent's uid cannot touch.
+- Tamper-evidence over the whole record: every audit event HMAC-chains;
+  federated fleets export that chain to a SIEM in independently verifiable form.
+- Bounded, inspectable work: a multi-step task is a pinned manifest approved
+  once, each action charging one slot, with a receipt — not an open-ended
+  credential handed to the agent.
 
-There are two distinct goals you called out:
+## 2. Threat model
 
-1. Prevent **accidental disclosure** (secrets appearing in prompts/logs/tool output).
-2. Resist a **malicious agent runtime** (actively trying to steal secrets).
+An agent with arbitrary commands and unconstrained egress can exfiltrate
+anything it can read. Opaque doesn't claim otherwise. What it does claim:
 
-To satisfy (1), it is usually sufficient that secret *values* never flow back through the LLM-visible channels.
+1. **Accidental disclosure is prevented by construction.** No operation
+   returns a plaintext secret to a CLI/MCP/web client (`REVEAL` doesn't
+   exist); typestate in `opaque-core` makes an unsanitized response a
+   compile error, not a runtime check someone can forget.
+2. **A malicious agent runtime is resisted, not just an honest one.** The
+   daemon executes secret-using operations itself. Client classification
+   (human vs. agent) is audit-only, never a security gate — an agent can
+   present the same executable path and peer credentials a human's terminal
+   does. Sandboxed exec (Landlock/seccomp on Linux, Seatbelt on macOS)
+   bounds an agent-driven command when exec mode is used at all.
+3. **A compromised daemon-uid process is bounded by trust-domain
+   separation**, not by this codebase alone — see [deployment](deployment.md).
 
-To satisfy (2), you must also ensure the agent-controlled runtime never gets access to plaintext secrets *and* cannot trivially exfiltrate them by running arbitrary commands (or by asking the broker to perform “reveal” operations).
+## 3. Crates
 
-Therefore, "never disclose secrets to the LLM" requires **one** of:
+`opaqued`'s original ~65k-line monolith is now a ~23k-line composition root
+over focused crates. Each crate owns one concern; `opaqued` wires them
+together and runs the RPC dispatch loop.
 
-1. Secrets never enter the agent-controlled process space (preferred):
-   - the broker executes privileged operations itself (HTTP calls, SaaS updates, etc).
-2. Agent-controlled processes run inside a sandbox with controls:
-   - network egress allowlists
-   - output redaction
-   - explicit policy allowlists for which binaries can receive which secrets
-
-Opaque is designed around (1) by default, and supports (2) as an opt-in compatibility mode.
-
-### 2.1 What "Hard Guarantee" Can Mean Here
-
-With careful API design, Opaque can offer a strong guarantee that:
-
-- plaintext secrets are never returned to the client (CLI/MCP) and therefore never enter the LLM context
-- plaintext secrets never enter the agent-controlled process space (in agent-safe operation mode)
-
-However, it cannot guarantee that a malicious agent cannot exfiltrate *other* sensitive data it can access (source code, files, API responses) unless the agent runtime itself is sandboxed.
-
-In practice, “hard guarantee” becomes:
-
-- **Hard guarantee (secrets):** achievable by never providing "reveal secret" APIs and by executing secret-using operations inside the broker.
-- **Hard guarantee (exfiltration):** requires sandboxing + network egress control for anything the agent can execute.
-
-## 3. High-Level System
-
-### Components
-
-- `opaqued` (local daemon)
-  - policy engine (who/what can request which secret use)
-  - provider connectors (1Password, Vault, etc)
-  - approval orchestration (proof-of-life, step-up auth)
-  - audit log
-  - operation executors:
-    - GitHub Actions/Codespaces secret sync
-    - GitLab CI variable sync
-    - Kubernetes secret/manifest operations
-    - AWS operations (signed proxy / SDK calls)
-    - HTTP proxy operations (strict allowlist)
-- `opaque` (CLI)
-  - user-facing configuration, setup, debugging
-  - “exec mode” wrapper (optional) to run a command with environment injected
-  - starts/stops the daemon
-- Approval factors
-  - `fido2` (hardware security key / passkey)
-  - `local-bio` (OS biometric prompt on the same machine)
-  - `ios-approve` (second-device approval)
-- Integrations
-  - MCP server (optional): exposes *operations* to agent tools without returning secret values
-  - GitHub/GitLab sync modules (push secrets to SaaS secret stores)
-
-### Supported platforms (v1)
-
-- macOS (LaunchAgent in GUI session — see [Deployment](deployment.md))
-- Linux (systemd user service in graphical session — see [Deployment](deployment.md))
-
-### Component diagram
+| Crate | Owns |
+|---|---|
+| `opaque-core` | Shared types: policy engine, operation/audit/proto, task manifests, tenant bindings, sealing, socket hygiene |
+| `opaqued` | Composition root: enclave, RPC dispatch, identity store, provisioning API, agent sessions |
+| `opaque-providers` | GitHub, GitLab, 1Password, Bitwarden, Vault, AWS. GCP/Azure/Doppler/Infisical are Cargo features `opaqued` enables by default, so all ten still ship in the daemon binary today |
+| `opaque-approval` | Device pairing, FIDO2, factor registry, native prompting, approval-server relay |
+| `opaque-native-approval` | Native review/auth shared by the daemon and the workstation approver |
+| `opaque-approve-helper` | Linux polkit review helper |
+| `opaque-approver` | Trusted paired-workstation full-manifest approver — a separate binary for a separate machine (`crates/opaque-approver/README.md`) |
+| `opaque-sandbox` | Landlock/seccomp/Seatbelt isolation, execve hooks, composite secret-resolver dispatch |
+| `opaque-bounded-work` | The [task](bounded-work.md) ledger, SSH certificate execution, inference brokering |
+| `opaque-tenant` | Tenant custody boundary, delegated IdP provisioning types |
+| `opaque-federation-runtime` | [Federation](federation.md): signed policy bundles, SIEM export, posture attestation |
+| `opaque-mcp` | MCP server for Claude Code and other MCP clients |
+| `opaque-web` | Read-only local dashboard |
+| `opaque` | CLI client |
+| `opaque-showcase` | Demo/sales collateral (chat + metrics gateway). Excluded from `default-members`, so it never compiles into a plain build or release binary |
 
 ```mermaid
 flowchart LR
-  Agent["LLM Tool (Codex / Claude Code)"] -->|requests operation| MCP["Opaque MCP (optional)"]
-  User["User"] -->|approve| Factor["Approval Factor(s)"]
-  MCP --> D["opaqued (daemon)"]
+  Agent["LLM tool (Codex / Claude Code)"] -->|requests operation| MCP["opaque-mcp"]
   CLI["opaque (CLI)"] --> D
-  Web["opaque-web (dashboard)"] -->|IPC + SQLite| D
-  Factor --> D
+  MCP --> D["opaqued"]
+  Web["opaque-web (read-only)"] -->|IPC + SQLite| D
+  Human["Human"] -->|out-of-band approval| Approval["opaque-approval /<br/>opaque-approver"]
+  Approval --> D
 
-  D --> P["Provider Connectors<br/>1Password / Vault / ..."]
-  D --> S["SaaS Targets<br/>GitHub / GitLab / ..."]
-  D --> X["Exec Sandbox (optional)<br/>run command with env"]
+  D --> Providers["opaque-providers<br/>GitHub / GitLab / 1Password /<br/>Bitwarden / Vault / AWS"]
+  D --> Sandbox["opaque-sandbox<br/>exec (optional)"]
+  D --> BoundedWork["opaque-bounded-work<br/>task ledger / SSH / inference"]
+  D --> Tenant["opaque-tenant"]
+  D --> Federation["opaque-federation-runtime"]
 ```
 
-## 4. Core Idea: "Secrets as Capabilities"
+## 4. Trust boundaries
 
-Opaque avoids returning plaintext values. Instead it grants **capabilities**:
+- **Trusted:** `opaqued`, the approval factor(s) and pairing/workstation
+  keys, configured provider credentials, the audit chain's HMAC key.
+- **Same-uid, tamper-evident not tamper-proof, until trust-domain
+  enforcement is on:** by default the daemon's DB and config live at the
+  agent's own uid, so a compromised agent account can read the HMAC key or
+  rewrite the DB. `opaque audit verify` and startup verification detect
+  this; they don't prevent it. A dedicated service account or separate
+  container turns it into a hard guarantee — see [deployment](deployment.md).
+- **Untrusted:** the LLM and its tool runtime, arbitrary agent-run commands,
+  dependencies pulled in at run time.
 
-- A capability is scoped to:
-  - a specific operation (ex: "set GitHub Actions secret")
-  - a specific target (repo/project/host)
-  - a time window (TTL)
-  - a calling identity (client)
-- The broker uses secrets internally to perform the operation.
-- The model receives results (status codes, resource IDs, sanitized payloads), not the secrets.
+## 5. Identity and policy
 
-This resembles how `ssh-agent` avoids handing out private keys: clients ask the agent to sign, not to reveal the key.
+Client identity is derived, never self-declared: Unix socket peer
+credentials (uid/gid/pid) plus executable path and SHA-256. (macOS Team-ID
+matching exists in policy but nothing populates it from a real code-signature
+check yet — treat it as inert.) Client type classification is **audit-only**
+— it never gates a decision, since an agent drives the same CLI a human does.
 
-## 5. Trust Boundaries
+Real authority comes from [identity](identity.md): a verified human (OIDC
+login, daemon-owned), an agent workload, or a config-declared service
+principal, with roles resolved live at request time — never embedded in a
+token, so revocation is immediate. Delegated access is the intersection of
+what the agent session and the delegating human may do.
 
-- **Trusted**:
-  - `opaqued` process (local daemon)
-  - the approval factor(s) and pairing keys
-  - configured provider connectors and their credentials (stored in OS keychain)
-- **Untrusted / semi-trusted**:
-  - the LLM and its tool runtime
-  - arbitrary commands the agent chooses to run
-  - dependencies installed during runs
+Policy rules match `client_id` × `operation` × `target`:
 
-## 6. Identity and Policy
-
-### Client identity (local)
-Minimum viable identification:
-
-- Unix socket peer creds: uid/gid/pid
-- executable path + SHA-256
-
-Stronger on macOS:
-
-- verify code signature + Team ID (treat "unsigned" as high risk)
-
-Policy rules should be expressible as:
-
-- allow `client_id` to invoke `operation` for `secret_ref` against `target`, with constraints
-
-Examples:
-
-- Allow the MCP server process to call `github.set_actions_secret` only for repos under `org/acme-*`.
-- Allow `opaque exec -- npm` to receive `NPM_TOKEN` but only when egress is limited to `registry.npmjs.org`.
-
-## 7. Approval (Proof of Life)
-
-Approval is required when:
-
-- a secret is used for the first time for a (client, operation, target) tuple
-- policy requires step-up for high-risk actions (ex: writing CI secrets)
-- a previous approval lease expired
-
-### Approval request contents (what the user sees)
-
-Keep it explicit and non-technical:
-
-- client: "Claude Code" (and executable hash)
-- action: "Set GitHub Actions secret"
-- target: `org/repo` and secret name (not value)
-- TTL: "approve for 10 minutes" or "one-time"
-
-### Native OS Popup Approvals (v1)
-
-Opaque v1 uses **native OS authentication prompts** (not terminal prompts) to ensure proof-of-life:
-
-- macOS:
-  - `LocalAuthentication` prompt using `LAPolicyDeviceOwnerAuthentication`
-  - Shows a system-owned Touch ID / password dialog
-  - Requires a GUI (Aqua) session — daemon must run as a LaunchAgent, never a LaunchDaemon
-- Linux (two-step flow):
-  - **Step 1: Intent dialog** — `zenity --question` or `kdialog --yesno` shows operation details before authentication
-  - **Step 2: Polkit authentication** — `CheckAuthorization` with `AllowUserInteraction` for system auth
-  - This separation ensures the user always sees what they are approving, regardless of whether the polkit agent displays operation details
-  - Requires a graphical session, a polkit auth agent, and `zenity` or `kdialog`
-  - Supported desktops: GNOME, KDE Plasma, MATE, XFCE, Cinnamon, Budgie, LXQt (see [Deployment](deployment.md) for full tier list)
-- iOS (second device, deferred to v3):
-  - QR pairing + Face ID gated approvals via a companion app (see [Mobile approvals](mobile-approvals.md))
-
-If the daemon is running without access to an interactive user session (headless / no auth agent / no display server), approvals **fail closed**. The daemon refuses to start. See [Deployment](deployment.md) for session detection requirements.
-
-### Approval sequence
-
-```mermaid
-sequenceDiagram
-  participant C as Client (CLI/MCP)
-  participant D as opaqued
-  participant A as Approval Factor (FIDO2 / iOS)
-
-  C->>D: RequestOperation(op, target, secret_refs)
-  D->>D: Evaluate policy + risk
-  alt approval required
-    D->>A: Challenge(request summary + nonce)
-    A->>D: SignedApproval(challenge)
-  end
-  D->>D: Fetch secrets from providers (if needed)
-  D->>D: Execute operation
-  D-->>C: Result (sanitized)
+```toml
+[[rules]]
+name = "mcp-github-only"
+client_id = "opaque-mcp"
+operation_pattern = "github.*"
+target_pattern = "org/acme-*"
+allow = true
 ```
 
-### iOS second-device factor (sketch)
+See [policy](policy.md) for the full rule and preset reference.
 
-- Pairing:
-  - daemon displays QR containing pairing public key + endpoint
-  - iOS app scans, establishes an encrypted channel, stores daemon identity
-- Approvals:
-  - daemon sends approval challenge (push notification or local-network delivery)
-  - user approves with FaceID/TouchID
-  - app signs challenge with Secure Enclave key, returns signature
+## 6. Approval
 
-## 8. Provider Connectors
+Approval is required on first use of a (client, operation, target) tuple, on
+policy-flagged high-risk actions, and after lease expiry. The factor
+registry is pluggable and challenge-bound:
 
-Connectors are responsible for:
+- **Local biometric** — macOS Touch ID; Linux polkit with a pre-auth intent
+  dialog (`zenity`/`kdialog`) shown before the OS prompt.
+- **Paired second device** — Ed25519, decision-bound signatures.
+- **FIDO2** — hardware keys and passkeys, verified daemon-side.
+- **Paired workstation** — a separate machine reviews the entire task
+  manifest and signs a decision; see [bounded work](bounded-work.md) and
+  `crates/opaque-approver/README.md`.
 
-- authentication to provider
-- reading secrets by reference
-- caching with TTL/lease semantics when supported (Vault)
-- returning secret material only inside `opaqued` memory
+No interactive session or configured factor reachable (headless, no
+display, no paired device) fails closed — never an unapproved fallback. See
+[deployment](deployment.md) for platform session-detection requirements.
 
-Recommended patterns:
+## 7. Sandboxed execution
 
-- 1Password:
-  - prefer service-account / Connect API where possible
-  - store provider auth tokens in OS keychain
-- Vault:
-  - prefer OIDC or AppRole with short-lived tokens
-  - prefer dynamic secrets (DB creds, cloud creds) to reduce blast radius
+`opaque exec` is the compatibility path for humans running existing dev
+tools with secrets injected as env vars — not a hard guarantee if the agent
+picks the command. `opaque-sandbox` applies Landlock + seccomp (Linux) or
+Seatbelt (macOS) to every exec child; typestate sanitization and
+secret-pattern scrubbing apply regardless of sandbox mode.
 
-## 9. Delivery Targets
+Agent-safe operations are preferred over exec: the daemon performs the
+privileged call itself (`github.set_actions_secret`, `task_run`, …) and
+returns a sanitized result, so the secret never enters the agent's process.
 
-### 9.1 Agent-safe operations (preferred)
+## 8. Bounded agent work
 
-Examples:
+Beyond a single operation, Opaque hands the agent a **task**: an immutable
+manifest approved once as a whole, each action charging one slot exactly
+once. Three operation families today: repository/release work,
+application-evidence reads, host operations over signed SSH certs. See
+[bounded work](bounded-work.md) for the manifest, CLI, lifecycle, and what's
+production-ready versus fixture-validated.
 
-- `github.set_actions_secret(repo, name, value_ref)`
-- `github.set_codespaces_secret(repo_or_user, name, value_ref)`
-- `gitlab.set_ci_variable(project, key, value_ref)`
-- `http.request_with_auth(secret_ref, request)` (strict allowlist of domains/methods)
-- `k8s.set_secret(namespace, name, items_from_refs)`
-- `aws.call(service, action, params)` (broker executes AWS SDK call; response is sanitized)
+## 9. Federation
 
-In this mode the secret never enters the agent’s process.
+One org signature carries policy to a fleet (`opqb1` bundles, verified
+before parsing, anti-rollback from custody). Each daemon exports its audit
+chain to a SIEM in independently verifiable form, and can produce signed
+posture attestations and require verified posture before releasing key
+material. See [federation](federation.md).
 
-### 9.2 Exec mode (compatibility)
+## 10. Audit
 
-`opaque exec --profile myproj -- <command>`
+Every operation — approval requested/granted/denied and by which factor,
+executed and its target/status, provider fetches (metadata only, never
+values) — is an append-only, HMAC-chained SQLite row. `opaque audit verify`
+detects edits, reordering, deletion, or tail truncation; the daemon
+re-verifies at startup and raises a CRITICAL alert on break. SIEM export
+(spool, webhook, TLS syslog) carries each record's sequence number and hash,
+so the exported stream verifies independently against the source database.
 
-- broker injects env vars into a subprocess
-- optionally runs it inside a sandbox:
-  - egress allowlist
-  - filesystem restrictions
-  - output redaction (best-effort)
+## 11. Providers
 
-This is useful for humans running dev tools, but is not a complete guarantee if the agent can pick arbitrary commands.
+GitHub Actions/Codespaces secrets, GitLab CI variables, 1Password, Bitwarden
+Secrets Manager, HashiCorp Vault, AWS Secrets Manager. GCP, Azure, Doppler,
+and Infisical are feature-gated in `opaque-providers`, but `opaqued` enables
+all four anyway — so today's shipped binary compiles in all ten regardless.
 
-### 9.3 .env brokering
+## 12. Platforms
 
-Avoid emitting plaintext `.env` to stdout when the caller is an LLM tool.
+| Platform | Architecture | Status |
+|---|---|---|
+| macOS | Apple Silicon (aarch64), Intel (x86_64) | Fully supported |
+| Linux | x86_64, aarch64 | Fully supported |
 
-Safer alternatives:
+macOS runs the daemon as a LaunchAgent in a GUI session (never a
+LaunchDaemon — native approval prompts require it); Linux runs it as a
+systemd user service in a graphical session with a polkit auth agent. See
+[deployment](deployment.md).
 
-- "render to FD": pass an anonymous file descriptor to a trusted child process
-- "render to temp file": create a temp file with `0600`, delete on exit (human use)
-- "exec": don’t render a file at all; set env in the target process
+## Deferred
 
-### 9.4 Kubernetes
-
-Goal: allow the agent to cause Kubernetes changes that require secret material (imagePullSecrets, API tokens for a workload, etc) without ever seeing the secret value.
-
-Recommended model:
-
-- Opaque stores cluster access (kubeconfig / exec auth) and performs Kubernetes API calls itself.
-- For secret writes, use a Kubernetes identity (service account / user) that can `create/patch/update` secrets but is not granted `get/list/watch` secrets, so the value cannot be read back via the same identity.
-
-Operations:
-
-- `k8s.set_secret(namespace, name, items_from_refs)`
-- `k8s.patch_secret(namespace, name, items_from_refs)`
-- `k8s.apply_manifest(manifest)` with a policy that rejects `kind: Secret` (force secrets through `set_secret` so values only come from refs, never from LLM-provided YAML)
-
-### 9.5 AWS (Cloud Provider Access)
-
-Avoid long-lived access keys when possible. Preferred sources:
-
-- Vault AWS secrets engine (dynamic STS creds)
-- AWS SSO / OIDC / device-code flows (broker-managed session)
-- static IAM access keys only as a last resort
-
-Two delivery patterns:
-
-1. **AWS SDK proxy (preferred):** client requests an AWS operation, broker performs the signed call and returns sanitized output.
-   - Pros: no keys ever leave the broker
-   - Cons: you must model/allowlist which AWS APIs the agent can call
-2. **Exec mode with sandbox:** broker injects short-lived STS creds into a sandboxed command (awscli/terraform/kubectl-eks).
-   - Pros: supports existing tools
-   - Cons: without strong sandboxing + egress allowlists, a malicious agent can steal the creds
-
-Pragmatic v1 approach:
-
-- Implement AWS SDK proxy for a small set of allowed operations (ECR/EKS/S3/STS).
-- Add exec-mode STS injection for humans, and require step-up auth + strong egress restrictions for agent use.
-
-## 10. Operation Safety Model (Preventing Secret "Reveal" Paths)
-
-To support both accidental and malicious-agent threat models, operations should be classified and filtered:
-
-- `SAFE`: does not use secrets, or uses secrets but cannot return them (ex: set GitHub secret)
-- `SENSITIVE_OUTPUT`: may return credentials or token-like outputs (ex: ECR login password). These should be disabled for LLM clients by default.
-- `REVEAL`: explicitly returns secret values. These should not be exposed to MCP/agent clients at all (human-only UI, if implemented).
-
-Additionally:
-
-- Never allow a generic "get secret value" tool call from an LLM-facing client.
-- Avoid returning raw HTTP response bodies from authenticated proxy calls unless the endpoint is allowlisted and the response is scrubbed.
-
-## 11. Audit and Observability
-
-Audit events (append-only):
-
-- approval requested
-- approval granted/denied + factor used
-- operation executed + target + status
-- provider fetches (metadata only; never values)
-
-Store locally (SQLite) with optional export to JSON for enterprise setups.
-
-## 12. Minimal MVP Plan
-
-### MVP 0 (days)
-
-- CLI only (no daemon):
-  - `opaque exec` pulls secrets from 1Password/Vault and runs a command
-  - manual approval prompt in terminal
-  - never prints secret values
-
-### MVP 1 (1-2 weeks) - v1 Targets
-
-- `opaqued` daemon + policy + audit log
-- approval factor: FIDO2 security key (local)
-- GitHub Actions secret sync module
-- GitLab CI variable sync module
-- GitHub Codespaces secret sync module
-- Kubernetes `set_secret` (from refs only)
-
-### MVP 2 (2-4 weeks)
-
-- iOS second-device approvals (pairing + signed challenges)
-- MCP server exposing safe operations
-- AWS SDK proxy (initial allowlist)
-
-### MVP 3 (future)
-
-- hardened exec sandbox:
-  - Linux: namespaces + seccomp + egress allowlist
-  - macOS: likely VM/container-based runner for per-command egress policy
-- broader cloud providers (GCP/Azure)
-
-## 13. Decisions (Based on Your Answers)
-
-1. Platforms: macOS + Linux.
-2. GitHub/GitLab auth: support both user tokens (PAT) and app-style integrations (least privilege).
-3. GitHub scopes: support repo secrets and environment secrets (v1).
-4. SaaS targets (v1): GitHub Actions secrets, GitHub Codespaces secrets, GitLab CI variables.
-5. Kubernetes: support EKS and self-managed clusters (v1); write-only secrets RBAC is acceptable.
-6. AWS auth sources: support Vault dynamic creds, AWS SSO, and static keys (last resort).
-
-## 14. Remaining Open Questions
-
-1. Approval UX for v1: CLI prompt only, or do you want a small local GUI/menubar app that shows approvals (with CLI fallback)?
-2. For GitHub App: do you want org-wide install support (multi-repo) in v1, or single-repo to start?
-3. For GitLab “app-style”: GitLab OAuth application vs project access token; which do you prefer to prioritize?
+iOS second-device approvals (FaceID) and a general-purpose interactive
+tenant runtime remain out of scope for now — see the
+[deferred roadmap](roadmap-deferred.md).

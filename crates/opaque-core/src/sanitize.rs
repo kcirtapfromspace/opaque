@@ -29,18 +29,27 @@ pub enum Sanitized {}
 /// A response wrapper that uses the typestate pattern to guarantee at compile
 /// time that only sanitized responses can be returned from the enclave.
 ///
-/// - `SanitizedResponse<Unsanitized>` can only be constructed internally.
+/// - Untrusted payloads enter through `SanitizedResponse<Unsanitized>`.
 /// - Only the [`Sanitizer`] can produce a `SanitizedResponse<Sanitized>`.
 /// - The enclave returns `SanitizedResponse<Sanitized>`.
+///
+/// Validated outputs cannot be rewritten after sanitization:
+/// ```compile_fail
+/// use opaque_core::sanitize::{SanitizedResponse, Sanitizer};
+/// let mut response = Sanitizer::new().sanitize_response(
+///     SanitizedResponse::from_payload(serde_json::json!({"status":"ok"})),
+/// );
+/// response.payload = serde_json::json!({"token":"unscrubbed"});
+/// ```
 pub struct SanitizedResponse<State> {
     /// The response payload.
-    pub payload: serde_json::Value,
+    payload: serde_json::Value,
 
     /// Error code, if this is an error response.
-    pub error_code: Option<String>,
+    error_code: Option<String>,
 
     /// Sanitized error message (if error).
-    pub error_message: Option<String>,
+    error_message: Option<String>,
 
     /// Marker for the sanitization state.
     _state: PhantomData<State>,
@@ -96,6 +105,10 @@ impl SanitizedResponse<Sanitized> {
     pub fn error_code(&self) -> Option<&str> {
         self.error_code.as_deref()
     }
+
+    pub fn error_message(&self) -> Option<&str> {
+        self.error_message.as_deref()
+    }
 }
 
 // Custom Debug that never shows raw payload content for unsanitized responses.
@@ -124,11 +137,17 @@ impl fmt::Debug for SanitizedResponse<Sanitized> {
 /// Compiled set of patterns for detecting secret-like content.
 #[derive(Clone)]
 pub(crate) struct SecretPatterns {
-    patterns: Vec<(String, Regex)>,
+    patterns: std::sync::Arc<[(String, Regex)]>,
 }
 
 impl SecretPatterns {
     pub(crate) fn compile() -> Self {
+        static PATTERNS: std::sync::LazyLock<SecretPatterns> =
+            std::sync::LazyLock::new(SecretPatterns::compile_once);
+        PATTERNS.clone()
+    }
+
+    fn compile_once() -> Self {
         // Each pattern is (label, regex).
         let raw = vec![
             // JWT tokens (header.payload.signature).
@@ -175,7 +194,12 @@ impl SecretPatterns {
 
         let patterns = raw
             .into_iter()
-            .filter_map(|(label, pat)| Regex::new(pat).ok().map(|r| (label.to_owned(), r)))
+            .map(|(label, pat)| {
+                (
+                    label.to_owned(),
+                    Regex::new(pat).expect("valid built-in secret pattern"),
+                )
+            })
             .collect();
 
         Self { patterns }
@@ -189,7 +213,7 @@ impl SecretPatterns {
     /// Replace all secret-like patterns in text with `[REDACTED]`.
     pub(crate) fn redact(&self, text: &str) -> String {
         let mut result = text.to_owned();
-        for (label, re) in &self.patterns {
+        for (label, re) in self.patterns.iter() {
             result = re
                 .replace_all(&result, &format!("[REDACTED:{label}]"))
                 .into_owned();
@@ -213,20 +237,25 @@ impl fmt::Debug for SecretPatterns {
 /// Scrub filesystem paths from error messages.
 fn scrub_paths(text: &str) -> String {
     // Remove absolute paths that look like they contain user directories.
-    let path_re =
-        Regex::new(r"(?:/[Uu]sers/[^\s:]+|/home/[^\s:]+|/tmp/[^\s:]+)").expect("valid regex");
-    path_re.replace_all(text, "[PATH]").into_owned()
+    static PATH_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"(?:/[Uu]sers/[^\s:]+|/home/[^\s:]+|/tmp/[^\s:]+)").expect("valid regex")
+    });
+    PATH_RE.replace_all(text, "[PATH]").into_owned()
 }
 
 /// Scrub URLs that may contain credentials or tokens.
 pub(crate) fn scrub_urls(text: &str) -> String {
     // URLs with embedded credentials (user:pass@host).
-    let cred_url_re = Regex::new(r"https?://[^\s@]+:[^\s@]+@[^\s]+").expect("valid regex");
-    let result = cred_url_re.replace_all(text, "[URL:REDACTED]");
+    static CRED_URL_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"https?://[^\s@]+:[^\s@]+@[^\s]+").expect("valid regex")
+    });
+    let result = CRED_URL_RE.replace_all(text, "[URL:REDACTED]");
 
     // URLs with long query parameters that might contain tokens.
-    let token_url_re = Regex::new(r"(https?://[^\s?]+)\?[^\s]{40,}").expect("valid regex");
-    token_url_re
+    static TOKEN_URL_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"(https?://[^\s?]+)\?[^\s]{40,}").expect("valid regex")
+    });
+    TOKEN_URL_RE
         .replace_all(&result, "$1?[PARAMS:REDACTED]")
         .into_owned()
 }
@@ -259,6 +288,116 @@ pub struct Sanitizer {
 }
 
 impl Sanitizer {
+    /// Task receipts contain typed public authority metadata, never provider
+    /// output. Preserve their verified digest and reference identifiers while
+    /// still scrubbing free text. Generic key/token heuristics would otherwise
+    /// destroy the exact scope the owner needs to review.
+    pub fn sanitize_task_record(
+        &self,
+        record: &crate::task::TaskRecord,
+    ) -> Result<serde_json::Value, String> {
+        record
+            .validate_tenant_and_inference_receipts()
+            .map_err(|_| "invalid tenant or bounded task receipt")?;
+        record
+            .validate_release_observation()
+            .map_err(|_| "invalid release observation")?;
+        record
+            .manifest
+            .validate()
+            .map_err(|_| "invalid task receipt")?;
+        if record
+            .manifest
+            .digest()
+            .map_err(|_| "invalid task receipt")?
+            != record.manifest_digest
+            || record.slots.len() != record.manifest.actions.len()
+            || record
+                .slots
+                .iter()
+                .zip(&record.manifest.actions)
+                .any(|(slot, action)| &slot.action != action)
+        {
+            return Err("invalid task receipt integrity".into());
+        }
+        for slot in &record.slots {
+            if let Some(outcome) = &slot.outcome {
+                outcome
+                    .validate()
+                    .map_err(|_| "invalid task receipt outcome")?;
+            }
+        }
+        let source = serde_json::to_value(record).map_err(|_| "invalid task receipt")?;
+        let mut output = self.sanitize_value(&source);
+        output["manifest_digest"] = source["manifest_digest"].clone();
+        if record.tenant.is_some() {
+            output["tenant"] = source["tenant"].clone();
+        }
+        if record.release_observation.is_some() {
+            output["release_observation"] = source["release_observation"].clone();
+        }
+        for key in ["github_api_url", "vault_api_url", "actions"] {
+            output["manifest"][key] = source["manifest"][key].clone();
+        }
+        for (index, slot) in record.slots.iter().enumerate() {
+            output["slots"][index]["action"] = source["slots"][index]["action"].clone();
+            if slot
+                .outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.ssh_receipt.is_some())
+            {
+                // Only strictly validated and broker-authenticated host metadata
+                // and bounded nonsecret output bypass generic hash redaction.
+                output["slots"][index]["outcome"]["ssh_receipt"] =
+                    source["slots"][index]["outcome"]["ssh_receipt"].clone();
+            }
+            if let Some(receipt) = slot
+                .outcome
+                .as_ref()
+                .and_then(|outcome| outcome.inference_receipt.as_ref())
+            {
+                // Only validated public demo text can bypass generic secret-shaped
+                // field removal. Keep the exact text whose digest the receipt binds.
+                if receipt
+                    .output_text
+                    .as_ref()
+                    .is_some_and(|text| self.patterns.redact(text) != *text)
+                {
+                    return Err("unsafe model output in task receipt".into());
+                }
+                output["slots"][index]["outcome"]["inference_receipt"] =
+                    source["slots"][index]["outcome"]["inference_receipt"].clone();
+            }
+        }
+        Ok(output)
+    }
+    /// Validate public task receipts and construct their final immutable response.
+    /// Only this boundary may preserve typed authority metadata that resembles
+    /// secrets; callers cannot mutate a sanitized payload afterward.
+    pub fn sanitize_task_response(
+        &self,
+        payload: serde_json::Value,
+    ) -> Result<SanitizedResponse<Sanitized>, String> {
+        let render = |value: &serde_json::Value| {
+            let record =
+                serde_json::from_value(value.clone()).map_err(|_| "invalid task receipt")?;
+            self.sanitize_task_record(&record)
+        };
+        let (key, receipts) = if let Some(task) = payload.get("task") {
+            ("task", render(task)?)
+        } else if let Some(tasks) = payload.get("tasks").and_then(|v| v.as_array()) {
+            (
+                "tasks",
+                serde_json::Value::Array(tasks.iter().map(render).collect::<Result<Vec<_>, _>>()?),
+            )
+        } else {
+            return Err("invalid task response".into());
+        };
+        let mut response = self.sanitize_response(SanitizedResponse::from_payload(payload));
+        response.payload[key] = receipts;
+        Ok(response)
+    }
+
     /// Create a new sanitizer with the default pattern set.
     pub fn new() -> Self {
         Self {
@@ -451,6 +590,14 @@ fn is_secret_field_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_secret_patterns_share_one_compilation() {
+        let first = SecretPatterns::compile();
+        let second = SecretPatterns::compile();
+        assert!(std::sync::Arc::ptr_eq(&first.patterns, &second.patterns));
+        assert_eq!(first.patterns.len(), 11);
+    }
 
     #[test]
     fn detects_jwt() {

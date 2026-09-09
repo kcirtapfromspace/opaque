@@ -1,0 +1,26 @@
+# Optional template. Copy into a repository's .github/workflows only when ready
+# to install it. Nothing in Opaque automatically installs or dispatches this.
+name: Verify Opaque dogfood markers
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  verify-markers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    env:
+      OPAQUE_DOGFOOD_MARKER: ${{ secrets.OPAQUE_DOGFOOD_MARKER }}
+      OPAQUE_DOGFOOD_ROTATION: ${{ secrets.OPAQUE_DOGFOOD_ROTATION }}
+    steps:
+      - name: Check both disposable markers are available
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${OPAQUE_DOGFOOD_MARKER:-}" || -z "${OPAQUE_DOGFOOD_ROTATION:-}" ]]; then
+            printf '%s\n' 'A required Opaque dogfood marker is missing.' >&2
+            exit 1
+          fi
+          printf '%s\n' 'Both Opaque dogfood markers are available.'

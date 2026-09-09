@@ -1,5 +1,10 @@
 # Opaque
 
+> Private dogfooding workspace: experiments, customer demo operations, app/repository
+> configurations, and validation records live in `kcirtapfromspace/opaque-dogfood`.
+> The public product upstream is `kcirtapfromspace/opaque`; its badges below describe
+> that upstream, not the validation status of this private workspace.
+
 ![CI](https://github.com/kcirtapfromspace/opaque/actions/workflows/ci.yml/badge.svg)
 [![License: BUSL-1.1](https://img.shields.io/badge/License-BUSL--1.1-orange.svg)](LICENSE)
 ![Release](https://img.shields.io/github/v/release/kcirtapfromspace/opaque)
@@ -7,13 +12,22 @@
 
 ### Secrets stay ███████. Agents stay powerful.
 
-Local approval-gated secrets broker for AI coding tools (Codex, Claude Code, etc) that must not disclose plaintext secrets to LLM context.
+### Approve the work. Keep authority bounded.
+
+Opaque lets a team give an AI coding agent (Codex, Claude Code, etc) a
+**bounded piece of work** — publish a secret, dispatch a release, run a
+fixed host check, read scoped application data — approve exactly what it's
+allowed to do, and inspect the evidence after. LLMs get **operations**,
+never plaintext secret values.
 
 ## What It Does
 
-Opaque sits between your AI coding assistant and your secrets. LLMs get **operations** (e.g., "set this GitHub secret"), never plaintext values. Every operation passes through:
+Every operation passes through:
 
 **Policy -> Approval -> Execute -> Sanitize -> Audit**
+
+Multi-step work adds **plan -> review -> approve -> run -> inspect** — see
+[bounded agent work](docs/bounded-work.md).
 
 New here? The [15-minute tutorial](docs/tutorial.md) takes you from install to a
 secret your agent moved but never saw, with an audit chain proving it.
@@ -21,8 +35,9 @@ secret your agent moved but never saw, with an audit chain proving it.
 ## Features
 
 - Deny-by-default policy engine with allowlist rules
+- **Bounded agent work**: a pinned task manifest — publish a secret, dispatch a release, run a fixed SSH host check, read scoped data — approved once as a whole, each action charging exactly one slot, with a receipt (`opaque task plan|run|show|reconcile|revoke`, see `docs/bounded-work.md`)
 - **Trust-domain enforcement**: run the daemon as a dedicated service account (or separate container) that exclusively owns every key, database, and config — startup verifies custody and fails closed, turning tamper-evidence into tamper-prevention (`docs/deployment.md`)
-- **Signature-bound approvals**: pluggable factor registry — macOS Touch ID / Linux polkit, paired second device (Ed25519, decision-bound signatures), FIDO2 hardware keys and passkeys (challenge-bound, verified daemon-side); the audit chain records *who* approved, cryptographically
+- **Signature-bound approvals**: pluggable factor registry — macOS Touch ID / Linux polkit, paired second device (Ed25519, decision-bound signatures), FIDO2 hardware keys and passkeys (challenge-bound, verified daemon-side), and a trusted-workstation full-manifest reviewer for tasks; the audit chain records *who* approved, cryptographically
 - Identity substrate: daemon-owned OIDC login (PKCE), on-behalf-of delegation tokens, live-resolved roles, segregation of duties
 - Tamper-evident HMAC audit chain (SQLite) with `opaque audit verify`, restart-safe sequencing, and correlation IDs
 - Sandboxed execution: bubblewrap + Landlock + seccomp applied to every exec child; typestate-enforced response sanitization + secret-pattern scrubbing
@@ -197,6 +212,8 @@ opaque policy preset github-secrets
 - [Docs index](docs/README.md)
 - [Tutorial: your first gated operation](docs/tutorial.md)
 - [Getting started](docs/getting-started.md)
+- [Bounded agent work](docs/bounded-work.md)
+- [Identity](docs/identity.md)
 - [MCP integration](docs/mcp-integration.md)
 - [Bitwarden setup](docs/bitwarden.md)
 - [Vault setup](docs/vault.md)
@@ -213,8 +230,8 @@ opaque policy preset github-secrets
 
 See [Deferred roadmap](docs/roadmap-deferred.md). Notably:
 
-- iOS approvals / FaceID (v3)
-- FIDO2 / WebAuthn approvals (v3)
+- iOS second-device approvals / Face ID
+- A general-purpose tenant operator and hardware attestation
 
 ## License
 

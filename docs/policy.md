@@ -64,21 +64,31 @@ Nested tables:
 - `[rules.identity]`: match on the verified principal — `principal`, `roles`, `access_modes`, `require_principal`, and `teams` (membership comes from the applied [federation bundle](federation.md), resolved daemon-side per request and never supplied by a client). Any constraint here demands a verified principal, so these rules fail closed.
 - `[rules.approval]`: operation-bound approval requirements
 
-Note: `secret_names` enforcement currently depends on `secret_ref_names` being populated on the request. Some convenience wrappers (e.g., `exec`, `github`, `onepassword`) do not currently provide reliable `secret_ref_names`, so `secret_names` should be treated as best-effort until that is fixed (see the latest [security review](security-assessment.md)).
+Note: `secret_names` enforcement depends on `secret_ref_names`, which the daemon now derives server-side and fails closed on when a pattern is configured but the derived list is empty — see the [adversarial review](adversarial-security-review-2026-02-14.md) for the fix.
 
 ### Approval Configuration
 
 `[rules.approval]` fields:
 
 - `require`: `always` | `first_use` | `never`
-- `factors`: approval factors (any-of). v1 supports `local_bio`
+- `factors`: approval factors (any-of)
 - `lease_ttl`: seconds (optional; for `first_use`)
 - `one_time`: bool (optional; defaults to `false`)
+- `require_distinct_approver`: bool (optional; defaults to `false`). Forces
+  break-glass segregation of duties — the approver must be a different
+  principal than the one the operation runs on behalf of. Fails closed
+  without a verified principal, and requires `require` to be something other
+  than `never`. See [identity: break-glass](identity.md#access-modes).
 
-Deferred factors exist in types but are out of scope for v1:
+Approval factors (any-of):
 
-- `ios_faceid` (v3)
-- `fido2` (v3)
+- `local_bio`: native OS biometric/password prompt (macOS Touch ID, Linux polkit)
+- `fido2`: hardware security key or passkey — `opaque key ls` / `opaque key remove`
+- `paired_workstation`: full-manifest review by an enrolled trusted
+  workstation, for [bounded task](bounded-work.md) approval
+- `ios_faceid`: paired second-device approval (Ed25519). Despite the name,
+  ships as desktop-to-desktop pairing, not an iOS app — `opaque device
+  pair` / `ls` / `confirm` / `revoke`
 
 ## Example Policy File
 

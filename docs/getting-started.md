@@ -352,6 +352,21 @@ opaque attest --key <attestation key hex>
 See [federation](federation.md) for bundle format, anti-rollback semantics,
 export transports, and the key-release protocol.
 
+## Bounded Agent Work
+
+Beyond one-shot operations, an agent can be handed a **task** — an immutable,
+fully-reviewed manifest (publish a secret, dispatch a release, run a fixed
+host check) approved once as a whole and executed once, with a receipt:
+
+```bash
+opaque task plan --manifest ./release.json
+opaque task run <task-id>
+opaque task show <task-id>
+```
+
+See [bounded agent work](bounded-work.md) for the full lifecycle, the three
+operation families, and what's production-ready today.
+
 ## Environment Variables
 
 - `OPAQUE_CONFIG`: override daemon/CLI config path (default: `~/.opaque/config.toml`)
@@ -365,6 +380,7 @@ export transports, and the key-release protocol.
 ## Next
 
 - [Tutorial: your first gated operation](tutorial.md)
+- [Bounded agent work: plan, approve, and run a task](bounded-work.md)
 - [MCP integration (Claude Code)](mcp-integration.md)
 - [Identity, delegation, and approval factors](identity.md)
 - [Federation: signed policy, SIEM export, attestation](federation.md)

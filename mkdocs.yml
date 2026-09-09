@@ -87,6 +87,7 @@ nav:
       - Policy Engine: policy.md
       - Identity: identity.md
       - Federation: federation.md
+      - Bounded Agent Work: bounded-work.md
       - Operations: operations.md
       - Storage: storage.md
       - Deployment: deployment.md
@@ -105,5 +106,6 @@ nav:
       - Audit Analytics: audit-analytics.md
   - Architecture:
       - Design Notes: architecture.md
+      - Deferred: roadmap-deferred.md
   - Blog:
       - Why We Built Opaque: blog/why-we-built-opaque.md
