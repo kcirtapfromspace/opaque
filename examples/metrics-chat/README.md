@@ -7,7 +7,7 @@ This demo connects an authenticated customer chat to a bearer-protected HTTP MCP
 From the Opaque repository, after the current gateway tests pass:
 
 ```sh
-cargo build --locked -p opaque-metrics
+cargo build --locked -p opaque-showcase
 python3 -B scripts/metrics_chat_dogfood.py --check --no-build
 python3 -B scripts/metrics_chat_dogfood.py --serve --no-build
 ```

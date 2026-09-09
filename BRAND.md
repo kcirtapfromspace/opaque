@@ -8,18 +8,26 @@ branch. It is written down now.
 ## The slogan
 
 > **Secrets stay ███████. Agents stay powerful.**
+> **Approve the work. Keep authority bounded.**
 
-Two lines, in that order, always. The first line makes the promise and then
-performs it: the word `secret` is present in the markup — screen readers and
-search engines read "Secrets stay secret" — and a redaction bar covers it. The
-second line is the reason anyone tolerates the first: the point is not to lock
-the agent out, it is to keep it useful without handing it the values.
+The first pair is the brand line, always two lines in that order. Line one
+makes the promise and performs it: `secret` is present in the markup —
+screen readers and search engines read "Secrets stay secret" — under a
+redaction bar. Line two is why anyone tolerates line one: not to lock the
+agent out, but to keep it useful without handing it values.
 
 Do not paraphrase it into "Secrets stay hidden" or "Agents stay productive".
 Do not use line one alone; half the slogan is an unfinished argument.
 
-Where it lives: the landing hero (`docs/overrides/home.html`), `README.md`,
-`docs/index.md`, and `site_description` in `mkdocs.yml`.
+The second pair is a secondary line, run right after the brand line where
+there's room: it names the mechanism (bounded agent work — see
+[bounded-work.md](docs/bounded-work.md)), the brand line names the
+guarantee. Alongside, never instead of.
+
+Brand line: landing hero (`docs/overrides/home.html`), `README.md`,
+`docs/index.md`, `site_description` in `mkdocs.yml`. Secondary line: runs
+alongside it in `README.md` and `docs/index.md` only — hero and meta
+description stay brand-line-only, both need to stay short.
 
 ## The redaction motif
 

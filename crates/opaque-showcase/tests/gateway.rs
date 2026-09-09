@@ -45,7 +45,7 @@ mod exploration;
 struct TestDirectory(PathBuf);
 impl TestDirectory {
     fn new() -> Self {
-        Self(std::env::temp_dir().join(format!("opaque-metrics-test-{}", Uuid::new_v4())))
+        Self(std::env::temp_dir().join(format!("opaque-showcase-test-{}", Uuid::new_v4())))
     }
 }
 impl Drop for TestDirectory {

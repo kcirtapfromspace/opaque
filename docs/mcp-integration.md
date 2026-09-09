@@ -61,7 +61,28 @@ In Claude Code, ask: "List my GitHub secrets for owner/repo". If the policy allo
 
 ## Available Tools
 
-The MCP server exposes only `SAFE` operations. Operations classified as `SENSITIVE_OUTPUT` or `REVEAL` are never exposed.
+The MCP server exposes `SAFE` operations normally. It also exposes sandbox
+execution (`SENSITIVE_OUTPUT`) with its output content withheld from the
+model — see [Sandbox](#sandbox) below. Operations classified as `REVEAL`
+(they return plaintext secret values) are never exposed.
+
+### Bounded Tasks
+
+An immutable, fully-reviewed manifest — publish a secret, dispatch a
+release, run a fixed host check, or run scoped inference — approved once and
+executed once. See [bounded agent work](bounded-work.md) for the full
+lifecycle.
+
+| Tool | Daemon method | Description |
+|------|-----------|-------------|
+| `opaque_task_plan_ssh` | `task_plan_ssh` | Plan one fixed SSH host-health check on the tenant's trusted host/command profile |
+| `opaque_task_plan_inference` | `task_plan_inference` | Plan three fixed public-source completions in the authenticated tenant |
+| `opaque_task_plan` | `task_plan` | Plan a secret-publish or staging-release manifest for review |
+| `opaque_task_run` | `task_run` | Request trusted approval and execute a planned task's actions once |
+| `opaque_task_get` | `task_get` | Inspect a task's exact scope, approval state, and receipt (maps to `opaque task show` in the CLI) |
+| `opaque_task_list` | `task_list` | List a page of tasks owned by the authenticated caller |
+| `opaque_task_revoke` | `task_revoke` | Block future provider actions on a task; already-dispatched work may still complete |
+| `opaque_task_reconcile` | `task_reconcile` | Re-read correlated provider evidence without re-dispatching |
 
 ### GitHub
 
@@ -94,11 +115,29 @@ The MCP server exposes only `SAFE` operations. Operations classified as `SENSITI
 | `opaque_bitwarden_list_projects` | `bitwarden.list_projects` | List Bitwarden projects |
 | `opaque_bitwarden_list_secrets` | `bitwarden.list_secrets` | List secret names in a project |
 
+### Sandbox
+
+| Tool | Operation | Description |
+|------|-----------|-------------|
+| `opaque_sandbox_exec` | `sandbox.exec` | Run a command in the sandbox with profile-scoped secrets injected |
+| `opaque_sandbox_list_profiles` | *(client-side)* | List available `~/.opaque/profiles/*.toml` names — reads local files directly, never calls the daemon |
+
+`sandbox.exec` is `SENSITIVE_OUTPUT` and still needs an explicit policy rule
+for `agent` clients. It's safe to expose because the model sees only exit
+code and stdout/stderr **byte lengths**, never content. The CLI path
+(`opaque exec`) differs — it prints raw output to the terminal; treat that
+as sensitive, per [LLM harness](llm-harness.md).
+
+### Utility
+
+| Tool | Operation | Description |
+|------|-----------|-------------|
+| `opaque_secrets_status` | *(client-side)* | List a profile's secret ref names and schemes (never resolves values) — reads the profile TOML directly, never calls the daemon |
+
 ### Not Exposed
 
-These operations are intentionally excluded from MCP:
+These operations are intentionally excluded from MCP entirely:
 
-- `sandbox.exec` — `SENSITIVE_OUTPUT` (captured stdout/stderr may contain secrets)
 - `onepassword.read_field` — `REVEAL` (returns plaintext secret values)
 - `bitwarden.read_secret` — `REVEAL` (returns plaintext secret values)
 - `test.noop` — test-only, not useful for agents
@@ -107,9 +146,9 @@ These operations are intentionally excluded from MCP:
 
 1. **Defense in depth**: The MCP tool list is hard-coded in the `opaque-mcp` binary. Even if a client requests an unlisted tool, the MCP server will reject it before it reaches the daemon.
 
-2. **Daemon enforcement**: Every tool call passes through `Enclave::execute()` in `opaqued`. Policy rules, approval requirements, and audit logging all apply regardless of whether the request comes from CLI or MCP.
+2. **Daemon enforcement**: Every tool call that reaches the daemon passes through `Enclave::execute()` in `opaqued`. Policy, approval, and audit apply regardless of CLI vs. MCP. (`opaque_sandbox_list_profiles` and `opaque_secrets_status` are client-side only — they read local profile files and never reach the daemon.)
 
-3. **No secret values in responses**: All MCP tool results are sanitized by the daemon. Secret values are never included in tool responses.
+3. **No secret values in responses**: MCP tool results are sanitized by the daemon; `REVEAL` operations are never listed. `opaque_sandbox_exec` additionally withholds output content, returning only length metadata.
 
 4. **Agent classification**: The MCP server connects as an `agent` client. Policy rules with `client_types = ["human"]` will not match MCP requests.
 

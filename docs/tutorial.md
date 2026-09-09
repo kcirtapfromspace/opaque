@@ -310,6 +310,12 @@ one.
 
 ## Where to go next
 
+**Hand it a whole piece of work, not one operation at a time.** Everything
+above was a single gated call. [Bounded agent work](bounded-work.md) lets you
+plan a task — publish a secret, dispatch a release, run a fixed host check —
+as one immutable manifest, approved once and executed once, with a receipt
+you can inspect afterward.
+
 **Harden it.** Everything above ran in *session mode*, where the daemon shares
 your user account. That means an attacker holding your uid could read the
 daemon's keys — you would detect it afterward, but not prevent it. The

@@ -253,6 +253,30 @@ bounds new authentication; the implemented fixed-health host guard separately
 enforces session duration, expiry and revocation. Validate those controls on the
 selected real host before claiming its bounded operation is demonstrated.
 
+## Since September 5
+
+Infrastructure/quality work in parallel; no M0–M4 gate changed.
+
+- **Code quality remediation.** Seven P1 gaps found (partial-failure
+  recovery, durable audit correctness, transport lifecycle bounds, test
+  enforcement), fixed and merged with the seven-crate `opaqued` split.
+  [Review](2026-09-09-code-quality-gap-plan.md),
+  [remediation](2026-09-09-code-quality-implementation.md),
+  [merge validation](2026-09-09-quality-extraction-merge-validation.md),
+  [deployment](2026-09-09-quality-runtime-deployment.md).
+- **Cloudflare usage safeguards.** September 5–6 demo pause was Durable
+  Object storage-quota exhaustion from continuous front-end polling; fixed
+  by reducing polling/write frequency.
+  [Investigation](2026-09-09-cloudflare-worker-usage.md),
+  [rollout](2026-09-09-cloudflare-usage-safeguards.md).
+- **Demo pilot contact capture.** Optional contact-request flow added to
+  the public demo to start recruiting pilot teams; not evidence of demand.
+  [Plan](2026-09-09-demo-pilot-recruitment.md),
+  [deployment](2026-09-09-pilot-contact-deployment.md).
+- **Visitor documentation redeployed** at the post-merge commit; private
+  routes/search/sitemap exclusions reverified.
+  [Deployment](2026-09-09-visitor-docs-deployment.md).
+
 ## Separate deferred gates
 
 - **Isolation and hardware:** a general tenant operator, more runtime attestors,

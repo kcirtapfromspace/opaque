@@ -161,7 +161,8 @@ enum Cmd {
         #[command(subcommand)]
         action: GithubAction,
     },
-    /// Plan, approve, and inspect a bounded GitHub publishing task.
+    /// Plan, approve, and inspect a bounded task (secret publish, staging
+    /// release, SSH host check, or inference).
     Task {
         #[command(subcommand)]
         action: TaskAction,

@@ -17,7 +17,7 @@ The runner builds the four binaries, creates a short isolated directory under `/
 5. Simulate one uncertain GitHub 500 response and confirm its slot becomes `unknown`, remains consumed, and cannot be retried.
 6. Verify public manifest digests, pinned references, and native/test approval provenance survive sanitization, without plaintext in receipts.
 7. Restart the daemon and confirm both receipts remain readable and neither task can write again.
-8. Start the real stdio MCP server with only the isolated socket, discover the five task tools, inspect/list the completed receipt, and verify an MCP replay returns a tool error without an extra write. Provider credentials are not passed to the agent transport.
+8. Start the real stdio MCP server with only the isolated socket, discover its task tools (asserting at least `opaque_task_plan`, `_run`, `_get`, `_list`, and `_revoke` are present — the current catalog also includes `_plan_ssh`, `_plan_inference`, and `_reconcile`), inspect/list the completed receipt, and verify an MCP replay returns a tool error without an extra write. Provider credentials are not passed to the agent transport.
 
 The final `PASS` line means these checks passed. Paths for the config, manifests, logs, receipt databases, and fixture write log are retained for inspection. `fixture-writes.jsonl` records targets, HTTP status, and ciphertext length only. The fixture verifies encryption's wire format and absence of plaintext; it does not prove GitHub storage or decrypt the sealed value.
 

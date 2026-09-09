@@ -24,7 +24,7 @@ Use the OS store for **credentials and private keys**:
 
 - GitHub/GitLab credentials (PATs) if you choose to store them locally
 - Vault tokens / 1Password service tokens (if stored)
-- Opaque server identity private key (used for iOS pairing/transport)
+- Opaque server identity private key (used for second-device pairing/transport — desktop-to-desktop Ed25519 today, see [identity](identity.md))
 - optional: a database encryption key (see below)
 
 macOS: Keychain
@@ -36,7 +36,7 @@ Use SQLite for durable **metadata + audit**:
 
 - append-only audit log
 - client identities (what binary called, uid/gid, hash)
-- paired mobile devices (public keys)
+- paired device public keys (desktop-to-desktop workstation approvers today; see [identity](identity.md))
 - provider accounts (non-secret config, labels)
 - profiles (name -> secret refs mapping)
 - operation receipts (optional: last sync status for UX)
@@ -124,7 +124,9 @@ struct OperationRequest {
 ```rust
 struct ApprovalDecision {
   approved: bool,
-  factor: String,               // "local_bio" | "ios_faceid" | ...
+  factor: String,               // "local_bio" | "ios_faceid" (wire name for the shipped
+                                 // desktop-to-desktop paired-device factor, see
+                                 // mobile-approvals.md) | "paired_workstation" | "fido2"
   decided_at: i64,
   lease_ttl_secs: u32,          // optional
 }
@@ -149,12 +151,12 @@ Fields:
 
 ### 4.2 `paired_devices`
 
-- store device public key only (Secure Enclave private key stays on device)
+- store device public key only (the private key stays on the paired device)
 
 Fields:
 
 - `id` (pk)
-- `kind` (`ios`)
+- `kind` (`workstation` — the desktop-to-desktop Ed25519 pairing that ships today; `ios` exists only as the schema's legacy default value and has no shipped mobile app behind it, see [mobile approvals](mobile-approvals.md))
 - `device_pubkey` (blob/base64)
 - `device_name`
 - `added_at`
