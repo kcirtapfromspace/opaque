@@ -416,6 +416,69 @@ fn missing_or_corrupt_keys_are_never_replaced_for_an_existing_chain() {
 }
 
 #[test]
+fn append_waits_for_writer_contention_before_reading_its_snapshot() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // A deferred transaction can read successfully while another connection
+    // holds the WAL writer lock, then fail its write upgrade without invoking
+    // the busy handler. Acquire that lock before reading the append snapshot.
+    static WAITING: AtomicBool = AtomicBool::new(false);
+    fn wait_for_writer(attempt: i32) -> bool {
+        WAITING.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(1));
+        attempt < 1_000
+    }
+
+    let fixture = Fixture::new();
+    fixture.seed(&[now()]);
+    let key = load_hmac_key(&fixture.path).unwrap();
+    let mut conn = fixture.connection();
+    let initial_hash = hashes(&conn).pop().unwrap();
+    let blocker = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    let path = fixture.path.clone();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    WAITING.store(false, Ordering::SeqCst);
+    let writer = std::thread::spawn(move || {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.busy_handler(Some(wait_for_writer)).unwrap();
+        let mut tail = initial_hash;
+        let result = SqliteAuditSink::insert_batch(
+            &conn,
+            &[AuditEvent::new(AuditEventKind::RequestReceived).with_sequence_number(1)],
+            &key,
+            &mut tail,
+        );
+        sender.send(result).unwrap();
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut early_result = None;
+    while !WAITING.load(Ordering::SeqCst) && Instant::now() < deadline {
+        if let Ok(result) = receiver.try_recv() {
+            early_result = Some(result);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    blocker.rollback().unwrap();
+    let result =
+        early_result.unwrap_or_else(|| receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+    writer.join().unwrap();
+    assert!(
+        result.is_ok(),
+        "append must wait for transient writer contention: {result:?}"
+    );
+    assert!(
+        WAITING.load(Ordering::SeqCst),
+        "append must consult the busy handler"
+    );
+    assert_eq!(row_count(&conn), 2);
+    assert!(verify_audit_chain(&fixture.path).unwrap().ok);
+}
+
+#[test]
 fn verified_reads_remain_consistent_while_transactions_append_and_prune() {
     let fixture = Fixture::new();
     fixture.seed(&[1]);
