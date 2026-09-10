@@ -1,0 +1,28 @@
+# Synthetic candidate narrows publication to staging and requires each approval.
+org = "example"
+version = 2
+
+[[rules]]
+name = "list-example-repository-secrets"
+operation_pattern = "github.list_secrets"
+allow = true
+[rules.target]
+fields = { repo = "example/*" }
+
+[[rules]]
+name = "publish-staging-secret"
+operation_pattern = "github.set_actions_secret"
+allow = true
+[rules.target]
+fields = { repo = "example/*", environment = "staging" }
+[rules.approval]
+require = "always"
+factors = ["local_bio"]
+
+[[rules]]
+name = "allow-reviewed-synthetic-noop"
+operation_pattern = "test.noop"
+allow = true
+[rules.approval]
+require = "always"
+factors = ["local_bio"]

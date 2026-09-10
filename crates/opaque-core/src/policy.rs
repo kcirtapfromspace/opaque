@@ -618,6 +618,17 @@ impl PolicyEngine {
         self.rules.len()
     }
 
+    /// Stable digest of the complete ordered effective rule set. Conversion
+    /// through JSON values orders object keys without changing rule order.
+    pub fn digest(&self) -> Result<String, serde_json::Error> {
+        use sha2::{Digest, Sha256};
+        let value = serde_json::to_value(&self.rules)?;
+        let mut hash = Sha256::new();
+        hash.update(b"opaque.effective-policy.v1\0");
+        hash.update(serde_json::to_vec(&value)?);
+        Ok(crate::workstation::hex(&hash.finalize()))
+    }
+
     /// Evaluate a request against the policy rules.
     ///
     /// Applies additional safety-class enforcement:

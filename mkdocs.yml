@@ -17,9 +17,9 @@ theme:
   custom_dir: docs/overrides
   icon:
     logo: material/shield-lock
-  font:
-    text: Archivo
-    code: IBM Plex Mono
+  # Local licensed fonts come from the shared brand foundation.
+  font: false
+  favicon: brand/opaque-mark.svg
   palette:
     - scheme: slate
       primary: custom
@@ -66,7 +66,11 @@ markdown_extensions:
 plugins:
   - search
 
+hooks:
+  - scripts/mkdocs_brand.py
+
 extra_css:
+  - brand/opaque.css
   - stylesheets/extra.css
 
 extra:

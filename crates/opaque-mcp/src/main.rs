@@ -13,6 +13,7 @@ use tokio_util::codec::{Decoder, FramedRead, LinesCodec, LinesCodecError};
 use tracing::{debug, error, info};
 
 mod daemon_client;
+mod external;
 mod tools;
 
 use daemon_client::DaemonClient;
@@ -184,18 +185,14 @@ async fn handle_tools_call(
     if !arguments.is_object() {
         return JsonRpcResponse::error(id, INVALID_PARAMS, "tool arguments must be a JSON object");
     }
+    if external::recognizes(tool_name) {
+        return external::call(id, tool_name, arguments, client).await;
+    }
     let Some((tool_def, validator)) = tool_definitions()
         .iter()
         .find(|(tool, _)| tool.name == tool_name)
     else {
-        return JsonRpcResponse::error(
-            id,
-            INVALID_PARAMS,
-            format!(
-                "unknown tool: {}",
-                opaque_core::validate::truncate_utf8(tool_name, 64)
-            ),
-        );
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "unknown tool");
     };
     if !validator.is_valid(&arguments) {
         // Validation errors can quote supplied values. Keep those out of logs
@@ -633,14 +630,18 @@ async fn run_transport(
                                         match request.method.as_str() {
                                             "initialize" => Some(handle_initialize(request.id)),
                                             "ping" => Some(JsonRpcResponse::ok(request.id, json!({}))),
-                                            "tools/list" => Some(handle_tools_list(request.id)),
+
+                                            "tools/list" if pending.len() >= MAX_IN_FLIGHT => Some(handle_tools_list(request.id)),
                                             "tools/call" if pending.len() >= MAX_IN_FLIGHT => Some(JsonRpcResponse::error(request.id, SERVER_BUSY, "too many in-flight tool calls")),
-                                            "tools/call" => {
+                                            "tools/call" | "tools/list" => {
                                                 let (handle, registration) = AbortHandle::new_pair();
                                                 cancellations.insert(key.clone(), handle);
                                                 let client = client.clone();
                                                 pending.push(async move {
-                                                    let result = Abortable::new(handle_tools_call(request.id, &request.params, &client), registration).await.ok();
+                                                    let result = Abortable::new(async {
+                                                        if request.method == "tools/list" { external::list(request.id, &client).await }
+                                                        else {handle_tools_call(request.id, &request.params, &client).await}
+                                                    }, registration).await.ok();
                                                     (key, result)
                                                 }.boxed());
                                                 None
@@ -679,6 +680,41 @@ async fn run_transport(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unknown_tool_handler_never_echoes_untrusted_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let client = DaemonClient::new(Some(directory.path().join("absent.sock")));
+        let mut names = vec![
+            String::new(),
+            "private-tool-name".into(),
+            "秘密".repeat(4096),
+        ];
+        names.extend((61..=65).map(|length| format!("{}é", "a".repeat(length))));
+        for (index, name) in names.into_iter().enumerate() {
+            let id = Some(json!(index));
+            let response =
+                handle_tools_call(id.clone(), &json!({"name":name,"arguments":{}}), &client).await;
+            assert_eq!(response.id, id);
+            assert!(response.result.is_none());
+            let error = response.error.unwrap();
+            assert_eq!(error.code, INVALID_PARAMS);
+            assert_eq!(error.message, "unknown tool");
+            assert!(error.data.is_none());
+        }
+        for params in [
+            json!({}),
+            json!({"name":null}),
+            json!({"name":42}),
+            json!({"name":[]}),
+        ] {
+            let response = handle_tools_call(Some(json!("missing")), &params, &client).await;
+            assert_eq!(response.id, Some(json!("missing")));
+            let error = response.error.unwrap();
+            assert_eq!(error.code, INVALID_PARAMS);
+            assert_eq!(error.message, "missing 'name' in tools/call");
+        }
+    }
 
     #[tokio::test]
     async fn stalled_local_lookup_has_a_terminal_response() {

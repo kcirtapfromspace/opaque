@@ -380,6 +380,7 @@ mod tests {
             expires_at: 400,
             approved_at: Some(101),
             approval_mode: Some(TaskApprovalMode::Native),
+            workstation_receipt: None,
             state: TaskState::Completed,
             slots: vec![TaskSlot {
                 id: "slot-1".into(),

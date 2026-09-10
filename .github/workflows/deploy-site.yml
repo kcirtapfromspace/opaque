@@ -17,6 +17,8 @@ on:
     branches: [main]
     paths:
       - 'docs/**'
+      - 'assets/brand/**'
+      - 'scripts/mkdocs_brand.py'
       - 'mkdocs.yml'
       - 'wrangler.toml'
       - '.python-version'
@@ -24,6 +26,8 @@ on:
   pull_request:
     paths:
       - 'docs/**'
+      - 'assets/brand/**'
+      - 'scripts/mkdocs_brand.py'
       - 'mkdocs.yml'
       - 'wrangler.toml'
       - '.python-version'

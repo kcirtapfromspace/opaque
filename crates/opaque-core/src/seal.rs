@@ -176,7 +176,9 @@ pub fn verify_seal(config_bytes: &[u8], seal_file: &Path) -> Result<SealStatus, 
 /// Verify config bytes against the seal file only (no keychain).
 ///
 /// Use this when you need verification isolated from system keychain state,
-/// e.g. in tests or when operating on config files outside the default location.
+/// e.g. in tests, independently custodied tenants, or config files outside the
+/// default location. A missing local seal remains `Unsealed`; this function
+/// never substitutes a global keychain seal for missing local authority.
 pub fn verify_seal_from_file(
     config_bytes: &[u8],
     seal_file: &Path,

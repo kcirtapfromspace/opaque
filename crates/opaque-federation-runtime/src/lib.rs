@@ -23,4 +23,5 @@
 pub mod attest;
 pub mod export;
 pub mod federation;
+pub mod fleet;
 pub mod workload_attest;

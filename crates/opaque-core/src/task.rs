@@ -248,6 +248,8 @@ impl SlotOutcome {
                     | "source_unavailable"
                     | "policy_denied"
                     | "approval_denied"
+                    | "reviewer_or_task_authority_changed"
+                    | "requester_or_task_authority_changed"
                     | "internal_error"
                     | "revoked"
                     | "expired"
@@ -351,11 +353,22 @@ pub struct TaskRecord {
     /// Absent on legacy receipts whose approval provenance is unavailable.
     #[serde(default)]
     pub approval_mode: Option<TaskApprovalMode>,
+    /// Digest and lookup identifier of a separately retained signed human
+    /// decision; absence on old/local receipts remains explicitly unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workstation_receipt: Option<WorkstationReceiptRef>,
     pub state: TaskState,
     pub slots: Vec<TaskSlot>,
     /// Read-only provider evidence, independent of the consumed dispatch slot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_observation: Option<crate::release::ReleaseObservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkstationReceiptRef {
+    pub approval_id: String,
+    pub sha256: String,
 }
 
 impl TaskRecord {
@@ -1137,6 +1150,7 @@ mod tests {
             expires_at: 700,
             approved_at: None,
             approval_mode: None,
+            workstation_receipt: None,
             state: TaskState::Planned,
             release_observation: None,
             slots: vec![TaskSlot {

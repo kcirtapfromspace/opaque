@@ -1,5 +1,6 @@
 [package]
 name = "opaque-mcp"
+default-run = "opaque-mcp"
 version.workspace = true
 edition = "2024"
 publish = false
@@ -15,6 +16,7 @@ futures-util = { workspace = true }
 jsonschema = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true, features = ["io-std"] }
 tokio-util = { workspace = true }
 toml_edit = { workspace = true }

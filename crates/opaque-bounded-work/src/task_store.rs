@@ -289,6 +289,7 @@ impl TaskStore {
             expires_at,
             approved_at: None,
             approval_mode: None,
+            workstation_receipt: None,
             state: TaskState::Planned,
             release_observation: None,
         };
@@ -484,6 +485,21 @@ impl TaskStore {
         mode: TaskApprovalMode,
         now: i64,
     ) -> Result<TaskRecord, TaskStoreError> {
+        self.approve_with_receipt(id, owner, digest, mode, now, None)
+    }
+
+    /// Attach the already durable and verified signed decision atomically
+    /// with task approval. Current reviewer authority is checked by the gate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn approve_with_receipt(
+        &self,
+        id: &str,
+        owner: &str,
+        digest: &str,
+        mode: TaskApprovalMode,
+        now: i64,
+        receipt: Option<&opaque_core::workstation::SignedWorkstationReceipt>,
+    ) -> Result<TaskRecord, TaskStoreError> {
         self.mutate(id, owner, now, |record| {
             check_active(record)?;
             if record.manifest_digest != digest {
@@ -494,6 +510,33 @@ impl TaskStore {
             }
             if now < record.created_at {
                 return Err(TaskStoreError::InvalidInput);
+            }
+            if let Some(receipt) = receipt {
+                receipt.verify().map_err(|_| TaskStoreError::InvalidInput)?;
+                let challenge = &receipt.review.challenge;
+                let binding = &challenge
+                    .authority
+                    .as_ref()
+                    .ok_or(TaskStoreError::InvalidInput)?
+                    .binding;
+                if binding.task_id != record.id
+                    || binding.manifest_digest != record.manifest_digest
+                    || Some(&binding.tenant) != record.tenant.as_ref()
+                    || receipt.response.decision
+                        != opaque_core::workstation::WorkstationDecision::Approve
+                    || !matches!(
+                        mode,
+                        TaskApprovalMode::PairedWorkstation | TaskApprovalMode::InsecureTest
+                    )
+                    || receipt.accepted_at > now
+                    || now >= challenge.expires_at
+                {
+                    return Err(TaskStoreError::InvalidInput);
+                }
+                record.workstation_receipt = Some(opaque_core::task::WorkstationReceiptRef {
+                    approval_id: challenge.approval_id.clone(),
+                    sha256: opaque_core::workstation::review_hash(&serde_json::to_string(receipt)?),
+                });
             }
             record.approved_at = Some(now);
             record.approval_mode = Some(mode);
@@ -820,6 +863,17 @@ fn save_record(connection: &Connection, record: &TaskRecord) -> Result<(), TaskS
 /// database and daemon configuration together.
 fn verify_record(record: &TaskRecord) -> Result<(), TaskStoreError> {
     let corrupt = || TaskStoreError::Corrupt;
+    if let Some(receipt) = &record.workstation_receipt
+        && (record.approved_at.is_none()
+            || !matches!(
+                record.approval_mode,
+                Some(TaskApprovalMode::PairedWorkstation | TaskApprovalMode::InsecureTest)
+            )
+            || uuid::Uuid::parse_str(&receipt.approval_id).is_err()
+            || opaque_core::workstation::decode_hex::<32>(&receipt.sha256).is_err())
+    {
+        return Err(corrupt());
+    }
     record
         .validate_tenant_and_inference_receipts()
         .map_err(|_| corrupt())?;
@@ -960,6 +1014,123 @@ mod tests {
                 "prompt_sha256": "d".repeat(64), "options": opaque_core::inference::InferenceOptions::default()
             })).collect::<Vec<_>>()
         })).unwrap()
+    }
+
+    #[test]
+    fn signed_approval_reference_binds_task_and_survives_recovery() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use opaque_core::workstation::*;
+        let directory = tempfile::tempdir().unwrap();
+        let binding = tenant("remote-review");
+        let owner = binding.owner_key(501, None);
+        let path = directory.path().join("tasks.db");
+        let store = TaskStore::open_for_tenant(&path, Some(binding.clone())).unwrap();
+        let task = store
+            .create(&owner, inference_manifest(&binding), NOW)
+            .unwrap();
+        store.claim(&task.id, &owner, NOW).unwrap();
+        let key = SigningKey::from_bytes(&[53; 32]);
+        let review = WorkstationReview {
+            challenge: WorkstationChallenge {
+                schema_version: 2,
+                broker_id: "opq-receipt-fixture".into(),
+                authority: Some(WorkstationAuthority {
+                    binding: ApprovalBinding {
+                        tenant: binding.clone(),
+                        task_id: task.id.clone(),
+                        manifest_digest: task.manifest_digest.clone(),
+                        request_hash: "a".repeat(64),
+                        policy_digest: "b".repeat(64),
+                        requester: "fixture-requester".into(),
+                    },
+                    principal_id: "fixture-reviewer".into(),
+                    public_key_hex: hex(key.verifying_key().as_bytes()),
+                    required_role: "operator".into(),
+                    authority_epoch: 1,
+                }),
+                approval_id: uuid::Uuid::new_v4().to_string(),
+                request_id: uuid::Uuid::new_v4().to_string(),
+                operation: "inference.fixed_manifest".into(),
+                content_hash: review_hash("Exact fixture review"),
+                nonce: "c".repeat(64),
+                created_at: NOW,
+                expires_at: NOW + 120,
+            },
+            review_text: "Exact fixture review".into(),
+        };
+        let response = WorkstationResponse {
+            device_id: uuid::Uuid::new_v4().to_string(),
+            decision: WorkstationDecision::Approve,
+            signature: hex(&key
+                .sign(&workstation_decision_bytes(&review.challenge, true))
+                .to_bytes()),
+        };
+        let receipt = SignedWorkstationReceipt {
+            schema_version: 1,
+            review,
+            response,
+            accepted_at: NOW,
+        };
+        assert!(
+            store
+                .approve_with_receipt(
+                    &task.id,
+                    &owner,
+                    &task.manifest_digest,
+                    TaskApprovalMode::Native,
+                    NOW,
+                    Some(&receipt)
+                )
+                .is_err()
+        );
+        let mut wrong = receipt.clone();
+        wrong
+            .review
+            .challenge
+            .authority
+            .as_mut()
+            .unwrap()
+            .binding
+            .task_id = uuid::Uuid::new_v4().to_string();
+        wrong.response.signature = hex(&key
+            .sign(&workstation_decision_bytes(&wrong.review.challenge, true))
+            .to_bytes());
+        assert!(
+            store
+                .approve_with_receipt(
+                    &task.id,
+                    &owner,
+                    &task.manifest_digest,
+                    TaskApprovalMode::PairedWorkstation,
+                    NOW,
+                    Some(&wrong)
+                )
+                .is_err()
+        );
+        let approved = store
+            .approve_with_receipt(
+                &task.id,
+                &owner,
+                &task.manifest_digest,
+                TaskApprovalMode::PairedWorkstation,
+                NOW,
+                Some(&receipt),
+            )
+            .unwrap();
+        let reference = approved.workstation_receipt.unwrap();
+        assert_eq!(reference.approval_id, receipt.review.challenge.approval_id);
+        assert_eq!(
+            reference.sha256,
+            review_hash(&serde_json::to_string(&receipt).unwrap())
+        );
+        drop(store);
+        let restarted = TaskStore::open_for_tenant(&path, Some(binding)).unwrap();
+        let recovered = restarted.get(&task.id, &owner, NOW + 1).unwrap();
+        assert_eq!(recovered.workstation_receipt, Some(reference));
+        assert!(
+            restarted.claim(&task.id, &owner, NOW + 1).is_err(),
+            "receipt is evidence, not resumable permission"
+        );
     }
 
     #[test]

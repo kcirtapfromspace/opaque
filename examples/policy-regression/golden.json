@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "list-example-repository",
+      "operation": "github.list_secrets",
+      "safety": "SAFE",
+      "client_type": "agent",
+      "client_identity": { "uid": 1000, "gid": 1000 },
+      "target": { "repo": "example/demo" },
+      "expect": { "decision": "allow" }
+    },
+    {
+      "id": "publish-staging-requires-each-approval",
+      "operation": "github.set_actions_secret",
+      "safety": "SAFE",
+      "client_type": "agent",
+      "client_identity": { "uid": 1000, "gid": 1000 },
+      "target": { "repo": "example/demo", "environment": "staging" },
+      "secret_ref_names": ["SYNTHETIC_DEPLOY_TOKEN"],
+      "expect": {
+        "decision": "human_gated",
+        "approval_requirement": "always",
+        "required_factors": ["local_bio"]
+      }
+    },
+    {
+      "id": "publish-production-blocked",
+      "operation": "github.set_actions_secret",
+      "safety": "SAFE",
+      "client_type": "agent",
+      "client_identity": { "uid": 1000, "gid": 1000 },
+      "target": { "repo": "example/demo", "environment": "production" },
+      "expect": { "decision": "deny" }
+    },
+    {
+      "id": "publish-other-organization-blocked",
+      "operation": "github.set_actions_secret",
+      "safety": "SAFE",
+      "client_type": "agent",
+      "client_identity": { "uid": 1000, "gid": 1000 },
+      "target": { "repo": "outside/demo", "environment": "staging" },
+      "expect": { "decision": "deny" }
+    },
+    {
+      "id": "agent-reveal-always-blocked",
+      "operation": "synthetic.reveal",
+      "safety": "REVEAL",
+      "client_type": "agent",
+      "client_identity": { "uid": 1000, "gid": 1000 },
+      "expect": { "decision": "deny" }
+    },
+    {
+      "id": "new-noop-is-human-gated",
+      "operation": "test.noop",
+      "safety": "SAFE",
+      "client_type": "agent",
+      "client_identity": { "uid": 1000, "gid": 1000 },
+      "expect": {
+        "decision": "human_gated",
+        "approval_requirement": "always",
+        "required_factors": ["local_bio"]
+      }
+    }
+  ]
+}

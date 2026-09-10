@@ -51,36 +51,24 @@ pub async fn handle_execute(
         return Response::err(Some(req.id), "bad_request", "missing 'operation' field");
     }
 
-    let target: HashMap<String, String> = req
-        .params
-        .get("target")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-
-    let secret_ref_names: Vec<String> = req
-        .params
-        .get("secret_ref_names")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-
-    // --- Input validation (P0): sanitize client-controlled strings ---
-    let target = match InputValidator::validate_target(&target) {
-        Ok(t) => t,
-        Err(e) => {
-            return Response::err(Some(req.id), "bad_request", format!("invalid target: {e}"));
-        }
+    let target: HashMap<String, String> = match req.params.get("target") {
+        None => HashMap::new(),
+        Some(value) => match serde_json::from_value(value.clone()) {
+            Ok(target) => target,
+            Err(_) => {
+                return Response::err(
+                    Some(req.id),
+                    "bad_request",
+                    "target must be an object of string assertions",
+                );
+            }
+        },
     };
 
-    let secret_ref_names = match InputValidator::validate_secret_ref_names(&secret_ref_names) {
-        Ok(n) => n,
-        Err(e) => {
-            return Response::err(
-                Some(req.id),
-                "bad_request",
-                format!("invalid secret_ref_names: {e}"),
-            );
-        }
-    };
+    // Caller reference hints are non-authoritative. Preparation supplies every
+    // effective reference, including implicit credential selectors. Targets stay
+    // byte-for-byte assertions; trimming them here would hide contradictions.
+    let secret_ref_names = Vec::new();
 
     // Client type is derived from verified identity — NEVER from params.
     // Any `client_type` field in params is silently ignored.
@@ -245,29 +233,15 @@ pub async fn handle_gitlab(
         }
     };
 
-    let mut op_params = serde_json::json!({
-        "project": project,
-        "key": key,
-        "value_ref": value_ref,
-    });
-    if let Some(tok) = req.params.get("gitlab_token_ref").and_then(|v| v.as_str()) {
-        op_params["gitlab_token_ref"] = serde_json::Value::String(tok.to_owned());
-    }
-    if let Some(scope) = req.params.get("environment_scope").and_then(|v| v.as_str()) {
-        op_params["environment_scope"] = serde_json::Value::String(scope.to_owned());
-    }
-    if req.params.get("protected").is_some() {
-        op_params["protected"] = req.params["protected"].clone();
-    }
-    if req.params.get("masked").is_some() {
-        op_params["masked"] = req.params["masked"].clone();
-    }
-    if req.params.get("raw").is_some() {
-        op_params["raw"] = req.params["raw"].clone();
-    }
-    if let Some(variable_type) = req.params.get("variable_type").and_then(|v| v.as_str()) {
-        op_params["variable_type"] = serde_json::Value::String(variable_type.to_owned());
-    }
+    // Preserve provider input types and unknown fields for the strict preparer.
+    // Removing an invalid optional value here would silently change the action.
+    let mut op_params = req.params.clone();
+    let Some(params) = op_params.as_object_mut() else {
+        return Response::err(Some(req.id), "bad_request", "invalid GitLab parameters");
+    };
+    params.remove("action");
+    params.remove("workspace");
+    params.remove("client_type");
 
     let op_req = OperationRequest {
         principal: principal_ctx.clone(),
@@ -300,151 +274,25 @@ pub async fn handle_onepassword(
     principal_ctx: Option<PrincipalContext>,
     wrapper_workspace: Option<opaque_core::operation::WorkspaceContext>,
 ) -> Response {
-    // The onepassword method is a convenience wrapper that builds an
-    // "execute" request for the appropriate onepassword.* operation.
-    let action = req
-        .params
-        .get("action")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_owned();
-
-    if action.is_empty() {
-        return Response::err(Some(req.id), "bad_request", "missing 'action' field");
-    }
-
-    let (operation, target, op_params) = match action.as_str() {
-        "list_vaults" => (
-            "onepassword.list_vaults",
-            HashMap::new(),
-            serde_json::json!({}),
-        ),
-        "list_items" => {
-            let vault = req
-                .params
-                .get("vault")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-
-            if vault.is_empty() {
-                return Response::err(Some(req.id), "bad_request", "missing 'vault' field");
-            }
-
-            let target = HashMap::from([("vault".into(), vault.clone())]);
-            (
-                "onepassword.list_items",
-                target,
-                serde_json::json!({ "vault": vault }),
-            )
-        }
-        "read_field" => {
-            let vault = req
-                .params
-                .get("vault")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-            let item = req
-                .params
-                .get("item")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-            let field = req
-                .params
-                .get("field")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-
-            if vault.is_empty() {
-                return Response::err(Some(req.id), "bad_request", "missing 'vault' field");
-            }
-            if item.is_empty() {
-                return Response::err(Some(req.id), "bad_request", "missing 'item' field");
-            }
-            if field.is_empty() {
-                return Response::err(Some(req.id), "bad_request", "missing 'field' field");
-            }
-
-            let target = HashMap::from([
-                ("vault".into(), vault.clone()),
-                ("item".into(), item.clone()),
-            ]);
-            (
-                "onepassword.read_field",
-                target,
-                serde_json::json!({ "vault": vault, "item": item, "field": field }),
-            )
-        }
-        unknown => {
-            return Response::err(
-                Some(req.id),
-                "bad_request",
-                format!(
-                    "unknown action '{}' (expected: list_vaults, list_items, read_field)",
-                    truncate_for_error(unknown, 64)
-                ),
-            );
-        }
+    let operation = match req.params.get("action").and_then(|v| v.as_str()) {
+        Some("list_vaults") => "onepassword.list_vaults",
+        Some("list_items") => "onepassword.list_items",
+        Some("read_field") => "onepassword.read_field",
+        _ => return Response::err(Some(req.id), "bad_request", "unknown onepassword action"),
     };
-
-    // Validate target before building OperationRequest.
-    let target = match InputValidator::validate_target(&target) {
-        Ok(t) => t,
-        Err(e) => {
-            return Response::err(Some(req.id), "bad_request", format!("invalid target: {e}"));
-        }
-    };
-
-    // Build secret_ref_names from the vault/item/field path for read_field.
-    let secret_ref_names = if action == "read_field" {
-        let v = op_params
-            .get("vault")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let i = op_params.get("item").and_then(|v| v.as_str()).unwrap_or("");
-        let f = op_params
-            .get("field")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let refs = vec![format!("onepassword:{v}/{i}/{f}")];
-        if let Err(e) = InputValidator::validate_secret_ref_names(&refs) {
-            return Response::err(
-                Some(req.id),
-                "bad_request",
-                format!("invalid secret ref: {e}"),
-            );
-        }
-        refs
-    } else {
-        vec![]
-    };
-
-    let op_req = OperationRequest {
-        principal: principal_ctx.clone(),
-        request_id: Uuid::new_v4(),
-        client_identity: identity.clone(),
+    execute_wrapper(
+        state,
+        req,
+        operation,
+        identity,
         client_type,
-        operation: operation.into(),
-        target,
-        secret_ref_names,
-        created_at: SystemTime::now(),
-        expires_at: None,
-        params: op_params,
-        workspace: wrapper_workspace.clone(),
-    };
-
-    state
-        .enclave
-        .execute(op_req)
-        .await
-        .into_proto_response(req.id)
+        principal_ctx,
+        wrapper_workspace,
+    )
+    .await
 }
 
-/// `bitwarden`: convenience wrapper for `bitwarden.list_projects` /
-/// `bitwarden.list_secrets` / `bitwarden.read_secret`.
+/// `bitwarden`: convenience wrapper for the typed Bitwarden actions.
 pub async fn handle_bitwarden(
     state: &DaemonState,
     req: Request,
@@ -453,116 +301,59 @@ pub async fn handle_bitwarden(
     principal_ctx: Option<PrincipalContext>,
     wrapper_workspace: Option<opaque_core::operation::WorkspaceContext>,
 ) -> Response {
-    // The bitwarden method is a convenience wrapper that builds an
-    // "execute" request for the appropriate bitwarden.* operation.
-    let action = req
-        .params
-        .get("action")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_owned();
+    let operation = match req.params.get("action").and_then(|v| v.as_str()) {
+        Some("list_projects") => "bitwarden.list_projects",
+        Some("list_secrets") => "bitwarden.list_secrets",
+        Some("read_secret") => "bitwarden.read_secret",
+        _ => return Response::err(Some(req.id), "bad_request", "unknown bitwarden action"),
+    };
+    execute_wrapper(
+        state,
+        req,
+        operation,
+        identity,
+        client_type,
+        principal_ctx,
+        wrapper_workspace,
+    )
+    .await
+}
 
-    if action.is_empty() {
-        return Response::err(Some(req.id), "bad_request", "missing 'action' field");
+/// Preserve every supplied provider field for strict action validation. Only
+/// documented RPC envelope fields are removed; wrong types and unknown options
+/// must never silently become a broader default operation.
+fn wrapper_params(mut params: serde_json::Value) -> serde_json::Value {
+    if let Some(fields) = params.as_object_mut() {
+        fields.remove("action");
+        fields.remove("workspace");
+        fields.remove("client_type");
     }
+    params
+}
 
-    let (operation, target, op_params) = match action.as_str() {
-        "list_projects" => (
-            "bitwarden.list_projects",
-            HashMap::new(),
-            serde_json::json!({}),
-        ),
-        "list_secrets" => {
-            let project = req
-                .params
-                .get("project")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_owned());
-
-            let target = if let Some(ref p) = project {
-                HashMap::from([("project".into(), p.clone())])
-            } else {
-                HashMap::new()
-            };
-            let params = if let Some(ref p) = project {
-                serde_json::json!({ "project": p })
-            } else {
-                serde_json::json!({})
-            };
-            ("bitwarden.list_secrets", target, params)
-        }
-        "read_secret" => {
-            let secret_id = req
-                .params
-                .get("secret_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-
-            if secret_id.is_empty() {
-                return Response::err(Some(req.id), "bad_request", "missing 'secret_id' field");
-            }
-
-            let target = HashMap::from([("secret_id".into(), secret_id.clone())]);
-            (
-                "bitwarden.read_secret",
-                target,
-                serde_json::json!({ "secret_id": secret_id }),
-            )
-        }
-        unknown => {
-            return Response::err(
-                Some(req.id),
-                "bad_request",
-                format!(
-                    "unknown action '{}' (expected: list_projects, list_secrets, read_secret)",
-                    truncate_for_error(unknown, 64)
-                ),
-            );
-        }
-    };
-
-    // Validate target before building OperationRequest.
-    let target = match InputValidator::validate_target(&target) {
-        Ok(t) => t,
-        Err(e) => {
-            return Response::err(Some(req.id), "bad_request", format!("invalid target: {e}"));
-        }
-    };
-
-    // Build secret_ref_names for read_secret.
-    let secret_ref_names = if action == "read_secret" {
-        let sid = op_params
-            .get("secret_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let refs = vec![format!("bitwarden:{sid}")];
-        if let Err(e) = InputValidator::validate_secret_ref_names(&refs) {
-            return Response::err(
-                Some(req.id),
-                "bad_request",
-                format!("invalid secret ref: {e}"),
-            );
-        }
-        refs
-    } else {
-        vec![]
-    };
-
+#[allow(clippy::too_many_arguments)] // RPC envelope and verified peer context stay separate.
+async fn execute_wrapper(
+    state: &DaemonState,
+    req: Request,
+    operation: &str,
+    identity: &ClientIdentity,
+    client_type: ClientType,
+    principal_ctx: Option<PrincipalContext>,
+    workspace: Option<opaque_core::operation::WorkspaceContext>,
+) -> Response {
     let op_req = OperationRequest {
-        principal: principal_ctx.clone(),
+        principal: principal_ctx,
         request_id: Uuid::new_v4(),
         client_identity: identity.clone(),
         client_type,
         operation: operation.into(),
-        target,
-        secret_ref_names,
+        target: HashMap::new(),
+        secret_ref_names: vec![],
         created_at: SystemTime::now(),
         expires_at: None,
-        params: op_params,
-        workspace: wrapper_workspace.clone(),
+        params: wrapper_params(req.params),
+        workspace,
     };
-
     state
         .enclave
         .execute(op_req)
@@ -580,86 +371,14 @@ pub async fn handle_exec(
     principal_ctx: Option<PrincipalContext>,
     wrapper_workspace: Option<opaque_core::operation::WorkspaceContext>,
 ) -> Response {
-    // The exec method is a convenience wrapper that builds an "execute"
-    // request for "sandbox.exec" from exec-specific params.
-    let profile = req
-        .params
-        .get("profile")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_owned();
-
-    if profile.is_empty() {
-        return Response::err(Some(req.id), "bad_request", "missing 'profile' field");
-    }
-
-    let command: Vec<String> = req
-        .params
-        .get("command")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-
-    if command.is_empty() {
-        return Response::err(Some(req.id), "bad_request", "missing 'command' field");
-    }
-
-    // Validate profile name (alphanumeric + hyphens + underscores).
-    if !profile
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return Response::err(
-            Some(req.id),
-            "bad_request",
-            "profile name must be alphanumeric (with hyphens/underscores)",
-        );
-    }
-
-    // Derive secret_ref_names from the profile's secret declarations.
-    let secret_ref_names = opaque_core::profile::load_named_profile(&profile)
-        .map(|p| p.secrets.keys().cloned().collect::<Vec<_>>())
-        .unwrap_or_default();
-
-    let op_req = OperationRequest {
-        principal: principal_ctx.clone(),
-        request_id: Uuid::new_v4(),
-        client_identity: identity.clone(),
+    execute_wrapper(
+        state,
+        req,
+        "sandbox.exec",
+        identity,
         client_type,
-        operation: "sandbox.exec".into(),
-        // SECURITY (C3): include the command in `target` so it is rendered
-        // in the approval prompt, covered by allowed_target_keys, and bound
-        // into the content hash and lease key — the approver authorizes the
-        // exact argv, not just the profile name.
-        target: {
-            let cmd_display = command
-                .iter()
-                .map(|a| {
-                    if a.is_empty() || a.chars().any(|c| c.is_whitespace() || c == '"') {
-                        format!("{a:?}")
-                    } else {
-                        a.clone()
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" ");
-            HashMap::from([
-                ("profile".into(), profile.clone()),
-                ("command".into(), cmd_display),
-            ])
-        },
-        secret_ref_names,
-        created_at: SystemTime::now(),
-        expires_at: None,
-        params: serde_json::json!({
-            "profile": profile,
-            "command": command,
-        }),
-        workspace: wrapper_workspace.clone(),
-    };
-
-    state
-        .enclave
-        .execute(op_req)
-        .await
-        .into_proto_response(req.id)
+        principal_ctx,
+        wrapper_workspace,
+    )
+    .await
 }

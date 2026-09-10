@@ -25,6 +25,7 @@ mdns-sd = { workspace = true }
 p256 = { workspace = true }
 rcgen = { workspace = true }
 reqwest = { workspace = true }
+rusqlite = { workspace = true }
 rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -39,3 +40,4 @@ uuid = { workspace = true }
 opaque-approver = { path = "../opaque-approver" }
 rand = { workspace = true }
 tempfile = "3"
+wiremock = { workspace = true }

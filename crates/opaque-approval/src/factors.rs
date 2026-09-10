@@ -26,6 +26,7 @@ use uuid::Uuid;
 /// What a verifier needs to run one approval round.
 #[derive(Debug, Clone)]
 pub struct ApprovalContext {
+    pub binding: Option<opaque_core::workstation::ApprovalBinding>,
     pub approval_id: Uuid,
     pub request_id: Uuid,
     /// Operation name (e.g. `sandbox.exec`).
@@ -41,6 +42,7 @@ pub struct ApprovalContext {
 /// A decision from a factor, with the verified identity that made it.
 #[derive(Debug, Clone)]
 pub struct VerifiedDecision {
+    pub workstation_receipt: Option<opaque_core::workstation::SignedWorkstationReceipt>,
     pub approved: bool,
     /// `None` only for factors that prove presence without naming anyone
     /// (a local biometric with no active login session).
@@ -71,6 +73,20 @@ type VerifyFuture = Pin<Box<dyn Future<Output = Result<VerifiedDecision, FactorE
 
 /// One approval factor's implementation.
 pub trait FactorVerifier: Send + Sync + fmt::Debug {
+    fn authorize_receipt(
+        &self,
+        _requester: Option<&opaque_core::identity::PrincipalContext>,
+        _receipt: &opaque_core::workstation::SignedWorkstationReceipt,
+        _authorize: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
+        Err("factor cannot fence remote authority".into())
+    }
+    fn revalidate_receipt(
+        &self,
+        _receipt: &opaque_core::workstation::SignedWorkstationReceipt,
+    ) -> Result<(), String> {
+        Err("factor cannot revalidate remote authority".into())
+    }
     /// The factor this verifier serves.
     fn factor(&self) -> ApprovalFactor;
 
@@ -97,6 +113,29 @@ impl fmt::Debug for FactorRegistry {
 }
 
 impl FactorRegistry {
+    pub fn authorize_receipt(
+        &self,
+        requester: Option<&opaque_core::identity::PrincipalContext>,
+        receipt: &opaque_core::workstation::SignedWorkstationReceipt,
+        authorize: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.verifiers
+            .iter()
+            .find(|v| v.factor() == ApprovalFactor::PairedWorkstation)
+            .ok_or("workstation verifier unavailable")?
+            .authorize_receipt(requester, receipt, authorize)
+    }
+    pub fn revalidate_receipt(
+        &self,
+        receipt: &opaque_core::workstation::SignedWorkstationReceipt,
+    ) -> Result<(), String> {
+        let verifier = self
+            .verifiers
+            .iter()
+            .find(|v| v.factor() == ApprovalFactor::PairedWorkstation)
+            .ok_or("workstation verifier unavailable")?;
+        verifier.revalidate_receipt(receipt)
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -215,20 +254,10 @@ impl FactorVerifier for LocalBioVerifier {
     fn verify(&self, ctx: ApprovalContext) -> VerifyFuture {
         let resolver = self.approver_resolver.clone();
         Box::pin(async move {
-            let result = if matches!(
-                ctx.operation.as_str(),
-                "github.publish_manifest"
-                    | "github.release_manifest"
-                    | "inference.fixed_manifest"
-                    | "agent_session_start"
-                    | "identity.provisioning.bind_start"
-                    | "identity.provisioning.mandate_start"
-                    | "identity.role_set"
-            ) {
-                crate::approval::prompt_task(&ctx.description).await
-            } else {
-                crate::approval::prompt(&ctx.description).await
-            };
+            // Every operation can carry a scope, audience or argv too large for
+            // the biometric reason line. Review the complete bound document in
+            // the trusted scrollable helper, then authenticate its fingerprint.
+            let result = crate::approval::prompt_task(&ctx.description).await;
             let outcome = result.map_err(|e| match e {
                 crate::approval::ApprovalError::Unavailable => {
                     FactorError::Unavailable("no interactive session for local prompt".into())
@@ -238,6 +267,7 @@ impl FactorVerifier for LocalBioVerifier {
 
             match outcome {
                 crate::approval::PromptOutcome::Denied => Ok(VerifiedDecision {
+                    workstation_receipt: None,
                     approved: false,
                     approver: None,
                 }),
@@ -254,6 +284,7 @@ impl FactorVerifier for LocalBioVerifier {
                         })
                         .or_else(|| resolver.as_ref().and_then(|r| r()));
                     Ok(VerifiedDecision {
+                        workstation_receipt: None,
                         approved: true,
                         approver,
                     })
@@ -342,6 +373,7 @@ impl FactorVerifier for PairedDeviceVerifier {
                 Ok(Ok(verified)) => {
                     let device = verified.device;
                     Ok(VerifiedDecision {
+                        workstation_receipt: None,
                         approved: verified.approve,
                         approver: Some(ApproverIdentity {
                             // Attribute to the human who paired the device
@@ -393,6 +425,20 @@ impl PairedWorkstationVerifier {
 }
 
 impl FactorVerifier for PairedWorkstationVerifier {
+    fn authorize_receipt(
+        &self,
+        requester: Option<&opaque_core::identity::PrincipalContext>,
+        receipt: &opaque_core::workstation::SignedWorkstationReceipt,
+        authorize: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.server.authorize_receipt(requester, receipt, authorize)
+    }
+    fn revalidate_receipt(
+        &self,
+        receipt: &opaque_core::workstation::SignedWorkstationReceipt,
+    ) -> Result<(), String> {
+        self.server.revalidate_receipt(receipt)
+    }
     fn factor(&self) -> ApprovalFactor {
         ApprovalFactor::PairedWorkstation
     }
@@ -421,9 +467,10 @@ impl FactorVerifier for PairedWorkstationVerifier {
                 .as_secs()
                 .min(MAX_CHALLENGE_TTL_SECS as u64)
                 .max(1) as i64;
-            let review = WorkstationReview {
+            let mut review = WorkstationReview {
                 challenge: WorkstationChallenge {
                     schema_version: 1,
+                    authority: None,
                     broker_id: pairing.server_id().to_owned(),
                     approval_id: ctx.approval_id.to_string(),
                     request_id: ctx.request_id.to_string(),
@@ -435,6 +482,11 @@ impl FactorVerifier for PairedWorkstationVerifier {
                 },
                 review_text: ctx.description,
             };
+            if let Some(binding) = ctx.binding {
+                server
+                    .bind_remote_review(&mut review, binding)
+                    .map_err(FactorError::Failed)?;
+            }
             let verified = server
                 .await_workstation_review(review)
                 .await
@@ -445,6 +497,7 @@ impl FactorVerifier for PairedWorkstationVerifier {
                     FactorError::Failed("approving workstation is no longer authorized".into())
                 })?;
             Ok(VerifiedDecision {
+                workstation_receipt: verified.workstation_receipt,
                 approved: verified.approve,
                 approver: Some(ApproverIdentity {
                     principal_id: device
@@ -759,6 +812,7 @@ impl FactorVerifier for Fido2Verifier {
                         .map(|binding| binding.principal_id.as_str().to_owned())
                         .unwrap_or_else(|| format!("fido2:{id_prefix}"));
                     Ok(VerifiedDecision {
+                        workstation_receipt: None,
                         approved: true,
                         approver: Some(ApproverIdentity {
                             principal_id,
@@ -811,6 +865,7 @@ mod tests {
                 }
                 match outcome {
                     FakeOutcome::Approve(who) => Ok(VerifiedDecision {
+                        workstation_receipt: None,
                         approved: true,
                         approver: Some(ApproverIdentity {
                             principal_id: who.into(),
@@ -819,6 +874,7 @@ mod tests {
                         }),
                     }),
                     FakeOutcome::Deny => Ok(VerifiedDecision {
+                        workstation_receipt: None,
                         approved: false,
                         approver: None,
                     }),
@@ -831,6 +887,7 @@ mod tests {
 
     fn ctx() -> ApprovalContext {
         ApprovalContext {
+            binding: None,
             approval_id: Uuid::new_v4(),
             request_id: Uuid::new_v4(),
             operation: "test.noop".into(),
@@ -898,6 +955,7 @@ mod tests {
                         .verify_approval(&pc, &sig.to_bytes(), &device.device_id, true)
                         .expect("signature must verify");
                     let _ = tx.send(crate::approval_server::VerifiedDeviceDecision {
+                        workstation_receipt: None,
                         approve: true,
                         device: verified,
                     });

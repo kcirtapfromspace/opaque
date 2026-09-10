@@ -567,6 +567,7 @@ impl IdentityStore {
         let snapshot = persona::read_snapshot(&tx, recipient)?.ok_or("verified persona absent")?;
         if !snapshot.is_fresh(now, persona_max_age_secs)
             || !snapshot.groups.contains(&profile.eligible_group)
+            || !super::scim::provisioning_group_permitted(&tx, recipient, &profile.eligible_group)?
         {
             return Err("verified persona is stale or outside eligible group".into());
         }
@@ -643,6 +644,11 @@ impl IdentityStore {
                     || persona.revision != grant.persona_revision
                     || !persona.is_fresh(now, persona_max_age_secs)
                     || !persona.groups.contains(&profile.eligible_group)
+                    || !super::scim::provisioning_group_permitted(
+                        &tx,
+                        recipient,
+                        &profile.eligible_group,
+                    )?
                 {
                     return Err("access eligibility changed".into());
                 }

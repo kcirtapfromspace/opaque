@@ -73,26 +73,8 @@ pub struct Field {
 
 /// Validate that a URL uses `https://`, allowing `http://` only for localhost.
 fn validate_url_scheme(url: &str) -> Result<(), ConnectApiError> {
-    if url.starts_with("https://") {
-        return Ok(());
-    }
-    if url.starts_with("http://") {
-        if let Some(host_part) = url.strip_prefix("http://") {
-            let host = host_part.split('/').next().unwrap_or("");
-            let host_no_port = host.split(':').next().unwrap_or("");
-            if host_no_port == "localhost" || host_no_port == "127.0.0.1" {
-                return Ok(());
-            }
-        }
-        return Err(ConnectApiError::InvalidUrlScheme(format!(
-            "insecure HTTP URL rejected: {url}. \
-             Only https:// URLs are allowed (http:// is permitted for localhost/127.0.0.1 only)"
-        )));
-    }
-    Err(ConnectApiError::InvalidUrlScheme(format!(
-        "unsupported URL scheme: {url}. \
-         Only https:// URLs are allowed (http:// is permitted for localhost/127.0.0.1 only)"
-    )))
+    crate::endpoint::validate_http_endpoint(url)
+        .map_err(|message| ConnectApiError::InvalidUrlScheme(message.into()))
 }
 
 /// 1Password Connect REST API client.
@@ -106,6 +88,11 @@ pub struct OnePasswordClient {
 }
 
 impl OnePasswordClient {
+    /// Credential-free endpoint frozen when the client was constructed.
+    pub(super) fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     /// Build the user-agent string from the crate version.
     fn user_agent() -> String {
         format!("opaqued/{}", env!("CARGO_PKG_VERSION"))
@@ -118,6 +105,8 @@ impl OnePasswordClient {
         let http = reqwest::Client::builder()
             .user_agent(Self::user_agent())
             .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .build()
             .map_err(ConnectApiError::Network)?;
 
@@ -244,6 +233,55 @@ impl OnePasswordClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constructor_rejects_sensitive_endpoint_without_echoing_it() {
+        for endpoint in [
+            "https://endpoint-secret@example.test",
+            "https://user:endpoint-secret@example.test",
+            "https://example.test?token=endpoint-secret",
+            "https://example.test#endpoint-secret",
+            "https://@example.test",
+            "https://example.test?",
+            "https://example.test#",
+            "https:///example.test",
+            "https://example.test/\nendpoint-secret",
+        ] {
+            let error = OnePasswordClient::new(endpoint).unwrap_err().to_string();
+            assert!(!error.contains("endpoint-secret"));
+            assert!(!error.contains(endpoint));
+        }
+    }
+
+    #[tokio::test]
+    async fn request_does_not_follow_redirect_or_repeat_failure() {
+        for status in [302, 307, 503] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v1/vaults"))
+                .and(header("Authorization", "Bearer fixture-token"))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .insert_header("Location", format!("{}/forbidden-follow", server.uri())),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(path("/forbidden-follow"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+                .expect(0)
+                .mount(&server)
+                .await;
+            let client = OnePasswordClient::new(&server.uri()).unwrap();
+            let error = client.list_vaults("fixture-token").await.unwrap_err();
+            if status == 503 {
+                assert!(matches!(error, ConnectApiError::ServerError));
+            } else {
+                assert!(matches!(error, ConnectApiError::UnexpectedStatus(code) if code == status));
+            }
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+    }
 
     #[test]
     fn client_stores_base_url_trimmed() {

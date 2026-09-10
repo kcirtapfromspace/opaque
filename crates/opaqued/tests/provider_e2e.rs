@@ -267,6 +267,16 @@ impl Daemon {
     }
 }
 
+// A failed assertion must not leave a fixture daemon or its socket alive.
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
 /// Stand in for the GitHub API: hand out a real Curve25519 public key, then
 /// accept the sealed secret.
 async fn mock_github() -> MockServer {
@@ -679,26 +689,10 @@ factors = ["local_bio"]
 /// is via another provider's ref resolution, so this drives
 /// `github.set_actions_secret` with a `value_ref` in the `vault:` scheme.
 ///
-/// Routed through the generic `execute` method rather than the ad-hoc
-/// `"github"` RPC method deliberately: the ad-hoc wrapper's
-/// `InputValidator::validate_secret_ref_names` charset-allowlists ref
-/// bodies to `[A-Za-z0-9_./:-]` — it does not include `#`, which every
-/// `vault:<path>#<field>` ref requires — so a `vault:`-scheme `value_ref`
-/// can never pass that specific gate (a pre-existing constraint, not
-/// something this extraction introduced or could fix in scope). The
-/// generic `execute` method validates only the client-declared
-/// `secret_ref_names` array up front (trivially empty here); the enclave
-/// re-derives the real `secret_ref_names` from `params` server-side
-/// (`derive_secret_ref_names`, which performs no charset check) before
-/// dispatch, so the same `github.set_actions_secret` operation and handler
-/// run either way. Confirms: Vault client construction from
-/// `OPAQUE_VAULT_URL`, KV v2 field extraction, `env:`-ref token
-/// resolution, and the resolved value actually reaching the sealed-box
-/// GitHub write — all through the real RPC boundary, previously only
-/// covered by in-process unit tests. Does NOT cover the ad-hoc `"github"`
-/// RPC wrapper with a vault-scheme ref (rejected by input validation, as
-/// above) or Vault lease renewal/caching (covered by
-/// `vault::resolve`'s inline unit tests, unaffected by this move).
+/// Uses generic execution with a complete prepared Vault source reference.
+/// Confirms Vault KV v2 extraction and environment-token resolution reach the
+/// actual sealed GitHub write. The wrapper now shares the same typed preparer;
+/// ref syntax is provider-owned. Lease renewal/caching has separate unit tests.
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn github_set_actions_secret_resolves_vault_value_ref_end_to_end() {
@@ -930,4 +924,487 @@ async fn infisical_operation_is_unknown_end_to_end() {
     );
 
     daemon.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Canonical actions: real socket -> policy/review/audit -> actual provider effects.
+// ---------------------------------------------------------------------------
+
+fn github_action_params(repo: &str) -> Value {
+    json!({
+        "repo":repo, "secret_name":"TUTORIAL_KEY",
+        "value_ref":"env:OPAQUE_E2E_VALUE", "github_token_ref":"env:OPAQUE_E2E_PAT",
+    })
+}
+
+fn assert_error(response: &Value, expected: &str) {
+    assert_eq!(
+        response["error"]["code"], expected,
+        "unexpected response: {response}"
+    );
+    assert!(response.get("result").is_none_or(Value::is_null));
+}
+
+fn audit_events(fixture: &Fixture) -> Vec<opaque_core::audit::AuditEvent> {
+    opaque_core::audit::query_audit_db(
+        &fixture.home.path().join(".opaque/audit.db"),
+        &opaque_core::audit::AuditFilter {
+            limit: 1000,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+}
+
+fn assert_no_approval_or_execution(events: &[opaque_core::audit::AuditEvent]) {
+    use opaque_core::audit::AuditEventKind;
+    assert!(
+        !events
+            .iter()
+            .filter(|event| event.operation.as_deref() != Some("daemon_startup"))
+            .any(|event| matches!(
+                event.kind,
+                AuditEventKind::ApprovalRequired
+                    | AuditEventKind::ApprovalPresented
+                    | AuditEventKind::ApprovalGranted
+                    | AuditEventKind::OperationStarted
+                    | AuditEventKind::SecretResolved
+                    | AuditEventKind::ProviderFetchStarted
+                    | AuditEventKind::OperationSucceeded
+            )),
+        "rejection reached approval, credentials or execution: {events:?}"
+    );
+}
+
+const REPOSITORY_POLICY: &str = r#"
+[[rules]]
+name = "only-approved-repository"
+operation_pattern = "github.set_actions_secret"
+allow = true
+[rules.target.fields]
+repo = "acme/widgets"
+scope = "actions"
+scope_kind = "repository"
+[rules.approval]
+require = "always"
+factors = ["local_bio"]
+"#;
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn canonical_action_rejects_target_substitution_before_approval_and_provider_io() {
+    let _serial = serial_guard();
+    let github = mock_github().await;
+    let fixture = Fixture::new();
+    let config = fixture.write_config_with_rules(REPOSITORY_POLICY);
+    let daemon = fixture.spawn(&config, &github.uri());
+    let response = daemon
+        .call(
+            "execute",
+            json!({
+                "operation":"github.set_actions_secret",
+                "target":{"repo":"acme/widgets"},
+                "params":github_action_params("acme/unapproved"),
+            }),
+        )
+        .await;
+    assert_error(&response, "bad_request");
+    assert!(github.received_requests().await.unwrap().is_empty());
+    daemon.shutdown();
+    let events = audit_events(&fixture);
+    assert_no_approval_or_execution(&events);
+    let rejected: Vec<_> = events
+        .iter()
+        .filter(|event| event.detail.as_deref() == Some("action_preparation_rejected"))
+        .collect();
+    assert_eq!(rejected.len(), 1);
+    assert!(rejected[0].target.is_none());
+    assert!(rejected[0].operation.is_none());
+    assert!(rejected[0].secret_names.is_empty());
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == opaque_core::audit::AuditEventKind::RequestReceived)
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn canonical_action_derives_omitted_targets_for_policy_and_equivalent_dispatch() {
+    use opaque_core::audit::AuditEventKind;
+    let _serial = serial_guard();
+    let github = mock_github().await;
+    let fixture = Fixture::new();
+    let config = fixture.write_config_with_rules(REPOSITORY_POLICY);
+    let daemon = fixture.spawn(&config, &github.uri());
+    let denied = daemon.call("execute", json!({
+        "operation":"github.set_actions_secret", "params":github_action_params("acme/unapproved"),
+    })).await;
+    assert_error(&denied, "policy_denied");
+    assert!(github.received_requests().await.unwrap().is_empty());
+    let raw = daemon.call("execute", json!({
+        "operation":"github.set_actions_secret", "params":github_action_params("acme/widgets"),
+    })).await;
+    assert_eq!(raw["result"]["status"], "created", "{raw}");
+    let mut wrapped = github_action_params("acme/widgets");
+    wrapped["scope"] = "repo_actions".into();
+    let wrapped = daemon.call("github", wrapped).await;
+    assert_eq!(wrapped["result"]["status"], "created", "{wrapped}");
+    let requests = github.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method.as_str() == "PUT")
+            .count(),
+        2
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.url.path().starts_with("/repos/acme/widgets/"))
+    );
+    daemon.shutdown();
+    let events = audit_events(&fixture);
+    let received: Vec<_> = events
+        .iter()
+        .filter(|event| event.kind == AuditEventKind::RequestReceived)
+        .collect();
+    assert_eq!(received.len(), 3);
+    let approved: Vec<_> = received
+        .iter()
+        .filter(|event| event.target.as_ref().unwrap().fields["repo"] == "acme/widgets")
+        .collect();
+    assert_eq!(approved.len(), 2);
+    assert!(approved[0].request_hash.is_some());
+    assert_eq!(
+        approved[0].request_hash, approved[1].request_hash,
+        "raw and wrapper must bind the same prepared action"
+    );
+    for event in approved {
+        let target = &event.target.as_ref().unwrap().fields;
+        assert_eq!(target["scope"], "actions");
+        assert_eq!(target["scope_kind"], "repository");
+        assert_eq!(
+            event.secret_names,
+            ["env:OPAQUE_E2E_PAT", "env:OPAQUE_E2E_VALUE"]
+        );
+    }
+    let denied_event = events
+        .iter()
+        .find(|event| event.kind == AuditEventKind::PolicyDenied)
+        .unwrap();
+    assert_eq!(
+        denied_event.target.as_ref().unwrap().fields["repo"],
+        "acme/unapproved"
+    );
+    let denied_id = denied_event.request_id;
+    assert_no_approval_or_execution(
+        &events
+            .iter()
+            .filter(|event| event.request_id == denied_id)
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn canonical_action_rejects_malformed_targets_and_unknown_provider_fields() {
+    let _serial = serial_guard();
+    let github = mock_github().await;
+    let fixture = Fixture::new();
+    let config = fixture.write_config();
+    let daemon = fixture.spawn_with_env(
+        &config,
+        &github.uri(),
+        &[
+            ("OPAQUE_1PASSWORD_CONNECT_URL", &github.uri()),
+            ("OPAQUE_1PASSWORD_TOKEN_REF", "env:OPAQUE_E2E_PAT"),
+        ],
+    );
+    for target in [
+        Value::Null,
+        json!([]),
+        json!("acme/widgets"),
+        json!({"repo":42}),
+        json!({"unrecognized":"x"}),
+    ] {
+        let response = daemon
+            .call(
+                "execute",
+                json!({
+                    "operation":"github.set_actions_secret", "target":target,
+                    "params":github_action_params("acme/widgets"),
+                }),
+            )
+            .await;
+        assert_error(&response, "bad_request");
+    }
+    for (field, value) in [
+        ("unexpected", json!(true)),
+        ("environment", json!(false)),
+        ("org", json!("competing")),
+    ] {
+        let mut params = github_action_params("acme/widgets");
+        params[field] = value;
+        let raw = daemon
+            .call(
+                "execute",
+                json!({"operation":"github.set_actions_secret", "params":params.clone()}),
+            )
+            .await;
+        assert_error(&raw, "invalid_params");
+        params["scope"] = "repo_actions".into();
+        let wrapped = daemon.call("github", params).await;
+        assert_error(&wrapped, "invalid_params");
+    }
+    let malformed_project = daemon
+        .call(
+            "bitwarden",
+            json!({"action":"list_secrets", "project":false}),
+        )
+        .await;
+    assert_error(&malformed_project, "invalid_params");
+    let unknown_option = daemon
+        .call(
+            "onepassword",
+            json!({"action":"list_items", "vault":"Engineering", "unrecognized":true}),
+        )
+        .await;
+    assert_error(&unknown_option, "invalid_params");
+    assert!(github.received_requests().await.unwrap().is_empty());
+    daemon.shutdown();
+    assert_no_approval_or_execution(&audit_events(&fixture));
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn canonical_action_policy_includes_implicit_token_refs_and_ignores_forged_ref_lists() {
+    use opaque_core::audit::AuditEventKind;
+    let _serial = serial_guard();
+    let github = mock_github().await;
+    for allow_token in [false, true] {
+        let fixture = Fixture::new();
+        let patterns = if allow_token {
+            r#"["env:OPAQUE_E2E_VALUE", "env:OPAQUE_E2E_PAT"]"#
+        } else {
+            r#"["env:OPAQUE_E2E_VALUE"]"#
+        };
+        let config = fixture.write_config_with_rules(&format!(
+            r#"
+[[rules]]
+name = "only-enrolled-secret-references"
+operation_pattern = "github.set_actions_secret"
+allow = true
+[rules.secret_names]
+patterns = {patterns}
+[rules.approval]
+require = "always"
+factors = ["local_bio"]
+"#
+        ));
+        let daemon = fixture.spawn_with_env(
+            &config,
+            &github.uri(),
+            &[("OPAQUE_GITHUB_TOKEN_REF", "env:OPAQUE_E2E_PAT")],
+        );
+        let mut params = github_action_params("acme/widgets");
+        params.as_object_mut().unwrap().remove("github_token_ref");
+        let response = daemon
+            .call(
+                "execute",
+                json!({
+                    "operation":"github.set_actions_secret", "params":params,
+                    // A caller cannot hide the implicitly selected provider credential.
+                    "secret_ref_names":["env:OPAQUE_E2E_VALUE"],
+                }),
+            )
+            .await;
+        if allow_token {
+            assert_eq!(response["result"]["status"], "created", "{response}");
+        } else {
+            assert_error(&response, "policy_denied");
+            assert!(github.received_requests().await.unwrap().is_empty());
+        }
+        daemon.shutdown();
+        let events = audit_events(&fixture);
+        let received = events
+            .iter()
+            .find(|event| event.kind == AuditEventKind::RequestReceived)
+            .unwrap();
+        assert_eq!(
+            received.secret_names,
+            ["env:OPAQUE_E2E_PAT", "env:OPAQUE_E2E_VALUE"]
+        );
+        if !allow_token {
+            assert_no_approval_or_execution(&events);
+        }
+    }
+    assert_eq!(github.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn canonical_action_policy_constrains_actual_secret_scope_and_environment() {
+    use opaque_core::audit::AuditEventKind;
+    let _serial = serial_guard();
+    let github = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/widgets/environments/staging/secrets"))
+        .and(header("authorization", format!("Bearer {TEST_PAT}")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"total_count":0,"secrets":[]})),
+        )
+        .expect(1)
+        .mount(&github)
+        .await;
+    let fixture = Fixture::new();
+    let config = fixture.write_config_with_rules(
+        r#"
+[[rules]]
+name = "only-staging-actions"
+operation_pattern = "github.list_secrets"
+allow = true
+[rules.target.fields]
+repo = "acme/widgets"
+scope = "actions"
+environment = "staging"
+[rules.approval]
+require = "always"
+factors = ["local_bio"]
+"#,
+    );
+    let daemon = fixture.spawn(&config, &github.uri());
+    for params in [
+        json!({"repo":"acme/widgets","environment":"production"}),
+        json!({"repo":"acme/widgets","scope":"dependabot"}),
+        json!({"scope":"org","org":"acme"}),
+    ] {
+        let mut params = params;
+        params["github_token_ref"] = "env:OPAQUE_E2E_PAT".into();
+        let response = daemon
+            .call(
+                "execute",
+                json!({"operation":"github.list_secrets","params":params}),
+            )
+            .await;
+        assert_error(&response, "policy_denied");
+    }
+    assert!(github.received_requests().await.unwrap().is_empty());
+    let response = daemon
+        .call(
+            "github",
+            json!({
+                "action":"list_secrets","repo":"acme/widgets","environment":"staging",
+                "github_token_ref":"env:OPAQUE_E2E_PAT",
+            }),
+        )
+        .await;
+    assert_eq!(response["result"]["total_count"], 0, "{response}");
+    assert_eq!(github.received_requests().await.unwrap().len(), 1);
+    daemon.shutdown();
+    let events = audit_events(&fixture);
+    let denied: Vec<_> = events
+        .iter()
+        .filter(|event| event.kind == AuditEventKind::PolicyDenied)
+        .collect();
+    assert_eq!(denied.len(), 3);
+    for event in denied {
+        assert_no_approval_or_execution(
+            &events
+                .iter()
+                .filter(|other| other.request_id == event.request_id)
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn canonical_action_rejects_task_only_operations_under_allow_all_policy() {
+    let _serial = serial_guard();
+    let github = MockServer::start().await;
+    let fixture = Fixture::new();
+    let config = fixture.write_config_with_rules(
+        r#"
+[[rules]]
+name = "allow-all-for-route-regression"
+operation_pattern = "*"
+allow = true
+[rules.approval]
+require = "always"
+factors = ["local_bio"]
+"#,
+    );
+    let daemon = fixture.spawn(&config, &github.uri());
+    for operation in [
+        "github.publish_manifest",
+        "github.release_manifest",
+        "github.dispatch_staging_workflow",
+        "github.observe_staging_workflow",
+        "inference.fixed_manifest",
+        "inference.fixed_completion",
+        "ssh.health_manifest",
+        "ssh.service_health",
+    ] {
+        let response = daemon
+            .call("execute", json!({"operation":operation,"params":{}}))
+            .await;
+        assert_error(&response, "bad_request");
+    }
+    assert!(github.received_requests().await.unwrap().is_empty());
+    daemon.shutdown();
+    let events = audit_events(&fixture);
+    assert_no_approval_or_execution(&events);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.detail.as_deref() == Some("action_preparation_rejected"))
+            .count(),
+        8
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn canonical_reference_metadata_rejects_secret_bytes_before_audit_or_review() {
+    let _serial = serial_guard();
+    let github = mock_github().await;
+    let fixture = Fixture::new();
+    let config = fixture.write_config();
+    let daemon = fixture.spawn(&config, &github.uri());
+    let sentinel = format!("ghp_{}", "z".repeat(36));
+    for reference in [
+        format!("env:{sentinel}"),
+        "env:forged\nrecord".into(),
+        "env:hidden\u{202e}".into(),
+    ] {
+        for field in ["value_ref", "github_token_ref"] {
+            let mut params = github_action_params("acme/widgets");
+            params[field] = reference.clone().into();
+            let raw = daemon
+                .call(
+                    "execute",
+                    json!({
+                        "operation":"github.set_actions_secret", "params":params.clone(),
+                    }),
+                )
+                .await;
+            assert_error(&raw, "invalid_params");
+            params["scope"] = "repo_actions".into();
+            let wrapped = daemon.call("github", params).await;
+            assert!(wrapped.get("error").is_some(), "{wrapped}");
+            assert!(!wrapped.to_string().contains(&sentinel));
+        }
+    }
+    assert!(github.received_requests().await.unwrap().is_empty());
+    daemon.shutdown();
+    let events = audit_events(&fixture);
+    assert_no_approval_or_execution(&events);
+    let encoded = serde_json::to_string(&events).unwrap();
+    for marker in [&sentinel, "forged", "hidden"] {
+        assert!(!encoded.contains(marker));
+    }
 }

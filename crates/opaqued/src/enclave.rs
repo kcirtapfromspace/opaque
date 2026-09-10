@@ -9,10 +9,10 @@
 //!
 //! 1. Verify client identity
 //! 2. Look up operation in registry
-//! 3. Check safety-class / client-type constraints
-//! 4. Evaluate policy
+//! 3. Prepare one typed action; derive its target, refs, review and hash payload
+//! 4. Check safety constraints and evaluate policy
 //! 5. If approval required, trigger operation-bound approval
-//! 6. Execute the operation handler
+//! 6. Consume the same prepared action after the durable audit barrier
 //! 7. Sanitize the response
 //! 8. Emit audit events at each step
 //! 9. Return sanitized response
@@ -38,7 +38,12 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
+mod action;
+#[cfg(test)]
+mod action_tests;
 mod audit_durability;
+mod mcp;
+pub use mcp::operation as mcp_operation;
 mod task;
 pub use task::{
     inference_task_operations, release_task_operations, ssh_task_operations, task_operation,
@@ -62,6 +67,7 @@ pub use task::{
 ///
 /// Non-string, empty, or missing values are skipped (params schema validation
 /// has already run by this point).
+#[cfg(test)]
 fn render_secret_ref_template(
     template: &str,
     params: &serde_json::Map<String, serde_json::Value>,
@@ -96,6 +102,7 @@ fn render_secret_ref_template(
     Some(out)
 }
 
+#[cfg(test)]
 fn derive_secret_ref_names(param_keys: &[String], params: &serde_json::Value) -> Vec<String> {
     let mut refs = Vec::new();
     if let serde_json::Value::Object(map) = params {
@@ -393,7 +400,6 @@ impl LeaseCache {
     }
 
     /// Clear all leases.
-    #[cfg(test)]
     fn clear(&self) {
         self.leases
             .lock()
@@ -457,7 +463,16 @@ impl fmt::Debug for LeaseCache {
 ///
 /// All secret-using operations pass through this enclave, via individual
 /// execution or the typed, durably accounted task path.
+pub type TaskAuthorityGuard = Arc<
+    dyn Fn(
+            Option<&opaque_core::identity::PrincipalContext>,
+            &mut dyn FnMut() -> Result<(), String>,
+        ) -> Result<(), String>
+        + Send
+        + Sync,
+>;
 pub struct Enclave {
+    task_authority_guard: Option<TaskAuthorityGuard>,
     inference_profile: Option<opaque_bounded_work::inference::TrustedInferenceProfile>,
     ssh_profile: Option<opaque_bounded_work::ssh::TrustedSshProfile>,
     /// Exact session/provisioning ceremonies use this complete-review factor.
@@ -511,6 +526,7 @@ impl fmt::Debug for Enclave {
 
 /// Builder for constructing an [`Enclave`].
 pub struct EnclaveBuilder {
+    task_authority_guard: Option<TaskAuthorityGuard>,
     task_grants_enabled: bool,
     inference_profile: Option<opaque_bounded_work::inference::TrustedInferenceProfile>,
     ssh_profile: Option<opaque_bounded_work::ssh::TrustedSshProfile>,
@@ -524,9 +540,14 @@ pub struct EnclaveBuilder {
 }
 
 impl EnclaveBuilder {
+    pub fn task_authority_guard(mut self, guard: TaskAuthorityGuard) -> Self {
+        self.task_authority_guard = Some(guard);
+        self
+    }
     /// Create a new builder.
     pub fn new() -> Self {
         Self {
+            task_authority_guard: None,
             task_grants_enabled: false,
             inference_profile: None,
             ssh_profile: None,
@@ -620,6 +641,7 @@ impl EnclaveBuilder {
             return Err("agent-session approval requires local_bio or paired_workstation".into());
         }
         Ok(Enclave {
+            task_authority_guard: self.task_authority_guard,
             task_operations: task::enabled_operation_names(
                 self.task_grants_enabled,
                 self.inference_profile.is_some(),
@@ -713,9 +735,8 @@ impl Enclave {
 
     /// Replace the policy engine in place (federation bundle hot-swap).
     ///
-    /// Requests already past their policy evaluation finish under the old
-    /// rules; every evaluation after the swap sees the new set. Returns the
-    /// new rule count.
+    /// Requests already authorized for dispatch may finish; pending review
+    /// under an older generation fails closed. Returns the new rule count.
     pub fn swap_policy(&self, policy: PolicyEngine) -> usize {
         let count = policy.rule_count();
         let mut current = self
@@ -725,6 +746,7 @@ impl Enclave {
         *current = policy;
         self.policy_generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.lease_cache.clear();
         count
     }
 
@@ -736,12 +758,12 @@ impl Enclave {
     ///
     /// Pipeline:
     /// 1. Verify client identity (defense-in-depth)
-    /// 2. Emit request-received audit event
-    /// 3. Look up operation in registry, validate target keys and params
+    /// 2. Look up the operation and prepare the validated typed action
+    /// 3. Emit canonical request metadata; raw assertions never become authority
     /// 4. Check safety-class constraints
     /// 5. Evaluate policy
     /// 6. Trigger approval if required
-    /// 7. Execute operation handler
+    /// 7. Consume the captured action after durable audit confirmation
     /// 8. Sanitize response
     /// 9. Emit outcome audit event
     pub async fn execute(&self, mut request: OperationRequest) -> SanitizedResponse<Sanitized> {
@@ -754,8 +776,6 @@ impl Enclave {
         if let Some(ref ctx) = request.principal {
             client_summary = client_summary.with_principal(ctx);
         }
-        let target_summary = TargetSummary::sanitized(&request.target);
-
         let workspace_summary = request.workspace.as_ref().map(WorkspaceSummary::sanitized);
 
         // --- Step 1: Verify client identity ---
@@ -768,80 +788,39 @@ impl Enclave {
             return self.error_to_sanitized(&err);
         }
 
-        // --- Step 2: Emit request received ---
+        // Freeze the actual action before publishing metadata or evaluating
+        // policy. Caller targets are assertions, never the execution authority.
+        let op_def = match self.registry.get(&request.operation) {
+            Ok(definition) => definition.clone(),
+            Err(_) => {
+                return self.reject_unprepared(
+                    request_id,
+                    client_summary,
+                    EnclaveError::UnknownOperation("unregistered operation".into()),
+                );
+            }
+        };
+        let prepared = match self.prepare_generic(&request, &op_def) {
+            Ok(action) => action,
+            Err(error) => return self.reject_unprepared(request_id, client_summary, error),
+        };
+        request.target = prepared.target().clone();
+        request.secret_ref_names = prepared.secret_ref_names().to_vec();
+        request.params = prepared.params().clone();
+        let target_summary = TargetSummary::sanitized(&request.target);
+        let action_hash = request.content_hash();
+
         let mut event = AuditEvent::new(AuditEventKind::RequestReceived)
             .with_request_id(request_id)
             .with_client(client_summary.clone())
             .with_operation(&request.operation)
             .with_target(target_summary.clone())
-            .with_secret_names(request.secret_ref_names.clone());
+            .with_secret_names(request.secret_ref_names.clone())
+            .with_request_hash(&action_hash);
         if let Some(ref ws) = workspace_summary {
             event = event.with_workspace(ws.clone());
         }
         self.audit.emit(event);
-
-        // --- Step 3: Look up operation in registry ---
-        let op_def = match self.registry.get(&request.operation) {
-            Ok(def) => def.clone(),
-            Err(_) => {
-                let err = EnclaveError::UnknownOperation(request.operation.clone());
-                return self.emit_and_sanitize_error(
-                    request_id,
-                    &client_summary,
-                    &request.operation,
-                    &target_summary,
-                    &request.secret_ref_names,
-                    &err,
-                    start,
-                );
-            }
-        };
-
-        // --- Step 3b: Validate target keys against allowed set ---
-        if !op_def.allowed_target_keys.is_empty() {
-            for key in request.target.keys() {
-                if !op_def.allowed_target_keys.iter().any(|k| k == key) {
-                    let err = EnclaveError::InvalidInput(format!("unexpected target key: {key}"));
-                    return self.emit_and_sanitize_error(
-                        request_id,
-                        &client_summary,
-                        &request.operation,
-                        &target_summary,
-                        &request.secret_ref_names,
-                        &err,
-                        start,
-                    );
-                }
-            }
-        }
-
-        // --- Step 3c: Validate params against schema ---
-        if let Err(errors) = self
-            .registry
-            .validate_params(&request.operation, &request.params)
-        {
-            let err = EnclaveError::InvalidParams(errors.join("; "));
-            return self.emit_and_sanitize_error(
-                request_id,
-                &client_summary,
-                &request.operation,
-                &target_summary,
-                &request.secret_ref_names,
-                &err,
-                start,
-            );
-        }
-
-        // --- Step 3d: Derive secret_ref_names server-side ---
-        // SECURITY: Never trust client-supplied secret_ref_names. Extract
-        // them from the operation params using the operation definition's
-        // `secret_ref_param_keys`. This prevents policy bypass where a
-        // client sends empty secret_ref_names to sidestep secret name
-        // constraints.
-        if !op_def.secret_ref_param_keys.is_empty() {
-            let derived = derive_secret_ref_names(&op_def.secret_ref_param_keys, &request.params);
-            request.secret_ref_names = derived;
-        }
 
         // --- Step 4: Safety-class / client-type constraints ---
         if let Err(err) = self.check_safety_constraints(&request, &op_def) {
@@ -857,11 +836,17 @@ impl Enclave {
         }
 
         // --- Step 5: Evaluate policy ---
-        let mut decision = self
-            .policy
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .evaluate(&request, op_def.safety);
+        let (mut decision, policy_generation) = {
+            let policy = self
+                .policy
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (
+                policy.evaluate(&request, op_def.safety),
+                self.policy_generation
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            )
+        };
 
         if !decision.allowed {
             let reason = decision
@@ -927,6 +912,7 @@ impl Enclave {
                 &decision,
                 &client_summary,
                 &target_summary,
+                policy_generation,
             )
             .await
         {
@@ -948,35 +934,44 @@ impl Enclave {
                 .with_client(client_summary.clone())
                 .with_operation(&request.operation)
                 .with_target(target_summary.clone())
-                .with_safety(op_def.safety),
+                .with_safety(op_def.safety)
+                .with_request_hash(&action_hash),
         );
-
-        let handler = match self.handlers.get(&request.operation) {
-            Some(h) => h,
-            None => {
-                let err = EnclaveError::Internal(format!(
-                    "no handler registered for operation: {}",
-                    request.operation
-                ));
-                self.audit.emit(
-                    AuditEvent::new(AuditEventKind::OperationFailed)
-                        .with_request_id(request_id)
-                        .with_client(client_summary.clone())
-                        .with_operation(&request.operation)
-                        .with_target(target_summary.clone())
-                        .with_outcome("error")
-                        .with_detail("no handler registered")
-                        .with_latency_ms(start.elapsed().as_millis() as i64),
-                );
-                return self.error_to_sanitized(&err);
-            }
-        };
 
         if let Err(error) = self.confirm_audit(false).await {
             return self.error_to_sanitized(&error);
         }
+        // Current identity, role and delegation state are checked after human
+        // review. This synchronous admission is the generic dispatch boundary;
+        // removal afterward cannot recall an already admitted provider action.
+        let dispatch_authorized = {
+            let _policy = self
+                .policy
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.policy_generation
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == policy_generation
+                && self
+                    .task_authority_guard
+                    .as_ref()
+                    .is_none_or(|guard| guard(request.principal.as_ref(), &mut || Ok(())).is_ok())
+        };
+        if !dispatch_authorized {
+            return self.emit_and_sanitize_error(
+                request_id,
+                &client_summary,
+                &request.operation,
+                &target_summary,
+                &request.secret_ref_names,
+                &EnclaveError::SafetyViolation(
+                    "policy or requester authority changed before dispatch".into(),
+                ),
+                start,
+            );
+        }
         let op_start = Instant::now();
-        let result = handler.execute(&request).await;
+        let result = prepared.execute().await;
         let op_latency = op_start.elapsed();
 
         match result {
@@ -991,6 +986,7 @@ impl Enclave {
                         .with_request_id(request_id)
                         .with_client(client_summary)
                         .with_operation(&request.operation)
+                        .with_request_hash(&action_hash)
                         .with_target(target_summary)
                         .with_safety(op_def.safety)
                         .with_outcome("ok")
@@ -1009,6 +1005,7 @@ impl Enclave {
                         .with_request_id(request_id)
                         .with_client(client_summary)
                         .with_operation(&request.operation)
+                        .with_request_hash(&action_hash)
                         .with_target(target_summary)
                         .with_safety(op_def.safety)
                         .with_outcome("error")
@@ -1198,7 +1195,8 @@ impl Enclave {
         decision: &PolicyDecision,
         client_summary: &ClientSummary,
         target_summary: &TargetSummary,
-    ) -> Result<(), EnclaveError> {
+        expected_policy_generation: u64,
+    ) -> Result<Option<opaque_core::workstation::SignedWorkstationReceipt>, EnclaveError> {
         let needs_approval = match decision.approval_requirement {
             ApprovalRequirement::Always => true,
             ApprovalRequirement::FirstUse => {
@@ -1249,7 +1247,7 @@ impl Enclave {
         }
 
         if !needs_approval {
-            return Ok(());
+            return Ok(None);
         }
         // SECURITY (H10): a required approval with no configured factor must fail
         // closed, never be silently skipped. `execute` clamps factors to the
@@ -1305,33 +1303,11 @@ impl Enclave {
                 self.ssh_profile.as_ref(),
             )?);
         }
-        for (k, v) in &request.target {
-            // SECURITY (C3): the command is the security-critical field the approver
-            // must actually read, so render it in full (sanitized to a single line)
-            // with an explicit truncation marker — never silently cut it, which would
-            // let an attacker hide an exfil tail past a truncation limit. Other target
-            // fields are short identifiers and keep the conservative cap.
-            if k == "command" {
-                let full = sanitize_for_display(v, 4096);
-                let marker = if v.chars().count() > 4096 {
-                    " …(truncated)"
-                } else {
-                    ""
-                };
-                description.push_str(&format!("\n  command: {full}{marker}"));
-                continue;
-            }
-            let v_safe = sanitize_for_display(v, 128);
-            description.push_str(&format!("\n  {k}: {v_safe}"));
-        }
+        description.push_str(&action::canonical_review_fields(
+            &request.target,
+            &request.secret_ref_names,
+        ));
         description.push_str(&format!("\nClient: {}", request.client_identity));
-        let ref_display: Vec<String> = request
-            .secret_ref_names
-            .iter()
-            .take(8)
-            .map(|s| sanitize_for_display(s, 128))
-            .collect();
-        description.push_str(&format!("\nSecrets: [{}]", ref_display.join(", ")));
         if let Some(ref ws) = request.workspace {
             let url = ws.remote_url.as_deref().unwrap_or("?");
             description.push_str(&format!(
@@ -1340,8 +1316,8 @@ impl Enclave {
                 ws.branch.as_deref().unwrap_or("?"),
             ));
         }
-        // Append truncated content hash for cryptographic binding.
-        description.push_str(&format!("\nRequest Hash: {}", &content_hash[..16]));
+        // Display the complete action fingerprint.
+        description.push_str(&format!("\nRequest Hash: {content_hash}"));
 
         // Serialize approval prompts to avoid races.
         let _permit = self
@@ -1362,19 +1338,67 @@ impl Enclave {
         );
 
         let approval_start = Instant::now();
+        let binding = if request.target.contains_key("task_id")
+            && request.params.get("tenant").is_some_and(|v| !v.is_null())
+        {
+            let tenant = serde_json::from_value(request.params["tenant"].clone())
+                .map_err(|_| EnclaveError::SafetyViolation("invalid approval tenant".into()))?;
+            let binding = opaque_core::workstation::ApprovalBinding {
+                tenant,
+                task_id: request.target["task_id"].clone(),
+                manifest_digest: request
+                    .target
+                    .get("manifest_digest")
+                    .cloned()
+                    .unwrap_or_default(),
+                request_hash: content_hash.clone(),
+                policy_digest: self
+                    .policy
+                    .read()
+                    .map_err(|_| EnclaveError::SafetyViolation("policy unavailable".into()))?
+                    .digest()
+                    .map_err(|_| {
+                        EnclaveError::SafetyViolation("policy digest unavailable".into())
+                    })?,
+                requester: request
+                    .principal
+                    .as_ref()
+                    .map(|p| p.sub.to_string())
+                    .unwrap_or_default(),
+            };
+            // Local approvals retain their existing principal semantics. Remote
+            // binding validation happens in the configured workstation verifier.
+            Some(binding)
+        } else {
+            None
+        };
         let result = self
             .approval_gate
-            .request_approval(
+            .request_bound_approval(
                 approval_id,
                 request,
                 &decision.required_factors,
                 &description,
+                binding,
             )
             .await;
         let approval_latency = approval_start.elapsed();
 
         match result {
             Ok(outcome) if outcome.approved => {
+                // Keep policy publication and lease issuance ordered. A round
+                // started under an older policy must not repopulate the cache
+                // after swap_policy has invalidated its leases.
+                let _policy = self.policy.read().unwrap_or_else(|p| p.into_inner());
+                if self
+                    .policy_generation
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    != expected_policy_generation
+                {
+                    return Err(EnclaveError::ApprovalNotGranted(
+                        "policy changed during review; a fresh approval is required".into(),
+                    ));
+                }
                 // Segregation of duties: the approver must be a verified
                 // identity DIFFERENT from the principal the operation is for.
                 // An anonymous approval (nobody logged in) fails closed —
@@ -1433,7 +1457,7 @@ impl Enclave {
                     self.lease_cache.grant(lease_key, ttl, decision.one_time);
                 }
 
-                Ok(())
+                Ok(outcome.workstation_receipt)
             }
             Ok(_) => {
                 self.audit.emit(
@@ -1589,6 +1613,22 @@ impl NativeApprovalGate {
 }
 
 impl ApprovalGate for NativeApprovalGate {
+    fn authorize_receipt(
+        &self,
+        requester: Option<&opaque_core::identity::PrincipalContext>,
+        receipt: &opaque_core::workstation::SignedWorkstationReceipt,
+        authorize: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.registry
+            .authorize_receipt(requester, receipt, authorize)
+    }
+    fn revalidate_receipt(
+        &self,
+        receipt: &opaque_core::workstation::SignedWorkstationReceipt,
+    ) -> Result<(), String> {
+        self.registry.revalidate_receipt(receipt)
+    }
+
     fn request_approval(
         &self,
         approval_id: Uuid,
@@ -1598,7 +1638,21 @@ impl ApprovalGate for NativeApprovalGate {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<ApprovalOutcome, String>> + Send + '_>,
     > {
+        self.request_bound_approval(approval_id, request, factors, description, None)
+    }
+
+    fn request_bound_approval(
+        &self,
+        approval_id: Uuid,
+        request: &OperationRequest,
+        factors: &[ApprovalFactor],
+        description: &str,
+        binding: Option<opaque_core::workstation::ApprovalBinding>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ApprovalOutcome, String>> + Send + '_>,
+    > {
         let ctx = opaque_approval::factors::ApprovalContext {
+            binding,
             approval_id,
             request_id: request.request_id,
             operation: request.operation.clone(),
@@ -1608,13 +1662,10 @@ impl ApprovalGate for NativeApprovalGate {
         let factors = factors.to_vec();
         Box::pin(async move {
             let decision = self.registry.request_approval(&factors, &ctx).await?;
-            Ok(if !decision.approved {
-                ApprovalOutcome::denied()
-            } else {
-                match decision.approver {
-                    Some(approver) => ApprovalOutcome::approved_by(approver),
-                    None => ApprovalOutcome::approved_anonymous(),
-                }
+            Ok(ApprovalOutcome {
+                approved: decision.approved,
+                approver: decision.approver,
+                workstation_receipt: decision.workstation_receipt,
             })
         })
     }
@@ -1792,6 +1843,26 @@ mod test_support {
         }
     }
 
+    // This test-only projection preserves focused policy/lease fixtures. Runtime
+    // provider contracts are exercised separately with their real preparers.
+    pub fn fixture_refs(request: &OperationRequest) -> Vec<String> {
+        let keys = [
+            "value_ref",
+            "github_token_ref",
+            "gitlab_token_ref",
+            "onepassword:{vault}/{item}/{field}",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        let derived = derive_secret_ref_names(&keys, &request.params);
+        if derived.is_empty() {
+            request.secret_ref_names.clone()
+        } else {
+            derived
+        }
+    }
+
     /// A stub operation handler that returns a fixed payload. For testing only.
     #[derive(Debug)]
     pub struct StubHandler {
@@ -1799,6 +1870,20 @@ mod test_support {
     }
 
     impl OperationHandler for StubHandler {
+        fn prepare<'a>(
+            &'a self,
+            request: &OperationRequest,
+        ) -> Result<opaque_core::operation_handler::PreparedOperation<'a>, String> {
+            let resp = self.response.clone();
+            let refs = fixture_refs(request);
+            opaque_core::operation_handler::PreparedOperation::new(
+                request.params.clone(),
+                request.target.clone(),
+                refs,
+                move |_| async move { Ok(resp) },
+            )
+        }
+
         fn execute(
             &self,
             _request: &OperationRequest,
@@ -1817,6 +1902,20 @@ mod test_support {
     }
 
     impl OperationHandler for FailingHandler {
+        fn prepare<'a>(
+            &'a self,
+            request: &OperationRequest,
+        ) -> Result<opaque_core::operation_handler::PreparedOperation<'a>, String> {
+            let msg = self.error_message.clone();
+            let refs = fixture_refs(request);
+            opaque_core::operation_handler::PreparedOperation::new(
+                request.params.clone(),
+                request.target.clone(),
+                refs,
+                move |_| async move { Err(msg) },
+            )
+        }
+
         fn execute(
             &self,
             _request: &OperationRequest,
@@ -2774,6 +2873,77 @@ mod tests {
         let resp = enclave.execute(req).await;
         assert!(resp.error_code().is_none());
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn policy_swap_during_review_cannot_repopulate_first_use_lease() {
+        #[derive(Debug)]
+        struct PausedGate {
+            started: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl ApprovalGate for PausedGate {
+            fn request_approval(
+                &self,
+                _: Uuid,
+                _: &OperationRequest,
+                _: &[ApprovalFactor],
+                _: &str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<ApprovalOutcome, String>> + Send + '_>,
+            > {
+                let first = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                Box::pin(async move {
+                    if first {
+                        self.started.notify_one();
+                        self.release.notified().await;
+                    }
+                    Ok(ApprovalOutcome::approved_anonymous())
+                })
+            }
+        }
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let enclave = Arc::new(build_lease_enclave(
+            Box::new(PausedGate {
+                started: started.clone(),
+                release: release.clone(),
+                calls: calls.clone(),
+            }),
+            audit.clone(),
+            test_first_use_policy(Some(Duration::from_secs(300)), false),
+        ));
+        let running = enclave.clone();
+        let first = tokio::spawn(async move {
+            running
+                .execute(test_request("github.set_actions_secret", ClientType::Agent))
+                .await
+        });
+        started.notified().await;
+        enclave.swap_policy(test_first_use_policy(Some(Duration::from_secs(300)), false));
+        release.notify_one();
+        assert_eq!(
+            first.await.unwrap().error_code(),
+            Some("approval_not_granted")
+        );
+        assert!(enclave.active_leases().is_empty());
+        assert!(
+            audit
+                .events_of_kind(AuditEventKind::OperationSucceeded)
+                .is_empty()
+        );
+        assert_eq!(
+            enclave
+                .execute(test_request("github.set_actions_secret", ClientType::Agent))
+                .await
+                .error_code(),
+            None
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(audit.events_of_kind(AuditEventKind::LeaseHit).is_empty());
     }
 
     #[tokio::test]
@@ -3818,7 +3988,7 @@ mod tests {
         );
         // Should contain target fields.
         assert!(
-            desc.contains("repo: org/myrepo"),
+            desc.contains("\"repo\": \"org/myrepo\""),
             "description should contain target repo"
         );
         // Should contain secret ref names.
@@ -3937,6 +4107,26 @@ mod tests {
     }
 
     impl OperationHandler for RecordingHandler {
+        fn prepare<'a>(
+            &'a self,
+            request: &OperationRequest,
+        ) -> Result<opaque_core::operation_handler::PreparedOperation<'a>, String> {
+            let request = request.clone();
+            let received = self.received.clone();
+            opaque_core::operation_handler::PreparedOperation::new(
+                request.params.clone(),
+                request.target.clone(),
+                fixture_refs(&request),
+                move |_| async move {
+                    received
+                        .lock()
+                        .expect("recording handler mutex")
+                        .push(request);
+                    Ok(serde_json::json!({"status":"ok"}))
+                },
+            )
+        }
+
         fn execute(
             &self,
             request: &OperationRequest,

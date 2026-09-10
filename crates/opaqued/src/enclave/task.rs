@@ -14,6 +14,10 @@ use std::sync::atomic::Ordering;
 
 const PUBLISH_CHILD_OPERATION: &str = "github.set_actions_secret";
 
+#[cfg(test)]
+#[path = "task_remote_tests.rs"]
+mod remote_tests;
+
 /// Capability metadata for the typed task transport, kept with its operation
 /// definitions. Registration alone does not install a task ledger or profile.
 pub(super) fn enabled_operation_names(
@@ -582,11 +586,36 @@ impl Enclave {
                 .with_target(target.clone())
                 .with_secret_names(request.secret_ref_names.clone()),
         );
-        self.handle_approval(&request, &definition, &decision, &client, &target)
+        let remote_receipt = self
+            .handle_approval(
+                &request,
+                &definition,
+                &decision,
+                &client,
+                &target,
+                generation,
+            )
             .await
             .map_err(|e| e.to_string())?;
         if self.policy_generation.load(Ordering::SeqCst) != generation {
             return Err("policy changed during task approval; create a fresh task".into());
+        }
+        if let Some(receipt) = &remote_receipt {
+            let binding = &receipt
+                .review
+                .challenge
+                .authority
+                .as_ref()
+                .ok_or("remote receipt has no authority")?
+                .binding;
+            if binding.task_id != claimed.id
+                || binding.manifest_digest != claimed.manifest_digest
+                || Some(&binding.tenant) != claimed.tenant.as_ref()
+                || binding.request_hash != request.content_hash()
+            {
+                return Err("remote approval receipt does not bind this task".into());
+            }
+            self.approval_gate.revalidate_receipt(receipt)?;
         }
         let approval_mode = if approval_mode == TaskApprovalMode::Native
             && decision.required_factors == [ApprovalFactor::PairedWorkstation]
@@ -596,12 +625,13 @@ impl Enclave {
             approval_mode
         };
         store
-            .approve(
+            .approve_with_receipt(
                 id,
                 owner,
                 &claimed.manifest_digest,
                 approval_mode,
                 now_unix(),
+                remote_receipt.as_ref(),
             )
             .map_err(|e| e.to_string())?;
         for slot in &claimed.slots {
@@ -646,8 +676,43 @@ impl Enclave {
                 }
                 self.task_decision(&mut request.clone(), &claimed.manifest)
                     .map_err(|_| rejected("policy_denied"))?;
+                let _policy = self.policy.read().map_err(|_| rejected("policy_denied"))?;
+                if self.policy_generation.load(Ordering::SeqCst) != generation {
+                    return Err(rejected("policy_denied"));
+                }
                 // This final ledger check is the dispatch authorization boundary.
                 // Revocation after it cannot recall an already authorized HTTP request.
+                if let Some(receipt) = &remote_receipt {
+                    self.approval_gate
+                        .authorize_receipt(request.principal.as_ref(), receipt, &mut || {
+                            store
+                                .authorize_dispatch(
+                                    id,
+                                    owner,
+                                    &slot.id,
+                                    &request_id.to_string(),
+                                    now_unix(),
+                                )
+                                .map_err(|_| "task dispatch no longer authorized".into())
+                        })
+                        .map_err(|_| rejected("reviewer_or_task_authority_changed"))?;
+                    return Ok(());
+                }
+                if let Some(guard) = &self.task_authority_guard {
+                    guard(request.principal.as_ref(), &mut || {
+                        store
+                            .authorize_dispatch(
+                                id,
+                                owner,
+                                &slot.id,
+                                &request_id.to_string(),
+                                now_unix(),
+                            )
+                            .map_err(|_| "task dispatch no longer authorized".into())
+                    })
+                    .map_err(|_| rejected("requester_or_task_authority_changed"))?;
+                    return Ok(());
+                }
                 store
                     .authorize_dispatch(id, owner, &slot.id, &request_id.to_string(), now_unix())
                     .map_err(|error| {

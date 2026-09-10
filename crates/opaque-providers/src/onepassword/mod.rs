@@ -13,19 +13,20 @@
 //! 2. If `op` CLI is found in PATH → `op` CLI
 //! 3. Otherwise → disabled
 
+mod action;
 pub mod client;
 pub mod op_cli;
 pub mod resolve;
 
 use std::fmt;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use opaque_core::audit::{AuditEvent, AuditEventKind, AuditSink};
 use opaque_core::operation::OperationRequest;
 
-use opaque_core::operation_handler::OperationHandler;
+use opaque_core::operation_handler::{OperationHandler, PreparedOperation};
+
+use action::OnePasswordAction;
 use opaque_core::resolver::{BaseResolver, SecretResolver};
 
 use client::OnePasswordClient;
@@ -120,18 +121,46 @@ impl OnePasswordHandler {
 }
 
 impl OperationHandler for OnePasswordHandler {
-    fn execute(
-        &self,
-        request: &OperationRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send + '_>> {
+    fn prepare<'a>(&'a self, request: &OperationRequest) -> Result<PreparedOperation<'a>, String> {
+        let action = OnePasswordAction::parse(&request.operation, &request.params)?;
+        let mut secret_refs = match &self.backend {
+            OnePasswordBackend::ConnectServer {
+                connect_token_ref, ..
+            } => vec![connect_token_ref.clone()],
+            OnePasswordBackend::Cli(_) => Vec::new(),
+        };
+        if matches!(self.backend, OnePasswordBackend::Cli(_)) {
+            action.validate_cli_selectors()?;
+        }
+        if let OnePasswordAction::ReadField { vault, item, field } = &action {
+            secret_refs.push(format!("onepassword:{vault}/{item}/{field}"));
+        }
+        let mut target = action.target();
+        let backend = match &self.backend {
+            OnePasswordBackend::ConnectServer { client, .. } => {
+                target.insert("onepassword_backend".into(), "connect_server".into());
+                target.insert("onepassword_api_url".into(), client.base_url().into());
+                action::BackendBinding::ConnectServer {
+                    api_url: client.base_url().into(),
+                }
+            }
+            OnePasswordBackend::Cli(cli) => {
+                target.insert("onepassword_backend".into(), "cli".into());
+                target.insert("onepassword_cli_path".into(), cli.executable_path().into());
+                action::BackendBinding::Cli {
+                    executable: cli.executable_path().into(),
+                }
+            }
+        };
+        let action = action::BoundAction { action, backend };
         let request_id = request.request_id;
-        let params = request.params.clone();
         let operation = request.operation.clone();
         let audit = self.audit.clone();
 
-        Box::pin(async move {
-            match operation.as_str() {
-                "onepassword.list_vaults" => {
+        PreparedOperation::new(action, target, secret_refs, move |action| async move {
+            let action = action.action;
+            match &action {
+                OnePasswordAction::ListVaults {} => {
                     audit.emit(
                         AuditEvent::new(AuditEventKind::ProviderFetchStarted)
                             .with_request_id(request_id)
@@ -174,20 +203,11 @@ impl OperationHandler for OnePasswordHandler {
 
                     Ok(serde_json::json!({ "vaults": sanitized }))
                 }
-                "onepassword.read_field" => {
-                    let vault_name = params
-                        .get("vault")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| "missing 'vault' parameter".to_string())?;
-                    let item_name = params
-                        .get("item")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| "missing 'item' parameter".to_string())?;
-                    let field_name = params
-                        .get("field")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| "missing 'field' parameter".to_string())?;
-
+                OnePasswordAction::ReadField {
+                    vault: vault_name,
+                    item: item_name,
+                    field: field_name,
+                } => {
                     audit.emit(
                         AuditEvent::new(AuditEventKind::ProviderFetchStarted)
                             .with_request_id(request_id)
@@ -245,12 +265,7 @@ impl OperationHandler for OnePasswordHandler {
                         "value": value,
                     }))
                 }
-                "onepassword.list_items" => {
-                    let vault_name = params
-                        .get("vault")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| "missing 'vault' parameter".to_string())?;
-
+                OnePasswordAction::ListItems { vault: vault_name } => {
                     audit.emit(
                         AuditEvent::new(AuditEventKind::ProviderFetchStarted)
                             .with_request_id(request_id)
@@ -297,7 +312,6 @@ impl OperationHandler for OnePasswordHandler {
 
                     Ok(serde_json::json!({ "vault": vault_name, "items": sanitized }))
                 }
-                other => Err(format!("unknown 1Password operation: {other}")),
             }
         })
     }
@@ -690,5 +704,198 @@ mod tests {
         assert!(result.unwrap_err().contains("vault lookup failed"));
 
         cleanup_env();
+    }
+
+    #[test]
+    fn prepared_actions_bind_exact_selectors_and_configured_credentials() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let handler = OnePasswordHandler {
+            audit: audit.clone(),
+            backend: OnePasswordBackend::ConnectServer {
+                client: OnePasswordClient::new("http://127.0.0.1:1").unwrap(),
+                connect_token_ref: "env:OPAQUE_MISSING_CANONICAL_1P_TOKEN".into(),
+            },
+        };
+        for (operation, params, expected) in [
+            (
+                "onepassword.list_vaults",
+                serde_json::json!({}),
+                serde_json::json!({}),
+            ),
+            (
+                "onepassword.list_items",
+                serde_json::json!({"vault":"Exact Vault"}),
+                serde_json::json!({"vault":"Exact Vault"}),
+            ),
+            (
+                "onepassword.read_field",
+                serde_json::json!({"vault":"Exact Vault","item":"Exact Item","field":"username"}),
+                serde_json::json!({"vault":"Exact Vault","item":"Exact Item","field":"username"}),
+            ),
+        ] {
+            let mut request = make_request(operation, params);
+            request.target.insert("vault".into(), "decoy".into());
+            request.secret_ref_names.push("env:DECOY".into());
+            let prepared = handler.prepare(&request).unwrap();
+            let mut expected = expected;
+            expected["onepassword_backend"] = "connect_server".into();
+            expected["onepassword_api_url"] = "http://127.0.0.1:1".into();
+            assert_eq!(serde_json::to_value(prepared.target()).unwrap(), expected);
+            let mut expected_refs = vec!["env:OPAQUE_MISSING_CANONICAL_1P_TOKEN".to_string()];
+            if operation == "onepassword.read_field" {
+                expected_refs.push("onepassword:Exact Vault/Exact Item/username".into());
+            }
+            assert_eq!(prepared.secret_ref_names(), expected_refs);
+            assert_eq!(prepared.params()["action"], format!("{operation}.v1"));
+        }
+        assert!(audit.events().is_empty());
+    }
+
+    #[test]
+    fn prepared_hash_payload_distinguishes_connect_endpoints_and_cli_backend() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let first = OnePasswordHandler::new(audit.clone(), "http://127.0.0.1:1").unwrap();
+        let second = OnePasswordHandler::new(audit.clone(), "http://127.0.0.1:2").unwrap();
+        let cli = OnePasswordHandler::from_cli(audit.clone(), OpCliClient::preparation_fixture());
+        let request = make_request("onepassword.list_vaults", serde_json::json!({}));
+        let first = first.prepare(&request).unwrap();
+        let second = second.prepare(&request).unwrap();
+        let cli = cli.prepare(&request).unwrap();
+        assert_ne!(first.params(), second.params());
+        assert_ne!(first.params(), cli.params());
+        assert_eq!(first.params()["backend"]["api_url"], "http://127.0.0.1:1");
+        assert_eq!(
+            cli.params()["backend"]["executable"],
+            "/opaque-fixture-not-executed"
+        );
+        assert_eq!(cli.target()["onepassword_backend"], "cli");
+        assert_eq!(
+            cli.target()["onepassword_cli_path"],
+            "/opaque-fixture-not-executed"
+        );
+        assert!(!cli.target().contains_key("onepassword_api_url"));
+        assert!(audit.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_actions_fail_before_credentials_and_provider_audit() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let handler = OnePasswordHandler::new(audit.clone(), "http://127.0.0.1:1").unwrap();
+        for (operation, params) in [
+            (
+                "onepassword.list_vaults",
+                serde_json::json!({"vault":"hidden-scope"}),
+            ),
+            ("onepassword.list_vaults", serde_json::Value::Null),
+            ("onepassword.list_items", serde_json::json!({"vault":null})),
+            ("onepassword.list_items", serde_json::json!({"vault":"   "})),
+            (
+                "onepassword.read_field",
+                serde_json::json!({"vault":"v","item":"i","field":"f","unknown":true}),
+            ),
+            (
+                "onepassword.read_field",
+                serde_json::json!({"vault":"v","item":"i","field":"f\nredirect"}),
+            ),
+        ] {
+            assert!(
+                handler
+                    .execute(&make_request(operation, params))
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(audit.events().is_empty());
+    }
+
+    #[test]
+    fn cli_uri_components_cannot_redirect_the_prepared_field() {
+        for value in ["a/b", "a?b", "a#b", "a%2fb"] {
+            for key in ["vault", "item", "field"] {
+                let mut params = serde_json::json!({"vault":"v","item":"i","field":"f"});
+                params[key] = value.into();
+                let action = OnePasswordAction::parse("onepassword.read_field", &params).unwrap();
+                assert!(action.validate_cli_selectors().is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_listing_executes_original_vault_after_request_changes() {
+        let (_guard, handler, mock_server, _) = setup_handler_with_mock().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/vaults"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id":"v1","name":"approved"}, {"id":"v2","name":"changed"}
+            ])))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/vaults/v1/items"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let mut request = make_request(
+            "onepassword.list_items",
+            serde_json::json!({"vault":"approved"}),
+        );
+        let prepared = handler.prepare(&request).unwrap();
+        request.params["vault"] = "changed".into();
+        assert_eq!(prepared.target()["vault"], "approved");
+        assert_eq!(prepared.execute().await.unwrap()["vault"], "approved");
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 2);
+        cleanup_env();
+    }
+
+    #[test]
+    fn resource_secret_name_policy_cannot_be_bypassed_by_an_allowed_service_token() {
+        use opaque_core::policy::SecretNameMatch;
+        for backend in [
+            OnePasswordBackend::ConnectServer {
+                client: OnePasswordClient::new("http://127.0.0.1:1").unwrap(),
+                connect_token_ref: "env:FIXTURE_1P_AUTH".into(),
+            },
+            OnePasswordBackend::Cli(OpCliClient::preparation_fixture()),
+        ] {
+            let audit = Arc::new(InMemoryAuditEmitter::new());
+            let handler = OnePasswordHandler {
+                audit: audit.clone(),
+                backend,
+            };
+            let policy = SecretNameMatch {
+                patterns: vec![
+                    "env:FIXTURE_1P_AUTH".into(),
+                    "onepassword:allowed/item/field".into(),
+                ],
+            };
+            let approved = make_request(
+                "onepassword.read_field",
+                serde_json::json!({"vault":"allowed","item":"item","field":"field"}),
+            );
+            let mut denied = make_request(
+                "onepassword.read_field",
+                serde_json::json!({"vault":"other","item":"item","field":"field"}),
+            );
+            denied.secret_ref_names = vec!["onepassword:allowed/item/field".into()];
+            let approved = handler.prepare(&approved).unwrap();
+            let denied = handler.prepare(&denied).unwrap();
+            assert!(policy.matches(approved.secret_ref_names()));
+            assert!(!policy.matches(denied.secret_ref_names()));
+            assert!(
+                approved
+                    .secret_ref_names()
+                    .iter()
+                    .any(|name| name == "onepassword:allowed/item/field")
+            );
+            assert!(
+                !SecretNameMatch {
+                    patterns: vec!["env:FIXTURE_1P_AUTH".into()]
+                }
+                .matches(approved.secret_ref_names())
+            );
+            assert!(audit.events().is_empty());
+        }
     }
 }

@@ -22,6 +22,9 @@ impl Drop for CancelRound {
     fn drop(&mut self) {
         if let Ok(mut pending) = self.state.workstation_pending.lock() {
             pending.remove(&self.approval_id);
+            if let Some(remote) = &self.state.remote {
+                let _ = remote.store.cancel(&self.approval_id);
+            }
         }
     }
 }
@@ -34,6 +37,39 @@ fn now() -> i64 {
 }
 
 impl ApprovalServerHandle {
+    pub fn authorize_receipt(
+        &self,
+        requester: Option<&opaque_core::identity::PrincipalContext>,
+        receipt: &opaque_core::workstation::SignedWorkstationReceipt,
+        authorize: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.state
+            .remote
+            .as_ref()
+            .ok_or("remote authority unavailable")?
+            .authorize(requester, receipt, authorize)
+    }
+    pub fn bind_remote_review(
+        &self,
+        review: &mut WorkstationReview,
+        binding: opaque_core::workstation::ApprovalBinding,
+    ) -> Result<(), String> {
+        if let Some(remote) = &self.state.remote {
+            remote.bind(review, binding)?;
+        }
+        Ok(())
+    }
+
+    pub fn revalidate_receipt(
+        &self,
+        receipt: &opaque_core::workstation::SignedWorkstationReceipt,
+    ) -> Result<(), String> {
+        self.state
+            .remote
+            .as_ref()
+            .ok_or("remote approval store unavailable")?
+            .revalidate(receipt)
+    }
     /// Cancelling this future synchronously removes the issued round. A
     /// disconnected agent cannot leave an actionable workstation prompt.
     pub async fn await_workstation_review(
@@ -60,6 +96,13 @@ impl ApprovalServerHandle {
             });
             if pending.len() >= 64 || pending.contains_key(&approval_id) {
                 return Err("workstation approval capacity unavailable".into());
+            }
+            if review.challenge.authority.is_some() {
+                self.state
+                    .remote
+                    .as_ref()
+                    .ok_or("remote approval store unavailable")?
+                    .enqueue(&review)?;
             }
             pending.insert(
                 approval_id.clone(),
@@ -94,6 +137,7 @@ pub(super) fn routes() -> Router<Arc<ServerState>> {
         )
         .route("/workstation/approvals/pending", get(pending))
         .route("/workstation/approvals/{approval_id}", get(review))
+        .route("/workstation/receipts/{approval_id}", get(receipt))
         .route(
             "/workstation/approvals/{approval_id}/respond",
             post(respond),
@@ -142,7 +186,11 @@ async fn pending(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    auth(&state, &headers)?;
+    let device_id = auth(&state, &headers)?;
+    let device = state
+        .pairing
+        .workstation_device(&device_id)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
     let mut pending = state
         .workstation_pending
         .lock()
@@ -152,6 +200,23 @@ async fn pending(
     });
     let mut approvals: Vec<_> = pending
         .values()
+        .filter(|entry| {
+            entry.review.challenge.authority.is_none()
+                || state.remote.as_ref().is_some_and(|remote| {
+                    remote.check_current(&entry.review, Some(&device)).is_ok()
+                })
+        })
+        .filter(|entry| {
+            entry
+                .review
+                .challenge
+                .authority
+                .as_ref()
+                .is_none_or(|authority| {
+                    authority.public_key_hex == device.public_key_hex
+                        && device.paired_by.as_deref() == Some(authority.principal_id.as_str())
+                })
+        })
         .map(|entry| entry.review.challenge.clone())
         .collect();
     approvals.sort_by(|a, b| {
@@ -167,12 +232,36 @@ async fn review(
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<WorkstationReview>, StatusCode> {
-    auth(&state, &headers)?;
+    let device_id = auth(&state, &headers)?;
+    let device = state
+        .pairing
+        .workstation_device(&device_id)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
     let pending = state
         .workstation_pending
         .lock()
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let entry = pending.get(&id).ok_or(StatusCode::NOT_FOUND)?;
+    if entry.review.challenge.authority.is_some()
+        && state
+            .remote
+            .as_ref()
+            .is_none_or(|remote| remote.check_current(&entry.review, Some(&device)).is_err())
+    {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    if entry
+        .review
+        .challenge
+        .authority
+        .as_ref()
+        .is_some_and(|authority| {
+            authority.public_key_hex != device.public_key_hex
+                || device.paired_by.as_deref() != Some(authority.principal_id.as_str())
+        })
+    {
+        return Err(StatusCode::NOT_FOUND);
+    }
     if entry.created_at.elapsed() >= entry.timeout || entry.review.challenge.expires_at <= now() {
         return Err(StatusCode::GONE);
     }
@@ -209,12 +298,52 @@ async fn respond(
             approve,
         )
         .map_err(|_| StatusCode::FORBIDDEN)?;
+    let workstation_receipt = if entry.review.challenge.authority.is_some() {
+        Some(
+            state
+                .remote
+                .as_ref()
+                .ok_or(StatusCode::SERVICE_UNAVAILABLE)?
+                .accept(&entry.review, body, &device)
+                .map_err(|_| StatusCode::FORBIDDEN)?,
+        )
+    } else {
+        None
+    };
     let entry = pending.remove(&id).ok_or(StatusCode::NOT_FOUND)?;
     entry
         .response_tx
-        .send(VerifiedDeviceDecision { approve, device })
+        .send(VerifiedDeviceDecision {
+            approve,
+            device,
+            workstation_receipt,
+        })
         .map_err(|_| StatusCode::GONE)?;
     Ok(StatusCode::OK)
+}
+
+async fn receipt(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<opaque_core::workstation::SignedWorkstationReceipt>, StatusCode> {
+    let device = auth(&state, &headers)?;
+    let receipt = state
+        .remote
+        .as_ref()
+        .ok_or(StatusCode::NOT_FOUND)?
+        .store
+        .receipt(&id)
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if state
+        .remote
+        .as_ref()
+        .is_none_or(|remote| remote.can_read_receipt(&receipt, &device).is_err())
+    {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(Json(receipt))
 }
 
 #[cfg(test)]
@@ -301,6 +430,7 @@ mod tests {
         WorkstationReview {
             challenge: WorkstationChallenge {
                 schema_version: 1,
+                authority: None,
                 broker_id: "opq-workstation-test".into(),
                 approval_id: uuid::Uuid::new_v4().to_string(),
                 request_id: uuid::Uuid::new_v4().to_string(),

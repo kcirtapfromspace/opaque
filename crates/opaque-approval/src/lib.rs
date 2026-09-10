@@ -25,3 +25,4 @@ pub mod fido2;
 #[allow(dead_code)]
 pub mod pairing;
 pub mod push;
+pub mod remote;

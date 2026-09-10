@@ -67,28 +67,11 @@ pub struct SetCiVariableOptions<'a> {
     pub variable_type: Option<&'a str>,
 }
 
-/// Validate that a URL uses `https://`, allowing `http://` only for localhost.
+/// Validate a credential-free endpoint before it enters action/review metadata.
+/// Parse exactly as the HTTP client does; never echo rejected configuration.
 fn validate_url_scheme(url: &str) -> Result<(), GitLabApiError> {
-    if url.starts_with("https://") {
-        return Ok(());
-    }
-    if url.starts_with("http://") {
-        if let Some(host_part) = url.strip_prefix("http://") {
-            let host = host_part.split('/').next().unwrap_or("");
-            let host_no_port = host.split(':').next().unwrap_or("");
-            if host_no_port == "localhost" || host_no_port == "127.0.0.1" {
-                return Ok(());
-            }
-        }
-        return Err(GitLabApiError::InvalidUrlScheme(format!(
-            "insecure HTTP URL rejected: {url}. \
-             Only https:// URLs are allowed (http:// is permitted for localhost/127.0.0.1 only)"
-        )));
-    }
-    Err(GitLabApiError::InvalidUrlScheme(format!(
-        "unsupported URL scheme: {url}. \
-         Only https:// URLs are allowed (http:// is permitted for localhost/127.0.0.1 only)"
-    )))
+    crate::endpoint::validate_http_endpoint(url)
+        .map_err(|message| GitLabApiError::InvalidUrlScheme(message.into()))
 }
 
 /// Percent-encode a single URL path component.
@@ -157,6 +140,11 @@ pub struct GitLabClient {
 }
 
 impl GitLabClient {
+    /// The endpoint pinned when this client was created.
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     /// Build the user-agent string from crate version.
     fn user_agent() -> String {
         format!("opaqued/{}", env!("CARGO_PKG_VERSION"))
@@ -166,11 +154,17 @@ impl GitLabClient {
     pub fn new() -> Result<Self, GitLabApiError> {
         let base_url =
             std::env::var(GITLAB_API_URL_ENV).unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned());
+        Self::from_base_url(base_url)
+    }
+
+    fn from_base_url(base_url: String) -> Result<Self, GitLabApiError> {
         validate_url_scheme(&base_url)?;
 
         let http = reqwest::Client::builder()
             .user_agent(Self::user_agent())
             .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .build()
             .map_err(GitLabApiError::Network)?;
 
@@ -180,12 +174,7 @@ impl GitLabClient {
     /// Create a client at custom base URL (for tests).
     #[cfg(test)]
     pub fn with_base_url(base_url: String) -> Self {
-        let http = reqwest::Client::builder()
-            .user_agent(Self::user_agent())
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .expect("failed to build reqwest client");
-        Self { http, base_url }
+        Self::from_base_url(base_url).expect("invalid test GitLab API endpoint")
     }
 
     /// Upsert a GitLab CI/CD variable.
@@ -219,6 +208,12 @@ impl GitLabClient {
         let update_resp = self
             .http
             .put(&update_url)
+            // The body sets scope; the filter selects the exact existing variable.
+            // See https://docs.gitlab.com/api/project_level_variables/#update-a-variable
+            .query(&[(
+                "filter[environment_scope]",
+                options.environment_scope.unwrap_or("*"),
+            )])
             .header("PRIVATE-TOKEN", token)
             .header("Accept", "application/json")
             .json(&update_payload)
@@ -330,6 +325,47 @@ mod tests {
     fn validate_url_scheme_rejects_ftp() {
         let err = validate_url_scheme("ftp://gitlab.example.com/api/v4").unwrap_err();
         assert!(err.to_string().contains("unsupported URL scheme"));
+    }
+
+    #[test]
+    fn constructor_rejects_sensitive_or_ambiguous_endpoint_without_echoing_it() {
+        for endpoint in [
+            "https://PRIVATE-ENDPOINT-SENTINEL@gitlab.example.invalid/api/v4",
+            "https://owner:PRIVATE-ENDPOINT-SENTINEL@gitlab.example.invalid/api/v4",
+            "https://@gitlab.example.invalid/api/v4",
+            "https://gitlab.example.invalid/api/v4?token=PRIVATE-ENDPOINT-SENTINEL",
+            "https://gitlab.example.invalid/api/v4#PRIVATE-ENDPOINT-SENTINEL",
+            "https://gitlab.example.invalid/api/v4?",
+            "https://gitlab.example.invalid/api/v4#",
+            "https://",
+            "https:///gitlab.example.invalid",
+            "https:gitlab.example.invalid",
+            "https://gitlab.example.invalid:99999",
+            " https://gitlab.example.invalid",
+            "https://gitlab.example.invalid\n",
+            "https://gitlab.example.invalid\\api/v4",
+            "http://localhost.evil.invalid/api/v4",
+            "http://127.0.0.1.evil.invalid/api/v4",
+        ] {
+            let error = GitLabClient::from_base_url(endpoint.into()).unwrap_err();
+            assert!(!error.to_string().contains("PRIVATE-ENDPOINT-SENTINEL"));
+            assert!(!format!("{error:?}").contains("PRIVATE-ENDPOINT-SENTINEL"));
+        }
+    }
+
+    #[test]
+    fn constructor_preserves_valid_pinned_enterprise_endpoint() {
+        for endpoint in [
+            "https://gitlab.example.invalid/api/v4",
+            "http://localhost:8712/api/v4",
+        ] {
+            assert_eq!(
+                GitLabClient::from_base_url(endpoint.into())
+                    .unwrap()
+                    .base_url(),
+                endpoint
+            );
+        }
     }
 
     #[tokio::test]
@@ -457,5 +493,37 @@ mod tests {
 
         assert!(matches!(err, GitLabApiError::NotFound(_)));
         assert!(format!("{err}").contains("group/missing"));
+    }
+    #[tokio::test]
+    async fn variable_transport_does_not_redirect_or_retry_prepared_writes() {
+        for status in [307, 503] {
+            let server = MockServer::start().await;
+            let client = GitLabClient::with_base_url(server.uri());
+            Mock::given(method("PUT"))
+                .and(path("/projects/group%2Fproj/variables/TOKEN"))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .insert_header("Location", "/projects/unapproved/variables/TOKEN"),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let result = client
+                .set_ci_variable(
+                    "fixture-token",
+                    "group/proj",
+                    "TOKEN",
+                    "fixture-secret",
+                    SetCiVariableOptions::default(),
+                )
+                .await;
+            assert!(result.is_err());
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(
+                requests[0].url.path(),
+                "/projects/group%2Fproj/variables/TOKEN"
+            );
+        }
     }
 }

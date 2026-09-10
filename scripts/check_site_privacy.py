@@ -161,6 +161,11 @@ def build_and_inspect(repository: Path = ROOT) -> list[str]:
         fixture = Path(temporary)
         shutil.copytree(repository / "docs", fixture / "docs")
         shutil.copy2(repository / "mkdocs.yml", fixture / "mkdocs.yml")
+        # The build hook publishes only the checked brand manifest. Copy its
+        # source into the isolated fixture rather than using publication symlinks.
+        (fixture / "scripts").mkdir()
+        shutil.copy2(repository / "scripts/mkdocs_brand.py", fixture / "scripts/mkdocs_brand.py")
+        shutil.copytree(repository / "assets/brand", fixture / "assets/brand")
         sentinel = "OPAQUEPRIVATE" + uuid.uuid4().hex.upper()
         marked = mark_private_sources(fixture / "docs", sentinel)
         site = fixture / "artifact"

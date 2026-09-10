@@ -11,6 +11,8 @@
 
 pub mod client;
 pub mod crypto;
+#[cfg(test)]
+mod prepared_tests;
 pub mod release;
 mod rpc;
 mod task;
@@ -26,8 +28,6 @@ pub use task::{execute_task_action, plan_task_manifest, prepare_task_manifest};
 static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 use std::fmt;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use opaque_core::audit::{AuditEvent, AuditEventKind, AuditSink};
@@ -36,7 +36,7 @@ use opaque_core::operation::OperationRequest;
 use opaque_core::profile::ALLOWED_REF_SCHEMES;
 
 use crate::internal_resolve::CompositeResolver;
-use opaque_core::operation_handler::OperationHandler;
+use opaque_core::operation_handler::{OperationHandler, PreparedOperation};
 use opaque_core::resolver::SecretResolver;
 
 use client::{GitHubClient, SecretScope};
@@ -95,6 +95,15 @@ fn validate_repo(repo: &str) -> Result<(&str, &str), String> {
         return Err("repo must be in 'owner/repo' format (no extra slashes)".into());
     }
 
+    validate_org_name(owner)?;
+    if name.len() > 100
+        || matches!(name, "." | "..")
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err("repo name contains invalid path characters".into());
+    }
     Ok((owner, name))
 }
 
@@ -136,6 +145,9 @@ fn validate_value_ref(ref_str: &str) -> Result<(), String> {
 fn validate_environment_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("environment name must be non-empty".into());
+    }
+    if matches!(name, "." | "..") {
+        return Err("environment name must not be a path traversal segment".into());
     }
     if name.len() > 255 {
         return Err("environment name must be at most 255 characters".into());
@@ -298,485 +310,512 @@ async fn set_secret_flow(
     Ok(resp)
 }
 
-/// Resolve the GitHub token ref from params, env, or default.
-fn resolve_github_token_ref(params: &serde_json::Value) -> String {
-    let env_token_ref = std::env::var(GITHUB_TOKEN_REF_ENV).ok();
-    params
-        .get("github_token_ref")
-        .and_then(|v| v.as_str())
-        .or(env_token_ref.as_deref())
-        .unwrap_or(DEFAULT_GITHUB_TOKEN_REF)
-        .to_owned()
+/// Token reference selection is frozen before policy or provider access.
+fn resolve_github_token_ref(explicit: Option<String>) -> Result<String, String> {
+    let reference = explicit
+        .or_else(|| std::env::var(GITHUB_TOKEN_REF_ENV).ok())
+        .unwrap_or_else(|| DEFAULT_GITHUB_TOKEN_REF.to_owned());
+    validate_value_ref(&reference)?;
+    Ok(reference)
+}
+
+fn parse_params<T: serde::de::DeserializeOwned>(params: &serde_json::Value) -> Result<T, String> {
+    // Keep parse diagnostics bounded and never echo an untrusted parameter value.
+    serde_json::from_value(params.clone()).map_err(|error| {
+        let message = error.to_string();
+        if let Some(field) = message
+            .strip_prefix("missing field `")
+            .and_then(|s| s.strip_suffix('`'))
+        {
+            format!("missing '{field}' parameter")
+        } else {
+            "invalid GitHub parameters (unexpected field or incorrect type)".to_owned()
+        }
+    })
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActionsInput {
+    repo: String,
+    secret_name: String,
+    value_ref: String,
+    environment: Option<String>,
+    github_token_ref: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DependabotInput {
+    repo: String,
+    secret_name: String,
+    value_ref: String,
+    github_token_ref: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CodespacesInput {
+    secret_name: String,
+    value_ref: String,
+    repo: Option<String>,
+    selected_repository_ids: Option<Vec<i64>>,
+    github_token_ref: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OrgInput {
+    org: String,
+    secret_name: String,
+    value_ref: String,
+    visibility: Option<String>,
+    selected_repository_ids: Option<Vec<i64>>,
+    github_token_ref: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListInput {
+    scope: Option<String>,
+    repo: Option<String>,
+    org: Option<String>,
+    environment: Option<String>,
+    github_token_ref: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteInput {
+    secret_name: String,
+    scope: Option<String>,
+    repo: Option<String>,
+    org: Option<String>,
+    environment: Option<String>,
+    github_token_ref: Option<String>,
+}
+
+/// Only valid scope combinations can reach an execution closure.
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum PreparedScope {
+    RepoActions {
+        owner: String,
+        repo: String,
+    },
+    EnvActions {
+        owner: String,
+        repo: String,
+        environment: String,
+    },
+    CodespacesUser,
+    CodespacesRepo {
+        owner: String,
+        repo: String,
+    },
+    Dependabot {
+        owner: String,
+        repo: String,
+    },
+    OrgActions {
+        org: String,
+    },
+}
+
+impl PreparedScope {
+    fn borrowed(&self) -> SecretScope<'_> {
+        match self {
+            Self::RepoActions { owner, repo } => SecretScope::RepoActions { owner, repo },
+            Self::EnvActions {
+                owner,
+                repo,
+                environment,
+            } => SecretScope::EnvActions {
+                owner,
+                repo,
+                environment,
+            },
+            Self::CodespacesUser => SecretScope::CodespacesUser,
+            Self::CodespacesRepo { owner, repo } => SecretScope::CodespacesRepo { owner, repo },
+            Self::Dependabot { owner, repo } => SecretScope::Dependabot { owner, repo },
+            Self::OrgActions { org } => SecretScope::OrgActions { org },
+        }
+    }
+
+    fn target(&self) -> std::collections::HashMap<String, String> {
+        let (scope, scope_kind) = match self {
+            Self::RepoActions { .. } => ("actions", "repository"),
+            Self::EnvActions { .. } => ("actions", "environment"),
+            Self::CodespacesUser => ("codespaces", "user"),
+            Self::CodespacesRepo { .. } => ("codespaces", "repository"),
+            Self::Dependabot { .. } => ("dependabot", "repository"),
+            Self::OrgActions { .. } => ("org", "organization"),
+        };
+        let mut target = std::collections::HashMap::from([
+            ("scope".into(), scope.into()),
+            ("scope_kind".into(), scope_kind.into()),
+        ]);
+        match self {
+            Self::RepoActions { owner, repo }
+            | Self::CodespacesRepo { owner, repo }
+            | Self::Dependabot { owner, repo } => {
+                target.insert("repo".into(), format!("{owner}/{repo}"));
+            }
+            Self::EnvActions {
+                owner,
+                repo,
+                environment,
+            } => {
+                target.insert("repo".into(), format!("{owner}/{repo}"));
+                target.insert("environment".into(), environment.clone());
+            }
+            Self::OrgActions { org } => {
+                target.insert("org".into(), org.clone());
+            }
+            Self::CodespacesUser => {}
+        }
+        target
+    }
+}
+
+fn prepare_scope(
+    scope: Option<String>,
+    repo: Option<String>,
+    org: Option<String>,
+    environment: Option<String>,
+) -> Result<PreparedScope, String> {
+    let scope = scope.as_deref().unwrap_or("actions");
+    if (scope != "org" && org.is_some())
+        || (scope == "org" && repo.is_some())
+        || (scope != "actions" && environment.is_some())
+    {
+        return Err("competing or irrelevant GitHub scope parameters".into());
+    }
+    if scope == "org" {
+        let org = org.ok_or("missing 'org' parameter")?;
+        validate_org_name(&org)?;
+        return Ok(PreparedScope::OrgActions { org });
+    }
+    if !matches!(scope, "actions" | "codespaces" | "dependabot") {
+        return Err(
+            "unknown scope: expected 'actions', 'codespaces', 'dependabot', or 'org'".into(),
+        );
+    }
+    if scope == "codespaces" && repo.is_none() {
+        return Ok(PreparedScope::CodespacesUser);
+    }
+    let repo = repo.ok_or("missing 'repo' parameter")?;
+    let (owner, repo) = validate_repo(&repo)?;
+    let (owner, repo) = (owner.to_owned(), repo.to_owned());
+    match scope {
+        "actions" => match environment {
+            Some(environment) => {
+                validate_environment_name(&environment)?;
+                Ok(PreparedScope::EnvActions {
+                    owner,
+                    repo,
+                    environment,
+                })
+            }
+            None => Ok(PreparedScope::RepoActions { owner, repo }),
+        },
+        "codespaces" => Ok(PreparedScope::CodespacesRepo { owner, repo }),
+        "dependabot" => Ok(PreparedScope::Dependabot { owner, repo }),
+        _ => unreachable!("validated scope"),
+    }
+}
+
+#[cfg(test)]
+fn parse_scope(params: &serde_json::Value) -> Result<PreparedScope, String> {
+    let input: ListInput = parse_params(params)?;
+    prepare_scope(input.scope, input.repo, input.org, input.environment)
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SecretEffect {
+    Set {
+        secret_name: String,
+        value_ref: String,
+        audience: Option<SecretAudience>,
+    },
+    List,
+    Delete {
+        secret_name: String,
+    },
+}
+
+#[derive(serde::Serialize)]
+struct SecretAudience {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    visibility: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_repository_ids: Option<Vec<i64>>,
+}
+
+#[derive(serde::Serialize)]
+struct GitHubAction {
+    github_api_url: String,
+    scope: PreparedScope,
+    github_token_ref: String,
+    effect: SecretEffect,
+}
+
+fn prepare_audience(
+    visibility: Option<String>,
+    ids: Option<Vec<i64>>,
+) -> Result<SecretAudience, String> {
+    if visibility
+        .as_deref()
+        .is_some_and(|v| !matches!(v, "all" | "private" | "selected"))
+    {
+        return Err("visibility must be 'all', 'private', or 'selected'".into());
+    }
+    if visibility.as_deref().is_some_and(|v| v != "selected") && ids.is_some() {
+        return Err("selected_repository_ids requires selected visibility".into());
+    }
+    if visibility.as_deref() == Some("selected") && ids.is_none() {
+        return Err("selected visibility requires explicit selected_repository_ids".into());
+    }
+    let mut ids = ids;
+    if let Some(ids) = &mut ids {
+        if ids.iter().any(|id| *id <= 0) {
+            return Err("selected_repository_ids must contain positive integer IDs".into());
+        }
+        // GitHub treats this audience as a set. Execution consumes the same ordering.
+        ids.sort_unstable();
+        ids.dedup();
+    }
+    Ok(SecretAudience {
+        visibility,
+        selected_repository_ids: ids,
+    })
 }
 
 impl OperationHandler for GitHubHandler {
-    fn execute(
-        &self,
-        request: &OperationRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send + '_>> {
-        let request_id = request.request_id;
-        let params = request.params.clone();
-        let operation = request.operation.clone();
-        let audit = self.audit.clone();
-
-        Box::pin(async move {
-            match operation.as_str() {
-                "github.set_actions_secret" => {
-                    self.handle_actions_secret(request_id, &params, &audit)
-                        .await
-                }
-                "github.set_codespaces_secret" => {
-                    self.handle_codespaces_secret(request_id, &params, &audit)
-                        .await
-                }
-                "github.set_dependabot_secret" => {
-                    self.handle_dependabot_secret(request_id, &params, &audit)
-                        .await
-                }
-                "github.set_org_secret" => {
-                    self.handle_org_secret(request_id, &params, &audit).await
-                }
-                "github.list_secrets" => {
-                    self.handle_list_secrets(request_id, &params, &audit).await
-                }
-                "github.delete_secret" => {
-                    self.handle_delete_secret(request_id, &params, &audit).await
-                }
-                other => Err(format!("unknown GitHub operation: {other}")),
+    fn prepare<'a>(&'a self, request: &OperationRequest) -> Result<PreparedOperation<'a>, String> {
+        let (scope, token_ref, effect) = match request.operation.as_str() {
+            "github.set_actions_secret" => {
+                let input: ActionsInput = parse_params(&request.params)?;
+                (
+                    prepare_scope(None, Some(input.repo), None, input.environment)?,
+                    input.github_token_ref,
+                    SecretEffect::Set {
+                        secret_name: input.secret_name,
+                        value_ref: input.value_ref,
+                        audience: None,
+                    },
+                )
             }
+            "github.set_dependabot_secret" => {
+                let input: DependabotInput = parse_params(&request.params)?;
+                (
+                    prepare_scope(Some("dependabot".into()), Some(input.repo), None, None)?,
+                    input.github_token_ref,
+                    SecretEffect::Set {
+                        secret_name: input.secret_name,
+                        value_ref: input.value_ref,
+                        audience: None,
+                    },
+                )
+            }
+            "github.set_codespaces_secret" => {
+                let input: CodespacesInput = parse_params(&request.params)?;
+                if input.repo.is_some() && input.selected_repository_ids.is_some() {
+                    return Err(
+                        "selected_repository_ids is only valid for user Codespaces secrets".into(),
+                    );
+                }
+                let audience = if input.repo.is_none() {
+                    Some(prepare_audience(None, input.selected_repository_ids)?)
+                } else {
+                    None
+                };
+                (
+                    prepare_scope(Some("codespaces".into()), input.repo, None, None)?,
+                    input.github_token_ref,
+                    SecretEffect::Set {
+                        secret_name: input.secret_name,
+                        value_ref: input.value_ref,
+                        audience,
+                    },
+                )
+            }
+            "github.set_org_secret" => {
+                let input: OrgInput = parse_params(&request.params)?;
+                let audience = prepare_audience(
+                    Some(input.visibility.unwrap_or_else(|| "private".into())),
+                    input.selected_repository_ids,
+                )?;
+                (
+                    prepare_scope(Some("org".into()), None, Some(input.org), None)?,
+                    input.github_token_ref,
+                    SecretEffect::Set {
+                        secret_name: input.secret_name,
+                        value_ref: input.value_ref,
+                        audience: Some(audience),
+                    },
+                )
+            }
+            "github.list_secrets" => {
+                let input: ListInput = parse_params(&request.params)?;
+                (
+                    prepare_scope(input.scope, input.repo, input.org, input.environment)?,
+                    input.github_token_ref,
+                    SecretEffect::List,
+                )
+            }
+            "github.delete_secret" => {
+                let input: DeleteInput = parse_params(&request.params)?;
+                (
+                    prepare_scope(input.scope, input.repo, input.org, input.environment)?,
+                    input.github_token_ref,
+                    SecretEffect::Delete {
+                        secret_name: input.secret_name,
+                    },
+                )
+            }
+            other => return Err(format!("unknown GitHub operation: {other}")),
+        };
+        let mut target = scope.target();
+        target.insert("github_api_url".into(), self.client.base_url().to_owned());
+        let github_token_ref = resolve_github_token_ref(token_ref)?;
+        let mut refs = vec![github_token_ref.clone()];
+        match &effect {
+            SecretEffect::Set {
+                secret_name,
+                value_ref,
+                audience,
+            } => {
+                validate_secret_name(secret_name)?;
+                validate_value_ref(value_ref)?;
+                target.insert("secret_name".into(), secret_name.clone());
+                refs.push(value_ref.clone());
+                if let Some(audience) = audience {
+                    if let Some(visibility) = &audience.visibility {
+                        target.insert("visibility".into(), visibility.clone());
+                    }
+                    if let Some(ids) = &audience.selected_repository_ids {
+                        target.insert(
+                            "selected_repository_ids".into(),
+                            serde_json::to_string(ids).map_err(|_| "invalid audience")?,
+                        );
+                    } else if audience.visibility.is_none() {
+                        // Omitted user Codespaces audience retains the API's
+                        // existing/default behavior; do not revoke it by inventing [].
+                        target.insert(
+                            "selected_repository_ids".into(),
+                            "preserve_or_provider_default".into(),
+                        );
+                    }
+                }
+            }
+            SecretEffect::Delete { secret_name } => {
+                validate_secret_name(secret_name)?;
+                target.insert("secret_name".into(), secret_name.clone());
+            }
+            SecretEffect::List => {}
+        }
+        let action = GitHubAction {
+            github_api_url: self.client.base_url().to_owned(),
+            scope,
+            github_token_ref,
+            effect,
+        };
+        let request_id = request.request_id;
+        let operation = request.operation.clone();
+        PreparedOperation::new(action, target, refs, move |action| async move {
+            self.execute_prepared(request_id, &operation, action).await
         })
     }
 }
 
 impl GitHubHandler {
-    /// Handle `github.set_actions_secret`: repo-level or environment-level.
-    async fn handle_actions_secret(
+    async fn execute_prepared(
         &self,
         request_id: uuid::Uuid,
-        params: &serde_json::Value,
-        audit: &Arc<dyn AuditSink>,
+        operation: &str,
+        action: GitHubAction,
     ) -> Result<serde_json::Value, String> {
-        let repo = params
-            .get("repo")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing 'repo' parameter".to_string())?;
-        let secret_name = params
-            .get("secret_name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing 'secret_name' parameter".to_string())?;
-        let value_ref = params
-            .get("value_ref")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing 'value_ref' parameter".to_string())?;
-        let environment = params.get("environment").and_then(|v| v.as_str());
-        let github_token_ref = resolve_github_token_ref(params);
-
-        let (owner, repo_name) = validate_repo(repo)?;
-        validate_secret_name(secret_name)?;
-        validate_value_ref(value_ref)?;
-        validate_value_ref(&github_token_ref)?;
-
-        let scope = if let Some(env_name) = environment {
-            validate_environment_name(env_name)?;
-            SecretScope::EnvActions {
-                owner,
-                repo: repo_name,
-                environment: env_name,
-            }
-        } else {
-            SecretScope::RepoActions {
-                owner,
-                repo: repo_name,
-            }
-        };
-
-        set_secret_flow(
-            &self.client,
-            audit,
-            request_id,
-            &scope,
+        let scope = action.scope.borrowed();
+        if let SecretEffect::Set {
             secret_name,
             value_ref,
-            &github_token_ref,
-            "github.set_actions_secret",
-            None,
-        )
-        .await
-    }
-
-    /// Handle `github.set_codespaces_secret`: user-level or repo-level.
-    async fn handle_codespaces_secret(
-        &self,
-        request_id: uuid::Uuid,
-        params: &serde_json::Value,
-        audit: &Arc<dyn AuditSink>,
-    ) -> Result<serde_json::Value, String> {
-        let secret_name = params
-            .get("secret_name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing 'secret_name' parameter".to_string())?;
-        let value_ref = params
-            .get("value_ref")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing 'value_ref' parameter".to_string())?;
-        let repo = params.get("repo").and_then(|v| v.as_str());
-        let github_token_ref = resolve_github_token_ref(params);
-
-        validate_secret_name(secret_name)?;
-        validate_value_ref(value_ref)?;
-        validate_value_ref(&github_token_ref)?;
-
-        let scope = if let Some(repo_str) = repo {
-            let (owner, repo_name) = validate_repo(repo_str)?;
-            SecretScope::CodespacesRepo {
-                owner,
-                repo: repo_name,
-            }
-        } else {
-            SecretScope::CodespacesUser
-        };
-
-        // Build extra body for user-level codespaces (selected_repository_ids).
-        let extra_body = if repo.is_none() {
-            params
-                .get("selected_repository_ids")
-                .map(|ids| serde_json::json!({ "selected_repository_ids": ids }))
-        } else {
-            None
-        };
-
-        set_secret_flow(
-            &self.client,
-            audit,
-            request_id,
-            &scope,
-            secret_name,
-            value_ref,
-            &github_token_ref,
-            "github.set_codespaces_secret",
-            extra_body.as_ref(),
-        )
-        .await
-    }
-
-    /// Handle `github.set_dependabot_secret`: repo-level only.
-    async fn handle_dependabot_secret(
-        &self,
-        request_id: uuid::Uuid,
-        params: &serde_json::Value,
-        audit: &Arc<dyn AuditSink>,
-    ) -> Result<serde_json::Value, String> {
-        let repo = params
-            .get("repo")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing 'repo' parameter".to_string())?;
-        let secret_name = params
-            .get("secret_name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing 'secret_name' parameter".to_string())?;
-        let value_ref = params
-            .get("value_ref")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing 'value_ref' parameter".to_string())?;
-        let github_token_ref = resolve_github_token_ref(params);
-
-        let (owner, repo_name) = validate_repo(repo)?;
-        validate_secret_name(secret_name)?;
-        validate_value_ref(value_ref)?;
-        validate_value_ref(&github_token_ref)?;
-
-        let scope = SecretScope::Dependabot {
-            owner,
-            repo: repo_name,
-        };
-
-        set_secret_flow(
-            &self.client,
-            audit,
-            request_id,
-            &scope,
-            secret_name,
-            value_ref,
-            &github_token_ref,
-            "github.set_dependabot_secret",
-            None,
-        )
-        .await
-    }
-
-    /// Handle `github.set_org_secret`: org-level Actions secrets.
-    async fn handle_org_secret(
-        &self,
-        request_id: uuid::Uuid,
-        params: &serde_json::Value,
-        audit: &Arc<dyn AuditSink>,
-    ) -> Result<serde_json::Value, String> {
-        let org = params
-            .get("org")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing 'org' parameter".to_string())?;
-        let secret_name = params
-            .get("secret_name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing 'secret_name' parameter".to_string())?;
-        let value_ref = params
-            .get("value_ref")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing 'value_ref' parameter".to_string())?;
-        let github_token_ref = resolve_github_token_ref(params);
-
-        validate_org_name(org)?;
-        validate_secret_name(secret_name)?;
-        validate_value_ref(value_ref)?;
-        validate_value_ref(&github_token_ref)?;
-
-        let scope = SecretScope::OrgActions { org };
-
-        let visibility = params
-            .get("visibility")
-            .and_then(|v| v.as_str())
-            .unwrap_or("private");
-
-        // Validate visibility value.
-        if !["all", "private", "selected"].contains(&visibility) {
-            return Err(format!(
-                "visibility must be 'all', 'private', or 'selected', got: '{visibility}'"
-            ));
+            audience,
+        } = &action.effect
+        {
+            let extra = audience
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|_| "invalid audience")?;
+            return set_secret_flow(
+                &self.client,
+                &self.audit,
+                request_id,
+                &scope,
+                secret_name,
+                value_ref,
+                &action.github_token_ref,
+                operation,
+                extra.as_ref(),
+            )
+            .await;
         }
-
-        let mut extra = serde_json::json!({ "visibility": visibility });
-        if let Some(ids) = params.get("selected_repository_ids") {
-            extra["selected_repository_ids"] = ids.clone();
-        }
-
-        set_secret_flow(
-            &self.client,
-            audit,
-            request_id,
-            &scope,
-            secret_name,
-            value_ref,
-            &github_token_ref,
-            "github.set_org_secret",
-            Some(&extra),
-        )
-        .await
-    }
-
-    /// Handle `github.list_secrets`: list secret names for any scope.
-    async fn handle_list_secrets(
-        &self,
-        request_id: uuid::Uuid,
-        params: &serde_json::Value,
-        audit: &Arc<dyn AuditSink>,
-    ) -> Result<serde_json::Value, String> {
-        let github_token_ref = resolve_github_token_ref(params);
-        validate_value_ref(&github_token_ref)?;
-
-        let scope = parse_scope(params)?;
-
         let resolver = CompositeResolver::new(crate::internal_resolve::default_secret_resolvers());
-        let github_token = resolver
-            .resolve(&github_token_ref)
+        let token = resolver
+            .resolve(&action.github_token_ref)
             .map_err(|e| format!("failed to resolve github_token_ref: {e}"))?;
-        github_token.mlock();
-        let github_token_str = github_token
-            .as_str()
-            .ok_or_else(|| "github token is not valid UTF-8".to_string())?;
-
-        audit.emit(
+        token.mlock();
+        let token = token.as_str().ok_or("github token is not valid UTF-8")?;
+        self.audit.emit(
             AuditEvent::new(AuditEventKind::ProviderFetchStarted)
                 .with_request_id(request_id)
-                .with_operation("github.list_secrets")
-                .with_detail(format!("endpoint=list_secrets {}", scope.display_target())),
+                .with_operation(operation)
+                .with_detail(scope.display_target()),
         );
-
-        let list_resp = self
-            .client
-            .list_secrets_scoped(github_token_str, &scope)
-            .await
-            .map_err(|e| format!("failed to list secrets: {e}"))?;
-
-        audit.emit(
+        let (result, outcome) = match &action.effect {
+            SecretEffect::List => {
+                let response = self
+                    .client
+                    .list_secrets_scoped(token, &scope)
+                    .await
+                    .map_err(|e| format!("failed to list secrets: {e}"))?;
+                let secrets: Vec<_> = response.secrets.into_iter().map(|secret| serde_json::json!({
+                    "name": secret.name, "created_at": secret.created_at, "updated_at": secret.updated_at,
+                })).collect();
+                (
+                    serde_json::json!({"total_count": response.total_count, "secrets": secrets}),
+                    "ok",
+                )
+            }
+            SecretEffect::Delete { secret_name } => {
+                self.client
+                    .delete_secret_scoped(token, &scope, secret_name)
+                    .await
+                    .map_err(|e| format!("failed to delete secret: {e}"))?;
+                let mut response =
+                    serde_json::json!({"status": "deleted", "secret_name": secret_name});
+                for (key, value) in action.scope.target() {
+                    if matches!(key.as_str(), "repo" | "org" | "environment") {
+                        response[key] = value.into();
+                    }
+                }
+                if matches!(scope, SecretScope::CodespacesUser) {
+                    response["scope"] = "user".into();
+                }
+                (response, "deleted")
+            }
+            SecretEffect::Set { .. } => unreachable!("set completed before token-only flow"),
+        };
+        self.audit.emit(
             AuditEvent::new(AuditEventKind::ProviderFetchFinished)
                 .with_request_id(request_id)
-                .with_operation("github.list_secrets")
-                .with_outcome("ok")
-                .with_detail(format!(
-                    "{} total_count={}",
-                    scope.display_target(),
-                    list_resp.total_count
-                )),
+                .with_operation(operation)
+                .with_outcome(outcome)
+                .with_detail(scope.display_target()),
         );
-
-        let secrets: Vec<serde_json::Value> = list_resp
-            .secrets
-            .into_iter()
-            .map(|s| {
-                serde_json::json!({
-                    "name": s.name,
-                    "created_at": s.created_at,
-                    "updated_at": s.updated_at,
-                })
-            })
-            .collect();
-
-        Ok(serde_json::json!({
-            "total_count": list_resp.total_count,
-            "secrets": secrets,
-        }))
-    }
-
-    /// Handle `github.delete_secret`: delete a secret from any scope.
-    async fn handle_delete_secret(
-        &self,
-        request_id: uuid::Uuid,
-        params: &serde_json::Value,
-        audit: &Arc<dyn AuditSink>,
-    ) -> Result<serde_json::Value, String> {
-        let secret_name = params
-            .get("secret_name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing 'secret_name' parameter".to_string())?;
-        let github_token_ref = resolve_github_token_ref(params);
-
-        validate_secret_name(secret_name)?;
-        validate_value_ref(&github_token_ref)?;
-
-        let scope = parse_scope(params)?;
-
-        let resolver = CompositeResolver::new(crate::internal_resolve::default_secret_resolvers());
-        let github_token = resolver
-            .resolve(&github_token_ref)
-            .map_err(|e| format!("failed to resolve github_token_ref: {e}"))?;
-        github_token.mlock();
-        let github_token_str = github_token
-            .as_str()
-            .ok_or_else(|| "github token is not valid UTF-8".to_string())?;
-
-        audit.emit(
-            AuditEvent::new(AuditEventKind::ProviderFetchStarted)
-                .with_request_id(request_id)
-                .with_operation("github.delete_secret")
-                .with_detail(format!(
-                    "endpoint=delete_secret {} secret_name={secret_name}",
-                    scope.display_target()
-                )),
-        );
-
-        self.client
-            .delete_secret_scoped(github_token_str, &scope, secret_name)
-            .await
-            .map_err(|e| format!("failed to delete secret: {e}"))?;
-
-        audit.emit(
-            AuditEvent::new(AuditEventKind::ProviderFetchFinished)
-                .with_request_id(request_id)
-                .with_operation("github.delete_secret")
-                .with_outcome("deleted")
-                .with_detail(format!(
-                    "{} secret_name={secret_name}",
-                    scope.display_target()
-                )),
-        );
-
-        let mut resp = serde_json::json!({
-            "status": "deleted",
-            "secret_name": secret_name,
-        });
-
-        match &scope {
-            SecretScope::RepoActions { owner, repo }
-            | SecretScope::CodespacesRepo { owner, repo }
-            | SecretScope::Dependabot { owner, repo } => {
-                resp["repo"] = serde_json::Value::String(format!("{owner}/{repo}"));
-            }
-            SecretScope::EnvActions {
-                owner,
-                repo,
-                environment,
-            } => {
-                resp["repo"] = serde_json::Value::String(format!("{owner}/{repo}"));
-                resp["environment"] = serde_json::Value::String(environment.to_string());
-            }
-            SecretScope::CodespacesUser => {
-                resp["scope"] = serde_json::Value::String("user".into());
-            }
-            SecretScope::OrgActions { org } => {
-                resp["org"] = serde_json::Value::String(org.to_string());
-            }
-        }
-
-        Ok(resp)
-    }
-}
-
-/// Parse a `SecretScope` from operation params.
-///
-/// The `scope` parameter determines the secret type: `"actions"` (default),
-/// `"codespaces"`, `"dependabot"`, or `"org"`. Combined with `repo`, `org`,
-/// and `environment` parameters to build the full scope.
-fn parse_scope(params: &serde_json::Value) -> Result<SecretScope<'_>, String> {
-    let scope_type = params
-        .get("scope")
-        .and_then(|v| v.as_str())
-        .unwrap_or("actions");
-
-    match scope_type {
-        "actions" => {
-            let repo = params
-                .get("repo")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| "missing 'repo' parameter".to_string())?;
-            let (owner, repo_name) = validate_repo(repo)?;
-
-            if let Some(env_name) = params.get("environment").and_then(|v| v.as_str()) {
-                validate_environment_name(env_name)?;
-                Ok(SecretScope::EnvActions {
-                    owner,
-                    repo: repo_name,
-                    environment: env_name,
-                })
-            } else {
-                Ok(SecretScope::RepoActions {
-                    owner,
-                    repo: repo_name,
-                })
-            }
-        }
-        "codespaces" => {
-            if let Some(repo) = params.get("repo").and_then(|v| v.as_str()) {
-                let (owner, repo_name) = validate_repo(repo)?;
-                Ok(SecretScope::CodespacesRepo {
-                    owner,
-                    repo: repo_name,
-                })
-            } else {
-                Ok(SecretScope::CodespacesUser)
-            }
-        }
-        "dependabot" => {
-            let repo = params
-                .get("repo")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| "missing 'repo' parameter for dependabot scope".to_string())?;
-            let (owner, repo_name) = validate_repo(repo)?;
-            Ok(SecretScope::Dependabot {
-                owner,
-                repo: repo_name,
-            })
-        }
-        "org" => {
-            let org = params
-                .get("org")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| "missing 'org' parameter for org scope".to_string())?;
-            validate_org_name(org)?;
-            Ok(SecretScope::OrgActions { org })
-        }
-        other => Err(format!(
-            "unknown scope '{other}': expected 'actions', 'codespaces', 'dependabot', or 'org'"
-        )),
+        Ok(result)
     }
 }
 
@@ -1162,7 +1201,8 @@ mod tests {
     #[test]
     fn parse_scope_default_actions() {
         let params = serde_json::json!({"repo": "owner/repo"});
-        let scope = parse_scope(&params).unwrap();
+        let prepared_scope = parse_scope(&params).unwrap();
+        let scope = prepared_scope.borrowed();
         assert_eq!(
             scope,
             SecretScope::RepoActions {
@@ -1175,7 +1215,8 @@ mod tests {
     #[test]
     fn parse_scope_actions_with_environment() {
         let params = serde_json::json!({"repo": "owner/repo", "environment": "production"});
-        let scope = parse_scope(&params).unwrap();
+        let prepared_scope = parse_scope(&params).unwrap();
+        let scope = prepared_scope.borrowed();
         assert_eq!(
             scope,
             SecretScope::EnvActions {
@@ -1189,14 +1230,16 @@ mod tests {
     #[test]
     fn parse_scope_codespaces_user() {
         let params = serde_json::json!({"scope": "codespaces"});
-        let scope = parse_scope(&params).unwrap();
+        let prepared_scope = parse_scope(&params).unwrap();
+        let scope = prepared_scope.borrowed();
         assert_eq!(scope, SecretScope::CodespacesUser);
     }
 
     #[test]
     fn parse_scope_codespaces_repo() {
         let params = serde_json::json!({"scope": "codespaces", "repo": "owner/repo"});
-        let scope = parse_scope(&params).unwrap();
+        let prepared_scope = parse_scope(&params).unwrap();
+        let scope = prepared_scope.borrowed();
         assert_eq!(
             scope,
             SecretScope::CodespacesRepo {
@@ -1209,7 +1252,8 @@ mod tests {
     #[test]
     fn parse_scope_dependabot() {
         let params = serde_json::json!({"scope": "dependabot", "repo": "owner/repo"});
-        let scope = parse_scope(&params).unwrap();
+        let prepared_scope = parse_scope(&params).unwrap();
+        let scope = prepared_scope.borrowed();
         assert_eq!(
             scope,
             SecretScope::Dependabot {
@@ -1228,7 +1272,8 @@ mod tests {
     #[test]
     fn parse_scope_org() {
         let params = serde_json::json!({"scope": "org", "org": "myorg"});
-        let scope = parse_scope(&params).unwrap();
+        let prepared_scope = parse_scope(&params).unwrap();
+        let scope = prepared_scope.borrowed();
         assert_eq!(scope, SecretScope::OrgActions { org: "myorg" });
     }
 

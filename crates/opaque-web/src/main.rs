@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 mod config;
 mod daemon_client;
 mod demo;
+mod fleet;
 mod routes;
 pub mod security;
 mod sse;
@@ -15,6 +16,9 @@ mod sse;
 #[derive(Parser)]
 #[command(name = "opaque-web", about = "Opaque live dashboard & demo explorer")]
 struct Args {
+    /// Owner-only JSON configuring the read-only tenant fleet collector.
+    #[arg(long)]
+    fleet_config: Option<PathBuf>,
     /// Port to listen on.
     #[arg(long, default_value = "7380")]
     port: u16,
@@ -43,6 +47,7 @@ struct Args {
 /// Shared application state available to all route handlers.
 #[derive(Clone)]
 pub struct AppState {
+    pub fleet: Option<fleet::FleetClient>,
     pub daemon: daemon_client::DaemonClient,
     pub config_path: PathBuf,
     pub audit_db_path: PathBuf,
@@ -61,6 +66,18 @@ async fn main() {
     let cancel = CancellationToken::new();
 
     let paths = config::resolve_paths(args.data_dir, args.config, args.socket);
+    let fleet = if args.demo {
+        None
+    } else {
+        args.fleet_config
+            .as_deref()
+            .map(fleet::FleetClient::from_file)
+            .transpose()
+            .unwrap_or_else(|error| {
+                tracing::error!("{error}");
+                std::process::exit(1);
+            })
+    };
     let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
     // Bind before writing the token or opening a browser. A failed second launch
     // must not replace the running dashboard's token file.
@@ -78,6 +95,7 @@ async fn main() {
     }
 
     let state = AppState {
+        fleet,
         daemon: daemon_client::DaemonClient::new(Some(paths.socket)),
         config_path: paths.config,
         audit_db_path: paths.audit_db,
@@ -164,6 +182,7 @@ mod integration_tests {
             opaque_core::socket::ensure_socket_parent_dir(&socket).unwrap();
             Self {
                 state: AppState {
+                    fleet: None,
                     daemon: daemon_client::DaemonClient::new(Some(socket)),
                     config_path: dir.join("config.toml"),
                     audit_db_path: dir.join("audit.db"),
@@ -209,14 +228,25 @@ mod integration_tests {
             "/api/policy",
             "/api/sessions",
             "/api/operations",
+            "/api/fleet",
         ] {
-            let response = fixture
-                .app()
-                .oneshot(request(uri).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
-            assert_eq!(response.headers()["cache-control"], "no-store");
+            for (uri, bearer) in [
+                (uri.to_string(), None),
+                (uri.to_string(), Some("Bearer wrong-token")),
+                (format!("{uri}?token=router-test-token"), None),
+            ] {
+                let mut req = request(&uri);
+                if let Some(bearer) = bearer {
+                    req = req.header("authorization", bearer);
+                }
+                let response = fixture
+                    .app()
+                    .oneshot(req.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+                assert_eq!(response.headers()["cache-control"], "no-store");
+            }
         }
         let response = fixture
             .app()
@@ -268,7 +298,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn spa_bootstraps_auth_without_cache_and_is_not_frameable() {
+    async fn spa_is_identical_and_credential_free_with_or_without_authentication() {
         let fixture = Fixture::new(false);
         let response = fixture
             .app()
@@ -285,7 +315,105 @@ mod integration_tests {
                 .to_vec(),
         )
         .unwrap();
-        assert!(body.contains("content=\"router-test-token\""));
+        assert!(!body.contains("router-test-token"));
+        assert!(!body.contains("opaque-auth-token"));
+        assert!(body.contains("id=\"unlock-token\""));
+        assert!(body.contains("type=\"password\""));
+        let authenticated_body = to_bytes(
+            fixture
+                .app()
+                .oneshot(authenticated("/"))
+                .await
+                .unwrap()
+                .into_body(),
+            1_000_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(body.as_bytes(), authenticated_body.as_ref());
+    }
+
+    #[tokio::test]
+    async fn brand_assets_are_exact_public_bytes_under_existing_security_headers() {
+        let fixture = Fixture::new(false);
+        for asset in routes::brand::assets::ASSETS {
+            let uri = format!("/brand/{}", asset.path);
+            let response = fixture
+                .app()
+                .oneshot(request(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            assert_eq!(response.headers()["content-type"], asset.content_type);
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+            assert_eq!(response.headers()["x-frame-options"], "DENY");
+            let csp = response.headers()["content-security-policy"]
+                .to_str()
+                .unwrap();
+            assert!(csp.contains("style-src 'self' 'unsafe-inline';"));
+            assert!(csp.contains("font-src 'self';"));
+            assert!(csp.contains("connect-src 'self';"));
+            assert!(csp.starts_with("default-src 'none';"));
+            assert!(!csp.contains("https:"));
+            assert_eq!(
+                to_bytes(response.into_body(), 1_000_000)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                asset.bytes
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn brand_assets_do_not_expose_source_paths_or_bypass_origin_controls() {
+        let fixture = Fixture::new(false);
+        for uri in [
+            "/brand/manifest.json",
+            "/brand/embedded.rs",
+            "/brand/README.md",
+            "/brand/../config.toml",
+            "/brand/%2e%2e/config.toml",
+            "/brand/fonts/../../config.toml",
+            "/brand/fonts/missing.ttf",
+        ] {
+            let response = fixture
+                .app()
+                .oneshot(request(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+            assert_eq!(response.headers()["cache-control"], "no-store");
+        }
+        for asset in ["opaque.css", "fonts/archivo-variable.ttf"] {
+            let uri = format!("/brand/{asset}");
+            for req in [
+                request(&uri).header("origin", "https://evil.example"),
+                Request::builder()
+                    .uri(&uri)
+                    .header("host", "evil.example:9389"),
+            ] {
+                let response = fixture
+                    .app()
+                    .oneshot(req.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                assert!(
+                    to_bytes(response.into_body(), 1_000)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
+        let response = fixture
+            .app()
+            .oneshot(request("/api/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -563,16 +691,25 @@ mod integration_tests {
     async fn workflow_check_requires_auth_and_only_calls_read_only_reconciliation() {
         let fixture = Fixture::new(false);
         let uri = "/api/tasks/task-123/reconcile";
-        let unauthenticated = request(uri).method("POST").body(Body::empty()).unwrap();
-        assert_eq!(
-            fixture
-                .app()
-                .oneshot(unauthenticated)
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::UNAUTHORIZED
-        );
+        for (request_uri, bearer) in [
+            (uri.to_string(), None),
+            (uri.to_string(), Some("Bearer wrong-token")),
+            (format!("{uri}?token=router-test-token"), None),
+        ] {
+            let mut req = request(&request_uri).method("POST");
+            if let Some(bearer) = bearer {
+                req = req.header("authorization", bearer);
+            }
+            assert_eq!(
+                fixture
+                    .app()
+                    .oneshot(req.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::UNAUTHORIZED,
+            );
+        }
         let cross_origin = request(uri)
             .method("POST")
             .header("authorization", "Bearer router-test-token")

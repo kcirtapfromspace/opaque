@@ -85,7 +85,7 @@ jobs:
         run: cargo test --locked --workspace --all-features
 
   python:
-    name: Python protocol and controller tests
+    name: Python protocol, evidence and operator tests
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -115,7 +115,7 @@ jobs:
           PYTEST
 
   javascript:
-    name: JavaScript queue, privacy and browser tests
+    name: JavaScript privacy and browser tests
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -124,11 +124,14 @@ jobs:
         with:
           node-version: "26.8.1"
       - name: Run all Node regression suites
-        run: >-
-          node --test
-          deploy/cloudflare-docs-privacy/tests/*.test.mjs
-          crates/opaque-showcase/tests/*.test.cjs
-          crates/opaque-web/tests/*.test.cjs
+        # The customer demo has its own repository. All three suites here are
+        # required: fail glob expansion if any directory loses its test files.
+        run: |
+          shopt -s failglob
+          node --test \
+            deploy/cloudflare-docs-privacy/tests/*.test.mjs \
+            crates/opaque-showcase/tests/*.test.cjs \
+            crates/opaque-web/tests/*.test.cjs
 
   site-privacy:
     name: Generated visitor site privacy
@@ -189,14 +192,42 @@ jobs:
           cargo test --locked -p opaqued --test federation_e2e 2>&1 | tee /tmp/fed-e2e.out
           grep -q "test result: ok. 3 passed" /tmp/fed-e2e.out
 
-      - name: Provider e2e (a real GitHub write, end to end, against a mock API)
-        # Drives the flagship provider path through a live daemon. Two
-        # regressions that made every GitHub write impossible were invisible to
-        # unit tests; this is the suite that sees them. Same anti-vacuous grep,
-        # same reason for running before the root-gated steps.
+      - name: Provider e2e (canonical authority and real mock-provider effects)
+        # Require original positive controls and the canonical-action regressions,
+        # while allowing the suite to grow. Run before root-owned build artifacts.
         run: |
+          set -o pipefail
           cargo test --locked -p opaqued --test provider_e2e 2>&1 | tee /tmp/prov-e2e.out
-          grep -q "test result: ok. 10 passed" /tmp/prov-e2e.out
+          grep -Eq "test result: ok\. [1-9][0-9]* passed; 0 failed" /tmp/prov-e2e.out
+          for required in \
+            github_set_actions_secret_succeeds_end_to_end \
+            unlisted_provider_operation_is_policy_denied \
+            canonical_action_rejects_target_substitution_before_approval_and_provider_io \
+            canonical_action_derives_omitted_targets_for_policy_and_equivalent_dispatch \
+            canonical_action_rejects_malformed_targets_and_unknown_provider_fields \
+            canonical_action_policy_includes_implicit_token_refs_and_ignores_forged_ref_lists \
+            canonical_action_policy_constrains_actual_secret_scope_and_environment \
+            canonical_action_rejects_task_only_operations_under_allow_all_policy \
+            canonical_reference_metadata_rejects_secret_bytes_before_audit_or_review; do
+            grep -Fxq "test ${required} ... ok" /tmp/prov-e2e.out
+          done
+
+      - name: MCP broker e2e (signed tools, approval, durable charges, real fixture effects)
+        run: |
+          set -o pipefail
+          cargo build --locked -p opaque-mcp --bin opaque-mcp
+          cargo test --locked -p opaque-bounded-work mcp:: --lib
+          cargo test --locked -p opaqued --bin opaqued mcp_approval_reviews
+          cargo test --locked -p opaqued --test mcp_gateway_e2e 2>&1 | tee /tmp/mcp-e2e.out
+          grep -Eq "test result: ok\. [1-9][0-9]* passed; 0 failed" /tmp/mcp-e2e.out
+          for required in \
+            adapter_signed_tool_daemon_effect_receipt_and_replay_survive_restart \
+            policy_denial_malformed_input_and_generic_bypass_make_no_http_calls \
+            revoke_during_handshake_stops_final_tool_dispatch_and_does_not_refund \
+            daemon_death_after_effect_recovers_unknown_and_never_replays \
+            expiry_during_handshake_prevents_tool_effect_and_preserves_charge; do
+            grep -Fxq "test ${required} ... ok" /tmp/mcp-e2e.out
+          done
 
       - name: Multi-uid isolation suite (custody + privilege drop, as root)
         run: ./scripts/linux-harness.sh isolation

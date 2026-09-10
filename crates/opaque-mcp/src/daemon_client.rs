@@ -53,7 +53,10 @@ impl DaemonClient {
         let deadline = match method {
             "exec" | "execute" => Duration::from_secs(300),
             "task_run" => Duration::from_secs(3660),
-            "ping"
+            "mcp_catalog"
+            | "mcp_get"
+            | "mcp_revoke"
+            | "ping"
             | "operations"
             | "version"
             | "whoami"

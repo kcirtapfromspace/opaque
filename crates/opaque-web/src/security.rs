@@ -14,7 +14,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
 /// Only the two loopback hostnames at the actual listening port may serve
-/// token-bearing HTML or API responses. Host validation also blocks DNS rebinding.
+/// dashboard HTML or protected API responses. Host validation also blocks DNS rebinding.
 #[derive(Clone)]
 pub struct LocalOrigin {
     hosts: [String; 2],
@@ -56,7 +56,7 @@ pub async fn validate_origin(
     headers.insert("referrer-policy", "no-referrer".parse().unwrap());
     headers.insert("x-content-type-options", "nosniff".parse().unwrap());
     headers.insert("x-frame-options", "DENY".parse().unwrap());
-    headers.insert("content-security-policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'none'".parse().unwrap());
+    headers.insert("content-security-policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'none'".parse().unwrap());
     response
 }
 
@@ -128,43 +128,6 @@ pub fn write_token_file(dir: &Path, token: &str) -> std::io::Result<PathBuf> {
     result?;
 
     Ok(path)
-}
-
-/// Inject a `<meta name="opaque-auth-token" content="...">` tag into the HTML `<head>`.
-///
-/// The dashboard JavaScript reads this to authenticate API requests.
-/// The token value is HTML-escaped to prevent attribute injection.
-pub fn inject_token_meta(html: &str, token: &str) -> String {
-    let escaped = html_escape_attr(token);
-    let meta_tag = format!(r#"<meta name="opaque-auth-token" content="{escaped}">"#);
-    // Insert right after the opening <head> tag.
-    if let Some(pos) = html.find("<head>") {
-        let insert_at = pos + "<head>".len();
-        let mut result = String::with_capacity(html.len() + meta_tag.len() + 1);
-        result.push_str(&html[..insert_at]);
-        result.push('\n');
-        result.push_str(&meta_tag);
-        result.push_str(&html[insert_at..]);
-        result
-    } else {
-        // Fallback: prepend (should not happen with well-formed HTML).
-        format!("{meta_tag}\n{html}")
-    }
-}
-
-/// Escape a string for safe inclusion in an HTML double-quoted attribute value.
-fn html_escape_attr(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '"' => out.push_str("&quot;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            _ => out.push(ch),
-        }
-    }
-    out
 }
 
 /// Constant-time byte comparison to prevent timing side-channel attacks.
@@ -381,22 +344,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ---------------------------------------------------------------
-    // HTML meta tag injection test
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn html_meta_tag_escapes_special_chars() {
-        let html = "<html><head></head><body></body></html>";
-        let malicious = r#""><script>alert(1)</script><meta x=""#;
-        let injected = inject_token_meta(html, malicious);
-        assert!(
-            !injected.contains("<script>"),
-            "special characters must be escaped to prevent XSS"
-        );
-        assert!(injected.contains("&lt;script&gt;"));
-    }
-
     #[test]
     fn constant_time_eq_works() {
         assert!(constant_time_eq(b"abc", b"abc"));
@@ -404,29 +351,5 @@ mod tests {
         assert!(!constant_time_eq(b"abc", b"ab"));
         assert!(!constant_time_eq(b"", b"a"));
         assert!(constant_time_eq(b"", b""));
-    }
-
-    #[test]
-    fn html_meta_tag_injection() {
-        let html = r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<title>Opaque Dashboard</title>
-</head>
-<body></body>
-</html>"#;
-
-        let token = "abc123";
-        let injected = inject_token_meta(html, token);
-        assert!(
-            injected.contains(r#"<meta name="opaque-auth-token" content="abc123">"#),
-            "injected HTML should contain auth token meta tag"
-        );
-        // Meta tag should appear inside <head>
-        let head_start = injected.find("<head>").unwrap();
-        let head_end = injected.find("</head>").unwrap();
-        let meta_pos = injected.find(r#"<meta name="opaque-auth-token""#).unwrap();
-        assert!(meta_pos > head_start && meta_pos < head_end);
     }
 }

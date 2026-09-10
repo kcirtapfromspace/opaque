@@ -1,0 +1,21 @@
+# Synthetic bundle manifest for offline policy regression examples.
+org = "example"
+version = 1
+
+[[rules]]
+name = "list-example-repository-secrets"
+operation_pattern = "github.list_secrets"
+allow = true
+[rules.target]
+fields = { repo = "example/*" }
+
+[[rules]]
+name = "publish-example-repository-secret"
+operation_pattern = "github.set_actions_secret"
+allow = true
+[rules.target]
+fields = { repo = "example/*" }
+[rules.approval]
+require = "first_use"
+factors = ["local_bio"]
+lease_ttl = 300

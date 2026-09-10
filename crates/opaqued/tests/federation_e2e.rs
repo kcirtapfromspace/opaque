@@ -72,6 +72,7 @@ fn bundle_payload(version: u64) -> BundlePayload {
             members: vec!["alice@acme.com".into()],
         }],
         rules: vec![rule],
+        mcp_registry: None,
     }
 }
 

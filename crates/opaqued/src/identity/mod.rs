@@ -17,6 +17,7 @@ pub mod login;
 pub mod oidc;
 pub mod persona;
 pub mod provisioning;
+pub mod scim;
 pub mod store;
 
 use std::path::Path;
@@ -189,6 +190,102 @@ impl IdentityRuntime {
             }),
             PrincipalKind::Agent { .. } => false,
         }
+    }
+
+    /// Current trusted reviewer authority. The epoch changes on lifecycle and
+    /// role changes; callers must compare the captured epoch at acceptance and
+    /// again at dispatch. Labels and notification payloads are not identity.
+    pub fn reviewer_eligibility(
+        &self,
+        id: &opaque_core::identity::PrincipalId,
+        role: Role,
+    ) -> Result<u64, String> {
+        let epoch = self.store.authority_epoch(id)?;
+        self.with_reviewer_authority(id, role, epoch, &mut || Ok(()))?;
+        Ok(epoch)
+    }
+
+    /// Hold identity lifecycle writer exclusion through a synchronous dispatch
+    /// fence. Lock order is identity -> task; callbacks must not re-enter identity.
+    pub fn with_reviewer_authority(
+        &self,
+        id: &opaque_core::identity::PrincipalId,
+        role: Role,
+        expected_epoch: u64,
+        authorize: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.with_dispatch_authority(None, Some((id, role, expected_epoch)), authorize)
+    }
+
+    /// Atomically validate requester and reviewer under one identity lock.
+    /// This closes lifecycle removal races at the durable dispatch boundary;
+    /// prior asynchronous checks still validate workload/workspace/policy context.
+    pub fn with_dispatch_authority(
+        &self,
+        requester: Option<&PrincipalContext>,
+        reviewer: Option<(&opaque_core::identity::PrincipalId, Role, u64)>,
+        authorize: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let conn = self.store.lock();
+        let read_principal = |id: &opaque_core::identity::PrincipalId| {
+            conn.query_row(
+                "SELECT id,kind,iss,sub,email,display_name,tool,service_name,roles,created_at,last_seen,disabled FROM principals WHERE id=?1",
+                [id.as_str()], store::row_to_principal,
+            ).map_err(|_|"principal unavailable".to_string())
+        };
+        let now = opaque_core::identity::now_unix();
+        if let Some(context) = requester {
+            let principal = read_principal(&context.sub)?;
+            let actor = read_principal(&context.act)?;
+            if !self.principal_permitted(&principal)
+                || actor.disabled
+                || principal.roles != context.sub_roles
+            {
+                return Err("requester authority changed before dispatch".into());
+            }
+            let live: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM delegations WHERE jti=?1 AND sub_principal=?2 AND act_principal=?3 AND mode=?4 AND revoked_at IS NULL AND expires_at>?5 AND human_session_id IS ?6)",
+                rusqlite::params![context.jti,context.sub.as_str(),context.act.as_str(),context.mode.as_str(),now,context.human_session_id],|row|row.get(0),
+            ).map_err(|_|"requester delegation unavailable")?;
+            if !live {
+                return Err("requester delegation revoked or expired".into());
+            }
+            if matches!(
+                context.mode,
+                opaque_core::identity::AccessMode::Delegated
+                    | opaque_core::identity::AccessMode::BreakGlass
+            ) {
+                let session = context
+                    .human_session_id
+                    .as_deref()
+                    .ok_or("requester login binding unavailable")?;
+                let live: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM human_sessions WHERE id=?1 AND principal_id=?2 AND idp_issuer=?3 AND revoked_at IS NULL AND expires_at>?4)",
+                    rusqlite::params![session,context.sub.as_str(),self.config.issuer,now],|row|row.get(0),
+                ).map_err(|_|"requester login unavailable")?;
+                if !live {
+                    return Err("requester login revoked or expired".into());
+                }
+            }
+        }
+        if let Some((id, role, expected_epoch)) = reviewer {
+            let principal = read_principal(id)?;
+            let epoch: u64 = conn
+                .query_row(
+                    "SELECT epoch FROM identity_authority_epochs WHERE principal_id=?1",
+                    [id.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(|_| "reviewer authority unavailable")?;
+            if !id.is_human()
+                || !self.principal_permitted(&principal)
+                || !principal.has_role(role)
+                || epoch != expected_epoch
+            {
+                return Err("reviewer authority changed before dispatch".into());
+            }
+        }
+        authorize()
     }
 
     /// Initialize the identity runtime: validate config, open the store,

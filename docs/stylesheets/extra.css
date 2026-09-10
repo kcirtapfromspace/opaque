@@ -8,71 +8,7 @@
    1. Tokens
    -------------------------------------------------------------------------- */
 
-:root {
-  --op-radius: 8px;
-  --op-radius-sm: 5px;
-}
-
-[data-md-color-scheme="slate"] {
-  /* warm charcoal, coordinated with the hosted demo */
-  --md-hue: 212deg;
-  --md-default-bg-color: #111310;
-  --md-code-bg-color: #1a1d18;
-  --md-typeset-a-color: #dcb46d;
-  --md-accent-fg-color: #e7c790;
-  --md-primary-fg-color: #111310;
-  --md-primary-fg-color--light: #1a1d18;
-  --md-primary-fg-color--dark: #0c0e0b;
-  --md-primary-bg-color: #eeeae0;
-  --md-primary-bg-color--light: #a7ac9f;
-  --md-footer-bg-color: #0c0e0b;
-  --md-footer-bg-color--dark: #080a07;
-
-  --op-bg: #111310;
-  --op-bg-soft: #171a15;
-  --op-panel: #1a1d18;
-  --op-text: #eeeae0;
-  --op-text-dim: #a7ac9f;
-  --op-line: rgba(227, 229, 214, 0.11);
-  --op-line-strong: rgba(227, 229, 214, 0.24);
-  --op-accent: #dcb46d;
-  --op-accent-soft: rgba(220, 180, 109, 0.14);
-  --op-btn-bg: #eeeae0;
-  --op-btn-fg: #111310;
-  --op-redact-bg: #ebe3d0;
-  --op-redact-fg: #111310;
-}
-
-[data-md-color-scheme="default"] {
-  /* paper ground, ink text */
-  --md-default-bg-color: #f5f3ec;
-  --md-default-fg-color: rgba(20, 24, 29, 0.92);
-  --md-default-fg-color--light: rgba(20, 24, 29, 0.62);
-  --md-default-fg-color--lighter: rgba(20, 24, 29, 0.36);
-  --md-default-fg-color--lightest: rgba(20, 24, 29, 0.08);
-  --md-code-bg-color: #edebe4;
-  --md-typeset-a-color: #7a5504;
-  --md-accent-fg-color: #9a6c05;
-  --md-primary-fg-color: #f5f3ec;
-  --md-primary-fg-color--light: #efede7;
-  --md-primary-fg-color--dark: #e6e3da;
-  --md-primary-bg-color: #14181d;
-  --md-primary-bg-color--light: rgba(20, 24, 29, 0.56);
-
-  --op-bg: #f5f3ec;
-  --op-bg-soft: #eceae1;
-  --op-panel: #faf8f2;
-  --op-text: #22261e;
-  --op-text-dim: #666b60;
-  --op-line: rgba(25, 29, 34, 0.13);
-  --op-line-strong: rgba(25, 29, 34, 0.3);
-  --op-accent: #7a5504;
-  --op-accent-soft: rgba(154, 108, 5, 0.12);
-  --op-btn-bg: #22261e;
-  --op-btn-fg: #f5f4ef;
-  --op-redact-bg: #16181c;
-  --op-redact-fg: #f3efe4;
-}
+/* Shared tokens and local fonts load first from brand/opaque.css. */
 
 /* --------------------------------------------------------------------------
    2. Chrome: header, tabs, footer
@@ -100,8 +36,8 @@
   width: 1.2rem;
   height: 1.2rem;
   background: var(--op-accent);
-  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 28 28'%3E%3Cpath d='M2 3h24v5H2zm0 9h9v4H2zm15 0h9v4h-9zM2 20h24v5H2z'/%3E%3C/svg%3E") center / contain no-repeat;
-  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 28 28'%3E%3Cpath d='M2 3h24v5H2zm0 9h9v4H2zm15 0h9v4h-9zM2 20h24v5H2z'/%3E%3C/svg%3E") center / contain no-repeat;
+  -webkit-mask: url("../brand/opaque-mark.svg") center / contain no-repeat;
+  mask: url("../brand/opaque-mark.svg") center / contain no-repeat;
 }
 
 .md-header__topic .md-ellipsis {
@@ -804,7 +740,14 @@
   letter-spacing: 0.06em;
 }
 
-.op-brand-glyph { width: 1.15rem; height: 1.15rem; fill: currentColor; }
+.op-brand-glyph {
+  display: inline-block;
+  width: 1.15rem;
+  height: 1.15rem;
+  background: currentColor;
+  -webkit-mask: url("../brand/opaque-mark.svg") center / contain no-repeat;
+  mask: url("../brand/opaque-mark.svg") center / contain no-repeat;
+}
 
 .op-architecture {
   --op-scene-duration: 12s;

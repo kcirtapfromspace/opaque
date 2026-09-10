@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "source_commit": "8e44913e4ff26fc997e6856c1ec40ff4791c98c5",
+  "assets": [
+    {
+      "path": "fonts/archivo-variable.ttf",
+      "content_type": "font/ttf",
+      "sha256": "0e094a7d3c7c4c25cf1310c4b30014f1dae9332220b1c2c88f4fa996f0b05053",
+      "upstream_url": "https://raw.githubusercontent.com/google/fonts/8e44913e4ff26fc997e6856c1ec40ff4791c98c5/ofl/archivo/Archivo%5Bwdth%2Cwght%5D.ttf",
+      "family": "Archivo",
+      "license": "licenses/archivo-OFL.txt"
+    },
+    {
+      "path": "fonts/archivo-variable-italic.ttf",
+      "content_type": "font/ttf",
+      "sha256": "305d13b4eb80e62f7d517f78d7c045250d977552a420f2dbed906f314e761305",
+      "upstream_url": "https://raw.githubusercontent.com/google/fonts/8e44913e4ff26fc997e6856c1ec40ff4791c98c5/ofl/archivo/Archivo-Italic%5Bwdth%2Cwght%5D.ttf",
+      "family": "Archivo",
+      "license": "licenses/archivo-OFL.txt"
+    },
+    {
+      "path": "fonts/ibm-plex-mono-regular.ttf",
+      "content_type": "font/ttf",
+      "sha256": "6a3412f058c7d8dfd9170c41e85ade48e5156ecb89356110ca57a0a27734af46",
+      "upstream_url": "https://raw.githubusercontent.com/google/fonts/8e44913e4ff26fc997e6856c1ec40ff4791c98c5/ofl/ibmplexmono/IBMPlexMono-Regular.ttf",
+      "family": "IBM Plex Mono",
+      "license": "licenses/ibm-plex-mono-OFL.txt"
+    },
+    {
+      "path": "fonts/ibm-plex-mono-italic.ttf",
+      "content_type": "font/ttf",
+      "sha256": "3362fc791b0652193328b862c1c5f23a789bc7288b1617fa63302f88689a2a34",
+      "upstream_url": "https://raw.githubusercontent.com/google/fonts/8e44913e4ff26fc997e6856c1ec40ff4791c98c5/ofl/ibmplexmono/IBMPlexMono-Italic.ttf",
+      "family": "IBM Plex Mono",
+      "license": "licenses/ibm-plex-mono-OFL.txt"
+    },
+    {
+      "path": "fonts/ibm-plex-mono-bold.ttf",
+      "content_type": "font/ttf",
+      "sha256": "ac27abd6450a64dd94467580a02fe6235156d5b92f2926ebbc8e7489df64e0be",
+      "upstream_url": "https://raw.githubusercontent.com/google/fonts/8e44913e4ff26fc997e6856c1ec40ff4791c98c5/ofl/ibmplexmono/IBMPlexMono-Bold.ttf",
+      "family": "IBM Plex Mono",
+      "license": "licenses/ibm-plex-mono-OFL.txt"
+    },
+    {
+      "path": "fonts/ibm-plex-mono-bold-italic.ttf",
+      "content_type": "font/ttf",
+      "sha256": "af4e05a761e98c1adf064c48a6352c9bec1a6ad70982cd2a544149323391f98e",
+      "upstream_url": "https://raw.githubusercontent.com/google/fonts/8e44913e4ff26fc997e6856c1ec40ff4791c98c5/ofl/ibmplexmono/IBMPlexMono-BoldItalic.ttf",
+      "family": "IBM Plex Mono",
+      "license": "licenses/ibm-plex-mono-OFL.txt"
+    },
+    {
+      "path": "licenses/archivo-OFL.txt",
+      "content_type": "text/plain; charset=utf-8",
+      "sha256": "108b4e57c9c796d3d38d0428ca7ee39de47ad93187302718d9b2d8864b9b716b",
+      "upstream_url": "https://raw.githubusercontent.com/google/fonts/8e44913e4ff26fc997e6856c1ec40ff4791c98c5/ofl/archivo/OFL.txt",
+      "family": "Archivo"
+    },
+    {
+      "path": "licenses/ibm-plex-mono-OFL.txt",
+      "content_type": "text/plain; charset=utf-8",
+      "sha256": "7e6b2818edbd8f6a01ae80641cc8f16a51080d08fb4e532be3a0b6f74adb07da",
+      "upstream_url": "https://raw.githubusercontent.com/google/fonts/8e44913e4ff26fc997e6856c1ec40ff4791c98c5/ofl/ibmplexmono/OFL.txt",
+      "family": "IBM Plex Mono"
+    },
+    {
+      "path": "opaque.css",
+      "content_type": "text/css; charset=utf-8",
+      "sha256": "1dab89c5cd046f7e5699d723cf1c01d8c9ba0a1ff7311addb143201233c39adb"
+    },
+    {
+      "path": "opaque-mark.svg",
+      "content_type": "image/svg+xml",
+      "sha256": "1dc92e93044c5521633c2802041f5fb8af5f3228f261e8b30d5a379b35c89c59"
+    }
+  ]
+}
