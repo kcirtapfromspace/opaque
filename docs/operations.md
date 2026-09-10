@@ -8,12 +8,45 @@ v1 transport is local only:
 
 For MCP-aware tools (Claude Code), `opaque-mcp` provides a stdio-based MCP server that exposes Safe operations as tools. See [MCP integration](mcp-integration.md).
 
+## Prepared action contract
+
+The daemon parses each generic operation once before policy, human approval or
+credential resolution. Policy, review, leases and audit use the same captured
+action that execution consumes. Targets include effective scope, options and
+configured destination. Credential selectors are resolved once during preparation;
+secret values are resolved only after authorization.
+
+For the low-level `execute` RPC, `target` is an optional consistency assertion.
+Omit redundant fields or supply values that exactly match the operation's
+parameters and defaults. Contradictory, unknown or malformed target assertions
+fail before approval. Caller-supplied `secret_ref_names` are ignored: the daemon
+derives effective credential and accessed-resource references. Restrictive
+`secret_names` rules must allow both. Unknown provider parameters and malformed
+optional values are rejected instead of silently selecting defaults.
+
+Review includes every target and reference without truncation. Commands use a
+JSON argv array so empty arguments, spaces and control characters remain distinct.
+Generic actions whose review fields exceed 32 KiB are rejected. Local native
+approval first opens the complete review in the installed trusted helper, then
+requests authentication bound to that review's fingerprint.
+
+Sandbox execution captures a validated profile once and binds its digest, including
+literal environment configuration, without placing those literal values in audit
+metadata. Changing a profile file after preparation does not change that action.
+Secret references still select their current values; this is not secret-version
+or executable-binary attestation.
+
+Bounded task manifests use their dedicated task transport. Their parent and
+internal task-operation names cannot be invoked through generic `execute`.
+Upgrading requires a daemon restart, which clears old in-memory generic leases;
+persistent task allowances and audit history retain their existing semantics.
+
 ## Safety Classes
 
 | Class | Meaning | Agent Access |
 |------:|---------|--------------|
 | `SAFE` | Uses secrets internally and must not return them | Allowed (with policy + approvals) |
-| `SENSITIVE_OUTPUT` | Output may contain credential-like data | Denied for agents unless explicitly allowlisted in policy |
+| `SENSITIVE_OUTPUT` | Output may contain credential-like data | Requires policy permission and out-of-band approval |
 | `REVEAL` | Returns plaintext secrets | Never (hard-blocked in v1) |
 
 ## Secret Ref Schemes
@@ -149,7 +182,7 @@ Inputs:
 - `value_ref`
 - optional: `github_token_ref`
 - optional: `visibility`: `"all" | "private" | "selected"` (default: `"private"`)
-- optional: `selected_repository_ids` (when `visibility = "selected"`)
+- `selected_repository_ids`: required when `visibility = "selected"`; rejected for other visibility modes
 
 Result:
 
@@ -171,11 +204,11 @@ Inputs:
 - `key`: variable key (ex: `DATABASE_URL`)
 - `value_ref`: secret reference (ex: `keychain:opaque/db-url`)
 - optional: `gitlab_token_ref`: GitLab token ref (default: `keychain:opaque/gitlab-pat`)
-- optional: `environment_scope`
+- optional: `environment_scope` (default: `"*"`; updates match this exact environment scope)
 - optional: `protected`: boolean
 - optional: `masked`: boolean
 - optional: `raw`: boolean
-- optional: `variable_type`: `"env_var" | "file"` (default: `"env_var"`)
+- optional: `variable_type`: `"env_var" | "file"` (omission preserves an existing value or uses the provider default on creation)
 
 Result:
 

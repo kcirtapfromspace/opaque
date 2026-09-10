@@ -9,7 +9,9 @@
 //! - **Pairing** (`POST /pair`): authenticated by the one-time nonce from the
 //!   QR payload (5-minute TTL, single use). Returns the device id plus a
 //!   per-device bearer token (shown once; stored hashed).
-//! - **Transport auth**: every other authenticated route requires
+//! - **Notice feed**: `/notifications/pending` requires a separate read-only
+//!   notification credential and returns opaque references only.
+//! - **Device transport auth**: other authenticated routes require
 //!   `Authorization: Bearer <token>` + `X-Opaque-Device: <device_id>`, and
 //!   the token must match THAT device's stored hash. This is coarse gating
 //!   only — it decides who may see and submit, never who approved.
@@ -135,6 +137,7 @@ pub struct PairResponse {
 pub struct VerifiedDeviceDecision {
     pub approve: bool,
     pub device: PairedDevice,
+    pub workstation_receipt: Option<opaque_core::workstation::SignedWorkstationReceipt>,
 }
 
 /// Pending approval entry (internal).
@@ -170,6 +173,7 @@ pub(crate) struct ServerState {
     pairing: Arc<PairingManager>,
     timeout: Duration,
     workstation_pending: std::sync::Mutex<HashMap<String, workstation::PendingWorkstation>>,
+    remote: Option<Arc<crate::remote::RemoteApprovals>>,
 }
 
 impl std::fmt::Debug for ServerState {
@@ -373,9 +377,18 @@ impl ApprovalServer {
             pairing,
             timeout: Duration::from_secs(config.timeout_secs),
             workstation_pending: std::sync::Mutex::new(HashMap::new()),
+            remote: None,
         });
 
         Ok(Self { state, config })
+    }
+
+    /// Attach durable remote routing before exposing a handle or starting.
+    pub fn with_remote(mut self, remote: Arc<crate::remote::RemoteApprovals>) -> Self {
+        Arc::get_mut(&mut self.state)
+            .expect("remote routing configured before server use")
+            .remote = Some(remote);
+        self
     }
 
     /// Handle for submitting challenges (usable before and after `start`).
@@ -493,6 +506,10 @@ fn build_tls_config(cert_der: &[u8], key_der: &[u8]) -> Result<rustls::ServerCon
 fn build_router(state: Arc<ServerState>) -> Router {
     Router::new()
         .merge(workstation::routes())
+        .route(
+            "/notifications/pending",
+            get(workstation::notice_feed_handler),
+        )
         .route("/health", get(health_handler))
         .route("/pair", post(pair_handler))
         .route("/approvals/pending", get(pending_handler))
@@ -617,9 +634,11 @@ async fn respond_handler(
         "device decision verified"
     );
 
-    let _ = entry
-        .response_tx
-        .send(VerifiedDeviceDecision { approve, device });
+    let _ = entry.response_tx.send(VerifiedDeviceDecision {
+        approve,
+        device,
+        workstation_receipt: None,
+    });
 
     Ok(StatusCode::OK)
 }
@@ -1362,6 +1381,7 @@ mod tests {
             store,
         ));
         let state = ServerState {
+            remote: None,
             pending: Mutex::new(HashMap::new()),
             pairing,
             timeout: Duration::from_secs(60),

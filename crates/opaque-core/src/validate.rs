@@ -168,6 +168,31 @@ impl InputValidator {
         Ok(validated)
     }
 
+    /// Check daemon-derived resource and credential selectors before review or
+    /// audit. Provider names may contain spaces or URI characters, so preserve
+    /// them exactly; reject display controls and recognizable secret bytes.
+    /// This is separate from the narrower legacy wire-reference grammar.
+    pub fn validate_prepared_refs(names: &[String]) -> Result<(), ValidationError> {
+        let patterns = SecretPatterns::compile();
+        for name in names {
+            let field = "prepared secret reference".to_owned();
+            if name.len() > 4096 {
+                return Err(ValidationError::TooLong {
+                    field,
+                    max: 4096,
+                    actual: name.len(),
+                });
+            }
+            if name.trim().is_empty() || name.chars().any(|ch| ch.is_control() || matches!(ch as u32, 0x061c | 0x200e..=0x200f | 0x202a..=0x202e | 0x2066..=0x2069)) {
+                return Err(ValidationError::InvalidCharset { field, value: String::new() });
+            }
+            if patterns.contains_secret(name) {
+                return Err(ValidationError::SecretDetected { field });
+            }
+        }
+        Ok(())
+    }
+
     /// Validate secret ref names: max 32 entries, each `[A-Za-z0-9_.:/-]` max
     /// 128 chars. Reject if any name matches secret patterns (a value, not a
     /// name).

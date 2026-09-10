@@ -12,6 +12,7 @@ homepage.workspace = true
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
 getrandom = { workspace = true }
+libc = { workspace = true }
 opaque-core = { path = "../opaque-core" }
 bytes = { workspace = true }
 clap = { workspace = true, features = ["derive"] }

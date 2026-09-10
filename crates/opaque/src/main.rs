@@ -18,6 +18,7 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 #[cfg(test)]
 mod ipc_tests;
+mod policy_regression;
 mod service;
 mod setup;
 mod ui;
@@ -338,6 +339,21 @@ enum ServiceAction {
 
 #[derive(Debug, Subcommand)]
 enum PolicyAction {
+    /// Compare baseline/candidate policy against reviewed golden cases (offline).
+    Regress {
+        /// Baseline config or unsigned bundle manifest (TOML).
+        #[arg(long)]
+        baseline: PathBuf,
+        /// Candidate config or unsigned bundle manifest (TOML).
+        #[arg(long)]
+        candidate: PathBuf,
+        /// Golden cases (JSON, schema_version = 1).
+        #[arg(long)]
+        cases: PathBuf,
+        /// Fail on any changed decision, even when the candidate is expected.
+        #[arg(long)]
+        fail_on_change: bool,
+    },
     /// Validate policy configuration file.
     Check {
         /// Path to config file (default: ~/.opaque/config.toml or $OPAQUE_CONFIG).
@@ -564,6 +580,15 @@ enum BundleAction {
         /// Expire the bundle N days from now.
         #[arg(long)]
         expires_days: Option<u32>,
+        /// Run reviewed golden policy cases before reading the signing key.
+        #[arg(long, requires = "baseline")]
+        regression_cases: Option<PathBuf>,
+        /// Baseline policy for the pre-sign regression comparison.
+        #[arg(long, requires = "regression_cases")]
+        baseline: Option<PathBuf>,
+        /// Also block signing on any semantic policy decision change.
+        #[arg(long, requires = "regression_cases")]
+        fail_on_policy_change: bool,
     },
     /// Verify a bundle against one or more trust anchors.
     Verify {
@@ -2307,6 +2332,28 @@ async fn main() {
     // Handle commands that don't need a daemon connection.
     match &cmd {
         Cmd::Policy { action } => match action {
+            PolicyAction::Regress {
+                baseline,
+                candidate,
+                cases,
+                fail_on_change,
+            } => {
+                match policy_regression::run(
+                    baseline,
+                    candidate,
+                    cases,
+                    *fail_on_change,
+                    json_output,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => std::process::exit(EXIT_ERROR),
+                    Err(error) => {
+                        ui::error(&error);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+                return;
+            }
             PolicyAction::Check { file } => {
                 match policy_check_path(file.as_deref()) {
                     Ok(msg) => ui::success(&msg),
@@ -4926,6 +4973,8 @@ struct BundleManifest {
     teams: Vec<opaque_core::bundle::Team>,
     #[serde(default)]
     rules: Vec<opaque_core::policy::PolicyRule>,
+    #[serde(default)]
+    mcp_registry: Option<opaque_core::mcp::RegistryDocument>,
 }
 
 /// Offline org tooling for signed federation policy bundles.
@@ -4996,11 +5045,36 @@ fn run_bundle(action: &BundleAction) -> Result<(), String> {
             out,
             version,
             expires_days,
+            regression_cases,
+            baseline,
+            fail_on_policy_change,
         } => {
-            let text = std::fs::read_to_string(manifest)
-                .map_err(|e| format!("cannot read manifest {}: {e}", manifest.display()))?;
-            let parsed: BundleManifest =
-                toml_edit::de::from_str(&text).map_err(|e| format!("manifest parse error: {e}"))?;
+            let gated = regression_cases.is_some();
+            let text = if gated {
+                policy_regression::read_input(manifest)?
+            } else {
+                std::fs::read_to_string(manifest)
+                    .map_err(|e| format!("cannot read manifest {}: {e}", manifest.display()))?
+            };
+            let parsed: BundleManifest = toml_edit::de::from_str(&text).map_err(|e| {
+                if gated {
+                    "invalid bundle manifest TOML (check required fields and schema)".to_string()
+                } else {
+                    format!("manifest parse error: {e}")
+                }
+            })?;
+            if let Some(cases) = regression_cases {
+                let baseline = baseline
+                    .as_deref()
+                    .ok_or("regression cases require a baseline policy")?;
+                policy_regression::gate_bundle(
+                    baseline,
+                    cases,
+                    &parsed.rules,
+                    &parsed.teams,
+                    *fail_on_policy_change,
+                )?;
+            }
             let signing_key = load_signing_key(key)?;
 
             let issued_at = now_unix();
@@ -5018,6 +5092,7 @@ fn run_bundle(action: &BundleAction) -> Result<(), String> {
                     .collect(),
                 teams: parsed.teams,
                 rules: parsed.rules,
+                mcp_registry: parsed.mcp_registry,
             };
             let bundle_text = bundle::sign_bundle(&payload, &signing_key)
                 .map_err(|e| format!("signing failed: {e}"))?;
@@ -8954,6 +9029,7 @@ BAZ=
             expires_at: 700,
             approved_at: Some(101),
             approval_mode: Some(TaskApprovalMode::Native),
+            workstation_receipt: None,
             state: TaskState::Partial,
             release_observation: None,
             slots: vec![TaskSlot {

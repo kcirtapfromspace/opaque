@@ -114,6 +114,7 @@ impl IdentityStore {
         }
         let conn = Connection::open(path).map_err(|e| e.to_string())?;
         conn.execute_batch(SCHEMA_SQL).map_err(|e| e.to_string())?;
+        super::lifecycle::ensure_schema(&conn)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -133,6 +134,7 @@ impl IdentityStore {
     pub fn open_in_memory() -> Result<Self, String> {
         let conn = Connection::open_in_memory().map_err(|e| e.to_string())?;
         conn.execute_batch(SCHEMA_SQL).map_err(|e| e.to_string())?;
+        super::lifecycle::ensure_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -160,6 +162,17 @@ impl IdentityStore {
 
         let now = now_unix();
         let conn = self.lock();
+        let managed: bool = conn
+            .query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_config)", [], |r| {
+                r.get(0)
+            })
+            .map_err(|_| "lifecycle configuration unavailable")?;
+        if managed {
+            let admitted: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_subjects r JOIN lifecycle_config c ON c.issuer=?1 AND c.suspended=0 JOIN principals p ON p.id=r.principal_id AND p.disabled=0 WHERE r.subject=?2 AND r.deleted=0 AND r.active=1)",params![iss,sub],|r|r.get(0)).map_err(|_|"lifecycle admission unavailable")?;
+            if !admitted {
+                return Err("identity must be actively provisioned before login".into());
+            }
+        }
         let existing: Option<String> = conn
             .query_row(
                 "SELECT id FROM principals WHERE kind='human' AND iss=?1 AND sub=?2",
@@ -489,11 +502,27 @@ impl IdentityStore {
     // -- human sessions -----------------------------------------------------
 
     /// Create a login session for `principal`, valid for `ttl_secs`.
+    #[cfg(test)]
     pub fn create_human_session(
         &self,
         principal: &PrincipalId,
         ttl_secs: u64,
         idp_issuer: &str,
+    ) -> Result<HumanSession, String> {
+        self.create_human_session_at_revision(
+            principal,
+            ttl_secs,
+            idp_issuer,
+            self.lifecycle_revision()?,
+        )
+    }
+
+    pub fn create_human_session_at_revision(
+        &self,
+        principal: &PrincipalId,
+        ttl_secs: u64,
+        idp_issuer: &str,
+        expected_revision: i64,
     ) -> Result<HumanSession, String> {
         if !principal.is_human() {
             return Err("sessions can only be created for human principals".into());
@@ -508,6 +537,25 @@ impl IdentityStore {
             idp_issuer: idp_issuer.to_owned(),
         };
         let conn = self.lock();
+        let revision: i64 = conn
+            .query_row(
+                "SELECT revision FROM lifecycle_config WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|_| "lifecycle state unavailable")?
+            .unwrap_or(0);
+        let enabled: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM principals WHERE id=?1 AND iss=?2 AND disabled=0)",
+                params![principal.as_str(), idp_issuer],
+                |r| r.get(0),
+            )
+            .map_err(|_| "principal unavailable")?;
+        if revision != expected_revision || !enabled {
+            return Err("identity lifecycle changed during login; start a fresh login".into());
+        }
         conn.execute(
             "INSERT INTO human_sessions (id, principal_id, created_at, expires_at, idp_issuer) \
              VALUES (?1,?2,?3,?4,?5)",

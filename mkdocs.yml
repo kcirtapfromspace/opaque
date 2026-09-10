@@ -17,9 +17,9 @@ theme:
   custom_dir: docs/overrides
   icon:
     logo: material/shield-lock
-  font:
-    text: Archivo
-    code: IBM Plex Mono
+  # Local licensed fonts come from the shared brand foundation.
+  font: false
+  favicon: brand/opaque-mark.svg
   palette:
     - scheme: slate
       primary: custom
@@ -66,7 +66,11 @@ markdown_extensions:
 plugins:
   - search
 
+hooks:
+  - scripts/mkdocs_brand.py
+
 extra_css:
+  - brand/opaque.css
   - stylesheets/extra.css
 
 extra:
@@ -99,12 +103,14 @@ nav:
   - Platform:
       - Linux polkit: linux-polkit.md
       - Mobile Approvals: mobile-approvals.md
+      - Remote Approvals: remote-approvals.md
       - Enterprise Architecture: enterprise-architecture.md
   - Security:
       - Security Assessment: security-assessment.md
       - Adversarial Review: adversarial-security-review-2026-02-14.md
       - Audit Analytics: audit-analytics.md
   - Architecture:
+      - Building on the Core: reusable-core.md
       - Design Notes: architecture.md
       - Deferred: roadmap-deferred.md
   - Blog:

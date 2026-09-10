@@ -357,6 +357,7 @@ mod tests {
             .unwrap();
         let valid = WorkstationChallenge {
             schema_version: 1,
+            authority: None,
             broker_id: "opq-test".into(),
             approval_id: Uuid::new_v4().to_string(),
             request_id: Uuid::new_v4().to_string(),

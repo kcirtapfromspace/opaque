@@ -37,6 +37,7 @@ mod agent_session;
 mod connection;
 mod enclave;
 mod identity;
+mod mcp_gateway;
 mod provisioning_api;
 #[cfg(test)]
 mod provisioning_api_tests;
@@ -72,6 +73,9 @@ use opaque_core::operation_handler::OperationHandler;
 /// Daemon configuration loaded from `~/.opaque/config.toml`.
 #[derive(Debug, Clone, Deserialize, Default)]
 struct DaemonConfig {
+    /// Signed third-party MCP registry and broker-owned credential bindings.
+    #[serde(default)]
+    mcp: Option<opaque_bounded_work::mcp::Config>,
     /// One immutable tenant per independently isolated broker installation.
     #[serde(default)]
     tenant: Option<opaque_tenant::tenant::TenantConfig>,
@@ -127,6 +131,14 @@ struct DaemonConfig {
     /// Absent = identity features disabled (Phase 0 behavior).
     #[serde(default)]
     identity: Option<identity::IdentityConfig>,
+    /// Recognize old provisioning configuration solely to reject a silent
+    /// downgrade to unmanaged identity after component extraction.
+    #[serde(default, rename = "scim")]
+    legacy_scim: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    lifecycle: Option<identity::lifecycle::LifecycleConfig>,
+    #[serde(default)]
+    fleet: Option<opaque_federation_runtime::fleet::reporter::ReporterConfig>,
     #[serde(default)]
     resource_authority: Option<opaque_bounded_work::resource_authority::ResourceAuthorityConfig>,
     /// Explicitly scoped, human-authorized IdP provisioning mandates.
@@ -143,6 +155,9 @@ struct DaemonConfig {
     /// Public keys authorized by the trusted operator to review whole tasks.
     #[serde(default)]
     workstation_approvers: Vec<opaque_approval::pairing::WorkstationApproverConfig>,
+    /// Durable signed review decisions and minimal collaboration notifications.
+    #[serde(default)]
+    remote_approvals: Option<opaque_approval::remote::RemoteApprovalConfig>,
 
     /// Downgrades receipt provenance for an automated signing fixture. This
     /// does not bypass any enrollment, signature, expiry or policy check.
@@ -329,6 +344,7 @@ Docs: https://opaque.info/
 }
 
 struct DaemonState {
+    mcp: Option<Arc<opaque_bounded_work::mcp::Gateway>>,
     /// Immutable attestor binding installed by the Unix listener after privilege drop.
     workload_attestor: opaque_federation_runtime::workload_attest::ListenerAttestor,
     tenant: Option<opaque_tenant::tenant::TenantBoundary>,
@@ -852,17 +868,78 @@ fn verify_config_seal(
     require_seal: bool,
     allow_unsealed: bool,
     enforce: bool,
+    file_only: bool,
 ) -> std::io::Result<()> {
     let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
     let seal_file = config_dir.join("config.seal");
 
-    check_seal(
-        config_path,
-        &seal_file,
-        require_seal,
-        allow_unsealed,
-        enforce,
-    )
+    if file_only {
+        check_seal_file_only(
+            config_path,
+            &seal_file,
+            require_seal,
+            allow_unsealed,
+            enforce,
+        )
+    } else {
+        check_seal(
+            config_path,
+            &seal_file,
+            require_seal,
+            allow_unsealed,
+            enforce,
+        )
+    }
+}
+
+/// The legacy default shared installation retains its keychain fallback.
+/// Every explicitly isolated installation verifies only its own seal and key.
+fn config_uses_file_seal(config: &DaemonConfig, config_path: &Path, home: &Path) -> bool {
+    config.data_dir.is_some()
+        || config.tenant.is_some()
+        || config.trust_domain.enforce
+        || config_path != home.join(".opaque/config.toml")
+}
+
+#[cfg(test)]
+mod seal_scope_tests {
+    use super::*;
+    #[test]
+    fn scoped_installations_use_local_seals_and_preserve_required_custody() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path();
+        let mut config = DaemonConfig::default();
+        let default = home.join(".opaque/config.toml");
+        assert!(!config_uses_file_seal(&config, &default, home));
+        let path = home.join("config.toml");
+        assert!(config_uses_file_seal(&config, &path, home));
+        config.data_dir = Some(home.join("state"));
+        assert!(config_uses_file_seal(&config, &default, home));
+        config.data_dir = None;
+        config.trust_domain.enforce = true;
+        assert!(config_uses_file_seal(&config, &default, home));
+        std::fs::write(&path, b"fixture config").unwrap();
+        assert!(verify_config_seal(&path, true, false, true, true).is_err());
+        let seal = home.join("config.seal");
+        let key_path = opaque_core::seal::seal_key_path(&seal);
+        let key = [73u8; 32];
+        std::fs::write(&key_path, key).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(
+            &seal,
+            opaque_core::seal::compute_seal_keyed(b"fixture config", &key),
+        )
+        .unwrap();
+        assert!(verify_config_seal(&path, true, false, true, true).is_ok());
+        std::fs::write(&path, b"tampered config").unwrap();
+        assert!(verify_config_seal(&path, true, true, true, true).is_err());
+        std::fs::write(&path, b"fixture config").unwrap();
+        std::fs::remove_file(&key_path).unwrap();
+        assert!(verify_config_seal(&path, false, true, true, true).is_err());
+        std::fs::write(&seal, opaque_core::seal::compute_seal(b"fixture config")).unwrap();
+        assert!(verify_config_seal(&path, true, false, true, true).is_err());
+    }
 }
 
 /// Core seal-check logic, separated from env-var resolution for testability.
@@ -887,11 +964,9 @@ fn check_seal(
     evaluate_seal_status(status, require_seal, allow_unsealed, enforce)
 }
 
-/// File-only variant of `check_seal` for testing.
-///
-/// Skips the OS keychain lookup so tests are not affected by stale keychain
-/// entries from real `opaque setup --seal` runs on this machine.
-#[cfg(test)]
+/// File-only verification for independently custodied installations.
+/// The global OS keychain entry belongs only to the default shared installation;
+/// it cannot supply authority for another tenant or explicit config location.
 fn check_seal_file_only(
     config_path: &Path,
     seal_file: &Path,
@@ -1003,11 +1078,24 @@ fn write_daemon_token(socket: &Path, token: &str) -> std::io::Result<PathBuf> {
 struct NoopHandler;
 
 impl OperationHandler for NoopHandler {
-    fn execute(
-        &self,
-        _request: &OperationRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send + '_>> {
-        Box::pin(async { Ok(serde_json::json!({"status": "ok"})) })
+    fn prepare<'a>(
+        &'a self,
+        request: &OperationRequest,
+    ) -> Result<opaque_core::operation_handler::PreparedOperation<'a>, String> {
+        if !request.params.is_null()
+            && !request
+                .params
+                .as_object()
+                .is_some_and(|params| params.is_empty())
+        {
+            return Err("test.noop takes no parameters".into());
+        }
+        opaque_core::operation_handler::PreparedOperation::new(
+            serde_json::json!({"action":"test.noop.v1"}),
+            HashMap::new(),
+            vec![],
+            |_| async { Ok(serde_json::json!({"status":"ok"})) },
+        )
     }
 }
 
@@ -1039,7 +1127,653 @@ fn init_memory_safety() {
     }
 }
 
+/// Complete operation inventory shared by startup and coverage regressions.
+fn operation_registry() -> std::io::Result<OperationRegistry> {
+    let mut registry = OperationRegistry::new();
+    registry
+        .register(OperationDef {
+            name: "test.noop".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::FirstUse,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "No-op test operation".into(),
+            params_schema: None,
+            allowed_target_keys: vec![],
+            secret_ref_param_keys: vec![],
+        })
+        .map_err(std::io::Error::other)?;
+
+    registry
+        .register(OperationDef {
+            name: "sandbox.exec".into(),
+            // SECURITY (C2): SensitiveOutput re-engages the enclave + policy gates
+            // that deny agent access unless a rule explicitly allows it. Restored
+            // after 2fd20b8 re-added stdout/stderr without restoring the class.
+            safety: OperationSafety::SensitiveOutput,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Execute a command in a sandboxed environment".into(),
+            params_schema: None,
+            allowed_target_keys: vec!["profile".into(), "command".into(), "profile_sha256".into()],
+            secret_ref_param_keys: vec!["profile".into()],
+        })
+        .map_err(std::io::Error::other)?;
+
+    registry
+        .register(OperationDef {
+            name: "github.set_actions_secret".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Set a GitHub Actions repository secret".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["repo", "secret_name", "value_ref"],
+                "properties": {
+                    "repo": {"type": "string"},
+                    "secret_name": {"type": "string"},
+                    "value_ref": {"type": "string"},
+                    "github_token_ref": {"type": "string"},
+                    "environment": {"type": "string"}
+                }
+            })),
+            allowed_target_keys: vec![
+                "repo".into(),
+                "secret_name".into(),
+                "environment".into(),
+                "scope".into(),
+                "scope_kind".into(),
+                "github_api_url".into(),
+            ],
+            secret_ref_param_keys: vec!["value_ref".into(), "github_token_ref".into()],
+        })
+        .map_err(std::io::Error::other)?;
+
+    registry
+        .register(OperationDef {
+            name: "github.set_codespaces_secret".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Set a GitHub Codespaces secret (user or repo level)".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["secret_name", "value_ref"],
+                "properties": {
+                    "secret_name": {"type": "string"},
+                    "value_ref": {"type": "string"},
+                    "repo": {"type": "string"},
+                    "github_token_ref": {"type": "string"},
+                    "selected_repository_ids": {"type": "array", "items": {"type": "integer"}}
+                }
+            })),
+            allowed_target_keys: vec![
+                "repo".into(),
+                "secret_name".into(),
+                "scope".into(),
+                "scope_kind".into(),
+                "visibility".into(),
+                "selected_repository_ids".into(),
+                "github_api_url".into(),
+            ],
+            secret_ref_param_keys: vec!["value_ref".into(), "github_token_ref".into()],
+        })
+        .map_err(std::io::Error::other)?;
+
+    registry
+        .register(OperationDef {
+            name: "github.set_dependabot_secret".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Set a GitHub Dependabot repository secret".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["repo", "secret_name", "value_ref"],
+                "properties": {
+                    "repo": {"type": "string"},
+                    "secret_name": {"type": "string"},
+                    "value_ref": {"type": "string"},
+                    "github_token_ref": {"type": "string"}
+                }
+            })),
+            allowed_target_keys: vec![
+                "repo".into(),
+                "secret_name".into(),
+                "scope".into(),
+                "scope_kind".into(),
+                "github_api_url".into(),
+            ],
+            secret_ref_param_keys: vec!["value_ref".into(), "github_token_ref".into()],
+        })
+        .map_err(std::io::Error::other)?;
+
+    registry
+        .register(OperationDef {
+            name: "github.set_org_secret".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Set a GitHub Actions organization secret".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["org", "secret_name", "value_ref"],
+                "properties": {
+                    "org": {"type": "string"},
+                    "secret_name": {"type": "string"},
+                    "value_ref": {"type": "string"},
+                    "github_token_ref": {"type": "string"},
+                    "visibility": {"type": "string", "enum": ["all", "private", "selected"]},
+                    "selected_repository_ids": {"type": "array", "items": {"type": "integer"}}
+                }
+            })),
+            allowed_target_keys: vec![
+                "org".into(),
+                "secret_name".into(),
+                "scope".into(),
+                "scope_kind".into(),
+                "visibility".into(),
+                "selected_repository_ids".into(),
+                "github_api_url".into(),
+            ],
+            secret_ref_param_keys: vec!["value_ref".into(), "github_token_ref".into()],
+        })
+        .map_err(std::io::Error::other)?;
+
+    registry
+        .register(OperationDef {
+            name: "github.list_secrets".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::FirstUse,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "List GitHub secret names for a repository, environment, or org".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "scope": {"type": "string", "enum": ["actions", "codespaces", "dependabot", "org"]},
+                    "repo": {"type": "string"},
+                    "org": {"type": "string"},
+                    "environment": {"type": "string"},
+                    "github_token_ref": {"type": "string"}
+                }
+            })),
+            allowed_target_keys: vec!["repo".into(), "org".into(), "environment".into(), "scope".into(), "scope_kind".into(), "github_api_url".into()],
+            secret_ref_param_keys: vec!["github_token_ref".into()],
+        })
+        .map_err(std::io::Error::other)?;
+
+    registry
+        .register(OperationDef {
+            name: "github.delete_secret".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Delete a GitHub secret from a repository, environment, or org".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["secret_name"],
+                "properties": {
+                    "scope": {"type": "string", "enum": ["actions", "codespaces", "dependabot", "org"]},
+                    "secret_name": {"type": "string"},
+                    "repo": {"type": "string"},
+                    "org": {"type": "string"},
+                    "environment": {"type": "string"},
+                    "github_token_ref": {"type": "string"}
+                }
+            })),
+            allowed_target_keys: vec!["repo".into(), "org".into(), "environment".into(), "secret_name".into(), "scope".into(), "scope_kind".into(), "github_api_url".into()],
+            secret_ref_param_keys: vec!["github_token_ref".into()],
+        })
+        .map_err(std::io::Error::other)?;
+
+    registry
+        .register(OperationDef {
+            name: "gitlab.set_ci_variable".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Set a GitLab CI/CD variable for a project".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["project", "key", "value_ref"],
+                "properties": {
+                    "project": {"type": "string"},
+                    "key": {"type": "string"},
+                    "value_ref": {"type": "string"},
+                    "gitlab_token_ref": {"type": "string"},
+                    "environment_scope": {"type": "string"},
+                    "protected": {"type": "boolean"},
+                    "masked": {"type": "boolean"},
+                    "raw": {"type": "boolean"},
+                    "variable_type": {"type": "string", "enum": ["env_var", "file"]}
+                }
+            })),
+            allowed_target_keys: vec![
+                "project".into(),
+                "key".into(),
+                "environment_scope".into(),
+                "protected".into(),
+                "masked".into(),
+                "raw".into(),
+                "variable_type".into(),
+                "gitlab_api_url".into(),
+            ],
+            secret_ref_param_keys: vec!["value_ref".into(), "gitlab_token_ref".into()],
+        })
+        .map_err(std::io::Error::other)?;
+
+    registry
+        .register(OperationDef {
+            name: "onepassword.list_vaults".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::FirstUse,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "List available 1Password vaults".into(),
+            params_schema: None,
+            allowed_target_keys: vec![
+                "onepassword_backend".into(),
+                "onepassword_api_url".into(),
+                "onepassword_cli_path".into(),
+            ],
+            secret_ref_param_keys: vec![],
+        })
+        .map_err(std::io::Error::other)?;
+
+    registry
+        .register(OperationDef {
+            name: "onepassword.read_field".into(),
+            safety: OperationSafety::Reveal,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Read a single field value from a 1Password item".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["vault", "item", "field"],
+                "properties": {
+                    "vault": {"type": "string"},
+                    "item": {"type": "string"},
+                    "field": {"type": "string"}
+                }
+            })),
+            allowed_target_keys: vec![
+                "vault".into(),
+                "item".into(),
+                "field".into(),
+                "onepassword_backend".into(),
+                "onepassword_api_url".into(),
+                "onepassword_cli_path".into(),
+            ],
+            secret_ref_param_keys: vec!["onepassword:{vault}/{item}/{field}".into()],
+        })
+        .map_err(std::io::Error::other)?;
+
+    registry
+        .register(OperationDef {
+            name: "onepassword.list_items".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::FirstUse,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "List items in a 1Password vault".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["vault"],
+                "properties": { "vault": {"type": "string"} }
+            })),
+            allowed_target_keys: vec![
+                "vault".into(),
+                "onepassword_backend".into(),
+                "onepassword_api_url".into(),
+                "onepassword_cli_path".into(),
+            ],
+            secret_ref_param_keys: vec![],
+        })
+        .map_err(std::io::Error::other)?;
+
+    registry
+        .register(OperationDef {
+            name: "bitwarden.list_projects".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::FirstUse,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "List available Bitwarden Secrets Manager projects".into(),
+            params_schema: None,
+            allowed_target_keys: vec!["bitwarden_api_url".into()],
+            secret_ref_param_keys: vec![],
+        })
+        .map_err(std::io::Error::other)?;
+
+    registry
+        .register(OperationDef {
+            name: "bitwarden.list_secrets".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::FirstUse,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "List secrets in a Bitwarden Secrets Manager project".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": { "project": {"type": "string"} }
+            })),
+            allowed_target_keys: vec!["project".into(), "bitwarden_api_url".into()],
+            secret_ref_param_keys: vec![],
+        })
+        .map_err(std::io::Error::other)?;
+
+    registry
+        .register(OperationDef {
+            name: "bitwarden.read_secret".into(),
+            safety: OperationSafety::Reveal,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Read a secret value from Bitwarden Secrets Manager".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["secret_id"],
+                "properties": { "secret_id": {"type": "string"} }
+            })),
+            allowed_target_keys: vec!["secret_id".into(), "bitwarden_api_url".into()],
+            secret_ref_param_keys: vec!["secret_id".into()],
+        })
+        .map_err(std::io::Error::other)?;
+
+    // AWS STS operations
+    registry
+        .register(OperationDef {
+            name: "aws.get_caller_identity".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::FirstUse,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Get the AWS caller identity (account, ARN, user ID)".into(),
+            params_schema: None,
+            allowed_target_keys: vec!["aws_backend".into(), "aws_api_url".into()],
+            secret_ref_param_keys: vec![],
+        })
+        .map_err(std::io::Error::other)?;
+
+    registry
+        .register(OperationDef {
+            name: "aws.assume_role".into(),
+            safety: OperationSafety::SensitiveOutput,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Assume an AWS IAM role and get temporary credentials".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["role_arn"],
+                "properties": {
+                    "role_arn": {"type": "string"},
+                    "session_name": {"type": "string"}
+                }
+            })),
+            allowed_target_keys: vec![
+                "role_arn".into(),
+                "session_name".into(),
+                "aws_backend".into(),
+                "aws_api_url".into(),
+            ],
+            secret_ref_param_keys: vec![],
+        })
+        .map_err(std::io::Error::other)?;
+
+    // AWS Secrets Manager operations
+    registry
+        .register(OperationDef {
+            name: "aws.list_secrets".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::FirstUse,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "List AWS Secrets Manager secret names".into(),
+            params_schema: None,
+            allowed_target_keys: vec!["aws_backend".into(), "aws_api_url".into()],
+            secret_ref_param_keys: vec![],
+        })
+        .map_err(std::io::Error::other)?;
+
+    registry
+        .register(OperationDef {
+            name: "aws.get_secret_value".into(),
+            safety: OperationSafety::Reveal,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Read a secret value from AWS Secrets Manager".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["secret_id"],
+                "properties": { "secret_id": {"type": "string"} }
+            })),
+            allowed_target_keys: vec![
+                "secret_id".into(),
+                "aws_backend".into(),
+                "aws_api_url".into(),
+            ],
+            secret_ref_param_keys: vec!["secret_id".into()],
+        })
+        .map_err(std::io::Error::other)?;
+
+    registry
+        .register(OperationDef {
+            name: "aws.create_secret".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Create a new secret in AWS Secrets Manager".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["name", "value"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "value": {"type": "string"},
+                    "description": {"type": "string"}
+                }
+            })),
+            allowed_target_keys: vec!["name".into(), "aws_backend".into(), "aws_api_url".into()],
+            secret_ref_param_keys: vec![],
+        })
+        .map_err(std::io::Error::other)?;
+
+    registry
+        .register(OperationDef {
+            name: "aws.put_secret_value".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Update an existing AWS Secrets Manager secret value".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["secret_id", "value"],
+                "properties": {
+                    "secret_id": {"type": "string"},
+                    "value": {"type": "string"}
+                }
+            })),
+            allowed_target_keys: vec![
+                "secret_id".into(),
+                "aws_backend".into(),
+                "aws_api_url".into(),
+            ],
+            secret_ref_param_keys: vec![],
+        })
+        .map_err(std::io::Error::other)?;
+
+    registry
+        .register(OperationDef {
+            name: "aws.delete_secret".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Schedule an AWS Secrets Manager secret for deletion".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["secret_id"],
+                "properties": { "secret_id": {"type": "string"} }
+            })),
+            allowed_target_keys: vec![
+                "secret_id".into(),
+                "force_delete_without_recovery".into(),
+                "aws_backend".into(),
+                "aws_api_url".into(),
+            ],
+            secret_ref_param_keys: vec![],
+        })
+        .map_err(std::io::Error::other)?;
+
+    // AWS SSM Parameter Store operations
+    registry
+        .register(OperationDef {
+            name: "aws.get_parameter".into(),
+            safety: OperationSafety::Reveal,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Read a parameter from AWS SSM Parameter Store".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["name"],
+                "properties": { "name": {"type": "string"} }
+            })),
+            allowed_target_keys: vec![
+                "name".into(),
+                "with_decryption".into(),
+                "aws_backend".into(),
+                "aws_api_url".into(),
+            ],
+            secret_ref_param_keys: vec!["name".into()],
+        })
+        .map_err(std::io::Error::other)?;
+
+    registry
+        .register(OperationDef {
+            name: "aws.put_parameter".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Write a parameter to AWS SSM Parameter Store".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["name", "value"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "value": {"type": "string"},
+                    "type": {"type": "string"},
+                    "overwrite": {"type": "boolean"}
+                }
+            })),
+            allowed_target_keys: vec![
+                "name".into(),
+                "type".into(),
+                "overwrite".into(),
+                "aws_backend".into(),
+                "aws_api_url".into(),
+            ],
+            secret_ref_param_keys: vec![],
+        })
+        .map_err(std::io::Error::other)?;
+
+    registry
+        .register(OperationDef {
+            name: "aws.get_parameters_by_path".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::FirstUse,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "List parameters under a path in AWS SSM Parameter Store".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": {"type": "string"},
+                    "with_decryption": {"type": "boolean"}
+                }
+            })),
+            allowed_target_keys: vec![
+                "path".into(),
+                "with_decryption".into(),
+                "recursive".into(),
+                "aws_backend".into(),
+                "aws_api_url".into(),
+            ],
+            secret_ref_param_keys: vec![],
+        })
+        .map_err(std::io::Error::other)?;
+
+    registry
+        .register(OperationDef {
+            name: "aws.delete_parameter".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Always,
+            default_factors: vec![ApprovalFactor::LocalBio],
+            description: "Delete a parameter from AWS SSM Parameter Store".into(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["name"],
+                "properties": { "name": {"type": "string"} }
+            })),
+            allowed_target_keys: vec!["name".into(), "aws_backend".into(), "aws_api_url".into()],
+            secret_ref_param_keys: vec![],
+        })
+        .map_err(std::io::Error::other)?;
+
+    // Sandbox execve policy hook operations.
+    registry
+        .register(OperationDef {
+            name: "sandbox.execve_check".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Never,
+            default_factors: vec![],
+            description: "Evaluate an execve against policy".into(),
+            params_schema: None,
+            allowed_target_keys: vec![
+                "executable".into(),
+                "command".into(),
+                "cwd".into(),
+                "sandbox_id".into(),
+                "env_keys".into(),
+            ],
+            secret_ref_param_keys: vec![],
+        })
+        .map_err(std::io::Error::other)?;
+
+    registry
+        .register(OperationDef {
+            name: "sandbox.execve_approve".into(),
+            safety: OperationSafety::Safe,
+            default_approval: ApprovalRequirement::Never,
+            default_factors: vec![],
+            description: "Complete an execve approval".into(),
+            params_schema: None,
+            allowed_target_keys: vec![
+                "approval_id".into(),
+                "decision".into(),
+                "lease_for_pattern".into(),
+                "command".into(),
+                "sandbox_id".into(),
+                "pattern".into(),
+            ],
+            secret_ref_param_keys: vec![],
+        })
+        .map_err(std::io::Error::other)?;
+
+    registry
+        .register(enclave::mcp_operation())
+        .map_err(std::io::Error::other)?;
+    registry
+        .register(enclave::task_operation())
+        .map_err(std::io::Error::other)?;
+    for operation in enclave::release_task_operations()
+        .into_iter()
+        .chain(enclave::inference_task_operations())
+        .chain(enclave::ssh_task_operations())
+    {
+        registry
+            .register(operation)
+            .map_err(std::io::Error::other)?;
+    }
+    Ok(registry)
+}
+
 async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> {
+    if config.legacy_scim.is_some() {
+        return Err(std::io::Error::other(
+            "legacy [scim] configuration requires explicit migration to the managed lifecycle adapter; refusing unmanaged startup",
+        ));
+    }
     init_memory_safety();
 
     let session_approval_factor = config
@@ -1124,6 +1858,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         config.require_seal,
         allow_unsealed,
         td.enforce,
+        config_uses_file_seal(&config, &config_path, &home),
     )?;
 
     // Bind custody before any identity, ledger, or provider state is opened.
@@ -1231,539 +1966,8 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
 
     info!("listening on {}", socket.display());
 
-    // Build enclave with registered operations and policy from config.
-    let mut registry = OperationRegistry::new();
-    registry
-        .register(OperationDef {
-            name: "test.noop".into(),
-            safety: OperationSafety::Safe,
-            default_approval: ApprovalRequirement::FirstUse,
-            default_factors: vec![ApprovalFactor::LocalBio],
-            description: "No-op test operation".into(),
-            params_schema: None,
-            allowed_target_keys: vec![],
-            secret_ref_param_keys: vec![],
-        })
-        .map_err(std::io::Error::other)?;
-
-    registry
-        .register(OperationDef {
-            name: "sandbox.exec".into(),
-            // SECURITY (C2): SensitiveOutput re-engages the enclave + policy gates
-            // that deny agent access unless a rule explicitly allows it. Restored
-            // after 2fd20b8 re-added stdout/stderr without restoring the class.
-            safety: OperationSafety::SensitiveOutput,
-            default_approval: ApprovalRequirement::Always,
-            default_factors: vec![ApprovalFactor::LocalBio],
-            description: "Execute a command in a sandboxed environment".into(),
-            params_schema: None,
-            allowed_target_keys: vec!["profile".into(), "command".into()],
-            secret_ref_param_keys: vec!["profile".into()],
-        })
-        .map_err(std::io::Error::other)?;
-
-    registry
-        .register(OperationDef {
-            name: "github.set_actions_secret".into(),
-            safety: OperationSafety::Safe,
-            default_approval: ApprovalRequirement::Always,
-            default_factors: vec![ApprovalFactor::LocalBio],
-            description: "Set a GitHub Actions repository secret".into(),
-            params_schema: Some(serde_json::json!({
-                "type": "object",
-                "required": ["repo", "secret_name", "value_ref"],
-                "properties": {
-                    "repo": {"type": "string"},
-                    "secret_name": {"type": "string"},
-                    "value_ref": {"type": "string"},
-                    "github_token_ref": {"type": "string"},
-                    "environment": {"type": "string"}
-                }
-            })),
-            allowed_target_keys: vec!["repo".into(), "secret_name".into(), "environment".into()],
-            secret_ref_param_keys: vec!["value_ref".into(), "github_token_ref".into()],
-        })
-        .map_err(std::io::Error::other)?;
-
-    registry
-        .register(OperationDef {
-            name: "github.set_codespaces_secret".into(),
-            safety: OperationSafety::Safe,
-            default_approval: ApprovalRequirement::Always,
-            default_factors: vec![ApprovalFactor::LocalBio],
-            description: "Set a GitHub Codespaces secret (user or repo level)".into(),
-            params_schema: Some(serde_json::json!({
-                "type": "object",
-                "required": ["secret_name", "value_ref"],
-                "properties": {
-                    "secret_name": {"type": "string"},
-                    "value_ref": {"type": "string"},
-                    "repo": {"type": "string"},
-                    "github_token_ref": {"type": "string"},
-                    "selected_repository_ids": {"type": "array", "items": {"type": "integer"}}
-                }
-            })),
-            allowed_target_keys: vec!["repo".into(), "secret_name".into()],
-            secret_ref_param_keys: vec!["value_ref".into(), "github_token_ref".into()],
-        })
-        .map_err(std::io::Error::other)?;
-
-    registry
-        .register(OperationDef {
-            name: "github.set_dependabot_secret".into(),
-            safety: OperationSafety::Safe,
-            default_approval: ApprovalRequirement::Always,
-            default_factors: vec![ApprovalFactor::LocalBio],
-            description: "Set a GitHub Dependabot repository secret".into(),
-            params_schema: Some(serde_json::json!({
-                "type": "object",
-                "required": ["repo", "secret_name", "value_ref"],
-                "properties": {
-                    "repo": {"type": "string"},
-                    "secret_name": {"type": "string"},
-                    "value_ref": {"type": "string"},
-                    "github_token_ref": {"type": "string"}
-                }
-            })),
-            allowed_target_keys: vec!["repo".into(), "secret_name".into()],
-            secret_ref_param_keys: vec!["value_ref".into(), "github_token_ref".into()],
-        })
-        .map_err(std::io::Error::other)?;
-
-    registry
-        .register(OperationDef {
-            name: "github.set_org_secret".into(),
-            safety: OperationSafety::Safe,
-            default_approval: ApprovalRequirement::Always,
-            default_factors: vec![ApprovalFactor::LocalBio],
-            description: "Set a GitHub Actions organization secret".into(),
-            params_schema: Some(serde_json::json!({
-                "type": "object",
-                "required": ["org", "secret_name", "value_ref"],
-                "properties": {
-                    "org": {"type": "string"},
-                    "secret_name": {"type": "string"},
-                    "value_ref": {"type": "string"},
-                    "github_token_ref": {"type": "string"},
-                    "visibility": {"type": "string", "enum": ["all", "private", "selected"]},
-                    "selected_repository_ids": {"type": "array", "items": {"type": "integer"}}
-                }
-            })),
-            allowed_target_keys: vec!["org".into(), "secret_name".into()],
-            secret_ref_param_keys: vec!["value_ref".into(), "github_token_ref".into()],
-        })
-        .map_err(std::io::Error::other)?;
-
-    registry
-        .register(OperationDef {
-            name: "github.list_secrets".into(),
-            safety: OperationSafety::Safe,
-            default_approval: ApprovalRequirement::FirstUse,
-            default_factors: vec![ApprovalFactor::LocalBio],
-            description: "List GitHub secret names for a repository, environment, or org".into(),
-            params_schema: Some(serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "scope": {"type": "string", "enum": ["actions", "codespaces", "dependabot", "org"]},
-                    "repo": {"type": "string"},
-                    "org": {"type": "string"},
-                    "environment": {"type": "string"},
-                    "github_token_ref": {"type": "string"}
-                }
-            })),
-            allowed_target_keys: vec!["repo".into(), "org".into()],
-            secret_ref_param_keys: vec!["github_token_ref".into()],
-        })
-        .map_err(std::io::Error::other)?;
-
-    registry
-        .register(OperationDef {
-            name: "github.delete_secret".into(),
-            safety: OperationSafety::Safe,
-            default_approval: ApprovalRequirement::Always,
-            default_factors: vec![ApprovalFactor::LocalBio],
-            description: "Delete a GitHub secret from a repository, environment, or org".into(),
-            params_schema: Some(serde_json::json!({
-                "type": "object",
-                "required": ["secret_name"],
-                "properties": {
-                    "scope": {"type": "string", "enum": ["actions", "codespaces", "dependabot", "org"]},
-                    "secret_name": {"type": "string"},
-                    "repo": {"type": "string"},
-                    "org": {"type": "string"},
-                    "environment": {"type": "string"},
-                    "github_token_ref": {"type": "string"}
-                }
-            })),
-            allowed_target_keys: vec!["repo".into(), "org".into(), "secret_name".into()],
-            secret_ref_param_keys: vec!["github_token_ref".into()],
-        })
-        .map_err(std::io::Error::other)?;
-
-    registry
-        .register(OperationDef {
-            name: "gitlab.set_ci_variable".into(),
-            safety: OperationSafety::Safe,
-            default_approval: ApprovalRequirement::Always,
-            default_factors: vec![ApprovalFactor::LocalBio],
-            description: "Set a GitLab CI/CD variable for a project".into(),
-            params_schema: Some(serde_json::json!({
-                "type": "object",
-                "required": ["project", "key", "value_ref"],
-                "properties": {
-                    "project": {"type": "string"},
-                    "key": {"type": "string"},
-                    "value_ref": {"type": "string"},
-                    "gitlab_token_ref": {"type": "string"},
-                    "environment_scope": {"type": "string"},
-                    "protected": {"type": "boolean"},
-                    "masked": {"type": "boolean"},
-                    "raw": {"type": "boolean"},
-                    "variable_type": {"type": "string", "enum": ["env_var", "file"]}
-                }
-            })),
-            allowed_target_keys: vec!["project".into(), "key".into()],
-            secret_ref_param_keys: vec!["value_ref".into(), "gitlab_token_ref".into()],
-        })
-        .map_err(std::io::Error::other)?;
-
-    registry
-        .register(OperationDef {
-            name: "onepassword.list_vaults".into(),
-            safety: OperationSafety::Safe,
-            default_approval: ApprovalRequirement::FirstUse,
-            default_factors: vec![ApprovalFactor::LocalBio],
-            description: "List available 1Password vaults".into(),
-            params_schema: None,
-            allowed_target_keys: vec![],
-            secret_ref_param_keys: vec![],
-        })
-        .map_err(std::io::Error::other)?;
-
-    registry
-        .register(OperationDef {
-            name: "onepassword.read_field".into(),
-            safety: OperationSafety::Reveal,
-            default_approval: ApprovalRequirement::Always,
-            default_factors: vec![ApprovalFactor::LocalBio],
-            description: "Read a single field value from a 1Password item".into(),
-            params_schema: Some(serde_json::json!({
-                "type": "object",
-                "required": ["vault", "item", "field"],
-                "properties": {
-                    "vault": {"type": "string"},
-                    "item": {"type": "string"},
-                    "field": {"type": "string"}
-                }
-            })),
-            allowed_target_keys: vec!["vault".into(), "item".into()],
-            secret_ref_param_keys: vec!["onepassword:{vault}/{item}/{field}".into()],
-        })
-        .map_err(std::io::Error::other)?;
-
-    registry
-        .register(OperationDef {
-            name: "onepassword.list_items".into(),
-            safety: OperationSafety::Safe,
-            default_approval: ApprovalRequirement::FirstUse,
-            default_factors: vec![ApprovalFactor::LocalBio],
-            description: "List items in a 1Password vault".into(),
-            params_schema: Some(serde_json::json!({
-                "type": "object",
-                "required": ["vault"],
-                "properties": { "vault": {"type": "string"} }
-            })),
-            allowed_target_keys: vec!["vault".into()],
-            secret_ref_param_keys: vec![],
-        })
-        .map_err(std::io::Error::other)?;
-
-    registry
-        .register(OperationDef {
-            name: "bitwarden.list_projects".into(),
-            safety: OperationSafety::Safe,
-            default_approval: ApprovalRequirement::FirstUse,
-            default_factors: vec![ApprovalFactor::LocalBio],
-            description: "List available Bitwarden Secrets Manager projects".into(),
-            params_schema: None,
-            allowed_target_keys: vec![],
-            secret_ref_param_keys: vec![],
-        })
-        .map_err(std::io::Error::other)?;
-
-    registry
-        .register(OperationDef {
-            name: "bitwarden.list_secrets".into(),
-            safety: OperationSafety::Safe,
-            default_approval: ApprovalRequirement::FirstUse,
-            default_factors: vec![ApprovalFactor::LocalBio],
-            description: "List secrets in a Bitwarden Secrets Manager project".into(),
-            params_schema: Some(serde_json::json!({
-                "type": "object",
-                "properties": { "project": {"type": "string"} }
-            })),
-            allowed_target_keys: vec!["project".into()],
-            secret_ref_param_keys: vec![],
-        })
-        .map_err(std::io::Error::other)?;
-
-    registry
-        .register(OperationDef {
-            name: "bitwarden.read_secret".into(),
-            safety: OperationSafety::Reveal,
-            default_approval: ApprovalRequirement::Always,
-            default_factors: vec![ApprovalFactor::LocalBio],
-            description: "Read a secret value from Bitwarden Secrets Manager".into(),
-            params_schema: Some(serde_json::json!({
-                "type": "object",
-                "required": ["secret_id"],
-                "properties": { "secret_id": {"type": "string"} }
-            })),
-            allowed_target_keys: vec!["secret_id".into()],
-            secret_ref_param_keys: vec!["secret_id".into()],
-        })
-        .map_err(std::io::Error::other)?;
-
-    // AWS STS operations
-    registry
-        .register(OperationDef {
-            name: "aws.get_caller_identity".into(),
-            safety: OperationSafety::Safe,
-            default_approval: ApprovalRequirement::FirstUse,
-            default_factors: vec![ApprovalFactor::LocalBio],
-            description: "Get the AWS caller identity (account, ARN, user ID)".into(),
-            params_schema: None,
-            allowed_target_keys: vec![],
-            secret_ref_param_keys: vec![],
-        })
-        .map_err(std::io::Error::other)?;
-
-    registry
-        .register(OperationDef {
-            name: "aws.assume_role".into(),
-            safety: OperationSafety::SensitiveOutput,
-            default_approval: ApprovalRequirement::Always,
-            default_factors: vec![ApprovalFactor::LocalBio],
-            description: "Assume an AWS IAM role and get temporary credentials".into(),
-            params_schema: Some(serde_json::json!({
-                "type": "object",
-                "required": ["role_arn"],
-                "properties": {
-                    "role_arn": {"type": "string"},
-                    "session_name": {"type": "string"}
-                }
-            })),
-            allowed_target_keys: vec!["role_arn".into()],
-            secret_ref_param_keys: vec![],
-        })
-        .map_err(std::io::Error::other)?;
-
-    // AWS Secrets Manager operations
-    registry
-        .register(OperationDef {
-            name: "aws.list_secrets".into(),
-            safety: OperationSafety::Safe,
-            default_approval: ApprovalRequirement::FirstUse,
-            default_factors: vec![ApprovalFactor::LocalBio],
-            description: "List AWS Secrets Manager secret names".into(),
-            params_schema: None,
-            allowed_target_keys: vec![],
-            secret_ref_param_keys: vec![],
-        })
-        .map_err(std::io::Error::other)?;
-
-    registry
-        .register(OperationDef {
-            name: "aws.get_secret_value".into(),
-            safety: OperationSafety::Reveal,
-            default_approval: ApprovalRequirement::Always,
-            default_factors: vec![ApprovalFactor::LocalBio],
-            description: "Read a secret value from AWS Secrets Manager".into(),
-            params_schema: Some(serde_json::json!({
-                "type": "object",
-                "required": ["secret_id"],
-                "properties": { "secret_id": {"type": "string"} }
-            })),
-            allowed_target_keys: vec!["secret_id".into()],
-            secret_ref_param_keys: vec!["secret_id".into()],
-        })
-        .map_err(std::io::Error::other)?;
-
-    registry
-        .register(OperationDef {
-            name: "aws.create_secret".into(),
-            safety: OperationSafety::Safe,
-            default_approval: ApprovalRequirement::Always,
-            default_factors: vec![ApprovalFactor::LocalBio],
-            description: "Create a new secret in AWS Secrets Manager".into(),
-            params_schema: Some(serde_json::json!({
-                "type": "object",
-                "required": ["name", "value"],
-                "properties": {
-                    "name": {"type": "string"},
-                    "value": {"type": "string"},
-                    "description": {"type": "string"}
-                }
-            })),
-            allowed_target_keys: vec!["name".into()],
-            secret_ref_param_keys: vec!["value".into()],
-        })
-        .map_err(std::io::Error::other)?;
-
-    registry
-        .register(OperationDef {
-            name: "aws.put_secret_value".into(),
-            safety: OperationSafety::Safe,
-            default_approval: ApprovalRequirement::Always,
-            default_factors: vec![ApprovalFactor::LocalBio],
-            description: "Update an existing AWS Secrets Manager secret value".into(),
-            params_schema: Some(serde_json::json!({
-                "type": "object",
-                "required": ["secret_id", "value"],
-                "properties": {
-                    "secret_id": {"type": "string"},
-                    "value": {"type": "string"}
-                }
-            })),
-            allowed_target_keys: vec!["secret_id".into()],
-            secret_ref_param_keys: vec!["value".into()],
-        })
-        .map_err(std::io::Error::other)?;
-
-    registry
-        .register(OperationDef {
-            name: "aws.delete_secret".into(),
-            safety: OperationSafety::Safe,
-            default_approval: ApprovalRequirement::Always,
-            default_factors: vec![ApprovalFactor::LocalBio],
-            description: "Schedule an AWS Secrets Manager secret for deletion".into(),
-            params_schema: Some(serde_json::json!({
-                "type": "object",
-                "required": ["secret_id"],
-                "properties": { "secret_id": {"type": "string"} }
-            })),
-            allowed_target_keys: vec!["secret_id".into()],
-            secret_ref_param_keys: vec![],
-        })
-        .map_err(std::io::Error::other)?;
-
-    // AWS SSM Parameter Store operations
-    registry
-        .register(OperationDef {
-            name: "aws.get_parameter".into(),
-            safety: OperationSafety::Reveal,
-            default_approval: ApprovalRequirement::Always,
-            default_factors: vec![ApprovalFactor::LocalBio],
-            description: "Read a parameter from AWS SSM Parameter Store".into(),
-            params_schema: Some(serde_json::json!({
-                "type": "object",
-                "required": ["name"],
-                "properties": { "name": {"type": "string"} }
-            })),
-            allowed_target_keys: vec!["name".into()],
-            secret_ref_param_keys: vec!["name".into()],
-        })
-        .map_err(std::io::Error::other)?;
-
-    registry
-        .register(OperationDef {
-            name: "aws.put_parameter".into(),
-            safety: OperationSafety::Safe,
-            default_approval: ApprovalRequirement::Always,
-            default_factors: vec![ApprovalFactor::LocalBio],
-            description: "Write a parameter to AWS SSM Parameter Store".into(),
-            params_schema: Some(serde_json::json!({
-                "type": "object",
-                "required": ["name", "value"],
-                "properties": {
-                    "name": {"type": "string"},
-                    "value": {"type": "string"},
-                    "type": {"type": "string"},
-                    "overwrite": {"type": "boolean"}
-                }
-            })),
-            allowed_target_keys: vec!["name".into()],
-            secret_ref_param_keys: vec!["value".into()],
-        })
-        .map_err(std::io::Error::other)?;
-
-    registry
-        .register(OperationDef {
-            name: "aws.get_parameters_by_path".into(),
-            safety: OperationSafety::Safe,
-            default_approval: ApprovalRequirement::FirstUse,
-            default_factors: vec![ApprovalFactor::LocalBio],
-            description: "List parameters under a path in AWS SSM Parameter Store".into(),
-            params_schema: Some(serde_json::json!({
-                "type": "object",
-                "required": ["path"],
-                "properties": {
-                    "path": {"type": "string"},
-                    "with_decryption": {"type": "boolean"}
-                }
-            })),
-            allowed_target_keys: vec!["path".into()],
-            secret_ref_param_keys: vec![],
-        })
-        .map_err(std::io::Error::other)?;
-
-    registry
-        .register(OperationDef {
-            name: "aws.delete_parameter".into(),
-            safety: OperationSafety::Safe,
-            default_approval: ApprovalRequirement::Always,
-            default_factors: vec![ApprovalFactor::LocalBio],
-            description: "Delete a parameter from AWS SSM Parameter Store".into(),
-            params_schema: Some(serde_json::json!({
-                "type": "object",
-                "required": ["name"],
-                "properties": { "name": {"type": "string"} }
-            })),
-            allowed_target_keys: vec!["name".into()],
-            secret_ref_param_keys: vec![],
-        })
-        .map_err(std::io::Error::other)?;
-
-    // Sandbox execve policy hook operations.
-    registry
-        .register(OperationDef {
-            name: "sandbox.execve_check".into(),
-            safety: OperationSafety::Safe,
-            default_approval: ApprovalRequirement::Never,
-            default_factors: vec![],
-            description: "Evaluate an execve against policy".into(),
-            params_schema: None,
-            allowed_target_keys: vec![],
-            secret_ref_param_keys: vec![],
-        })
-        .map_err(std::io::Error::other)?;
-
-    registry
-        .register(OperationDef {
-            name: "sandbox.execve_approve".into(),
-            safety: OperationSafety::Safe,
-            default_approval: ApprovalRequirement::Never,
-            default_factors: vec![],
-            description: "Complete an execve approval".into(),
-            params_schema: None,
-            allowed_target_keys: vec![],
-            secret_ref_param_keys: vec![],
-        })
-        .map_err(std::io::Error::other)?;
-
+    let registry = operation_registry()?;
     let policy = PolicyEngine::with_rules(config.rules.clone());
-    registry
-        .register(enclave::task_operation())
-        .map_err(std::io::Error::other)?;
-    for operation in enclave::release_task_operations()
-        .into_iter()
-        .chain(enclave::inference_task_operations())
-        .chain(enclave::ssh_task_operations())
-    {
-        registry
-            .register(operation)
-            .map_err(std::io::Error::other)?;
-    }
     info!("policy engine loaded with {} rules", policy.rule_count());
 
     let tracing_sink: Arc<dyn AuditSink> = Arc::new(TracingAuditEmitter::new());
@@ -1850,6 +2054,18 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         );
     }
 
+    if identity::lifecycle::persisted_lifecycle(&state_dir).map_err(std::io::Error::other)?
+        && (config.lifecycle.is_none()
+            || !config
+                .identity
+                .as_ref()
+                .is_some_and(|identity| identity.required))
+    {
+        return Err(std::io::Error::other(
+            "persisted managed lifecycle requires lifecycle and required identity configuration; explicit offline migration required",
+        ));
+    }
+
     // Identity substrate (Phase 1): initialize when `[identity]` is present.
     // A broken identity config fails the daemon only when `required = true`
     // (fail closed where identity gates operations); otherwise it degrades to
@@ -1877,6 +2093,41 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
                 }
             }
         }
+    };
+
+    if config.lifecycle.is_none()
+        && identity_runtime.as_ref().is_some_and(|runtime| {
+            runtime
+                .store
+                .lifecycle_revision()
+                .map_or(true, |revision| revision > 0)
+        })
+    {
+        return Err(std::io::Error::other(
+            "persisted managed lifecycle requires its configured ingress; explicit offline migration required",
+        ));
+    }
+    let _lifecycle_listener = if let Some(lifecycle_config) = config.lifecycle.clone() {
+        if !config.require_seal || !td.enforce {
+            return Err(std::io::Error::other(
+                "Managed lifecycle requires sealed configuration and isolated tenant custody",
+            ));
+        }
+        let runtime = identity_runtime
+            .clone()
+            .ok_or_else(|| std::io::Error::other("Managed lifecycle requires identity"))?;
+        let binding = tenant
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("Managed lifecycle requires a tenant binding"))?
+            .binding()
+            .clone();
+        Some(
+            identity::lifecycle::start(lifecycle_config, runtime, binding, &state_dir)
+                .await
+                .map_err(std::io::Error::other)?,
+        )
+    } else {
+        None
     };
 
     provisioning_api::initialize(
@@ -1969,6 +2220,13 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         .handler("github.list_secrets", Box::new(github_list_handler))
         .handler("github.delete_secret", Box::new(github_delete_handler))
         .handler("gitlab.set_ci_variable", Box::new(gitlab_handler));
+
+    if let Some(runtime) = identity_runtime.clone() {
+        enclave_builder =
+            enclave_builder.task_authority_guard(Arc::new(move |requester, authorize| {
+                runtime.with_dispatch_authority(requester, None, authorize)
+            }));
+    }
 
     if !onepassword_connect_url.is_empty() {
         // Connect Server backend (self-hosted REST API).
@@ -2090,7 +2348,10 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         Arc<opaque_approval::pairing::PairingManager>,
         opaque_approval::approval_server::ApprovalServerHandle,
     )> = None;
-    if config.approval.second_device || !config.workstation_approvers.is_empty() {
+    if config.approval.second_device
+        || !config.workstation_approvers.is_empty()
+        || config.remote_approvals.is_some()
+    {
         let state_dir = audit_db_path
             .parent()
             .map(Path::to_path_buf)
@@ -2142,6 +2403,63 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
                 .map_err(std::io::Error::other)?;
         }
 
+        let remote = config
+            .remote_approvals
+            .clone()
+            .map(|remote_config| {
+                if !config.enable_task_grants || backend != ApprovalBackendKind::Native {
+                    return Err("remote approvals require native bounded-task approval".to_owned());
+                }
+                if !config.require_seal
+                    || !td.enforce
+                    || !config.identity.as_ref().is_some_and(|id| id.required)
+                {
+                    return Err(
+                        "remote approvals require sealed isolated custody and required identity"
+                            .to_owned(),
+                    );
+                }
+                let runtime = identity_runtime
+                    .clone()
+                    .ok_or("remote approvals require identity")?;
+                let boundary = tenant
+                    .as_ref()
+                    .ok_or("remote approvals require an isolated tenant")?;
+                let resolution_runtime = runtime.clone();
+                let resolver: opaque_approval::remote::ReviewerResolver =
+                    Arc::new(move |principal, role| {
+                        let principal = opaque_core::identity::PrincipalId::parse(principal)
+                            .map_err(|_| "invalid remote reviewer principal")?;
+                        let role = role
+                            .parse::<opaque_core::identity::Role>()
+                            .map_err(|_| "invalid remote reviewer role")?;
+                        resolution_runtime.reviewer_eligibility(&principal, role)
+                    });
+                let authority_guard: opaque_approval::remote::ReviewerAuthorityGuard =
+                    Arc::new(move |requester, principal, role, epoch, authorize| {
+                        let principal = opaque_core::identity::PrincipalId::parse(principal)
+                            .map_err(|_| "invalid reviewer principal")?;
+                        let role = role
+                            .parse::<opaque_core::identity::Role>()
+                            .map_err(|_| "invalid reviewer role")?;
+                        runtime.with_dispatch_authority(
+                            requester,
+                            Some((&principal, role, epoch)),
+                            authorize,
+                        )
+                    });
+                opaque_approval::remote::RemoteApprovals::open(
+                    remote_config,
+                    &state_dir.join("remote-approvals.db"),
+                    boundary.binding().clone(),
+                    pm.clone(),
+                    resolver,
+                    authority_guard,
+                )
+            })
+            .transpose()
+            .map_err(std::io::Error::other)?;
+
         // TLS identity persists so paired devices' fingerprint pin survives
         // restarts (custody set).
         let tls = opaque_approval::approval_server::load_or_create_tls_identity(&state_dir)
@@ -2158,6 +2476,11 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
             pm.clone(),
         )
         .map_err(std::io::Error::other)?;
+        let server = if let Some(remote) = &remote {
+            server.with_remote(remote.clone())
+        } else {
+            server
+        };
         let server_handle = server.handle();
 
         let (_join, addr) = server
@@ -2299,8 +2622,8 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         .map_err(std::io::Error::other)?;
     let enclave = Arc::new(enclave);
 
-    // --- SIEM export: stream the audit chain off the box ---
-    if config.export.configured() {
+    // Detector runs locally even when no off-box export is configured.
+    {
         let pump = opaque_federation_runtime::export::ExportPump::new(
             config.export.clone(),
             audit_db_path.clone(),
@@ -2399,6 +2722,26 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         "attestation service ready (enroll this key with your verifier)"
     );
     attestation.record_posture(&audit, "startup");
+    if let Some(fleet_config) = config.fleet.clone() {
+        if !config.require_seal || !td.enforce {
+            return Err(std::io::Error::other(
+                "fleet reporter requires sealed isolated tenant custody",
+            ));
+        }
+        let binding = tenant
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("fleet reporter requires a tenant binding"))?
+            .binding()
+            .clone();
+        let reporter = opaque_federation_runtime::fleet::reporter::Reporter::new(
+            fleet_config,
+            binding,
+            attestation.clone(),
+            &state_dir,
+        )
+        .map_err(std::io::Error::other)?;
+        tokio::spawn(reporter.run());
+    }
 
     // Verify-before-trust: prove posture to the verifier before it releases
     // custody material. A refusal is loud but not fatal — the daemon keeps
@@ -2433,7 +2776,13 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         );
     }
 
+    let mcp = mcp_gateway::initialize(
+        &config,
+        &state_dir,
+        tenant.as_ref().map(|t| t.binding()).cloned(),
+    )?;
     let state = Arc::new(DaemonState {
+        mcp,
         workload_attestor,
         tenant,
         enclave,
@@ -3917,6 +4266,10 @@ fn is_operation_method(method: &str) -> bool {
             | "task_plan"
             | "task_plan_inference"
             | "task_plan_ssh"
+            | "mcp_call"
+            | "mcp_catalog"
+            | "mcp_get"
+            | "mcp_revoke"
             | "task_run"
             | "task_get"
             | "task_list"
@@ -4028,6 +4381,7 @@ async fn handle_request(
             | "task_plan"
             | "task_plan_inference"
             | "task_plan_ssh"
+            | "mcp_call"
             | "task_run"
             | "task_reconcile"
     ) {
@@ -4061,6 +4415,18 @@ async fn handle_request(
     };
 
     match req.method.as_str() {
+        "mcp_catalog" | "mcp_call" | "mcp_get" | "mcp_revoke" => {
+            mcp_gateway::handle(
+                state,
+                req,
+                identity,
+                client_type,
+                session_id,
+                principal_ctx,
+                verified_workspace,
+            )
+            .await
+        }
         "task_plan"
         | "task_plan_inference"
         | "task_plan_ssh"
@@ -4099,7 +4465,7 @@ async fn handle_request(
         "operations" => Response::ok(
             req.id,
             serde_json::json!({
-                "mode": "live", "operations": state.enclave.operation_catalog(),
+                "mode": "live", "operations": mcp_gateway::operation_catalog(state),
             }),
         ),
         "version" => {
@@ -5016,6 +5382,85 @@ mod tests {
     use bytes::Bytes;
     use futures_util::{SinkExt, StreamExt};
     use tokio_util::codec::{Framed, LengthDelimitedCodec};
+
+    #[test]
+    fn every_registered_operation_has_an_explicit_generic_or_task_contract() {
+        // A new registration must extend this reviewed inventory and its real
+        // preparer/transport tests; it cannot inherit raw-request execution.
+        let families: &[(&str, &[&str])] = &[
+            (
+                "github",
+                &[
+                    "set_actions_secret",
+                    "set_codespaces_secret",
+                    "set_dependabot_secret",
+                    "set_org_secret",
+                    "list_secrets",
+                    "delete_secret",
+                ],
+            ),
+            ("gitlab", &["set_ci_variable"]),
+            ("onepassword", &["list_vaults", "list_items", "read_field"]),
+            (
+                "bitwarden",
+                &["list_projects", "list_secrets", "read_secret"],
+            ),
+            (
+                "aws",
+                &[
+                    "get_caller_identity",
+                    "assume_role",
+                    "list_secrets",
+                    "get_secret_value",
+                    "create_secret",
+                    "put_secret_value",
+                    "delete_secret",
+                    "get_parameter",
+                    "put_parameter",
+                    "get_parameters_by_path",
+                    "delete_parameter",
+                ],
+            ),
+            ("sandbox", &["exec", "execve_check", "execve_approve"]),
+            ("test", &["noop"]),
+        ];
+        let mut expected: std::collections::BTreeSet<_> = families
+            .iter()
+            .flat_map(|(family, actions)| {
+                actions
+                    .iter()
+                    .map(move |action| format!("{family}.{action}"))
+            })
+            .collect();
+        assert_eq!(expected.len(), 28);
+        expected.extend(
+            [enclave::task_operation()]
+                .into_iter()
+                .chain(enclave::release_task_operations())
+                .chain(enclave::inference_task_operations())
+                .chain(enclave::ssh_task_operations())
+                .map(|def| def.name),
+        );
+        // MCP uses its dedicated, durably accounted invocation runner. It
+        // must remain explicitly reviewed here, with an unlowerable local
+        // approval floor, rather than inheriting a generic raw handler.
+        let mcp = enclave::mcp_operation();
+        assert_eq!(mcp.name, "mcp.call");
+        assert_eq!(mcp.default_approval, ApprovalRequirement::Always);
+        assert_eq!(mcp.default_factors, vec![ApprovalFactor::LocalBio]);
+        assert!(expected.insert(mcp.name));
+        let registry = operation_registry().unwrap();
+        let actual: std::collections::BTreeSet<_> =
+            registry.iter().map(|def| def.name.clone()).collect();
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 37);
+        // Raw secret bytes must never be cataloged as reference names.
+        assert!(
+            registry
+                .iter()
+                .all(|def| !def.secret_ref_param_keys.iter().any(|key| key == "value"))
+        );
+    }
 
     fn test_identity() -> ClientIdentity {
         ClientIdentity {
@@ -6007,6 +6452,7 @@ exe_sha256 = "deadbeef"
             .build()
             .unwrap();
         DaemonState {
+            mcp: None,
             workload_attestor:
                 opaque_federation_runtime::workload_attest::ListenerAttestor::unix_listener(),
             tenant: None,
@@ -7257,18 +7703,49 @@ exe_sha256 = "deadbeef"
             .await
             .unwrap()
             .unwrap();
-        state
-            .identity
-            .as_ref()
+        let store = &state.identity.as_ref().unwrap().store;
+        assert!(
+            store
+                .get_delegation(&context.jti)
+                .unwrap()
+                .unwrap()
+                .revoked_at
+                .is_none()
+        );
+        store.set_disabled(&context.act, true).unwrap();
+        assert!(store.get_principal(&context.act).unwrap().unwrap().disabled);
+        // The lifecycle trigger revokes existing delegations in the same
+        // transaction as disabling their acting principal. Live resolution
+        // therefore rejects the persisted revocation before checking the
+        // principal's disabled flag.
+        let revoked_at = store
+            .get_delegation(&context.jti)
             .unwrap()
-            .store
-            .set_disabled(&context.act, true)
-            .unwrap();
+            .unwrap()
+            .revoked_at;
+        assert!(revoked_at.is_some());
         assert_eq!(
             resolve_principal_context(&state, Some(&sid))
                 .await
                 .unwrap_err(),
-            "agent principal disabled"
+            "delegation revoked"
+        );
+        // Re-enabling the principal cannot resurrect an old delegated grant.
+        store.set_disabled(&context.act, false).unwrap();
+        assert!(!store.get_principal(&context.act).unwrap().unwrap().disabled);
+        assert_eq!(
+            store
+                .get_delegation(&context.jti)
+                .unwrap()
+                .unwrap()
+                .revoked_at,
+            revoked_at
+        );
+        assert_eq!(
+            resolve_principal_context(&state, Some(&sid))
+                .await
+                .unwrap_err(),
+            "delegation revoked"
         );
     }
 

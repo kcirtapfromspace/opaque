@@ -61,6 +61,21 @@ enum Command {
         #[arg(long)]
         approval_id: String,
     },
+    /// Resolve an opaque notification reference against this local enrollment,
+    /// then perform the same full native review as the Review command.
+    Open {
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long)]
+        notice: String,
+    },
+    /// Retrieve a retained signed decision over the enrolled pinned connection.
+    Receipt {
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long)]
+        approval_id: String,
+    },
 }
 
 fn now() -> i64 {
@@ -78,7 +93,7 @@ async fn main() {
     }
 }
 
-async fn run(args: Args) -> Result<(), String> {
+async fn run(mut args: Args) -> Result<(), String> {
     // This application must run in trusted custody, not inside an agent's
     // delegated execution session. This check complements account isolation;
     // environment absence alone is not proof that a process is trusted.
@@ -86,6 +101,16 @@ async fn run(args: Args) -> Result<(), String> {
         return Err(
             "run the approver outside delegated agent sessions on the trusted workstation".into(),
         );
+    }
+    if let Command::Open { state_dir, notice } = &args.command {
+        let (state, _) = custody::load(state_dir)?;
+        let enrollment = state.enrollment.ok_or("workstation is not enrolled")?;
+        let approval_id = opaque_core::workstation::resolve_notice(notice, &enrollment.broker_id)
+            .map_err(|_| "notice does not refer to this enrolled broker")?;
+        args.command = Command::Review {
+            state_dir: state_dir.clone(),
+            approval_id,
+        };
     }
     match args.command {
         Command::CheckNative => check_native().await?,
@@ -207,7 +232,12 @@ async fn run(args: Args) -> Result<(), String> {
             if review.challenge.approval_id != approval_id {
                 return Err("broker returned a different approval round".into());
             }
-            let reason = format!(
+            if let Some(authority) = &review.challenge.authority
+                && authority.public_key_hex != state.public_key_hex
+            {
+                return Err("approval is assigned to a different enrolled workstation key".into());
+            }
+            let mut reason = format!(
                 "Trusted broker: {}\nApproval: {}\nRequest: {}\nOperation: {}\nChallenge expires: {}\nReview content SHA256: {}\n\n{}",
                 review.challenge.broker_id,
                 approval_id,
@@ -217,6 +247,14 @@ async fn run(args: Args) -> Result<(), String> {
                 review.challenge.content_hash,
                 review.review_text
             );
+            if let Some(authority) = &review.challenge.authority {
+                reason.push_str(&format!(
+                    "\n\nSigned authority:\nTenant: {}\nBroker lineage: {}\nTask: {}\nManifest SHA256: {}\nEffective policy SHA256: {}\nRequester: {}\nReviewer: {}\nRequired role: {}\nReviewer authority epoch: {}",
+                    authority.binding.tenant.tenant_id,authority.binding.tenant.broker_id,
+                    authority.binding.task_id,authority.binding.manifest_digest,authority.binding.policy_digest,
+                    authority.binding.requester,authority.principal_id,authority.required_role,authority.authority_epoch,
+                ));
+            }
             let approved = matches!(
                 native::prompt_task(&reason)
                     .await
@@ -265,6 +303,43 @@ async fn run(args: Args) -> Result<(), String> {
                 enrollment.broker_id
             );
         }
+        Command::Receipt {
+            state_dir,
+            approval_id,
+        } => {
+            if uuid_like(&approval_id).is_none() {
+                return Err("approval_id must be a UUID".into());
+            }
+            let (state, _) = custody::load(&state_dir)?;
+            let enrollment = state.enrollment.ok_or("workstation is not enrolled")?;
+            let client = BrokerClient::new(&enrollment.endpoint, &enrollment.tls_fingerprint)?;
+            let receipt: opaque_core::workstation::SignedWorkstationReceipt = client
+                .request(
+                    reqwest::Method::GET,
+                    &format!("/workstation/receipts/{approval_id}"),
+                    None,
+                    Some((&enrollment.device_id, &enrollment.token)),
+                )
+                .await?;
+            receipt.verify().map_err(|_| "invalid signed receipt")?;
+            if receipt.review.challenge.approval_id != approval_id
+                || receipt.review.challenge.broker_id != enrollment.broker_id
+                || receipt.response.device_id != enrollment.device_id
+                || receipt
+                    .review
+                    .challenge
+                    .authority
+                    .as_ref()
+                    .is_none_or(|a| a.public_key_hex != state.public_key_hex)
+            {
+                return Err("receipt belongs to another enrollment".into());
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&receipt).map_err(|_| "receipt encoding failed")?
+            );
+        }
+        Command::Open { .. } => unreachable!("notice resolved before command dispatch"),
     }
     Ok(())
 }

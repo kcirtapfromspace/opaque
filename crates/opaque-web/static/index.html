@@ -1,743 +1,1826 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-md-color-scheme="slate">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Opaque Dashboard</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 24 24%27%3E%3Cpath fill=%27%233fb950%27 d=%27M12 1 2 5v7c0 5 5 9 10 11 5-2 10-6 10-11V5z%27/%3E%3C/svg%3E">
+<link rel="icon" type="image/svg+xml" href="/brand/opaque-mark.svg">
+<link rel="stylesheet" href="/brand/opaque.css">
 <style>
-*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-:root{
-  --bg:#0d1117;--panel:#161b22;--border:#21262d;--border-hi:#30363d;
-  --text:#e6edf3;--dim:#7d8590;--muted:#484f58;
-  --green:#3fb950;--green-dim:#238636;--red:#f85149;--red-dim:#da3633;
-  --amber:#d29922;--blue:#58a6ff;--cyan:#39d353;--purple:#bc8cff;
-  --mono:'SF Mono','Cascadia Code','Fira Code','JetBrains Mono',Consolas,monospace;
-}
-html,body{
-  height:100%;
-  background:var(--bg);
-  color:var(--text);
-  font-family:var(--mono);
-  font-size:13px;
-  overflow:hidden;
-}
-body{
-  display:flex;
-  flex-direction:column;
+/* Opaque workspace. The website, dashboard and demo share /brand/opaque.css. */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0
 }
 
-/* ===== Scrollbar ===== */
-::-webkit-scrollbar{width:6px;height:6px}
-::-webkit-scrollbar-track{background:transparent}
-::-webkit-scrollbar-thumb{background:var(--border-hi);border-radius:3px}
-::-webkit-scrollbar-thumb:hover{background:var(--muted)}
-
-/* ===== CRT Scanline overlay ===== */
-body::before{
-  content:'';
-  position:fixed;
-  top:0;left:0;right:0;bottom:0;
-  background:repeating-linear-gradient(
-    0deg,transparent,transparent 2px,rgba(0,0,0,.03) 2px,rgba(0,0,0,.03) 4px
-  );
-  pointer-events:none;
-  z-index:9999;
+:root {
+  color-scheme: dark;
+  --bg: var(--op-bg,#111310);
+  --panel: var(--op-panel,#1a1d18);
+  --surface: var(--op-bg-soft,#171a15);
+  --border: var(--op-line,rgba(227,229,214,.11));
+  --border-hi: var(--op-line-strong,rgba(227,229,214,.24));
+  --text: var(--op-text,#eeeae0);
+  --dim: var(--op-text-dim,#a7ac9f);
+  --muted: var(--op-text-dim,#a7ac9f);
+  --accent: var(--op-accent,#dcb46d);
+  --accent-soft: var(--op-accent-soft,rgba(220,180,109,.14));
+  --green: #a2c38e;
+  --green-dim: #3f5736;
+  --green-soft: rgba(162,195,142,.10);
+  --red: #e7a198;
+  --red-dim: #ae544d;
+  --red-soft: rgba(231,161,152,.10);
+  --amber: var(--accent);
+  --blue: var(--accent);
+  --cyan: var(--green);
+  --purple: #c5b4cf;
+  --sans: var(--op-font-sans,'Archivo','Avenir Next',sans-serif);
+  --mono: var(--op-font-mono,'IBM Plex Mono','SFMono-Regular',monospace);
 }
 
-/* ===== Header ===== */
-header{
-  height:48px;
-  min-height:48px;
-  display:flex;
-  align-items:center;
-  justify-content:space-between;
-  padding:0 20px;
-  background:var(--panel);
-  border-bottom:1px solid var(--border);
-  gap:16px;
-  flex-shrink:0;
-}
-.logo{
-  display:flex;
-  align-items:center;
-  gap:10px;
-  font-size:15px;
-  font-weight:700;
-  letter-spacing:0.5px;
-}
-.logo-icon{
-  width:28px;height:28px;
-  border-radius:6px;
-  background:linear-gradient(135deg,var(--green-dim),var(--green));
-  display:flex;align-items:center;justify-content:center;
-  font-size:14px;font-weight:900;color:var(--bg);
-}
-.header-right{
-  display:flex;
-  align-items:center;
-  gap:16px;
-  font-size:11px;
-  color:var(--dim);
-}
-.mode-indicator{
-  display:flex;
-  align-items:center;
-  gap:6px;
-  padding:4px 10px;
-  border-radius:4px;
-  background:var(--bg);
-  border:1px solid var(--border);
-  font-size:11px;
-  font-weight:600;
-  letter-spacing:0.5px;
-}
-.mode-dot{
-  width:8px;height:8px;
-  border-radius:50%;
-  display:inline-block;
-}
-.mode-dot.live{
-  background:var(--green);
-  box-shadow:0 0 6px var(--green);
-}
-.mode-dot.demo{
-  background:var(--amber);
-  box-shadow:0 0 6px var(--amber);
-}
-.version-text{
-  font-size:10px;
-  color:var(--muted);
-  letter-spacing:0.3px;
+[data-md-color-scheme="default"] {
+  color-scheme: light;
+  --green: #416932;
+  --green-dim: #365829;
+  --green-soft: rgba(65,105,50,.08);
+  --red: #a53c36;
+  --red-dim: #85302b;
+  --red-soft: rgba(165,60,54,.08);
+  --purple: #77567f
 }
 
-/* ===== Tab Bar ===== */
-.tab-bar{
-  display:flex;
-  align-items:center;
-  gap:0;
-  background:var(--panel);
-  border-bottom:1px solid var(--border);
-  padding:0 20px;
-  flex-shrink:0;
-}
-.tab-btn{
-  padding:10px 18px;
-  border:none;
-  background:transparent;
-  color:var(--dim);
-  font-family:var(--mono);
-  font-size:12px;
-  font-weight:600;
-  cursor:pointer;
-  border-bottom:2px solid transparent;
-  transition:all .15s;
-  letter-spacing:0.3px;
-}
-.tab-btn:hover{
-  color:var(--text);
-  background:rgba(255,255,255,.03);
-}
-.tab-btn.active{
-  color:var(--green);
-  border-bottom-color:var(--green);
+html,
+body {
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased
 }
 
-/* ===== Content Area ===== */
-.content{
-  flex:1;
-  overflow-y:auto;
-  padding:16px 20px;
-}
-.tab-panel{
-  display:none;
-}
-.tab-panel.active{
-  display:block;
+body {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden
 }
 
-/* ===== Audit Tab ===== */
-.audit-toolbar{
-  display:flex;
-  align-items:center;
-  gap:8px;
-  margin-bottom:12px;
-  flex-wrap:wrap;
+[hidden] {
+  display: none!important
 }
+
+button,
+input,
+select {
+  font: inherit;
+  color: inherit
+}
+
+button,
+a,
+input,
+select,
+summary {
+  -webkit-tap-highlight-color: transparent
+}
+
+button {
+  cursor: pointer
+}
+
+a {
+  color: var(--accent);
+  text-underline-offset: 4px
+}
+
+code,
+pre {
+  font-family: var(--mono)
+}
+
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+select:focus-visible,
+summary:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 4px
+}
+
+button:disabled {
+  opacity: .55;
+  cursor: wait
+}
+
+button,
+input,
+select {
+  touch-action: manipulation
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px
+}
+
+::-webkit-scrollbar-track {
+  background: transparent
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-hi);
+  border: 2px solid var(--bg);
+  border-radius: 5px
+}
+
+.skip-link {
+  position: fixed;
+  top: 8px;
+  left: 20px;
+  z-index: 20;
+  padding: 10px 16px;
+  background: var(--text);
+  color: var(--bg);
+  transform: translateY(-160%)
+}
+
+.skip-link:focus {
+  transform: none
+}
+
+/* Brand masthead */
+header {
+  height: 76px;
+  min-height: 76px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 32px;
+  border-bottom: 1px solid var(--border);
+  gap: 24px;
+  background: var(--bg);
+  flex-shrink: 0
+}
+
+.logo {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  min-width: 0
+}
+
+.brand-glyph {
+  display: block;
+  background: currentColor;
+  -webkit-mask: url("/brand/opaque-mark.svg") center/contain no-repeat;
+  mask: url("/brand/opaque-mark.svg") center/contain no-repeat;
+}
+.logo-icon {
+  display: flex;
+  align-items: center;
+  color: var(--accent);
+  width: 28px;
+  height: 28px
+}
+
+.logo-icon .brand-glyph {
+  width: 28px;
+  height: 28px;
+  fill: currentColor
+}
+
+.wordmark {
+  font-weight: 700;
+  font-size: 20px;
+  letter-spacing: 1.4px
+}
+
+.logo-section {
+  border-left: 1px solid var(--border-hi);
+  padding-left: 16px;
+  margin-left: 6px;
+  font: 11px var(--mono);
+  color: var(--dim)
+}
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  min-width: 0
+}
+
+.mode-indicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font: 10px var(--mono);
+  letter-spacing: .07em;
+  white-space: nowrap
+}
+
+.mode-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--dim);
+  display: inline-block;
+  flex-shrink: 0
+}
+
+.mode-dot.live {
+  background: var(--green)
+}
+
+.mode-dot.demo {
+  background: var(--accent)
+}
+
+.mode-dot.disconnected,
+.mode-dot.error {
+  background: var(--red)
+}
+
+.version-text {
+  font: 10px var(--mono);
+  color: var(--dim)
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 40px;
+  padding: 9px 16px;
+  border: 1px solid var(--border-hi);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 500;
+  text-decoration: none;
+  transition: background-color 150ms,border-color 150ms,color 150ms
+}
+
+.btn:hover {
+  background: var(--surface);
+  border-color: var(--accent)
+}
+
+.btn-green {
+  background: var(--text);
+  border-color: var(--text);
+  color: var(--bg)
+}
+
+.btn-green:hover {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--bg)
+}
+
+.btn-small {
+  font-size: 11px;
+  min-height: 36px;
+  padding: 7px 12px
+}
+
+.theme-button {
+  border-color: transparent;
+  color: var(--dim);
+  min-width: 94px
+}
+
+.theme-button:hover {
+  color: var(--text)
+}
+
+/* Workspace layout: private content remains one lockable subtree. */
+#dashboard-private {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  min-width: 0
+}
+
+.workspace {
+  display: grid;
+  grid-template-columns: 226px minmax(0,1fr);
+  width: 100%;
+  min-height: 0
+}
+
+.workspace-main {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0
+}
+
+.tab-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 32px 18px 24px;
+  border-right: 1px solid var(--border);
+  background: var(--bg);
+  min-height: 0;
+  overflow: auto
+}
+
+.nav-eyebrow {
+  font: 9px var(--mono);
+  letter-spacing: .12em;
+  color: var(--dim);
+  padding: 0 13px 21px
+}
+
+.tab-btn {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  text-align: left;
+  width: 100%;
+  padding: 13px 14px;
+  min-height: 49px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--dim);
+  font-size: 13px;
+  font-weight: 400;
+  transition: background-color 150ms,color 150ms,border-color 150ms
+}
+
+.tab-btn .nav-index {
+  font: 10px var(--mono);
+  color: var(--dim)
+}
+
+.tab-btn .nav-arrow {
+  margin-left: auto;
+  opacity: 0
+}
+
+.tab-btn:hover {
+  background: var(--surface);
+  color: var(--text)
+}
+
+.tab-btn.active {
+  background: var(--accent-soft);
+  color: var(--text);
+  border-color: var(--border)
+}
+
+.tab-btn.active .nav-index,
+.tab-btn.active .nav-arrow {
+  color: var(--accent);
+  opacity: 1
+}
+
+.nav-footer {
+  margin-top: auto;
+  padding: 32px 13px 0;
+  font: 10px/1.8 var(--mono);
+  color: var(--dim)
+}
+
+.nav-footer strong {
+  display: block;
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 12px;
+  font-weight: 400;
+  margin-bottom: 6px
+}
+
+.nav-seal {
+  display: block;
+  width: 24px;
+  height: 24px;
+  color: var(--accent);
+  margin-bottom: 16px
+}
+
+.connection-banner {
+  padding: 12px 36px;
+  border-bottom: 1px solid var(--border);
+  color: var(--dim);
+  font: 11px/1.65 var(--mono);
+  background: var(--surface);
+  flex-shrink: 0;
+  overflow-wrap: anywhere
+}
+
+.connection-banner.warning {
+  color: var(--accent);
+  background: var(--accent-soft)
+}
+
+.connection-banner.error {
+  color: var(--red);
+  background: var(--red-soft)
+}
+
+.connection-banner button {
+  margin-left: 12px
+}
+
+.content {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  overflow: auto;
+  padding: 36px 40px 48px;
+  scrollbar-gutter: stable
+}
+
+.tab-panel {
+  display: none;
+  max-width: 1360px;
+  margin: 0 auto;
+  min-width: 0
+}
+
+.tab-panel.active {
+  display: block;
+  animation: view-enter 180ms ease-out
+}
+.view-heading,
+.tasks-heading,
+.sessions-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  margin-bottom: 28px
+}
+.view-heading .btn,
+.tasks-heading>.btn,
+.sessions-header>.btn {
+  margin-top: 28px;
+  flex-shrink: 0
+}
+
+.view-eyebrow {
+  font: 9px var(--mono);
+  letter-spacing: .13em;
+  color: var(--accent);
+  margin-bottom: 12px
+}
+.view-heading h2,
+.tasks-heading h2,
+.sessions-header h2 {
+  font-size: clamp(28px,3vw,39px);
+  font-weight: 400;
+  letter-spacing: -.045em;
+  line-height: 1.15;
+  margin: 0 0 13px
+}
+.view-heading p:not(.view-eyebrow),
+.tasks-heading p:not(.view-eyebrow),
+.sessions-header p:not(.view-eyebrow) {
+  font-size: 13px;
+  line-height: 1.75;
+  color: var(--dim);
+  max-width: 720px
+}
+
+/* Informational workflow, never a fabricated runtime status. */
+.authority-path {
+  display: grid;
+  grid-template-columns: repeat(4,minmax(0,1fr));
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  margin-bottom: 28px
+}
+
+.authority-stage {
+  padding: 19px 20px;
+  border-right: 1px solid var(--border)
+}
+
+.authority-stage:last-child {
+  border-right: 0
+}
+
+.authority-stage span {
+  display: block;
+  font: 9px var(--mono);
+  color: var(--accent);
+  margin-bottom: 9px
+}
+
+.authority-stage strong {
+  font-size: 13px;
+  font-weight: 500
+}
+
+.authority-stage p {
+  font-size: 11px;
+  line-height: 1.65;
+  color: var(--dim);
+  margin-top: 5px
+}
+
+/* Filters and observed audit activity */
+.audit-toolbar {
+  display: flex;
+  align-items: end;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 20px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  margin-bottom: 14px
+}
+
+.filter-field {
+  display: flex;
+  flex: 1 1 140px;
+  flex-direction: column;
+  gap: 7px;
+  min-width: 125px
+}
+
+.filter-field.search-field {
+  flex-grow: 1.4
+}
+
+.filter-field label {
+  font: 9px var(--mono);
+  color: var(--dim);
+  letter-spacing: .04em
+}
+
 .audit-toolbar select,
-.audit-toolbar input[type="text"]{
-  background:var(--bg);
-  border:1px solid var(--border);
-  color:var(--text);
-  font-family:var(--mono);
-  font-size:11px;
-  padding:6px 10px;
-  border-radius:4px;
-  outline:none;
-}
-.audit-toolbar select:focus,
-.audit-toolbar input[type="text"]:focus{
-  border-color:var(--blue);
-}
-.audit-toolbar input[type="text"]{
-  min-width:140px;
-}
-.audit-toolbar input[type="text"]::placeholder{
-  color:var(--muted);
-}
-.audit-toolbar select{
-  cursor:pointer;
-  min-width:100px;
-}
-.btn{
-  padding:6px 14px;
-  border:1px solid var(--border);
-  background:var(--border-hi);
-  color:var(--text);
-  font-family:var(--mono);
-  font-size:11px;
-  border-radius:4px;
-  cursor:pointer;
-  transition:all .15s;
-  font-weight:600;
-}
-.btn:hover{
-  border-color:var(--blue);
-  color:var(--blue);
-}
-.btn-green{
-  background:var(--green-dim);
-  border-color:var(--green-dim);
-}
-.btn-green:hover{
-  background:var(--green);
-  border-color:var(--green);
-  color:var(--text);
-}
-.btn-small{
-  padding:4px 10px;
-  font-size:10px;
-}
-.toolbar-spacer{
-  flex:1;
+.audit-toolbar input {
+  width: 100%;
+  min-width: 0;
+  height: 40px;
+  background: var(--bg);
+  border: 1px solid var(--border-hi);
+  border-radius: 4px;
+  font: 11px var(--mono);
+  padding: 9px 10px
 }
 
-/* Audit event list */
-.audit-list{
-  display:flex;
-  flex-direction:column;
-  gap:1px;
-}
-.audit-event{
-  display:grid;
-  grid-template-columns:80px 20px 1fr auto auto auto;
-  gap:8px;
-  align-items:center;
-  padding:6px 12px;
-  border-radius:4px;
-  font-size:11px;
-  cursor:pointer;
-  transition:background .1s;
-  background:var(--panel);
-  border:1px solid transparent;
-}
-.audit-event:hover{
-  background:var(--border);
-  border-color:var(--border-hi);
-}
-.audit-event.expanded{
-  background:var(--border);
-  border-color:var(--border-hi);
-  border-bottom-left-radius:0;
-  border-bottom-right-radius:0;
-}
-.audit-ts{
-  color:var(--muted);
-  font-size:10px;
-  white-space:nowrap;
-}
-.audit-icon{
-  text-align:center;
-  font-size:13px;
-}
-.audit-icon.ok{color:var(--green)}
-.audit-icon.denied{color:var(--red)}
-.audit-icon.error{color:var(--red)}
-.audit-icon.warn{color:var(--amber)}
-.audit-kind{
-  color:var(--text);
-  font-weight:500;
-}
-.audit-operation{
-  color:var(--blue);
-  font-size:10px;
-}
-.outcome-badge{
-  font-size:9px;
-  padding:2px 6px;
-  border-radius:3px;
-  font-weight:700;
-  letter-spacing:0.3px;
-  text-transform:uppercase;
-}
-.outcome-badge.ok{
-  background:rgba(63,185,80,.15);
-  color:var(--green);
-}
-.outcome-badge.denied{
-  background:rgba(248,81,73,.15);
-  color:var(--red);
-}
-.outcome-badge.error{
-  background:rgba(248,81,73,.15);
-  color:var(--red);
-}
-.outcome-badge.warn{
-  background:rgba(210,153,34,.15);
-  color:var(--amber);
-}
-.audit-latency{
-  color:var(--muted);
-  font-size:10px;
-  min-width:50px;
-  text-align:right;
-}
-.audit-detail-panel{
-  background:var(--bg);
-  border:1px solid var(--border-hi);
-  border-top:none;
-  border-bottom-left-radius:4px;
-  border-bottom-right-radius:4px;
-  padding:12px 16px;
-  margin-bottom:4px;
-  overflow-x:auto;
-}
-.audit-detail-panel pre{
-  font-size:11px;
-  line-height:1.6;
-  white-space:pre-wrap;
-  word-break:break-all;
-}
-.audit-empty{
-  text-align:center;
-  padding:40px 20px;
-  color:var(--muted);
-  font-style:italic;
-}
-.audit-refresh-error{padding:8px 12px;color:var(--amber);font-size:11px}
-.audit-paused-banner{
-  display:none;
-  align-items:center;
-  gap:8px;
-  padding:6px 12px;
-  background:rgba(210,153,34,.1);
-  border:1px solid rgba(210,153,34,.3);
-  border-radius:4px;
-  color:var(--amber);
-  font-size:11px;
-  margin-bottom:8px;
-}
-.audit-paused-banner.visible{
-  display:flex;
+.audit-toolbar input::placeholder {
+  color: var(--dim);
+  opacity: .8
 }
 
-/* ===== Policy Tab ===== */
-.policy-info-bar{
-  display:flex;
-  align-items:center;
-  gap:16px;
-  padding:12px 16px;
-  background:var(--panel);
-  border:1px solid var(--border);
-  border-radius:6px;
-  margin-bottom:16px;
-  flex-wrap:wrap;
-}
-.policy-info-item{
-  display:flex;
-  align-items:center;
-  gap:6px;
-  font-size:11px;
-  color:var(--dim);
-}
-.policy-info-item .label{
-  color:var(--muted);
-  font-size:10px;
-  text-transform:uppercase;
-  letter-spacing:0.5px;
-}
-.policy-info-item .value{
-  color:var(--text);
-  font-weight:500;
-}
-.policy-info-item .icon{
-  font-size:14px;
+.audit-toolbar select {
+  cursor: pointer
 }
 
-.policy-rules-list{
-  display:flex;
-  flex-direction:column;
-  gap:8px;
-}
-.policy-card{
-  background:var(--panel);
-  border:1px solid var(--border);
-  border-radius:6px;
-  padding:14px 16px;
-  transition:border-color .15s;
-}
-.policy-card:hover{
-  border-color:var(--border-hi);
-}
-.policy-card-header{
-  display:flex;
-  align-items:center;
-  gap:10px;
-  margin-bottom:8px;
-}
-.policy-card-name{
-  font-weight:700;
-  font-size:13px;
-  color:var(--text);
-}
-.policy-card-effect{
-  font-size:9px;
-  padding:2px 8px;
-  border-radius:3px;
-  font-weight:700;
-  letter-spacing:0.5px;
-  text-transform:uppercase;
-}
-.policy-card-effect.allow{
-  background:rgba(63,185,80,.15);
-  color:var(--green);
-}
-.policy-card-effect.deny{
-  background:rgba(248,81,73,.15);
-  color:var(--red);
-}
-.policy-card-body{
-  display:flex;
-  flex-direction:column;
-  gap:4px;
-  font-size:11px;
-}
-.policy-card-row{
-  display:flex;
-  align-items:center;
-  gap:8px;
-}
-.policy-card-label{
-  color:var(--muted);
-  min-width:80px;
-  font-size:10px;
-  text-transform:uppercase;
-  letter-spacing:0.5px;
-}
-.policy-card-value{
-  color:var(--dim);
-}
-.policy-card-value.pattern{
-  color:var(--blue);
-  font-weight:600;
-}
-.policy-no-config{
-  text-align:center;
-  padding:40px 20px;
-  color:var(--muted);
-  font-style:italic;
+.toolbar-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center
 }
 
-/* ===== Sessions Tab ===== */
-.sessions-header{
-  display:flex;
-  align-items:center;
-  justify-content:space-between;
-  margin-bottom:12px;
-}
-.sessions-header h2{
-  font-size:14px;
-  font-weight:700;
-  color:var(--text);
-}
-.sessions-table{
-  width:100%;
-  border-collapse:collapse;
-  font-size:11px;
-}
-.sessions-table thead{
-  position:sticky;
-  top:0;
-  z-index:1;
-}
-.sessions-table th{
-  text-align:left;
-  padding:8px 12px;
-  background:var(--panel);
-  border-bottom:1px solid var(--border);
-  color:var(--muted);
-  font-size:10px;
-  text-transform:uppercase;
-  letter-spacing:0.8px;
-  font-weight:600;
-}
-.sessions-table td{
-  padding:8px 12px;
-  border-bottom:1px solid var(--border);
-  color:var(--text);
-}
-.sessions-table tbody tr{
-  transition:background .1s;
-}
-.sessions-table tbody tr:hover{
-  background:var(--panel);
-}
-.session-id{
-  font-family:var(--mono);
-  color:var(--blue);
-  font-weight:500;
-}
-.session-ttl{
-  font-family:var(--mono);
-  font-weight:600;
-}
-.session-ttl.expiring{
-  color:var(--amber);
-}
-.session-ttl.healthy{
-  color:var(--green);
-}
-.sessions-empty{
-  text-align:center;
-  padding:40px 20px;
-  color:var(--muted);
-  font-style:italic;
+.toolbar-spacer {
+  flex: 1
 }
 
-/* ===== Operations Tab ===== */
-.ops-group{
-  margin-bottom:20px;
-}
-.ops-group-header{
-  font-size:12px;
-  font-weight:700;
-  color:var(--dim);
-  text-transform:uppercase;
-  letter-spacing:1px;
-  padding:8px 0;
-  margin-bottom:6px;
-  border-bottom:1px solid var(--border);
-  display:flex;
-  align-items:center;
-  gap:8px;
-}
-.ops-group-header .provider-icon{
-  font-size:14px;
-}
-.ops-list{
-  display:flex;
-  flex-direction:column;
-  gap:4px;
-}
-.op-card{
-  display:grid;
-  grid-template-columns:1fr auto auto auto;
-  gap:10px;
-  align-items:center;
-  padding:10px 14px;
-  background:var(--panel);
-  border:1px solid var(--border);
-  border-radius:4px;
-  transition:border-color .15s;
-}
-.op-card:hover{
-  border-color:var(--border-hi);
-}
-.op-card-info{
-  display:flex;
-  flex-direction:column;
-  gap:2px;
-}
-.op-card-name{
-  font-weight:600;
-  font-size:12px;
-  color:var(--text);
-}
-.op-card-desc{
-  font-size:10px;
-  color:var(--dim);
-}
-.safety-badge{
-  font-size:9px;
-  padding:2px 6px;
-  border-radius:3px;
-  font-weight:700;
-  letter-spacing:0.3px;
-  text-transform:uppercase;
-}
-.safety-badge.safe{
-  background:rgba(63,185,80,.15);
-  color:var(--green);
-}
-.safety-badge.sensitive{
-  background:rgba(210,153,34,.15);
-  color:var(--amber);
-}
-.safety-badge.reveal{
-  background:rgba(248,81,73,.15);
-  color:var(--red);
-}
-.mcp-badge{
-  font-size:9px;
-  padding:2px 6px;
-  border-radius:3px;
-  font-weight:700;
-  letter-spacing:0.3px;
-}
-.mcp-badge.exposed{
-  background:rgba(63,185,80,.15);
-  color:var(--green);
-}
-.mcp-badge.internal{
-  background:rgba(125,133,144,.1);
-  color:var(--muted);
-}
-.approval-text{
-  font-size:10px;
-  color:var(--muted);
+.audit-list {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border)
 }
 
-/* ===== JSON Syntax Highlighting ===== */
-.json-key{color:var(--blue)}
-.json-str{color:var(--green)}
-.json-num{color:var(--amber)}
-.json-bool{color:var(--cyan)}
-.json-null{color:var(--muted)}
+.audit-event {
+  display: grid;
+  grid-template-columns: 78px 18px minmax(145px,1.2fr) minmax(120px,1fr) auto 58px;
+  gap: 12px;
+  align-items: center;
+  width: 100%;
+  text-align: left;
+  padding: 17px 12px;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  background: transparent;
+  border-radius: 0;
+  font: 11px var(--mono);
+  transition: background-color 140ms
+}
 
-/* ===== Responsive ===== */
-@media (max-width: 768px) {
-  .audit-event{
-    grid-template-columns:60px 20px 1fr auto;
+.audit-event:hover,
+.audit-event.expanded {
+  background: var(--surface)
+}
+
+.audit-event:focus-visible {
+  outline-offset: -2px
+}
+
+.audit-ts {
+  font-size: 10px;
+  color: var(--dim);
+  white-space: nowrap
+}
+
+.audit-icon {
+  text-align: center;
+  font-size: 13px
+}
+
+.audit-icon.ok {
+  color: var(--green)
+}
+
+.audit-icon.denied,
+.audit-icon.error {
+  color: var(--red)
+}
+
+.audit-icon.warn {
+  color: var(--accent)
+}
+
+.audit-icon.neutral {
+  color: var(--dim)
+}
+
+.audit-kind {
+  color: var(--text);
+  overflow-wrap: anywhere;
+  font-weight: 400
+}
+
+.audit-operation {
+  color: var(--dim);
+  overflow-wrap: anywhere;
+  font-size: 10px
+}
+
+.audit-latency {
+  color: var(--dim);
+  font-size: 10px;
+  text-align: right;
+  font-variant-numeric: tabular-nums
+}
+
+.outcome-badge,
+.safety-badge,
+.mcp-badge,
+.policy-card-effect {
+  display: inline-block;
+  justify-self: start;
+  font: 9px/1.6 var(--mono);
+  padding: 3px 7px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  text-transform: uppercase;
+  letter-spacing: .03em;
+  white-space: normal
+}
+
+.outcome-badge.ok,
+.safety-badge.safe,
+.mcp-badge.exposed,
+.policy-card-effect.allow {
+  background: var(--green-soft);
+  color: var(--green)
+}
+
+.outcome-badge.denied,
+.outcome-badge.error,
+.safety-badge.reveal,
+.policy-card-effect.deny {
+  background: var(--red-soft);
+  color: var(--red)
+}
+
+.outcome-badge.warn,
+.safety-badge.sensitive {
+  background: var(--accent-soft);
+  color: var(--accent)
+}
+
+.outcome-badge.neutral,
+.mcp-badge.internal {
+  color: var(--dim);
+  background: var(--surface)
+}
+
+.audit-detail-panel {
+  padding: 22px 24px;
+  border-bottom: 1px solid var(--border);
+  border-left: 2px solid var(--accent);
+  background: var(--surface);
+  overflow: auto
+}
+
+.audit-detail-panel pre {
+  font: 11px/1.9 var(--mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere
+}
+.audit-empty,
+.policy-no-config,
+.sessions-empty,
+.task-empty {
+  color: var(--dim);
+  font-size: 13px;
+  line-height: 1.85;
+  padding: 38px 28px;
+  border: 1px dashed var(--border-hi);
+  border-radius: 8px;
+  background: var(--surface);
+  text-align: left;
+  margin: 12px 0 24px;
+  overflow-wrap: anywhere
+}
+
+.task-empty code {
+  color: var(--text)
+}
+
+.audit-list .audit-empty {
+  margin-top: 20px
+}
+
+.audit-refresh-error {
+  padding: 12px;
+  color: var(--accent);
+  font-size: 12px
+}
+
+.audit-paused-banner {
+  display: none;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  background: var(--accent-soft);
+  border: 1px solid var(--border-hi);
+  border-radius: 5px;
+  color: var(--accent);
+  font: 11px var(--mono);
+  margin-bottom: 12px
+}
+
+.audit-paused-banner.visible {
+  display: flex
+}
+
+.audit-stream-status {
+  padding: 7px 0 18px;
+  font: 10px/1.6 var(--mono);
+  color: var(--dim)
+}
+
+/* Policy: names and relationships before syntax. */
+.policy-info-bar {
+  display: flex;
+  align-items: flex-start;
+  gap: 24px;
+  padding: 20px 24px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-bottom: 24px;
+  flex-wrap: wrap
+}
+
+.policy-info-item {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  font-size: 12px;
+  min-width: 0
+}
+
+.policy-info-item .label {
+  font: 9px var(--mono);
+  color: var(--dim);
+  letter-spacing: .04em
+}
+
+.policy-info-item .value {
+  color: var(--text);
+  font: 11px/1.7 var(--mono);
+  overflow-wrap: anywhere
+}
+
+.policy-info-item .icon {
+  display: none
+}
+
+.policy-rules-list {
+  display: grid;
+  grid-template-columns: repeat(2,minmax(0,1fr));
+  gap: 14px
+}
+
+.policy-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 22px 24px;
+  transition: border-color 150ms;
+  min-width: 0
+}
+
+.policy-card:hover {
+  border-color: var(--border-hi)
+}
+
+.policy-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 18px;
+  flex-wrap: wrap
+}
+
+.policy-card-name {
+  font-size: 14px;
+  font-weight: 500;
+  overflow-wrap: anywhere
+}
+
+.policy-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 11px
+}
+
+.policy-card-row {
+  display: grid;
+  grid-template-columns: 64px minmax(0,1fr);
+  gap: 12px;
+  align-items: baseline
+}
+
+.policy-card-label {
+  font: 9px var(--mono);
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: .04em
+}
+
+.policy-card-value {
+  font-size: 12px;
+  line-height: 1.65;
+  color: var(--dim);
+  overflow-wrap: anywhere
+}
+
+.policy-card-value.pattern {
+  font: 11px/1.65 var(--mono);
+  color: var(--accent)
+}
+.table-wrap {
+  overflow: auto;
+  max-width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 8px
+}
+.sessions-table,
+.task-slots {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+  font-size: 12px;
+  line-height: 1.7
+}
+
+.sessions-table {
+  min-width: 680px
+}
+.sessions-table th,
+.task-slots th {
+  padding: 13px 18px;
+  background: var(--surface);
+  color: var(--dim);
+  border-bottom: 1px solid var(--border);
+  font: 9px/1.6 var(--mono);
+  font-weight: 400;
+  letter-spacing: .06em;
+  text-transform: uppercase
+}
+.sessions-table td,
+.task-slots td {
+  padding: 18px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+  overflow-wrap: anywhere
+}
+.sessions-table tr:last-child td {
+  border-bottom: 0
+}
+
+.sessions-table tbody tr:hover {
+  background: var(--surface)
+}
+
+.session-id {
+  font: 11px/1.7 var(--mono);
+  color: var(--text)
+}
+
+.session-ttl {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums
+}
+
+.session-ttl.expiring {
+  color: var(--accent)
+}
+
+.session-ttl.healthy {
+  color: var(--green)
+}
+.task-note {
+  color: var(--dim);
+  font-size: 12px;
+  line-height: 1.85;
+  max-width: 820px
+}
+
+/* Operations are an inventory, never implied permission. */
+.ops-group {
+  margin-top: 30px
+}
+
+.ops-group-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font: 11px var(--mono);
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  color: var(--dim);
+  padding-bottom: 13px;
+  border-bottom: 1px solid var(--border)
+}
+
+.provider-icon {
+  color: var(--accent)
+}
+
+.ops-list {
+  display: flex;
+  flex-direction: column
+}
+
+.op-card {
+  display: grid;
+  grid-template-columns: minmax(0,1fr) auto auto minmax(120px,.28fr);
+  gap: 18px;
+  align-items: center;
+  padding: 20px 0;
+  border-bottom: 1px solid var(--border)
+}
+
+.op-card-info {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0
+}
+
+.op-card-name {
+  font: 12px var(--mono);
+  color: var(--text);
+  overflow-wrap: anywhere
+}
+
+.op-card-desc {
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--dim)
+}
+
+.op-card-info .op-card-desc:last-child {
+  font: 10px/1.7 var(--mono)
+}
+
+.approval-text {
+  font: 10px/1.7 var(--mono);
+  color: var(--dim)
+}
+
+/* Bounded work receipts */
+.task-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  margin-bottom: 18px;
+  padding: 24px;
+  min-width: 0
+}
+
+.task-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap
+}
+
+.task-title {
+  font: 500 18px/1.5 var(--sans);
+  letter-spacing: -.02em;
+  color: var(--text);
+  background: none;
+  border: 0;
+  cursor: pointer;
+  text-align: left;
+  overflow-wrap: anywhere;
+  padding: 2px 0
+}
+
+.task-title:hover {
+  color: var(--accent)
+}
+
+.task-state {
+  font: 10px var(--mono);
+  color: var(--accent);
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  overflow-wrap: anywhere
+}
+
+.task-state.completed {
+  color: var(--green)
+}
+
+.task-state.partial,
+.task-state.revoked,
+.task-state.expired {
+  color: var(--red)
+}
+
+.task-metrics {
+  display: flex;
+  gap: 24px;
+  flex-wrap: wrap;
+  margin: 18px 0;
+  color: var(--dim);
+  font-size: 12px
+}
+
+.task-metrics strong {
+  color: var(--text);
+  font-weight: 500
+}
+
+.task-targets {
+  font: 11px/1.9 var(--mono);
+  color: var(--dim);
+  overflow-wrap: anywhere
+}
+
+.task-detail,
+.workflow-evidence {
+  border-top: 1px solid var(--border);
+  margin-top: 20px;
+  padding-top: 20px
+}
+
+.workflow-evidence strong {
+  font-size: 14px;
+  font-weight: 500
+}
+
+.workflow-evidence p {
+  margin-top: 10px
+}
+
+.task-detail dl {
+  display: grid;
+  grid-template-columns: 150px minmax(0,1fr);
+  gap: 10px 18px;
+  margin-bottom: 22px;
+  font-size: 12px
+}
+
+.task-detail dt {
+  color: var(--dim)
+}
+
+.task-detail dd {
+  overflow-wrap: anywhere;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.8
+}
+
+.task-slots {
+  min-width: 620px
+}
+
+.task-slots .source-ref {
+  display: block;
+  color: var(--dim);
+  font: 10px/1.8 var(--mono);
+  margin-top: 7px
+}
+
+.slot-api_accepted {
+  color: var(--green)
+}
+
+.slot-unknown {
+  color: var(--accent)
+}
+
+.slot-rejected {
+  color: var(--red)
+}
+
+.json-key {
+  color: var(--accent)
+}
+
+.json-str {
+  color: var(--green)
+}
+
+.json-num {
+  color: var(--text)
+}
+
+.json-bool {
+  color: var(--purple)
+}
+
+.json-null {
+  color: var(--dim)
+}
+
+/* Owner access shares the site's quiet authority-boundary motif. */
+.unlock-panel {
+  display: grid;
+  grid-template-columns: 1.1fr 1fr;
+  align-items: center;
+  gap: clamp(40px,8vw,130px);
+  width: min(1150px,100%);
+  margin: auto;
+  padding: clamp(28px,5vw,76px);
+  overflow: auto
+}
+
+.unlock-story {
+  max-width: 480px
+}
+
+.unlock-eyebrow {
+  font: 10px var(--mono);
+  letter-spacing: .13em;
+  color: var(--accent);
+  margin-bottom: 22px
+}
+
+.unlock-story h1 {
+  font-size: clamp(38px,4.6vw,62px);
+  font-weight: 400;
+  letter-spacing: -.05em;
+  line-height: 1.08;
+  margin-bottom: 24px
+}
+
+.unlock-story h1 span {
+  color: var(--accent)
+}
+
+.unlock-story>p:not(.unlock-eyebrow) {
+  color: var(--dim);
+  font-size: 14px;
+  line-height: 1.85;
+  max-width: 360px
+}
+
+.unlock-boundary {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  margin-top: 40px;
+  color: var(--dim);
+  font: 10px var(--mono)
+}
+
+.boundary-mark {
+  width: 80px;
+  height: 72px;
+  padding: 10px 18px;
+  border: 1px solid var(--border-hi);
+  background: var(--accent-soft);
+  color: var(--accent);
+  position: relative
+}
+
+.boundary-mark:before,
+.boundary-mark:after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  width: 16px;
+  border-top: 1px solid var(--border-hi)
+}
+
+.boundary-mark:before {
+  right: 100%
+}
+
+.boundary-mark:after {
+  left: 100%
+}
+
+.boundary-mark .brand-glyph {
+  height: 100%;
+  width: 100%;
+  fill: currentColor
+}
+
+.unlock-form-card {
+  max-width: 425px;
+  width: 100%;
+  padding: 32px;
+  border: 1px solid var(--border-hi);
+  border-radius: 8px;
+  background: var(--surface)
+}
+
+.unlock-form-card h2 {
+  font-size: 23px;
+  letter-spacing: -.025em;
+  font-weight: 400;
+  margin-bottom: 14px
+}
+
+.unlock-form-card>p {
+  color: var(--dim);
+  font-size: 12px;
+  line-height: 1.8
+}
+
+.unlock-form-card code {
+  color: var(--text);
+  font-size: 11px
+}
+
+.unlock-panel form {
+  display: grid;
+  gap: 12px;
+  margin-top: 24px
+}
+
+.unlock-panel label {
+  font-size: 12px
+}
+
+.unlock-panel input {
+  width: 100%;
+  padding: 12px 13px;
+  min-height: 46px;
+  border: 1px solid var(--border-hi);
+  border-radius: 4px;
+  background: var(--bg);
+  font: 12px var(--mono)
+}
+
+.unlock-panel .btn {
+  width: 100%;
+  min-height: 43px
+}
+
+.unlock-panel .unlock-note {
+  font-size: 11px;
+  margin-top: 14px;
+  padding-top: 18px;
+  border-top: 1px solid var(--border);
+  line-height: 1.8;
+  color: var(--dim)
+}
+
+#unlock-message {
+  min-height: 1.7em;
+  color: var(--accent);
+  font-size: 12px
+}
+
+@keyframes view-enter {
+  from {
+    opacity: .7;
+    transform: translateY(4px)
   }
-  .audit-operation,
-  .audit-latency{
-    display:none;
-  }
-  .op-card{
-    grid-template-columns:1fr;
-    gap:6px;
-  }
-  .policy-info-bar{
-    flex-direction:column;
-    gap:8px;
+  to {
+    opacity: 1;
+    transform: none
   }
 }
-/* Dogfood status and bounded task receipts */
-.connection-banner{padding:12px 24px;border-bottom:1px solid var(--border-hi);color:var(--dim);font-size:12px;line-height:1.6;background:var(--panel);flex-shrink:0}
-.connection-banner.warning{color:var(--amber)}
-.connection-banner.error{color:var(--red)}
-.connection-banner button{margin-left:12px}
-.mode-dot.disconnected,.mode-dot.error{background:var(--red);box-shadow:none;animation:none}
-.tasks-heading{display:flex;justify-content:space-between;align-items:center;gap:20px;margin-bottom:16px}
-.tasks-heading h2{font-size:18px;font-weight:500;margin-bottom:8px}
-.tasks-heading p,.task-note{color:var(--dim);line-height:1.6;max-width:780px}
-.task-card{border:1px solid var(--border-hi);background:var(--panel);margin:0 0 14px;padding:20px}
-.task-card-header{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
-.task-title{font-size:16px;font-weight:500;color:var(--text);background:none;border:0;cursor:pointer;text-align:left;font-family:inherit}
-.task-title:hover{text-decoration:underline}
-.task-title:focus-visible,button:focus-visible{outline:2px solid var(--blue);outline-offset:4px}
-.task-state{font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--amber)}
-.task-state.completed{color:var(--green)}
-.task-state.partial,.task-state.revoked,.task-state.expired{color:var(--red)}
-.task-metrics{display:flex;gap:24px;flex-wrap:wrap;margin:16px 0;color:var(--dim);font-size:12px}
-.task-metrics strong{color:var(--text);font-weight:500}
-.workflow-evidence{border-top:1px solid var(--border);margin-top:16px;padding-top:16px}
-.workflow-evidence strong{font-size:13px;font-weight:500}
-.workflow-evidence p{margin-top:8px}
-button:disabled{opacity:.55;cursor:wait}
-.task-targets{color:var(--dim);font-size:12px;line-height:1.8;overflow-wrap:anywhere}
-.task-detail{border-top:1px solid var(--border-hi);margin-top:16px;padding-top:16px}
-.task-detail dl{display:grid;grid-template-columns:130px minmax(0,1fr);gap:8px 16px;margin-bottom:18px;font-size:12px}
-.task-detail dt{color:var(--dim)}
-.task-detail dd{overflow-wrap:anywhere}
-.task-slots{width:100%;border-collapse:collapse;font-size:12px;text-align:left}
-.task-slots th{color:var(--dim);font-weight:400;padding:10px 8px;border-bottom:1px solid var(--border-hi)}
-.task-slots td{padding:12px 8px;border-bottom:1px solid var(--border);vertical-align:top;overflow-wrap:anywhere}
-.task-slots .source-ref{display:block;color:var(--dim);font-size:11px;margin-top:6px;line-height:1.6}
-.slot-api_accepted{color:var(--green)}
-.slot-unknown{color:var(--amber)}
-.slot-rejected{color:var(--red)}
-.task-empty{padding:28px 0;line-height:1.8;color:var(--dim);max-width:780px}
-.task-empty code{color:var(--text)}
-.audit-stream-status{padding:8px 0 12px;font-size:11px;color:var(--dim);line-height:1.5}
-@media(max-width:600px){
-  header{height:auto;min-height:48px;flex-wrap:wrap;padding:12px 16px;gap:10px}
-  .logo{min-width:0}
-  .header-right{width:100%;min-width:0;justify-content:space-between;gap:12px}
-  .mode-indicator{white-space:nowrap;flex-shrink:0}
-  .version-text{min-width:0;text-align:right;overflow-wrap:anywhere}
-  .tab-bar{min-width:0;overflow-x:auto}
-  .tab-btn{flex-shrink:0}
-  .content{padding:16px;min-width:0}
-  .connection-banner{padding:10px 16px}
-  .task-card{padding:14px;min-width:0}
-  .task-title,.task-state{overflow-wrap:anywhere}
-  .task-detail dl{grid-template-columns:1fr}
-  .task-detail dd{margin-bottom:6px}
-  .task-slots{font-size:12px}
-  .task-metrics{gap:12px}
-  .tasks-heading{align-items:flex-start;flex-wrap:wrap;gap:12px}
-  .inference-slots,.inference-slots tbody,.inference-slots tr,.inference-slots td{display:block;width:100%}
-  .inference-slots thead{position:absolute;width:1px;height:1px;padding:0;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap}
-  .inference-slots tr{border-top:1px solid var(--border-hi);padding:12px 0}
-  .inference-slots td{border:0;padding:6px 0;line-height:1.6}
-  .inference-slots td::before{content:attr(data-label);display:block;color:var(--dim);font-size:11px;margin-bottom:4px}
-  .inference-slots .source-ref{font-size:11px}
+
+@media(min-width:1800px) {
+  .content {
+    padding-left: 64px;
+    padding-right: 64px
+  }
+  .workspace {
+    grid-template-columns: 252px minmax(0,1fr)
+  }
 }
-@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+
+@media(max-width:1150px) {
+  .workspace {
+    grid-template-columns: 192px minmax(0,1fr)
+  }
+  .tab-bar {
+    padding: 28px 12px
+  }
+  .tab-btn {
+    gap: 11px;
+    padding: 12px
+  }
+  .content {
+    padding: 30px 28px
+  }
+  .connection-banner {
+    padding: 12px 28px
+  }
+  .policy-rules-list {
+    grid-template-columns: 1fr
+  }
+  .audit-event {
+    grid-template-columns: 67px 15px minmax(125px,1fr) minmax(110px,1fr) auto;
+    gap: 10px
+  }
+  .audit-ts {
+    grid-column: 1;
+    grid-row: 1/3
+  }
+  .audit-icon {
+    grid-column: 2;
+    grid-row: 1/3
+  }
+  .audit-kind {
+    grid-column: 3;
+    grid-row: 1/3
+  }
+  .audit-latency {
+    grid-column: 5;
+    grid-row: 2;
+    white-space: nowrap
+  }
+  .audit-event>:nth-child(5) {
+    grid-column: 5;
+    grid-row: 1
+  }
+  .audit-operation {
+    grid-column: 4;
+    grid-row: 1/3
+  }
+  .audit-kind {
+    grid-row: 1/3
+  }
+  .op-card {
+    grid-template-columns: minmax(0,1fr) auto auto;
+    gap: 12px
+  }
+  .approval-text {
+    grid-column: 1/-1
+  }
+  .header-right {
+    gap: 12px
+  }
+  .authority-stage {
+    padding: 16px
+  }
+}
+
+@media(max-width:820px) {
+  body {
+    overflow: auto;
+    height: auto;
+    min-height: 100dvh
+  }
+  html {
+    height: auto;
+    min-height: 100%
+  }
+  header {
+    min-height: 70px;
+    height: auto;
+    padding: 16px 22px;
+    flex-wrap: wrap;
+    gap: 12px
+  }
+  .header-right {
+    margin-left: auto
+  }
+  .logo-section {
+    display: none
+  }
+  #dashboard-private {
+    display: block
+  }
+  .workspace {
+    display: flex;
+    flex-direction: column
+  }
+  .tab-bar {
+    display: grid;
+    grid-template-columns: repeat(6,minmax(0,1fr));
+    gap: 3px;
+    padding: 10px 16px;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+    overflow: visible
+  }
+  .nav-eyebrow,
+  .nav-footer,
+  .nav-index,
+  .nav-arrow {
+    display: none!important
+  }
+  .tab-btn {
+    justify-content: center;
+    text-align: center;
+    padding: 10px 4px;
+    font-size: 12px;
+    min-height: 43px
+  }
+  .workspace-main {
+    display: block
+  }
+  .content {
+    overflow: visible;
+    padding: 30px 22px 44px;
+    scrollbar-gutter: auto
+  }
+  .connection-banner {
+    padding: 12px 22px;
+    font-size: 10px
+  }
+.view-heading h2,
+.tasks-heading h2,
+.sessions-header h2 {
+    font-size: 32px
+  }
+  .unlock-panel {
+    padding: 48px 28px;
+    gap: 35px;
+    overflow: visible;
+    margin: 0 auto;
+    flex: 1
+  }
+  .unlock-form-card {
+    padding: 25px
+  }
+  .unlock-story h1 {
+    font-size: 42px
+  }
+  .unlock-boundary {
+    gap: 11px;
+    font-size: 9px
+  }
+  .boundary-mark {
+    width: 62px;
+    height: 60px;
+    padding: 10px
+  }
+}
+
+@media(max-width:600px) {
+  header {
+    padding: 16px 18px;
+    gap: 15px
+  }
+  .wordmark {
+    font-size: 18px
+  }
+  .logo-icon,
+  .logo-icon .brand-glyph {
+    width: 25px;
+    height: 25px
+  }
+  .header-right {
+    width: 100%;
+    margin: 0;
+    gap: 10px;
+    justify-content: space-between
+  }
+  .mode-indicator {
+    font-size: 9px;
+    white-space: normal;
+    min-width: 0
+  }
+  .version-text {
+    display: none
+  }
+  .theme-button {
+    font-size: 10px;
+    min-width: 0;
+    padding: 7px
+  }
+  .header-right .btn-small {
+    white-space: nowrap
+  }
+  .tab-bar {
+    grid-template-columns: repeat(3,minmax(0,1fr));
+    padding: 9px 14px
+  }
+  .tab-btn {
+    min-height: 42px;
+    font-size: 12px
+  }
+  .content {
+    padding: 26px 18px 36px
+  }
+  .connection-banner {
+    padding: 12px 18px
+  }
+.view-heading,
+.tasks-heading,
+.sessions-header {
+    gap: 15px;
+    margin-bottom: 24px
+  }
+.view-heading h2,
+.tasks-heading h2,
+.sessions-header h2 {
+    font-size: 28px
+  }
+.view-heading p:not(.view-eyebrow),
+.tasks-heading p:not(.view-eyebrow),
+.sessions-header p:not(.view-eyebrow) {
+    font-size: 12px
+  }
+.view-heading .btn,
+.tasks-heading>.btn,
+.sessions-header>.btn {
+    padding: 8px 10px;
+    font-size: 11px
+  }
+  .authority-path {
+    grid-template-columns: repeat(2,minmax(0,1fr))
+  }
+  .authority-stage {
+    padding: 17px
+  }
+  .authority-stage:nth-child(2) {
+    border-right: 0
+  }
+  .authority-stage:nth-child(-n+2) {
+    border-bottom: 1px solid var(--border)
+  }
+  .audit-toolbar {
+    padding: 16px;
+    gap: 12px
+  }
+  .filter-field {
+    flex-basis: calc(50% - 12px);
+    min-width: 100px
+  }
+  .audit-toolbar>.btn {
+    width: 100%
+  }
+  .toolbar-actions {
+    width: 100%;
+    justify-content: space-between
+  }
+  .audit-event {
+    grid-template-columns: 19px minmax(0,1fr) auto;
+    padding: 16px 3px;
+    gap: 6px 8px
+  }
+  .audit-icon {
+    grid-column: 1;
+    grid-row: 1
+  }
+  .audit-kind {
+    grid-column: 2;
+    grid-row: 1;
+    font-size: 10px
+  }
+  .audit-operation {
+    grid-column: 2/4;
+    grid-row: 2;
+    font-size: 10px
+  }
+  .audit-event>:nth-child(5) {
+    grid-column: 3;
+    grid-row: 1;
+    max-width: 104px;
+    font-size: 8px
+  }
+  .audit-ts {
+    grid-column: 2;
+    grid-row: 3;
+    font-size: 9px
+  }
+  .audit-latency {
+    grid-column: 3;
+    grid-row: 3;
+    font-size: 9px
+  }
+  .audit-detail-panel {
+    padding: 16px 14px
+  }
+  .audit-detail-panel pre {
+    font-size: 10px
+  }
+  .policy-info-bar {
+    padding: 18px;
+    gap: 20px
+  }
+  .policy-info-item:first-child {
+    width: 100%
+  }
+  .policy-card {
+    padding: 20px
+  }
+  .policy-card-name {
+    font-size: 13px
+  }
+  .task-card {
+    padding: 18px
+  }
+  .task-title {
+    font-size: 16px
+  }
+  .task-metrics {
+    gap: 13px
+  }
+  .task-detail dl {
+    grid-template-columns: 1fr;
+    gap: 4px
+  }
+  .task-detail dd {
+    margin-bottom: 10px
+  }
+  .inference-slots {
+    min-width: 0
+  }
+  .inference-slots,
+  .inference-slots tbody,
+  .inference-slots tr,
+  .inference-slots td {
+    display: block;
+    width: 100%
+  }
+  .inference-slots thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    overflow: hidden;
+    clip: rect(0,0,0,0);
+    white-space: nowrap
+  }
+  .inference-slots tr {
+    border-top: 1px solid var(--border-hi);
+    padding: 12px 0
+  }
+  .inference-slots td {
+    border: 0;
+    padding: 7px 0;
+    line-height: 1.7
+  }
+  .inference-slots td::before {
+    content: attr(data-label);
+    display: block;
+    color: var(--dim);
+    font: 9px var(--mono);
+    margin-bottom: 6px
+  }
+  .op-card {
+    grid-template-columns: minmax(0,1fr) auto;
+    gap: 11px
+  }
+  .op-card-info {
+    grid-column: 1/-1
+  }
+  .op-card .mcp-badge {
+    justify-self: end
+  }
+  .op-card-name {
+    font-size: 11px
+  }
+  .unlock-panel {
+    display: block;
+    padding: 32px 20px 40px
+  }
+  .unlock-story {
+    margin-bottom: 30px
+  }
+  .unlock-story h1 {
+    font-size: 38px
+  }
+  .unlock-eyebrow {
+    font-size: 9px;
+    margin-bottom: 15px
+  }
+  .unlock-story>p:not(.unlock-eyebrow) {
+    font-size: 13px
+  }
+  .unlock-boundary {
+    display: none
+  }
+  .unlock-form-card {
+    max-width: none;
+    padding: 24px
+  }
+  .unlock-form-card h2 {
+    font-size: 22px
+  }
+}
+
+@media(prefers-reduced-motion:reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none!important;
+    transition: none!important;
+    scroll-behavior: auto!important
+  }
+}
+
+/* opaque:extension-style */
 </style>
 </head>
 <body>
 
 <header>
   <div class="logo">
-    <div class="logo-icon">
-      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-        <path d="M8 1L2 4v4c0 3.5 2.5 6.4 6 7 3.5-.6 6-3.5 6-7V4L8 1z" fill="#0d1117" stroke="#0d1117" stroke-width="0.5"/>
-        <path d="M8 2L3 4.5v3.5c0 2.9 2.1 5.3 5 5.9 2.9-.6 5-3 5-5.9V4.5L8 2z" fill="none" stroke="#0d1117" stroke-width="0.8"/>
-      </svg>
-    </div>
-    <span>OPAQUE</span>
-    <span style="color:var(--dim);font-size:11px;font-weight:400">dashboard</span>
+    <div class="logo-icon"><span class="brand-glyph" aria-hidden="true"></span></div>
+    <span class="wordmark">OPAQUE</span><span class="logo-section">Workspace</span>
   </div>
   <div class="header-right">
-    <div class="mode-indicator" id="mode-indicator">
-      <span class="mode-dot disconnected" id="mode-dot"></span>
-      <span id="mode-label">CONNECTING</span>
-    </div>
+    <div class="mode-indicator" id="mode-indicator"><span class="mode-dot disconnected" id="mode-dot"></span><span id="mode-label">LOCKED</span></div>
     <span class="version-text" id="version-text"></span>
+    <button class="btn btn-small theme-button" id="theme-toggle" onclick="toggleTheme()" aria-label="Switch to paper theme">Paper theme</button>
+    <button class="btn btn-small" id="lock-dashboard" onclick="lockDashboard()" hidden>Lock dashboard</button>
   </div>
 </header>
 
-<div class="connection-banner" id="connection-banner" role="status" aria-live="polite">Connecting to the selected Opaque daemon…</div>
-<nav class="tab-bar" aria-label="Dashboard sections">
-  <button class="tab-btn active" data-tab="tasks" onclick="switchTab('tasks')">Tasks</button>
-  <button class="tab-btn" data-tab="audit" onclick="switchTab('audit')">Audit</button>
-  <button class="tab-btn" data-tab="policy" onclick="switchTab('policy')">Policy</button>
-  <button class="tab-btn" data-tab="sessions" onclick="switchTab('sessions')">Sessions</button>
-  <button class="tab-btn" data-tab="operations" onclick="switchTab('operations')">Operations</button>
+<section class="unlock-panel" id="unlock-panel" aria-labelledby="unlock-title">
+  <div class="unlock-story">
+    <p class="unlock-eyebrow">AUTHORITY, BY DESIGN.</p>
+    <h1>Power to act.<br><span>Limits that hold.</span></h1>
+    <p>One place to review bounded work, inspect the evidence, and understand what your agents can do.</p>
+    <div class="unlock-boundary" aria-hidden="true"><span>Agent request</span><div class="boundary-mark"><span class="brand-glyph" aria-hidden="true"></span></div><span>Bounded work</span></div>
+  </div>
+  <div class="unlock-form-card">
+    <h2 id="unlock-title">Unlock your dashboard</h2>
+    <p>Enter the token from <code>web.token</code> in the data directory printed by <code>opaque-web</code> when it starts.</p>
+    <form id="unlock-form" onsubmit="unlockDashboard(event)" autocomplete="off">
+      <label for="unlock-token">Owner token</label>
+      <input type="password" id="unlock-token" name="owner-token" autocomplete="off" spellcheck="false" autocapitalize="none" required aria-describedby="unlock-message">
+      <button class="btn btn-green" type="submit" id="unlock-button">Unlock dashboard</button>
+      <p id="unlock-message" role="status" aria-live="polite"></p>
+    </form>
+    <p class="unlock-note">The token stays in this page's memory. Reloading or locking the dashboard clears it. Each tab unlocks separately.</p>
+  </div>
+</section>
+<div id="dashboard-private" hidden>
+<a class="skip-link" href="#workspace-content">Skip to workspace content</a>
+<div class="workspace">
+<nav class="tab-bar" role="tablist" aria-label="Dashboard sections" aria-orientation="vertical" onkeydown="navigateTabs(event)">
+  <p class="nav-eyebrow" aria-hidden="true">YOUR WORKSPACE</p>
+  <button class="tab-btn active" id="tab-tasks" data-tab="tasks" role="tab" aria-controls="panel-tasks" aria-selected="true" tabindex="0" onclick="switchTab('tasks')"><span class="nav-index" aria-hidden="true">01</span><span>Tasks</span><span class="nav-arrow" aria-hidden="true">↗</span></button>
+  <button class="tab-btn" id="tab-audit" data-tab="audit" role="tab" aria-controls="panel-audit" aria-selected="false" tabindex="-1" onclick="switchTab('audit')"><span class="nav-index" aria-hidden="true">02</span><span>Audit</span><span class="nav-arrow" aria-hidden="true">↗</span></button>
+  <button class="tab-btn" id="tab-policy" data-tab="policy" role="tab" aria-controls="panel-policy" aria-selected="false" tabindex="-1" onclick="switchTab('policy')"><span class="nav-index" aria-hidden="true">03</span><span>Policy</span><span class="nav-arrow" aria-hidden="true">↗</span></button>
+  <button class="tab-btn" id="tab-sessions" data-tab="sessions" role="tab" aria-controls="panel-sessions" aria-selected="false" tabindex="-1" onclick="switchTab('sessions')"><span class="nav-index" aria-hidden="true">04</span><span>Sessions</span><span class="nav-arrow" aria-hidden="true">↗</span></button>
+  <button class="tab-btn" id="tab-operations" data-tab="operations" role="tab" aria-controls="panel-operations" aria-selected="false" tabindex="-1" onclick="switchTab('operations')"><span class="nav-index" aria-hidden="true">05</span><span>Operations</span><span class="nav-arrow" aria-hidden="true">↗</span></button>
+  <!-- opaque:extension-tabs -->
+  <div class="nav-footer" aria-hidden="true"><span class="nav-seal brand-glyph" aria-hidden="true"></span><strong>Approve the work.</strong>Keep authority bounded.</div>
 </nav>
-
-<div class="content">
-  <div class="tab-panel active" id="panel-tasks">
-    <div class="tasks-heading"><div><h2>Bounded work</h2><p>Review approved authority, consumed allowances, and provider evidence for your agent tasks.</p></div><button class="btn" onclick="loadTasks()">Refresh</button></div>
+<div class="workspace-main">
+<div class="connection-banner" id="connection-banner" role="status" aria-live="polite">Connecting to the selected Opaque daemon…</div>
+<main class="content" id="workspace-content" tabindex="-1">
+  <div class="tab-panel active" id="panel-tasks" role="tabpanel" aria-labelledby="tab-tasks" tabindex="0">
+    <div class="tasks-heading"><div><p class="view-eyebrow">01 / TASKS</p><h2>Bounded work</h2><p>Review approved authority, consumed allowances, and provider evidence for your agent tasks.</p></div><button class="btn" onclick="loadTasks()">Refresh</button></div>
+    <div class="authority-path" aria-label="How a bounded task works; this is explanatory, not a live progress indicator">
+      <div class="authority-stage"><span>01 / REVIEW</span><strong>Exact authority</strong><p>Inspect the requested scope.</p></div>
+      <div class="authority-stage"><span>02 / RESERVE</span><strong>Bounded allowance</strong><p>Approve limits before work.</p></div>
+      <div class="authority-stage"><span>03 / EXECUTE</span><strong>Controlled work</strong><p>Act within the approved scope.</p></div>
+      <div class="authority-stage"><span>04 / INSPECT</span><strong>Retained evidence</strong><p>See what was observed.</p></div>
+    </div>
     <div id="tasks-content"><div class="task-empty">Loading tasks…</div></div>
     <p class="task-note">Approval uses the trusted approver; execution uses the CLI or agent tools. Receipts separate consumed authority from provider evidence. Inference receipts record observed output and token use; uncertain requests keep their reserved allowance. Write or dispatch acceptance does not prove workflow success or service health.</p>
   </div>
   <!-- ===== AUDIT TAB ===== -->
-  <div class="tab-panel" id="panel-audit">
-    <div class="audit-toolbar">
-      <select id="filter-kind" aria-label="Event kind">
+  <div class="tab-panel" id="panel-audit" role="tabpanel" aria-labelledby="tab-audit" tabindex="0">
+    <div class="view-heading"><div><p class="view-eyebrow">02 / AUDIT</p><h2>Audit trail</h2><p>Follow requests, decisions, and observed outcomes. Expand any event to inspect its evidence.</p></div></div>
+    <form class="audit-toolbar" onsubmit="event.preventDefault();applyFilters()" aria-label="Filter audit events">
+      <div class="filter-field"><label for="filter-kind">Event kind</label><select id="filter-kind" aria-label="Event kind">
         <option value="">All Kinds</option>
         <option value="request.received">request.received</option>
         <option value="policy.allowed">policy.allowed</option>
@@ -751,22 +1834,23 @@ button:disabled{opacity:.55;cursor:wait}
         <option value="session.created">session.created</option>
         <option value="session.revoked">session.revoked</option>
         <option value="secret.resolved">secret.resolved</option>
-      </select>
-      <input type="text" id="filter-operation" aria-label="Operation" placeholder="Operation...">
-      <select id="filter-outcome" aria-label="Outcome">
+      </select></div>
+      <div class="filter-field"><label for="filter-operation">Operation</label><input type="text" id="filter-operation" aria-label="Operation" placeholder="Operation..."></div>
+      <div class="filter-field"><label for="filter-outcome">Outcome</label><select id="filter-outcome" aria-label="Outcome">
         <option value="">All Outcomes</option>
         <option value="ok">ok</option>
         <option value="denied">denied</option>
         <option value="error">error</option>
         <option value="api_accepted">api_accepted</option>
         <option value="transport_unknown">transport_unknown</option>
-      </select>
-      <input type="text" id="filter-q" aria-label="Audit search" placeholder="Search...">
-      <button class="btn btn-green" onclick="applyFilters()">Apply</button>
-      <div class="toolbar-spacer"></div>
-      <button class="btn btn-small" id="pause-btn" onclick="togglePause()">Pause</button>
-      <button class="btn btn-small" onclick="clearAudit()">Clear</button>
-    </div>
+      </select></div>
+      <div class="filter-field search-field"><label for="filter-q">Search</label><input type="text" id="filter-q" aria-label="Audit search" placeholder="Search..."></div>
+      <button class="btn btn-green" type="submit">Apply filters</button>
+      <div class="toolbar-actions">
+      <button type="button" class="btn btn-small" id="pause-btn" onclick="togglePause()">Pause</button>
+      <button type="button" class="btn btn-small" onclick="clearAudit()">Clear view</button>
+      </div>
+    </form>
     <div class="audit-paused-banner" id="paused-banner">
       Streaming paused. New events are being buffered.
       <button class="btn btn-small" onclick="togglePause()" style="margin-left:auto">Resume</button>
@@ -778,7 +1862,8 @@ button:disabled{opacity:.55;cursor:wait}
   </div>
 
   <!-- ===== POLICY TAB ===== -->
-  <div class="tab-panel" id="panel-policy">
+  <div class="tab-panel" id="panel-policy" role="tabpanel" aria-labelledby="tab-policy" tabindex="0">
+    <div class="view-heading"><div><p class="view-eyebrow">03 / POLICY</p><h2>Policy &amp; boundaries</h2><p>Understand the rules that shape agent authority and the conditions attached to each operation.</p></div></div>
     <div class="policy-info-bar" id="policy-info-bar">
       <div class="policy-info-item">
         <span class="label">Config</span>
@@ -803,9 +1888,9 @@ button:disabled{opacity:.55;cursor:wait}
   </div>
 
   <!-- ===== SESSIONS TAB ===== -->
-  <div class="tab-panel" id="panel-sessions">
+  <div class="tab-panel" id="panel-sessions" role="tabpanel" aria-labelledby="tab-sessions" tabindex="0">
     <div class="sessions-header">
-      <h2>Agent Sessions</h2>
+      <div><p class="view-eyebrow">04 / SESSIONS</p><h2>Agent sessions</h2><p>Inspect active sessions and the time remaining on their approved authority.</p></div>
       <button class="btn" onclick="loadSessions()">Refresh</button>
     </div>
     <div id="sessions-content">
@@ -814,11 +1899,16 @@ button:disabled{opacity:.55;cursor:wait}
   </div>
 
   <!-- ===== OPERATIONS TAB ===== -->
-  <div class="tab-panel" id="panel-operations">
+  <div class="tab-panel" id="panel-operations" role="tabpanel" aria-labelledby="tab-operations" tabindex="0">
+    <div class="view-heading"><div><p class="view-eyebrow">05 / OPERATIONS</p><h2>Operation catalog</h2><p>Explore the available operations, their safety classifications, and approval requirements.</p></div></div>
     <div id="operations-content">
       <div class="audit-empty">Loading operations...</div>
     </div>
   </div>
+<!-- opaque:extension-panels -->
+</main>
+</div>
+</div>
 </div>
 
 <script>
@@ -826,8 +1916,8 @@ button:disabled{opacity:.55;cursor:wait}
 // STATE
 // ============================================================================
 
-var state = {
-  mode: 'connecting',
+function initialState() { return {
+  mode: 'locked',
   daemonRunning: false,
   daemonVersion: null,
   approvalBackend: null,
@@ -850,6 +1940,7 @@ var state = {
   auditRefreshRequested: false,
   auditRefreshPromise: null,
   auditRenderPending: false,
+  auditFrame: null,
   tasksData: [],
   tasksLoaded: false,
   tasksCursor: null,
@@ -859,29 +1950,179 @@ var state = {
   demoTimer: null,
   demoSeqCounter: 100,
   statusTimer: null,
+  relativeTimeTimer: null,
   sessionCountdownTimer: null,
   sessionsData: [],
-};
+}; }
+var state = initialState();
 
-// The token stays in the page and request headers, never a URL or browser storage.
-var authToken = document.querySelector('meta[name="opaque-auth-token"]').content;
-function apiFetch(path, options) {
-  options = options || {};
-  options.headers = Object.assign({}, options.headers, { Authorization: 'Bearer ' + authToken });
+// Trusted applications may compose extra views while retaining the same auth lifecycle.
+// This is a source-level composition API, not an untrusted plugin loader.
+var dashboardViews = Object.create(null);
+function registerDashboardView(id, view) {
+  if (!/^[a-z][a-z0-9-]{0,31}$/.test(id) || ['tasks','audit','policy','sessions','operations'].indexOf(id) >= 0 ||
+      Object.prototype.hasOwnProperty.call(dashboardViews, id) || !view || typeof view.load !== 'function' || typeof view.clear !== 'function') {
+    throw new Error('Invalid or duplicate dashboard view.');
+  }
+  dashboardViews[id] = view;
+}
+function refreshExtensionView() {
+  if (auth.unlocked && Object.prototype.hasOwnProperty.call(dashboardViews, state.activeTab)) dashboardViews[state.activeTab].load();
+}
+
+
+// Owner credentials exist only in memory and Authorization headers. Each unlock
+// starts a generation; old requests, streams and callbacks cannot update it.
+var authToken = '';
+var auth = {unlocked:false, generation:0, requests:new Set()};
+var responseRequests = new WeakMap();
+function currentAuth(generation) { return auth.unlocked && auth.generation === generation; }
+function requireGeneration(generation) {
+  if (generation !== auth.generation || !authToken) {
+    var error = new Error('Dashboard locked.'); error.name = 'AbortError'; throw error;
+  }
+}
+function releaseResponse(response) {
+  var request = response && responseRequests.get(response);
+  if (request) { request.release(); responseRequests.delete(response); }
+}
+async function authenticatedFetch(path, options, generation) {
+  requireGeneration(generation);
+  options = Object.assign({}, options || {});
+  var controller = new AbortController();
+  var upstreamSignal = options.signal;
+  var abort = function() { controller.abort(); };
+  if (upstreamSignal) {
+    if (upstreamSignal.aborted) controller.abort();
+    else upstreamSignal.addEventListener('abort', abort, {once:true});
+  }
+  auth.requests.add(controller);
+  var release = function() {
+    auth.requests.delete(controller);
+    if (upstreamSignal) upstreamSignal.removeEventListener('abort', abort);
+  };
+  options.signal = controller.signal;
+  options.headers = Object.assign({}, options.headers, {Authorization:'Bearer ' + authToken});
   options.cache = 'no-store';
   options.credentials = 'same-origin';
-  return fetch(path, options).then(async function(response) {
+  try {
+    var response = await fetch(path, options);
+    requireGeneration(generation);
+    if (controller.signal.aborted) throw Object.assign(new Error('Request cancelled.'), {name:'AbortError'});
+    responseRequests.set(response, {release:release});
+    if (response.status === 401) {
+      lockDashboard('The owner token was not accepted. Read the current web.token file and try again.');
+      throw Object.assign(new Error('Dashboard authentication expired.'), {name:'AbortError'});
+    }
     if (!response.ok) {
-      var message = response.status === 401
-        ? 'Dashboard authentication expired. Reload this page to reconnect.'
-        : 'Request failed (' + response.status + ').';
-      try { var body = await response.json(); message = body.error || message; } catch (_) {}
+      var message = 'Request failed (' + response.status + ').';
+      try { var body = await response.json(); requireGeneration(generation); message = body.error || message; }
+      catch (error) { requireGeneration(generation); }
       throw new Error(message);
     }
     return response;
-  });
+  } catch (error) {
+    controller.abort();
+    release();
+    throw error;
+  }
 }
-function apiJson(path, options) { return apiFetch(path, options).then(function(response) { return response.json(); }); }
+function apiFetch(path, options) {
+  if (!auth.unlocked) return Promise.reject(Object.assign(new Error('Dashboard locked.'), {name:'AbortError'}));
+  return authenticatedFetch(path, options, auth.generation);
+}
+async function apiJson(path, options) {
+  var generation = auth.generation;
+  var response;
+  try {
+    response = await apiFetch(path, options);
+    requireGeneration(generation);
+    var body = await response.json();
+    requireGeneration(generation);
+    return body;
+  } finally { releaseResponse(response); }
+}
+function lockDashboard(message, focus) {
+  auth.generation++;
+  auth.unlocked = false;
+  authToken = '';
+  auth.requests.forEach(function(controller) { controller.abort(); });
+  auth.requests.clear();
+  if (state.sseController) state.sseController.abort();
+  ['sseRetryTimer','demoTimer'].forEach(function(key) { if (state[key]) clearTimeout(state[key]); });
+  ['statusTimer','sessionCountdownTimer','relativeTimeTimer'].forEach(function(key) { if (state[key]) clearInterval(state[key]); });
+  if (state.auditFrame !== null) cancelAnimationFrame(state.auditFrame);
+  state = initialState();
+  Object.keys(dashboardViews).forEach(function(id) { dashboardViews[id].clear(); });
+  ['tasks-content','audit-list','policy-rules-list','sessions-content','operations-content'].forEach(function(id) {
+    document.getElementById(id).textContent = '';
+  });
+  ['policy-config-path','policy-seal-icon','policy-seal-status','policy-agent-sessions','policy-session-ttl','audit-stream-status','version-text','connection-banner'].forEach(function(id) {
+    document.getElementById(id).textContent = '';
+  });
+  ['filter-kind','filter-operation','filter-outcome','filter-q','unlock-token'].forEach(function(id) {
+    document.getElementById(id).value = '';
+  });
+  document.querySelectorAll('.tab-btn[data-tab]').forEach(function(button) {
+    var selected = button.getAttribute('data-tab') === 'tasks';
+    button.classList.toggle('active', selected);
+    button.setAttribute('aria-selected', String(selected));
+    button.tabIndex = selected ? 0 : -1;
+  });
+  document.querySelectorAll('.tab-panel').forEach(function(panel) {
+    panel.classList.toggle('active', panel.id === 'panel-tasks');
+  });
+  ['policy-seal-status','policy-agent-sessions'].forEach(function(id) {
+    document.getElementById(id).style.color = '';
+  });
+  document.getElementById('connection-banner').className = 'connection-banner';
+  document.getElementById('pause-btn').textContent = 'Pause';
+  document.getElementById('paused-banner').classList.remove('visible');
+  document.getElementById('dashboard-private').hidden = true;
+  document.getElementById('unlock-panel').hidden = false;
+  document.getElementById('lock-dashboard').hidden = true;
+  document.getElementById('unlock-button').disabled = false;
+  document.getElementById('unlock-message').textContent = message || '';
+  updateModeIndicator();
+  if (focus !== false) document.getElementById('unlock-token').focus();
+}
+async function unlockDashboard(event) {
+  if (event) event.preventDefault();
+  var input = document.getElementById('unlock-token');
+  var candidate = input.value.trim();
+  input.value = '';
+  lockDashboard('', false);
+  if (!candidate) { document.getElementById('unlock-message').textContent = 'Enter the owner token to unlock.'; input.focus(); return; }
+  authToken = candidate;
+  var generation = auth.generation;
+  document.getElementById('unlock-button').disabled = true;
+  document.getElementById('unlock-message').textContent = 'Checking owner token…';
+  var response;
+  try {
+    response = await authenticatedFetch('/api/status', {}, generation);
+    requireGeneration(generation);
+    var data = await response.json();
+    requireGeneration(generation);
+    auth.unlocked = true;
+    document.getElementById('unlock-panel').hidden = true;
+    document.getElementById('dashboard-private').hidden = false;
+    document.getElementById('lock-dashboard').hidden = false;
+    document.getElementById('unlock-message').textContent = '';
+    applyStatus(data, generation);
+    startAuthenticatedTimers(generation);
+    document.getElementById('lock-dashboard').focus();
+  } catch (error) {
+    if (generation === auth.generation) lockDashboard('Could not unlock the dashboard. Check the owner token and local connection.');
+  } finally { releaseResponse(response); }
+}
+function startAuthenticatedTimers(generation) {
+  if (!currentAuth(generation)) return;
+  state.statusTimer = setInterval(function() { if (currentAuth(generation)) pollStatus(); }, 10000);
+  state.relativeTimeTimer = setInterval(function() {
+    if (currentAuth(generation) && state.activeTab === 'audit' && state.auditEvents.length > 0) renderAuditList();
+    if (currentAuth(generation)) refreshExtensionView();
+  }, 15000);
+}
 
 // ============================================================================
 // DOM HELPERS
@@ -1057,12 +2298,46 @@ function jsonToHighlightedDom(obj) {
 // TAB SWITCHING
 // ============================================================================
 
+function toggleTheme() {
+  var root = document.documentElement;
+  var paper = root.getAttribute('data-md-color-scheme') !== 'default';
+  root.setAttribute('data-md-color-scheme', paper ? 'default' : 'slate');
+  var button = document.getElementById('theme-toggle');
+  button.textContent = paper ? 'Dark theme' : 'Paper theme';
+  button.setAttribute('aria-label', paper ? 'Switch to dark theme' : 'Switch to paper theme');
+}
+
+function navigateTabs(event) {
+  if (!auth.unlocked) return;
+  var buttons = Array.from(document.querySelectorAll('.tab-btn[data-tab]'));
+  var index = buttons.indexOf(event.target);
+  if (index < 0) return;
+  if (event.key === 'Home') index = 0;
+  else if (event.key === 'End') index = buttons.length - 1;
+  else if (event.key === 'ArrowRight' || event.key === 'ArrowDown') index = (index + 1) % buttons.length;
+  else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') index = (index + buttons.length - 1) % buttons.length;
+  else return;
+  event.preventDefault();
+  switchTab(buttons[index].getAttribute('data-tab'));
+  buttons[index].focus();
+}
+
+function updateTabOrientation() {
+  var tabs = document.querySelector('.tab-bar');
+  if (tabs && window.matchMedia) tabs.setAttribute('aria-orientation', window.matchMedia('(max-width:820px)').matches ? 'horizontal' : 'vertical');
+}
+
 function switchTab(tab) {
+  if (!auth.unlocked || (['tasks','audit','policy','sessions','operations'].indexOf(tab) < 0 && !Object.prototype.hasOwnProperty.call(dashboardViews, tab))) return;
+  var changed = state.activeTab !== tab;
   state.activeTab = tab;
 
-  var buttons = document.querySelectorAll('.tab-btn');
+  var buttons = document.querySelectorAll('.tab-btn[data-tab]');
   for (var i = 0; i < buttons.length; i++) {
     var btn = buttons[i];
+    var selected = btn.getAttribute('data-tab') === tab;
+    btn.setAttribute('aria-selected', String(selected));
+    btn.tabIndex = selected ? 0 : -1;
     if (btn.getAttribute('data-tab') === tab) {
       btn.classList.add('active');
     } else {
@@ -1080,18 +2355,20 @@ function switchTab(tab) {
     }
   }
 
+  if (changed) document.getElementById('workspace-content').scrollTop = 0;
   if (tab === 'tasks') loadTasks();
   if (tab === 'policy') loadPolicy();
   if (tab === 'sessions') loadSessions();
   if (tab === 'operations') loadOperations();
+  if (Object.prototype.hasOwnProperty.call(dashboardViews, tab)) dashboardViews[tab].load();
 }
 
 // ============================================================================
 // STATUS POLLING
 // ============================================================================
 
-function pollStatus() {
-  return apiJson('/api/status').then(function(data) {
+function applyStatus(data, generation) {
+  if (!currentAuth(generation)) return;
     var prevMode = state.mode;
     var prevAuditAvailable = state.auditAvailable;
     state.auditAvailable = typeof data.audit_available === 'boolean' ? data.audit_available : null;
@@ -1115,11 +2392,18 @@ function pollStatus() {
     }
     if (prevMode !== state.mode || prevAuditAvailable !== state.auditAvailable) {
       refreshCurrentTab();
-      applyFilters().then(reconnectSSE);
+      applyFilters().then(function() { if (currentAuth(generation)) reconnectSSE(); });
     } else if (state.mode === 'live' && state.activeTab === 'tasks') {
       loadTasks();
     }
+}
+function pollStatus() {
+  if (!auth.unlocked) return Promise.resolve();
+  var generation = auth.generation;
+  return apiJson('/api/status').then(function(data) {
+    if (currentAuth(generation)) applyStatus(data, generation);
   }).catch(function(error) {
+    if (!currentAuth(generation)) return;
     state.mode = 'error';
     state.daemonRunning = false;
     updateModeIndicator();
@@ -1141,6 +2425,7 @@ function updateModeIndicator() {
 }
 
 function refreshCurrentTab() {
+  if (!auth.unlocked) return;
   switch (state.activeTab) {
     case 'tasks':
       loadTasks();
@@ -1157,6 +2442,8 @@ function refreshCurrentTab() {
     case 'operations':
       loadOperations();
       break;
+    default:
+      refreshExtensionView();
   }
 }
 
@@ -1218,16 +2505,20 @@ function formatTtl(secs) {
 
 function outcomeClass(event) {
   var outcome = (event.outcome || '').toLowerCase();
-  if (outcome === 'ok') return 'ok';
+  if (['unknown','transport_unknown','interrupted'].indexOf(outcome) !== -1) return 'warn';
+  if (outcome === 'ok' || outcome === 'api_accepted') return 'ok';
   if (outcome === 'denied') return 'denied';
-  if (outcome === 'error') return 'error';
+  if (outcome === 'error' || outcome === 'rejected') return 'error';
+  // Unrecognized outcomes do not establish success, even for a familiar kind.
+  if (outcome) return 'neutral';
 
   var kind = (event.kind || '').toLowerCase();
   if (kind.indexOf('denied') !== -1) return 'denied';
   if (kind.indexOf('failed') !== -1) return 'error';
   if (kind.indexOf('error') !== -1) return 'error';
   if (kind.indexOf('warn') !== -1) return 'warn';
-  return 'ok';
+  if (['policy.allowed','approval.granted','operation.succeeded','session.created','secret.resolved','lease.hit'].indexOf(kind) !== -1) return 'ok';
+  return 'neutral';
 }
 
 function outcomeIcon(cls) {
@@ -1240,18 +2531,29 @@ function outcomeIcon(cls) {
   }
 }
 
-function buildAuditEventRow(event, index) {
+function auditEventKey(event) {
+  if (event.event_id) return 'id:' + event.event_id;
+  if (Number.isFinite(event.sequence_number)) return 'sequence:' + event.sequence_number;
+  // Legacy records without an ID retain identity as newer rows arrive.
+  return 'legacy:' + JSON.stringify(event);
+}
+
+function buildAuditEventRow(event) {
   var cls = outcomeClass(event);
   var ts = event.ts_utc_ms ? formatTimestamp(event.ts_utc_ms) : '--';
   var kind = event.kind || '--';
   var operation = event.operation || '';
   var outcome = event.outcome || '';
-  var latency = event.latency_ms ? event.latency_ms + 'ms' : '';
-  var isExpanded = state.expandedEvent === index;
+  var latency = event.latency_ms != null ? event.latency_ms + 'ms' : '';
+  var key = auditEventKey(event);
+  var isExpanded = state.expandedEvent === key;
 
-  var row = el('div', {
+  var row = el('button', {
+    type: 'button',
+    'aria-expanded': String(isExpanded),
+    'data-event-key': key,
     className: 'audit-event' + (isExpanded ? ' expanded' : ''),
-    onClick: function() { toggleEventDetail(index); }
+    onClick: function() { toggleEventDetail(key); }
   }, [
     el('span', { className: 'audit-ts' }, ts),
     el('span', { className: 'audit-icon ' + cls }, outcomeIcon(cls)),
@@ -1277,6 +2579,8 @@ function buildAuditEventRow(event, index) {
 
 function renderAuditList() {
   var list = document.getElementById('audit-list');
+  var focused = document.activeElement;
+  var focusedKey = focused && focused.getAttribute && focused.getAttribute('data-event-key');
   list.textContent = '';
 
   if (state.auditEvents.length === 0) {
@@ -1292,20 +2596,29 @@ function renderAuditList() {
       'Refresh failed: ' + state.auditError + ' Showing previously confirmed events.'));
   }
   for (var i = 0; i < state.auditEvents.length; i++) {
-    list.appendChild(buildAuditEventRow(state.auditEvents[i], i));
+    list.appendChild(buildAuditEventRow(state.auditEvents[i]));
+  }
+  if (focusedKey) {
+    list.querySelectorAll('.audit-event').forEach(function(row) {
+      if (row.getAttribute('data-event-key') === focusedKey) row.focus({preventScroll:true});
+    });
   }
 }
 
 function scheduleAuditRender() {
-  if (state.auditRenderPending) return;
+  if (!auth.unlocked || state.auditRenderPending) return;
+  var generation = auth.generation;
   state.auditRenderPending = true;
-  requestAnimationFrame(function() {
+  state.auditFrame = requestAnimationFrame(function() {
+    if (!currentAuth(generation)) return;
+    state.auditFrame = null;
     state.auditRenderPending = false;
     renderAuditList();
   });
 }
 
 function prependAuditEvent(event) {
+  if (!auth.unlocked) return;
   if (Number.isFinite(event.sequence_number)) state.lastAuditSequence = Math.max(state.lastAuditSequence || 0, event.sequence_number);
   if (!matchesAuditFilters(event)) return;
   if (state.auditPaused) {
@@ -1331,16 +2644,18 @@ function prependAuditEvent(event) {
   scheduleAuditRender();
 }
 
-function toggleEventDetail(index) {
-  if (state.expandedEvent === index) {
+function toggleEventDetail(key) {
+  if (!auth.unlocked) return;
+  if (state.expandedEvent === key) {
     state.expandedEvent = null;
   } else {
-    state.expandedEvent = index;
+    state.expandedEvent = key;
   }
   renderAuditList();
 }
 
 function togglePause() {
+  if (!auth.unlocked) return;
   state.auditPaused = !state.auditPaused;
   var btn = document.getElementById('pause-btn');
   var banner = document.getElementById('paused-banner');
@@ -1363,6 +2678,7 @@ function togglePause() {
 }
 
 function clearAudit() {
+  if (!auth.unlocked) return;
   state.auditGeneration++;
   state.auditRefreshRequested = false;
   state.auditEvents = [];
@@ -1383,6 +2699,8 @@ function auditFilterParams() {
 }
 
 function applyFilters() {
+  if (!auth.unlocked) return Promise.resolve();
+  var authGeneration = auth.generation;
   if (state.mode !== 'demo' && state.auditAvailable === false) {
     state.auditGeneration++;
     state.auditRefreshRequested = false;
@@ -1403,13 +2721,14 @@ function applyFilters() {
   // a full-text result or let an obsolete filter replace the current view.
   state.auditRefreshPromise = Promise.resolve().then(async function() {
     try {
-      while (state.auditRefreshRequested) {
+      while (currentAuth(authGeneration) && state.auditRefreshRequested) {
         state.auditRefreshRequested = false;
         var generation = state.auditGeneration;
         var params = state.auditFilterKey;
         var streamSequence = state.lastAuditSequence;
         try {
           var data = await apiJson('/api/audit?' + params);
+          if (!currentAuth(authGeneration)) return;
           if (generation !== state.auditGeneration || params !== auditFilterParams()) continue;
           var events = (data.events || []).filter(matchesAuditFilters);
           if (!document.getElementById('filter-q').value.trim()) {
@@ -1434,6 +2753,7 @@ function applyFilters() {
           }
           scheduleAuditRender();
         } catch (error) {
+          if (!currentAuth(authGeneration)) return;
           if (generation !== state.auditGeneration || params !== auditFilterParams()) continue;
           state.auditError = error.message;
           // Retain the last confirmed evidence when a refresh fails.
@@ -1441,7 +2761,7 @@ function applyFilters() {
         }
       }
     } finally {
-      state.auditRefreshPromise = null;
+      if (currentAuth(authGeneration)) state.auditRefreshPromise = null;
     }
   });
   return state.auditRefreshPromise;
@@ -1462,6 +2782,9 @@ function matchesAuditFilters(event) {
 function setStreamStatus(message) { document.getElementById('audit-stream-status').textContent = message; }
 
 async function connectSSE() {
+  if (!auth.unlocked) return;
+  var generation = auth.generation;
+  var response, reader;
   if (state.mode === 'demo') { setStreamStatus('Synthetic demo activity'); startDemoMode(); return; }
   if (state.auditAvailable === false) { setStreamStatus('No local audit source. Status checks will detect when it becomes available.'); return; }
   var controller = new AbortController();
@@ -1469,15 +2792,17 @@ async function connectSSE() {
   var headers = {Accept: 'text/event-stream'};
   if (state.lastAuditSequence !== null) headers['Last-Event-ID'] = String(state.lastAuditSequence);
   try {
-    var response = await apiFetch('/api/audit/stream', {signal:controller.signal, headers:headers});
+    response = await apiFetch('/api/audit/stream', {signal:controller.signal, headers:headers});
+    if (!currentAuth(generation)) return;
     if (!response.body || !(response.headers.get('content-type') || '').includes('text/event-stream')) throw new Error('Invalid audit stream response.');
     state.sseRetryDelay = 3000;
     setStreamStatus('Audit stream connected · automatically resumes after connection loss');
-    var reader = response.body.getReader();
+    reader = response.body.getReader();
     var decoder = new TextDecoder();
     var buffer = '';
     while (true) {
       var chunk = await reader.read();
+      if (!currentAuth(generation) || controller.signal.aborted) return;
       if (chunk.done) throw new Error('Audit stream disconnected.');
       buffer += decoder.decode(chunk.value, {stream:true}).replace(/\r\n/g, '\n');
       var boundary;
@@ -1501,17 +2826,20 @@ async function connectSSE() {
       }
     }
   } catch (error) {
-    if (controller.signal.aborted) return;
+    if (!currentAuth(generation) || controller.signal.aborted) return;
     setStreamStatus(error.message + ' Reconnecting in ' + (state.sseRetryDelay / 1000) + ' seconds.');
-    state.sseRetryTimer = setTimeout(connectSSE, state.sseRetryDelay);
+    state.sseRetryTimer = setTimeout(function() { if (currentAuth(generation)) connectSSE(); }, state.sseRetryDelay);
     state.sseRetryDelay = Math.min(state.sseRetryDelay * 2, 30000);
   } finally {
     controller.abort();
+    if (reader) { try { await reader.cancel(); } catch (_) {} }
+    releaseResponse(response);
     if (state.sseController === controller) state.sseController = null;
   }
 }
 
 function reconnectSSE() {
+  if (!auth.unlocked) return;
   stopDemoMode();
   if (state.sseController) state.sseController.abort();
   if (state.sseRetryTimer) clearTimeout(state.sseRetryTimer);
@@ -1620,11 +2948,13 @@ function generateDemoEvent() {
 }
 
 function startDemoMode() {
-  if (state.mode !== 'demo' || state.demoTimer) return;
+  if (!auth.unlocked || state.mode !== 'demo' || state.demoTimer) return;
+  var generation = auth.generation;
 
   function scheduleNext() {
     var delay = 3000 + Math.floor(Math.random() * 2000);
     state.demoTimer = setTimeout(function() {
+      if (!currentAuth(generation)) return;
       var event = generateDemoEvent();
       prependAuditEvent(event);
       scheduleNext();
@@ -1646,11 +2976,15 @@ function stopDemoMode() {
 // ============================================================================
 
 function loadPolicy() {
-  apiJson('/api/policy')
+  if (!auth.unlocked) return Promise.resolve();
+  var generation = auth.generation;
+  return apiJson('/api/policy')
     .then(function(data) {
+    if (!currentAuth(generation)) return;
       renderPolicy(data);
     })
     .catch(function(error) {
+    if (!currentAuth(generation)) return;
       document.getElementById('policy-config-path').textContent = '--';
       document.getElementById('policy-seal-status').textContent = 'Unknown';
       document.getElementById('policy-agent-sessions').textContent = '--';
@@ -1670,7 +3004,7 @@ function renderPolicy(data) {
   if (data.seal_present) {
     sealIcon.textContent = '\uD83D\uDD12';
     sealStatus.textContent = 'Seal file present (not verified)';
-    sealStatus.style.color = 'var(--green)';
+    sealStatus.style.color = 'var(--dim)';
   } else {
     sealIcon.textContent = '\uD83D\uDD13';
     sealStatus.textContent = 'No seal file';
@@ -1759,13 +3093,17 @@ function buildPolicyCard(rule) {
 // ============================================================================
 
 function loadSessions() {
-  apiJson('/api/sessions')
+  if (!auth.unlocked) return Promise.resolve();
+  var generation = auth.generation;
+  return apiJson('/api/sessions')
     .then(function(data) {
+    if (!currentAuth(generation)) return;
       state.sessionsData = data.sessions || [];
       renderSessions();
       startSessionCountdown();
     })
     .catch(function(error) {
+    if (!currentAuth(generation)) return;
       state.sessionsData = [];
       if (state.sessionCountdownTimer) clearInterval(state.sessionCountdownTimer);
       var target = document.getElementById('sessions-content');
@@ -1775,17 +3113,30 @@ function loadSessions() {
 }
 
 function startSessionCountdown() {
+  if (!auth.unlocked) return;
+  var generation = auth.generation;
   if (state.sessionCountdownTimer) {
     clearInterval(state.sessionCountdownTimer);
   }
   state.sessionCountdownTimer = setInterval(function() {
+    if (!currentAuth(generation)) return;
     if (state.activeTab === 'sessions' && state.sessionsData.length > 0) {
-      for (var i = 0; i < state.sessionsData.length; i++) {
-        state.sessionsData[i].ttl_remaining_secs = Math.max(0, Math.floor((state.sessionsData[i].expires_at_utc_ms - Date.now()) / 1000));
-      }
-      renderSessions();
+      updateSessionCountdown();
     }
   }, 1000);
+}
+
+function updateSessionCountdown() {
+  // Updating text preserves keyboard focus and horizontal table scrolling.
+  var cells = document.querySelectorAll('#sessions-content .session-ttl');
+  for (var i = 0; i < state.sessionsData.length; i++) {
+    var ttl = Math.max(0, Math.floor((state.sessionsData[i].expires_at_utc_ms - Date.now()) / 1000));
+    state.sessionsData[i].ttl_remaining_secs = ttl;
+    if (cells[i]) {
+      cells[i].textContent = formatTtl(ttl);
+      cells[i].className = 'session-ttl ' + (ttl < 300 ? 'expiring' : 'healthy');
+    }
+  }
 }
 
 function renderSessions() {
@@ -1831,7 +3182,7 @@ function renderSessions() {
   }
 
   table.appendChild(tbody);
-  container.appendChild(table);
+  container.appendChild(el('div', {className:'table-wrap', tabindex:'0', role:'region', 'aria-label':'Agent sessions table'}, [table]));
 }
 
 // ============================================================================
@@ -1851,11 +3202,15 @@ var PROVIDER_ICONS = {
 var PROVIDER_ORDER = ['github', 'gitlab', '1password', 'bitwarden', 'vault', 'sandbox', 'test'];
 
 function loadOperations() {
-  apiJson('/api/operations')
+  if (!auth.unlocked) return Promise.resolve();
+  var generation = auth.generation;
+  return apiJson('/api/operations')
     .then(function(data) {
+    if (!currentAuth(generation)) return;
       renderOperations(data.operations || []);
     })
     .catch(function(error) {
+    if (!currentAuth(generation)) return;
       var target = document.getElementById('operations-content');
       target.textContent = '';
       target.appendChild(el('div', { className: 'audit-empty' }, error.message));
@@ -1980,8 +3335,11 @@ function taskStateLabel(task) {
 }
 
 function loadTasks(cursor) {
+  if (!auth.unlocked) return Promise.resolve();
+  var generation = auth.generation;
   if (cursor === undefined) cursor = state.tasksCursor;
   return apiJson('/api/tasks' + (cursor ? '?cursor=' + encodeURIComponent(cursor) : '')).then(function(data) {
+    if (!currentAuth(generation)) return;
     var tasks = Array.isArray(data.tasks) ? data.tasks : [];
     var changed = !state.tasksLoaded || cursor !== state.tasksCursor || JSON.stringify(tasks) !== JSON.stringify(state.tasksData) || state.tasksHasMore !== (data.has_more === true);
     state.tasksCursor = cursor;
@@ -1991,6 +3349,7 @@ function loadTasks(cursor) {
     state.tasksLoaded = true;
     if (changed) renderTasks();
   }).catch(function(error) {
+    if (!currentAuth(generation)) return;
     state.tasksLoaded = false;
     var container = document.getElementById('tasks-content');
     container.textContent = '';
@@ -2064,13 +3423,17 @@ function buildInferenceEvidence(task) {
   return box;
 }
 function toggleTask(id) {
+  if (!auth.unlocked) return Promise.resolve();
+  var generation = auth.generation;
   if (state.expandedTask === id) { state.expandedTask = null; renderTasks(); return; }
-  apiJson('/api/tasks/' + encodeURIComponent(id)).then(function(data) {
+  return apiJson('/api/tasks/' + encodeURIComponent(id)).then(function(data) {
+    if (!currentAuth(generation)) return;
     if (!data.task) throw new Error('Task receipt unavailable.');
     state.tasksData = state.tasksData.map(function(task) { return task.id === id ? data.task : task; });
     state.expandedTask = id;
     renderTasks();
   }).catch(function(error) {
+    if (!currentAuth(generation)) return;
     var container = document.getElementById('tasks-content');
     var message = el('div', {className:'task-empty', role:'alert'}, error.message);
     container.prepend(message);
@@ -2100,16 +3463,21 @@ function buildWorkflowEvidence(task) {
   return box;
 }
 function reconcileTask(id) {
+  if (!auth.unlocked) return Promise.resolve();
+  var generation = auth.generation;
   if (state.reconcilingTask) return;
   state.reconcilingTask = id;
   delete state.reconcileErrors[id];
   renderTasks();
-  apiJson('/api/tasks/' + encodeURIComponent(id) + '/reconcile', {method:'POST'}).then(function(data) {
+  return apiJson('/api/tasks/' + encodeURIComponent(id) + '/reconcile', {method:'POST'}).then(function(data) {
+    if (!currentAuth(generation)) return;
     if (!data.task) throw new Error('Workflow evidence unavailable.');
     state.tasksData = state.tasksData.map(function(task) { return task.id === id ? data.task : task; });
   }).catch(function(error) {
+    if (!currentAuth(generation)) return;
     state.reconcileErrors[id] = error.message + ' Existing evidence is retained; no dispatch was requested.';
   }).finally(function() {
+    if (!currentAuth(generation)) return;
     state.reconcilingTask = null;
     renderTasks();
   });
@@ -2169,7 +3537,8 @@ function buildTaskDetail(task) {
       el('td', null, [txt(slot.outcome ? slot.outcome.code + (slot.outcome.provider_run_id ? ' · Run ' + slot.outcome.provider_run_id : '') : 'No terminal receipt'), el('span', {className:'source-ref'}, 'Slot ' + slot.id)]),
     ]));
   });
-  table.appendChild(body); detail.appendChild(table);
+  table.appendChild(body);
+  detail.appendChild(el('div', {className:'table-wrap', tabindex:'0', role:'region', 'aria-label':'Task receipts table'}, [table]));
   return detail;
 }
 
@@ -2178,23 +3547,16 @@ function buildTaskDetail(task) {
 // ============================================================================
 
 function init() {
-  // Initial status poll
-  pollStatus();
-
-  // Poll status every 10 seconds
-  state.statusTimer = setInterval(pollStatus, 10000);
-
-  // First status response selects explicit live/demo mode and loads the tasks.
-
-
-  // Update relative timestamps every 15 seconds
-  setInterval(function() {
-    if (state.activeTab === 'audit' && state.auditEvents.length > 0) {
-      renderAuditList();
-    }
-  }, 15000);
+  lockDashboard('', false);
+  updateTabOrientation();
+  window.addEventListener('resize', updateTabOrientation);
+  window.addEventListener('pagehide', function() { lockDashboard('', false); });
+  window.addEventListener('pageshow', function(event) {
+    if (event.persisted) lockDashboard('Enter the owner token after returning to this page.', false);
+  });
 }
 
+/* opaque:extension-script */
 init();
 </script>
 </body>

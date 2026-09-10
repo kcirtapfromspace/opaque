@@ -12,18 +12,19 @@
 //! `OPAQUE_AWS_ALLOW_INSECURE=1` and a loopback `OPAQUE_AWS_MOCK_URL`, with
 //! disposable credentials supplied through the configured base resolver refs.
 
+mod action;
 pub mod client;
 pub mod resolve;
 
 use std::fmt;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use opaque_core::audit::{AuditEvent, AuditEventKind, AuditSink};
 use opaque_core::operation::OperationRequest;
 
-use opaque_core::operation_handler::OperationHandler;
+use opaque_core::operation_handler::{OperationHandler, PreparedOperation};
+
+use action::AwsAction;
 use opaque_core::resolver::{BaseResolver, SecretResolver};
 
 use client::AwsClient;
@@ -107,21 +108,41 @@ impl OperationHandler for AwsHandler {
         true
     }
 
-    fn execute(
-        &self,
-        request: &OperationRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send + '_>> {
+    fn prepare<'a>(&'a self, request: &OperationRequest) -> Result<PreparedOperation<'a>, String> {
+        let action = AwsAction::parse(&request.operation, &request.params)?;
+        let mut secret_refs = vec![self.access_key_ref.clone(), self.secret_key_ref.clone()];
+        // Resource selectors were already part of read-operation secret_names
+        // policy. Credential refs supplement that authority, never replace it.
+        match &action {
+            AwsAction::GetSecretValue { secret_id } => secret_refs.push(secret_id.clone()),
+            AwsAction::GetParameter { name, .. } => secret_refs.push(name.clone()),
+            _ => {}
+        }
+        let mut target = action.target();
+        let api_url = self
+            .client
+            .endpoint_for_operation(&request.operation)
+            .ok_or("unknown AWS operation")?
+            .to_owned();
+        let backend = "unsigned_loopback_fixture";
+        target.insert("aws_backend".into(), backend.into());
+        target.insert("aws_api_url".into(), api_url.clone());
+        let action = action::BoundAction {
+            action,
+            backend,
+            api_url,
+        };
         let request_id = request.request_id;
-        let params = request.params.clone();
         let operation = request.operation.clone();
         let audit = self.audit.clone();
 
-        Box::pin(async move {
-            match operation.as_str() {
+        PreparedOperation::new(action, target, secret_refs, move |action| async move {
+            let action = action.action;
+            match &action {
                 // ---------------------------------------------------------
                 // STS operations
                 // ---------------------------------------------------------
-                "aws.get_caller_identity" => {
+                AwsAction::GetCallerIdentity {} => {
                     audit.emit(
                         AuditEvent::new(AuditEventKind::ProviderFetchStarted)
                             .with_request_id(request_id)
@@ -152,16 +173,10 @@ impl OperationHandler for AwsHandler {
                     }))
                 }
 
-                "aws.assume_role" => {
-                    let role_arn = params
-                        .get("role_arn")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| "missing 'role_arn' parameter".to_string())?;
-                    let session_name = params
-                        .get("session_name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("opaque-session");
-
+                AwsAction::AssumeRole {
+                    role_arn,
+                    session_name,
+                } => {
                     audit.emit(
                         AuditEvent::new(AuditEventKind::ProviderFetchStarted)
                             .with_request_id(request_id)
@@ -196,7 +211,7 @@ impl OperationHandler for AwsHandler {
                 // ---------------------------------------------------------
                 // Secrets Manager operations
                 // ---------------------------------------------------------
-                "aws.list_secrets" => {
+                AwsAction::ListSecrets {} => {
                     audit.emit(
                         AuditEvent::new(AuditEventKind::ProviderFetchStarted)
                             .with_request_id(request_id)
@@ -235,12 +250,7 @@ impl OperationHandler for AwsHandler {
                     Ok(serde_json::json!({ "secrets": sanitized }))
                 }
 
-                "aws.get_secret_value" => {
-                    let secret_id = params
-                        .get("secret_id")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| "missing 'secret_id' parameter".to_string())?;
-
+                AwsAction::GetSecretValue { secret_id } => {
                     audit.emit(
                         AuditEvent::new(AuditEventKind::ProviderFetchStarted)
                             .with_request_id(request_id)
@@ -277,17 +287,11 @@ impl OperationHandler for AwsHandler {
                     }))
                 }
 
-                "aws.create_secret" => {
-                    let name = params
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| "missing 'name' parameter".to_string())?;
-                    let value = params
-                        .get("value")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| "missing 'value' parameter".to_string())?;
-                    let description = params.get("description").and_then(|v| v.as_str());
-
+                AwsAction::CreateSecret {
+                    name,
+                    value,
+                    description,
+                } => {
                     audit.emit(
                         AuditEvent::new(AuditEventKind::ProviderFetchStarted)
                             .with_request_id(request_id)
@@ -299,7 +303,13 @@ impl OperationHandler for AwsHandler {
                     let secret_key = self.resolve_secret_key()?;
                     let resp = self
                         .client
-                        .create_secret(&access_key, &secret_key, name, value, description)
+                        .create_secret(
+                            &access_key,
+                            &secret_key,
+                            name,
+                            value.expose(),
+                            description.as_deref(),
+                        )
                         .await
                         .map_err(|e| format!("CreateSecret failed: {e}"))?;
 
@@ -317,16 +327,7 @@ impl OperationHandler for AwsHandler {
                     }))
                 }
 
-                "aws.put_secret_value" => {
-                    let secret_id = params
-                        .get("secret_id")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| "missing 'secret_id' parameter".to_string())?;
-                    let value = params
-                        .get("value")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| "missing 'value' parameter".to_string())?;
-
+                AwsAction::PutSecretValue { secret_id, value } => {
                     audit.emit(
                         AuditEvent::new(AuditEventKind::ProviderFetchStarted)
                             .with_request_id(request_id)
@@ -337,7 +338,7 @@ impl OperationHandler for AwsHandler {
                     let access_key = self.resolve_access_key()?;
                     let secret_key = self.resolve_secret_key()?;
                     self.client
-                        .put_secret_value(&access_key, &secret_key, secret_id, value)
+                        .put_secret_value(&access_key, &secret_key, secret_id, value.expose())
                         .await
                         .map_err(|e| format!("PutSecretValue failed: {e}"))?;
 
@@ -355,12 +356,7 @@ impl OperationHandler for AwsHandler {
                     }))
                 }
 
-                "aws.delete_secret" => {
-                    let secret_id = params
-                        .get("secret_id")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| "missing 'secret_id' parameter".to_string())?;
-
+                AwsAction::DeleteSecret { secret_id, .. } => {
                     audit.emit(
                         AuditEvent::new(AuditEventKind::ProviderFetchStarted)
                             .with_request_id(request_id)
@@ -392,16 +388,10 @@ impl OperationHandler for AwsHandler {
                 // ---------------------------------------------------------
                 // SSM Parameter Store operations
                 // ---------------------------------------------------------
-                "aws.get_parameter" => {
-                    let name = params
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| "missing 'name' parameter".to_string())?;
-                    let with_decryption = params
-                        .get("with_decryption")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(true);
-
+                AwsAction::GetParameter {
+                    name,
+                    with_decryption,
+                } => {
                     audit.emit(
                         AuditEvent::new(AuditEventKind::ProviderFetchStarted)
                             .with_request_id(request_id)
@@ -413,7 +403,7 @@ impl OperationHandler for AwsHandler {
                     let secret_key = self.resolve_secret_key()?;
                     let param = self
                         .client
-                        .get_parameter(&access_key, &secret_key, name, with_decryption)
+                        .get_parameter(&access_key, &secret_key, name, *with_decryption)
                         .await
                         .map_err(|e| format!("GetParameter failed: {e}"))?;
 
@@ -437,24 +427,12 @@ impl OperationHandler for AwsHandler {
                     }))
                 }
 
-                "aws.put_parameter" => {
-                    let name = params
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| "missing 'name' parameter".to_string())?;
-                    let value = params
-                        .get("value")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| "missing 'value' parameter".to_string())?;
-                    let parameter_type = params
-                        .get("type")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("SecureString");
-                    let overwrite = params
-                        .get("overwrite")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-
+                AwsAction::PutParameter {
+                    name,
+                    value,
+                    parameter_type,
+                    overwrite,
+                } => {
                     audit.emit(
                         AuditEvent::new(AuditEventKind::ProviderFetchStarted)
                             .with_request_id(request_id)
@@ -469,9 +447,9 @@ impl OperationHandler for AwsHandler {
                             &access_key,
                             &secret_key,
                             name,
-                            value,
+                            value.expose(),
                             parameter_type,
-                            overwrite,
+                            *overwrite,
                         )
                         .await
                         .map_err(|e| format!("PutParameter failed: {e}"))?;
@@ -490,16 +468,11 @@ impl OperationHandler for AwsHandler {
                     }))
                 }
 
-                "aws.get_parameters_by_path" => {
-                    let path_prefix = params
-                        .get("path")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| "missing 'path' parameter".to_string())?;
-                    let with_decryption = params
-                        .get("with_decryption")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-
+                AwsAction::GetParametersByPath {
+                    path: path_prefix,
+                    with_decryption,
+                    ..
+                } => {
                     audit.emit(
                         AuditEvent::new(AuditEventKind::ProviderFetchStarted)
                             .with_request_id(request_id)
@@ -517,7 +490,7 @@ impl OperationHandler for AwsHandler {
                             &access_key,
                             &secret_key,
                             path_prefix,
-                            with_decryption,
+                            *with_decryption,
                         )
                         .await
                         .map_err(|e| format!("GetParametersByPath failed: {e}"))?;
@@ -551,12 +524,7 @@ impl OperationHandler for AwsHandler {
                     }))
                 }
 
-                "aws.delete_parameter" => {
-                    let name = params
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| "missing 'name' parameter".to_string())?;
-
+                AwsAction::DeleteParameter { name } => {
                     audit.emit(
                         AuditEvent::new(AuditEventKind::ProviderFetchStarted)
                             .with_request_id(request_id)
@@ -584,8 +552,6 @@ impl OperationHandler for AwsHandler {
                         "status": "deleted",
                     }))
                 }
-
-                other => Err(format!("unknown AWS operation: {other}")),
             }
         })
     }
@@ -635,6 +601,49 @@ mod tests {
             params,
             workspace: None,
         }
+    }
+
+    #[test]
+    fn prepared_actions_pin_the_selected_service_endpoint() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let handler = AwsHandler::new(
+            audit.clone(),
+            AwsClient::new(
+                "http://127.0.0.1:1",
+                "http://127.0.0.1:2",
+                "http://127.0.0.1:3",
+            )
+            .unwrap(),
+        );
+        let changed = AwsHandler::new(audit.clone(), AwsClient::new_single("http://127.0.0.1:4"));
+        for (operation, params, expected) in [
+            (
+                "aws.get_caller_identity",
+                serde_json::json!({}),
+                "http://127.0.0.1:1",
+            ),
+            (
+                "aws.get_secret_value",
+                serde_json::json!({"secret_id":"fixture"}),
+                "http://127.0.0.1:2",
+            ),
+            (
+                "aws.get_parameter",
+                serde_json::json!({"name":"fixture"}),
+                "http://127.0.0.1:3",
+            ),
+        ] {
+            let request = make_request(operation, params);
+            let prepared = handler.prepare(&request).unwrap();
+            assert_eq!(prepared.target()["aws_api_url"], expected);
+            assert_eq!(prepared.params()["api_url"], expected);
+            assert_eq!(prepared.params()["backend"], "unsigned_loopback_fixture");
+            assert_ne!(
+                prepared.params(),
+                changed.prepare(&request).unwrap().params()
+            );
+        }
+        assert!(audit.events().is_empty());
     }
 
     #[test]
@@ -1116,5 +1125,232 @@ mod tests {
         assert!(result.unwrap_err().contains("authentication failed"));
 
         cleanup_env();
+    }
+
+    #[test]
+    fn prepared_actions_bind_every_destination_and_effective_option() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let handler = AwsHandler {
+            audit: audit.clone(),
+            client: AwsClient::new_single("http://127.0.0.1:1"),
+            access_key_ref: "env:OPAQUE_MISSING_CANONICAL_AWS_AK".into(),
+            secret_key_ref: "env:OPAQUE_MISSING_CANONICAL_AWS_SK".into(),
+        };
+        assert!(handler.fixture_only());
+        for (operation, params, expected) in [
+            (
+                "aws.get_caller_identity",
+                serde_json::json!({}),
+                serde_json::json!({}),
+            ),
+            (
+                "aws.list_secrets",
+                serde_json::json!({}),
+                serde_json::json!({}),
+            ),
+            (
+                "aws.assume_role",
+                serde_json::json!({"role_arn":"arn:fixture"}),
+                serde_json::json!({"role_arn":"arn:fixture","session_name":"opaque-session"}),
+            ),
+            (
+                "aws.get_secret_value",
+                serde_json::json!({"secret_id":"approved"}),
+                serde_json::json!({"secret_id":"approved"}),
+            ),
+            (
+                "aws.create_secret",
+                serde_json::json!({"name":"approved","value":"synthetic-fixture"}),
+                serde_json::json!({"name":"approved"}),
+            ),
+            (
+                "aws.put_secret_value",
+                serde_json::json!({"secret_id":"approved","value":"synthetic-fixture"}),
+                serde_json::json!({"secret_id":"approved"}),
+            ),
+            (
+                "aws.delete_secret",
+                serde_json::json!({"secret_id":"approved"}),
+                serde_json::json!({"secret_id":"approved","force_delete_without_recovery":"false"}),
+            ),
+            (
+                "aws.get_parameter",
+                serde_json::json!({"name":"/approved"}),
+                serde_json::json!({"name":"/approved","with_decryption":"true"}),
+            ),
+            (
+                "aws.put_parameter",
+                serde_json::json!({"name":"/approved","value":"synthetic-fixture"}),
+                serde_json::json!({"name":"/approved","type":"SecureString","overwrite":"false"}),
+            ),
+            (
+                "aws.get_parameters_by_path",
+                serde_json::json!({"path":"/approved/"}),
+                serde_json::json!({"path":"/approved/","with_decryption":"false","recursive":"true"}),
+            ),
+            (
+                "aws.delete_parameter",
+                serde_json::json!({"name":"/approved"}),
+                serde_json::json!({"name":"/approved"}),
+            ),
+        ] {
+            let mut request = make_request(operation, params);
+            request.target.insert("name".into(), "decoy".into());
+            request
+                .secret_ref_names
+                .push("raw-secret-must-not-bind".into());
+            let prepared = handler.prepare(&request).unwrap();
+            let mut expected = expected;
+            expected["aws_backend"] = "unsigned_loopback_fixture".into();
+            expected["aws_api_url"] = "http://127.0.0.1:1".into();
+            assert_eq!(serde_json::to_value(prepared.target()).unwrap(), expected);
+            let mut expected_refs = vec![
+                "env:OPAQUE_MISSING_CANONICAL_AWS_AK".to_string(),
+                "env:OPAQUE_MISSING_CANONICAL_AWS_SK".to_string(),
+            ];
+            if operation == "aws.get_secret_value" {
+                expected_refs.push("approved".into());
+            }
+            if operation == "aws.get_parameter" {
+                expected_refs.push("/approved".into());
+            }
+            expected_refs.sort();
+            assert_eq!(prepared.secret_ref_names(), expected_refs);
+            assert_eq!(prepared.params()["action"], format!("{operation}.v1"));
+            assert!(!prepared.params().to_string().contains("synthetic-fixture"));
+        }
+        assert!(audit.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_options_fail_before_credentials_and_provider_audit() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let handler = AwsHandler::new(audit.clone(), AwsClient::new_single("http://127.0.0.1:1"));
+        for (operation, params) in [
+            ("aws.get_caller_identity", serde_json::Value::Null),
+            (
+                "aws.list_secrets",
+                serde_json::json!({"secret_id":"hidden"}),
+            ),
+            (
+                "aws.assume_role",
+                serde_json::json!({"role_arn":"arn:fixture","session_name":1}),
+            ),
+            (
+                "aws.create_secret",
+                serde_json::json!({"name":"n","value":null}),
+            ),
+            (
+                "aws.create_secret",
+                serde_json::json!({"name":"n","value":"v","description":false}),
+            ),
+            (
+                "aws.get_parameter",
+                serde_json::json!({"name":"/n","with_decryption":"false"}),
+            ),
+            (
+                "aws.put_parameter",
+                serde_json::json!({"name":"/n","value":"v","overwrite":"true"}),
+            ),
+            (
+                "aws.put_parameter",
+                serde_json::json!({"name":"/n","value":"v","type":"unknown"}),
+            ),
+            (
+                "aws.get_parameters_by_path",
+                serde_json::json!({"path":"/n","recursive":false}),
+            ),
+            (
+                "aws.delete_secret",
+                serde_json::json!({"secret_id":"n","force_delete_without_recovery":true}),
+            ),
+            ("aws.delete_parameter", serde_json::json!({"name":"\n"})),
+        ] {
+            assert!(
+                handler
+                    .execute(&make_request(operation, params))
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(audit.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepared_write_binds_confidential_bytes_and_executes_exact_original_options() {
+        let (_guard, handler, mock_server, _) = setup_handler_with_mock().await;
+        Mock::given(method("POST"))
+            .and(header("X-Amz-Target", "AmazonSSM.PutParameter"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "Name":"/approved", "Value":"original-synthetic-fixture", "Type":"String", "Overwrite":true
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"Version":1})))
+            .expect(1).mount(&mock_server).await;
+        let mut request = make_request(
+            "aws.put_parameter",
+            serde_json::json!({
+                "name":"/approved","value":"original-synthetic-fixture","type":"String","overwrite":true
+            }),
+        );
+        let prepared = handler.prepare(&request).unwrap();
+        let original = prepared.params().clone();
+        assert!(!original.to_string().contains("original-synthetic-fixture"));
+        request.params["value"] = "changed-synthetic-fixture".into();
+        let changed = handler.prepare(&request).unwrap();
+        assert_ne!(
+            original["params"]["value_sha256"],
+            changed.params()["params"]["value_sha256"]
+        );
+        assert_eq!(prepared.target()["overwrite"], "true");
+        request.params["name"] = "/changed".into();
+        request.params["overwrite"] = false.into();
+        assert_eq!(prepared.execute().await.unwrap()["name"], "/approved");
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
+        cleanup_env();
+    }
+
+    #[test]
+    fn resource_secret_name_policy_keeps_secret_and_parameter_constraints() {
+        use opaque_core::policy::SecretNameMatch;
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let handler = AwsHandler {
+            audit: audit.clone(),
+            client: AwsClient::new_single("http://127.0.0.1:1"),
+            access_key_ref: "env:FIXTURE_AWS_AK".into(),
+            secret_key_ref: "env:FIXTURE_AWS_SK".into(),
+        };
+        let policy = SecretNameMatch {
+            patterns: vec![
+                "env:FIXTURE_AWS_AK".into(),
+                "env:FIXTURE_AWS_SK".into(),
+                "approved-resource".into(),
+            ],
+        };
+        for (operation, selector) in [
+            ("aws.get_secret_value", "secret_id"),
+            ("aws.get_parameter", "name"),
+        ] {
+            let approved = handler
+                .prepare(&make_request(
+                    operation,
+                    serde_json::json!({selector:"approved-resource"}),
+                ))
+                .unwrap();
+            let mut request = make_request(
+                operation,
+                serde_json::json!({selector:"different-resource"}),
+            );
+            request.secret_ref_names = vec!["approved-resource".into()];
+            let denied = handler.prepare(&request).unwrap();
+            assert!(policy.matches(approved.secret_ref_names()));
+            assert!(!policy.matches(denied.secret_ref_names()));
+            assert!(
+                !SecretNameMatch {
+                    patterns: vec!["env:FIXTURE_AWS_AK".into(), "env:FIXTURE_AWS_SK".into()]
+                }
+                .matches(approved.secret_ref_names())
+            );
+        }
+        assert!(audit.events().is_empty());
     }
 }

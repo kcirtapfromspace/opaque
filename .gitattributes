@@ -1,0 +1,3 @@
+# Keep the licensed upstream text byte-for-byte, including original CRLF and
+# trailing whitespace, so its recorded provenance hashes remain verifiable.
+assets/brand/licenses/*.txt -whitespace -text

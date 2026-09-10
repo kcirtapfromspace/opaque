@@ -20,6 +20,15 @@
 //! declarations). `opaqued` enables all ten explicitly so turning this
 //! feature system on does not change its shipped behavior.
 
+#[cfg(any(
+    feature = "aws",
+    feature = "github",
+    feature = "gitlab",
+    feature = "onepassword",
+    feature = "bitwarden"
+))]
+mod endpoint;
+
 #[cfg(feature = "aws")]
 pub mod aws;
 #[cfg(feature = "azure")]

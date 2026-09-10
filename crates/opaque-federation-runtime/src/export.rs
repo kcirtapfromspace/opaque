@@ -2,7 +2,8 @@
 //!
 //! The pump tails the SQLite audit CHAIN — not the live event stream — so
 //! every exported record carries its `sequence_number` and `record_hash`,
-//! keeping the export externally verifiable against the chain. Delivery is
+//! allowing custody-side verification and keyless artifact comparison. The HMAC
+//! alone is not public-key verification of producer identity. Delivery is
 //! at-least-once per transport with a persisted cursor apiece (one dead
 //! transport never stalls the others); consumers dedupe on
 //! `(sequence_number, record_hash)`.
@@ -19,7 +20,6 @@
 //! raises an `audit.alert` event — which lands in the chain and is exported
 //! like everything else.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -182,6 +182,8 @@ pub struct Cursors {
     /// The integrity detector's own frontier (it must see each row once).
     #[serde(default)]
     pub detector: i64,
+    #[serde(default)]
+    pub detector_state: Option<ApprovalDetector>,
 }
 
 pub fn cursor_path(home: &Path) -> PathBuf {
@@ -189,31 +191,83 @@ pub fn cursor_path(home: &Path) -> PathBuf {
 }
 
 pub fn load_cursors(path: &Path) -> std::io::Result<Cursors> {
-    match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Cursors::default()),
-        Err(e) => Err(e),
-    }
-}
-
-pub fn save_cursors(path: &Path, cursors: &Cursors) -> std::io::Result<()> {
-    let bytes = serde_json::to_vec_pretty(cursors)?;
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
     #[cfg(unix)]
     {
-        use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        f.write_all(&bytes)?;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
     }
-    #[cfg(not(unix))]
-    std::fs::write(path, &bytes)?;
-    Ok(())
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Cursors::default()),
+        Err(e) => return Err(e),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("cursor is not a regular file"));
+    }
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(8 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 8 * 1024 * 1024 {
+        return Err(std::io::Error::other("cursor exceeds limit"));
+    }
+    let cursors: Cursors = serde_json::from_slice(&bytes)
+        .map_err(|_| std::io::Error::other("invalid cursor state"))?;
+    if [
+        cursors.spool,
+        cursors.webhook,
+        cursors.syslog,
+        cursors.detector,
+    ]
+    .iter()
+    .any(|v| *v < 0)
+        || cursors
+            .detector_state
+            .as_ref()
+            .is_some_and(|state| !state.valid(cursors.detector))
+    {
+        return Err(std::io::Error::other("inconsistent detector cursor state"));
+    }
+    Ok(cursors)
+}
+
+/// One atomic, durable replacement binds the detector frontier and pending state.
+/// A single daemon pump owns this file; concurrent writers are unsupported.
+pub fn save_cursors(path: &Path, cursors: &Cursors) -> std::io::Result<()> {
+    use std::io::Write;
+    let bytes = serde_json::to_vec(cursors)?;
+    if bytes.len() > 8 * 1024 * 1024 {
+        return Err(std::io::Error::other("cursor exceeds limit"));
+    }
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let temporary = parent.join(format!(
+        ".export-cursor-{}",
+        AuditEvent::new(AuditEventKind::AuditAlert).event_id
+    ));
+    let result = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        std::fs::File::open(parent)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -467,56 +521,8 @@ fn gethostname() -> String {
 // Integrity detector
 // ---------------------------------------------------------------------------
 
-/// Streaming detector for "operation succeeded without its required approval".
-///
-/// The chain's own invariant: any request that emitted `approval.required`
-/// must show `approval.granted` before `operation.succeeded`. The detector
-/// needs no policy knowledge — the requirement is recorded in the chain.
-#[derive(Debug, Default)]
-pub struct ApprovalDetector {
-    /// request_id → approval granted yet?
-    pending: HashMap<String, bool>,
-    /// Insertion order for cap eviction.
-    order: std::collections::VecDeque<String>,
-}
-
-const DETECTOR_CAP: usize = 8192;
-
-impl ApprovalDetector {
-    /// Feed one record; returns an alert description when the invariant broke.
-    pub fn observe(&mut self, record: &ExportRecord) -> Option<String> {
-        let request_id = record.request_id.clone()?;
-        match record.kind.as_str() {
-            "approval.required" => {
-                if self.pending.insert(request_id.clone(), false).is_none() {
-                    self.order.push_back(request_id);
-                    if self.order.len() > DETECTOR_CAP
-                        && let Some(evicted) = self.order.pop_front()
-                    {
-                        self.pending.remove(&evicted);
-                    }
-                }
-                None
-            }
-            "approval.granted" | "lease.hit" => {
-                if let Some(granted) = self.pending.get_mut(&request_id) {
-                    *granted = true;
-                }
-                None
-            }
-            "operation.succeeded" => match self.pending.get(&request_id) {
-                Some(false) => Some(format!(
-                    "operation {} (request {request_id}, seq {}) SUCCEEDED without its \
-                     required approval being granted in the chain",
-                    record.operation.as_deref().unwrap_or("?"),
-                    record.sequence_number,
-                )),
-                _ => None,
-            },
-            _ => None,
-        }
-    }
-}
+mod detector;
+pub use detector::{ApprovalDetector, Finding};
 
 // ---------------------------------------------------------------------------
 // Pump
@@ -539,6 +545,11 @@ impl ExportPump {
         cursor_file: PathBuf,
         audit: Arc<dyn AuditSink>,
     ) -> Result<Self, String> {
+        if config.batch_size.is_some_and(|n| !(1..=1024).contains(&n))
+            || config.poll_secs.is_some_and(|n| !(1..=3600).contains(&n))
+        {
+            return Err("invalid export batch or polling limit".into());
+        }
         let syslog = match &config.syslog_addr {
             Some(addr) => Some(SyslogTarget::new(addr, config.syslog_ca_file.as_deref())?),
             None => None,
@@ -564,7 +575,9 @@ impl ExportPump {
         let batch_size = self.config.batch_size.unwrap_or(256);
         let mut cursors = load_cursors(&self.cursor_file)
             .map_err(|e| format!("export cursors unreadable: {e}"))?;
+        let original_cursors = cursors.clone();
         let mut delivered = 0usize;
+        let mut failed_transports = std::collections::BTreeSet::new();
 
         if let Some(spool) = &self.config.spool_path {
             let batch = read_rows_after(&self.db_path, cursors.spool, batch_size)?;
@@ -574,7 +587,10 @@ impl ExportPump {
                         cursors.spool = batch.last().expect("nonempty").rowid;
                         delivered += batch.len();
                     }
-                    Err(e) => warn!("export spool delivery failed: {e}"),
+                    Err(e) => {
+                        warn!("export spool delivery failed: {e}");
+                        failed_transports.insert("spool".to_string());
+                    }
                 }
             }
         }
@@ -594,7 +610,10 @@ impl ExportPump {
                         cursors.webhook = batch.last().expect("nonempty").rowid;
                         delivered += batch.len();
                     }
-                    Err(e) => warn!("export webhook delivery failed: {e}"),
+                    Err(e) => {
+                        warn!("export webhook delivery failed: {e}");
+                        failed_transports.insert("webhook".to_string());
+                    }
                 }
             }
         }
@@ -607,32 +626,136 @@ impl ExportPump {
                         cursors.syslog = batch.last().expect("nonempty").rowid;
                         delivered += batch.len();
                     }
-                    Err(e) => warn!("export syslog delivery failed: {e}"),
+                    Err(e) => {
+                        warn!("export syslog delivery failed: {e}");
+                        failed_transports.insert("syslog".to_string());
+                    }
                 }
             }
         }
 
-        // Detector: independent frontier, each row observed exactly once.
+        // Pending requirements and this frontier are one durable snapshot.
+        // The caller's memory is a view only; disk is authoritative after errors.
+        let legacy_gap = cursors.detector > 0 && cursors.detector_state.is_none();
+        let mut state = cursors.detector_state.take().unwrap_or_default();
+        self.deliver_findings(&state.outbox).await?;
+        state.outbox.clear();
         let batch = read_rows_after(&self.db_path, cursors.detector, batch_size)?;
-        if !batch.is_empty() {
-            for record in &batch {
-                if let Some(alert) = detector.observe(record) {
-                    warn!("AUDIT ALERT: {alert}");
-                    self.audit.emit(
-                        AuditEvent::new(AuditEventKind::AuditAlert)
-                            .with_operation("export_detector")
-                            .with_outcome("approval_missing")
-                            .with_level(AuditLevel::Error)
-                            .with_detail(alert),
-                    );
+        for (index, record) in batch.iter().enumerate() {
+            if index == 0 && legacy_gap {
+                let finding = state.coverage_gap("restart_coverage_gap", record);
+                state.outbox.push(finding);
+            }
+            let findings = state.observe_findings(record);
+            state.outbox.extend(findings);
+        }
+        if let Some(last) = batch.last() {
+            cursors.detector = last.rowid;
+        }
+        // Only transitions into a failed transport emit a finding. Repeated
+        // failed polling cannot recursively generate an alert for its own alert.
+        if failed_transports != state.failed_transports {
+            let anchor = if let Some(last) = batch.last() {
+                Some(last.clone())
+            } else {
+                read_rows_after(&self.db_path, state.last_rowid.saturating_sub(1), 1)?
+                    .into_iter()
+                    .next()
+            };
+            for transport in failed_transports.difference(&state.failed_transports) {
+                if let Some(record) = &anchor {
+                    state.outbox.push(Finding::new(
+                        &format!("export_{transport}_failed"),
+                        record,
+                        None,
+                    ));
                 }
             }
-            cursors.detector = batch.last().expect("nonempty").rowid;
+            state.failed_transports = failed_transports;
         }
-
-        save_cursors(&self.cursor_file, &cursors)
-            .map_err(|e| format!("export cursors persist: {e}"))?;
+        // Legacy state with no new rows remains explicitly absent until the
+        // first observed record can anchor a coverage finding.
+        if !legacy_gap || !batch.is_empty() {
+            cursors.detector_state = Some(state.clone());
+        }
+        if cursors != original_cursors {
+            save_cursors(&self.cursor_file, &cursors)
+                .map_err(|_| "export cursors persist failed".to_string())?;
+        }
+        self.deliver_findings(&state.outbox).await?;
+        let acknowledged = !state.outbox.is_empty();
+        state.outbox.clear();
+        if acknowledged && cursors.detector_state.is_some() {
+            cursors.detector_state = Some(state.clone());
+            save_cursors(&self.cursor_file, &cursors)
+                .map_err(|_| "export cursors persist failed".to_string())?;
+        }
+        *detector = state;
         Ok(delivered)
+    }
+
+    /// Replay-safe alert outbox. The deterministic event ID is looked up in
+    /// the durable sink before emission; a crash after commit and before cursor
+    /// acknowledgment does not append the same finding again.
+    async fn deliver_findings(&self, findings: &[Finding]) -> Result<(), String> {
+        if findings.is_empty() {
+            return Ok(());
+        }
+        let connection = rusqlite::Connection::open_with_flags(
+            &self.db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|_| "detector audit lookup failed".to_string())?;
+        for finding in findings {
+            let detail =
+                serde_json::to_string(finding).map_err(|_| "detector finding encoding failed")?;
+            let existing: Option<(String, Option<String>)> = {
+                use rusqlite::OptionalExtension;
+                connection
+                    .query_row(
+                        "SELECT kind, detail FROM audit_events WHERE event_id = ?1",
+                        [finding.event_id()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()
+                    .map_err(|_| "detector audit lookup failed".to_string())?
+            };
+            if let Some((kind, previous)) = existing {
+                if kind != "audit.alert" || previous.as_deref() != Some(&detail) {
+                    return Err("detector finding identity conflict".into());
+                }
+                continue;
+            }
+            let source_retained: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM audit_events WHERE sequence_number = ?1)",
+                    [finding.sequence],
+                    |row| row.get(0),
+                )
+                .map_err(|_| "detector evidence lookup failed")?;
+            if !source_retained {
+                // If the source/old alert was pruned during a long outage, we
+                // cannot distinguish never delivered from delivered then pruned.
+                // Keep the outbox and fail visibly instead of reusing an event ID.
+                return Err("detector outbox evidence no longer retained; delivery unknown".into());
+            }
+            let mut event = AuditEvent::new(AuditEventKind::AuditAlert)
+                .with_operation("export_detector")
+                .with_outcome(&finding.rule)
+                .with_level(AuditLevel::Error)
+                .with_detail(detail);
+            event.event_id = finding
+                .event_id()
+                .parse()
+                .map_err(|_| "invalid finding identity")?;
+            self.audit.emit(event);
+        }
+        drop(connection);
+        let audit = self.audit.clone();
+        tokio::task::spawn_blocking(move || audit.flush(std::time::Duration::from_secs(5)))
+            .await
+            .map_err(|_| "detector audit acknowledgment failed")?
+            .map_err(|_| "detector audit acknowledgment failed".to_string())
     }
 
     /// Run the pump forever (spawned as a daemon task).
@@ -892,79 +1015,6 @@ mod tests {
         // Timestamp is RFC 3339 UTC.
         let ts = frame.split_whitespace().nth(1).unwrap();
         assert!(ts.ends_with('Z') && ts.contains('T'), "bad timestamp {ts}");
-    }
-
-    #[test]
-    fn detector_flags_success_without_grant() {
-        let mut detector = ApprovalDetector::default();
-        let base = ExportRecord {
-            schema: EXPORT_SCHEMA.into(),
-            rowid: 1,
-            event_id: "e1".into(),
-            sequence_number: 1,
-            ts_utc_ms: 0,
-            level: "info".into(),
-            kind: String::new(),
-            request_id: Some("req-1".into()),
-            approval_id: None,
-            client_json: None,
-            operation: Some("github.set_actions_secret".into()),
-            safety: None,
-            target_json: None,
-            outcome: None,
-            latency_ms: None,
-            secret_names: None,
-            policy_decision: None,
-            detail: None,
-            workspace_json: None,
-            request_hash: None,
-            approver_json: None,
-            record_hash: None,
-        };
-
-        // required → succeeded WITHOUT grant: alert.
-        let mut required = base.clone();
-        required.kind = "approval.required".into();
-        assert!(detector.observe(&required).is_none());
-        let mut succeeded = base.clone();
-        succeeded.kind = "operation.succeeded".into();
-        let alert = detector.observe(&succeeded).expect("alert raised");
-        assert!(alert.contains("without its required approval"), "{alert}");
-
-        // required → granted → succeeded: clean.
-        let mut detector = ApprovalDetector::default();
-        let mut r2 = base.clone();
-        r2.request_id = Some("req-2".into());
-        let mut required = r2.clone();
-        required.kind = "approval.required".into();
-        detector.observe(&required);
-        let mut granted = r2.clone();
-        granted.kind = "approval.granted".into();
-        detector.observe(&granted);
-        let mut succeeded = r2.clone();
-        succeeded.kind = "operation.succeeded".into();
-        assert!(detector.observe(&succeeded).is_none());
-
-        // lease.hit counts as satisfied too.
-        let mut detector = ApprovalDetector::default();
-        let mut r3 = base.clone();
-        r3.request_id = Some("req-3".into());
-        let mut required = r3.clone();
-        required.kind = "approval.required".into();
-        detector.observe(&required);
-        let mut lease = r3.clone();
-        lease.kind = "lease.hit".into();
-        detector.observe(&lease);
-        let mut succeeded = r3;
-        succeeded.kind = "operation.succeeded".into();
-        assert!(detector.observe(&succeeded).is_none());
-
-        // Operations that never required approval never alert.
-        let mut detector = ApprovalDetector::default();
-        let mut free = base;
-        free.request_id = Some("req-4".into());
-        free.kind = "operation.succeeded".into();
-        assert!(detector.observe(&free).is_none());
     }
 
     #[test]

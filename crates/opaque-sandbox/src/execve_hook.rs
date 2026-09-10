@@ -12,8 +12,7 @@
 //!     "args": ["push", "origin", "main"],
 //!     "cwd": "/home/user/project",
 //!     "env_keys": ["PATH", "HOME", "GITHUB_TOKEN"],
-//!     "sandbox_id": "codex-session-abc123",
-//!     "workspace": { ... }
+//!     "sandbox_id": "codex-session-abc123"
 //! }
 //! ```
 //!
@@ -49,8 +48,6 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -59,7 +56,8 @@ use opaque_core::execve_map::{ExecveDefaultDecision, ExecveMapper};
 use opaque_core::operation::OperationRequest;
 use uuid::Uuid;
 
-use opaque_core::operation_handler::OperationHandler;
+use opaque_core::operation_handler::{OperationHandler, PreparedOperation, render_argv};
+use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -145,14 +143,114 @@ impl ExecveLeaseCache {
 // ---------------------------------------------------------------------------
 
 /// Tracks a pending execve approval (for the prompt flow).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct PendingApproval {
+    /// Fresh server generation; approval IDs alone never identify replacement state.
+    generation: Uuid,
+    /// Exact check input and mapping being approved, including argv boundaries.
+    check: ExecveCheckAction,
+    /// Verified request context supplied by the daemon.
+    request_context: serde_json::Value,
     /// The matched pattern (for leasing on approve).
     pattern_or_command: String,
     /// The sandbox session ID.
     sandbox_id: String,
     /// When this pending approval was created.
+    #[serde(skip)]
     created_at: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ExecveCheckInput {
+    executable: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    cwd: String,
+    #[serde(default)]
+    env_keys: Vec<String>,
+    #[serde(default)]
+    sandbox_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ExecveRuleMatch {
+    operation: Option<String>,
+    secret_refs: Vec<String>,
+    matched_pattern: Option<String>,
+    is_default: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ExecveCheckAction {
+    version: &'static str,
+    input: ExecveCheckInput,
+    rule_match: ExecveRuleMatch,
+    default_decision: ExecveDefaultDecision,
+}
+
+impl ExecveCheckInput {
+    fn parse(request: &OperationRequest) -> Result<Self, String> {
+        if request.operation != "sandbox.execve_check" {
+            return Err("unknown execve check operation".into());
+        }
+        if request.params.get("executable").is_none() {
+            return Err("missing 'executable' parameter".into());
+        }
+        let input: Self = serde_json::from_value(request.params.clone())
+            .map_err(|_| "invalid execve check parameters")?;
+        if input.executable.is_empty()
+            || input.executable.contains('\0')
+            || input.args.iter().any(|arg| arg.contains('\0'))
+            || input.cwd.contains('\0')
+            || input.sandbox_id.chars().any(char::is_control)
+            || input.env_keys.iter().any(|key| {
+                let mut chars = key.bytes();
+                !chars
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
+                    || !chars.all(|c| c.is_ascii_alphanumeric() || c == b'_')
+            })
+        {
+            return Err("invalid execve check input".into());
+        }
+        Ok(input)
+    }
+
+    fn command(&self) -> String {
+        format_command(&self.executable, &self.args)
+    }
+
+    fn target(&self) -> HashMap<String, String> {
+        HashMap::from([
+            ("executable".into(), self.executable.clone()),
+            ("command".into(), self.command()),
+            ("cwd".into(), self.cwd.clone()),
+            ("env_keys".into(), render_argv(&self.env_keys)),
+            ("sandbox_id".into(), self.sandbox_id.clone()),
+        ])
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ExecveApproveInput {
+    approval_id: Uuid,
+    decision: String,
+    #[serde(default = "default_lease_for_pattern")]
+    lease_for_pattern: bool,
+}
+
+fn default_lease_for_pattern() -> bool {
+    true
+}
+
+#[derive(Serialize)]
+struct ExecveApproveAction {
+    version: &'static str,
+    input: ExecveApproveInput,
+    pending: PendingApproval,
 }
 
 // ---------------------------------------------------------------------------
@@ -202,47 +300,47 @@ impl ExecveCheckHandler {
 }
 
 impl OperationHandler for ExecveCheckHandler {
-    fn execute(
-        &self,
-        request: &OperationRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send + '_>> {
+    fn prepare<'a>(&'a self, request: &OperationRequest) -> Result<PreparedOperation<'a>, String> {
+        let input = ExecveCheckInput::parse(request)?;
+        let target = input.target();
+        let matched = self.mapper.match_execve(&input.executable, &input.args);
+        let secret_refs = matched.secret_refs.clone();
+        let action = ExecveCheckAction {
+            version: "sandbox.execve_check.v1",
+            input,
+            rule_match: ExecveRuleMatch {
+                operation: matched.operation,
+                secret_refs: matched.secret_refs,
+                matched_pattern: matched.matched_pattern,
+                is_default: matched.is_default,
+            },
+            default_decision: self.mapper.default_decision(),
+        };
+        let request_context = serde_json::json!({
+            "client_identity": request.client_identity,
+            "principal": request.principal,
+            "workspace": request.workspace,
+        });
         let request_id = request.request_id;
-        let params = request.params.clone();
         let audit = self.audit.clone();
-        let mapper = self.mapper.clone();
         let lease_cache = self.lease_cache.clone();
         let pending_approvals = self.pending_approvals.clone();
 
-        Box::pin(async move {
-            // Parse request params.
-            let executable = params
-                .get("executable")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| "missing 'executable' parameter".to_string())?
-                .to_owned();
-
-            let args: Vec<String> = params
-                .get("args")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default();
-
-            let cwd = params
-                .get("cwd")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-
-            let env_keys: Vec<String> = params
-                .get("env_keys")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default();
-
-            let sandbox_id = params
-                .get("sandbox_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-
+        PreparedOperation::new(action, target, secret_refs, move |action| async move {
+            let pending_check = action.clone();
+            let ExecveCheckAction {
+                input,
+                rule_match: match_result,
+                default_decision,
+                ..
+            } = action;
+            let ExecveCheckInput {
+                executable,
+                args,
+                cwd,
+                env_keys,
+                sandbox_id,
+            } = input;
             // Emit ExecveChecked audit event.
             let args_truncated = truncate_args(&args);
             let detail = format!(
@@ -254,9 +352,6 @@ impl OperationHandler for ExecveCheckHandler {
                     .with_operation("sandbox.execve_check")
                     .with_detail(&detail),
             );
-
-            // Match against execve rules.
-            let match_result = mapper.match_execve(&executable, &args);
 
             // Build the lease key from matched pattern or command string.
             let pattern_or_command = match_result
@@ -288,7 +383,7 @@ impl OperationHandler for ExecveCheckHandler {
                 return Ok(serde_json::json!({
                     "decision": "allow",
                     "reason": reason,
-                    "secrets_to_inject": match_result.secret_refs,
+                    "secrets_to_inject": filter_secret_refs(&env_keys, &match_result.secret_refs),
                     "approval_id": null,
                     "lease_ttl_secs": DEFAULT_EXECVE_LEASE_TTL.as_secs(),
                 }));
@@ -297,7 +392,7 @@ impl OperationHandler for ExecveCheckHandler {
             // Determine decision from match result + default.
             let (decision, reason, secrets) = if match_result.is_default {
                 // No rule matched; use default decision.
-                match mapper.default_decision() {
+                match default_decision {
                     ExecveDefaultDecision::Allow => (
                         "allow",
                         "no matching rule (default: allow)".to_string(),
@@ -376,6 +471,9 @@ impl OperationHandler for ExecveCheckHandler {
                 pending.insert(
                     id,
                     PendingApproval {
+                        generation: Uuid::new_v4(),
+                        check: pending_check,
+                        request_context,
                         pattern_or_command,
                         sandbox_id,
                         created_at: Instant::now(),
@@ -441,59 +539,71 @@ impl ExecveApproveHandler {
 }
 
 impl OperationHandler for ExecveApproveHandler {
-    fn execute(
-        &self,
-        request: &OperationRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send + '_>> {
+    fn prepare<'a>(&'a self, request: &OperationRequest) -> Result<PreparedOperation<'a>, String> {
+        if request.operation != "sandbox.execve_approve" {
+            return Err("unknown execve approve operation".into());
+        }
+        let input: ExecveApproveInput = serde_json::from_value(request.params.clone())
+            .map_err(|_| "invalid execve approval parameters")?;
+        if !matches!(input.decision.as_str(), "allow" | "deny") {
+            return Err("invalid decision: must be 'allow' or 'deny'".into());
+        }
+        let pending = self
+            .pending_approvals
+            .lock()
+            .expect("pending approvals mutex poisoned")
+            .get(&input.approval_id)
+            .cloned()
+            .ok_or("unknown or expired approval_id")?;
+        if pending.created_at.elapsed() >= Duration::from_secs(600) {
+            return Err("approval has expired (10 minutes)".into());
+        }
+        let target = HashMap::from([
+            ("approval_id".into(), input.approval_id.to_string()),
+            ("decision".into(), input.decision.clone()),
+            (
+                "lease_for_pattern".into(),
+                input.lease_for_pattern.to_string(),
+            ),
+            ("command".into(), pending.check.input.command()),
+            ("sandbox_id".into(), pending.sandbox_id.clone()),
+            ("pattern".into(), pending.pattern_or_command.clone()),
+        ]);
+        let secret_refs = pending.check.rule_match.secret_refs.clone();
+        let action = ExecveApproveAction {
+            version: "sandbox.execve_approve.v1",
+            input,
+            pending,
+        };
         let request_id = request.request_id;
-        let params = request.params.clone();
         let audit = self.audit.clone();
         let lease_cache = self.lease_cache.clone();
         let pending_approvals = self.pending_approvals.clone();
-
-        Box::pin(async move {
-            // Parse params.
-            let approval_id_str = params
-                .get("approval_id")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| "missing 'approval_id' parameter".to_string())?;
-
-            let approval_id: Uuid = approval_id_str
-                .parse()
-                .map_err(|e| format!("invalid approval_id: {e}"))?;
-
-            let decision = params
-                .get("decision")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| "missing 'decision' parameter".to_string())?;
-
-            if decision != "allow" && decision != "deny" {
-                return Err(format!(
-                    "invalid decision '{decision}': must be 'allow' or 'deny'"
-                ));
-            }
-
-            let lease_for_pattern = params
-                .get("lease_for_pattern")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-
-            // Look up the pending approval.
-            let pending = {
+        PreparedOperation::new(action, target, secret_refs, move |action| async move {
+            let ExecveApproveAction { input, pending, .. } = action;
+            let ExecveApproveInput {
+                approval_id,
+                decision,
+                lease_for_pattern,
+            } = input;
+            // Preparation does not consume authority. Atomically compare and
+            // remove only the exact pending generation reviewed above.
+            {
                 let mut map = pending_approvals
                     .lock()
                     .expect("pending approvals mutex poisoned");
-                map.remove(&approval_id)
-            };
-
-            let pending =
-                pending.ok_or_else(|| format!("unknown or expired approval_id: {approval_id}"))?;
-
-            // Check if the pending approval has expired (10 minutes).
-            if pending.created_at.elapsed() > Duration::from_secs(600) {
-                return Err("approval has expired (>10 minutes)".to_string());
+                let current = map
+                    .get(&approval_id)
+                    .ok_or("unknown or expired approval_id")?;
+                if current != &pending {
+                    return Err("pending approval changed after preparation".into());
+                }
+                if current.created_at.elapsed() >= Duration::from_secs(600) {
+                    map.remove(&approval_id);
+                    return Err("approval has expired (10 minutes)".into());
+                }
+                map.remove(&approval_id);
             }
-
             let lease_ttl = if decision == "allow" && lease_for_pattern {
                 // Grant a lease for the pattern.
                 let lease_key = ExecveLeaseKey {
@@ -517,7 +627,7 @@ impl OperationHandler for ExecveApproveHandler {
                     .with_request_id(request_id)
                     .with_approval_id(approval_id)
                     .with_operation("sandbox.execve_approve")
-                    .with_outcome(decision)
+                    .with_outcome(&decision)
                     .with_detail(format!(
                         "pattern={} sandbox_id={} lease_for_pattern={lease_for_pattern}",
                         pending.pattern_or_command, pending.sandbox_id
@@ -588,7 +698,13 @@ pub fn create_execve_handlers(
 fn truncate_args(args: &[String]) -> String {
     let joined = args.join(", ");
     if joined.len() > MAX_ARGS_AUDIT_LENGTH {
-        format!("{}...", &joined[..MAX_ARGS_AUDIT_LENGTH])
+        {
+            let mut end = MAX_ARGS_AUDIT_LENGTH;
+            while !joined.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}...", &joined[..end])
+        }
     } else {
         joined
     }
@@ -596,11 +712,10 @@ fn truncate_args(args: &[String]) -> String {
 
 /// Format a command string for display/keying.
 fn format_command(executable: &str, args: &[String]) -> String {
-    if args.is_empty() {
-        executable.to_owned()
-    } else {
-        format!("{} {}", executable, args.join(" "))
-    }
+    let mut command = Vec::with_capacity(args.len() + 1);
+    command.push(executable.to_owned());
+    command.extend_from_slice(args);
+    render_argv(&command)
 }
 
 /// Filter secret refs to only include those present in env_keys.
@@ -1011,5 +1126,197 @@ mod tests {
         let (_, handler) = create_execve_handlers(audit, mapper);
         let dbg = format!("{handler:?}");
         assert!(dbg.contains("ExecveApproveHandler"));
+    }
+
+    #[tokio::test]
+    async fn malformed_hook_parameters_never_create_pending_or_cached_authority() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let (check, approve) = create_execve_handlers(audit.clone(), Arc::new(test_mapper()));
+        for field in ["args", "cwd", "env_keys", "sandbox_id", "extra"] {
+            let mut params = serde_json::json!({"executable":"/bin/echo"});
+            params[field] = true.into();
+            assert!(check.execute(&test_request(params)).await.is_err());
+        }
+        for params in [
+            serde_json::json!({"executable":"/bin/echo","args":[1]}),
+            serde_json::json!({"executable":"/bin/echo","env_keys":["TOKEN=secret"]}),
+            serde_json::json!({"executable":"/bin/echo","cwd":null}),
+            serde_json::json!({"executable":"/bin/echo","args":null}),
+        ] {
+            assert!(check.execute(&test_request(params)).await.is_err());
+        }
+        let result = check
+            .execute(&test_request(serde_json::json!({
+                "executable":"/usr/bin/git", "args":["push","origin","main"], "sandbox_id":"session"
+            })))
+            .await
+            .unwrap();
+        let pending_count = check.pending_approvals.lock().unwrap().len();
+        let events = audit.events().len();
+        for field in ["lease_for_pattern", "extra"] {
+            let mut params =
+                serde_json::json!({"approval_id":result["approval_id"],"decision":"allow"});
+            params[field] = "not-a-boolean".into();
+            assert!(approve.execute(&approve_request(params)).await.is_err());
+        }
+        assert_eq!(check.pending_approvals.lock().unwrap().len(), pending_count);
+        assert!(check.lease_cache.leases.lock().unwrap().is_empty());
+        assert_eq!(audit.events().len(), events);
+    }
+
+    #[tokio::test]
+    async fn approval_snapshots_server_command_and_rejects_replacement_without_consuming_it() {
+        let (check, approve) = create_execve_handlers(
+            Arc::new(InMemoryAuditEmitter::new()),
+            Arc::new(test_mapper()),
+        );
+        let input = test_request(serde_json::json!({
+            "executable":"/usr/bin/git", "args":["push","origin","main"], "cwd":"/approved", "sandbox_id":"session"
+        }));
+        let result = check.execute(&input).await.unwrap();
+        let approval_id: Uuid = result["approval_id"].as_str().unwrap().parse().unwrap();
+        let request =
+            approve_request(serde_json::json!({"approval_id":approval_id,"decision":"allow"}));
+        let prepared = approve.prepare(&request).unwrap();
+        assert_eq!(
+            prepared.target()["command"],
+            r#"["/usr/bin/git","push","origin","main"]"#
+        );
+        assert_eq!(prepared.target()["sandbox_id"], "session");
+        assert_eq!(prepared.target()["pattern"], "git push *");
+        assert_eq!(
+            prepared.params()["pending"]["request_context"]["client_identity"]["uid"],
+            501
+        );
+        assert_eq!(check.pending_approvals.lock().unwrap().len(), 1);
+        let replacement = {
+            let mut pending = check.pending_approvals.lock().unwrap();
+            let item = pending.get_mut(&approval_id).unwrap();
+            item.generation = Uuid::new_v4();
+            item.check.input.args.push("--different".into());
+            item.clone()
+        };
+        assert!(prepared.execute().await.unwrap_err().contains("changed"));
+        assert_eq!(
+            check.pending_approvals.lock().unwrap().get(&approval_id),
+            Some(&replacement)
+        );
+        assert!(check.lease_cache.leases.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepared_approval_consumes_once_and_ignores_later_request_edits() {
+        let (check, approve) = create_execve_handlers(
+            Arc::new(InMemoryAuditEmitter::new()),
+            Arc::new(test_mapper()),
+        );
+        let result = check
+            .execute(&test_request(serde_json::json!({
+                "executable":"/usr/bin/git", "args":["push","origin","main"], "sandbox_id":"session"
+            })))
+            .await
+            .unwrap();
+        let mut request = approve_request(
+            serde_json::json!({"approval_id":result["approval_id"],"decision":"allow"}),
+        );
+        let prepared = approve.prepare(&request).unwrap();
+        let duplicate = approve.prepare(&request).unwrap();
+        request.params["decision"] = "deny".into();
+        request.params["lease_for_pattern"] = false.into();
+        assert_eq!(prepared.execute().await.unwrap()["lease_ttl_secs"], 300);
+        assert!(duplicate.execute().await.is_err());
+        assert!(check.pending_approvals.lock().unwrap().is_empty());
+        assert_eq!(check.lease_cache.leases.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn expired_pending_authority_rejects_before_preparation() {
+        let (check, approve) = create_execve_handlers(
+            Arc::new(InMemoryAuditEmitter::new()),
+            Arc::new(test_mapper()),
+        );
+        let result = check
+            .execute(&test_request(serde_json::json!({
+                "executable":"/usr/bin/git", "args":["push","origin","main"]
+            })))
+            .await
+            .unwrap();
+        let approval_id: Uuid = result["approval_id"].as_str().unwrap().parse().unwrap();
+        check
+            .pending_approvals
+            .lock()
+            .unwrap()
+            .get_mut(&approval_id)
+            .unwrap()
+            .created_at = Instant::now() - Duration::from_secs(600);
+        let request =
+            approve_request(serde_json::json!({"approval_id":approval_id,"decision":"allow"}));
+        assert!(approve.prepare(&request).unwrap_err().contains("expired"));
+        assert!(check.lease_cache.leases.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unmatched_argv_boundaries_cannot_reuse_another_commands_lease() {
+        let mapper = ExecveMapper::new(
+            vec![],
+            ExecveDefault {
+                decision: ExecveDefaultDecision::Prompt,
+            },
+        );
+        let (check, approve) =
+            create_execve_handlers(Arc::new(InMemoryAuditEmitter::new()), Arc::new(mapper));
+        let first = test_request(
+            serde_json::json!({"executable":"/bin/tool","args":["a b"],"sandbox_id":"session"}),
+        );
+        let prompted = check.execute(&first).await.unwrap();
+        approve
+            .execute(&approve_request(
+                serde_json::json!({"approval_id":prompted["approval_id"],"decision":"allow"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(check.execute(&first).await.unwrap()["decision"], "allow");
+        let second = test_request(
+            serde_json::json!({"executable":"/bin/tool","args":["a","b"],"sandbox_id":"session"}),
+        );
+        assert_eq!(check.execute(&second).await.unwrap()["decision"], "prompt");
+    }
+
+    #[test]
+    fn truncating_multibyte_hook_arguments_preserves_utf8() {
+        for prefix in [253, 254, 255, 256] {
+            let result = truncate_args(&[format!("{}🙂more", "a".repeat(prefix))]);
+            assert!(result.len() <= MAX_ARGS_AUDIT_LENGTH + 3);
+            assert!(result.ends_with("..."));
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_expiry_is_rechecked_after_preparation_before_grant() {
+        let (check, approve) = create_execve_handlers(
+            Arc::new(InMemoryAuditEmitter::new()),
+            Arc::new(test_mapper()),
+        );
+        let result = check
+            .execute(&test_request(serde_json::json!({
+                "executable":"/usr/bin/git", "args":["push","origin","main"]
+            })))
+            .await
+            .unwrap();
+        let approval_id: Uuid = result["approval_id"].as_str().unwrap().parse().unwrap();
+        check
+            .pending_approvals
+            .lock()
+            .unwrap()
+            .get_mut(&approval_id)
+            .unwrap()
+            .created_at = Instant::now() - Duration::from_millis(599_500);
+        let request =
+            approve_request(serde_json::json!({"approval_id":approval_id,"decision":"allow"}));
+        let prepared = approve.prepare(&request).unwrap();
+        tokio::time::sleep(Duration::from_millis(550)).await;
+        assert!(prepared.execute().await.unwrap_err().contains("expired"));
+        assert!(check.lease_cache.leases.lock().unwrap().is_empty());
+        assert!(check.pending_approvals.lock().unwrap().is_empty());
     }
 }

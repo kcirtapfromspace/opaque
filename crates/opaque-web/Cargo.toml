@@ -19,6 +19,8 @@ bytes = { workspace = true }
 clap = { workspace = true }
 futures-util = { workspace = true }
 getrandom = { workspace = true }
+libc = { workspace = true }
+reqwest = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -31,3 +33,5 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+tempfile = "3"
+wiremock = { workspace = true }

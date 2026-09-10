@@ -246,28 +246,11 @@ struct SetSecretPayload {
     selected_repository_ids: Option<Vec<i64>>,
 }
 
-/// Validate that a URL uses `https://`, allowing `http://` only for localhost.
+/// Validate a credential-free endpoint before it enters action/review metadata.
+/// Parse exactly as the HTTP client does; never echo rejected configuration.
 fn validate_url_scheme(url: &str) -> Result<(), GitHubApiError> {
-    if url.starts_with("https://") {
-        return Ok(());
-    }
-    if url.starts_with("http://") {
-        if let Some(host_part) = url.strip_prefix("http://") {
-            let host = host_part.split('/').next().unwrap_or("");
-            let host_no_port = host.split(':').next().unwrap_or("");
-            if host_no_port == "localhost" || host_no_port == "127.0.0.1" {
-                return Ok(());
-            }
-        }
-        return Err(GitHubApiError::InvalidUrlScheme(format!(
-            "insecure HTTP URL rejected: {url}. \
-             Only https:// URLs are allowed (http:// is permitted for localhost/127.0.0.1 only)"
-        )));
-    }
-    Err(GitHubApiError::InvalidUrlScheme(format!(
-        "unsupported URL scheme: {url}. \
-         Only https:// URLs are allowed (http:// is permitted for localhost/127.0.0.1 only)"
-    )))
+    crate::endpoint::validate_http_endpoint(url)
+        .map_err(|message| GitHubApiError::InvalidUrlScheme(message.into()))
 }
 
 /// GitHub REST API client for secrets.
@@ -278,6 +261,11 @@ pub struct GitHubClient {
 }
 
 impl GitHubClient {
+    /// The endpoint pinned when this client was created.
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     /// Build the user-agent string from the crate version.
     fn user_agent() -> String {
         format!("opaqued/{}", env!("CARGO_PKG_VERSION"))
@@ -313,15 +301,7 @@ impl GitHubClient {
     #[cfg(test)]
     #[allow(dead_code)]
     pub fn with_base_url(base_url: String) -> Self {
-        let http = reqwest::Client::builder()
-            .user_agent(Self::user_agent())
-            .timeout(std::time::Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .build()
-            .expect("failed to build reqwest client");
-
-        Self { http, base_url }
+        Self::from_base_url(&base_url).expect("invalid test GitHub API endpoint")
     }
 
     /// Bind a repository name to the provider's stable numeric identity.
@@ -1064,5 +1044,44 @@ mod tests {
     fn validate_url_scheme_rejects_ftp() {
         let err = validate_url_scheme("ftp://example.com/file").unwrap_err();
         assert!(err.to_string().contains("unsupported URL scheme"));
+    }
+
+    #[test]
+    fn constructor_rejects_sensitive_or_ambiguous_endpoint_without_echoing_it() {
+        for endpoint in [
+            "https://PRIVATE-ENDPOINT-SENTINEL@api.github.com",
+            "https://owner:PRIVATE-ENDPOINT-SENTINEL@api.github.com",
+            "https://@api.github.com",
+            "https://api.github.com?token=PRIVATE-ENDPOINT-SENTINEL",
+            "https://api.github.com#PRIVATE-ENDPOINT-SENTINEL",
+            "https://api.github.com?",
+            "https://api.github.com#",
+            "https://",
+            "https:///api.github.com",
+            "https:api.github.com",
+            "https://api.github.com:99999",
+            " https://api.github.com",
+            "https://api.github.com\n",
+            "https://api.github.com\\path",
+            "http://localhost.evil.invalid",
+            "http://127.0.0.1.evil.invalid",
+        ] {
+            let error = GitHubClient::from_base_url(endpoint).unwrap_err();
+            assert!(!error.to_string().contains("PRIVATE-ENDPOINT-SENTINEL"));
+            assert!(!format!("{error:?}").contains("PRIVATE-ENDPOINT-SENTINEL"));
+        }
+    }
+
+    #[test]
+    fn constructor_preserves_valid_pinned_enterprise_endpoint() {
+        for endpoint in [
+            "https://github.example.invalid/api/v3",
+            "http://localhost:8712/api/v3",
+        ] {
+            assert_eq!(
+                GitHubClient::from_base_url(endpoint).unwrap().base_url(),
+                endpoint
+            );
+        }
     }
 }

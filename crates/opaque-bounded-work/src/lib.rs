@@ -32,3 +32,5 @@ pub mod ssh;
 pub mod task_api;
 pub mod task_facade;
 pub mod task_store;
+
+pub mod mcp;

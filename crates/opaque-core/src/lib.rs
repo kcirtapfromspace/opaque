@@ -6,12 +6,14 @@ pub mod capability;
 pub mod enclave_facade;
 pub mod execve_map;
 pub mod identity;
+pub mod identity_lifecycle;
 pub mod inference;
 pub mod keyfile;
 pub mod operation;
 pub mod operation_handler;
 pub mod peer;
 pub mod policy;
+pub mod policy_regression;
 pub mod profile;
 pub mod proto;
 pub mod release;
@@ -38,3 +40,5 @@ pub const API_VERSION: u32 = 1;
 pub const MAX_FRAME_LENGTH: usize = 128 * 1024;
 
 pub mod resource_auth;
+
+pub mod mcp;

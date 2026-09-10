@@ -164,32 +164,14 @@ pub struct GetParametersByPathResponse {
 
 /// Validate that a URL uses `https://`, allowing `http://` only for localhost.
 fn validate_url_scheme(url: &str) -> Result<(), AwsApiError> {
-    if url.starts_with("https://") {
-        return Ok(());
-    }
-    if url.starts_with("http://") {
-        if let Some(host_part) = url.strip_prefix("http://") {
-            let host = host_part.split('/').next().unwrap_or("");
-            let host_no_port = host.split(':').next().unwrap_or("");
-            if host_no_port == "localhost" || host_no_port == "127.0.0.1" {
-                return Ok(());
-            }
-        }
-        return Err(AwsApiError::BadRequest(format!(
-            "insecure HTTP URL rejected: {url}. \
-             Only https:// URLs are allowed (http:// is permitted for localhost/127.0.0.1 only)"
-        )));
-    }
-    Err(AwsApiError::BadRequest(format!(
-        "unsupported URL scheme: {url}. \
-         Only https:// URLs are allowed (http:// is permitted for localhost/127.0.0.1 only)"
-    )))
+    crate::endpoint::validate_http_endpoint(url)
+        .map_err(|message| AwsApiError::BadRequest(message.into()))
 }
 
 /// Validate the actual parsed destination, including URL authority syntax.
 /// No remote host is permitted even when mock mode is enabled.
 fn validate_mock_url(url: &str) -> Result<(), AwsApiError> {
-    let parsed = reqwest::Url::parse(url).map_err(|_| AwsApiError::MockOnly)?;
+    let parsed = crate::endpoint::parse_endpoint(url).map_err(|_| AwsApiError::MockOnly)?;
     let is_loopback = matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
     if !is_loopback
         || !matches!(parsed.scheme(), "http" | "https")
@@ -233,6 +215,23 @@ pub struct AwsClient {
 }
 
 impl AwsClient {
+    /// Exact selected endpoint, used in both action binding and transport.
+    pub(super) fn endpoint_for_operation(&self, operation: &str) -> Option<&str> {
+        match operation {
+            "aws.get_caller_identity" | "aws.assume_role" => Some(&self.sts_url),
+            "aws.list_secrets"
+            | "aws.get_secret_value"
+            | "aws.create_secret"
+            | "aws.put_secret_value"
+            | "aws.delete_secret" => Some(&self.secretsmanager_url),
+            "aws.get_parameter"
+            | "aws.put_parameter"
+            | "aws.get_parameters_by_path"
+            | "aws.delete_parameter" => Some(&self.ssm_url),
+            _ => None,
+        }
+    }
+
     /// Only explicit mock configuration enables an AWS resolver or handler.
     pub fn from_mock_env() -> Result<Option<Self>, AwsApiError> {
         if std::env::var(AWS_ALLOW_INSECURE_ENV).as_deref() != Ok("1") {
@@ -279,6 +278,7 @@ impl AwsClient {
             .user_agent(Self::user_agent())
             .timeout(std::time::Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .no_proxy()
             .build()
             .map_err(AwsApiError::Network)?;
@@ -957,6 +957,32 @@ mod tests {
     fn validate_url_scheme_rejects_ftp() {
         let err = validate_url_scheme("ftp://example.com/file").unwrap_err();
         assert!(err.to_string().contains("unsupported URL scheme"));
+    }
+
+    #[test]
+    fn constructor_rejects_sensitive_endpoint_without_echoing_it() {
+        for endpoint in [
+            "http://endpoint-secret@127.0.0.1:8200",
+            "http://user:endpoint-secret@127.0.0.1:8200",
+            "http://127.0.0.1:8200?token=endpoint-secret",
+            "http://127.0.0.1:8200#endpoint-secret",
+            "http://@127.0.0.1:8200",
+            "http://127.0.0.1:8200?",
+            "http://127.0.0.1:8200#",
+            "http:///127.0.0.1:8200",
+        ] {
+            for urls in [
+                [endpoint, "http://localhost", "http://localhost"],
+                ["http://localhost", endpoint, "http://localhost"],
+                ["http://localhost", "http://localhost", endpoint],
+            ] {
+                let error = AwsClient::new(urls[0], urls[1], urls[2])
+                    .unwrap_err()
+                    .to_string();
+                assert!(!error.contains("endpoint-secret"));
+                assert!(!error.contains(endpoint));
+            }
+        }
     }
 
     #[test]

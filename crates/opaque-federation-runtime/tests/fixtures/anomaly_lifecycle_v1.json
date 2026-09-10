@@ -1,0 +1,16 @@
+[
+  {"name":"approved","events":[{"kind":"approval.required"},{"kind":"approval.granted"},{"kind":"operation.succeeded"}],"rules":[],"pending":0},
+  {"name":"missing_grant","events":[{"kind":"approval.required"},{"kind":"operation.succeeded"}],"rules":["approval_missing"],"pending":0},
+  {"name":"partial_success","events":[{"kind":"operation.succeeded"}],"rules":[],"pending":0,"health":{"terminal_without_observed_requirement":1}},
+  {"name":"partial_grant","events":[{"kind":"approval.granted"},{"kind":"operation.succeeded"}],"rules":[],"pending":0,"health":{"terminal_without_observed_requirement":1}},
+  {"name":"missing_action","events":[{"kind":"approval.required","request_hash":null},{"kind":"operation.succeeded"}],"rules":[],"pending":0,"health":{"missing_lineage":2}},
+  {"name":"wrong_approval","events":[{"kind":"approval.required"},{"kind":"approval.granted","approval_id":"other-round"},{"kind":"operation.succeeded"}],"rules":["approval_lineage_mismatch","approval_missing"],"pending":0},
+  {"name":"wrong_action","events":[{"kind":"approval.required"},{"kind":"approval.granted"},{"kind":"operation.succeeded","request_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}],"rules":["action_lineage_mismatch"],"pending":0},
+  {"name":"unbound_grant","events":[{"kind":"approval.required"},{"kind":"approval.granted","request_hash":null},{"kind":"operation.succeeded"}],"rules":[],"pending":0,"health":{"missing_lineage":1}},
+  {"name":"lease_lineage_unknown","events":[{"kind":"approval.required"},{"kind":"lease.hit"},{"kind":"operation.succeeded"}],"rules":[],"pending":0,"health":{"missing_lineage":1}},
+  {"name":"denied_then_failed","events":[{"kind":"approval.required"},{"kind":"approval.denied"},{"kind":"operation.failed"}],"rules":[],"pending":0},
+  {"name":"denied_then_success","events":[{"kind":"approval.required"},{"kind":"approval.denied"},{"kind":"operation.succeeded"}],"rules":["approval_missing"],"pending":0},
+  {"name":"loss","events":[{"kind":"audit.dropped"}],"rules":["audit_loss_recorded"],"pending":0},
+  {"name":"clock_regression","events":[{"kind":"request.received","ts_utc_ms":200},{"kind":"operation.succeeded","ts_utc_ms":100}],"rules":[],"pending":0,"health":{"clock_regressions":1}},
+  {"name":"open_tail","events":[{"kind":"approval.required"}],"rules":[],"pending":1}
+]

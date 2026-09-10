@@ -40,6 +40,11 @@ pub struct OpCliClient {
 }
 
 impl OpCliClient {
+    /// The absolute executable selected once at construction; no later PATH lookup.
+    pub(super) fn executable_path(&self) -> &str {
+        &self.op_path
+    }
+
     /// Create a new client, resolving the `op` binary path.
     ///
     /// Checks `OPAQUE_1PASSWORD_CLI_PATH` env var first, then searches PATH.
@@ -48,13 +53,18 @@ impl OpCliClient {
         Ok(Self { op_path })
     }
 
+    #[cfg(test)]
+    pub(super) fn preparation_fixture() -> Self {
+        Self {
+            op_path: "/opaque-fixture-not-executed".into(),
+        }
+    }
+
     /// Find the `op` binary path.
     fn find_op_binary() -> Result<String, OpCliError> {
         // Check env var override first.
-        if let Ok(path) = std::env::var(OP_CLI_PATH_ENV)
-            && std::path::Path::new(&path).exists()
-        {
-            return Ok(path);
+        if let Ok(path) = std::env::var(OP_CLI_PATH_ENV) {
+            return Self::canonical_binary_path(&path);
         }
 
         // Search PATH using `which`.
@@ -68,11 +78,21 @@ impl OpCliClient {
         if output.status.success() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
             if !path.is_empty() {
-                return Ok(path);
+                return Self::canonical_binary_path(&path);
             }
         }
 
         Err(OpCliError::NotFound)
+    }
+
+    fn canonical_binary_path(path: &str) -> Result<String, OpCliError> {
+        let path = std::fs::canonicalize(path).map_err(|_| OpCliError::NotFound)?;
+        if !path.is_file() {
+            return Err(OpCliError::NotFound);
+        }
+        path.into_os_string()
+            .into_string()
+            .map_err(|_| OpCliError::NotFound)
     }
 
     /// Run an `op` command and return stdout as a string.
@@ -331,6 +351,33 @@ mod tests {
 
         let err = OpCliError::ParseError("invalid json".into());
         assert!(format!("{err}").contains("invalid json"));
+    }
+
+    #[test]
+    fn executable_selection_resolves_symlinks_and_rejects_nonfiles() {
+        let directory = tempfile::tempdir().unwrap();
+        let real = directory.path().join("op-fixture");
+        std::fs::write(&real, "synthetic-non-executed-binary").unwrap();
+        let link = directory.path().join("op-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let selected = OpCliClient::canonical_binary_path(link.to_str().unwrap()).unwrap();
+        assert_eq!(
+            std::path::Path::new(&selected),
+            real.canonicalize().unwrap()
+        );
+        assert!(std::path::Path::new(&selected).is_absolute());
+        assert!(OpCliClient::canonical_binary_path(directory.path().to_str().unwrap()).is_err());
+        assert!(
+            OpCliClient::canonical_binary_path(directory.path().join("absent").to_str().unwrap())
+                .is_err()
+        );
+        // Replacing the configuration symlink cannot alter the selected path.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("different-op", &link).unwrap();
+        assert_eq!(
+            std::path::Path::new(&selected),
+            real.canonicalize().unwrap()
+        );
     }
 
     // -----------------------------------------------------------------------

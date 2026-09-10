@@ -17,6 +17,9 @@ pub const MAX_CHALLENGE_TTL_SECS: i64 = 300;
 #[serde(deny_unknown_fields)]
 pub struct WorkstationChallenge {
     pub schema_version: u32,
+    /// Version 2 binds current human authority and the exact bounded task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<WorkstationAuthority>,
     pub broker_id: String,
     pub approval_id: String,
     pub request_id: String,
@@ -27,6 +30,93 @@ pub struct WorkstationChallenge {
     pub nonce: String,
     pub created_at: i64,
     pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalBinding {
+    pub tenant: crate::tenant::TenantBinding,
+    pub task_id: String,
+    pub manifest_digest: String,
+    pub request_hash: String,
+    pub policy_digest: String,
+    pub requester: String,
+}
+
+impl ApprovalBinding {
+    pub fn validate(&self) -> Result<(), WorkstationError> {
+        if self.tenant.validate().is_err()
+            || uuid::Uuid::parse_str(&self.task_id).is_err()
+            || decode_hex::<32>(&self.manifest_digest).is_err()
+            || decode_hex::<32>(&self.request_hash).is_err()
+            || decode_hex::<32>(&self.policy_digest).is_err()
+            || !valid_identifier(&self.requester)
+        {
+            return Err(WorkstationError::InvalidChallenge);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkstationAuthority {
+    pub binding: ApprovalBinding,
+    pub principal_id: String,
+    pub public_key_hex: String,
+    pub required_role: String,
+    pub authority_epoch: u64,
+}
+
+impl WorkstationAuthority {
+    fn validate(&self) -> Result<(), WorkstationError> {
+        self.binding.validate()?;
+        if !valid_identifier(&self.principal_id)
+            || self.principal_id == self.binding.requester
+            || decode_hex::<32>(&self.public_key_hex).is_err()
+            || self.required_role.parse::<crate::identity::Role>().is_err()
+        {
+            return Err(WorkstationError::InvalidChallenge);
+        }
+        Ok(())
+    }
+}
+
+/// Human signature and reviewed bytes. `accepted_at` is broker metadata, not
+/// part of the human signature and not an independently signed broker receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedWorkstationReceipt {
+    pub schema_version: u32,
+    pub review: WorkstationReview,
+    pub response: WorkstationResponse,
+    pub accepted_at: i64,
+}
+
+impl SignedWorkstationReceipt {
+    pub fn verify(&self) -> Result<(), WorkstationError> {
+        if self.schema_version != 1 {
+            return Err(WorkstationError::InvalidChallenge);
+        }
+        let challenge = &self.review.challenge;
+        self.review
+            .validate(&challenge.broker_id, self.accepted_at)?;
+        let authority = challenge
+            .authority
+            .as_ref()
+            .ok_or(WorkstationError::InvalidChallenge)?;
+        if uuid::Uuid::parse_str(&self.response.device_id).is_err() {
+            return Err(WorkstationError::InvalidChallenge);
+        }
+        verify_signature(
+            &authority.public_key_hex,
+            &self.response.signature,
+            &workstation_decision_bytes(
+                challenge,
+                self.response.decision == WorkstationDecision::Approve,
+            ),
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,7 +145,7 @@ pub enum WorkstationDecision {
     Reject,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkstationResponse {
     pub device_id: String,
@@ -125,6 +215,33 @@ pub fn review_hash(text: &str) -> String {
     hex(&Sha256::digest(text.as_bytes()))
 }
 
+/// Notice references contain no endpoint, credential, TLS pin or action data.
+pub fn notice_link(broker_id: &str, approval_id: &str) -> Result<String, WorkstationError> {
+    if !valid_identifier(broker_id) || uuid::Uuid::parse_str(approval_id).is_err() {
+        return Err(WorkstationError::InvalidChallenge);
+    }
+    Ok(format!(
+        "opaque-approval://review/{broker_id}/{approval_id}"
+    ))
+}
+
+/// Resolve only against an already enrolled broker. A notification can never
+/// replace transport authority or select another enrollment.
+pub fn resolve_notice(link: &str, enrolled_broker: &str) -> Result<String, WorkstationError> {
+    let parts: Vec<_> = link
+        .strip_prefix("opaque-approval://review/")
+        .ok_or(WorkstationError::InvalidChallenge)?
+        .split('/')
+        .collect();
+    if parts.len() != 2 || notice_link(parts[0], parts[1])? != link {
+        return Err(WorkstationError::InvalidChallenge);
+    }
+    if parts[0] != enrolled_broker {
+        return Err(WorkstationError::WrongBroker);
+    }
+    Ok(parts[1].to_owned())
+}
+
 fn valid_identifier(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
@@ -148,8 +265,10 @@ fn validate_times(created_at: i64, expires_at: i64, now: i64) -> Result<(), Work
 
 impl WorkstationChallenge {
     pub fn validate(&self, broker_id: &str, now: i64) -> Result<(), WorkstationError> {
-        if self.schema_version != 1
-            || !valid_identifier(&self.broker_id)
+        if !matches!(
+            (self.schema_version, &self.authority),
+            (1, None) | (2, Some(_))
+        ) || !valid_identifier(&self.broker_id)
             || uuid::Uuid::parse_str(&self.approval_id).is_err()
             || uuid::Uuid::parse_str(&self.request_id).is_err()
             || !matches!(
@@ -168,6 +287,9 @@ impl WorkstationChallenge {
         }
         if self.broker_id != broker_id {
             return Err(WorkstationError::WrongBroker);
+        }
+        if let Some(authority) = &self.authority {
+            authority.validate()?;
         }
         validate_times(self.created_at, self.expires_at, now)
     }
@@ -227,6 +349,24 @@ fn signed_fields(fields: &[&[u8]]) -> Vec<u8> {
 /// The 32 bytes the workstation signs using Ed25519 (no prehashed Ed25519).
 /// A caller MUST validate the complete review and show it before approving.
 pub fn workstation_decision_bytes(challenge: &WorkstationChallenge, approve: bool) -> Vec<u8> {
+    if let Some(authority) = &challenge.authority {
+        // Struct field order is fixed; the authority contains no unordered maps.
+        let authority_bytes = serde_json::to_vec(authority).expect("authority serialization");
+        return signed_fields(&[
+            b"opaque.workstation-decision.v2",
+            &challenge.schema_version.to_le_bytes(),
+            challenge.broker_id.as_bytes(),
+            challenge.approval_id.as_bytes(),
+            challenge.request_id.as_bytes(),
+            challenge.operation.as_bytes(),
+            challenge.content_hash.as_bytes(),
+            challenge.nonce.as_bytes(),
+            &challenge.created_at.to_le_bytes(),
+            &challenge.expires_at.to_le_bytes(),
+            &authority_bytes,
+            if approve { b"approve" } else { b"reject" },
+        ]);
+    }
     signed_fields(&[
         b"opaque.workstation-decision.v1",
         challenge.broker_id.as_bytes(),
@@ -274,6 +414,7 @@ mod tests {
         WorkstationReview {
             challenge: WorkstationChallenge {
                 schema_version: 1,
+                authority: None,
                 broker_id: "opq-broker".into(),
                 approval_id: uuid::Uuid::new_v4().to_string(),
                 request_id: uuid::Uuid::new_v4().to_string(),

@@ -9,6 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+zeroize = { workspace = true }
 opaque-core = { path = "../opaque-core" }
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }

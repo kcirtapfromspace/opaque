@@ -93,6 +93,9 @@ pub struct BundlePayload {
     /// The org policy. When a bundle is applied these rules are authoritative
     /// (they replace local `[[rules]]`).
     pub rules: Vec<PolicyRule>,
+    /// Optional pinned MCP registry. Runtime consumption is opt-in and strictly expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_registry: Option<crate::mcp::RegistryDocument>,
 }
 
 impl BundlePayload {
@@ -118,6 +121,10 @@ impl BundlePayload {
             return Err(BundleError::InvalidPayload(
                 "expires_at <= issued_at".into(),
             ));
+        }
+        if let Some(registry) = &self.mcp_registry {
+            crate::mcp::Registry::from_document(registry)
+                .map_err(|_| BundleError::InvalidPayload("invalid MCP registry".into()))?;
         }
         for team in &self.teams {
             if team.name.is_empty()
@@ -373,6 +380,7 @@ mod tests {
                 members: vec!["alice@acme.com".into()],
             }],
             rules: vec![],
+            mcp_registry: None,
         }
     }
 

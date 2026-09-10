@@ -433,6 +433,7 @@ mod tests {
                 members: vec!["alice@acme.com".into()],
             }],
             rules: vec![rule],
+            mcp_registry: None,
         }
     }
 

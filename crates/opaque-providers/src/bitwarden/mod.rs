@@ -11,18 +11,19 @@
 //! 2. Otherwise → use default `https://api.bitwarden.com`
 //! 3. If no token is configured → disabled
 
+mod action;
 pub mod client;
 pub mod resolve;
 
 use std::fmt;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use opaque_core::audit::{AuditEvent, AuditEventKind, AuditSink};
 use opaque_core::operation::OperationRequest;
 
-use opaque_core::operation_handler::OperationHandler;
+use opaque_core::operation_handler::{OperationHandler, PreparedOperation};
+
+use action::BitwardenAction;
 use opaque_core::resolver::{BaseResolver, SecretResolver};
 
 use client::BitwardenClient;
@@ -78,18 +79,26 @@ impl BitwardenHandler {
 }
 
 impl OperationHandler for BitwardenHandler {
-    fn execute(
-        &self,
-        request: &OperationRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send + '_>> {
+    fn prepare<'a>(&'a self, request: &OperationRequest) -> Result<PreparedOperation<'a>, String> {
+        let action = BitwardenAction::parse(&request.operation, &request.params)?;
+        let mut secret_refs = vec![self.token_ref.clone()];
+        if let BitwardenAction::ReadSecret { secret_id } = &action {
+            // Preserve the resource selector used by existing secret_names
+            // policies in addition to the service-account credential ref.
+            secret_refs.push(secret_id.clone());
+        }
+        let mut target = action.target();
+        let api_url = self.client.base_url().to_owned();
+        target.insert("bitwarden_api_url".into(), api_url.clone());
+        let action = action::BoundAction { action, api_url };
         let request_id = request.request_id;
-        let params = request.params.clone();
         let operation = request.operation.clone();
         let audit = self.audit.clone();
 
-        Box::pin(async move {
-            match operation.as_str() {
-                "bitwarden.list_projects" => {
+        PreparedOperation::new(action, target, secret_refs, move |action| async move {
+            let action = action.action;
+            match &action {
+                BitwardenAction::ListProjects {} => {
                     audit.emit(
                         AuditEvent::new(AuditEventKind::ProviderFetchStarted)
                             .with_request_id(request_id)
@@ -124,8 +133,8 @@ impl OperationHandler for BitwardenHandler {
 
                     Ok(serde_json::json!({ "projects": sanitized }))
                 }
-                "bitwarden.list_secrets" => {
-                    let project_name = params.get("project").and_then(|v| v.as_str());
+                BitwardenAction::ListSecrets { project } => {
+                    let project_name = project.as_deref();
 
                     audit.emit(
                         AuditEvent::new(AuditEventKind::ProviderFetchStarted)
@@ -184,12 +193,7 @@ impl OperationHandler for BitwardenHandler {
                         "secrets": sanitized,
                     }))
                 }
-                "bitwarden.read_secret" => {
-                    let secret_id = params
-                        .get("secret_id")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| "missing 'secret_id' parameter".to_string())?;
-
+                BitwardenAction::ReadSecret { secret_id } => {
                     audit.emit(
                         AuditEvent::new(AuditEventKind::ProviderFetchStarted)
                             .with_request_id(request_id)
@@ -225,7 +229,6 @@ impl OperationHandler for BitwardenHandler {
                         "value": value,
                     }))
                 }
-                other => Err(format!("unknown Bitwarden operation: {other}")),
             }
         })
     }
@@ -543,5 +546,188 @@ mod tests {
         assert!(result.unwrap_err().contains("project lookup failed"));
 
         cleanup_env();
+    }
+
+    #[test]
+    fn prepared_actions_distinguish_all_projects_from_an_exact_project() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let handler = BitwardenHandler {
+            audit: audit.clone(),
+            client: BitwardenClient::new("http://127.0.0.1:1").unwrap(),
+            token_ref: "env:OPAQUE_MISSING_CANONICAL_BW_TOKEN".into(),
+        };
+        for (operation, params, expected) in [
+            (
+                "bitwarden.list_projects",
+                serde_json::json!({}),
+                serde_json::json!({}),
+            ),
+            (
+                "bitwarden.list_secrets",
+                serde_json::json!({}),
+                serde_json::json!({}),
+            ),
+            (
+                "bitwarden.list_secrets",
+                serde_json::json!({"project":null}),
+                serde_json::json!({}),
+            ),
+            (
+                "bitwarden.list_secrets",
+                serde_json::json!({"project":"Exact Project"}),
+                serde_json::json!({"project":"Exact Project"}),
+            ),
+            (
+                "bitwarden.read_secret",
+                serde_json::json!({"secret_id":"secret-123"}),
+                serde_json::json!({"secret_id":"secret-123"}),
+            ),
+        ] {
+            let mut request = make_request(operation, params);
+            request.target.insert("project".into(), "decoy".into());
+            let prepared = handler.prepare(&request).unwrap();
+            let mut expected = expected;
+            expected["bitwarden_api_url"] = "http://127.0.0.1:1".into();
+            assert_eq!(serde_json::to_value(prepared.target()).unwrap(), expected);
+            let mut expected_refs = vec!["env:OPAQUE_MISSING_CANONICAL_BW_TOKEN".to_string()];
+            if operation == "bitwarden.read_secret" {
+                expected_refs.push("secret-123".into());
+            }
+            assert_eq!(prepared.secret_ref_names(), expected_refs);
+            assert_eq!(prepared.params()["action"], format!("{operation}.v1"));
+        }
+        let absent = handler
+            .prepare(&make_request(
+                "bitwarden.list_secrets",
+                serde_json::json!({}),
+            ))
+            .unwrap();
+        let null = handler
+            .prepare(&make_request(
+                "bitwarden.list_secrets",
+                serde_json::json!({"project":null}),
+            ))
+            .unwrap();
+        assert_eq!(absent.params(), null.params());
+        assert!(audit.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_and_path_ambiguous_actions_fail_before_provider_work() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let handler = BitwardenHandler::new(audit.clone(), "http://127.0.0.1:1").unwrap();
+        for (operation, params) in [
+            (
+                "bitwarden.list_projects",
+                serde_json::json!({"project":"hidden-scope"}),
+            ),
+            ("bitwarden.list_projects", serde_json::json!([])),
+            (
+                "bitwarden.list_secrets",
+                serde_json::json!({"project":false}),
+            ),
+            ("bitwarden.list_secrets", serde_json::json!({"project":""})),
+            (
+                "bitwarden.read_secret",
+                serde_json::json!({"secret_id":"../projects"}),
+            ),
+            (
+                "bitwarden.read_secret",
+                serde_json::json!({"secret_id":"id?other=secret"}),
+            ),
+            (
+                "bitwarden.read_secret",
+                serde_json::json!({"secret_id":"id%2fother"}),
+            ),
+            (
+                "bitwarden.read_secret",
+                serde_json::json!({"secret_id":"id","project":"ignored"}),
+            ),
+        ] {
+            assert!(
+                handler
+                    .execute(&make_request(operation, params))
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(audit.events().is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn prepared_read_executes_original_id_after_request_changes() {
+        let _guard = env_guard();
+        let (handler, mock_server, _) = setup_handler_with_mock().await;
+        Mock::given(method("GET"))
+            .and(path("/api/secrets/approved-id"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id":"approved-id","key":"key","value":"synthetic-fixture"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let mut request = make_request(
+            "bitwarden.read_secret",
+            serde_json::json!({"secret_id":"approved-id"}),
+        );
+        let prepared = handler.prepare(&request).unwrap();
+        request.params["secret_id"] = "changed-id".into();
+        assert_eq!(prepared.target()["secret_id"], "approved-id");
+        assert_eq!(
+            prepared.execute().await.unwrap()["secret_id"],
+            "approved-id"
+        );
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
+        cleanup_env();
+    }
+
+    #[test]
+    fn resource_secret_name_policy_keeps_the_legacy_id_constraint() {
+        use opaque_core::policy::SecretNameMatch;
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let handler = BitwardenHandler {
+            audit: audit.clone(),
+            client: BitwardenClient::new("http://127.0.0.1:1").unwrap(),
+            token_ref: "env:FIXTURE_BW_AUTH".into(),
+        };
+        let policy = SecretNameMatch {
+            patterns: vec!["env:FIXTURE_BW_AUTH".into(), "allowed-id".into()],
+        };
+        let approved = handler
+            .prepare(&make_request(
+                "bitwarden.read_secret",
+                serde_json::json!({"secret_id":"allowed-id"}),
+            ))
+            .unwrap();
+        let mut request = make_request(
+            "bitwarden.read_secret",
+            serde_json::json!({"secret_id":"other-id"}),
+        );
+        request.secret_ref_names = vec!["allowed-id".into()];
+        let denied = handler.prepare(&request).unwrap();
+        assert!(policy.matches(approved.secret_ref_names()));
+        assert!(!policy.matches(denied.secret_ref_names()));
+        assert!(
+            !SecretNameMatch {
+                patterns: vec!["env:FIXTURE_BW_AUTH".into()]
+            }
+            .matches(approved.secret_ref_names())
+        );
+        assert!(audit.events().is_empty());
+    }
+
+    #[test]
+    fn prepared_hash_payload_distinguishes_configured_endpoints() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let first = BitwardenHandler::new(audit.clone(), "http://127.0.0.1:1").unwrap();
+        let second = BitwardenHandler::new(audit.clone(), "http://127.0.0.1:2").unwrap();
+        let request = make_request("bitwarden.list_projects", serde_json::json!({}));
+        let first = first.prepare(&request).unwrap();
+        let second = second.prepare(&request).unwrap();
+        assert_ne!(first.params(), second.params());
+        assert_eq!(first.params()["api_url"], "http://127.0.0.1:1");
+        assert_eq!(first.target()["bitwarden_api_url"], "http://127.0.0.1:1");
+        assert!(audit.events().is_empty());
     }
 }

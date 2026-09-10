@@ -1854,7 +1854,11 @@ impl SqliteAuditSink {
         key: &[u8; 32],
         last_hash: &mut String,
     ) -> Result<(), rusqlite::Error> {
-        let tx = conn.unchecked_transaction()?;
+        // Reserve the writer before reading the rowid snapshot. A deferred
+        // read-to-write upgrade can return SQLITE_BUSY without consulting the
+        // busy handler, losing an accepted batch during transient contention.
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
         let mut candidate_hash = last_hash.clone();
         // Export transports persist rowid cursors. SQLite reuses rowid 1 when
         // a table becomes empty, so allocate beyond the authenticated pruned

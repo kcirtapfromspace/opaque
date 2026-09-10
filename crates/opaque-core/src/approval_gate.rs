@@ -30,6 +30,7 @@ pub struct ApprovalOutcome {
     /// `None` on denial, and on approval paths with no identity binding
     /// (e.g. biometric passed but nobody is logged in).
     pub approver: Option<ApproverIdentity>,
+    pub workstation_receipt: Option<crate::workstation::SignedWorkstationReceipt>,
 }
 
 impl ApprovalOutcome {
@@ -38,6 +39,7 @@ impl ApprovalOutcome {
         Self {
             approved: true,
             approver: None,
+            workstation_receipt: None,
         }
     }
 
@@ -46,6 +48,7 @@ impl ApprovalOutcome {
         Self {
             approved: true,
             approver: Some(approver),
+            workstation_receipt: None,
         }
     }
 
@@ -54,6 +57,7 @@ impl ApprovalOutcome {
         Self {
             approved: false,
             approver: None,
+            workstation_receipt: None,
         }
     }
 }
@@ -64,6 +68,36 @@ impl ApprovalOutcome {
 /// Approval is ALWAYS bound to a specific operation request. There is no
 /// generic "approve" endpoint.
 pub trait ApprovalGate: Send + Sync + std::fmt::Debug {
+    fn authorize_receipt(
+        &self,
+        _requester: Option<&crate::identity::PrincipalContext>,
+        _receipt: &crate::workstation::SignedWorkstationReceipt,
+        _authorize: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
+        Err("approval backend cannot fence remote authority".into())
+    }
+    /// Recheck the currently enrolled key, reviewer role and authority epoch
+    /// immediately before the existing durable effect dispatch fence.
+    fn revalidate_receipt(
+        &self,
+        _receipt: &crate::workstation::SignedWorkstationReceipt,
+    ) -> Result<(), String> {
+        Err("approval backend cannot revalidate a remote receipt".into())
+    }
+
+    fn request_bound_approval(
+        &self,
+        approval_id: Uuid,
+        request: &OperationRequest,
+        factors: &[ApprovalFactor],
+        description: &str,
+        _binding: Option<crate::workstation::ApprovalBinding>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ApprovalOutcome, String>> + Send + '_>,
+    > {
+        self.request_approval(approval_id, request, factors, description)
+    }
+
     /// Present an approval challenge for the given operation request.
     ///
     /// The implementation must:

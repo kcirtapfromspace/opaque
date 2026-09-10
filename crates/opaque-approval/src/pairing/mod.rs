@@ -379,7 +379,28 @@ impl PairingManager {
 
     /// Remove a paired device.
     pub fn remove_device(&self, device_id: &str) -> Result<PairedDevice, PairingError> {
+        let _guard = self
+            .workstation_auth
+            .lock()
+            .map_err(|_| PairingError::InvalidSignature)?;
         Ok(self.device_store.remove_device(device_id)?)
+    }
+
+    /// Serialize revocation/removal with the caller's synchronous durable
+    /// acceptance/dispatch fence. The callback must not reenter pairing.
+    pub fn with_workstation_authority(
+        &self,
+        device_id: &str,
+        action: &mut dyn FnMut(&PairedDevice) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let _guard = self
+            .workstation_auth
+            .lock()
+            .map_err(|_| "workstation authority lock unavailable")?;
+        let device = self
+            .workstation_device(device_id)
+            .map_err(|_| "workstation no longer authorized")?;
+        action(&device)
     }
 
     /// Revoke a paired device (keeps record for audit).

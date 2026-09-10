@@ -251,3 +251,7 @@ See [Deferred roadmap](docs/roadmap-deferred.md). Notably:
 ## License
 
 Business Source License 1.1 (BUSL-1.1). See [LICENSE](LICENSE).
+
+## Building on core
+
+Opaque applications consume public libraries and protocols. See [reusable core](docs/reusable-core.md) and the [independent library consumer](examples/embedded-policy/README.md) for supported integration boundaries. Organization management and deployment automation are separately packaged; local core requires no private component.

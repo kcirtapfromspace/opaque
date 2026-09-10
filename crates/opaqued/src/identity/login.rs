@@ -95,6 +95,7 @@ impl IdentityRuntime {
     pub async fn login_start(self: &Arc<Self>) -> Result<StartedLogin, String> {
         self.attempts.gc();
 
+        let lifecycle_revision = self.store.lifecycle_revision()?;
         let oidc = self.oidc_client().await?;
 
         // Bind the loopback listener first so the redirect URI is exact.
@@ -160,6 +161,7 @@ impl IdentityRuntime {
                     nonce,
                     verifier,
                     redirect_uri,
+                    lifecycle_revision,
                 ),
             )
             .await;
@@ -212,6 +214,7 @@ async fn run_callback_listener(
     nonce: String,
     verifier: String,
     redirect_uri: String,
+    lifecycle_revision: i64,
 ) {
     for _ in 0..MAX_CALLBACK_REQUESTS {
         let (mut stream, peer) = match listener.accept().await {
@@ -287,7 +290,16 @@ async fn run_callback_listener(
             return;
         };
 
-        let outcome = complete_login(&runtime, &oidc, code, &verifier, &nonce, &redirect_uri).await;
+        let outcome = complete_login(
+            &runtime,
+            &oidc,
+            code,
+            &verifier,
+            &nonce,
+            &redirect_uri,
+            lifecycle_revision,
+        )
+        .await;
         let (status, page) = match &outcome {
             AttemptOutcome::Done { .. } => (200, SUCCESS_PAGE),
             _ => (200, ERROR_PAGE),
@@ -347,6 +359,7 @@ fn finish_attempt(runtime: &Arc<IdentityRuntime>, attempt_id: &str, outcome: Att
 }
 
 /// Exchange + verify + persist. Returns the terminal outcome.
+#[allow(clippy::too_many_arguments)]
 async fn complete_login(
     runtime: &Arc<IdentityRuntime>,
     oidc: &super::oidc::OidcClient,
@@ -354,6 +367,7 @@ async fn complete_login(
     verifier: &str,
     nonce: &str,
     redirect_uri: &str,
+    lifecycle_revision: i64,
 ) -> AttemptOutcome {
     let id_token = match oidc.exchange_code(code, verifier, redirect_uri).await {
         Ok(t) => t,
@@ -435,8 +449,8 @@ async fn complete_login(
             };
         }
     };
-    if principal.disabled {
-        info!("login rejected: principal is disabled");
+    if !runtime.principal_permitted(&principal) {
+        info!("login rejected: principal is not currently admitted");
         return AttemptOutcome::Failed {
             reason: "this identity has been disabled".into(),
         };
@@ -461,10 +475,11 @@ async fn complete_login(
         }
     }
 
-    let session = match runtime.store.create_human_session(
+    let session = match runtime.store.create_human_session_at_revision(
         &principal.id,
         runtime.config.session_ttl_secs(),
         &runtime.config.issuer,
+        lifecycle_revision,
     ) {
         Ok(s) => s,
         Err(e) => {

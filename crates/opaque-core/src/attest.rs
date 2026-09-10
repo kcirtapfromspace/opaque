@@ -34,6 +34,8 @@ pub enum AttestError {
     BadSignature,
     #[error("invalid report payload: {0}")]
     InvalidPayload(String),
+    #[error("verification clock and maximum age must be nonnegative")]
+    InvalidClock,
     #[error("report nonce mismatch (expected {expected}, got {got})")]
     NonceMismatch { expected: String, got: String },
     #[error("report is stale: issued {issued_at}, now {now}, max age {max_age_secs}s")]
@@ -155,6 +157,8 @@ pub fn sign_report(payload: &ReportPayload, key: &SigningKey) -> Result<String, 
 
 /// Verify a report's structure and signature; then bind it to the expected
 /// nonce and freshness window. Signature first, interpretation after.
+/// The verifier clock and maximum age must be nonnegative Unix seconds;
+/// a zero maximum age permits only current or tolerated future reports.
 pub fn verify_report(
     report: &str,
     key: &VerifyingKey,
@@ -162,6 +166,9 @@ pub fn verify_report(
     now_unix: i64,
     max_age_secs: i64,
 ) -> Result<VerifiedReport, AttestError> {
+    if now_unix < 0 || max_age_secs < 0 {
+        return Err(AttestError::InvalidClock);
+    }
     let report = report.trim();
     let mut parts = report.split('.');
     let (prefix, payload_b64, sig_b64) =
@@ -200,7 +207,14 @@ pub fn verify_report(
             got: payload.nonce,
         });
     }
-    if now_unix - payload.issued_at > max_age_secs || payload.issued_at - now_unix > 60 {
+    // Signed timestamps remain untrusted input. Checked differences avoid a
+    // panic (and poisoning a caller's shared-state lock) at the i64 extremes.
+    let age = now_unix.checked_sub(payload.issued_at);
+    let future_skew = payload.issued_at.checked_sub(now_unix);
+    if payload.issued_at < 0
+        || age.is_none_or(|age| age > max_age_secs)
+        || future_skew.is_none_or(|skew| skew > 60)
+    {
         return Err(AttestError::Stale {
             issued_at: payload.issued_at,
             now: now_unix,
@@ -303,6 +317,64 @@ mod tests {
             !p.healthy_for_release(),
             "keys must not flow to a shared-uid daemon"
         );
+    }
+
+    #[test]
+    fn signed_extreme_timestamps_are_rejected_without_panicking() {
+        let signing_key = key();
+        for issued_at in [i64::MIN, -1, i64::MAX] {
+            let mut p = payload(NONCE);
+            p.issued_at = issued_at;
+            let report = sign_report(&p, &signing_key).unwrap();
+            assert!(matches!(
+                verify_report(&report, &signing_key.verifying_key(), NONCE, 100, 60),
+                Err(AttestError::Stale { .. })
+            ));
+        }
+        // Rejection leaves the verifier usable for the next valid signed report.
+        let report = sign_report(&payload(NONCE), &signing_key).unwrap();
+        assert!(
+            verify_report(
+                &report,
+                &signing_key.verifying_key(),
+                NONCE,
+                1_700_000_000,
+                60
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn verification_clock_and_freshness_boundaries_are_explicit() {
+        let signing_key = key();
+        let report = sign_report(&payload(NONCE), &signing_key).unwrap();
+        for (now, max_age) in [(-1, 60), (i64::MIN, 60), (100, -1), (100, i64::MIN)] {
+            assert!(matches!(
+                verify_report(&report, &signing_key.verifying_key(), NONCE, now, max_age),
+                Err(AttestError::InvalidClock)
+            ));
+        }
+        for (issued_at, now, max_age, accepted) in [
+            (0, 0, 0, true),
+            (0, 1, 0, false),
+            (100, 400, 300, true),
+            (100, 401, 300, false),
+            (160, 100, 0, true),
+            (161, 100, 0, false),
+            (i64::MAX, i64::MAX, 0, true),
+            (0, i64::MAX, 60, false),
+            (0, i64::MAX, i64::MAX, true),
+        ] {
+            let mut p = payload(NONCE);
+            p.issued_at = issued_at;
+            let report = sign_report(&p, &signing_key).unwrap();
+            assert_eq!(
+                verify_report(&report, &signing_key.verifying_key(), NONCE, now, max_age).is_ok(),
+                accepted,
+                "issued={issued_at} now={now} maximum_age={max_age}"
+            );
+        }
     }
 
     #[test]

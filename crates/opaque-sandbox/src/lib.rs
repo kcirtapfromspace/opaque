@@ -21,7 +21,6 @@ pub mod macos;
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use opaque_core::audit::{AuditEvent, AuditEventKind, AuditSink};
@@ -30,10 +29,12 @@ use opaque_core::profile::{self, ExecProfile};
 use opaque_core::proto::ExecFrame;
 use tokio::sync::mpsc;
 
-use opaque_core::operation_handler::OperationHandler;
+use opaque_core::operation_handler::{OperationHandler, PreparedOperation, render_argv};
 use opaque_core::resolver::SecretResolver;
 use opaque_core::secret::SecretValue;
 use resolve::{CompositeResolver, resolve_all};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 /// Errors from direct (unsandboxed) execution.
 #[derive(Debug, thiserror::Error)]
@@ -128,36 +129,108 @@ impl SandboxExecutor {
     }
 }
 
+/// The execution profile is owned by the action, but only its digest enters
+/// authorization. Literal environment values never become review/audit fields.
+#[derive(Serialize)]
+struct SandboxAction {
+    version: &'static str,
+    profile_name: String,
+    command: Vec<String>,
+    profile_sha256: String,
+    #[serde(skip)]
+    profile: ExecProfile,
+}
+
+fn profile_digest(profile: &ExecProfile) -> Result<String, String> {
+    let mut canonical =
+        serde_json::to_value(profile).map_err(|_| "cannot encode sandbox profile")?;
+    canonical.sort_all_objects();
+    let bytes = serde_json::to_vec(&canonical).map_err(|_| "cannot encode sandbox profile")?;
+    let mut hash = Sha256::new();
+    hash.update(b"opaque:sandbox:profile:v1\0");
+    hash.update(bytes);
+    Ok(format!("{:x}", hash.finalize()))
+}
+
 impl OperationHandler for SandboxExecutor {
-    fn execute(
-        &self,
+    fn prepare<'a>(&'a self, request: &OperationRequest) -> Result<PreparedOperation<'a>, String> {
+        self.prepare_with_loader(request, Self::load_profile)
+    }
+}
+
+impl SandboxExecutor {
+    fn prepare_with_loader<'a>(
+        &'a self,
         request: &OperationRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send + '_>> {
+        load: impl FnOnce(&str) -> Result<ExecProfile, String>,
+    ) -> Result<PreparedOperation<'a>, String> {
+        if request.operation != "sandbox.exec" {
+            return Err("unknown sandbox operation".into());
+        }
+        let params = request
+            .params
+            .as_object()
+            .ok_or("sandbox params must be an object")?;
+        if params
+            .keys()
+            .any(|key| !matches!(key.as_str(), "profile" | "command"))
+        {
+            return Err("unknown sandbox parameter".into());
+        }
+        let profile_name = params
+            .get("profile")
+            .and_then(|value| value.as_str())
+            .ok_or("missing 'profile' parameter")?
+            .to_owned();
+        if profile_name.is_empty()
+            || !profile_name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-'))
+        {
+            return Err("invalid profile name".into());
+        }
+        let command: Vec<String> = params
+            .get("command")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .ok_or("missing or invalid 'command' parameter")?;
+        if command.is_empty() {
+            return Err("command must not be empty".into());
+        }
+        if command[0].is_empty() || command.iter().any(|value| value.contains('\0')) {
+            return Err("invalid command argument".into());
+        }
+        let profile = load(&profile_name)?;
+        profile::validate_profile(&profile, Some(&profile_name))
+            .map_err(|_| "invalid sandbox profile")?;
+        if profile.env.values().any(|value| value.contains('\0'))
+            || profile.secrets.values().any(|value| value.contains('\0'))
+        {
+            return Err("invalid NUL in sandbox environment or secret reference".into());
+        }
+        let profile_sha256 = profile_digest(&profile)?;
+        let secret_refs = profile.secrets.values().cloned().collect();
+        let target = HashMap::from([
+            ("profile".into(), profile_name.clone()),
+            ("command".into(), render_argv(&command)),
+            ("profile_sha256".into(), profile_sha256.clone()),
+        ]);
+        let action = SandboxAction {
+            version: "sandbox.exec.v1",
+            profile_name,
+            command,
+            profile_sha256,
+            profile,
+        };
         let request_id = request.request_id;
-        let params = request.params.clone();
         let audit = self.audit.clone();
         let resolver_factory = self.resolver_factory;
-
-        Box::pin(async move {
-            // Parse params: profile name + command.
-            let profile_name = params
-                .get("profile")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| "missing 'profile' parameter".to_string())?
-                .to_owned();
-
-            let command: Vec<String> = params
-                .get("command")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .ok_or_else(|| "missing or invalid 'command' parameter".to_string())?;
-
-            if command.is_empty() {
-                return Err("command must not be empty".into());
-            }
-
-            // Load and validate the profile.
-            let profile = Self::load_profile(&profile_name)?;
-
+        PreparedOperation::new(action, target, secret_refs, move |action| async move {
+            let SandboxAction {
+                profile_name,
+                command,
+                profile,
+                ..
+            } = action;
             // Resolve secret references.
             let resolved_secrets = Self::resolve_secrets(&profile, resolver_factory)?;
 
@@ -703,6 +776,186 @@ mod tests {
         assert!(obj.contains_key("stdout_length"));
         assert!(obj.contains_key("stderr_length"));
         assert!(obj.contains_key("truncated"));
+    }
+
+    fn sandbox_request(params: serde_json::Value) -> OperationRequest {
+        OperationRequest {
+            principal: None,
+            request_id: Uuid::new_v4(),
+            client_identity: ClientIdentity {
+                uid: 501,
+                gid: 20,
+                pid: Some(1234),
+                exe_path: None,
+                exe_sha256: None,
+                codesign_team_id: None,
+            },
+            client_type: ClientType::Human,
+            operation: "sandbox.exec".into(),
+            target: HashMap::new(),
+            secret_ref_names: vec![],
+            created_at: std::time::SystemTime::now(),
+            expires_at: None,
+            params,
+            workspace: None,
+        }
+    }
+
+    #[test]
+    fn preparation_validates_argv_before_profile_loading_or_resolution() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let executor = SandboxExecutor::new(audit.clone(), || panic!("must not resolve"));
+        for params in [
+            serde_json::json!({"profile":"test","command":["/bin/echo"],"extra":true}),
+            serde_json::json!({"profile":"test","command":["/bin/echo",1]}),
+            serde_json::json!({"profile":"test","command":["/bin/echo","bad\u{0}arg"]}),
+            serde_json::json!({"profile":"../test","command":["/bin/echo"]}),
+            serde_json::json!({"profile":"test","command":[""]}),
+        ] {
+            assert!(
+                executor
+                    .prepare_with_loader(&sandbox_request(params), |_| panic!(
+                        "must not load invalid action"
+                    ))
+                    .is_err()
+            );
+        }
+        assert!(audit.events().is_empty());
+    }
+
+    #[test]
+    fn profile_digest_is_stable_and_binds_all_execution_configuration() {
+        let mut original = test_profile();
+        original.env = HashMap::from([
+            ("A".into(), "private-literal".into()),
+            ("B".into(), "second".into()),
+        ]);
+        let mut reordered = original.clone();
+        reordered.env = HashMap::from([
+            ("B".into(), "second".into()),
+            ("A".into(), "private-literal".into()),
+        ]);
+        assert_eq!(
+            profile_digest(&original).unwrap(),
+            profile_digest(&reordered).unwrap()
+        );
+        let original_digest = profile_digest(&original).unwrap();
+        let mut variants = vec![];
+        let mut next = original.clone();
+        next.sandbox = !next.sandbox;
+        variants.push(next);
+        let mut next = original.clone();
+        next.network.allow.push("fixture.invalid:443".into());
+        variants.push(next);
+        let mut next = original.clone();
+        next.env.insert("A".into(), "different".into());
+        variants.push(next);
+        let mut next = original.clone();
+        next.secrets
+            .insert("TOKEN".into(), "env:FIXTURE_TOKEN".into());
+        variants.push(next);
+        let mut next = original.clone();
+        next.limits.timeout_secs += 1;
+        variants.push(next);
+        let mut next = original.clone();
+        next.project_dir = "/different".into();
+        variants.push(next);
+        for profile in variants {
+            assert_ne!(original_digest, profile_digest(&profile).unwrap());
+        }
+
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let executor =
+            SandboxExecutor::new(audit.clone(), || panic!("must not resolve during prepare"));
+        original
+            .secrets
+            .insert("TOKEN".into(), "env:FIXTURE_TOKEN".into());
+        let request = sandbox_request(
+            serde_json::json!({"profile":original.name,"command":["/bin/echo","a b"]}),
+        );
+        let prepared = executor
+            .prepare_with_loader(&request, |_| Ok(original.clone()))
+            .unwrap();
+        assert_eq!(prepared.secret_ref_names(), ["env:FIXTURE_TOKEN"]);
+        assert_eq!(prepared.target()["command"], r#"["/bin/echo","a b"]"#);
+        assert_eq!(
+            prepared.target()["profile_sha256"],
+            profile_digest(&original).unwrap()
+        );
+        assert!(!prepared.params().to_string().contains("private-literal"));
+        assert!(prepared.params().get("profile").is_none());
+        assert!(audit.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepared_executor_uses_owned_profile_after_file_and_request_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fixture.toml");
+        let content = format!(
+            r#"
+[profile]
+name = "snapshot"
+sandbox = false
+project_dir = {:?}
+[env]
+MARKER = "DO_NOT_SHOW_THIS_VALUE"
+[limits]
+timeout_secs = 3
+max_output_bytes = 1024
+"#,
+            directory.path().display().to_string()
+        );
+        std::fs::write(&path, &content).unwrap();
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let executor = SandboxExecutor::new(audit.clone(), Vec::new);
+        let mut request = sandbox_request(serde_json::json!({
+            "profile":"snapshot", "command":["/bin/sh","-c","test ${#MARKER} -eq 22"]
+        }));
+        let mut loads = 0;
+        let prepared = executor
+            .prepare_with_loader(&request, |name| {
+                loads += 1;
+                profile::load_profile(&std::fs::read_to_string(&path).unwrap(), Some(name))
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert_eq!(loads, 1);
+        assert!(audit.events().is_empty());
+        assert!(
+            !prepared
+                .params()
+                .to_string()
+                .contains("DO_NOT_SHOW_THIS_VALUE")
+        );
+        std::fs::write(&path, content.replace("DO_NOT_SHOW_THIS_VALUE", "changed")).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        request.params["command"] = serde_json::json!(["/usr/bin/false"]);
+        let result = prepared.execute().await.unwrap();
+        assert_eq!(result["exit_code"], 0);
+        assert_eq!(loads, 1);
+    }
+
+    #[test]
+    fn long_and_distinct_argv_keep_their_exact_canonical_rendering() {
+        let executor = SandboxExecutor::new(Arc::new(InMemoryAuditEmitter::new()), Vec::new);
+        let mut requests = vec![];
+        for command in [
+            serde_json::json!(["/bin/echo", "a b"]),
+            serde_json::json!(["/bin/echo", "a", "b"]),
+            serde_json::json!(["/bin/echo", "x".repeat(8192)]),
+        ] {
+            let request = sandbox_request(serde_json::json!({"profile":"test","command":command}));
+            requests.push(
+                executor
+                    .prepare_with_loader(&request, |_| Ok(test_profile()))
+                    .unwrap(),
+            );
+        }
+        assert_ne!(
+            requests[0].target()["command"],
+            requests[1].target()["command"]
+        );
+        assert!(requests[2].target()["command"].len() > 8192);
     }
 }
 

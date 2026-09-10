@@ -132,14 +132,10 @@ pub struct OperationDef {
     #[serde(default)]
     pub allowed_target_keys: Vec<String>,
 
-    /// Param keys that contain secret references (e.g. `"value_ref"`,
-    /// `"github_token_ref"`). Used by the enclave to derive
-    /// `secret_ref_names` server-side instead of trusting client input.
-    ///
-    /// If non-empty, the enclave extracts the string values of these keys
-    /// from `params` and uses them as the authoritative `secret_ref_names`.
-    /// If empty, the operation does not reference secrets through params
-    /// (e.g. browse/list operations).
+    /// Catalog metadata describing explicit secret-reference inputs. Generic
+    /// authorization uses the installed handler's prepared action, including
+    /// implicit credential references and captured profile references. This list
+    /// is not an authorization source and must never name raw secret values.
     #[serde(default)]
     pub secret_ref_param_keys: Vec<String>,
 }
