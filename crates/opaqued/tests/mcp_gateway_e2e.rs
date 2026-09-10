@@ -254,35 +254,12 @@ impl Adapter {
                 .unwrap();
         bytes.push(b'\n');
         self.input.write_all(&bytes).await.unwrap();
-        let line = tokio::time::timeout(Duration::from_secs(15), self.output.next_line())
+        let line = tokio::time::timeout(Duration::from_secs(45), self.output.next_line())
             .await
             .unwrap()
             .unwrap()
             .unwrap();
         serde_json::from_str(&line).unwrap()
-    }
-
-    async fn catalog_ready(&mut self, server: &McpServer) -> Value {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            // tools/list deliberately falls back to static tools after two
-            // seconds. Cold peer attestation on hosted runners can exceed that
-            // budget. Retry only this read, never a tool invocation.
-            let catalog = tokio::time::timeout_at(deadline, self.call("tools/list", json!({})))
-                .await
-                .expect("signed tool did not become discoverable before the readiness deadline");
-            assert_eq!(server.all.load(Ordering::SeqCst), 0);
-            assert!(!catalog.to_string().contains("unapproved_admin"));
-            if catalog["result"]["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|tool| tool["name"] == "opaque_mcp_tool_post_note")
-            {
-                return catalog;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
     }
 }
 #[derive(Clone)]
@@ -428,7 +405,7 @@ async fn adapter_signed_tool_daemon_effect_receipt_and_replay_survive_restart() 
         .unwrap();
     assert_eq!(operation["availability"], "fixture_only");
     assert_eq!(operation["execution_paths"], json!(["mcp_invocation"]));
-    let catalog = adapter.catalog_ready(&state).await;
+    let catalog = adapter.call("tools/list", json!({})).await;
     assert!(
         catalog["result"]["tools"]
             .as_array()

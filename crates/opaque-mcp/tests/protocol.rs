@@ -73,6 +73,148 @@ fn daemon_fixture() -> (tempfile::TempDir, UnixListener) {
 }
 
 #[tokio::test]
+async fn delayed_authenticated_catalog_remains_discoverable_without_blocking_ping_or_retrying() {
+    let (directory, listener) = daemon_fixture();
+    let mut server = Server::start(directory.path());
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let daemon = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
+        let handshake: Value =
+            serde_json::from_slice(&framed.next().await.unwrap().unwrap()).unwrap();
+        assert_eq!(
+            handshake,
+            json!({"handshake":"v1","daemon_token":"test-token"})
+        );
+        let request: Value =
+            serde_json::from_slice(&framed.next().await.unwrap().unwrap()).unwrap();
+        assert_eq!(request, json!({"id":1,"method":"mcp_catalog","params":{}}));
+        ready_tx.send(()).unwrap();
+        // Hold the authenticated catalog until after the control response,
+        // then exceed the former two-second discovery cutoff deliberately.
+        release_rx.await.unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        framed
+            .send(
+                serde_json::to_vec(&json!({"id":1,"result":{"tools":[{
+                    "name":"opaque_mcp_tool_fixture_note",
+                    "description":"Enrolled fixture tool",
+                    "inputSchema":{"type":"object","additionalProperties":false}
+                }]}}))
+                .unwrap()
+                .into(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), framed.next())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Discovery sends one read-only request and never retries it or work.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+    });
+    server
+        .send(json!({"jsonrpc":"2.0","id":"slow-list","method":"tools/list"}))
+        .await;
+    tokio::time::timeout(Duration::from_secs(5), ready_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    server
+        .send(json!({"jsonrpc":"2.0","id":"responsive-ping","method":"ping"}))
+        .await;
+    assert_eq!(
+        server.receive().await,
+        json!({"jsonrpc":"2.0","id":"responsive-ping","result":{}})
+    );
+    release_tx.send(()).unwrap();
+    let listed = server.receive().await;
+    assert_eq!(listed["id"], "slow-list");
+    let tools = listed["result"]["tools"].as_array().unwrap();
+    assert!(tools.iter().any(|tool| tool["name"] == "opaque_task_list"));
+    assert_eq!(
+        tools
+            .iter()
+            .filter(|tool| tool["name"] == "opaque_mcp_tool_fixture_note")
+            .collect::<Vec<_>>(),
+        vec![&json!({
+            "name":"opaque_mcp_tool_fixture_note",
+            "description":"Enrolled fixture tool",
+            "inputSchema":{"type":"object","additionalProperties":false}
+        })]
+    );
+    tokio::time::timeout(Duration::from_secs(5), daemon)
+        .await
+        .unwrap()
+        .unwrap();
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn authenticated_catalog_error_keeps_static_tools_without_retry_or_error_disclosure() {
+    let (directory, listener) = daemon_fixture();
+    let mut server = Server::start(directory.path());
+    let daemon = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
+        let handshake: Value =
+            serde_json::from_slice(&framed.next().await.unwrap().unwrap()).unwrap();
+        assert_eq!(
+            handshake,
+            json!({"handshake":"v1","daemon_token":"test-token"})
+        );
+        let request: Value =
+            serde_json::from_slice(&framed.next().await.unwrap().unwrap()).unwrap();
+        assert_eq!(request, json!({"id":1,"method":"mcp_catalog","params":{}}));
+        framed
+            .send(
+                serde_json::to_vec(&json!({"id":1,"error":{
+                    "code":"catalog_unavailable","message":"synthetic-private-catalog-detail"
+                }}))
+                .unwrap()
+                .into(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+    });
+    server
+        .send(json!({"jsonrpc":"2.0","id":"unavailable-list","method":"tools/list"}))
+        .await;
+    let listed = server.receive().await;
+    assert_eq!(listed["id"], "unavailable-list");
+    assert!(listed.get("error").is_none());
+    assert!(
+        !listed
+            .to_string()
+            .contains("synthetic-private-catalog-detail")
+    );
+    let tools = listed["result"]["tools"].as_array().unwrap();
+    assert!(tools.iter().any(|tool| tool["name"] == "opaque_task_list"));
+    assert!(
+        tools
+            .iter()
+            .all(|tool| !tool["name"].as_str().unwrap().starts_with("opaque_mcp_"))
+    );
+    tokio::time::timeout(Duration::from_secs(5), daemon)
+        .await
+        .unwrap()
+        .unwrap();
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn offline_gateway_contract_does_not_enable_runtime_proxying() {
     let (directory, listener) = daemon_fixture();
     let mut server = Server::start(directory.path());

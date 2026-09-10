@@ -4,11 +4,10 @@ use super::*;
 const PREFIX: &str = "opaque_mcp_tool_";
 pub async fn list(id: Option<serde_json::Value>, client: &DaemonClient) -> JsonRpcResponse {
     let mut response = handle_tools_list(id);
-    if let Ok(Ok(reply)) = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        client.call("mcp_catalog", json!({})),
-    )
-    .await
+    // DaemonClient already bounds this read-only exchange to 30 seconds,
+    // including peer authentication. A shorter outer deadline can repeatedly
+    // hide enrolled tools while the daemon is still attesting the adapter.
+    if let Ok(reply) = client.call("mcp_catalog", json!({})).await
         && reply.error.is_none()
         && let Some(tools) = reply.result.and_then(|v| {
             v.get("tools")
