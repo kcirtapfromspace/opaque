@@ -263,9 +263,11 @@ async fn batch_client_closing_stdin_still_receives_every_response() {
     std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut server = Server::start(directory.path());
     server
-        .send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        .send(
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
             "protocolVersion": "2024-11-05", "capabilities": {},
-            "clientInfo": {"name": "batch-check", "version": "1"}}}))
+            "clientInfo": {"name": "batch-check", "version": "1"}}}),
+        )
         .await;
     server
         .send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
@@ -276,8 +278,10 @@ async fn batch_client_closing_stdin_still_receives_every_response() {
     // The daemon socket does not exist, so the call resolves as an error
     // result. It must still be answered after EOF.
     server
-        .send(json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
-            "name": "opaque_task_list", "arguments": {}}}))
+        .send(
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+            "name": "opaque_task_list", "arguments": {}}}),
+        )
         .await;
     server.input.shutdown().await.unwrap();
     let mut answered = std::collections::BTreeSet::new();
