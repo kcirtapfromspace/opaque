@@ -9,9 +9,6 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-axum = { workspace = true }
-clap = { workspace = true }
-uuid = { workspace = true }
 zeroize = { workspace = true }
 opaque-core = { path = "../opaque-core" }
 base64 = { workspace = true }

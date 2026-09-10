@@ -1,6 +1,19 @@
 //! Broker-owned periodic reporting. Only compact audit identity/hash metadata
 //! is exported here; full audit export remains the existing separate transport.
 use super::*;
+use rusqlite::{Connection, params};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+fn sql<T>(result: rusqlite::Result<T>) -> Result<T> {
+    result.map_err(|_| "audit metadata unavailable".into())
+}
+fn now() -> i64 {
+    opaque_core::identity::now_unix()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReporterConfig {
@@ -24,7 +37,9 @@ impl Reporter {
         attestor: Arc<crate::attest::AttestationService>,
         state_dir: &Path,
     ) -> Result<Self> {
-        binding_parts(&binding)?;
+        binding
+            .validate()
+            .map_err(|_| "invalid tenant/broker binding")?;
         let base =
             reqwest::Url::parse(&config.collector_url).map_err(|_| "invalid collector URL")?;
         let loopback = base
@@ -209,7 +224,7 @@ fn read_evidence(path: &Path, after: Option<u64>) -> Result<Evidence> {
     ))?;
     let mut statement=sql(conn.prepare("SELECT sequence_number,event_id,record_hash FROM audit_events WHERE sequence_number>?1 ORDER BY sequence_number LIMIT ?2"))?;
     let entries = sql(
-        statement.query_map(params![after.unwrap_or(0), MAX_BATCH], |r| {
+        statement.query_map(params![after.unwrap_or(0), MAX_EXPORT_BATCH], |r| {
             Ok(ExportEntry {
                 sequence: r.get(0)?,
                 event_id: r.get(1)?,
@@ -223,4 +238,32 @@ fn read_evidence(path: &Path, after: Option<u64>) -> Result<Evidence> {
         audit_head: head,
         export_entries: entries,
     })
+}
+
+fn read_private_file(path: &Path, max: u64) -> Result<Vec<u8>> {
+    use std::{
+        io::Read,
+        os::unix::fs::{MetadataExt, OpenOptionsExt},
+    };
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|_| "private file unavailable")?;
+    let meta = f.metadata().map_err(|_| "private file unavailable")?;
+    if !meta.is_file()
+        || meta.uid() != unsafe { libc::geteuid() }
+        || meta.mode() & 0o7077 != 0
+        || meta.len() > max
+    {
+        return Err("file must be a bounded, owned private regular file".into());
+    }
+    let mut bytes = Vec::new();
+    f.take(max.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|_| "private file unavailable")?;
+    if bytes.len() as u64 > max {
+        return Err("private file exceeds bound".into());
+    }
+    Ok(bytes)
 }

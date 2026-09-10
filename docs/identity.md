@@ -67,6 +67,71 @@ URIs (RFC 8252). The daemon binds the loopback listener and performs the code
 exchange itself with PKCE. The authorization code never passes through the CLI,
 so an agent driving the CLI cannot complete a login.
 
+## Managed identity lifecycle
+
+A provider-neutral adapter can submit membership observations through the public
+[lifecycle contract](https://github.com/kcirtapfromspace/opaque/blob/main/crates/opaque-core/src/identity_lifecycle.rs). The broker
+owns admission, role mapping, authority epochs and revocation. An adapter never
+opens its identity database or submits roles directly.
+
+Enable managed lifecycle only with sealed configuration, enforced tenant custody,
+a tenant binding, `identity.required = true`, and explicit
+`identity.allowed_subjects`. Add these settings to the reviewed configuration:
+
+```toml
+[lifecycle]
+socket_path = "/run/opaque/identity-lifecycle.sock"
+allowed_adapter_uids = [7383]
+socket_gid = 7999
+token_file = "/var/lib/opaque/.opaque/identity-lifecycle.token"
+
+[lifecycle.group_roles]
+reviewers = ["approver", "operator"]
+```
+
+The example assumes broker UID 7381 and a separately isolated adapter UID 7383.
+Preprovision the socket parent as broker-owned, group 7999, mode 0750; grant the
+adapter only traversal and socket access. Every ancestor must be broker/root
+controlled without untrusted writes; root-owned sticky temporary directories are
+permitted. The socket is broker-owned mode 0660. Store a separate random
+32–128-character URL-safe credential without whitespace in owner-only
+`identity-lifecycle.token` directly inside broker custody. Give the adapter its
+own private copy of only that credential. Keep task, approval, provider and
+lifecycle credentials distinct. Same-UID processes share a trust boundary.
+
+The wire format is one big-endian `u32` length followed by one JSON
+`LifecycleRequest`, then one similarly framed `LifecycleResponse`. The public
+`identity_lifecycle::deliver(socket, broker_uid, credential, batch)` client checks
+path custody, socket ownership and the connected OS peer UID **before sending any
+credential or mutation bytes**. The broker separately checks the adapter peer UID
+against `allowed_adapter_uids` and authenticates the dedicated credential. There
+is no TCP or HTTP fallback. Frames are bounded, connections have a 10-second
+deadline, and at most 32 requests are handled concurrently.
+
+Each version-1 batch carries the exact tenant/broker binding, configured issuer,
+strictly sequential source revision starting at one, and at most 4,096 subject
+updates within 2 MiB. Each subject must be explicitly admitted and may carry at
+most 128 group identifiers. Core maps those identifiers through the sealed role
+mapping. Unprovisioned humans cannot bootstrap admin or log in under managed
+mode. Deleted subjects remain tombstoned; terminal `suspend` batches revoke human
+authority and cannot be remotely cleared.
+
+A successful receipt binds tenant, issuer, revision and the SHA-256 digest of the
+serialized batch. Adapters must verify all those values before acknowledging a
+source update, retain pending deliveries durably, and retry the exact batch after
+an uncertain result. Only exact replay of the most recent committed revision is
+acknowledged again. Updating authority and final task dispatch share the identity
+writer lock; removal/regrant does not restore old sessions, delegations or
+reviewer authority. A receipt cannot recall an already completed external effect.
+
+The broker holds a lifetime endpoint writer lock. On restart it retires only an
+owned stale socket after observing connection refusal; active sockets and
+unrelated files remain untouched. Managed state cannot be silently disabled by
+removing its configuration. Legacy `[scim]` configuration and persisted legacy
+managed identity state fail closed with an explicit offline-migration requirement.
+No automatic migration, authority reset, remote transport or retention pruning is
+provided by this contract.
+
 ## Commands
 
 ```console

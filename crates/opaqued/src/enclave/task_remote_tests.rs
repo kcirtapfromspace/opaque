@@ -265,7 +265,7 @@ impl Fixture {
             RemoteApprovalConfig {
                 reviewer_public_key_hex: public_key,
                 required_role: "operator".into(),
-                slack: None,
+                notice_token_file: None,
             },
             &directory.path().join("remote.db"),
             tenant.clone(),

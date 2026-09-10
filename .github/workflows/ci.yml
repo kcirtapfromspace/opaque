@@ -63,6 +63,9 @@ jobs:
       - name: Run workspace tests
         run: cargo test --locked --workspace --all-features
 
+      - name: Build independent core consumer
+        run: cargo run --locked --manifest-path examples/embedded-policy/Cargo.toml
+
       - name: Verify wrapper enforcement handshake test
         # --exact needs the full module path; a bare name matches 0 tests and
         # passes vacuously. The grep guard fails the step if the test ever

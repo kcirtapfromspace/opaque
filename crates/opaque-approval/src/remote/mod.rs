@@ -1,6 +1,7 @@
-//! Collaboration delivery carries an opaque reference only. Authorization is
-//! still a full review on a separately enrolled workstation.
-mod slack;
+//! Portable remote review authority and an opaque, read-only notice contract.
+//! Notification delivery is implemented by independent adapters; authorization
+//! remains a full review on a separately enrolled workstation.
+pub mod notices;
 pub mod store;
 
 use crate::pairing::PairingManager;
@@ -36,18 +37,7 @@ pub struct RemoteApprovalConfig {
     pub reviewer_public_key_hex: String,
     pub required_role: String,
     #[serde(default)]
-    pub slack: Option<SlackConfig>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SlackConfig {
-    pub channel_id: String,
-    pub token_file: PathBuf,
-    /// Production is fixed to Slack. The optional fixture endpoint must be a
-    /// literal loopback HTTP address, never a production credential destination.
-    #[serde(default)]
-    pub fixture_endpoint: Option<String>,
+    pub notice_token_file: Option<PathBuf>,
 }
 
 pub struct RemoteApprovals {
@@ -57,13 +47,13 @@ pub struct RemoteApprovals {
     resolver: ReviewerResolver,
     authority_guard: ReviewerAuthorityGuard,
     pub store: Arc<RemoteStore>,
-    slack: Option<slack::SlackTransport>,
+    notice_token_hash: Option<[u8; 32]>,
 }
 
 impl std::fmt::Debug for RemoteApprovals {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RemoteApprovals")
-            .field("notifications_enabled", &self.slack.is_some())
+            .field("notifications_enabled", &self.notice_token_hash.is_some())
             .finish()
     }
 }
@@ -90,10 +80,15 @@ impl RemoteApprovals {
             .required_role
             .parse::<opaque_core::identity::Role>()
             .map_err(|_| "invalid remote reviewer role")?;
-        let slack = config
-            .slack
-            .clone()
-            .map(slack::SlackTransport::new)
+        let notice_token_hash = config
+            .notice_token_file
+            .as_ref()
+            .map(|token_path| {
+                if token_path.parent() != path.parent() {
+                    return Err("notice credential must be directly inside broker custody".into());
+                }
+                notices::token_hash(token_path)
+            })
             .transpose()?;
         let store = Arc::new(RemoteStore::open(
             path,
@@ -107,7 +102,7 @@ impl RemoteApprovals {
             resolver,
             authority_guard,
             store,
-            slack,
+            notice_token_hash,
         });
         // Enrollment may not yet have completed its transport-token exchange.
         // Principal mapping must already be explicit in trusted configuration.
@@ -162,7 +157,7 @@ impl RemoteApprovals {
 
     pub fn enqueue(&self, review: &WorkstationReview) -> Result<(), String> {
         self.check_current(review, None)?;
-        self.store.enqueue(review, now(), self.slack.is_some())
+        self.store.enqueue(review, now())
     }
 
     pub(crate) fn check_current(
@@ -327,35 +322,28 @@ impl RemoteApprovals {
         Ok(())
     }
 
-    /// A delivery failure is never an approval. Notifications alone may retry;
-    /// the durable decision and task dispatch remain single consumption.
-    pub async fn deliver_one(&self) -> Result<bool, String> {
-        let Some(slack) = &self.slack else {
-            return Ok(false);
+    pub(crate) fn authorize_notice_feed(&self, headers: &axum::http::HeaderMap) -> bool {
+        use sha2::{Digest, Sha256};
+        let Some(expected) = self.notice_token_hash else {
+            return false;
         };
-        let Some(notice) = self.store.claim_notice(now())? else {
-            return Ok(false);
+        if headers.contains_key("origin") || headers.get_all("authorization").iter().count() != 1 {
+            return false;
+        }
+        let Some(token) = headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .filter(|token| (32..=128).contains(&token.len()))
+        else {
+            return false;
         };
-        if !self.store.notice_active(&notice, now())? {
-            return Ok(true);
-        }
-        let delivered = slack.send(&notice).await.is_ok();
-        self.store.finish_notice(&notice, delivered, now())?;
-        Ok(true)
-    }
-
-    pub async fn run_notifications(self: Arc<Self>) {
-        if self.slack.is_none() {
-            return;
-        }
-        loop {
-            match self.deliver_one().await {
-                Ok(true) => continue,
-                Ok(false) => {}
-                Err(_) => tracing::warn!("remote approval notification ledger unavailable"),
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        }
+        let actual: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        actual
+            .iter()
+            .zip(expected)
+            .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+            == 0
     }
 }
 

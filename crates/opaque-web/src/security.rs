@@ -64,6 +64,19 @@ pub async fn validate_origin(
 #[derive(Clone)]
 pub struct AuthToken(pub Arc<String>);
 
+/// Protect every route supplied by a trusted dashboard extension. Extension
+/// routes never inherit the public-shell exemption, regardless of their path.
+pub async fn require_token(
+    axum::extract::State(auth_token): axum::extract::State<AuthToken>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !is_bearer_authorized(request.headers(), &auth_token.0) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    next.run(request).await
+}
+
 /// Middleware that requires a valid `Authorization: Bearer <token>` header
 /// on all requests whose path starts with `/api/`.
 ///

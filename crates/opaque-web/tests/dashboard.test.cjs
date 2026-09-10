@@ -96,10 +96,10 @@ function tabDashboard() {
     };
     return result;
   }
-  const names = ['tasks','audit','policy','sessions','operations','fleet'];
+  const names = ['tasks','audit','policy','sessions','operations'];
   const tabs = names.map(name=>node('tab-'+name, name));
   const panels = names.map(name=>node('panel-'+name));
-  const refresh = node('fleet-refresh');
+  const refresh = node('operations-refresh');
   const workspace = {id:'workspace-content',scrollTop:480};
   refresh.tabIndex = 0;
   const byId = new Map([...tabs,...panels,refresh,workspace].map(node=>[node.id,node]));
@@ -118,24 +118,24 @@ function tabDashboard() {
   return {ui, tabs, panels, refresh, loaded, key, workspace};
 }
 
-test('tab selection exposes exactly one active keyboard tab without rewriting the fleet refresh control', () => {
+test('tab selection exposes exactly one active keyboard tab without rewriting the operation refresh control', () => {
   const {ui,tabs,panels,refresh,loaded,workspace} = tabDashboard();
-  ui.switchTab('fleet');
+  ui.switchTab('operations');
   assert.equal(workspace.scrollTop, 0, 'a different view begins at its heading');
-  assert.equal(ui.state.activeTab, 'fleet');
+  assert.equal(ui.state.activeTab, 'operations');
   for (const tab of tabs) {
-    const selected = tab.getAttribute('data-tab') === 'fleet';
+    const selected = tab.getAttribute('data-tab') === 'operations';
     assert.equal(tab.getAttribute('aria-selected'), String(selected));
     assert.equal(tab.tabIndex, selected ? 0 : -1);
     assert.equal(tab.classList.contains('active'), selected);
   }
   assert.equal(panels.filter(panel=>panel.classList.contains('active')).length, 1);
-  assert.ok(panels.find(panel=>panel.id === 'panel-fleet').classList.contains('active'));
+  assert.ok(panels.find(panel=>panel.id === 'panel-operations').classList.contains('active'));
   assert.equal(refresh.getAttribute('aria-selected'), null);
   assert.equal(refresh.tabIndex, 0);
-  assert.deepEqual(loaded, ['fleet']);
+  assert.deepEqual(loaded, ['operations']);
   workspace.scrollTop = 180;
-  ui.switchTab('fleet');
+  ui.switchTab('operations');
   assert.equal(workspace.scrollTop, 180, 'reselecting the same view preserves its position');
 });
 
@@ -144,13 +144,13 @@ test('tab keyboard navigation wraps and supports Home and End without treating u
   ui.switchTab('tasks');
   tabs[0].focus();
   assert.equal(key('ArrowLeft'), true);
-  assert.equal(ui.state.activeTab, 'fleet');
-  assert.equal(ui.document.activeElement, tabs[5]);
+  assert.equal(ui.state.activeTab, 'operations');
+  assert.equal(ui.document.activeElement, tabs[4]);
   assert.equal(key('ArrowRight'), true);
   assert.equal(ui.state.activeTab, 'tasks');
   assert.equal(ui.document.activeElement, tabs[0]);
   assert.equal(key('End'), true);
-  assert.equal(ui.state.activeTab, 'fleet');
+  assert.equal(ui.state.activeTab, 'operations');
   assert.equal(key('Home'), true);
   assert.equal(ui.state.activeTab, 'tasks');
   assert.equal(key('Escape'), false);
@@ -163,7 +163,7 @@ test('locked tab clicks and keyboard navigation do not activate or load private 
   const {ui,tabs,loaded,key} = tabDashboard();
   ui.auth.unlocked = false;
   tabs[0].focus();
-  ui.switchTab('fleet');
+  ui.switchTab('operations');
   key('End');
   assert.equal(ui.state.activeTab, 'tasks');
   assert.equal(ui.document.activeElement, tabs[0]);
@@ -599,61 +599,7 @@ test('a new locked page sends no protected requests or timers', async () => {
   await fixture.ui.loadTasks();
   await fixture.ui.reconcileTask('some-task');
   await fixture.ui.connectSSE();
-  await fixture.ui.loadFleet();
   assert.equal(fixture.calls.length, 0);
-});
-
-test('fleet view keeps stale posture and unobserved evidence explicitly unknown', () => {
-  const ui = dashboard();
-  const broker = {tenant_id:'tenant-a', broker_id:'22222222-2222-4222-8222-222222222222',
-    status:'stale',current_posture:'healthy',policy_status:'unknown',enrollment_epoch:1};
-  assert.equal(ui.fleetPosture(broker),'Current posture unknown');
-  const rendered = text(ui.buildFleetSnapshot({tenant_id:'tenant-a',observed_at:100,brokers:[broker]}));
-  assert.match(rendered,/Current posture unknown/);
-  assert.match(rendered,/Expected policy unknown/);
-  assert.match(rendered,/Acknowledged through unknown/);
-  assert.match(rendered,/enrolled brokers only/);
-  assert.doesNotMatch(rendered,/Checks passed/);
-});
-
-test('fresh fleet contact with an evidence gap never reports a zero backlog', () => {
-  const ui = dashboard();
-  const broker = {tenant_id:'tenant-a',broker_id:'22222222-2222-4222-8222-222222222222',
-    status:'fresh',current_posture:'healthy',policy_status:'matches',enrollment_epoch:1,
-    evidence_health:'gap',evidence_export_lag_records:0,acknowledged_evidence_sequence:8,
-    last_known_audit_head:20};
-  const rendered = text(ui.buildFleetSnapshot({tenant_id:'tenant-a',observed_at:100,brokers:[broker]}));
-  assert.match(rendered,/Checks passed/);
-  assert.match(rendered,/Evidence gap/);
-  assert.match(rendered,/Acknowledged through 8/);
-  assert.match(rendered,/Highest observed audit sequence 20/);
-  assert.doesNotMatch(rendered,/0 records/);
-});
-
-test('fleet loads only after unlock and late responses cannot repopulate a locked view', async () => {
-  const pending = deferred();
-  const fixture = authDashboard(path => path === '/api/fleet' ? pending.promise : disconnectedResponse(path));
-  await fixture.unlock();
-  assert.ok(!fixture.calls.some(call => call.path === '/api/fleet'));
-  const load = fixture.ui.loadFleet();
-  await nextTurn();
-  fixture.ui.lockDashboard();
-  pending.resolve(jsonResponse({configured:true,snapshot:{tenant_id:'secret-tenant',observed_at:100,brokers:[]}}));
-  await load;
-  assert.equal(fixture.nodes.get('fleet-content').textContent,'');
-  assert.equal(fixture.nodes.get('fleet-content').children.length,0);
-  assert.equal(fixture.ui.state.fleetLoading,false);
-});
-
-test('fleet collector failure removes previous health claims', async () => {
-  const fixture = authDashboard(path => path === '/api/fleet'
-    ? Promise.resolve(jsonResponse({error:'collector unavailable'},502)) : disconnectedResponse(path));
-  await fixture.unlock();
-  fixture.nodes.get('fleet-content').textContent='Previous healthy snapshot';
-  await fixture.ui.loadFleet();
-  const rendered=fixture.nodes.get('fleet-content').children[0].textContent;
-  assert.match(rendered,/Current broker health is unknown/);
-  assert.doesNotMatch(rendered,/Previous healthy/);
 });
 
 test('owner entry initializes once and accepts an authenticated disconnected daemon', async () => {

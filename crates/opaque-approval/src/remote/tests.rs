@@ -4,7 +4,6 @@ use ed25519_dalek::{Signer, SigningKey};
 use opaque_core::workstation::*;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use wiremock::{Mock, MockServer, ResponseTemplate, matchers::*};
 
 struct Rig {
     dir: tempfile::TempDir,
@@ -41,7 +40,7 @@ impl Rig {
         let config = RemoteApprovalConfig {
             reviewer_public_key_hex: device.public_key_hex.clone(),
             required_role: "operator".into(),
-            slack: None,
+            notice_token_file: None,
         };
         Self {
             dir,
@@ -165,7 +164,13 @@ fn signed_receipt_survives_restart_but_unfinished_round_does_not() {
             .accept(&pending, rig.response(&pending, true), &rig.device)
             .is_err()
     );
-    assert!(restarted.store.claim_notice(now()).unwrap().is_none());
+    assert!(
+        restarted
+            .store
+            .receipt(&pending.challenge.approval_id)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -436,87 +441,68 @@ async fn real_pinned_https_review_persists_signature_before_acknowledgment() {
     server_task.abort();
     let _ = server_task.await;
 }
-
-fn configure_slack(rig: &mut Rig, server: &MockServer) {
-    let token = rig.dir.path().join("slack.token");
-    std::fs::write(&token, "opaque-slack-fixture-token").unwrap();
-    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
-    rig.config.slack = Some(SlackConfig {
-        channel_id: "C12345".into(),
-        token_file: token,
-        fixture_endpoint: Some(format!("{}/api/chat.postMessage", server.uri())),
-    });
+#[test]
+fn notice_credential_is_scoped_and_old_transport_config_fails_closed() {
+    use axum::http::{HeaderMap, HeaderValue};
+    let mut rig = Rig::new();
+    let token = "fixture_notice_token_012345678901234567890123456789";
+    let path = rig.dir.path().join("notice.token");
+    std::fs::write(&path, token).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    rig.config.notice_token_file = Some(path);
+    let remote = rig.open();
+    let mut headers = HeaderMap::new();
+    assert!(!remote.authorize_notice_feed(&headers));
+    headers.insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+    );
+    assert!(remote.authorize_notice_feed(&headers));
+    headers.insert("origin", HeaderValue::from_static("https://example.test"));
+    assert!(!remote.authorize_notice_feed(&headers));
+    headers.remove("origin");
+    headers.append(
+        "authorization",
+        HeaderValue::from_static("Bearer second_value"),
+    );
+    assert!(!remote.authorize_notice_feed(&headers));
+    let mut old = serde_json::to_value(&rig.config).unwrap();
+    old["slack"] = serde_json::json!({"channel_id":"C12345","token_file":"/private/token"});
+    assert!(serde_json::from_value::<RemoteApprovalConfig>(old).is_err());
 }
 
-#[tokio::test]
-async fn slack_delivery_contains_only_reference_and_does_not_approve() {
-    let server = MockServer::start().await;
-    let mut rig = Rig::new();
-    configure_slack(&mut rig, &server);
-    Mock::given(method("POST"))
-        .and(path("/api/chat.postMessage"))
-        .and(header("authorization", "Bearer opaque-slack-fixture-token"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"ok":true,"channel":"C12345","ts":"123.456"})),
-        )
-        .expect(1)
-        .mount(&server)
-        .await;
+#[test]
+fn historical_notice_columns_do_not_resume_delivery_or_pending_authority() {
+    let rig = Rig::new();
     let remote = rig.open();
     let review = rig.review(&remote);
     remote.enqueue(&review).unwrap();
-    assert!(remote.deliver_one().await.unwrap());
-    assert!(!remote.deliver_one().await.unwrap());
+    let db = rusqlite::Connection::open(rig.dir.path().join("remote.db")).unwrap();
+    let notice: String = db
+        .query_row("SELECT notice FROM rounds", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(notice, "disabled");
+    db.execute(
+        "UPDATE rounds SET notice='sending',attempts=2,retry_at=100",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    drop(remote);
+    let reopened = rig.open();
     assert!(
-        remote
+        reopened
             .store
             .receipt(&review.challenge.approval_id)
             .unwrap()
             .is_none()
     );
-    let requests = server.received_requests().await.unwrap();
-    let body = String::from_utf8(requests[0].body.clone()).unwrap();
-    assert!(body.contains(&review.challenge.approval_id));
-    assert!(!body.contains(&review.review_text));
-    let authority = review.challenge.authority.as_ref().unwrap();
-    for private in [
-        &authority.binding.task_id,
-        &authority.binding.manifest_digest,
-        &authority.principal_id,
-        &authority.public_key_hex,
-    ] {
-        assert!(!body.contains(private));
-    }
-    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(payload["unfurl_links"], false);
-    assert_eq!(payload["unfurl_media"], false);
-}
-
-#[tokio::test]
-async fn slack_failure_is_bounded_and_cancel_stops_retry() {
-    let server = MockServer::start().await;
-    let mut rig = Rig::new();
-    configure_slack(&mut rig, &server);
-    Mock::given(method("POST"))
-        .respond_with(
-            ResponseTemplate::new(302).insert_header("location", "http://127.0.0.1:9/leak"),
-        )
-        .expect(1)
-        .mount(&server)
-        .await;
-    let remote = rig.open();
-    let review = rig.review(&remote);
-    remote.enqueue(&review).unwrap();
-    assert!(remote.deliver_one().await.unwrap());
-    assert!(!remote.deliver_one().await.unwrap());
-    remote.store.cancel(&review.challenge.approval_id).unwrap();
-    assert!(remote.store.claim_notice(now() + 20).unwrap().is_none());
-    assert!(
-        remote
-            .store
-            .receipt(&review.challenge.approval_id)
-            .unwrap()
-            .is_none()
-    );
+    let db = rusqlite::Connection::open(rig.dir.path().join("remote.db")).unwrap();
+    let (state, notice): (String, String) = db
+        .query_row("SELECT state,notice FROM rounds", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(state, "cancelled_restart");
+    assert_eq!(notice, "cancelled");
 }

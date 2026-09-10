@@ -1,7 +1,7 @@
 //! Opaque federation runtime: the SIEM-export / signed-attestation surface.
 //!
-//! Four cooperating pieces, extracted verbatim out of the `opaqued` binary
-//! crate so they are independently buildable and testable:
+//! Cooperating components of the public broker runtime, independently
+//! buildable and testable:
 //!
 //! - [`federation`] — fetching, verifying, and applying signed policy bundles
 //!   from an org (`BundleApplier`, hot-swaps the policy engine).
@@ -12,6 +12,9 @@
 //!   key release exchange.
 //! - [`workload_attest`] — the listener-bound workload attestor (peer
 //!   credentials -> `WorkloadIdentity`) installed after privilege drop.
+//!
+//! - [`fleet`] — provider-neutral signed broker reporting contracts and a
+//!   bounded reporter. Collectors and organization management live separately.
 //!
 //! `opaqued` is a binary-only crate: `Enclave`/`DaemonState` are not
 //! nameable from here. `federation::BundleApplier` depends on

@@ -454,22 +454,18 @@ header {
   display: block;
   animation: view-enter 180ms ease-out
 }
-
 .view-heading,
 .tasks-heading,
-.sessions-header,
-.fleet-heading {
+.sessions-header {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
   gap: 24px;
   margin-bottom: 28px
 }
-
 .view-heading .btn,
 .tasks-heading>.btn,
-.sessions-header>.btn,
-.fleet-heading>.btn {
+.sessions-header>.btn {
   margin-top: 28px;
   flex-shrink: 0
 }
@@ -480,22 +476,18 @@ header {
   color: var(--accent);
   margin-bottom: 12px
 }
-
 .view-heading h2,
 .tasks-heading h2,
-.sessions-header h2,
-.fleet-heading h2 {
+.sessions-header h2 {
   font-size: clamp(28px,3vw,39px);
   font-weight: 400;
   letter-spacing: -.045em;
   line-height: 1.15;
   margin: 0 0 13px
 }
-
 .view-heading p:not(.view-eyebrow),
 .tasks-heading p:not(.view-eyebrow),
-.sessions-header p:not(.view-eyebrow),
-.fleet-heading p:not(.view-eyebrow) {
+.sessions-header p:not(.view-eyebrow) {
   font-size: 13px;
   line-height: 1.75;
   color: var(--dim);
@@ -736,12 +728,10 @@ header {
   white-space: pre-wrap;
   overflow-wrap: anywhere
 }
-
 .audit-empty,
 .policy-no-config,
 .sessions-empty,
-.task-empty,
-.fleet-unavailable {
+.task-empty {
   color: var(--dim);
   font-size: 13px;
   line-height: 1.85;
@@ -893,19 +883,14 @@ header {
   font: 11px/1.65 var(--mono);
   color: var(--accent)
 }
-
-/* Tables keep identity and unknown states readable at every width. */
-.table-wrap,
-.fleet-table-wrap {
+.table-wrap {
   overflow: auto;
   max-width: 100%;
   border: 1px solid var(--border);
   border-radius: 8px
 }
-
 .sessions-table,
-.task-slots,
-.fleet-table {
+.task-slots {
   width: 100%;
   border-collapse: collapse;
   text-align: left;
@@ -916,10 +901,8 @@ header {
 .sessions-table {
   min-width: 680px
 }
-
 .sessions-table th,
-.task-slots th,
-.fleet-table th {
+.task-slots th {
   padding: 13px 18px;
   background: var(--surface);
   color: var(--dim);
@@ -929,18 +912,14 @@ header {
   letter-spacing: .06em;
   text-transform: uppercase
 }
-
 .sessions-table td,
-.task-slots td,
-.fleet-table td {
+.task-slots td {
   padding: 18px;
   border-bottom: 1px solid var(--border);
   vertical-align: top;
   overflow-wrap: anywhere
 }
-
-.sessions-table tr:last-child td,
-.fleet-table tr:last-child td {
+.sessions-table tr:last-child td {
   border-bottom: 0
 }
 
@@ -966,101 +945,11 @@ header {
 .session-ttl.healthy {
   color: var(--green)
 }
-
-.fleet-note,
 .task-note {
   color: var(--dim);
   font-size: 12px;
   line-height: 1.85;
   max-width: 820px
-}
-
-.fleet-summary {
-  display: grid;
-  grid-template-columns: repeat(5,minmax(0,1fr));
-  gap: 20px;
-  padding: 24px 0;
-  border-top: 1px solid var(--border);
-  border-bottom: 1px solid var(--border);
-  margin: 22px 0
-}
-
-.fleet-count {
-  display: block;
-  font-family: var(--sans);
-  font-weight: 300;
-  font-size: 36px;
-  letter-spacing: -.04em;
-  font-variant-numeric: tabular-nums;
-  line-height: 1.1;
-  margin-bottom: 9px
-}
-
-.fleet-label {
-  color: var(--dim);
-  font: 9px var(--mono);
-  text-transform: uppercase;
-  letter-spacing: .04em
-}
-
-.fleet-table {
-  min-width: 780px
-}
-
-.fleet-table details p {
-  font: 10px/1.8 var(--mono);
-  color: var(--dim);
-  max-width: 270px;
-  overflow-wrap: anywhere;
-  margin-top: 8px
-}
-
-.fleet-table summary {
-  cursor: pointer;
-  color: var(--text);
-  font: 11px var(--mono);
-  padding: 4px 0
-}
-
-.fleet-state {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--dim);
-  text-transform: capitalize
-}
-
-.fleet-state:before {
-  content: '';
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: currentColor
-}
-
-.fleet-state.fresh {
-  color: var(--green)
-}
-
-.fleet-state.stale,
-.fleet-state.offline {
-  color: var(--accent)
-}
-
-.fleet-state.revoked {
-  color: var(--red)
-}
-
-.fleet-subtle {
-  display: block;
-  color: var(--dim);
-  font-size: 11px;
-  margin-top: 5px
-}
-
-#fleet-content>.fleet-note,
-#fleet-content>div>.fleet-note:last-child {
-  margin-top: 20px
 }
 
 /* Operations are an inventory, never implied permission. */
@@ -1579,10 +1468,9 @@ header {
     padding: 12px 22px;
     font-size: 10px
   }
-  .view-heading h2,
-  .tasks-heading h2,
-  .sessions-header h2,
-  .fleet-heading h2 {
+.view-heading h2,
+.tasks-heading h2,
+.sessions-header h2 {
     font-size: 32px
   }
   .unlock-panel {
@@ -1606,9 +1494,6 @@ header {
     width: 62px;
     height: 60px;
     padding: 10px
-  }
-  .fleet-count {
-    font-size: 31px
   }
 }
 
@@ -1661,29 +1546,25 @@ header {
   .connection-banner {
     padding: 12px 18px
   }
-  .view-heading,
-  .tasks-heading,
-  .sessions-header,
-  .fleet-heading {
+.view-heading,
+.tasks-heading,
+.sessions-header {
     gap: 15px;
     margin-bottom: 24px
   }
-  .view-heading h2,
-  .tasks-heading h2,
-  .sessions-header h2,
-  .fleet-heading h2 {
+.view-heading h2,
+.tasks-heading h2,
+.sessions-header h2 {
     font-size: 28px
   }
-  .view-heading p:not(.view-eyebrow),
-  .tasks-heading p:not(.view-eyebrow),
-  .sessions-header p:not(.view-eyebrow),
-  .fleet-heading p:not(.view-eyebrow) {
+.view-heading p:not(.view-eyebrow),
+.tasks-heading p:not(.view-eyebrow),
+.sessions-header p:not(.view-eyebrow) {
     font-size: 12px
   }
-  .view-heading .btn,
-  .tasks-heading>.btn,
-  .sessions-header>.btn,
-  .fleet-heading>.btn {
+.view-heading .btn,
+.tasks-heading>.btn,
+.sessions-header>.btn {
     padding: 8px 10px;
     font-size: 11px
   }
@@ -1767,16 +1648,6 @@ header {
   }
   .policy-card-name {
     font-size: 13px
-  }
-  .fleet-summary {
-    grid-template-columns: repeat(3,minmax(0,1fr));
-    gap: 24px 16px
-  }
-  .fleet-count {
-    font-size: 31px
-  }
-  .fleet-label {
-    font-size: 8px
   }
   .task-card {
     padding: 18px
@@ -1880,6 +1751,8 @@ header {
     scroll-behavior: auto!important
   }
 }
+
+/* opaque:extension-style */
 </style>
 </head>
 <body>
@@ -1926,7 +1799,7 @@ header {
   <button class="tab-btn" id="tab-policy" data-tab="policy" role="tab" aria-controls="panel-policy" aria-selected="false" tabindex="-1" onclick="switchTab('policy')"><span class="nav-index" aria-hidden="true">03</span><span>Policy</span><span class="nav-arrow" aria-hidden="true">↗</span></button>
   <button class="tab-btn" id="tab-sessions" data-tab="sessions" role="tab" aria-controls="panel-sessions" aria-selected="false" tabindex="-1" onclick="switchTab('sessions')"><span class="nav-index" aria-hidden="true">04</span><span>Sessions</span><span class="nav-arrow" aria-hidden="true">↗</span></button>
   <button class="tab-btn" id="tab-operations" data-tab="operations" role="tab" aria-controls="panel-operations" aria-selected="false" tabindex="-1" onclick="switchTab('operations')"><span class="nav-index" aria-hidden="true">05</span><span>Operations</span><span class="nav-arrow" aria-hidden="true">↗</span></button>
-  <button class="tab-btn" id="tab-fleet" data-tab="fleet" role="tab" aria-controls="panel-fleet" aria-selected="false" tabindex="-1" onclick="switchTab('fleet')"><span class="nav-index" aria-hidden="true">06</span><span>Fleet</span><span class="nav-arrow" aria-hidden="true">↗</span></button>
+  <!-- opaque:extension-tabs -->
   <div class="nav-footer" aria-hidden="true"><span class="nav-seal brand-glyph" aria-hidden="true"></span><strong>Approve the work.</strong>Keep authority bounded.</div>
 </nav>
 <div class="workspace-main">
@@ -2026,19 +1899,13 @@ header {
   </div>
 
   <!-- ===== OPERATIONS TAB ===== -->
-  <div class="tab-panel" id="panel-fleet" role="tabpanel" aria-labelledby="tab-fleet" tabindex="0">
-    <div class="fleet-heading">
-      <div><p class="view-eyebrow">06 / FLEET</p><h2>Enrolled fleet</h2><p class="fleet-note">Broker availability, applied policy and evidence collection across one tenant.</p></div>
-      <button class="btn" onclick="loadFleet()">Refresh</button>
-    </div>
-    <div id="fleet-content" aria-live="polite"></div>
-  </div>
   <div class="tab-panel" id="panel-operations" role="tabpanel" aria-labelledby="tab-operations" tabindex="0">
     <div class="view-heading"><div><p class="view-eyebrow">05 / OPERATIONS</p><h2>Operation catalog</h2><p>Explore the available operations, their safety classifications, and approval requirements.</p></div></div>
     <div id="operations-content">
       <div class="audit-empty">Loading operations...</div>
     </div>
   </div>
+<!-- opaque:extension-panels -->
 </main>
 </div>
 </div>
@@ -2086,9 +1953,23 @@ function initialState() { return {
   relativeTimeTimer: null,
   sessionCountdownTimer: null,
   sessionsData: [],
-  fleetLoading: false,
 }; }
 var state = initialState();
+
+// Trusted applications may compose extra views while retaining the same auth lifecycle.
+// This is a source-level composition API, not an untrusted plugin loader.
+var dashboardViews = Object.create(null);
+function registerDashboardView(id, view) {
+  if (!/^[a-z][a-z0-9-]{0,31}$/.test(id) || ['tasks','audit','policy','sessions','operations'].indexOf(id) >= 0 ||
+      Object.prototype.hasOwnProperty.call(dashboardViews, id) || !view || typeof view.load !== 'function' || typeof view.clear !== 'function') {
+    throw new Error('Invalid or duplicate dashboard view.');
+  }
+  dashboardViews[id] = view;
+}
+function refreshExtensionView() {
+  if (auth.unlocked && Object.prototype.hasOwnProperty.call(dashboardViews, state.activeTab)) dashboardViews[state.activeTab].load();
+}
+
 
 // Owner credentials exist only in memory and Authorization headers. Each unlock
 // starts a generation; old requests, streams and callbacks cannot update it.
@@ -2172,7 +2053,8 @@ function lockDashboard(message, focus) {
   ['statusTimer','sessionCountdownTimer','relativeTimeTimer'].forEach(function(key) { if (state[key]) clearInterval(state[key]); });
   if (state.auditFrame !== null) cancelAnimationFrame(state.auditFrame);
   state = initialState();
-  ['tasks-content','audit-list','policy-rules-list','sessions-content','operations-content','fleet-content'].forEach(function(id) {
+  Object.keys(dashboardViews).forEach(function(id) { dashboardViews[id].clear(); });
+  ['tasks-content','audit-list','policy-rules-list','sessions-content','operations-content'].forEach(function(id) {
     document.getElementById(id).textContent = '';
   });
   ['policy-config-path','policy-seal-icon','policy-seal-status','policy-agent-sessions','policy-session-ttl','audit-stream-status','version-text','connection-banner'].forEach(function(id) {
@@ -2238,7 +2120,7 @@ function startAuthenticatedTimers(generation) {
   state.statusTimer = setInterval(function() { if (currentAuth(generation)) pollStatus(); }, 10000);
   state.relativeTimeTimer = setInterval(function() {
     if (currentAuth(generation) && state.activeTab === 'audit' && state.auditEvents.length > 0) renderAuditList();
-    if (currentAuth(generation) && state.activeTab === 'fleet') loadFleet();
+    if (currentAuth(generation)) refreshExtensionView();
   }, 15000);
 }
 
@@ -2446,7 +2328,7 @@ function updateTabOrientation() {
 }
 
 function switchTab(tab) {
-  if (!auth.unlocked || ['tasks','audit','policy','sessions','operations','fleet'].indexOf(tab) < 0) return;
+  if (!auth.unlocked || (['tasks','audit','policy','sessions','operations'].indexOf(tab) < 0 && !Object.prototype.hasOwnProperty.call(dashboardViews, tab))) return;
   var changed = state.activeTab !== tab;
   state.activeTab = tab;
 
@@ -2478,81 +2360,7 @@ function switchTab(tab) {
   if (tab === 'policy') loadPolicy();
   if (tab === 'sessions') loadSessions();
   if (tab === 'operations') loadOperations();
-  if (tab === 'fleet') loadFleet();
-}
-
-function fleetPosture(broker) {
-  if (broker.status !== 'fresh') return 'Current posture unknown';
-  if (broker.current_posture === 'healthy') return 'Checks passed';
-  if (broker.current_posture === 'unhealthy') return 'Checks failed';
-  return 'Current posture unknown';
-}
-function fleetAge(seconds) {
-  if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < 0) return 'Never observed';
-  if (seconds < 60) return Math.floor(seconds) + 's ago';
-  if (seconds < 3600) return Math.floor(seconds/60) + 'm ago';
-  return Math.floor(seconds/3600) + 'h ago';
-}
-function buildFleetSnapshot(snapshot) {
-  var brokers = snapshot.brokers || [];
-  var counts = {fresh:0,stale:0,offline:0,unknown:0,revoked:0};
-  brokers.forEach(function(broker) { if (Object.prototype.hasOwnProperty.call(counts, broker.status)) counts[broker.status]++; });
-  var summary = el('div',{className:'fleet-summary'},[]);
-  [['Enrolled',brokers.length],['Fresh',counts.fresh],['Stale / offline',counts.stale+counts.offline],['Unknown',counts.unknown],['Revoked',counts.revoked]].forEach(function(item) {
-    summary.appendChild(el('div',{},[el('span',{className:'fleet-count'},txt(String(item[1]).padStart(2,'0'))),el('span',{className:'fleet-label'},txt(item[0]))]));
-  });
-  var wrapper = el('div',{},[
-    el('p',{className:'fleet-note'},txt('Tenant ' + snapshot.tenant_id + ' · Snapshot ' + new Date(snapshot.observed_at*1000).toISOString())),
-    summary
-  ]);
-  if (!brokers.length) {
-    wrapper.appendChild(el('div',{className:'fleet-unavailable'},txt('No brokers are enrolled for this tenant. Enrollment is managed by the collector operator.')));
-  } else {
-    var head = el('tr',{},['Broker','Availability','Software posture','Applied policy','Evidence backlog'].map(function(label){return el('th',{scope:'col'},txt(label));}));
-    var rows = brokers.map(function(broker) {
-      var details = el('details',{},[
-        el('summary',{},txt(broker.broker_id.slice(0,8) + '…' + broker.broker_id.slice(-6))),
-        el('p',{},txt(broker.broker_id)),
-        el('p',{},txt('Enrollment revision ' + broker.enrollment_epoch)),
-        el('p',{},txt('Policy digest: ' + (broker.policy && broker.policy.digest || 'unknown'))),
-        el('p',{},txt('Highest observed audit sequence ' + (broker.last_known_audit_head == null ? 'unknown' : broker.last_known_audit_head))),
-        el('p',{},txt('Evidence coverage begins at sequence ' + (broker.evidence_coverage_start == null ? 'unknown' : broker.evidence_coverage_start)))
-      ]);
-      var policy = broker.policy ? 'v' + broker.policy.version : 'Unknown';
-      var drift = broker.policy_status === 'drift' ? 'Policy drift' : broker.policy_status === 'matches' ? 'Matches expected policy' : 'Expected policy unknown';
-      var lag = broker.status !== 'fresh' || broker.evidence_health !== 'ok' || broker.evidence_export_lag_records == null ? 'Unknown' : broker.evidence_export_lag_records + ' records';
-      var evidenceStates = {ok:'Continuous references',unknown:'Coverage unknown',unavailable:'Evidence unavailable',regressed:'Audit sequence regressed',gap:'Evidence gap'};
-      var evidenceHealth = evidenceStates[broker.evidence_health] || 'Coverage unknown';
-      return el('tr',{},[
-        el('td',{},[details,el('span',{className:'fleet-subtle'},txt(broker.daemon_version || 'Version unknown'))]),
-        el('td',{},[el('span',{className:'fleet-state ' + (Object.prototype.hasOwnProperty.call(counts,broker.status)?broker.status:'unknown')},txt(broker.status)),
-          el('span',{className:'fleet-subtle'},txt(fleetAge(broker.contact_age_secs)))]),
-        el('td',{},[txt(fleetPosture(broker)),el('span',{className:'fleet-subtle'},txt('Reported by broker'))]),
-        el('td',{},[txt(policy),el('span',{className:'fleet-subtle'},txt(drift))]),
-        el('td',{},[txt(lag),el('span',{className:'fleet-subtle'},txt(evidenceHealth)),el('span',{className:'fleet-subtle'},txt('Acknowledged through ' + (broker.acknowledged_evidence_sequence == null ? 'unknown' : broker.acknowledged_evidence_sequence)))])
-      ]);
-    });
-    wrapper.appendChild(el('div',{className:'fleet-table-wrap',tabindex:'0',role:'region','aria-label':'Enrolled brokers table'},[el('table',{className:'fleet-table'},[el('thead',{},[head]),el('tbody',{},rows)])]));
-  }
-  wrapper.appendChild(el('p',{className:'fleet-note'},txt('Coverage includes enrolled brokers only. Stale or offline reports do not establish current health. Evidence backlog counts compact record references; full audit payload delivery is not measured here.')));
-  return wrapper;
-}
-async function loadFleet() {
-  if (!auth.unlocked || state.fleetLoading) return;
-  state.fleetLoading = true;
-  var generation = auth.generation;
-  var content = document.getElementById('fleet-content');
-  try {
-    var data = await apiJson('/api/fleet');
-    if (!currentAuth(generation)) return;
-    content.textContent = '';
-    content.appendChild(data.configured ? buildFleetSnapshot(data.snapshot) :
-      el('div',{className:'fleet-unavailable'},txt(data.message || 'Fleet collector is not configured.')));
-  } catch(error) {
-    if (!currentAuth(generation)) return;
-    content.textContent = '';
-    content.appendChild(el('div',{className:'fleet-unavailable'},txt('Fleet inventory unavailable. Current broker health is unknown. Refresh after the collector connection is restored.')));
-  } finally { if (currentAuth(generation)) state.fleetLoading = false; }
+  if (Object.prototype.hasOwnProperty.call(dashboardViews, tab)) dashboardViews[tab].load();
 }
 
 // ============================================================================
@@ -2634,9 +2442,8 @@ function refreshCurrentTab() {
     case 'operations':
       loadOperations();
       break;
-    case 'fleet':
-      loadFleet();
-      break;
+    default:
+      refreshExtensionView();
   }
 }
 
@@ -3749,6 +3556,7 @@ function init() {
   });
 }
 
+/* opaque:extension-script */
 init();
 </script>
 </body>

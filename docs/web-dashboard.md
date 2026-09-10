@@ -51,7 +51,7 @@ page's memory and resets on reload; it does not change authentication.
 
 Navigation sits beside the content on wide screens and becomes a horizontal tab
 bar on narrow screens. Focus a tab and use the arrow keys to move between views;
-**Home** selects Tasks and **End** selects Fleet. In Audit, press **Enter** in a
+**Home** selects Tasks and **End** selects Operations. In Audit, press **Enter** in a
 filter field or select **Apply filters** to apply the query. Audit rows are
 keyboard-accessible disclosure buttons: **Enter** or **Space** expands or closes
 their evidence. New events preserve the focused row when it remains in the view.
@@ -90,19 +90,9 @@ The live operation catalog comes from the selected daemon's registry and configu
 
 **Sessions** lists the daemon's visible session IDs, labels, and expiration times. Session tokens are not returned. **Operations** shows the selected daemon's actual operation catalog, including enabled, disabled and fixture-only availability. Demo entries are explicitly synthetic. Catalog membership and default approval labels do not grant permission to execute an operation.
 
-**Fleet** shows explicitly enrolled brokers for one tenant: last contact, software
-version/posture, applied policy, enrollment status and acknowledged evidence
-references. Stale/offline reports do not establish current posture. A broker can
-be available while its evidence has a gap or regressed sequence; such a backlog
-is unknown, never zero. This view does not discover unenrolled agents or measure
-delivery of full audit payloads. Collector errors clear previous health claims.
-
-Connect the dashboard with `--fleet-config /absolute/private/fleet.json`. That
-owner-only JSON file contains `collector_url`, `tenant_id` and an absolute
-`read_token_file` path to an owner-only collector read credential. Use HTTPS or a
-literal loopback HTTP address. The web server contacts the collector; its token
-never reaches the browser. Demo mode does not connect to the collector. Fleet
-inventory is available independently of the selected local daemon's connection.
+Organization fleet views are composed by a separately packaged management
+console. The local dashboard contains five views and has no collector credential
+or `/api/fleet` route. See [dashboard composition](reusable-core.md#compose-a-dashboard).
 
 ## Security
 
@@ -126,7 +116,6 @@ This is a local read-only client of the existing daemon trust model. The daemon 
 | `/api/policy` | GET | Selected config and seal-file presence |
 | `/api/sessions` | GET | Visible session metadata through IPC |
 | `/api/operations` | GET | Selected daemon's operation catalog and handler availability; synthetic in demo mode |
-| `/api/fleet` | GET | Configured tenant's enrolled broker inventory; collector credentials stay server-side |
 
 Unavailable data returns an explicit non-2xx JSON error. Status returns the disconnected state as a successful health response so the page can explain it. Demo responses always carry `mode: "demo"`.
 

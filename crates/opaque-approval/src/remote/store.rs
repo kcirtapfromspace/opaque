@@ -1,4 +1,4 @@
-//! Durable approval rounds and minimal notification outbox. An unfinished
+//! Durable approval rounds. An unfinished
 //! round is cancelled on restart; a signed decision is never resumed as work.
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
@@ -29,14 +29,6 @@ impl Drop for RemoteStore {
         // SAFETY: this object owns the valid descriptor.
         unsafe { libc::flock(self.lock.as_raw_fd(), libc::LOCK_UN) };
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct Notice {
-    pub approval_id: String,
-    pub broker_id: String,
-    pub expires_at: i64,
-    pub attempt: u32,
 }
 
 fn err<E>(_: E) -> String {
@@ -111,6 +103,8 @@ impl RemoteStore {
             if (version == 0 && tables != 0) || (version == 1 && tables != 2) {
                 return Err("invalid remote approval ledger schema".into());
             }
+            // Retain the v1 notice/attempt columns so historical decision ledgers
+            // remain readable. New rounds never use them for delivery state.
             connection.execute_batch(
                 "CREATE TABLE IF NOT EXISTS binding (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL);
                  CREATE TABLE IF NOT EXISTS rounds (
@@ -147,12 +141,7 @@ impl RemoteStore {
         }
     }
 
-    pub fn enqueue(
-        &self,
-        review: &WorkstationReview,
-        now: i64,
-        notify: bool,
-    ) -> Result<(), String> {
+    pub fn enqueue(&self, review: &WorkstationReview, now: i64) -> Result<(), String> {
         review.validate(&self.broker, now).map_err(err)?;
         let authority = review
             .challenge
@@ -184,7 +173,7 @@ impl RemoteStore {
                 review.challenge.approval_id,
                 payload,
                 review.challenge.expires_at,
-                if notify { "queued" } else { "disabled" }
+                "disabled"
             ],
         )
         .map_err(err)?;
@@ -274,49 +263,5 @@ impl RemoteStore {
                 Ok(receipt)
             })
             .transpose()
-    }
-
-    pub fn claim_notice(&self, now: i64) -> Result<Option<Notice>, String> {
-        let mut connection = self.connection.lock().map_err(err)?;
-        let tx = connection.transaction().map_err(err)?;
-        tx.execute("UPDATE rounds SET state='expired',notice='cancelled' WHERE state='pending' AND expires<=?1", [now]).map_err(err)?;
-        let row: Option<(String,i64,u32)> = tx.query_row(
-            "SELECT id,expires,attempts FROM rounds WHERE state='pending' AND notice='queued' AND retry_at<=?1 ORDER BY rowid LIMIT 1",
-            [now], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(err)?;
-        let Some((approval_id, expires_at, attempt)) = row else {
-            return Ok(None);
-        };
-        tx.execute(
-            "UPDATE rounds SET notice='sending',attempts=attempts+1 WHERE id=?1",
-            [&approval_id],
-        )
-        .map_err(err)?;
-        tx.commit().map_err(err)?;
-        Ok(Some(Notice {
-            approval_id,
-            broker_id: self.broker.clone(),
-            expires_at,
-            attempt: attempt + 1,
-        }))
-    }
-
-    pub fn notice_active(&self, notice: &Notice, now: i64) -> Result<bool, String> {
-        self.connection.lock().map_err(err)?.query_row(
-            "SELECT EXISTS(SELECT 1 FROM rounds WHERE id=?1 AND state='pending' AND notice='sending' AND expires>?2 AND attempts=?3)",
-            params![notice.approval_id,now,notice.attempt], |r| r.get(0)).map_err(err)
-    }
-
-    pub fn finish_notice(&self, notice: &Notice, delivered: bool, now: i64) -> Result<(), String> {
-        let state = if delivered {
-            "delivered"
-        } else if notice.attempt >= 3 {
-            "failed"
-        } else {
-            "queued"
-        };
-        self.connection.lock().map_err(err)?.execute(
-            "UPDATE rounds SET notice=?1,retry_at=?2 WHERE id=?3 AND notice='sending' AND state='pending' AND attempts=?4",
-            params![state, now.saturating_add(5 * i64::from(notice.attempt)),notice.approval_id,notice.attempt]).map_err(err)?;
-        Ok(())
     }
 }

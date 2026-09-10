@@ -13,11 +13,11 @@
 //! and an attempt id to poll.
 
 pub mod keys;
+pub mod lifecycle;
 pub mod login;
 pub mod oidc;
 pub mod persona;
 pub mod provisioning;
-pub mod scim;
 pub mod store;
 
 use std::path::Path;

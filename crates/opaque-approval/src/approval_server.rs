@@ -9,7 +9,9 @@
 //! - **Pairing** (`POST /pair`): authenticated by the one-time nonce from the
 //!   QR payload (5-minute TTL, single use). Returns the device id plus a
 //!   per-device bearer token (shown once; stored hashed).
-//! - **Transport auth**: every other authenticated route requires
+//! - **Notice feed**: `/notifications/pending` requires a separate read-only
+//!   notification credential and returns opaque references only.
+//! - **Device transport auth**: other authenticated routes require
 //!   `Authorization: Bearer <token>` + `X-Opaque-Device: <device_id>`, and
 //!   the token must match THAT device's stored hash. This is coarse gating
 //!   only — it decides who may see and submit, never who approved.
@@ -504,6 +506,10 @@ fn build_tls_config(cert_der: &[u8], key_der: &[u8]) -> Result<rustls::ServerCon
 fn build_router(state: Arc<ServerState>) -> Router {
     Router::new()
         .merge(workstation::routes())
+        .route(
+            "/notifications/pending",
+            get(workstation::notice_feed_handler),
+        )
         .route("/health", get(health_handler))
         .route("/pair", post(pair_handler))
         .route("/approvals/pending", get(pending_handler))

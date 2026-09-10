@@ -131,8 +131,12 @@ struct DaemonConfig {
     /// Absent = identity features disabled (Phase 0 behavior).
     #[serde(default)]
     identity: Option<identity::IdentityConfig>,
+    /// Recognize old provisioning configuration solely to reject a silent
+    /// downgrade to unmanaged identity after component extraction.
+    #[serde(default, rename = "scim")]
+    legacy_scim: Option<serde::de::IgnoredAny>,
     #[serde(default)]
-    scim: Option<identity::scim::ScimConfig>,
+    lifecycle: Option<identity::lifecycle::LifecycleConfig>,
     #[serde(default)]
     fleet: Option<opaque_federation_runtime::fleet::reporter::ReporterConfig>,
     #[serde(default)]
@@ -1765,6 +1769,11 @@ fn operation_registry() -> std::io::Result<OperationRegistry> {
 }
 
 async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> {
+    if config.legacy_scim.is_some() {
+        return Err(std::io::Error::other(
+            "legacy [scim] configuration requires explicit migration to the managed lifecycle adapter; refusing unmanaged startup",
+        ));
+    }
     init_memory_safety();
 
     let session_approval_factor = config
@@ -2045,15 +2054,15 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         );
     }
 
-    if identity::scim::persisted_lifecycle(&state_dir).map_err(std::io::Error::other)?
-        && (config.scim.is_none()
+    if identity::lifecycle::persisted_lifecycle(&state_dir).map_err(std::io::Error::other)?
+        && (config.lifecycle.is_none()
             || !config
                 .identity
                 .as_ref()
                 .is_some_and(|identity| identity.required))
     {
         return Err(std::io::Error::other(
-            "persisted SCIM lifecycle requires SCIM and required identity configuration; explicit offline migration required",
+            "persisted managed lifecycle requires lifecycle and required identity configuration; explicit offline migration required",
         ));
     }
 
@@ -2086,7 +2095,7 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         }
     };
 
-    if config.scim.is_none()
+    if config.lifecycle.is_none()
         && identity_runtime.as_ref().is_some_and(|runtime| {
             runtime
                 .store
@@ -2095,25 +2104,25 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         })
     {
         return Err(std::io::Error::other(
-            "persisted SCIM lifecycle requires its configured ingress; explicit offline migration required",
+            "persisted managed lifecycle requires its configured ingress; explicit offline migration required",
         ));
     }
-    let _scim_listener = if let Some(scim_config) = config.scim.clone() {
+    let _lifecycle_listener = if let Some(lifecycle_config) = config.lifecycle.clone() {
         if !config.require_seal || !td.enforce {
             return Err(std::io::Error::other(
-                "SCIM requires sealed configuration and isolated tenant custody",
+                "Managed lifecycle requires sealed configuration and isolated tenant custody",
             ));
         }
         let runtime = identity_runtime
             .clone()
-            .ok_or_else(|| std::io::Error::other("SCIM requires identity"))?;
+            .ok_or_else(|| std::io::Error::other("Managed lifecycle requires identity"))?;
         let binding = tenant
             .as_ref()
-            .ok_or_else(|| std::io::Error::other("SCIM requires a tenant binding"))?
+            .ok_or_else(|| std::io::Error::other("Managed lifecycle requires a tenant binding"))?
             .binding()
             .clone();
         Some(
-            identity::scim::start(scim_config, runtime, binding, &state_dir)
+            identity::lifecycle::start(lifecycle_config, runtime, binding, &state_dir)
                 .await
                 .map_err(std::io::Error::other)?,
         )
@@ -2480,9 +2489,6 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
             .map_err(|e| std::io::Error::other(format!("approval server failed to start: {e}")))?;
         pm.set_port(addr.port());
         approval_server_addr = Some(addr);
-        if let Some(remote) = remote {
-            tokio::spawn(remote.run_notifications());
-        }
 
         // mDNS is convenience discovery — never fatal.
         match opaque_approval::approval_server::advertise_mdns(addr.port(), &fingerprint) {

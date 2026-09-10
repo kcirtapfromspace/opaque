@@ -6,6 +6,7 @@ pub mod capability;
 pub mod enclave_facade;
 pub mod execve_map;
 pub mod identity;
+pub mod identity_lifecycle;
 pub mod inference;
 pub mod keyfile;
 pub mod operation;

@@ -114,7 +114,7 @@ impl IdentityStore {
         }
         let conn = Connection::open(path).map_err(|e| e.to_string())?;
         conn.execute_batch(SCHEMA_SQL).map_err(|e| e.to_string())?;
-        super::scim::ensure_schema(&conn)?;
+        super::lifecycle::ensure_schema(&conn)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -134,7 +134,7 @@ impl IdentityStore {
     pub fn open_in_memory() -> Result<Self, String> {
         let conn = Connection::open_in_memory().map_err(|e| e.to_string())?;
         conn.execute_batch(SCHEMA_SQL).map_err(|e| e.to_string())?;
-        super::scim::ensure_schema(&conn)?;
+        super::lifecycle::ensure_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -163,10 +163,12 @@ impl IdentityStore {
         let now = now_unix();
         let conn = self.lock();
         let managed: bool = conn
-            .query_row("SELECT EXISTS(SELECT 1 FROM scim_config)", [], |r| r.get(0))
+            .query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_config)", [], |r| {
+                r.get(0)
+            })
             .map_err(|_| "lifecycle configuration unavailable")?;
         if managed {
-            let admitted: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM scim_resources r JOIN scim_config c ON c.issuer=?1 JOIN principals p ON p.id=r.principal_id AND p.disabled=0 WHERE r.kind='Users' AND r.subject=?2 AND r.deleted=0 AND json_extract(r.body,'$.active')=1)",params![iss,sub],|r|r.get(0)).map_err(|_|"lifecycle admission unavailable")?;
+            let admitted: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_subjects r JOIN lifecycle_config c ON c.issuer=?1 AND c.suspended=0 JOIN principals p ON p.id=r.principal_id AND p.disabled=0 WHERE r.subject=?2 AND r.deleted=0 AND r.active=1)",params![iss,sub],|r|r.get(0)).map_err(|_|"lifecycle admission unavailable")?;
             if !admitted {
                 return Err("identity must be actively provisioned before login".into());
             }
@@ -537,7 +539,7 @@ impl IdentityStore {
         let conn = self.lock();
         let revision: i64 = conn
             .query_row(
-                "SELECT revision FROM scim_config WHERE singleton=1",
+                "SELECT revision FROM lifecycle_config WHERE singleton=1",
                 [],
                 |r| r.get(0),
             )

@@ -346,6 +346,62 @@ async fn receipt(
     Ok(Json(receipt))
 }
 
+/// Exposes at most the existing 64 live workstation rounds, with current
+/// authority checked for each. The independent notification token is never a
+/// device credential and cannot read full reviews or submit signed decisions.
+pub(super) async fn notice_feed_handler(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    use crate::remote::notices::{ApprovalNotice, PendingNoticeFeed};
+    let Some(remote) = state
+        .remote
+        .as_ref()
+        .filter(|remote| remote.authorize_notice_feed(&headers))
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [("cache-control", "no-store")],
+            Json(serde_json::json!({"error":"notice credential required"})),
+        )
+            .into_response();
+    };
+    let Ok(pending) = state.workstation_pending.lock() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("cache-control", "no-store")],
+            Json(serde_json::json!({"error":"notice feed unavailable"})),
+        )
+            .into_response();
+    };
+    let mut notices: Vec<_> = pending
+        .values()
+        .filter(|entry| {
+            entry.created_at.elapsed() < entry.timeout
+                && remote.check_current(&entry.review, None).is_ok()
+        })
+        .map(|entry| ApprovalNotice {
+            approval_id: entry.review.challenge.approval_id.clone(),
+            broker_id: entry.review.challenge.broker_id.clone(),
+            expires_at: entry.review.challenge.expires_at,
+        })
+        .collect();
+    notices.sort_by(|a, b| a.approval_id.cmp(&b.approval_id));
+    (
+        StatusCode::OK,
+        [
+            ("cache-control", "no-store"),
+            ("x-content-type-options", "nosniff"),
+        ],
+        Json(PendingNoticeFeed {
+            schema_version: 1,
+            broker_id: state.pairing.server_id().to_owned(),
+            notices,
+        }),
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
