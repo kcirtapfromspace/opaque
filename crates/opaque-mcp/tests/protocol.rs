@@ -254,3 +254,44 @@ async fn malformed_daemon_envelopes_never_fabricate_tool_success() {
     daemon.await.unwrap();
     server.stop().await;
 }
+
+#[tokio::test]
+async fn batch_client_closing_stdin_still_receives_every_response() {
+    // dogfood-style batch transport: write every request, close stdin, then
+    // read. EOF must switch the server to draining, not drop in-flight calls.
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut server = Server::start(directory.path());
+    server
+        .send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2024-11-05", "capabilities": {},
+            "clientInfo": {"name": "batch-check", "version": "1"}}}))
+        .await;
+    server
+        .send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+        .await;
+    server
+        .send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}))
+        .await;
+    // The daemon socket does not exist, so the call resolves as an error
+    // result. It must still be answered after EOF.
+    server
+        .send(json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+            "name": "opaque_task_list", "arguments": {}}}))
+        .await;
+    server.input.shutdown().await.unwrap();
+    let mut answered = std::collections::BTreeSet::new();
+    while answered.len() < 3 {
+        let response = server.receive().await;
+        answered.insert(response["id"].as_i64().expect("response carries an ID"));
+    }
+    assert_eq!(answered.into_iter().collect::<Vec<_>>(), vec![1, 2, 3]);
+    drop(server.input);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), server.child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+}

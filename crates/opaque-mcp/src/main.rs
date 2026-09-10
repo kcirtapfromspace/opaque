@@ -585,18 +585,26 @@ async fn run_transport(
     );
     let mut pending: FuturesUnordered<BoxFuture<'static, Completion>> = FuturesUnordered::new();
     let mut cancellations: HashMap<String, AbortHandle> = HashMap::new();
+    let mut draining = false;
     loop {
+        if draining && pending.is_empty() {
+            break;
+        }
         let response = tokio::select! {
             completed = pending.next(), if !pending.is_empty() => {
                 let (key, response) = completed.expect("nonempty pending set");
                 cancellations.remove(&key);
                 response
             }
-            line = lines.next() => {
+            line = lines.next(), if !draining => {
                 let Some(line) = line else {
-                    // EOF ends the session. Dropping pending calls stops waiting;
-                    // it does not roll back requests already sent to the broker.
-                    break;
+                    // EOF: accept nothing new, but deliver responses for calls
+                    // already sent to the broker. Each call is bounded by its
+                    // own deadline and the delivery timeout below, so the drain
+                    // terminates; a batch client that writes requests and
+                    // closes stdin still receives every answer.
+                    draining = true;
+                    continue;
                 };
                 match line {
                     Err(error) => return Err(error),
