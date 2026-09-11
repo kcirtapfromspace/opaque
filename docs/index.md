@@ -1,61 +1,40 @@
 ---
 template: home.html
 hide:
-  - navigation
   - toc
 ---
 
 # Opaque
 
-**Secrets stay secret. Agents stay powerful.**
-**Approve the work. Keep authority bounded.**
+**Approve the work. Keep secrets secret.**
 
-Built for platform and security teams whose developers already use AI
-coding agents. Today those teams either keep sensitive access away from
-the agent or watch its every move. Start on one laptop; one signed policy
-governs a fleet. Opaque lets
-you hand the agent a bounded piece of work: publish a secret, dispatch a
-release, run a fixed host check, read scoped data. You approve exactly
-what it may do and inspect the evidence after. LLMs get operations, never
-plaintext values. Every operation passes through Policy → Approval →
-Execute → Sanitize → Audit; multi-step work adds plan → review → approve →
-run → inspect.
+Opaque runs sensitive operations for Claude Code, Codex, and MCP clients.
+It checks policy, requests required approval, and uses broker-held credentials.
 
-Opaque is not another secrets manager or agent framework. It decides what
-may pass between the two you already have, and records observed outcomes. Security
-owns policy and custody; developers and agents finish the work.
+[Try one operation](tutorial.md) · [Architecture](architecture.md) ·
+[Installation and release status](getting-started.md)
 
-- **Bounded agent work**: a pinned task manifest approved once as a whole;
-  each action charges exactly one slot and leaves a receipt.
-- **Trust-domain enforcement**: run the daemon under a dedicated service
-  account or separate container that exclusively owns every key, database,
-  and config; startup fails closed on any custody violation.
-- **Signature-bound approvals**: local biometric (Touch ID, polkit), paired
-  second device (Ed25519), FIDO2 hardware keys and passkeys, and a
-  trusted-workstation full-manifest reviewer for tasks, all verified
-  daemon-side.
-- **Tamper-evident audit**: an HMAC chain with an authenticated retained head,
-  verified with `opaque audit verify`; [portable checkpoints](evidence-checkpoints.md)
-  support independent export verification.
-- **Sandboxed execution**: bubblewrap, Landlock, and seccomp applied to exec
-  children; typestate-enforced response sanitization.
-- **Identity substrate**: OIDC human login (PKCE, daemon-owned), Ed25519
-  delegation tokens, live role resolution, segregation of duties.
-- **Federation**: one org signature carries policy to a whole fleet, with
-  anti-rollback enforcement; the audit chain exports to your SIEM in a form it
-  can verify; daemons prove their posture before receiving key material.
-- **Providers**: GitHub Actions secrets, GitLab CI variables, 1Password,
-  Bitwarden Secrets Manager, HashiCorp Vault, AWS Secrets Manager.
+## Publish a GitHub Actions secret
 
-Install: `brew install kcirtapfromspace/tap/opaque`, the shell installer, or
-`cargo install`. Licensed BUSL-1.1. New here? Start with the
-[tutorial](tutorial.md). Then: [getting started](getting-started.md), the
-[policy engine](policy.md), [bounded agent work](bounded-work.md),
-[MCP integration](mcp-integration.md), [qualified MCP tools](mcp-qualified-tools.md),
-[workstation review](remote-approvals.md), [identity](identity.md),
-[deployment](deployment.md), [federation](federation.md), and
-[architecture](architecture.md).
+The agent names a repository, secret, and stored reference. With a policy
+requiring approval for every write, you review the request before Opaque calls
+GitHub. The response omits the secret value. Inspect the observed result with
+`opaque audit tail` and `opaque audit verify`.
 
-The new reviewer app, MCP v2 projections and portable checkpoints are unreleased
-source capabilities. See [getting started](getting-started.md) before choosing a
-tagged package or upgrading an existing audit store.
+## Approve a whole task
+
+For supported workflows, [review a pinned manifest](bounded-work.md). Each action
+consumes a durable attempt before dispatch; retries do not replenish it.
+
+## Know the boundary
+
+A separate broker identity isolates custody from the agent's OS user. The default
+same-user setup does not. Other agent access remains outside Opaque. Audit records
+describe observations, not proof of every external effect. An interrupted call can
+leave the outcome unknown. Read the [architecture and evidence](architecture.md).
+
+## Start with one task
+
+Run the tutorial on a test repository, or bring a recurring CI task to a pilot
+conversation. [Demo and pilot invitation](https://demo.opaque.info/). The hosted
+demo uses fictional portfolio data and a separate workflow; see the [guide](hosted-demo.md).

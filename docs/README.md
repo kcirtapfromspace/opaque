@@ -1,28 +1,29 @@
-# Docs
+# Documentation
 
-- [Tutorial: your first gated operation](tutorial.md)
-- [Getting started](getting-started.md)
-- [Policy model + config format](policy.md)
-- [Identity, delegation, and approval factors](identity.md)
-- [Federation: signed policy bundles, SIEM export, attestation](federation.md)
-- [Bounded agent work: tasks, manifests, receipts](bounded-work.md)
-- [Operations contract](operations.md)
-- [MCP integration (Claude Code)](mcp-integration.md)
-- [Qualifying signed MCP tools](mcp-qualified-tools.md)
-- [Trusted workstation reviewer](remote-approvals.md)
-- [Evidence checkpoints and legacy audit upgrades](evidence-checkpoints.md)
-- [Bitwarden Secrets Manager](bitwarden.md)
-- [HashiCorp Vault](vault.md)
-- [LLM harness](llm-harness.md)
-- [Web dashboard](web-dashboard.md)
-- [Demo recordings](demos.md)
-- [Deployment guide (macOS LaunchAgent, Linux systemd user service + polkit)](deployment.md)
-- [Architecture (broader design notes, includes deferred items)](architecture.md)
-- [Enterprise architecture](enterprise-architecture.md)
-- [Security assessment](security-assessment.md)
-- [Adversarial security review (latest)](adversarial-security-review-2026-02-14.md)
-- [Storage and data model](storage.md)
-- [Linux polkit setup](linux-polkit.md)
-- [Mobile approvals](mobile-approvals.md)
-- [Audit log, live feed, and analytics](audit-analytics.md)
-- [Deferred roadmap](roadmap-deferred.md)
+Start with one operation, then inspect the boundary before widening access.
+
+| Purpose | Entry point |
+| --- | --- |
+| Run a first operation | [Tutorial](tutorial.md) |
+| Install, configure, or upgrade | [Install and command reference](getting-started.md) |
+| Evaluate the security model | [Architecture and evidence](architecture.md) |
+| Explore the hosted example | [Demo guide](hosted-demo.md) |
+
+## Technical reference
+
+- **Access:** [policy](policy.md), [identity](identity.md), [deployment](deployment.md).
+- **Work:** [operations](operations.md), [bounded tasks](bounded-work.md), [MCP](mcp-integration.md), [tool qualification](mcp-qualified-tools.md).
+- **Review:** [workstation approval](remote-approvals.md), [Linux polkit](linux-polkit.md), [mobile approval status](mobile-approvals.md).
+- **Evidence:** [checkpoints](evidence-checkpoints.md), [audit analytics](audit-analytics.md), [storage](storage.md).
+- **Integrations:** [Bitwarden](bitwarden.md), [Vault](vault.md), [LLM harness](llm-harness.md).
+- **Extensions:** [dashboard](web-dashboard.md), [federation](federation.md), [public libraries](reusable-core.md), [organization architecture](enterprise-architecture.md).
+
+## Background
+
+[Recordings](demos.md), [why we built Opaque](blog/why-we-built-opaque.md), and
+[deferred work](roadmap-deferred.md).
+
+The [February 12 assessment](security-assessment.md) and
+[February 14 review](adversarial-security-review-2026-02-14.md) are historical
+records. Use the architecture, deployment, and evidence guides for current
+source behavior and limitations.

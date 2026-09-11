@@ -1,13 +1,11 @@
 # Federation
 
-Central, signed control for a fleet of daemons: an org signs its policy once,
-every daemon verifies before applying it, the audit chain streams to your SIEM,
-and each daemon can prove its integrity posture on demand.
+For operators managing multiple Opaque daemons: distribute signed policy,
+export audit records, and inspect signed daemon posture reports.
 
-Federation builds on the [trust-domain split](deployment.md): under
-`[trust_domain] enforce = true` the files these features depend on (the bundle
-anti-rollback state, export cursors, attestation key) are custody material the
-agent's uid cannot touch.
+Federation requires the [trust-domain split](deployment.md) to protect bundle
+anti-rollback state, export cursors, and the attestation key from the agent's
+OS user. Set `[trust_domain] enforce = true` under a separate broker identity.
 
 ---
 
@@ -15,14 +13,12 @@ agent's uid cannot touch.
 
 A bundle is an org's policy as one signed document:
 `opqb1.<payload>.<signature>`. The Ed25519 signature covers the literal payload
-bytes under a domain separator, so there is no canonicalization step to
-disagree about: what was signed is exactly what is verified.
+bytes under a domain separator; verification requires no canonicalization.
 
 ### What a daemon guarantees about a bundle
 
-1. **Signature first.** The payload is not even parsed until a configured
-   trust anchor verifies it. Multiple anchors are allowed, which is how you
-   rotate a signing key without a flag day.
+1. **Signature first.** A configured trust anchor verifies the signature
+   before the payload is parsed. Multiple anchors support signing-key rotation.
 2. **No rollback.** The daemon persists `(org, version, digest)` in its custody
    set. A lower version is refused; an equal version is accepted only if it is
    byte-identical (idempotent re-apply); a *different* bundle carrying an
@@ -66,8 +62,7 @@ factors = ["local_bio"]
 teams = ["platform"]   # only platform members match this rule
 ```
 
-Guard the signing key like a CA key. The trust anchor (public half) is what
-goes into each daemon's config.
+Protect the signing key; configure its public key as a daemon trust anchor.
 
 ### Daemon configuration
 
@@ -80,13 +75,12 @@ require_bundle = true
 refresh_secs = 300
 ```
 
-The URL is fetched first and the path serves as a fallback, so a network blip
-cannot strip policy from a running fleet. A bundle that has *expired* is fatal
-as the initial `require_bundle` load but only a warning on refresh: an org
-outage must not disarm a running daemon.
+The URL is fetched first, with the path as fallback. With `require_bundle`,
+an expired bundle prevents startup. Refresh can apply an expired but otherwise
+valid bundle with a warning. Failed refresh leaves the applied policy in place.
 
-Distribution is deliberately dumb: any static host, object store, or git raw
-URL works, because trust comes from the signature rather than the channel.
+Distribute bundles through a static host, object store, or git raw URL.
+The configured trust anchors authenticate the bundle signature.
 
 ---
 
@@ -103,22 +97,19 @@ Rules constrain on teams through the identity block:
 teams = ["platform", "ml-infra"]   # ANY-of
 ```
 
-This fails closed in every direction that matters: requests without a verified
-principal never match, principals in none of the listed teams never match, and
-neither does anyone when no bundle is applied (nobody has teams then). An empty
-list matches nobody rather than everybody.
+Matching requires a verified principal in at least one listed team. Without an
+applied bundle, no principal has team membership. An empty list matches nobody.
 
-Team membership rides into the audit chain alongside the principal, so
-"who could have done this, under which namespace" is answerable after the fact.
+Audit records include the principal and resolved team membership.
 
 ---
 
 ## Audit export to SIEM
 
-The export pump tails the audit **chain**, not the live event stream, so every
-exported record carries its `sequence_number` and `record_hash`. A SIEM holding
-those records can verify them against the database: the stream is evidence,
-not a parallel log that could drift.
+The export pump reads the audit chain. Each exported record carries its
+`sequence_number` and `record_hash` for comparison with the source database.
+See [evidence verification](evidence-checkpoints.md) for authentication,
+continuity, and completeness limits.
 
 ```toml
 [export]
@@ -131,30 +122,26 @@ poll_secs = 2
 batch_size = 256
 ```
 
-Each transport keeps its own persisted cursor, so a dead SIEM never stalls the
-others and delivery resumes exactly where it stopped after a restart. Delivery
-is at-least-once; dedupe on `(sequence_number, record_hash)`.
+Each transport keeps its own persisted cursor and resumes from it after restart.
+Delivery is at-least-once; dedupe on `(sequence_number, record_hash)`.
 
-TLS syslog requires a CA file. There is no insecure-skip option, because
-shipping an audit trail to an unauthenticated endpoint is not a supported
-posture.
+TLS syslog requires a CA file and has no insecure-skip option.
 
 ### The independent detector
 
-The pump also runs a detector with its own cursor. Its rule comes from the
-chain rather than from policy: any request that recorded `approval.required`
-must record `approval.granted` (or a `lease.hit`) before
+The pump also runs a detector with its own cursor: any request that recorded
+`approval.required` must record `approval.granted` (or a `lease.hit`) before
 `operation.succeeded`. A violation raises an Error-level `audit.alert` event
-into the chain, which then exports like everything else. It is a second
-opinion on the enclave, derived from evidence the enclave itself wrote.
+into the chain for export. The detector checks the daemon's recorded events;
+it cannot establish that omitted events or provider effects occurred.
 
 ---
 
 ## Continuous attestation
 
-The daemon re-verifies its own custody set and audit chain on an interval and
-records the result in the chain, so *"was this daemon healthy at time T?"* is
-answerable from the log. On demand it produces a signed report:
+The daemon periodically checks its custody set and audit chain and records
+the results. These are the daemon's observations at each check, not continuous
+proof of host integrity. Request a signed report on demand:
 
 ```sh
 opaque attest --key <expected attestation key hex>
@@ -163,8 +150,9 @@ opaque attest --key <expected attestation key hex>
 The CLI generates a fresh nonce, the daemon answers with a signed report
 covering custody, chain, trust-domain enforcement, applied bundle, and
 registered approval factors, and the CLI verifies signature, nonce, and
-freshness **before** printing anything. Without `--key` it says plainly that
-the report is proven fresh but not proven to come from a particular daemon.
+freshness **before** printing the report. Without `--key`, it uses the key
+supplied with the response: nonce and freshness checks do not authenticate
+a particular enrolled daemon.
 
 ```toml
 [attestation]
@@ -173,20 +161,20 @@ key_release_url = "https://kms.acme.com/opaque"
 key_release_authorization = "Bearer …"
 ```
 
-Two verdicts are kept separate on purpose:
+The verdicts summarize the signed report's fields:
 
 | Verdict | Means | Requires |
 |---|---|---|
-| **Healthy** | nothing is broken | custody verified + chain verifies |
-| **Release-eligible** | may receive custody keys | healthy **and** trust-domain enforced |
+| **Healthy** | Reported custody and audit checks passed | custody verified + chain verifies |
+| **Release-eligible** | Meets the built-in posture predicate; the verifier decides release | healthy **and** trust-domain enforced |
 
-A developer's session-mode daemon is healthy; it simply must never be handed
-custody material, because it shares a uid with the agent.
+A session-mode daemon can report healthy checks while sharing a uid with the
+agent. It does not meet the release-eligible predicate.
 
 ### Verify before trust (key release)
 
-With `key_release_url` set, the daemon proves posture before it receives key
-material:
+With `key_release_url` set, the daemon submits a signed posture report to an
+external verifier to request key material:
 
 1. Daemon asks the verifier for a challenge; the verifier returns a nonce.
 2. Daemon returns a freshly signed report answering that nonce.
@@ -194,17 +182,18 @@ material:
    the nonce it issued, and applies its own posture policy.
 4. Only then does it release the material.
 
-The daemon never sees the release policy: it proves posture and either
-receives material or does not. A refusal is loud but not fatal: the daemon
-keeps running on what it already holds.
+The verifier owns the release policy. A refusal is logged but does not stop the
+daemon or revoke material it already holds.
 
-This is the seam where hardware-rooted attestation belongs. A KMS release
-policy or a SPIFFE/SPIRE SVID exchange plugs in at exactly this point with the
-same protocol shape; what changes is the strength of the identity, not the
-flow.
+Hardware-backed attestation or a KMS/SPIFFE/SPIRE integration would require
+separate implementation and qualification. This exchange alone provides no
+hardware measurement of the running binary.
 
-> **Honesty about strength.** This is *software* attestation: it proves a
-> holder of the enrolled key claims this posture, freshly. It is not a
-> hardware measurement of the running binary. What it buys is real but bounded:
-> a daemon whose custody was tampered with cannot silently collect fresh
-> keys, because the report it must produce carries the violations.
+> **Trust requirement.** Software attestation establishes that a holder of the
+> enrolled key signed these claims in response to the verifier's nonce. The
+> daemon and key holder remain trusted to report honestly. A compromised daemon
+> or signing key can produce false posture claims that pass signature checks.
+
+Inspect the [report format and verification tests](https://github.com/kcirtapfromspace/opaque/blob/83e7924960f809e87379a54996317dbe1422fe70/crates/opaque-core/src/attest.rs)
+and [posture observation and key-release client](https://github.com/kcirtapfromspace/opaque/blob/83e7924960f809e87379a54996317dbe1422fe70/crates/opaque-federation-runtime/src/attest.rs).
+These source references describe implementation, not an independent security audit.

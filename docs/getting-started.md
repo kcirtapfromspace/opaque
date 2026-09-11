@@ -17,6 +17,10 @@ minutes, ending with a real gated operation and a verified audit chain.
 
 ## Build
 
+For Homebrew, the shell installer, or installation from Git, start with
+[install Opaque](tutorial.md#1-install). The command below assumes you already
+have a source checkout and a Rust toolchain.
+
 ```bash
 cargo build --locked --release
 ```
