@@ -31,6 +31,22 @@ struct NoticeQueue {
     }
 }
 
+struct InspectionState {
+    private(set) var active: Notice?
+    var expiry: Double?
+    var verified = false
+
+    mutating func begin(_ notice: Notice) -> Bool {
+        guard active == nil else { return false }
+        active = notice; expiry = nil; verified = false
+        return true
+    }
+
+    mutating func reset() {
+        active = nil; expiry = nil; verified = false
+    }
+}
+
 // This mode never creates NSApplication, accesses custody, runs a subprocess,
 // registers a URL handler, opens a window or requests authentication.
 if CommandLine.arguments == [CommandLine.arguments[0], "--self-test"] {
@@ -42,10 +58,19 @@ if CommandLine.arguments == [CommandLine.arguments[0], "--self-test"] {
     var queue = NoticeQueue()
     for _ in 0..<100 { _ = queue.append(Notice(good)!) }
     precondition(queue.items.count == 1)
+    var inspection = InspectionState()
+    // A notice can arrive before enrollment. Failed inspection must be
+    // retryable after enrollment, without consuming or approving the notice.
+    precondition(inspection.begin(queue.items[0]))
+    precondition(!inspection.begin(queue.items[0]))
+    inspection.reset()
+    precondition(queue.items.count == 1 && inspection.begin(queue.items[0]))
+    precondition(inspection.expiry == nil && !inspection.verified)
+    precondition(!queue.append(Notice(good)!))
     queue.finish(); precondition(!queue.append(Notice(good)!))
     for _ in 0..<30 { _ = queue.append(Notice("opaque-approval://review/opq-lab/\(UUID().uuidString)")!) }
     precondition(queue.items.count == 16)
-    print("reviewer-launcher: strict references, 100 duplicate opens, completed deduplication and 16-item bound passed; native UI not invoked")
+    print("reviewer-launcher: strict references, 100 duplicate opens, post-enrollment inspection retry, completed deduplication and 16-item bound passed; native UI not invoked")
     exit(0)
 }
 
@@ -65,9 +90,7 @@ final class ReviewerApp: NSObject, NSApplicationDelegate {
     private var setupButtons: [NSButton] = []
     private var stateDir: String?
     private var queue = NoticeQueue()
-    private var active: Notice?
-    private var expiry: Double?
-    private var verified = false
+    private var inspection = InspectionState()
     private var busy = false
     private var lockFD: Int32 = -1
     private var timer: Timer?
@@ -158,7 +181,7 @@ final class ReviewerApp: NSObject, NSApplicationDelegate {
         if panel.runModal() == .OK, let url = panel.url { select(url.path) }
     }
     private func select(_ path: String) {
-        stateDir = path; folder.stringValue = path; verified = false; active = nil; expiry = nil
+        stateDir = path; folder.stringValue = path; inspection.reset()
         UserDefaults.standard.set(path, forKey: "trustedCustodyPath")
         publicKey.stringValue = "The public key is printed after creation. Share it with the broker operator; never share custody files."
         inspectNext()
@@ -177,7 +200,11 @@ final class ReviewerApp: NSObject, NSApplicationDelegate {
         guard !busy, let state = stateDir else { return }
         run(["enroll", "--state-dir", state, "--broker", endpoint.stringValue, "--broker-id", broker.stringValue, "--tls-fingerprint", fingerprint.stringValue]) { code, _, _ in
             self.status.stringValue = code == 0 ? "Enrolled. Open an opaque notification to queue a task for review." : "Enrollment failed. Verify the allowlisted key, broker ID and certificate fingerprint through the operator’s trusted channel."
-            if code == 0 { self.inspectNext() }
+            if code == 0 {
+                // Preserve the queued reference, but discard failed inspection
+                // from before enrollment. This refetches context only.
+                self.inspection.reset(); self.inspectNext()
+            }
         }
     }
     @objc private func checkNative() {
@@ -185,13 +212,13 @@ final class ReviewerApp: NSObject, NSApplicationDelegate {
         run(["check-native"]) { code, _, _ in self.status.stringValue = code == 0 ? "Native capability available. No review or authentication was performed." : "Native capability unavailable. Check the signed-in desktop session and installed helper." }
     }
     private func inspectNext() {
-        guard window != nil, !busy, active == nil, let state = stateDir, let notice = queue.items.first else { return }
-        active = notice; verified = false; expiry = nil
+        guard window != nil, !busy, let state = stateDir, let notice = queue.items.first,
+              inspection.begin(notice) else { return }
         run(["inspect", "--state-dir", state, "--notice", notice.link]) { code, value, _ in
-            guard self.active == notice else { return }
+            guard self.inspection.active == notice else { return }
             if code == 0, let value, let expires = value["expires_at"] as? Double,
                value["broker_id"] as? String == notice.broker, value["approval_id"] as? String == notice.id {
-                self.expiry = expires; self.verified = true
+                self.inspection.expiry = expires; self.inspection.verified = true
                 self.detail.stringValue = "Broker: \(notice.broker)\nOperation: \(value["operation"] as? String ?? "")\nTenant: \(value["tenant"] as? String ?? "Legacy ceremony")\nRequester: \(value["requester"] as? String ?? "See complete review")\nReviewer: \(value["reviewer"] as? String ?? "Enrolled workstation")\nApproval: \(notice.id)"
                 self.status.stringValue = "Reference verified against this enrollment. Choose Review to read every action and limit before native authentication."
             } else { self.detail.stringValue = "This notice is unavailable, expired, revoked, or belongs to another enrollment."; self.status.stringValue = "No review or decision occurred. Dismiss it or select its previously enrolled custody folder." }
@@ -199,16 +226,17 @@ final class ReviewerApp: NSObject, NSApplicationDelegate {
         }
     }
     @objc private func review() {
-        guard !busy, verified, let notice = active, let state = stateDir, let expiry, expiry > Date().timeIntervalSince1970 else { return }
+        guard !busy, inspection.verified, let notice = inspection.active, let state = stateDir,
+              let expiry = inspection.expiry, expiry > Date().timeIntervalSince1970 else { return }
         run(["open", "--state-dir", state, "--notice", notice.link], timeout: 310) { code, value, _ in
-            self.verified = false
+            self.inspection.verified = false
             if code == 0, let message = value?["message"] as? String { self.status.stringValue = message }
             else { self.status.stringValue = "Review did not complete. It may have expired or authority may have changed. Read the receipt for this exact round; never infer execution success." }
             self.tick()
         }
     }
     @objc private func lookup() {
-        guard !busy, let notice = active, let state = stateDir else { return }
+        guard !busy, let notice = inspection.active, let state = stateDir else { return }
         run(["receipt", "--state-dir", state, "--approval-id", notice.id]) { code, value, _ in
             if code == 0, let response = value?["response"] as? [String: Any], let decision = response["decision"] as? String {
                 self.status.stringValue = "Retained signed decision: \(decision). Broker acceptance metadata is not independently signed. Execution outcome remains unobserved here."
@@ -217,14 +245,14 @@ final class ReviewerApp: NSObject, NSApplicationDelegate {
     }
     @objc private func dismissNotice() {
         guard !busy else { return }
-        queue.finish(); active = nil; expiry = nil; verified = false
+        queue.finish(); inspection.reset()
         detail.stringValue = "No active request. Notifications only queue references."; status.stringValue = "Notice dismissed locally; no decision sent."; tick(); inspectNext()
     }
     private func tick() {
-        let seconds = expiry.map { max(0, Int(ceil($0 - Date().timeIntervalSince1970))) }
+        let seconds = inspection.expiry.map { max(0, Int(ceil($0 - Date().timeIntervalSince1970))) }
         countdown.stringValue = seconds.map { $0 > 0 ? "\($0)s remaining / \(queue.items.count) queued" : "Expired / a fresh request needs fresh review" } ?? "\(queue.items.count) queued"
-        reviewButton?.isEnabled = !busy && verified && (seconds ?? 0) > 0
-        receiptButton?.isEnabled = !busy && active != nil
+        reviewButton?.isEnabled = !busy && inspection.verified && (seconds ?? 0) > 0
+        receiptButton?.isEnabled = !busy && inspection.active != nil
         setupButtons.forEach { $0.isEnabled = !busy }
     }
     private func run(_ arguments: [String], timeout: Double = 55, completion: @escaping (Int32, [String: Any]?, String) -> Void) {

@@ -216,6 +216,96 @@ fn original_pin_rejects_corrupted_but_locally_consistent_legacy_prefix() {
 }
 
 #[test]
+fn empty_legacy_pin_cannot_bless_rollback_or_erased_retention_frontier() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("audit.db");
+    SqliteAuditSink::new(path.clone(), 0)
+        .unwrap()
+        .close()
+        .unwrap();
+    let earlier = directory.path().join("earlier.db");
+    std::fs::copy(&path, &earlier).unwrap();
+    std::fs::copy(path.with_extension("hmac"), earlier.with_extension("hmac")).unwrap();
+
+    let sink = SqliteAuditSink::new(path.clone(), 0).unwrap();
+    for _ in 0..3 {
+        let mut event =
+            AuditEvent::new(AuditEventKind::OperationSucceeded).with_operation("synthetic.expired");
+        event.ts_utc_ms = 1;
+        sink.emit(event);
+    }
+    sink.close().unwrap();
+    SqliteAuditSink::new(path.clone(), 1)
+        .unwrap()
+        .close()
+        .unwrap();
+    let retained_frontier: i64 = Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT last_sequence FROM chain_head", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(retained_frontier, 2);
+    legacy(&path);
+    legacy(&earlier);
+    let erased = directory.path().join("erased.db");
+    std::fs::copy(&path, &erased).unwrap();
+    std::fs::copy(path.with_extension("hmac"), erased.with_extension("hmac")).unwrap();
+    // A storage writer need not forge or read a key to erase these legacy anchors.
+    Connection::open(&erased)
+        .unwrap()
+        .execute_batch("DELETE FROM retention_boundary; DELETE FROM chain_head;")
+        .unwrap();
+    let archived = inspect_legacy_export(&path).unwrap();
+    assert!(archived.is_empty());
+    let independent_pin = sha256(&archived);
+    for candidate in [&path, &earlier, &erased] {
+        assert_eq!(inspect_legacy_export(candidate).unwrap(), archived);
+        let before = std::fs::read(candidate).unwrap();
+        let key_before = std::fs::read(candidate.with_extension("hmac")).unwrap();
+        let error = upgrade_legacy_head(candidate, &independent_pin).unwrap_err();
+        assert!(error.to_string().contains("empty legacy export"), "{error}");
+        assert_eq!(std::fs::read(candidate).unwrap(), before);
+        assert!(std::fs::read(candidate.with_extension("hmac")).unwrap() == key_before);
+        let conn = Connection::open(candidate).unwrap();
+        assert!(
+            conn.prepare("SELECT format_version,authenticator FROM chain_head")
+                .is_err(),
+            "refusal must not migrate or rewrite the old head"
+        );
+        drop(conn);
+        assert!(SqliteAuditSink::new(candidate.clone(), 0).is_err());
+    }
+}
+
+#[test]
+fn malformed_metadata_refuses_verification_startup_and_upgrade_without_changes() {
+    for malformed in [
+        "PRAGMA ignore_check_constraints=ON; INSERT INTO retention_boundary VALUES(1,'invalid',0,0,1,'invalid');",
+        "PRAGMA ignore_check_constraints=ON; INSERT INTO chain_head VALUES(1,'invalid',0);",
+        "CREATE TABLE duplicate_head AS SELECT * FROM chain_head; DROP TABLE chain_head; ALTER TABLE duplicate_head RENAME TO chain_head; INSERT INTO chain_head SELECT * FROM chain_head;",
+        "CREATE TRIGGER unexpected_head_trigger AFTER UPDATE ON chain_head BEGIN SELECT 1; END;",
+        "CREATE TRIGGER unexpected_boundary_trigger AFTER INSERT ON retention_boundary BEGIN SELECT 1; END;",
+        "ALTER TABLE retention_boundary RENAME TO renamed_boundary; ALTER TABLE renamed_boundary RENAME TO RETENTION_BOUNDARY; CREATE TRIGGER unexpected_uppercase_trigger AFTER INSERT ON RETENTION_BOUNDARY BEGIN SELECT 1; END;",
+    ] {
+        let (_directory, path, _key, _trust) = fixture();
+        let pin = sha256(&inspect_legacy_export(&path).unwrap());
+        legacy(&path);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(malformed)
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let checked = verify_audit_chain(&path).unwrap();
+        assert!(!checked.ok);
+        assert!(checked.detail.unwrap().contains("metadata"));
+        assert!(inspect_legacy_export(&path).is_err());
+        assert!(upgrade_legacy_head(&path, &pin).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(SqliteAuditSink::new(path.clone(), 0).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+}
+
+#[test]
 fn exact_older_snapshot_needs_retained_checkpoint_to_detect_regression() {
     let (directory, path, key, trust) = fixture();
     let old = directory.path().join("old.db");

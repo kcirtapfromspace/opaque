@@ -9,6 +9,40 @@ notes; `scripts/release-prep.sh` stamps the section below at release time.
 
 ## [Unreleased]
 
+### Added
+
+- macOS workstation reviewer app with reference-only notices, pinned enrollment,
+  bounded queues and readback after uncertain decision delivery. Signed/notarized
+  distribution and human installation qualification remain release gates.
+- Signed MCP v2 contracts, offline validate/qualify/prepare commands and bounded
+  typed result projections. Raw output stays withheld; projections are ephemeral
+  and require current authority. Existing v1 contracts retain their wire format.
+- Authenticated audit heads and portable producer-signed export checkpoints,
+  with public verification of independently enrolled retention receipts.
+
+### Changed
+
+- Existing audit stores require explicit legacy upgrade against independently
+  retained export evidence. Unsupported state fails closed; this is not an
+  automatic upgrade or authority restore path. See `docs/evidence-checkpoints.md`.
+- Installation, review, MCP, evidence and recovery guides describe executable
+  source commands and distinguish fixture validation from release qualification.
+
+### Fixed
+
+- Refuse empty legacy audit upgrades: an empty export digest cannot authenticate
+  a historical sequence frontier. Preserve existing custody on refusal. Reject
+  malformed singleton metadata/metadata triggers and recheck exact export bytes
+  before committing a legacy upgrade.
+- Refresh a pending reviewer notice after successful enrollment without approving it.
+- Install `opaque-approver` and `opaque-evidence` when present in release archives;
+  retain compatibility with older archives. Homebrew keeps a bundled reviewer
+  under its prefix; the shell installer remains CLI-only.
+- Pass the detached certificate to optional Cosign verification and bind its
+  identity to the exact release workflow/tag. Missing required certificate or
+  failed verification prevents installation when signature verification runs.
+- Isolate Infisical mock credential tests from parallel process-environment changes.
+
 ## [0.3.0] - 2026-09-09
 
 ### Added

@@ -2,7 +2,7 @@
 
 **Time: about 15 minutes.** By the end you will have an agent that can push a
 secret to GitHub without ever being able to read it, and an audit trail that
-proves what happened.
+records the broker’s observed outcome.
 
 You need macOS or Linux and a terminal. Steps 1–4 need nothing else; from step 5
 you also want a GitHub repo you can write to and a token with `repo` scope. No
@@ -29,6 +29,12 @@ agent sees carries no secret material.
 
 ## 1. Install
 
+This tutorial exercises the baseline broker flow. The new reviewer app, signed
+MCP v2 projections and portable checkpoints are unreleased source capabilities;
+see [getting started](getting-started.md) for their build paths. When upgrading
+an existing installation, follow the [audit migration guide](evidence-checkpoints.md#authenticated-local-head-and-older-databases)
+before restarting with the current source writer.
+
 === "macOS (Homebrew)"
 
     ```sh
@@ -44,14 +50,14 @@ agent sees carries no secret material.
 === "From source"
 
     ```sh
-    cargo install --git https://github.com/kcirtapfromspace/opaque.git opaque opaqued opaque-mcp
+    cargo install --locked --git https://github.com/kcirtapfromspace/opaque.git opaque opaqued opaque-mcp opaque-approve-helper
     ```
 
-Check all three binaries are on your PATH:
+Check the broker, client, MCP server and native helper are on your PATH:
 
 ```sh
 opaque --version
-command -v opaqued opaque-mcp
+command -v opaqued opaque-mcp opaque-approve-helper
 ```
 
 ---

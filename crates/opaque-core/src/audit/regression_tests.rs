@@ -210,8 +210,10 @@ fn transaction_failures_do_not_advance_the_in_memory_hash() {
         assert!(SqliteAuditSink::insert_batch(&conn, &batch, &key, &mut tail).is_err());
         assert_eq!(tail, initial, "head must only advance after commit");
         assert_eq!(row_count(&conn), 1);
-        assert!(verify_audit_chain(&fixture.path).unwrap().ok);
+        // Metadata triggers are rejected by normal verification. Remove this
+        // test's fault injector after asserting the write/commit rollback.
         conn.execute_batch("DROP TRIGGER reject_write;").unwrap();
+        assert!(verify_audit_chain(&fixture.path).unwrap().ok);
         SqliteAuditSink::insert_batch(
             &conn,
             &[AuditEvent::new(AuditEventKind::OperationSucceeded).with_sequence_number(3)],

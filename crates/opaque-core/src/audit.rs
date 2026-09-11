@@ -1123,7 +1123,7 @@ pub fn verify_audit_chain(db_path: &Path) -> Result<ChainVerification, AuditErro
 
 fn table_exists(conn: &rusqlite::Connection, name: &str) -> rusqlite::Result<bool> {
     conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1 COLLATE NOCASE)",
         [name],
         |row| row.get(0),
     )
@@ -1185,6 +1185,38 @@ fn verify_audit_connection(
         first_bad_sequence: sequence,
         detail: Some(detail),
     };
+    // Metadata is a singleton contract, not an extensible table. Authenticate
+    // exactly the row that startup/retention may use, and reject side effects on
+    // these tables before any maintenance or legacy upgrade can write them.
+    // The documented audit_events FTS triggers are unaffected.
+    for table in ["chain_head", "retention_boundary"] {
+        if !table_exists(conn, table)? {
+            continue;
+        }
+        let mut statement = conn.prepare(&format!("SELECT id FROM {table} LIMIT 2"))?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if ids.len() > 1 || ids.first().is_some_and(|id| *id != 0) {
+            return Ok(broken(
+                0,
+                None,
+                format!("audit {table} metadata must contain only the singleton id=0 row"),
+            ));
+        }
+        let has_triggers: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='trigger' AND tbl_name=?1 COLLATE NOCASE)",
+            [table],
+            |row| row.get(0),
+        )?;
+        if has_triggers {
+            return Ok(broken(
+                0,
+                None,
+                format!("audit {table} metadata does not permit triggers"),
+            ));
+        }
+    }
     let boundary = match retention_boundary(conn, key) {
         Ok(boundary) => boundary,
         Err(AuditError::Other(detail)) => return Ok(broken(0, None, detail)),
@@ -1537,8 +1569,8 @@ impl SqliteAuditSink {
         }
         let next_sequence: u64 = tx.query_row(
             "SELECT COALESCE(MAX(sequence_number), -1) + 1 FROM (
-                SELECT sequence_number FROM audit_events UNION ALL SELECT last_sequence FROM chain_head
-                UNION ALL SELECT sequence_high_watermark FROM retention_boundary
+                SELECT sequence_number FROM audit_events UNION ALL SELECT last_sequence FROM chain_head WHERE id=0
+                UNION ALL SELECT sequence_high_watermark FROM retention_boundary WHERE id=0
              )", [], |row| row.get(0),
         )?;
         let last_hash = tx

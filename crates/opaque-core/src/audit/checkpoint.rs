@@ -210,7 +210,16 @@ pub fn upgrade_legacy_head(path: &Path, trusted_export_sha256: &str) -> Result<(
         ));
     }
     require_valid_chain(&tx, &key, true)?;
-    if sha256(&export_snapshot(&tx)?) != trusted_export_sha256 {
+    let export = export_snapshot(&tx)?;
+    // An empty export carries no sequence/hash frontier: genesis, a fully pruned
+    // log, and a legacy log with its boundary/head removed have the same digest.
+    // Do not authenticate a caller-selected frontier using that ambiguous pin.
+    if export.is_empty() {
+        return Err(AuditError::Other(
+            "empty legacy export cannot establish a historical frontier; preserve custody and independent history without upgrading".into(),
+        ));
+    }
+    if sha256(&export) != trusted_export_sha256 {
         return Err(AuditError::Other(
             "independently trusted export digest does not match; no upgrade performed".into(),
         ));
@@ -232,6 +241,11 @@ pub fn upgrade_legacy_head(path: &Path, trusted_export_sha256: &str) -> Result<(
     };
     set_chain_head(&tx, &key, &hash, sequence)?;
     require_valid_chain(&tx, &key, false)?;
+    if sha256(&export_snapshot(&tx)?) != trusted_export_sha256 {
+        return Err(AuditError::Other(
+            "audit export changed during legacy upgrade; no upgrade performed".into(),
+        ));
+    }
     tx.commit()?;
     Ok(())
 }

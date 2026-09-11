@@ -25,7 +25,7 @@ Multi-step work adds **plan -> review -> approve -> run -> inspect**. See
 [bounded agent work](docs/bounded-work.md).
 
 New here? The [15-minute tutorial](docs/tutorial.md) takes you from install to a
-secret your agent moved but never saw, with an audit chain proving it.
+secret your agent moved but never saw, with verifiable broker audit records.
 
 ## Who It's For
 
@@ -40,12 +40,12 @@ fleet.
 - **Developers** hand the agent real work, approve the exact scope once,
   and read the receipt.
 - **The agent** (Claude Code, Codex, any MCP client) finishes the task with
-  operations, never plaintext. There is nothing in its process worth
-  stealing.
+  credentialed operations while provider credentials remain in broker custody.
+  Allowed data results and agent-owned credentials still need their own controls.
 
 Opaque is not another secrets manager or agent framework. It sits in front
 of GitHub, GitLab, 1Password, Bitwarden, Vault, and AWS, decides what may
-pass, and proves what did.
+pass, and records observed execution outcomes.
 
 ## Features
 
@@ -54,7 +54,8 @@ pass, and proves what did.
 - **Trust-domain enforcement**: run the daemon as a dedicated service account (or separate container) that exclusively owns every key, database, and config; startup verifies custody and fails closed, turning tamper-evidence into tamper-prevention (`docs/deployment.md`)
 - **Signature-bound approvals**: a pluggable factor registry with macOS Touch ID / Linux polkit, a paired second device (Ed25519, decision-bound signatures), FIDO2 hardware keys and passkeys (challenge-bound, verified daemon-side), and a trusted-workstation full-manifest reviewer for tasks; the audit chain records *who* approved, cryptographically
 - Identity substrate: daemon-owned OIDC login (PKCE), on-behalf-of delegation tokens, live-resolved roles, segregation of duties
-- Tamper-evident HMAC audit chain (SQLite) with `opaque audit verify`, restart-safe sequencing, and correlation IDs
+- Authenticated audit records and head (SQLite), plus portable signed checkpoints and independent verification with `opaque-evidence`; see [evidence checkpoints](docs/evidence-checkpoints.md) for coverage, freshness and legacy upgrade requirements
+- Signed MCP registry v2 with separate upstream/admitted schemas and bounded integer/status result projection; see [tool qualification](docs/mcp-qualified-tools.md)
 - Sandboxed execution: bubblewrap + Landlock + seccomp applied to every exec child; typestate-enforced response sanitization + secret-pattern scrubbing
 - Client identity from Unix peer creds + executable identity (path/hash, optional macOS Team ID)
 - **Federation**: one org signature carries policy to a whole fleet (`opqb1` bundles, verified before parsing, with anti-rollback and substitution refusal enforced from custody); the audit chain exports to SIEM over spool/webhook/TLS syslog carrying each record's sequence number and hash; daemons produce signed posture attestations and can be required to prove posture before receiving key material (`docs/federation.md`)
@@ -63,6 +64,11 @@ pass, and proves what did.
 - Policy presets for common workflows; deploy templates for systemd, launchd, docker-compose, and Kubernetes (`deploy/`)
 
 ## Install
+
+The reviewer app, MCP registry v2 and `opaque-evidence` are unreleased source
+capabilities. Tagged downloads and Homebrew install the published release; they
+may not contain these additions. Build this checkout to validate them. Before
+upgrading an existing audit store, follow the [explicit legacy transition](docs/evidence-checkpoints.md#authenticated-local-head-and-older-databases).
 
 ### macOS (Homebrew)
 
@@ -79,7 +85,7 @@ curl -sSfL https://raw.githubusercontent.com/kcirtapfromspace/opaque/main/instal
 ### From Source
 
 ```sh
-cargo install --git https://github.com/kcirtapfromspace/opaque.git opaque opaqued opaque-mcp
+cargo install --locked --git https://github.com/kcirtapfromspace/opaque.git opaque opaqued opaque-mcp opaque-approve-helper opaque-approver opaque-web
 ```
 
 Binaries:
@@ -89,6 +95,18 @@ Binaries:
 | `opaqued` | Trusted daemon (enclave, policy, approvals, audit) |
 | `opaque` | CLI client |
 | `opaque-mcp` | MCP server for Claude Code |
+| `opaque-mcp-contract` | Source-built offline registry qualification (`cargo build --locked -p opaque-mcp --bin opaque-mcp-contract`) |
+| `opaque-approve-helper` | Native review helper |
+| `opaque-approver` | Trusted workstation enrollment and whole-task review (macOS approval) |
+| `opaque-evidence` | Offline checkpoint producer and evidence verifier (included in the `opaque` package) |
+| `opaque-web` | Local dashboard |
+
+The [macOS reviewer guide](crates/opaque-approver/README.md) covers the separate
+app bundle, trusted enrollment and release qualification. The shell installer
+installs CLI tools only; a Homebrew release containing the app preserves it at
+`$(brew --prefix opaque)/Opaque Reviewer.app` without enrolling a broker.
+Source commands targeting Git use its default branch; for an unmerged change,
+check out its reviewed commit and run `cargo build --locked` there.
 
 ## Platform Support
 
@@ -230,6 +248,9 @@ opaque policy preset github-secrets
 - [Bounded agent work](docs/bounded-work.md)
 - [Identity](docs/identity.md)
 - [MCP integration](docs/mcp-integration.md)
+- [Qualifying MCP tools](docs/mcp-qualified-tools.md)
+- [Trusted reviewer](docs/remote-approvals.md)
+- [Evidence checkpoints and audit upgrades](docs/evidence-checkpoints.md)
 - [Bitwarden setup](docs/bitwarden.md)
 - [Vault setup](docs/vault.md)
 - [Federation](docs/federation.md)

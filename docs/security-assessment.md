@@ -1,6 +1,6 @@
 # Opaque Security Assessment
 
-> NOTE: This document is historical and may not match the current code. For the latest adversarial review and demos, see [Adversarial security review](adversarial-security-review-2026-02-14.md).
+> NOTE: This is a historical assessment, not a current deployment checklist. A later historical review is [Adversarial security review](adversarial-security-review-2026-02-14.md). Current custody and migration instructions are in [deployment](deployment.md), [storage](storage.md) and [evidence checkpoints](evidence-checkpoints.md).
 
 **Date:** 2026-02-12
 **Assessor:** Security Engineering Review
@@ -28,6 +28,13 @@
 >   [federation](federation.md).
 >
 > Appendix A/B file lists and dependency counts are frozen at 2026-02-12.
+>
+> September 11 source update: authenticated audit heads, explicit legacy upgrade
+> and independently verifiable checkpoints are implemented but unreleased.
+> Local verification cannot detect a forged history when the attacker holds the
+> HMAC key, or establish freshness of an older intact snapshot. The recovery
+> instructions below have been corrected; the historical findings elsewhere
+> have not been reclassified by this documentation update.
 
 ---
 
@@ -1037,29 +1044,21 @@ If a runtime dependency is compromised:
 
 ### 7.4 Backup and Recovery for Audit Data
 
-#### What to Back Up
+The original proposed paths, Parquet/embedding backups and “restore then restart”
+recipe are superseded. Use [current storage boundaries](storage.md) and
+[evidence checkpoints](evidence-checkpoints.md) for supported paths and commands.
 
-| Data | Location | Frequency | Retention |
-|------|----------|-----------|-----------|
-| SQLite audit DB | `~/.opaque/data/audit.db` (planned) | Daily incremental | 1 year minimum |
-| Parquet exports | `~/.opaque/data/parquet/` (planned) | On creation | 2+ years |
-| Policy files | `~/.opaque/policy.toml` (planned) | On change | Indefinite (version control recommended) |
-| Paired device keys | In SQLite DB | With audit DB | Until device is revoked |
+Preserve a consistent snapshot of custody and keep independently retained export
+pins/checkpoints under separate control. Inspect archived evidence offline;
+SQLite integrity alone is not a cryptographic or freshness check. The current
+writer rejects older audit schemas pending explicit, pinned migration.
 
-#### Backup Procedures
-
-1. **SQLite:** Use `.backup` command or `sqlite3 audit.db ".backup /path/to/backup.db"` to create a consistent backup. Do not copy the file while the daemon is running (WAL mode can leave the copy inconsistent).
-2. **Policy files:** Store in version control (git). Review diffs before applying changes.
-3. **Encrypt backups:** Use `age` or `gpg` to encrypt backup files before storing them off-machine.
-4. **Test recovery:** Periodically restore from backup to verify integrity.
-
-#### Recovery
-
-1. Stop `opaqued`.
-2. Replace the SQLite DB with the backup copy.
-3. Verify integrity: `sqlite3 audit.db "PRAGMA integrity_check"`.
-4. Restart `opaqued`.
-5. Note: Approval leases are intentionally not persisted (fail-closed). After recovery, users will need to re-approve operations.
+Do not replace live authority stores with an old backup and restart. Task/MCP
+consumption, revocation and replay state are durable; rolling them back can
+resurrect already consumed or revoked work. Safe recovery requires closed
+admission, fenced old writers, preserved unknown effects and a reviewed
+new-generation/re-enrollment procedure. The product has no generic authority
+restore command. See [deployment](deployment.md#upgrading-existing-custody).
 
 ---
 

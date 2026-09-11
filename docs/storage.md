@@ -1,207 +1,79 @@
-# Storage & Data Model (Broker-First)
+# Storage and recovery boundaries
 
-Opaque is a **broker**, not a general purpose secret key/value store. The persistent data model should therefore store:
+Opaque stores authorization state, references and evidence separately from the
+secret values used during an operation. This page describes the current source
+implementation; it is not a proposed database schema or a backend migration plan.
 
-- references, identities, policies, approvals, and audit history
-- provider connection metadata (non-secret)
-- paired device public keys
+## Durable authority
 
-and explicitly **must not** store plaintext secret values.
+The broker uses SQLite for existing local ledgers. Task and MCP invocation stores
+persist reservations before dispatch, consumption, expiry/revocation state and
+receipts. An interrupted attempt can have an unknown provider effect. Restarting
+the broker must preserve that charge and prevent replay; asking for approval
+again does not make the old attempt safe to repeat.
 
-## 1. Storage Layers (Recommended)
+Identity, pairing, federation replay state, tenant bindings and configuration
+seals also belong to trusted custody. Their precise files and migrations are
+owned by the corresponding components. Audit events are evidence about these
+systems, not a replacement for their authoritative state.
 
-### 1.1 In-Memory Only (never persisted)
+See [bounded work](bounded-work.md), [qualified MCP tools](mcp-qualified-tools.md),
+[identity](identity.md) and [deployment](deployment.md). Public wire contracts do
+not expose a database driver. A different storage implementation must preserve
+atomic admission, revocation ordering, replay tombstones and crash recovery.
+Analytics or graph projections must not become authorization sources.
 
-- plaintext secret material fetched from providers (bytes)
-- pending approval requests (nonces, request summaries)
-- short-lived approval leases/capabilities (optional to persist; safer to keep in-memory)
+## Keys, configuration and secret values
 
-If `opaqued` restarts, it is acceptable (and safer) to require re-approval.
+Provider credentials remain in the configured provider or credential backend.
+Secret values fetched for an operation are not an audit or metadata payload.
+Do not persist raw authenticated request/response bodies, credentials or injected
+process environments in application logs.
 
-### 1.2 OS Credential Store (Keychain / Secret Service)
+Do not assume every signing key is in an OS credential store. The audit HMAC key
+and several broker keys use protected key files. The workstation reviewer also
+uses file-backed private custody; enrollment stores pinned public identities.
+See [reviewer setup](remote-approvals.md) for its ownership and permission checks.
 
-Use the OS store for **credentials and private keys**:
+Configuration and profiles contain policy, references and provider metadata.
+Those references can themselves be sensitive. Protect the entire custody set,
+including SQLite WAL/SHM siblings, keys and backups. The dedicated service-account
+or container setup in [deployment](deployment.md) separates these files from the
+agent. An attacker who can read the HMAC key can forge a locally valid audit
+history; file permissions under the same compromised user do not prevent that.
 
-- GitHub/GitLab credentials (PATs) if you choose to store them locally
-- Vault tokens / 1Password service tokens (if stored)
-- Opaque server identity private key (used for second-device pairing/transport: desktop-to-desktop Ed25519 today, see [identity](identity.md))
-- optional: a database encryption key (see below)
+## Audit persistence and export
 
-macOS: Keychain
-Linux: Secret Service (freedesktop) where available; otherwise a file-backed keystore with strict perms (v1 fallback).
+The default session-mode audit path is `~/.opaque/audit.db`; service deployments
+use their configured state directory. The current writer authenticates both rows
+and the retained chain head, including empty state. Retention removes only a
+verified expired prefix in insertion order and preserves the authenticated
+frontier. Unsupported older stores fail closed until explicitly upgraded.
 
-### 1.3 Local Database (SQLite)
+Follow [the audit upgrade procedure](evidence-checkpoints.md#authenticated-local-head-and-older-databases)
+before starting this writer against an existing installation. A newly computed
+hash of a suspect database is not an independently retained historical pin.
+Never reset or delete custody just to bypass an upgrade refusal.
 
-Use SQLite for durable **metadata + audit**:
+[Portable checkpoints](evidence-checkpoints.md) bind exact export bytes to an
+enrolled producer, generation and sequence range. They can be verified without
+SQLite or the broker HMAC key. A retained external receipt or high-water mark is
+needed to detect replay of an older intact snapshot. A signature alone proves
+neither completeness, provider effects nor independence of the signer.
 
-- append-only audit log
-- client identities (what binary called, uid/gid, hash)
-- paired device public keys (desktop-to-desktop workstation approvers today; see [identity](identity.md))
-- provider accounts (non-secret config, labels)
-- profiles (name -> secret refs mapping)
-- operation receipts (optional: last sync status for UX)
+[Audit analytics](audit-analytics.md) describes the supported read interfaces and
+which analytics options remain proposals.
 
-Why SQLite:
+## Backup and recovery
 
-- single-user local daemon workload fits perfectly
-- strong consistency, easy migrations, good tooling
-- no external service dependency
+Use a consistent database snapshot or stop all writers before copying custody;
+copying only a live SQLite main file can omit committed WAL contents. Keep keys,
+configuration and independent evidence under separately controlled access.
+Verify archive integrity offline and retain the original evidence.
 
-For audit analytics and semantic search, see [Audit log, live feed, and analytics](audit-analytics.md).
-
-### 1.3.1 Why Not DuckDB or LanceDB As The Primary Store?
-
-- DuckDB:
-  - excellent embedded analytics engine (OLAP)
-  - not the typical choice as a system-of-record for transactional metadata (policy, devices, approvals, migrations)
-  - good fit as a secondary *read-only* analytics layer for large audit exports (Parquet) or ad-hoc queries
-- LanceDB:
-  - great when you need vector similarity search (embeddings)
-  - adds significant dependency surface area and is usually unnecessary for a broker's core metadata/audit needs
-  - consider only if you explicitly want semantic search over audit events/policies (and keep it out of the approval/execution path)
-
-### 1.4 Human-Readable Config Files (TOML)
-
-Keep policy and profiles in files when you want them to be reviewable and possibly checked into a repo:
-
-- policy allowlists (clients/ops/targets/factors)
-- profile mappings (env var names -> secret refs)
-
-These files can contain sensitive metadata (Vault paths, 1Password item names). They should be protected by file permissions and optionally kept out of repos.
-
-## 2. Encryption at Rest (Practical Options)
-
-Baseline:
-
-- rely on OS full-disk encryption (FileVault/LUKS) + strict directory/file perms (`0700` dirs, `0600` files)
-
-Stronger:
-
-- encrypt selected columns in SQLite (app-level AES-GCM) using a key stored in OS credential store
-- avoid SQLCipher until you truly need it (adds build/packaging complexity across macOS+Linux)
-
-Given you are not storing secret values, encryption is mostly about protecting:
-
-- secret references (paths/locators)
-- audit trail (targets, repos, clusters)
-- device pairing metadata
-
-## 3. Core Types (Conceptual)
-
-### 3.1 Secret reference
-
-The key design choice: store a *ref*, not the value.
-
-```rust
-struct SecretRef {
-  provider: String,  // "vault", "1password", "aws_sso", ...
-  locator: String,   // opaque provider-specific identifier
-}
-```
-
-Examples:
-
-- `vault://kv/myapp#JWT`
-- `op://Prod API/item#field`
-- `profile:myapp:JWT` (resolved server-side)
-
-### 3.2 Operation request (what gets approved + audited)
-
-```rust
-struct OperationRequest {
-  request_id: String,           // random, idempotency key
-  client: ClientIdentity,       // observed over UDS peer creds + exe hash
-  operation: String,            // "github.set_actions_secret"
-  target: serde_json::Value,    // repo/env/cluster/ns/etc
-  secret_refs: Vec<SecretRef>,  // refs only
-  created_at: i64,
-  expires_at: i64,
-}
-```
-
-### 3.3 Approval decision
-
-```rust
-struct ApprovalDecision {
-  approved: bool,
-  factor: String,               // "local_bio" | "ios_faceid" (wire name for the shipped
-                                 // desktop-to-desktop paired-device factor, see
-                                 // mobile-approvals.md) | "paired_workstation" | "fido2"
-  decided_at: i64,
-  lease_ttl_secs: u32,          // optional
-}
-```
-
-## 4. SQLite Schema (Suggested v1)
-
-This is intentionally "metadata + audit", not secret values.
-
-### 4.1 `clients`
-
-- last-seen cache for policy and UX
-
-Fields:
-
-- `id` (pk)
-- `uid`, `gid`
-- `exe_path`
-- `exe_sha256`
-- `codesign_team_id` (macOS optional)
-- `created_at`, `last_seen_at`
-
-### 4.2 `paired_devices`
-
-- store device public key only (the private key stays on the paired device)
-
-Fields:
-
-- `id` (pk)
-- `kind` (`workstation`: the desktop-to-desktop Ed25519 pairing that ships today; `ios` exists only as the schema's legacy default value and has no shipped mobile app behind it, see [mobile approvals](mobile-approvals.md))
-- `device_pubkey` (blob/base64)
-- `device_name`
-- `added_at`
-- `revoked_at` nullable
-
-### 4.3 `providers`
-
-Fields:
-
-- `id` (pk)
-- `kind` (`vault`, `1password`, ...)
-- `label`
-- `config_json` (non-secret)
-- `created_at`, `updated_at`
-
-### 4.4 `profiles`
-
-Fields:
-
-- `id` (pk)
-- `name` (unique)
-- `mapping_json` (env var name -> SecretRef string)
-- `created_at`, `updated_at`
-
-### 4.5 `audit_events` (append-only)
-
-Fields:
-
-- `id` (pk)
-- `ts`
-- `client_id`
-- `request_id`
-- `operation`
-- `target_json`
-- `secret_ref_names` (optional, avoid storing full locators if you consider them too sensitive)
-- `approval_factors_json`
-- `outcome` (`ok`/`denied`/`error`)
-- `error_code`, `error_message` (sanitized)
-
-You can keep this as the canonical history instead of adding many “state” tables.
-
-## 5. What NOT To Store
-
-- plaintext secrets
-- ciphertext that is trivially replayable to reveal secrets in an external system
-- raw HTTP request/response bodies from authenticated proxy operations (unless explicitly scrubbed)
-
-If a feature requires caching secret material, treat it as a design smell and revisit (prefer provider-side leases like Vault).
+A valid audit archive is suitable for inspection, not automatic restoration of
+execution authority. Restoring old task, identity, revocation or replay ledgers
+can resurrect consumed or revoked work even when every file passes integrity
+checks. Recovery needs admission closed, old writers fenced, unresolved effects
+preserved, and a reviewed generation/re-enrollment procedure. There is no generic
+safe “restore a database and restart” command in the current product.

@@ -44,16 +44,33 @@ agent instructions and do not become authority or override the enrolled tool ali
 ## Offline qualification
 
 The contract utility reads bounded regular files and never connects to a daemon,
-upstream endpoint, credential store or schema server:
+upstream endpoint, credential store or schema server.
+
+From the repository root, this complete example uses the bundled synthetic v2
+fixtures. It respects a custom Cargo target directory:
 
 ```sh
 cargo build --locked -p opaque-mcp --bin opaque-mcp-contract
-target/debug/opaque-mcp-contract validate registry.json
-target/debug/opaque-mcp-contract qualify registry.json catalog.json
-target/debug/opaque-mcp-contract prepare registry.json call.json
+mcp_contract_bin="${CARGO_TARGET_DIR:-target}/debug/opaque-mcp-contract"
+mcp_fixture_dir="crates/opaque-mcp/tests/fixtures"
+"$mcp_contract_bin" validate "$mcp_fixture_dir/gateway-registry-v2.json"
+"$mcp_contract_bin" qualify "$mcp_fixture_dir/gateway-registry-v2.json" \
+  "$mcp_fixture_dir/gateway-catalog-v2.json"
+"$mcp_contract_bin" prepare "$mcp_fixture_dir/gateway-registry-v2.json" \
+  "$mcp_fixture_dir/gateway-call-v2.json"
 ```
 
-`catalog.json` is a captured `tools/list` result or JSON-RPC result envelope.
+All three commands should exit 0. Validation reports `registry_valid: true`;
+qualification reports `scope: "catalog_pin_match_only"` and
+`diagnostic: "pinned_schema_matches"`; preparation reports
+`status: "prepared_not_authorized"`, `prepared_contract_version: 3` and
+`output_policy: "typed_fields"`. Every command reports
+`runtime_gateway_enabled: false`. Replace the fixture paths with the selected
+registry, captured catalog and bounded call to check another candidate. Repeating
+`prepare` does not execute or reserve an invocation; runtime replay protection is
+provided by the broker's durable invocation ledger, not this offline utility.
+
+The catalog is a captured `tools/list` result or JSON-RPC result envelope.
 Qualification accepts at most 256 KiB and 128 tools, with no pagination. Diagnostics
 are `pinned_schema_matches`, `tool_missing`, `duplicate_tool` or
 `upstream_schema_drift`; rejected upstream text is not echoed. Unsupported catalogs
@@ -72,6 +89,11 @@ unbounded strings, descriptions and an upstream number with stricter admitted in
 These are illustrative source-shape fixtures at `mcp.example.com`. They are not
 captured GitHub schemas or a ready-to-run GitHub integration. In particular, a real
 tool may not return the synthetic `structuredContent` fields used in this example.
+
+`validate` accepts the unsigned registry document for inspection. It does not enroll
+that document, validate issuer custody or replace runtime signature, tenant, registry
+sequence and expiry checks. `prepare` accepts only `route` and `arguments`; callers
+cannot add an endpoint, credential, approval or output-projection override.
 
 ## Signed typed result disclosure
 
@@ -109,6 +131,7 @@ Policy rules can match `output_policy`, `output_projection_digest` and
 `upstream_schema_digest`; these static fields are available during discovery too.
 Use the projection digest for matching, since policy field strings use glob syntax
 and serialized projection JSON contains characters with special glob meaning.
+The projection contract is signed; returned values are not separately signed evidence.
 Typed values remain untrusted provider claims; shape validation does not prove their
 truth, nor that the provider performed a business effect. Choose fields appropriate
 for the receiving principal and the workflow's disclosure policy.
@@ -138,6 +161,12 @@ provider business success. `attempt_charged` remains true after reservation,
 including failed admission during handshake, error, expiry, revocation or timeout.
 An interrupted dispatched call becomes `unknown`; it is never resumed or refunded.
 Every invocation UUID is single-use; a new UUID requires separate approval.
+
+An accepted receipt can accompany `withheld_invalid_projection` or
+`withheld_authority_changed`: the transport result was observed, but no useful values
+were disclosed. Check both `receipt` and `disclosure` before reporting success to the
+user. The MCP adapter sets `isError` from receipt acceptance, so `isError: false`
+alone is not evidence that an output was disclosed or a business effect succeeded.
 
 Production still requires a sealed tenant, separate broker custody, admitted
 delegated identity, enforced agent sessions, public HTTPS DNS on port 443 and actual

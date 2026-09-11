@@ -8,9 +8,7 @@ use std::sync::atomic::Ordering;
 pub fn operation() -> OperationDef {
     OperationDef {
         name: "mcp.call".into(),
-        description:
-            "Invoke exactly one signed, pinned third-party MCP tool; upstream output withheld"
-                .into(),
+        description: "Invoke exactly one signed, pinned third-party MCP tool; raw output withheld, signed projections may disclose typed fields".into(),
         safety: OperationSafety::Safe,
         default_approval: ApprovalRequirement::Always,
         default_factors: vec![ApprovalFactor::LocalBio],

@@ -6,7 +6,10 @@ Opaque is a local secrets broker made of:
 - `opaque`: untrusted CLI client
 - `opaque-mcp`: MCP server for Claude Code and other MCP-aware tools
 
-Everything flows through `Enclave::execute()` and results are sanitized so plaintext secrets never enter LLM-visible output.
+Built-in operations use the enclave execution pipeline. Bounded tasks and signed
+MCP routes have their own admission, review and durable consumption paths in the
+broker. Provider credentials stay in custody; permitted data outputs remain
+subject to each operation’s disclosure contract.
 
 This page is the reference: install, configure, and every command. If you would
 rather learn by doing, the [tutorial](tutorial.md) walks the same ground in 15
@@ -15,7 +18,7 @@ minutes, ending with a real gated operation and a verified audit chain.
 ## Build
 
 ```bash
-cargo build --release
+cargo build --locked --release
 ```
 
 Binaries:
@@ -23,6 +26,20 @@ Binaries:
 - `./target/release/opaqued`
 - `./target/release/opaque`
 - `./target/release/opaque-mcp`
+- `./target/release/opaque-mcp-contract` (offline MCP qualification)
+- `./target/release/opaque-approver` and `opaque-approve-helper` (trusted review)
+- `./target/release/opaque-evidence` (offline checkpoints and verification)
+- `./target/release/opaque-web` (local dashboard)
+
+These are checkout builds. The reviewer app, MCP v2 and evidence CLI are
+unreleased additions; a tagged package may omit them. See the
+[reviewer installation guide](remote-approvals.md) for the separate macOS bundle.
+
+**Existing installations:** authenticated audit heads require an
+[explicit legacy upgrade](evidence-checkpoints.md#authenticated-local-head-and-older-databases)
+before the new daemon can open an older audit store. Stop old writers and establish
+the independently held export pin before the upgrade. `opaque init` is for setup,
+not a repair or reset command for existing custody.
 
 ## Initialize Local State
 
@@ -115,7 +132,7 @@ Defaults:
 - Vault URL: `http://127.0.0.1:8200` (override with `OPAQUE_VAULT_URL`)
 - Vault token ref: `keychain:opaque/vault-token` (override with `OPAQUE_VAULT_TOKEN_REF`)
 - Vault lease renew window: `30` seconds (override with `OPAQUE_VAULT_LEASE_RENEW_WINDOW_SECS`, set `0` to disable proactive renewal)
-- Audit retention: `audit_retention_days = 90` (runtime purge continuously removes rows older than this window)
+- Audit retention: `audit_retention_days = 90` (verified retention removes only an expired insertion-order prefix)
 
 See [Vault setup](vault.md) for details.
 
@@ -329,12 +346,19 @@ The daemon writes a local SQLite audit DB at `~/.opaque/audit.db`.
 ./target/release/opaque audit tail --query github --limit 20
 ```
 
-The log is an HMAC hash chain. Verify it. Edits, reorderings, deletions, and
-truncation all fail, and the command exits nonzero:
+The log has an HMAC chain and authenticated head. Verification detects edits,
+reordering and unauthorized prefix/tail changes when the attacker lacks its key.
+A self-consistent older snapshot, or a writer controlling the HMAC key, needs
+independently held evidence to expose it. Failure exits nonzero:
 
 ```bash
 ./target/release/opaque audit verify
 ```
+
+For portable producer authentication and retention receipt checks without sharing
+the audit HMAC key, use [evidence checkpoints](evidence-checkpoints.md).
+A signed checkpoint covers its declared range; it does not prove provider effects,
+global completeness or permission to restore old authorization state.
 
 ## Fleet Operations
 
