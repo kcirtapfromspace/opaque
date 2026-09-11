@@ -1,0 +1,47 @@
+{
+  "tools": [
+    {
+      "name": "add_issue_comment",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "owner": {
+            "type": "string",
+            "description": "Repository owner"
+          },
+          "repo": {
+            "type": "string",
+            "description": "Repository name"
+          },
+          "issue_number": {
+            "type": "number",
+            "description": "Issue number"
+          },
+          "body": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Comment body"
+          },
+          "reaction": {
+            "type": "string",
+            "enum": [
+              "+1",
+              "-1",
+              "laugh"
+            ]
+          },
+          "comment_id": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "owner",
+          "repo",
+          "issue_number"
+        ]
+      },
+      "description": "Untrusted description cannot change approval or output policy"
+    }
+  ]
+}

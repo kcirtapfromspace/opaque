@@ -6,6 +6,17 @@ the full review over pinned TLS and signs the exact challenge. The broker verifi
 that signature and retains the decision before acknowledging it. Notification
 adapters cannot approve work or replace the native review ceremony.
 
+The macOS release includes `Opaque Reviewer.app` and the standalone reviewer.
+Its native URL handler accepts opaque references only, queues a bounded set of
+notices and resolves them against explicitly selected local enrollment. Opening
+a notice does not approve it. A reviewer chooses to open the full immutable
+document, confirms review and authenticates natively before the exact decision
+is signed. See the [installation and enrollment guide](https://github.com/kcirtapfromspace/opaque/blob/main/crates/opaque-approver/README.md).
+The app displays expiry and separates decision acceptance from execution. A
+missing acknowledgment triggers a read-only receipt lookup, never another POST
+or an operation retry. Signed/notarized distribution and fresh-user native testing
+remain distinct from local packaging and inert launcher tests.
+
 A host can use the public `opaque-approval` runtime without an enterprise service.
 `RemoteApprovals` accepts host-owned reviewer resolution and authority guards;
 the host keeps revocation checks held through the irreversible ledger transition.

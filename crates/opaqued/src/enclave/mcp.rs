@@ -1,7 +1,7 @@
 //! Canonical MCP approval and final authorization. No raw caller destination
 //! reaches the transport; only the signed-registry-derived Action does.
 use super::*;
-use opaque_bounded_work::mcp::{Action, Gateway, store::Receipt};
+use opaque_bounded_work::mcp::{Action, Gateway, InvocationResult, store::Receipt};
 use opaque_core::identity::PrincipalContext;
 use std::sync::atomic::Ordering;
 
@@ -27,6 +27,9 @@ pub fn operation() -> OperationDef {
             "request_context_digest",
             "registry_version",
             "schema_digest",
+            "upstream_schema_digest",
+            "output_projection",
+            "output_projection_digest",
             "arguments",
             "output_policy",
             "credential_ref",
@@ -44,6 +47,42 @@ pub fn operation() -> OperationDef {
     }
 }
 impl Enclave {
+    /// Legacy v1 receipt hashes/sizes are observable result data. Apply current
+    /// authority when reading them too; control-state metadata remains readable
+    /// to the authenticated owner without replaying an output disclosure.
+    pub fn filter_mcp_receipt_metadata(
+        &self,
+        gateway: &Gateway,
+        owner: &str,
+        request: &OperationRequest,
+        action: &Action,
+        receipt: &mut Receipt,
+    ) {
+        if receipt.response_sha256.is_none() && receipt.response_bytes.is_none() {
+            return;
+        }
+        let policy = self.policy.read().unwrap_or_else(|p| p.into_inner());
+        let mut authorize = || {
+            if !policy.evaluate(request, OperationSafety::Safe).allowed
+                || !policy.digest().is_ok_and(|d| d == action.policy_digest)
+            {
+                return Err("MCP result authority changed".into());
+            }
+            gateway.revalidate(action)?;
+            gateway.ledger.authorize_result(owner, action)
+        };
+        let allowed = if let Some(guard) = &self.task_authority_guard {
+            guard(request.principal.as_ref(), &mut authorize)
+        } else if request.principal.is_none() {
+            authorize()
+        } else {
+            Err("MCP identity guard unavailable".into())
+        };
+        if allowed.is_err() {
+            receipt.response_sha256 = None;
+            receipt.response_bytes = None;
+        }
+    }
     pub fn mcp_route_allowed(&self, request: &OperationRequest) -> bool {
         self.policy
             .read()
@@ -58,7 +97,7 @@ impl Enclave {
         mut request: OperationRequest,
         mut action: Action,
         check_context: F,
-    ) -> Result<Receipt, String>
+    ) -> Result<InvocationResult, String>
     where
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = Result<Option<PrincipalContext>, String>>,
@@ -148,7 +187,7 @@ impl Enclave {
         {
             return Err("MCP authority changed".into());
         }
-        let result = gateway
+        let mut result = gateway
             .execute(
                 owner,
                 &action,
@@ -218,12 +257,42 @@ impl Enclave {
                 "invocation={}; charged={}; receipt_digest={}",
                 result.invocation_id,
                 result.attempt_charged,
-                opaque_bounded_work::mcp::digest(&result)
+                opaque_bounded_work::mcp::digest(&result.receipt)
             )),
         );
         self.confirm_audit(true)
             .await
             .map_err(|_| "MCP audit unavailable")?;
+        if result.has_disclosable_values() {
+            // Revalidate after the final async audit/identity work. No await
+            // follows this policy + identity + ledger disclosure fence.
+            let context_current = check_context().await.is_ok_and(|p| p == request.principal);
+            let policy = self.policy.read().unwrap_or_else(|p| p.into_inner());
+            let mut disclose = || {
+                if !context_current
+                    || self.policy_generation.load(Ordering::SeqCst) != generation
+                    || !policy.evaluate(&request, definition.safety).allowed
+                {
+                    return Err("MCP disclosure authority changed".into());
+                }
+                gateway.revalidate(&action)?;
+                if result.output.is_some() {
+                    gateway.ledger.authorize_disclosure(owner, &action)
+                } else {
+                    gateway.ledger.authorize_result(owner, &action)
+                }
+            };
+            let allowed = if let Some(guard) = &self.task_authority_guard {
+                guard(request.principal.as_ref(), &mut disclose)
+            } else if request.principal.is_none() {
+                disclose()
+            } else {
+                Err("MCP identity guard unavailable".into())
+            };
+            if allowed.is_err() {
+                result.withhold_authority_changed();
+            }
+        }
         Ok(result)
     }
 }
@@ -269,7 +338,17 @@ mod tests {
                 assert!(description.contains(field), "missing review field {field}");
             }
             assert_eq!(request.target["arguments"], r#"{"message":"review me"}"#);
-            assert_eq!(request.target["output_policy"], "withhold");
+            if request.target["output_policy"] == "typed_fields" {
+                assert!(description.contains("output_projection"));
+                assert!(description.contains("upstream_schema_digest"));
+                assert!(description.contains("resource_id"));
+                assert_eq!(
+                    request.target["output_projection"],
+                    r#"{"fields":[{"source":"id","name":"resource_id","value_type":{"kind":"integer_id","maximum":1000}}]}"#
+                );
+            } else {
+                assert_eq!(request.target["output_policy"], "withhold");
+            }
             assert_eq!(request.target["attempt_limit"], "1");
             assert_eq!(
                 request.secret_ref_names,
@@ -281,11 +360,25 @@ mod tests {
     #[tokio::test]
     async fn mcp_approval_reviews_canonical_authority_and_denial_never_reserves_or_reads_credentials()
      {
+        assert_review_denial(false).await;
+    }
+    #[tokio::test]
+    async fn mcp_approval_reviews_signed_projection_and_separate_upstream_pin() {
+        assert_review_denial(true).await;
+    }
+    async fn assert_review_denial(project: bool) {
         let dir = tempfile::tempdir().unwrap();
         let bundle_path = dir.path().join("registry.bundle");
         let key = ed25519_dalek::SigningKey::from_bytes(&[43; 32]);
         let now = opaque_bounded_work::mcp::now();
-        let registry:RegistryDocument=serde_json::from_value(json!({"version":1,"routes":[{"protocol_version":PROTOCOL_VERSION,"alias":"post_note","server_id":"fixture","endpoint":{"host":"mcp.example.com","path":"/mcp"},"tool":"post_note","credential_binding":"notes","input_schema":{"type":"object","additionalProperties":false,"required":["message"],"properties":{"message":{"type":"string","maxLength":64}}},"output_policy":"withhold","max_request_bytes":4096,"max_response_bytes":4096,"timeout_ms":1000}]})).unwrap();
+        let mut registry:RegistryDocument=serde_json::from_value(json!({"version":1,"routes":[{"protocol_version":PROTOCOL_VERSION,"alias":"post_note","server_id":"fixture","endpoint":{"host":"mcp.example.com","path":"/mcp"},"tool":"post_note","credential_binding":"notes","input_schema":{"type":"object","additionalProperties":false,"required":["message"],"properties":{"message":{"type":"string","maxLength":64}}},"output_policy":"withhold","max_request_bytes":4096,"max_response_bytes":4096,"timeout_ms":1000}]})).unwrap();
+        if project {
+            registry.version = 2;
+            let route = &mut registry.routes[0];
+            route.upstream_input_schema = Some(route.input_schema.clone());
+            route.output_policy = opaque_core::mcp::OutputPolicy::TypedFields;
+            route.output_projection = Some(serde_json::from_value(json!({"fields":[{"source":"id","name":"resource_id","value_type":{"kind":"integer_id","maximum":1000}}]})).unwrap());
+        }
         let payload = BundlePayload {
             org: "fixture".into(),
             version: 1,

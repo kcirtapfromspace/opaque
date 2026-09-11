@@ -2142,6 +2142,7 @@ dependencies = [
  "toml_edit",
  "tracing-subscriber",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -2201,6 +2202,7 @@ dependencies = [
  "objc2-local-authentication",
  "opaque-core",
  "opaque-native-approval",
+ "rcgen",
  "reqwest 0.12.28",
  "rustls",
  "serde",
@@ -2208,6 +2210,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "zeroize",
 ]
 

@@ -23,6 +23,10 @@ pub struct Receipt {
     pub route: String,
     pub tool: String,
     pub schema_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_schema_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_projection_digest: Option<String>,
     pub credential_ref: String,
     pub output_policy: String,
     pub expires_at: i64,
@@ -33,6 +37,13 @@ pub struct Receipt {
     pub response_sha256: Option<String>,
     pub response_bytes: Option<usize>,
     pub fixture_only: bool,
+    /// Control state only; no projection values or value-derived commitments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_validated: Option<bool>,
+    /// A tool dispatch attempt is not proof of its business effect. In
+    /// particular, a server error may follow a completed effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_status: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -184,8 +195,20 @@ impl Ledger {
             route: action.call.route().alias.clone(),
             tool: action.call.route().tool.clone(),
             schema_digest: super::digest(&action.call.route().input_schema),
+            upstream_schema_digest: action
+                .call
+                .route()
+                .upstream_input_schema
+                .as_ref()
+                .map(super::digest),
+            output_projection_digest: action
+                .call
+                .route()
+                .output_projection
+                .as_ref()
+                .map(super::digest),
             credential_ref: action.credential_ref.clone(),
-            output_policy: "withhold".into(),
+            output_policy: action.call.route().output_policy.as_str().into(),
             expires_at: action.expires_at,
             state: "reviewing".into(),
             attempt_charged: false,
@@ -194,6 +217,18 @@ impl Ledger {
             response_sha256: None,
             response_bytes: None,
             fixture_only: action.fixture_origin.is_some(),
+            projection_validated: action
+                .call
+                .route()
+                .output_projection
+                .as_ref()
+                .map(|_| false),
+            dispatch_status: action
+                .call
+                .route()
+                .upstream_input_schema
+                .as_ref()
+                .map(|_| "not_attempted".into()),
         };
         let record = Record {
             owner: owner.into(),
@@ -212,6 +247,11 @@ impl Ledger {
     }
     pub fn get(&self, owner: &str, id: &str) -> Result<Receipt, String> {
         Ok(load(&*self.db()?, owner, id)?.receipt)
+    }
+    /// Broker-only authority snapshot for applying current read/disclosure
+    /// policy. Never serialize this action as a receipt response.
+    pub fn get_action(&self, owner: &str, id: &str) -> Result<Action, String> {
+        Ok(load(&*self.db()?, owner, id)?.action)
     }
     pub fn revoke(&self, owner: &str, id: &str) -> Result<Receipt, String> {
         let db = self.db()?;
@@ -234,12 +274,34 @@ impl Ledger {
         r.receipt.state = "reserved".into();
         r.receipt.attempt_charged = true;
         r.receipt.code = "attempt_reserved".into();
+        if r.receipt.dispatch_status.is_some() {
+            r.receipt.dispatch_status = Some("attempt_uncertain".into());
+        }
         save(&db, &r)
     }
     pub fn authorize_dispatch(&self, owner: &str, action: &Action) -> Result<(), String> {
         let r = load(&*self.db()?, owner, &action.invocation_id)?;
         active(&r, action)?;
         if r.receipt.state != "reserved" {
+            return Err(unavailable());
+        }
+        Ok(())
+    }
+    pub fn authorize_disclosure(&self, owner: &str, action: &Action) -> Result<(), String> {
+        let r = load(&*self.db()?, owner, &action.invocation_id)?;
+        active(&r, action)?;
+        if r.receipt.state != "accepted" || r.receipt.projection_validated != Some(true) {
+            return Err(unavailable());
+        }
+        Ok(())
+    }
+    pub fn authorize_result(&self, owner: &str, action: &Action) -> Result<(), String> {
+        let r = load(&*self.db()?, owner, &action.invocation_id)?;
+        active(&r, action)?;
+        if !matches!(
+            r.receipt.state.as_str(),
+            "accepted" | "rejected" | "unknown"
+        ) {
             return Err(unavailable());
         }
         Ok(())
@@ -257,8 +319,29 @@ impl Ledger {
         }
         r.receipt.state = outcome.state.into();
         r.receipt.code = outcome.code.into();
-        r.receipt.response_sha256 = outcome.response_sha256.clone();
-        r.receipt.response_bytes = outcome.response_bytes;
+        // V2 never publishes value-derived hashes or sizes. Low-entropy typed
+        // values can be recovered from an unkeyed commitment after revocation.
+        // V1 retains its historical observable response metadata for compatibility.
+        if action.call.route().upstream_input_schema.is_none() {
+            r.receipt.response_sha256 = outcome.response_sha256.clone();
+            r.receipt.response_bytes = outcome.response_bytes;
+        }
+        r.receipt.projection_validated = action
+            .call
+            .route()
+            .output_projection
+            .as_ref()
+            .map(|_| outcome.output.is_some());
+        if r.receipt.dispatch_status.is_some() {
+            r.receipt.dispatch_status = Some(
+                if outcome.dispatched {
+                    "attempted"
+                } else {
+                    "not_attempted"
+                }
+                .into(),
+            );
+        }
         save(&db, &r)?;
         Ok(r.receipt)
     }
@@ -323,8 +406,25 @@ fn decode(id: &str, text: &str) -> Result<Record, String> {
         || receipt.route != a.call.route().alias
         || receipt.tool != a.call.route().tool
         || receipt.schema_digest != super::digest(&a.call.route().input_schema)
+        || receipt.upstream_schema_digest
+            != a.call
+                .route()
+                .upstream_input_schema
+                .as_ref()
+                .map(super::digest)
+        || receipt.output_projection_digest
+            != a.call.route().output_projection.as_ref().map(super::digest)
         || receipt.credential_ref != a.credential_ref
-        || receipt.output_policy != "withhold"
+        || receipt.output_policy != a.call.route().output_policy.as_str()
+        || receipt.dispatch_status.is_some() != a.call.route().upstream_input_schema.is_some()
+        || receipt
+            .dispatch_status
+            .as_deref()
+            .is_some_and(|s| !matches!(s, "not_attempted" | "attempt_uncertain" | "attempted"))
+        || receipt.projection_validated.is_some() != a.call.route().output_projection.is_some()
+        || (receipt.projection_validated == Some(true) && receipt.state != "accepted")
+        || (a.call.route().upstream_input_schema.is_some()
+            && (receipt.response_sha256.is_some() || receipt.response_bytes.is_some()))
         || receipt.fixture_only != a.fixture_origin.is_some()
         || receipt.attempt_charged != charged
         || !matches!(

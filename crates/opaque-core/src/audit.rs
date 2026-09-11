@@ -20,6 +20,8 @@ use uuid::Uuid;
 use crate::operation::{ClientIdentity, ClientType, OperationSafety};
 use crate::policy::PolicyDecision;
 
+pub mod checkpoint;
+
 type HmacSha256 = Hmac<Sha256>;
 
 // ---------------------------------------------------------------------------
@@ -1005,7 +1007,7 @@ fn chain_hash(key: &[u8; 32], prev_hash: &str, canon: &str) -> String {
     mac.update(prev_hash.as_bytes());
     mac.update(b"\x1e");
     mac.update(canon.as_bytes());
-    hex_encode(mac.finalize().into_bytes().as_slice())
+    hex_encode(&mac.finalize().into_bytes())
 }
 
 /// Read the chained fields from a row starting at column `base` and return the
@@ -1063,67 +1065,30 @@ fn canon_from_row(
     Ok(canon)
 }
 
-/// Record the chain head (tail anchor) so verification can detect truncation of
-/// the newest records. Stored in the same database and written inside the insert
-/// transaction, so it stays consistent with the committed rows.
+/// Authenticate the tail with a separate HMAC domain, committed with its rows.
+/// This protects against database-only suffix/head edits. Restoring an older
+/// coherent database and authentic head still requires an independent checkpoint.
 fn set_chain_head(
     conn: &rusqlite::Connection,
+    key: &[u8; 32],
     last_hash: &str,
     last_sequence: i64,
 ) -> rusqlite::Result<()> {
+    let authenticator = head_signature(key, last_hash, last_sequence);
     conn.execute(
-        "INSERT INTO chain_head (id, last_hash, last_sequence) VALUES (0, ?1, ?2)
-         ON CONFLICT(id) DO UPDATE SET last_hash = ?1, last_sequence = ?2",
-        rusqlite::params![last_hash, last_sequence],
+        "INSERT INTO chain_head (id, last_hash, last_sequence, format_version, authenticator) VALUES (0, ?1, ?2, 1, ?3)
+         ON CONFLICT(id) DO UPDATE SET last_hash=?1, last_sequence=?2, format_version=1, authenticator=?3",
+        rusqlite::params![last_hash, last_sequence, authenticator],
     )?;
     Ok(())
 }
 
-// Only called in the atomic migration of a schema which never had hashes.
-// Retention must never recompute a surviving record's authenticator.
-fn migrate_unchained_records(
-    conn: &rusqlite::Transaction<'_>,
-    key: &[u8; 32],
-) -> Result<(), rusqlite::Error> {
-    // Only ever called from the sink, after the schema (incl. approver_json)
-    // is in place — so the column is always selectable here.
-    let sql = format!(
-        "SELECT rowid, {CHAIN_COLUMNS}, approver_json FROM audit_events ORDER BY rowid ASC"
-    );
-    let pending: Vec<(i64, String)> = {
-        let mut stmt = conn.prepare(&sql)?;
-        let mut q = stmt.query([])?;
-        let mut out = Vec::new();
-        while let Some(r) = q.next()? {
-            let rowid: i64 = r.get(0)?;
-            out.push((rowid, canon_from_row(r, 1, true)?));
-        }
-        out
-    };
-    let mut prev = CHAIN_GENESIS.to_string();
-    for (rowid, canon) in pending {
-        let h = chain_hash(key, &prev, &canon);
-        conn.execute(
-            "UPDATE audit_events SET record_hash = ?1 WHERE rowid = ?2",
-            rusqlite::params![h, rowid],
-        )?;
-        prev = h;
-    }
-    // Re-anchor the head to the new tail (or clear it if the log is now empty).
-    match conn
-        .query_row(
-            "SELECT record_hash, sequence_number FROM audit_events ORDER BY rowid DESC LIMIT 1",
-            [],
-            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?)),
-        )
-        .optional()?
-    {
-        Some((Some(h), seq)) => set_chain_head(conn, &h, seq)?,
-        _ => {
-            conn.execute("DELETE FROM chain_head", [])?;
-        }
-    }
-    Ok(())
+fn head_signature(key: &[u8; 32], hash: &str, sequence: i64) -> String {
+    chain_hash(
+        key,
+        "opaque-audit-tail-head-v1",
+        &format!("{sequence}\x1f{hash}"),
+    )
 }
 
 /// Result of verifying the audit hash chain.
@@ -1141,15 +1106,11 @@ pub struct ChainVerification {
 
 /// Verify the tamper-evident hash chain over the audit log at `db_path`.
 ///
-/// Recomputes the chain in insertion order and reports the first record whose
-/// stored hash does not match — catching any edit, reordering, or deletion of a
-/// record by anyone who does not hold the chain key. It then compares the recorded
-/// head anchor (`chain_head`) against the actual tail, so truncation of the newest
-/// records is detected too.
-///
-/// At a shared uid this is tamper-evidence (an adversary who also holds the key and
-/// can rewrite the database can still defeat it); it becomes a hard guarantee once
-/// the daemon runs under a dedicated service account that owns the database.
+/// Verifies row authenticators, retention boundary and authenticated tail head.
+/// Database-only edits cannot forge a new head without the separate HMAC key.
+/// The broker UID/host administrator remain trusted. An older intact snapshot
+/// requires independent retained high-water evidence; this is not rollback proof.
+/// Legacy unauthenticated heads require an explicit independently pinned upgrade.
 pub fn verify_audit_chain(db_path: &Path) -> Result<ChainVerification, AuditError> {
     let key = load_hmac_key(db_path)?;
     let mut conn =
@@ -1157,7 +1118,7 @@ pub fn verify_audit_chain(db_path: &Path) -> Result<ChainVerification, AuditErro
     // A snapshot spans the boundary, records and tail checks, including when
     // a writer commits or retention removes a prefix during verification.
     let tx = conn.transaction()?;
-    verify_audit_connection(&tx, &key, !table_exists(&tx, "chain_head")?)
+    verify_audit_connection(&tx, &key, false)
 }
 
 fn table_exists(conn: &rusqlite::Connection, name: &str) -> rusqlite::Result<bool> {
@@ -1271,9 +1232,19 @@ fn verify_audit_connection(
             }
         }
     }
+    let authenticated = conn
+        .prepare("SELECT format_version, authenticator FROM chain_head LIMIT 0")
+        .is_ok();
+    if !authenticated && !allow_legacy_missing_head {
+        return Ok(broken(
+            count,
+            tail_sequence.map(|n| n as u64),
+            "legacy audit head requires independently pinned offline upgrade".into(),
+        ));
+    }
     let head: Option<(String, i64)> = if table_exists(conn, "chain_head")? {
         conn.query_row(
-            "SELECT last_hash, last_sequence FROM chain_head WHERE id=0",
+            "SELECT last_hash,last_sequence FROM chain_head WHERE id=0",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -1281,21 +1252,31 @@ fn verify_audit_connection(
     } else {
         None
     };
-    match head {
-        Some((hash, sequence)) if hash == prev && Some(sequence) == tail_sequence => {}
-        None if tail_sequence.is_none() || allow_legacy_missing_head => {}
-        Some((_, sequence)) => {
+    if authenticated {
+        let authentication: Option<(i64, String)> = conn
+            .query_row(
+                "SELECT format_version,authenticator FROM chain_head WHERE id=0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if !matches!((&head,&authentication), (Some((hash,sequence)),Some((1,signature))) if signature == &head_signature(key,hash,*sequence))
+        {
             return Ok(broken(
                 count,
-                Some(sequence.max(0) as u64),
-                "audit log truncated or tail anchor altered".into(),
+                tail_sequence.map(|n| n as u64),
+                "audit tail head authentication failed".into(),
             ));
         }
-        None => {
+    }
+    match head {
+        Some((hash, sequence)) if hash == prev && sequence == tail_sequence.unwrap_or(-1) => {}
+        None if allow_legacy_missing_head => {}
+        _ => {
             return Ok(broken(
                 count,
-                tail_sequence.map(|seq| seq as u64),
-                "audit tail anchor is missing".into(),
+                tail_sequence.map(|n| n as u64),
+                "audit log truncated or tail anchor altered".into(),
             ));
         }
     }
@@ -1381,7 +1362,9 @@ CREATE TABLE IF NOT EXISTS retention_boundary (
 CREATE TABLE IF NOT EXISTS chain_head (
     id INTEGER PRIMARY KEY CHECK (id = 0),
     last_hash TEXT NOT NULL,
-    last_sequence INTEGER NOT NULL
+    last_sequence INTEGER NOT NULL,
+    format_version INTEGER NOT NULL CHECK(format_version=1),
+    authenticator TEXT NOT NULL
 );
 ";
 
@@ -1507,47 +1490,39 @@ impl SqliteAuditSink {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let had_events = table_exists(&tx, "audit_events")?;
         let had_head = table_exists(&tx, "chain_head")?;
-        let had_hashes = had_events
+        let had_fts = table_exists(&tx, "audit_events_fts")?;
+        if had_events
             && tx
                 .prepare("SELECT record_hash FROM audit_events LIMIT 0")
-                .is_ok();
-        let had_fts = table_exists(&tx, "audit_events_fts")?;
-        let established_chain = had_hashes
-            && tx.query_row("SELECT EXISTS(SELECT 1 FROM audit_events)", [], |row| {
-                row.get::<_, bool>(0)
-            })?
-            || had_head
-                && tx.query_row("SELECT EXISTS(SELECT 1 FROM chain_head)", [], |row| {
-                    row.get::<_, bool>(0)
-                })?;
-        let hmac_key = if established_chain {
+                .is_err()
+        {
+            return Err(AuditError::Other("unchained legacy audit cannot be authenticated automatically; preserve it separately and enroll a new stream".into()));
+        }
+        if (had_events || had_head)
+            && tx
+                .prepare("SELECT format_version,authenticator FROM chain_head LIMIT 0")
+                .is_err()
+        {
+            return Err(AuditError::Other(
+                "legacy audit head requires independently pinned offline upgrade".into(),
+            ));
+        }
+        let hmac_key = if had_events || had_head {
             load_hmac_key(&db_path)?
         } else {
             load_or_create_hmac_key(&db_path)?
         };
         tx.execute_batch(SCHEMA_SQL)?;
-        if had_events && !had_hashes {
-            tx.execute("ALTER TABLE audit_events ADD COLUMN record_hash TEXT", [])?;
-        }
         if tx
             .prepare("SELECT approver_json FROM audit_events LIMIT 0")
             .is_err()
         {
             tx.execute("ALTER TABLE audit_events ADD COLUMN approver_json TEXT", [])?;
         }
-        if had_events && !had_hashes {
-            // Pre-chain databases had no authenticators to verify. This one-time
-            // baseline is explicit; a present but NULL/bad hash is corruption.
-            migrate_unchained_records(&tx, &hmac_key)?;
-        } else {
-            require_valid_chain(&tx, &hmac_key, !had_head)?;
-            if !had_head && let Some((hash, sequence)) = tx.query_row(
-                "SELECT record_hash, sequence_number FROM audit_events ORDER BY rowid DESC LIMIT 1",
-                [], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-            ).optional()? {
-                set_chain_head(&tx, &hash, sequence)?;
-            }
+        if !had_events && !had_head {
+            set_chain_head(&tx, &hmac_key, CHAIN_GENESIS, -1)?;
         }
+        require_valid_chain(&tx, &hmac_key, false)?;
         Self::prune_verified_prefix(&tx, retention_days, &hmac_key)?;
         // Populate FTS only when introducing the index, not on every restart.
         if !had_fts {
@@ -1982,7 +1957,7 @@ impl SqliteAuditSink {
             // Record the tail anchor in the same transaction so verification can
             // detect truncation of the newest records.
             if let Some(seq) = last_seq {
-                set_chain_head(&tx, &candidate_hash, seq)?;
+                set_chain_head(&tx, key, &candidate_hash, seq)?;
             }
         }
         tx.commit()?;
@@ -3828,9 +3803,15 @@ mod tests {
         let db_path = temp_db_path();
         seed_pre_phase1_db(&db_path, 3);
 
-        // Standalone verify on the untouched old database (read-only path).
+        // An unauthenticated legacy head cannot be silently blessed at startup.
+        assert!(!verify_audit_chain(&db_path).unwrap().ok);
+        assert!(SqliteAuditSink::new(db_path.clone(), 0).is_err());
+        let trusted_pin = crate::evidence_checkpoint::sha256(
+            &checkpoint::inspect_legacy_export(&db_path).unwrap(),
+        );
+        checkpoint::upgrade_legacy_head(&db_path, &trusted_pin).unwrap();
         let v = verify_audit_chain(&db_path).unwrap();
-        assert!(v.ok, "pre-Phase-1 db must verify as-is: {:?}", v.detail);
+        assert!(v.ok);
         assert_eq!(v.records_checked, 3);
 
         // Snapshot old hashes, then open with the new sink (migrates: adds
@@ -3912,6 +3893,10 @@ mod tests {
         // after the column migration.
         let db_path = temp_db_path();
         seed_pre_phase1_db(&db_path, 2);
+        let trusted_pin = crate::evidence_checkpoint::sha256(
+            &checkpoint::inspect_legacy_export(&db_path).unwrap(),
+        );
+        checkpoint::upgrade_legacy_head(&db_path, &trusted_pin).unwrap();
         let sink = SqliteAuditSink::new(db_path.clone(), 0).unwrap();
         drop(sink); // migration only
         {

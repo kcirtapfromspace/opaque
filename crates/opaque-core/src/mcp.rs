@@ -16,7 +16,10 @@ use sha2::{Digest, Sha256};
 pub const MAX_REGISTRY_BYTES: usize = 1024 * 1024;
 pub const MAX_CALL_BYTES: usize = 64 * 1024;
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
-pub const PREPARED_CONTRACT_VERSION: u32 = 2;
+pub const PREPARED_CONTRACT_VERSION: u32 = 3;
+pub const MAX_UPSTREAM_SCHEMA_BYTES: usize = 64 * 1024;
+pub const MAX_CATALOG_BYTES: usize = 256 * 1024;
+pub const MAX_PROJECTED_BYTES: usize = 1024;
 fn protocol_version() -> String {
     PROTOCOL_VERSION.into()
 }
@@ -30,6 +33,8 @@ pub enum ContractError {
     InvalidRegistry,
     InvalidEndpoint,
     InvalidSchema,
+    UnsupportedUpstreamSchema,
+    InvalidProjection,
     InvalidCall,
     UnknownRoute,
     ArgumentsRejected,
@@ -42,6 +47,8 @@ impl fmt::Display for ContractError {
             Self::InvalidRegistry => "invalid gateway registry",
             Self::InvalidEndpoint => "invalid pinned HTTPS endpoint",
             Self::InvalidSchema => "unsupported or unbounded input schema",
+            Self::UnsupportedUpstreamSchema => "unsupported pinned upstream schema",
+            Self::InvalidProjection => "invalid bounded result projection",
             Self::InvalidCall => "invalid gateway call envelope",
             Self::UnknownRoute => "gateway route is not registered",
             Self::ArgumentsRejected => "arguments do not match the pinned input schema",
@@ -66,6 +73,113 @@ pub struct Endpoint {
 pub enum OutputPolicy {
     /// Raw upstream bodies (including errors) must never reach the agent.
     Withhold,
+    /// Only signed fields from structuredContent, after current authority checks.
+    TypedFields,
+}
+
+impl OutputPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Withhold => "withhold",
+            Self::TypedFields => "typed_fields",
+        }
+    }
+}
+
+/// The only permitted output values are bounded numeric IDs and signed status
+/// enums. No text, URLs, JSON pointers, nested values or caller-selected fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ResultFieldType {
+    IntegerId { maximum: u64 },
+    Status { values: Vec<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResultField {
+    pub source: String,
+    pub name: String,
+    pub value_type: ResultFieldType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResultProjection {
+    pub fields: Vec<ResultField>,
+}
+
+impl ResultProjection {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.fields.is_empty() || self.fields.len() > 8 {
+            return Err(ContractError::InvalidProjection);
+        }
+        let mut sources = BTreeSet::new();
+        let mut names = BTreeSet::new();
+        for field in &self.fields {
+            if !identifier(&field.source)
+                || !identifier(&field.name)
+                || !sources.insert(&field.source)
+                || !names.insert(&field.name)
+            {
+                return Err(ContractError::InvalidProjection);
+            }
+            match &field.value_type {
+                ResultFieldType::IntegerId { maximum }
+                    if !(1..=9_007_199_254_740_991).contains(maximum) =>
+                {
+                    return Err(ContractError::InvalidProjection);
+                }
+                ResultFieldType::Status { values } => {
+                    let unique: BTreeSet<_> = values.iter().collect();
+                    if values.is_empty()
+                        || values.len() > 16
+                        || unique.len() != values.len()
+                        || values.iter().any(|v| v.len() > 32 || !identifier(v))
+                    {
+                        return Err(ContractError::InvalidProjection);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Unselected fields are ignored; a missing, malformed or out-of-contract
+    /// selected field rejects the entire projection. Tool errors never call this.
+    pub fn project(&self, structured: &Value) -> Result<BTreeMap<String, Value>, ContractError> {
+        self.validate()?;
+        let object = structured
+            .as_object()
+            .ok_or(ContractError::InvalidProjection)?;
+        let mut output = BTreeMap::new();
+        for field in &self.fields {
+            let value = object
+                .get(&field.source)
+                .ok_or(ContractError::InvalidProjection)?;
+            let valid = match &field.value_type {
+                ResultFieldType::IntegerId { maximum } => {
+                    value.as_u64().is_some_and(|v| (1..=*maximum).contains(&v))
+                }
+                ResultFieldType::Status { values } => value
+                    .as_str()
+                    .is_some_and(|v| values.iter().any(|allowed| allowed == v)),
+            };
+            if !valid {
+                return Err(ContractError::InvalidProjection);
+            }
+            output.insert(field.name.clone(), value.clone());
+        }
+        if serde_json::to_vec(&output)
+            .map_err(|_| ContractError::InvalidProjection)?
+            .len()
+            > MAX_PROJECTED_BYTES
+        {
+            return Err(ContractError::InvalidProjection);
+        }
+        Ok(output)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,10 +195,32 @@ pub struct Route {
     /// The daemon maps this key to its own credential store.
     pub credential_binding: String,
     pub input_schema: Value,
+    /// Registry v2: exact advertised schema pin, separately validated from the
+    /// finite admitted input_schema. Absent in v1, where input_schema is the pin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_input_schema: Option<Value>,
     pub output_policy: OutputPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_projection: Option<ResultProjection>,
     pub max_request_bytes: usize,
     pub max_response_bytes: usize,
     pub timeout_ms: u64,
+}
+
+impl Route {
+    pub fn upstream_schema(&self) -> &Value {
+        self.upstream_input_schema
+            .as_ref()
+            .unwrap_or(&self.input_schema)
+    }
+
+    pub fn prepared_contract_version(&self) -> u32 {
+        if self.upstream_input_schema.is_some() {
+            PREPARED_CONTRACT_VERSION
+        } else {
+            2
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +233,7 @@ pub struct RegistryDocument {
 struct ValidatedRoute {
     route: Route,
     validator: jsonschema::Validator,
+    upstream_validator: Option<jsonschema::Validator>,
 }
 
 /// Immutable validated administrator configuration. Loading does not establish
@@ -155,7 +292,10 @@ impl Registry {
         }
         let document: RegistryDocument =
             serde_json::from_slice(bytes).map_err(|_| ContractError::InvalidRegistry)?;
-        if document.version != 1 || document.routes.is_empty() || document.routes.len() > 128 {
+        if !matches!(document.version, 1 | 2)
+            || document.routes.is_empty()
+            || document.routes.len() > 128
+        {
             return Err(ContractError::InvalidRegistry);
         }
         let mut routes = BTreeMap::new();
@@ -173,6 +313,27 @@ impl Registry {
                 return Err(ContractError::InvalidRegistry);
             }
             validate_endpoint(&route.endpoint)?;
+            if document.version == 2
+                && serde_json::to_vec(&route.input_schema)
+                    .map_err(|_| ContractError::InvalidSchema)?
+                    .len()
+                    > MAX_UPSTREAM_SCHEMA_BYTES
+            {
+                return Err(ContractError::InvalidSchema);
+            }
+            match (
+                document.version,
+                &route.upstream_input_schema,
+                route.output_policy,
+                &route.output_projection,
+            ) {
+                (1, None, OutputPolicy::Withhold, None) => {}
+                (2, Some(_), OutputPolicy::Withhold, None) => {}
+                (2, Some(_), OutputPolicy::TypedFields, Some(projection)) => {
+                    projection.validate()?
+                }
+                _ => return Err(ContractError::InvalidRegistry),
+            }
             let mut nodes = 0;
             validate_schema(&route.input_schema, 0, &mut nodes)?;
             if route.input_schema["type"] != "object" {
@@ -182,7 +343,23 @@ impl Registry {
             // Compilation cannot resolve URLs, files or external schemas.
             let validator = jsonschema::validator_for(&route.input_schema)
                 .map_err(|_| ContractError::InvalidSchema)?;
-            routes.insert(route.alias.clone(), ValidatedRoute { route, validator });
+            let upstream_validator = route
+                .upstream_input_schema
+                .as_ref()
+                .map(|schema| {
+                    validate_upstream_schema(schema)?;
+                    jsonschema::validator_for(schema)
+                        .map_err(|_| ContractError::UnsupportedUpstreamSchema)
+                })
+                .transpose()?;
+            routes.insert(
+                route.alias.clone(),
+                ValidatedRoute {
+                    route,
+                    validator,
+                    upstream_validator,
+                },
+            );
         }
         Ok(Self { routes })
     }
@@ -202,6 +379,52 @@ impl Registry {
         self.routes.len()
     }
 
+    /// Offline comparison against a captured tools/list result. This proves pin
+    /// equality only, not authorization, endpoint provenance or all possible
+    /// argument compatibility. Every runtime call still validates both schemas.
+    pub fn qualify_catalog(
+        &self,
+        bytes: &[u8],
+    ) -> Result<Vec<CatalogQualification>, ContractError> {
+        if bytes.len() > MAX_CATALOG_BYTES {
+            return Err(ContractError::InputTooLarge);
+        }
+        let catalog: Value =
+            serde_json::from_slice(bytes).map_err(|_| ContractError::InvalidRegistry)?;
+        let result = catalog.get("result").unwrap_or(&catalog);
+        let tools = result
+            .get("tools")
+            .and_then(Value::as_array)
+            .ok_or(ContractError::InvalidRegistry)?;
+        if result.get("nextCursor").is_some() || tools.len() > 128 {
+            return Err(ContractError::InvalidRegistry);
+        }
+        Ok(self
+            .routes
+            .values()
+            .map(|value| {
+                let route = &value.route;
+                let matches: Vec<_> = tools
+                    .iter()
+                    .filter(|t| t.get("name").and_then(Value::as_str) == Some(&route.tool))
+                    .collect();
+                let diagnostic = match matches.as_slice() {
+                    [] => "tool_missing",
+                    [tool] if tool.get("inputSchema") == Some(route.upstream_schema()) => {
+                        "pinned_schema_matches"
+                    }
+                    [_] => "upstream_schema_drift",
+                    _ => "duplicate_tool",
+                };
+                CatalogQualification {
+                    route: route.alias.clone(),
+                    compatible: diagnostic == "pinned_schema_matches",
+                    diagnostic,
+                }
+            })
+            .collect())
+    }
+
     /// Validate the agent envelope and freeze the exact administrator route and
     /// arguments together. There are no endpoint/header/approval override fields.
     pub fn prepare_json(&self, bytes: &[u8]) -> Result<PreparedCall, ContractError> {
@@ -217,16 +440,26 @@ impl Registry {
             return Err(ContractError::InputTooLarge);
         }
         let arguments = Value::Object(call.arguments.clone());
-        if !integer_numbers_only(&arguments) || !validated.validator.is_valid(&arguments) {
+        if !integer_numbers_only(&arguments)
+            || !validated.validator.is_valid(&arguments)
+            || validated
+                .upstream_validator
+                .as_ref()
+                .is_some_and(|v| !v.is_valid(&arguments))
+        {
             return Err(ContractError::ArgumentsRejected);
         }
         let snapshot = serde_json::json!({
-            "contract_version": PREPARED_CONTRACT_VERSION,
+            "contract_version": validated.route.prepared_contract_version(),
             "route": &validated.route,
             "arguments": arguments,
         });
         let mut hash = Sha256::new();
-        hash.update(b"opaque.mcp.prepared-call.v2\0");
+        hash.update(if validated.route.prepared_contract_version() == 2 {
+            b"opaque.mcp.prepared-call.v2\0"
+        } else {
+            b"opaque.mcp.prepared-call.v3\0"
+        });
         hash.update(serde_json::to_vec(&key_sorted(snapshot)).expect("JSON value serializes"));
         let digest = format!("{:x}", hash.finalize());
         Ok(PreparedCall {
@@ -235,6 +468,123 @@ impl Registry {
             digest,
         })
     }
+}
+
+#[derive(Debug, Serialize)]
+pub struct CatalogQualification {
+    pub route: String,
+    pub compatible: bool,
+    pub diagnostic: &'static str,
+}
+
+/// Bounded non-referencing subset of upstream JSON Schema. Unlike the admitted
+/// contract, upstream properties may be open/unbounded and carry descriptions.
+/// These annotations never become defaults, agent tools, review text or authority.
+/// Reject refs, regexes, combinators and unknown keywords before compilation, so
+/// the validator cannot retrieve schemas or perform unbounded regex evaluation.
+fn validate_upstream_schema(schema: &Value) -> Result<(), ContractError> {
+    fn visit(schema: &Value, depth: usize, nodes: &mut usize) -> Result<(), ContractError> {
+        let error = ContractError::UnsupportedUpstreamSchema;
+        *nodes += 1;
+        if depth > MAX_SCHEMA_DEPTH || *nodes > MAX_SCHEMA_NODES {
+            return Err(error);
+        }
+        let obj = schema.as_object().ok_or(error)?;
+        let kind = obj.get("type").and_then(Value::as_str).ok_or(error)?;
+        let allowed: &[&str] = match kind {
+            "object" => &[
+                "type",
+                "properties",
+                "required",
+                "additionalProperties",
+                "description",
+                "title",
+            ],
+            "string" => &[
+                "type",
+                "minLength",
+                "maxLength",
+                "enum",
+                "description",
+                "title",
+            ],
+            "number" | "integer" => &["type", "minimum", "maximum", "enum", "description", "title"],
+            "boolean" => &["type", "enum", "description", "title"],
+            "array" => &[
+                "type",
+                "items",
+                "minItems",
+                "maxItems",
+                "description",
+                "title",
+            ],
+            _ => return Err(error),
+        };
+        if obj.keys().any(|key| !allowed.contains(&key.as_str())) {
+            return Err(error);
+        }
+        for key in ["description", "title"] {
+            if obj
+                .get(key)
+                .is_some_and(|v| v.as_str().is_none_or(|s| s.len() > 4096))
+            {
+                return Err(error);
+            }
+        }
+        if let Some(values) = obj.get("enum") {
+            let values = values.as_array().ok_or(error)?;
+            if values.is_empty()
+                || values.len() > 128
+                || values
+                    .iter()
+                    .any(|v| !(v.is_string() || v.is_number() || v.is_boolean()))
+            {
+                return Err(error);
+            }
+        }
+        match kind {
+            "object" => {
+                let properties = obj
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .ok_or(error)?;
+                if properties.len() > 64 || properties.keys().any(|key| !identifier(key)) {
+                    return Err(error);
+                }
+                if obj
+                    .get("additionalProperties")
+                    .is_some_and(|v| !v.is_boolean())
+                {
+                    return Err(error);
+                }
+                if let Some(required) = obj.get("required") {
+                    let required = required.as_array().ok_or(error)?;
+                    let unique: BTreeSet<_> = required.iter().filter_map(Value::as_str).collect();
+                    if required.len() > 64
+                        || unique.len() != required.len()
+                        || unique.iter().any(|key| !properties.contains_key(*key))
+                    {
+                        return Err(error);
+                    }
+                }
+                for child in properties.values() {
+                    visit(child, depth + 1, nodes)?;
+                }
+            }
+            "array" => visit(obj.get("items").ok_or(error)?, depth + 1, nodes)?,
+            _ => {}
+        }
+        Ok(())
+    }
+    if serde_json::to_vec(schema)
+        .map_err(|_| ContractError::UnsupportedUpstreamSchema)?
+        .len()
+        > MAX_UPSTREAM_SCHEMA_BYTES
+        || schema.get("type").and_then(Value::as_str) != Some("object")
+    {
+        return Err(ContractError::UnsupportedUpstreamSchema);
+    }
+    visit(schema, 0, &mut 0)
 }
 
 fn identifier(value: &str) -> bool {

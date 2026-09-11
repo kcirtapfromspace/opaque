@@ -97,6 +97,7 @@ nav:
       - Deployment: deployment.md
   - Integrations:
       - MCP (Claude Code): mcp-integration.md
+      - Qualifying MCP Tools: mcp-qualified-tools.md
       - Bitwarden: bitwarden.md
       - HashiCorp Vault: vault.md
       - LLM Harness: llm-harness.md
@@ -109,6 +110,7 @@ nav:
       - Security Assessment: security-assessment.md
       - Adversarial Review: adversarial-security-review-2026-02-14.md
       - Audit Analytics: audit-analytics.md
+      - Evidence Checkpoints: evidence-checkpoints.md
   - Architecture:
       - Building on the Core: reusable-core.md
       - Design Notes: architecture.md

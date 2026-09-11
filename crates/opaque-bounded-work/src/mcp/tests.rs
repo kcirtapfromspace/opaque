@@ -24,6 +24,8 @@ fn route() -> Route {
         tool: "post_note".into(),
         credential_binding: "notes".into(),
         input_schema: schema(),
+        upstream_input_schema: None,
+        output_projection: None,
         output_policy: OutputPolicy::Withhold,
         max_request_bytes: 4096,
         max_response_bytes: 4096,
@@ -69,7 +71,11 @@ impl Fixture {
             teams: vec![],
             rules: vec![],
             mcp_registry: Some(RegistryDocument {
-                version: 1,
+                version: if route.upstream_input_schema.is_some() {
+                    2
+                } else {
+                    1
+                },
                 routes: vec![route],
             }),
         };
@@ -171,7 +177,7 @@ impl Respond for Server {
                 if matches!(self.mode, Mode::Invalid) {
                     return ResponseTemplate::new(200).set_body_string("not json");
                 }
-                json!({"content":[{"type":"text","text":if matches!(self.mode,Mode::Oversize){"x".repeat(8192)}else{"synthetic-secret-and-injection-output".into()}}],"isError":matches!(self.mode,Mode::ServerError)})
+                json!({"content":[{"type":"text","text":if matches!(self.mode,Mode::Oversize){"x".repeat(8192)}else{"synthetic-secret-and-injection-output".into()}}],"isError":matches!(self.mode,Mode::ServerError),"structuredContent":{"id":42,"status":"created","text":"synthetic-secret-in-unselected"}})
             }
             _ => panic!("unexpected method {method}"),
         };
@@ -644,5 +650,62 @@ async fn synchronous_identity_fence_denies_before_credentials_and_again_before_t
             state.requests.load(Ordering::SeqCst),
             if deny_on == 1 { 0 } else { 3 }
         );
+    }
+}
+
+#[tokio::test]
+async fn post_effect_authority_or_registry_change_erases_typed_values_but_keeps_receipt() {
+    for change in ["identity", "registry"] {
+        let (server, state) = server(Mode::Normal).await;
+        let fixture = Fixture::new(Some(server.uri()));
+        let mut selected = route();
+        selected.upstream_input_schema = Some(schema());
+        selected.output_policy = OutputPolicy::TypedFields;
+        selected.output_projection = Some(serde_json::from_value(json!({"fields":[{"source":"id","name":"resource_id","value_type":{"kind":"integer_id","maximum":1000}}]})).unwrap());
+        fixture.write(1, selected.clone(), now() + 600);
+        let gateway = fixture.gateway();
+        let action = fixture.action(&gateway);
+        gateway.ledger.claim("alice", &action).unwrap();
+        let mut checks = 0;
+        let result = gateway
+            .execute(
+                "alice",
+                &action,
+                || async { Ok(()) },
+                |check| {
+                    checks += 1;
+                    if checks == 3 {
+                        if change == "identity" {
+                            return Err("principal removed".into());
+                        }
+                        fixture.write(2, selected.clone(), now() + 600);
+                    }
+                    check()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(checks, 3);
+        assert_eq!(state.effects.load(Ordering::SeqCst), 1);
+        assert_eq!(result.state, "accepted");
+        assert!(result.attempt_charged);
+        assert!(result.output.is_none());
+        assert_eq!(result.disclosure, Some("withheld_authority_changed"));
+        assert_eq!(result.projection_validated, Some(true));
+        assert!(result.response_sha256.is_none());
+        assert!(result.response_bytes.is_none());
+        let stored = gateway.ledger.get("alice", &action.invocation_id).unwrap();
+        let stored = serde_json::to_value(stored).unwrap();
+        assert!(stored.get("projected_result_sha256").is_none());
+        assert!(stored["response_sha256"].is_null());
+        assert!(stored["response_bytes"].is_null());
+        assert_eq!(result.dispatch_status.as_deref(), Some("attempted"));
+        assert!(
+            !serde_json::to_string(&result)
+                .unwrap()
+                .contains("synthetic-secret")
+        );
+        assert!(gateway.ledger.claim("alice", &action).is_err());
+        assert_eq!(state.effects.load(Ordering::SeqCst), 1);
     }
 }

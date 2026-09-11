@@ -504,7 +504,7 @@ fn verified_reads_remain_consistent_while_transactions_append_and_prune() {
 }
 
 #[test]
-fn legacy_unchained_schema_gets_one_atomic_baseline() {
+fn legacy_unchained_schema_is_preserved_without_inventing_authenticity() {
     let fixture = Fixture::new();
     let conn = fixture.connection();
     // Match the historical schema: hash and approver columns did not exist.
@@ -521,20 +521,18 @@ fn legacy_unchained_schema_gets_one_atomic_baseline() {
         rusqlite::params![id, now()],
     )
     .unwrap();
-    let sink = SqliteAuditSink::new(fixture.path.clone(), 0).unwrap();
-    sink.close().unwrap();
-    let initial_hashes = hashes(&conn);
-    assert!(verify_audit_chain(&fixture.path).unwrap().ok);
-    SqliteAuditSink::new(fixture.path.clone(), 0)
-        .unwrap()
-        .close()
-        .unwrap();
-    assert_eq!(hashes(&conn), initial_hashes);
-    // Once migrated, a NULL authenticator must not trigger a second baseline.
-    conn.execute("UPDATE audit_events SET record_hash=NULL", [])
-        .unwrap();
     assert!(SqliteAuditSink::new(fixture.path.clone(), 0).is_err());
-    assert!(!verify_audit_chain(&fixture.path).unwrap().ok);
+    assert!(
+        conn.prepare("SELECT record_hash FROM audit_events LIMIT 0")
+            .is_err()
+    );
+    assert!(!table_exists(&conn, "chain_head").unwrap());
+    let retained: String = conn
+        .query_row("SELECT event_id FROM audit_events", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(retained, id);
+    assert!(checkpoint::upgrade_legacy_head(&fixture.path, &"0".repeat(64)).is_err());
+    assert!(!table_exists(&conn, "chain_head").unwrap());
 }
 
 #[test]

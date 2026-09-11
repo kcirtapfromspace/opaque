@@ -61,6 +61,10 @@ In Claude Code, ask: "List my GitHub secrets for owner/repo". If the policy allo
 
 ## Available Tools
 
+Signed third-party tool routes are covered in [qualifying one MCP tool](mcp-qualified-tools.md).
+That guide explains separate upstream/admitted schemas, offline catalog qualification,
+bounded typed result disclosure, current authority checks and the supported transport.
+
 The MCP server exposes `SAFE` operations normally. It also exposes sandbox
 execution (`SENSITIVE_OUTPUT`) with its output content withheld from the
 model; see [Sandbox](#sandbox) below. Operations classified as `REVEAL`

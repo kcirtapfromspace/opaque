@@ -25,6 +25,8 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+rcgen = { workspace = true }
+tokio-rustls = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-local-authentication = { version = "0.3.2", default-features = false, features = ["std", "block2", "LAContext"] }

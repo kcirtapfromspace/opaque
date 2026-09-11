@@ -28,7 +28,8 @@ ROOT = Path(__file__).resolve().parent.parent
 PUBLIC_ROUTES = frozenset({
     "", "adversarial-security-review-2026-02-14", "architecture", "audit-analytics",
     "bitwarden", "blog/why-we-built-opaque", "demos", "deployment",
-    "bounded-work", "enterprise-architecture", "federation", "getting-started",
+    "bounded-work", "enterprise-architecture", "evidence-checkpoints", "federation", "getting-started",
+    "mcp-qualified-tools",
     "hosted-demo", "identity", "linux-polkit", "llm-harness", "mcp-integration",
     "mobile-approvals", "operations", "policy", "roadmap-deferred",
     "remote-approvals", "reusable-core",

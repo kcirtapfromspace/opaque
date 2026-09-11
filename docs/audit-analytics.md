@@ -18,6 +18,8 @@ CLI retries cover connection establishment only. Neither CLI nor MCP automatical
 
 The chain depends on custody of its key and database. A process that can replace both can forge history. Preserve the database, WAL, and chain key when investigating integrity errors; do not edit rows or remove the key to force startup. Keep backups and exports under the same access controls as audit metadata.
 
+The local tail head is now versioned and authenticated. Older unversioned heads require an explicit offline upgrade against independently trusted export bytes; startup does not silently bless them. [Signed evidence checkpoints](evidence-checkpoints.md) documents the upgrade, dedicated producer-key enrollment, transactional snapshot signing, public verification and retention receipts. These authenticate declared ranges and custody commitments; they do not establish global completeness or safe authorization-state recovery.
+
 ## 1. Storage Strategy (Layered)
 
 ### System of record: SQLite (transactional)
