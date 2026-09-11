@@ -544,17 +544,25 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[tokio::test]
     async fn review_timeout_reports_last_stage_and_reaps_helper() {
+        // Model a helper that has received the complete review and then stalls
+        // at the window stage. The separate unread-input test covers a helper
+        // that never consumes its stdin.
         let (_directory, helper) = review_test_helper(
-            "printf '%s\\n' $$ > \"$0.pid\"\nprintf '%s\\n' 'opaque-review-stage: window-ordered'\nexec /bin/sleep 5",
+            "cat > \"$0.review\" || exit 2\nprintf '%s\\n' $$ > \"$0.pid\"\nprintf '%s\\n' 'opaque-review-stage: window-ordered'\nexec /bin/sleep 5",
         );
+        let review = "complete task";
         let started = std::time::Instant::now();
-        let error = run_task_review(&helper, "complete task", std::time::Duration::from_secs(1))
+        let error = run_task_review(&helper, review, std::time::Duration::from_secs(1))
             .await
             .unwrap_err()
             .to_string();
-        assert!(error.contains("task review timed out"));
-        assert!(error.contains("last stage: window-ordered"));
+        assert!(error.contains("task review timed out"), "{error}");
+        assert!(error.contains("last stage: window-ordered"), "{error}");
         assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        assert_eq!(
+            std::fs::read_to_string(helper.with_extension("review")).unwrap(),
+            review
+        );
         let pid: i32 = std::fs::read_to_string(helper.with_extension("pid"))
             .unwrap()
             .trim()
@@ -582,7 +590,7 @@ mod tests {
         .await
         .unwrap_err()
         .to_string();
-        assert!(error.contains("task review timed out"));
+        assert!(error.contains("task review timed out"), "{error}");
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
@@ -602,7 +610,7 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(error.contains("native review UI unavailable"));
+        assert!(error.contains("native review UI unavailable"), "{error}");
     }
 
     #[test]
