@@ -1,39 +1,35 @@
 # Tutorial: your first gated operation
 
-**Time: about 15 minutes.** By the end you will have an agent that can push a
-secret to GitHub without ever being able to read it, and an audit trail that
-records the broker’s observed outcome.
+Publish a disposable secret to a test GitHub repository, approve the request,
+and inspect the broker's audit record. The operation returns status without
+returning the secret value through Opaque.
 
-You need macOS or Linux and a terminal. Steps 1–4 need nothing else; from step 5
-you also want a GitHub repo you can write to and a token with `repo` scope. No
-prior Opaque knowledge assumed.
+This is a **local learning exercise**: agent and daemon share your user account.
+It does not isolate credentials from other processes with that account's access.
+Use a throwaway value and test repository, not production credentials or data.
 
----
+Steps 1–4 need macOS or a Linux graphical desktop with
+[native approval configured](linux-polkit.md). Step 5 also needs access to a test
+repository and a disposable GitHub token authorized to manage its Actions secrets.
 
 ## What you are about to build
 
-```
-   your agent  ──►  opaque CLI  ──►  opaqued  ──►  GitHub
-  (Claude Code)      (asks for       (holds the      (receives the
-                    an operation)     secret)          secret)
-                                          │
-                                    you approve
-                                     (Touch ID)
+```text
+Agent → opaque-mcp → opaqued → GitHub
+CLI   ────────────→    ↑
+                human approval
 ```
 
-The agent asks for an **operation** ("set this secret"), never for the secret
-itself. The daemon holds the value, you approve the act, and the response the
-agent sees carries no secret material.
-
----
+The broker checks policy, requests approval, resolves a credential reference,
+and calls GitHub. The CLI exercises the same broker before you connect an agent.
 
 ## 1. Install
 
-This tutorial exercises the baseline broker flow. The new reviewer app, signed
-MCP v2 projections and portable checkpoints are unreleased source capabilities;
-see [getting started](getting-started.md) for their build paths. When upgrading
-an existing installation, follow the [audit migration guide](evidence-checkpoints.md#authenticated-local-head-and-older-databases)
-before restarting with the current source writer.
+This tutorial covers the baseline broker flow. The reviewer app, signed MCP v2
+projections and portable checkpoints are unreleased source capabilities; see
+[getting started](getting-started.md) for their build paths. Before upgrading an
+existing installation to the current source writer, follow the
+[audit migration guide](evidence-checkpoints.md#authenticated-local-head-and-older-databases).
 
 === "macOS (Homebrew)"
 
@@ -53,25 +49,24 @@ before restarting with the current source writer.
     cargo install --locked --git https://github.com/kcirtapfromspace/opaque.git opaque opaqued opaque-mcp opaque-approve-helper
     ```
 
-Check the broker, client, MCP server and native helper are on your PATH:
+Check the installed version and binary paths:
 
 ```sh
 opaque --version
 command -v opaqued opaque-mcp opaque-approve-helper
 ```
 
----
-
 ## 2. Start from a policy you can read
 
-Opaque denies by default. A preset gives you a starting point you can read:
+For a fresh installation:
 
 ```sh
 opaque init --preset github-secrets
 ```
 
-This writes `~/.opaque/config.toml`. Open it: the whole security model is
-visible in one file. Here is the rule that matters most:
+Open `~/.opaque/config.toml`. If a configuration already exists, review it instead
+of overwriting it. These instructions assume the unchanged `github-secrets` preset.
+Its Actions-secret rule is:
 
 ```toml
 [[rules]]
@@ -81,92 +76,58 @@ allow = true
 client_types = ["agent", "human"]
 
 [rules.approval]
-require = "always"          # every single time, no lease
-factors = ["local_bio"]     # Touch ID / polkit
+require = "always"
+factors = ["local_bio"]
 ```
 
-Read that as: *setting a GitHub Actions secret is permitted, and only with a
-human approving each one.* The preset adds a few sibling rules (Codespaces,
-Dependabot, org secrets, list/delete) and one `test.noop` rule for onboarding.
-
-Everything not named in this file is denied. There is no implicit allowance to
-forget about, which you will see for yourself in step 6.
-
----
+The preset also permits other GitHub secret operations, including deletion;
+it is not restricted to your test repository. Writes and deletions require
+approval each time. Listing and `test.noop` use first-use approval with a
+five-minute lease. Unmatched operations are denied. For narrower repository
+and secret-name rules, see [policy](policy.md).
 
 ## 3. Run the daemon
 
-In a second terminal, leave this running so you can watch it work:
+In a second terminal, start the broker and leave it running:
 
 ```sh
 opaqued
 ```
 
-You will see it verify custody of its own state, load your policy, and listen:
-
-```
-INFO opaqued::trust_domain: custody verified: 20 paths exclusively owned by uid 501
-INFO opaqued: listening on ~/.opaque/run/opaqued.sock
-INFO opaqued: policy engine loaded with 7 rules
-INFO opaqued: audit chain verified (0 records)
-```
-
-Back in your first terminal, confirm the two can talk:
+Back in the first terminal:
 
 ```sh
 opaque ping
 ```
 
-```
-✔  Pong
-```
-
-!!! tip "Prefer it always-on?"
-    `opaque service install` registers a LaunchAgent (macOS) or systemd user
-    service (Linux). For this tutorial the foreground daemon is better: you get
-    to watch every decision.
-
----
+A successful ping confirms connectivity. Read startup errors before proceeding;
+ordinary session-mode startup does not establish separate credential custody.
 
 ## 4. Run your first gated operation
-
-Nothing external needed yet. The preset includes a no-op operation exactly for
-this moment:
 
 ```sh
 opaque execute test.noop
 ```
 
-Your machine prompts for Touch ID (macOS) or your password (polkit on Linux).
-**Read the prompt before you approve.** It names the operation and carries a
-hash binding the approval to this specific request. That prompt is the security
-boundary: an agent can ask, but it cannot answer.
+Review the operation in the native prompt, then approve using the configured
+native authentication. Linux requires an intent dialog followed by polkit.
+If review cannot open, fix that prerequisite before continuing.
 
-```
-✔  Operation succeeded
-```
-
-Run it a second time and it goes through without prompting. That is the rule's
-`require = "first_use"` with a 5-minute `lease_ttl`: approve once, and repeats of
-the *same* request ride the lease until it expires. The write rules you are about
-to use are `require = "always"` instead: no lease, every time.
-
----
+A successful no-op checks the local request and approval path without contacting
+a provider. Repeating the same request within its valid lease can skip another
+approval. That lease does not apply to the GitHub write below.
 
 ## 5. Give the daemon your secrets
 
-The daemon reads secrets from a **ref**: a pointer, not a value. Two entries: a
-GitHub token for API access (the daemon looks for it at
-`keychain:opaque/github-pat`), and the value you want to publish.
+Store two values interactively: the disposable GitHub token and a throwaway
+value. These commands match the resolver's `keychain:service/account` format.
+Do not put values in command arguments or agent messages.
 
 === "macOS"
 
     ```sh
     security add-generic-password -s opaque -a github-pat -w
-    # paste a GitHub token with `repo` scope, press Enter
-
     security add-generic-password -s opaque -a tutorial-value -w
-    # type any throwaway value, press Enter
     ```
 
 === "Linux (secret-tool)"
@@ -176,15 +137,15 @@ GitHub token for API access (the daemon looks for it at
     secret-tool store --label="opaque tutorial value" service opaque account tutorial-value
     ```
 
-Both values now live in the keychain. Nothing you type from here on contains
-either one; you refer to them as `keychain:opaque/github-pat` and
-`keychain:opaque/tutorial-value`.
+Enter the token at the first prompt and the throwaway value at the second.
+The references are `keychain:opaque/github-pat` and
+`keychain:opaque/tutorial-value`. An existing entry may need separate review;
+do not replace credentials belonging to another installation.
 
----
+## 6. Publish the disposable secret { #6-push-a-secret-you-never-see }
 
-## 6. Push a secret you never see
-
-This is the moment the whole design exists for:
+Replace the repository placeholder with your test repository. This creates or
+replaces its `TUTORIAL_KEY` Actions secret:
 
 ```sh
 opaque github set-secret \
@@ -193,173 +154,88 @@ opaque github set-secret \
   --value-ref keychain:opaque/tutorial-value
 ```
 
-Approve at the prompt. This rule is `require = "always"`, so there is no lease
-to ride and you will be asked every single time. Note what the prompt shows: the
-repo, the secret name, and the request hash. Then:
+Confirm the repository and secret name in the approval prompt. Success means
+GitHub accepted the write; it does not establish what a workflow later did
+with the value. Opaque's response omits the value. A process with independent
+keychain access or control of a consuming workflow has a different access path.
 
-```
-✔  Set TUTORIAL_KEY on YOUR_ORG/YOUR_REPO
-  🔗  YOUR_ORG/YOUR_REPO
-  🔑  TUTORIAL_KEY
-```
-
-Notice what is *not* there: the value. The daemon encrypted it with GitHub's
-public key and sent it directly. It never passed through the CLI's output, so it
-could never land in an agent's context.
-
-Now try the same shape of request against a provider this preset never
-mentioned, GitLab instead of GitHub:
+With the unchanged preset, this GitLab operation should be denied before
+provider execution:
 
 ```sh
 opaque gitlab set-ci-variable \
-  --project YOUR_GROUP/YOUR_PROJECT \
+  --project tutorial/denied \
   --key TUTORIAL_KEY \
   --value-ref keychain:opaque/tutorial-value
 ```
 
-```
-✖  policy denied: operation 'gitlab.set_ci_variable' denied by policy —
-   debug with: opaque policy simulate --operation gitlab.set_ci_variable
-  code: policy_denied
-
-  hint: This operation was denied by the security policy.
-    • Check policy: opaque policy show
-    • Request approval or check pending leases: opaque leases
-```
-
-No prompt, no network call, no GitLab token required: the request died at the
-policy engine because no rule named it. That is deny-by-default working, and it
-is why adding a provider is a deliberate act rather than an accident.
-
----
+Expect `policy_denied`; no GitLab token is needed. If your result differs,
+inspect the active policy before proceeding.
 
 ## 7. Read the audit trail
 
-Every decision above was recorded:
-
 ```sh
 opaque audit tail --limit 10
-```
-
-```
-Audit log — 10 event(s)
-  WHEN                       EVENT                    OPERATION                  OUTCOME
-  -------------------------  -----------------------  -------------------------  ----------
-  1m ago  18:53:40.668Z      operation.succeeded      github.set_actions_secret  [ok]
-  1m ago  18:53:40.651Z      provider.fetch.finished  github.set_actions_secret  [created]
-  1m ago  18:53:40.648Z      secret.resolved          github.set_actions_secret  [resolved]
-  1m ago  18:53:40.644Z      operation.started        github.set_actions_secret  [unknown]
-  1m ago  18:53:40.641Z      approval.granted         github.set_actions_secret  [allowed]
-```
-
-Every decision is there in order: the request, the approval requirement, the
-approval being granted and by whom, the secret being resolved, the provider
-call, and the denial of the GitLab request. Each row carries the correlation
-ID that ties one operation's events together.
-
-The log is not just a file; it is a hash chain:
-
-```sh
 opaque audit verify
 ```
 
-```
-✔  Audit chain intact — 34 records verified
-```
+Inspect recorded operation, approval, provider and denial events. Increase
+`--limit` if the relevant events are outside the displayed window. Results and
+event counts depend on your run; a provider error is not a successful write.
 
-If anyone edited, reordered, or deleted a record (including truncating the end),
-this command says so and exits nonzero. Wire it into a cron job and you have
-continuous integrity checking for free.
-
----
+Verification checks local audit integrity under its custody assumptions.
+Someone holding the audit HMAC key can forge records; verification cannot
+establish that a compromised broker reported truthfully. Whole-state rollback
+also needs an independently retained reference to detect. See
+[signed evidence checkpoints](evidence-checkpoints.md) for authenticated heads,
+retained references and verification limits.
 
 ## 8. Point your agent at it
 
-Now hand this capability to Claude Code. Add the MCP server to your config:
+For an MCP client using an `mcpServers` configuration, add:
 
 ```json
 {
   "mcpServers": {
     "opaque": {
-      "command": "/usr/local/bin/opaque-mcp"
+      "command": "/absolute/path/to/opaque-mcp"
     }
   }
 }
 ```
 
-(Use the absolute path `which opaque-mcp` prints; Homebrew and the shell
-installer put it in different places.)
+Use the path from `command -v opaque-mcp` and your client's supported configuration
+location. Restart or reconnect the client, then confirm it lists
+`opaque_github_set_actions_secret`. See [MCP integration](mcp-integration.md).
 
-Restart Claude Code and ask it, in plain language:
+Ask it to set `TUTORIAL_KEY` in your test repository using
+`keychain:opaque/tutorial-value`. Review the resulting request before approval.
+This built-in tool returns operation status without exposing the secret value
+through its result. It does not restrict the agent's independent tools or account.
 
-> "Set the GitHub Actions secret TUTORIAL_KEY for YOUR_ORG/YOUR_REPO from my
-> keychain."
+## Review your results { #what-you-just-proved }
 
-You will get the same approval prompt. The agent drove the operation; you
-authorized it; the secret never entered the model's context. Ask the agent to
-*show* you the secret instead and it cannot: there is no operation that returns
-one.
+Check your own outcomes: no-op completed, GitHub accepted the write, GitLab was
+denied, and audit verification passed. Record failures as failures. This exercise
+is not a production security assessment or evidence of customer deployment.
 
----
-
-## What you just proved
-
-| You did | It demonstrated |
-|---|---|
-| Ran an operation with a secret ref | The model gets operations, never plaintext |
-| Approved with Touch ID | Presence is proven by an act an agent cannot perform |
-| Saw a lease on the second `test.noop` | Approval scope is a policy decision, not a default |
-| Got denied on the GitLab request | Deny-by-default, with no implicit allowances |
-| Verified the chain | Tamper-evidence you can check in one command |
-
----
+Afterward, remove the test secret through GitHub and revoke the disposable token.
 
 ## Where to go next
 
-**Hand it a whole piece of work, not one operation at a time.** Everything
-above was a single gated call. [Bounded agent work](bounded-work.md) lets you
-plan a task (publish a secret, dispatch a release, run a fixed host check)
-as one immutable manifest, approved once and executed once, with a receipt
-you can inspect afterward.
-
-**Harden it.** Everything above ran in *session mode*, where the daemon shares
-your user account. That means an attacker holding your uid could read the
-daemon's keys; you would detect it afterward, but not prevent it. The
-[trust-domain split](deployment.md) moves the daemon to its own service account
-or container, where custody is enforced at startup and the guarantees become
-prevention rather than evidence.
-
-**Add real identity.** [Identity](identity.md) connects your IdP over OIDC, so
-approvals name a verified human and agents act *on behalf of* someone with
-delegation tokens, not anonymously.
-
-**Approve from your phone or a hardware key.** The
-[approval factors](identity.md#audit) include a paired second device and
-FIDO2/passkeys, which produce a cryptographically signed approver in the audit
-chain instead of a session-bound name.
-
-**Govern a fleet.** [Federation](federation.md) lets one org signature carry
-policy to every daemon, streams the audit chain to your SIEM in a form it can
-verify, and lets daemons prove their posture before receiving keys.
-
-**Go deeper on the rules.** [Policy](policy.md) covers targets, workspaces,
-secret-name constraints, leases, and segregation of duties.
-
----
+- [Deployment](deployment.md): separate broker custody and its trust assumptions.
+- [Bounded agent work](bounded-work.md): exact task manifests, durable consumption
+  and outcome receipts beyond this single-operation flow.
+- [Identity](identity.md) and [policy](policy.md): attributed access and narrower rules.
 
 ## Troubleshooting
 
-**`Is the daemon running? Try: opaque service start`**: the CLI could not reach
-the socket. Check the `opaqued` terminal for a startup error.
+**Daemon unreachable:** inspect the foreground broker's startup error.
 
-**The approval prompt never appears (Linux)**: polkit needs a desktop session
-and the helper installed; see [Linux polkit](linux-polkit.md). On a headless box
-use a second-device or FIDO2 factor instead, since there is no local prompt to
-show.
+**Linux prompt missing:** check the graphical session, dialog helper and polkit
+setup in [Linux native approvals](linux-polkit.md).
 
-**`config is unsealed`**: a warning, not an error. `opaque setup --seal` binds
-your config to a keyed HMAC so later edits are detected.
+**Unsealed configuration:** review [deployment](deployment.md) before sealing.
+A seal does not protect against someone who can replace its key.
 
-**`policy_denied` when you expected success**: compare your rule's
-`operation_pattern` and any `target` constraints against what you actually ran;
-`opaque audit tail` shows the decision and which rule matched.
+**Unexpected denial:** inspect `opaque policy show` and `opaque audit tail`.

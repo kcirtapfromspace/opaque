@@ -1,5 +1,5 @@
 site_name: Opaque
-site_description: Secrets stay secret. Agents stay powerful. A local, approval-gated secrets broker for AI coding tools.
+site_description: Opaque runs sensitive operations for coding agents with policy, required human approval, broker-held credentials, and recorded outcomes.
 site_url: https://opaque.info/
 repo_url: https://github.com/kcirtapfromspace/opaque
 repo_name: kcirtapfromspace/opaque
@@ -36,7 +36,6 @@ theme:
   features:
     - navigation.tabs
     - navigation.sections
-    - navigation.expand
     - navigation.top
     - search.suggest
     - search.highlight
@@ -49,7 +48,11 @@ markdown_extensions:
       permalink: true
   - admonition
   - pymdownx.details
-  - pymdownx.superfences
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
   - pymdownx.highlight:
       anchor_linenums: true
   - pymdownx.inlinehilite
@@ -82,38 +85,40 @@ copyright: "Copyright &copy; 2026 Patrick Deutsch"
 
 nav:
   - Home: index.md
-  - Getting Started:
-      - Tutorial: tutorial.md
-      - Quick Start: getting-started.md
-      - Demos: demos.md
-      - Web Dashboard: web-dashboard.md
-  - Configuration:
-      - Policy Engine: policy.md
-      - Identity: identity.md
-      - Federation: federation.md
-      - Bounded Agent Work: bounded-work.md
-      - Operations: operations.md
-      - Storage: storage.md
-      - Deployment: deployment.md
-  - Integrations:
-      - MCP (Claude Code): mcp-integration.md
-      - Qualifying MCP Tools: mcp-qualified-tools.md
-      - Bitwarden: bitwarden.md
-      - HashiCorp Vault: vault.md
-      - LLM Harness: llm-harness.md
-  - Platform:
-      - Linux polkit: linux-polkit.md
-      - Mobile Approvals: mobile-approvals.md
-      - Remote Approvals: remote-approvals.md
-      - Enterprise Architecture: enterprise-architecture.md
-  - Security:
-      - Security Assessment: security-assessment.md
-      - Adversarial Review: adversarial-security-review-2026-02-14.md
-      - Audit Analytics: audit-analytics.md
-      - Evidence Checkpoints: evidence-checkpoints.md
+  - Start Here:
+      - First Operation: tutorial.md
+      - Install and Commands: getting-started.md
+      - Hosted Demo: hosted-demo.md
   - Architecture:
-      - Building on the Core: reusable-core.md
-      - Design Notes: architecture.md
-      - Deferred: roadmap-deferred.md
-  - Blog:
-      - Why We Built Opaque: blog/why-we-built-opaque.md
+      - Boundaries and Evidence: architecture.md
+      - Deployment: deployment.md
+      - Evidence Verification: evidence-checkpoints.md
+      - Bounded Tasks: bounded-work.md
+  - Reference:
+      - Configuration:
+          - Policy: policy.md
+          - Identity: identity.md
+          - Operations: operations.md
+          - Storage: storage.md
+          - Federation: federation.md
+      - Integrations:
+          - MCP: mcp-integration.md
+          - Qualifying MCP Tools: mcp-qualified-tools.md
+          - Bitwarden: bitwarden.md
+          - HashiCorp Vault: vault.md
+          - LLM Harness: llm-harness.md
+      - Approvals:
+          - Linux polkit: linux-polkit.md
+          - Mobile Approvals: mobile-approvals.md
+          - Workstation Review: remote-approvals.md
+      - Tools and Extensions:
+          - Web Dashboard: web-dashboard.md
+          - Audit Analytics: audit-analytics.md
+          - Building on the Core: reusable-core.md
+          - Organization Architecture: enterprise-architecture.md
+          - Recordings: demos.md
+      - Background:
+          - Historical Assessment (February 12): security-assessment.md
+          - Historical Review (February 14): adversarial-security-review-2026-02-14.md
+          - Deferred Work: roadmap-deferred.md
+          - Why We Built Opaque: blog/why-we-built-opaque.md

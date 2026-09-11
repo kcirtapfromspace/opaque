@@ -955,3 +955,93 @@
   .op-architecture *, .op-architecture *::before, .op-architecture *::after { animation: none !important; transition: none !important; }
   .op-architecture .op-art-packet { opacity: 0; }
 }
+
+/* Product explanation: one operation, followed through three concrete stages. */
+.op-home .op-text-link {
+  display: inline-block;
+  padding: 0.5rem 0;
+  font-size: 0.8rem;
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 0.22em;
+  text-decoration-color: var(--op-line-strong);
+}
+.op-home .op-text-link:hover { color: var(--op-accent); }
+.op-workflow { padding: 0; margin: 0; list-style: none; }
+.op-workflow > li {
+  display: grid;
+  grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.15fr);
+  align-items: center;
+  gap: clamp(1.5rem, 5vw, 4rem);
+  padding: 2.2rem 0;
+  border-top: 1px solid var(--op-line);
+}
+.op-step {
+  display: block;
+  margin-bottom: 0.65rem;
+  color: var(--op-accent);
+  font: 0.72rem var(--md-code-font-family);
+}
+.op-workflow h3, .op-detail h2, .op-invitation h2 {
+  font-size: clamp(1.15rem, 2.2vw, 1.65rem);
+  line-height: 1.2;
+  letter-spacing: -0.025em;
+  text-wrap: balance;
+}
+.op-workflow p, .op-detail p, .op-invitation > div > p {
+  max-width: 52ch;
+  margin-top: 0.7rem;
+  color: var(--op-text-dim);
+  font-size: 0.84rem;
+  line-height: 1.65;
+}
+.op-example {
+  min-width: 0;
+  border: 1px solid var(--op-line);
+  background: var(--op-bg-soft);
+}
+.op-example__label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 2.35rem;
+  padding: 0.2rem 1rem;
+  color: var(--op-text-dim);
+  border-bottom: 1px solid var(--op-line);
+  font: 0.62rem var(--md-code-font-family);
+}
+.op-example .op-copy { padding: 0.45rem; min-height: 2rem; }
+.op-example pre {
+  margin: 0;
+  padding: 1.15rem;
+  overflow-x: auto;
+  font: 0.68rem/1.8 var(--md-code-font-family);
+  color: var(--op-text);
+}
+.op-request { margin: 0; min-width: 0; }
+.op-request > div {
+  display: grid;
+  grid-template-columns: minmax(0, 0.6fr) minmax(0, 1fr);
+  gap: 1rem;
+  padding: 0.75rem 0;
+  border-bottom: 1px solid var(--op-line);
+  font-size: 0.78rem;
+}
+.op-request dt { color: var(--op-text-dim); }
+.op-request dd {
+  margin: 0;
+  font-family: var(--md-code-font-family);
+  overflow-wrap: anywhere;
+}
+.op-detail, .op-invitation {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: clamp(2rem, 6vw, 5rem);
+}
+.op-detail .op-text-link { margin-top: 0.8rem; }
+.op-invitation .op-actions { margin-top: 0; }
+@media screen and (max-width: 44.9375em) {
+  .op-workflow > li, .op-detail, .op-invitation { grid-template-columns: minmax(0, 1fr); }
+  .op-workflow > li { gap: 1.3rem; }
+  .op-example pre { padding: 0.8rem; font-size: 0.58rem; }
+}
