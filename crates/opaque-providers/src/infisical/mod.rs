@@ -479,30 +479,61 @@ mod tests {
     use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// Set up a handler pointing at a mock server with the service token
-    /// provided via env var.
+    const TOKEN_FIXTURE_ENV: &str = "OPAQUE_TEST_INFISICAL_FIXTURE_TOKEN";
+    const CHILD_TEST_ENV: &str = "OPAQUE_TEST_INFISICAL_CHILD_TEST";
+
+    /// Keep the real constructor and env resolver without mutating the environment
+    /// of the multithreaded test process. A per-test token variable alone is not
+    /// enough: the constructor still reads the shared TOKEN_REF_ENV selector.
+    async fn run_with_isolated_token(test_name: &str) -> bool {
+        let full_name = format!("infisical::tests::{test_name}");
+        if std::env::var(CHILD_TEST_ENV).as_deref() == Ok(full_name.as_str()) {
+            assert_eq!(
+                std::env::var(TOKEN_REF_ENV).unwrap(),
+                format!("env:{TOKEN_FIXTURE_ENV}")
+            );
+            assert_eq!(std::env::var(TOKEN_FIXTURE_ENV).unwrap(), "test-inf-token");
+            return false;
+        }
+
+        // Command::env configures only the child, before libtest/Tokio start any
+        // threads. --exact prevents unrelated tests from changing its fixture.
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args(["--exact", &full_name, "--nocapture", "--test-threads=1"])
+            .env(CHILD_TEST_ENV, &full_name)
+            .env(TOKEN_REF_ENV, format!("env:{TOKEN_FIXTURE_ENV}"))
+            .env(TOKEN_FIXTURE_ENV, "test-inf-token")
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(std::time::Duration::from_secs(30), child.output())
+            .await
+            .expect("isolated Infisical test timed out")
+            .expect("failed to start isolated Infisical test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed; 0 failed; 0 ignored"),
+            "isolated {full_name} did not pass exactly one test: {}\n{stdout}\n{stderr}",
+            output.status
+        );
+        true
+    }
+
+    /// Set up the mock only inside the child with its immutable token fixture.
     async fn setup_handler_with_mock() -> (InfisicalHandler, MockServer, Arc<InMemoryAuditEmitter>)
     {
+        assert!(std::env::var(CHILD_TEST_ENV).is_ok());
         let mock_server = MockServer::start().await;
         let audit = Arc::new(InMemoryAuditEmitter::new());
-
-        // Provide the service token via env var so resolve_token()
-        // uses env resolver instead of keychain.
-        let token_env = format!("OPAQUE_TEST_INF_TOKEN_{}", uuid::Uuid::new_v4().as_simple());
-        unsafe { std::env::set_var(&token_env, "test-inf-token") };
-        unsafe { std::env::set_var(TOKEN_REF_ENV, format!("env:{token_env}")) };
-
         let handler = InfisicalHandler::new(audit.clone(), &mock_server.uri()).unwrap();
         (handler, mock_server, audit)
     }
 
-    /// Clean up env vars after test.
-    fn cleanup_env() {
-        unsafe { std::env::remove_var(TOKEN_REF_ENV) };
-    }
-
     #[tokio::test]
     async fn list_projects_via_handler() {
+        if run_with_isolated_token("list_projects_via_handler").await {
+            return;
+        }
         let (handler, mock_server, audit) = setup_handler_with_mock().await;
 
         Mock::given(method("GET"))
@@ -532,12 +563,13 @@ mod tests {
 
         let events = audit.events();
         assert!(events.len() >= 2);
-
-        cleanup_env();
     }
 
     #[tokio::test]
     async fn list_secrets_via_handler() {
+        if run_with_isolated_token("list_secrets_via_handler").await {
+            return;
+        }
         let (handler, mock_server, _audit) = setup_handler_with_mock().await;
 
         Mock::given(method("GET"))
@@ -568,12 +600,13 @@ mod tests {
         assert_eq!(secrets[0]["key"], "DB_PASSWORD");
         // Values must not be in the list output
         assert!(secrets[0].get("value").is_none());
-
-        cleanup_env();
     }
 
     #[tokio::test]
     async fn get_secret_via_handler() {
+        if run_with_isolated_token("get_secret_via_handler").await {
+            return;
+        }
         let (handler, mock_server, audit) = setup_handler_with_mock().await;
 
         Mock::given(method("GET"))
@@ -608,12 +641,13 @@ mod tests {
 
         let events = audit.events();
         assert!(events.len() >= 2);
-
-        cleanup_env();
     }
 
     #[tokio::test]
     async fn create_secret_via_handler() {
+        if run_with_isolated_token("create_secret_via_handler").await {
+            return;
+        }
         let (handler, mock_server, _audit) = setup_handler_with_mock().await;
 
         Mock::given(method("POST"))
@@ -642,12 +676,13 @@ mod tests {
 
         assert_eq!(result["status"], "created");
         assert_eq!(result["name"], "NEW_SECRET");
-
-        cleanup_env();
     }
 
     #[tokio::test]
     async fn update_secret_via_handler() {
+        if run_with_isolated_token("update_secret_via_handler").await {
+            return;
+        }
         let (handler, mock_server, _audit) = setup_handler_with_mock().await;
 
         Mock::given(method("PATCH"))
@@ -676,16 +711,18 @@ mod tests {
 
         assert_eq!(result["status"], "updated");
         assert_eq!(result["name"], "DB_PASSWORD");
-
-        cleanup_env();
     }
 
     #[tokio::test]
     async fn list_projects_auth_failure() {
+        if run_with_isolated_token("list_projects_auth_failure").await {
+            return;
+        }
         let (handler, mock_server, _audit) = setup_handler_with_mock().await;
 
         Mock::given(method("GET"))
             .and(path("/organizations/org-1/workspaces"))
+            .and(header("Authorization", "Bearer test-inf-token"))
             .respond_with(ResponseTemplate::new(401))
             .expect(1)
             .mount(&mock_server)
@@ -699,7 +736,5 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("authentication failed"));
-
-        cleanup_env();
     }
 }
