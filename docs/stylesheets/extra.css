@@ -1045,3 +1045,7 @@
   .op-workflow > li { gap: 1.3rem; }
   .op-example pre { padding: 0.8rem; font-size: 0.58rem; }
 }
+
+.op-home .op-scope-label { margin: 0 0 0.4rem; color: var(--op-text-dim); font: 0.62rem var(--md-code-font-family); }
+
+.op-home h2[id], .op-home #publish-a-github-actions-secret { scroll-margin-top: 5rem; }
