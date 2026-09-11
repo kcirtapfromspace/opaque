@@ -17,7 +17,7 @@ set -eu
 
 REPO="kcirtapfromspace/opaque"
 INSTALL_DIR="${OPAQUE_INSTALL:-/usr/local/bin}"
-BINARIES="opaqued opaque opaque-mcp opaque-approve-helper opaque-web"
+BINARIES="opaqued opaque opaque-mcp opaque-approve-helper opaque-approver opaque-evidence opaque-web"
 NO_VERIFY=0
 
 # --- flag parsing -----------------------------------------------------------
@@ -181,17 +181,24 @@ download_and_install() {
     printf 'Installing to %s...\n' "$INSTALL_DIR"
     mkdir -p "$INSTALL_DIR" || die "failed to create install directory: ${INSTALL_DIR}"
 
+    installed_binaries=""
     for bin in $BINARIES; do
         if [ -f "${tmpdir}/${bin}" ]; then
             install -m 755 "${tmpdir}/${bin}" "${INSTALL_DIR}/${bin}" \
                 || die "failed to install ${bin} to ${INSTALL_DIR}"
+            installed_binaries="${installed_binaries}${installed_binaries:+ }${bin}"
         else
             printf 'warning: binary %s not found in archive (may not be built for this platform)\n' "$bin" >&2
         fi
     done
 
+    [ -n "$installed_binaries" ] || die "archive contained no supported binaries"
     printf 'Successfully installed opaque %s to %s\n' "$version" "$INSTALL_DIR"
-    printf 'Binaries: %s\n' "$BINARIES"
+    printf 'Installed binaries: %s\n' "$installed_binaries"
+    if [ -d "${tmpdir}/Opaque Reviewer.app" ]; then
+        printf 'The shell installer installs CLI tools only. Install Opaque Reviewer.app from the verified macOS release archive using the reviewer guide.\n'
+        printf 'https://github.com/%s/blob/main/crates/opaque-approver/README.md\n' "$REPO"
+    fi
 }
 
 # --- checksum verification --------------------------------------------------
@@ -247,9 +254,21 @@ verify_cosign_signature() {
         fi
     fi
 
+    # A detached keyless signature also requires its published certificate.
+    # A signature that exists without its certificate is not a verified release.
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+        curl -fsSL -H "Authorization: token ${GITHUB_TOKEN}" \
+            -o "${dir}/${archive}.pem" "${base_url}.pem" 2>/dev/null \
+            || die "signature certificate unavailable; refusing cosign verification without it"
+    else
+        curl -fsSL -o "${dir}/${archive}.pem" "${base_url}.pem" 2>/dev/null \
+            || die "signature certificate unavailable; refusing cosign verification without it"
+    fi
+
     if cosign verify-blob \
         --signature "${dir}/${archive}.sig" \
-        --certificate-identity-regexp ".*github\\.com/${REPO}.*" \
+        --certificate "${dir}/${archive}.pem" \
+        --certificate-identity "https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/v${version}" \
         --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
         "${dir}/${archive}" 2>/dev/null; then
         printf 'Cosign signature verified.\n'

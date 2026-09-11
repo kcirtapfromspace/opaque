@@ -31,15 +31,16 @@ same `opaque` CLI a human does.
 An agent with arbitrary commands and unconstrained egress can exfiltrate
 anything it can read. Opaque doesn't claim otherwise. What it does claim:
 
-1. **Accidental disclosure is prevented by construction.** No operation
-   returns a plaintext secret to a CLI/MCP/web client (`REVEAL` doesn't
-   exist); typestate in `opaque-core` makes an unsanitized response a
-   compile error, not a runtime check someone can forget.
+1. **Brokered credentials stay in custody.** Operations use provider secrets
+   inside the broker and return their permitted result. Typestate in
+   `opaque-core` requires sanitization before returning operation responses;
+   it does not prove every possible output is harmless. MCP v2 additionally
+   constrains any disclosed projection to its signed result policy.
 2. **A malicious agent runtime is resisted, not just an honest one.** The
    daemon executes secret-using operations itself. Client classification
-   (human vs. agent) is audit-only, never a security gate; an agent can
-   present the same executable path and peer credentials a human's terminal
-   does. Sandboxed exec (Landlock/seccomp on Linux, Seatbelt on macOS)
+   can narrow policy, but cannot establish human identity: an agent can drive
+   the same executable a human's terminal does. Trusted identity, current
+   policy and the operation's required review remain necessary. Sandboxed exec (Landlock/seccomp on Linux, Seatbelt on macOS)
    bounds an agent-driven command when exec mode is used at all.
 3. **A compromised daemon-uid process is bounded by trust-domain
    separation**, not by this codebase alone. See [deployment](deployment.md).
@@ -52,21 +53,21 @@ together and runs the RPC dispatch loop.
 
 | Crate | Owns |
 |---|---|
-| `opaque-core` | Shared types: policy engine, operation/audit/proto, task manifests, tenant bindings, sealing, socket hygiene |
+| `opaque-core` | Shared types: policy engine, operation/audit/proto, task manifests, tenant bindings, sealing, socket hygiene, portable evidence contracts |
 | `opaqued` | Composition root: enclave, RPC dispatch, identity store, provisioning API, agent sessions |
 | `opaque-providers` | GitHub, GitLab, 1Password, Bitwarden, Vault, AWS. GCP/Azure/Doppler/Infisical are Cargo features `opaqued` enables by default, so all ten still ship in the daemon binary today |
 | `opaque-approval` | Device pairing, FIDO2, factor registry, native prompting, approval-server relay |
 | `opaque-native-approval` | Native review/auth shared by the daemon and the workstation approver |
-| `opaque-approve-helper` | Linux polkit review helper |
-| `opaque-approver` | Trusted paired-workstation full-manifest approver, a separate binary for a separate machine (`crates/opaque-approver/README.md`) |
+| `opaque-approve-helper` | Native full-review helper on macOS/Linux, plus Linux polkit approval |
+| `opaque-approver` | Trusted paired-workstation full-manifest approver, CLI and macOS reference-notice app on a separate trusted workstation ([setup](remote-approvals.md)) |
 | `opaque-sandbox` | Landlock/seccomp/Seatbelt isolation, execve hooks, composite secret-resolver dispatch |
-| `opaque-bounded-work` | The [task](bounded-work.md) ledger, SSH certificate execution, inference brokering |
+| `opaque-bounded-work` | The [task](bounded-work.md) and signed MCP invocation ledgers, SSH certificate execution, inference brokering |
 | `opaque-tenant` | Tenant custody boundary, delegated IdP provisioning types |
 | `opaque-federation-runtime` | [Federation](federation.md): signed policy bundles, SIEM export, posture attestation |
 | `opaque-mcp` | MCP server for Claude Code and other MCP clients |
 | `opaque-web` | Read-only local dashboard |
-| `opaque` | CLI client |
-| `opaque-showcase` | Demo/sales collateral (chat + metrics gateway). Excluded from `default-members`, so it never compiles into a plain build or release binary |
+| `opaque` | CLI client and offline `opaque-evidence` verifier/producer |
+| `opaque-showcase` | Demo/sales collateral (chat + metrics gateway). Excluded from default runtime builds; reused as a daemon test fixture through a dev dependency |
 
 ```mermaid
 flowchart LR
@@ -88,12 +89,13 @@ flowchart LR
 
 - **Trusted:** `opaqued`, the approval factor(s) and pairing/workstation
   keys, configured provider credentials, the audit chain's HMAC key.
-- **Same-uid, tamper-evident not tamper-proof, until trust-domain
-  enforcement is on:** by default the daemon's DB and config live at the
-  agent's own uid, so a compromised agent account can read the HMAC key or
-  rewrite the DB. `opaque audit verify` and startup verification detect
-  this; they don't prevent it. A dedicated service account or separate
-  container turns it into a hard guarantee. See [deployment](deployment.md).
+- **Key custody determines audit integrity:** by default the daemon's DB,
+  key and config live at the agent's own uid. An attacker who obtains the
+  HMAC key can forge history that passes local verification. A dedicated
+  service account or separate container denies the agent access to custody;
+  the daemon and its administrators remain trusted. A retained external
+  checkpoint/high-water mark is needed to detect an older intact snapshot.
+  See [deployment](deployment.md) and [evidence](evidence-checkpoints.md).
 - **Untrusted:** the LLM and its tool runtime, arbitrary agent-run commands,
   dependencies pulled in at run time.
 
@@ -102,8 +104,9 @@ flowchart LR
 Client identity is derived, never self-declared: Unix socket peer
 credentials (uid/gid/pid) plus executable path and SHA-256. (macOS Team-ID
 matching exists in policy but nothing populates it from a real code-signature
-check yet; treat it as inert.) Client type classification is **audit-only**.
-It never gates a decision, since an agent drives the same CLI a human does.
+check yet; treat it as inert.) Client type filters and safety classes can
+restrict policy matches. They do not prove a human is present: an agent can
+also drive the CLI, so classification cannot replace trusted identity or approval.
 
 Real authority comes from [identity](identity.md): a verified human (OIDC
 login, daemon-owned), an agent workload, or a config-declared service
@@ -161,7 +164,7 @@ manifest approved once as a whole, each action charging one slot exactly
 once. Three operation families today: repository/release work,
 application-evidence reads, host operations over signed SSH certs. See
 [bounded work](bounded-work.md) for the manifest, CLI, lifecycle, and what's
-production-ready versus fixture-validated.
+implemented versus fixture-validated.
 
 ## 9. Federation
 
@@ -173,13 +176,18 @@ material. See [federation](federation.md).
 
 ## 10. Audit
 
-Every operation is an append-only, HMAC-chained SQLite row: approval
-requested, granted or denied and by which factor, execution with its
-target and status, provider fetches (metadata only, never values). `opaque audit verify`
-detects edits, reordering, deletion, or tail truncation; the daemon
-re-verifies at startup and raises a CRITICAL alert on break. SIEM export
-(spool, webhook, TLS syslog) carries each record's sequence number and hash,
-so the exported stream verifies independently against the source database.
+Audit rows record approval decisions, observed execution outcomes and provider
+metadata without secret values. HMAC chaining and an authenticated retained head
+let `opaque audit verify` detect row/head tampering when the attacker lacks the
+key. Startup refuses invalid or unsupported legacy state. Retention removes a
+verified expired insertion-order prefix; it is not arbitrary row deletion.
+
+SIEM exports carry sequence numbers and record hashes. Portable producer-signed
+checkpoints additionally bind exact export bytes, enrollment and sequence range
+for verification without the broker HMAC key. Historical completeness, freshness
+and provider effects require additional evidence; an older intact snapshot can
+pass local checks. See [evidence checkpoints](evidence-checkpoints.md) for trust
+pins, retention receipts and the mandatory older-store upgrade procedure.
 
 ## 11. Providers
 
@@ -195,10 +203,14 @@ all four anyway, so today's shipped binary compiles in all ten regardless.
 | macOS | Apple Silicon (aarch64), Intel (x86_64) | Fully supported |
 | Linux | x86_64, aarch64 | Fully supported |
 
-macOS runs the daemon as a LaunchAgent in a GUI session (never a
-LaunchDaemon; native approval prompts require it). Linux runs it as a
-systemd user service in a graphical session with a polkit auth agent. See
-[deployment](deployment.md).
+These are the baseline distribution targets, not evidence that every new
+capability has been qualified on each target. The new reviewer app is macOS-only;
+source bundle checks do not establish signed/notarized installation, URL routing,
+accessibility or Intel qualification. See [reviewer setup](remote-approvals.md).
+
+Session-mode macOS uses a LaunchAgent and Linux a graphical systemd user service
+with a polkit auth agent. A split daemon uses a system service with out-of-band
+approval factors instead. See [deployment](deployment.md).
 
 ## Deferred
 

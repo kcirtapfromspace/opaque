@@ -1,13 +1,13 @@
 # Bounded agent work
 
 Beyond one-shot operations (`opaque execute`, `opaque github set-secret`),
-Opaque can hand an agent a **task**: an immutable manifest, approved once as
-a whole, executed once, with a receipt. **plan → review → approve → run →
-inspect**.
+Opaque can bind an agent's work to a **task**: an immutable manifest reviewed as a
+whole, with at most one attempt per action and an inspectable receipt.
+**plan → review → approve → run → inspect**.
 
-A task's authority is a **grant**: the manifest itself, pinned by content
-hash. A different manifest is a different task; scope can't change after
-planning.
+A content hash pins the planned manifest. Planning does not grant execution
+authority: approval, current policy, requester identity, expiry and revocation
+must still permit each dispatch. A changed manifest requires a new task and review.
 
 ---
 
@@ -16,13 +16,15 @@ planning.
 | Family | What it does | Action type | Enforcement |
 |---|---|---|---|
 | Repository & release work | Publish one GitHub secret, or dispatch one reviewed staging-release workflow | `PublishSecret`, `StagingRelease` | Pinned repo/workflow/branch/image digest; atomic single-use slot; provider reconciliation |
-| Application evidence | Run a fixed inference/query against a tenant-scoped source and disclose the result to an approved model | `Inference` | Tenant binding, source snapshot hash, model/profile hash, current-authority recheck before disclosure |
+| Application evidence | Run three fixed public-source completions against the tenant's configured model profile | `Inference` | Tenant binding, fixed source/prompt and model/profile hashes, bounded requested output, current-authority recheck before source disclosure |
 | Host operations | Run one fixed command against one host over a Vault-signed, short-lived SSH certificate | `SshHealth` | Exact host key + principal + command binding, session deadline, host-side revocation check |
 
-Every family shares one manifest shape (`opaque_core::task::TaskManifest`):
-`schema_version`, `title`, `expires_in_secs`, and a list of typed `actions`.
-Legacy and typed action kinds cannot be mixed in the same manifest, and a
-manifest holds at most 32 actions with a maximum total lifetime of one hour.
+Every family uses `opaque_core::task::TaskManifest`, with `schema_version`, `title`,
+`expires_in_secs`, typed `actions` and daemon-bound provider origin fields. Schema
+version 1 permits secret publishing, version 2 exactly one staging release, version
+3 three fixed inference requests, and version 4 one fixed SSH health check. Action
+families cannot be mixed. The overall maximum is 32 actions and one hour; a selected
+family can impose tighter action and lifetime limits.
 
 ## Planning a task
 
@@ -37,18 +39,34 @@ opaque task plan-ssh --title "Service health on approved host" --expires-in-secs
 opaque task plan-inference --title "Tenant public data inference" --expires-in-secs 600
 ```
 
-Planning resolves everything up front: repo IDs, workflow byte hashes,
-host keys, Vault CA and role bindings. The reviewer approves resolved
-facts, not names that could still resolve to something else at run time.
+Planning resolves the selected family's repository/workflow or trusted profile
+bindings and pins them for review. Execution revalidates the applicable repository,
+workflow, source/profile and authority constraints before dispatch; planning is not
+a promise that the external resource will remain unchanged.
 
 ## Reviewing and approving
 
-A planned task is reviewed as a whole, not action-by-action. Set
-`factors = ["paired_workstation"]` on the task's approval policy to require a
-trusted workstation approver (`crates/opaque-approver/README.md`): a
-separate machine with its own Ed25519 key that fetches the full manifest,
-verifies its hash and deadline, and signs only after native authentication.
-The agent never sees the review UI or holds the approver's key.
+A planned task is reviewed as a whole. The task and every action must require the
+same single complete-review factor: `local_bio` or `paired_workstation`. Unsupported
+or mixed factors fail closed. Local review uses the broker host's native helper.
+The current workstation protocol supports secret-publish, staging-release and fixed
+inference manifests. SSH health manifests require local native review; selecting a
+paired-workstation policy does not add that operation to the remote protocol.
+
+Set `factors = ["paired_workstation"]` in the applicable approval policies to use
+the [trusted workstation reviewer](https://github.com/kcirtapfromspace/opaque/blob/main/crates/opaque-approver/README.md).
+It fetches the complete broker-generated review over pinned TLS, verifies its hash
+and deadline, displays it for native review/authentication, rechecks the unchanged
+round and signs the exact decision. Run its custody and application in a trusted
+account/device the agent cannot control. A separate directory under the same
+agent-controlled account does not establish that boundary.
+
+The broker requires current reviewer eligibility when accepting and using the
+decision, including the enrolled device, principal, role and authority binding.
+Opening a notification or receiving a delivery acknowledgment grants no authority.
+A reviewer decision receipt proves the signed decision, not a biometric sensor
+event or completion of the provider operation. An ambiguous decision acknowledgment
+uses a read-only receipt lookup; the reviewer does not resend the decision or work.
 
 ```sh
 opaque task run <task-id>       # request approval, then execute once
@@ -62,37 +80,70 @@ opaque task list                # tasks owned by the authenticated caller
 
 ```
 Planned --run--> Running --> Completed
-                         \--> Partial   (some actions charged, ambiguous outcome)
+                         \--> Partial   (inspect each slot's state)
    \--revoke------------------> Revoked
    \--expire (deadline passes)-> Expired
 ```
 
-A slot charges **atomically before dispatch**, never after. Retry, restart,
-or an ambiguous provider response never refunds it; an uncertain outcome
-counts as consumed. `Partial` marks "charged, provider result unconfirmed"
-as its own state, rather than guessing success or failure.
+A slot charges **atomically before dispatch**. A charged slot can still be denied
+by a later fence before any provider effect; charge is consumption, not proof of a
+write. Errors, restart and ambiguous responses never refund the slot. A closed run
+cannot resume pending slots. Reserved slots found after interruption become unknown.
+
+`Completed` means every slot reached its action-specific `api_accepted` state.
+`Partial` can include unattempted, rejected or unknown slots; it does not mean every
+action was dispatched or every result is ambiguous. Inspect each slot and its
+action-specific receipt. GitHub API acceptance does not establish workflow success,
+deployment or service health. `reconcile` reads correlated provider evidence without
+dispatching again or restoring allowance. Revocation ordered before the final
+dispatch fence blocks that dispatch; it cannot recall an already authorized effect.
+
+## Relationship to third-party MCP
+
+The stdio MCP adapter exposes task planning and execution through `opaque_task_*`
+tools. Separately enrolled `opaque_mcp_tool_*` routes use their own signed registry,
+invocation UUID, approval and durable single-attempt ledger. They are not a new
+`TaskManifest` action family, and these schema version numbers are unrelated to MCP
+registry versions.
+
+Third-party MCP currently requires local native full review. A paired-workstation
+task receipt cannot authorize it. Registry v2 separates the upstream schema pin
+from admitted input and can disclose bounded integer/status fields selected by a
+signed projection; the values are not separately signed evidence. It does not permit
+arbitrary output passthrough. See [MCP integration](mcp-integration.md)
+and [qualifying one tool](mcp-qualified-tools.md) for input, disclosure and unknown
+effect semantics.
 
 ## Maturity
 
-Repository/release work is production-real: manifest format, atomic ledger,
-and `paired_workstation` approval are exercised end-to-end against real
-providers in tests and dogfooding.
+Repository/release manifests, durable consumption, native/paired-workstation gates
+and provider reconciliation have implemented runtime paths and isolated tests.
+Automated mock-provider and disposable fixtures validate mechanisms; they do not
+qualify a live repository's credentials, workflow protections, artifact, reviewer
+installation or business outcome. Qualify those controls for the selected deployment
+before treating a successful API response as evidence that the task achieved its goal.
 
-Host operations (`SshHealth`) are validated against disposable
-Vault/OpenSSH fixtures: real certs, real host-side guards, real
-revocation. See `examples/bounded-ssh/README.md` for the enforcement
-table. Provisioning a
-real host and running native approval against it is on you; `opaque task
-plan-ssh` doesn't do that part.
+Host operations (`SshHealth`) implement pinned certificate/host/profile checks and
+authenticated host evidence for one fixed health contract. Unit tests cover those
+bindings; the opt-in live Vault/SSH test needs separately provisioned disposable
+services. `opaque task plan-ssh` does not provision a host, configure its guard,
+install Vault or establish a successful native review ceremony.
 
-Application-evidence (`Inference`) tasks need a tenant-aware source
-adapter and a real IdP/resource-token contract; see
-[enterprise architecture](enterprise-architecture.md). Without that wired
-up, there's no source for the task to read.
+Application-evidence (`Inference`) currently uses three fixed synthetic public
+source prompts, with an explicitly configured tenant/model profile. It is not a
+general query connector or proof of tenant-aware private data access. Real private
+sources require a separately qualified source adapter, identity/resource-token
+contract and disclosure policy; see [enterprise architecture](enterprise-architecture.md).
+
+[Signed evidence checkpoints](evidence-checkpoints.md) let another recipient verify
+the producer and exact exported audit range without the audit HMAC key. They do not
+prove unobserved provider effects, restore task/MCP authority, recover lost revocation
+history or refund consumed unknown attempts. Retained high-water references and
+fenced authority recovery remain separate responsibilities.
 
 ## Related docs
 
 - [Identity](identity.md): the delegation token an agent session presents when planning a task on a human's behalf
-- Trusted workstation approvals (`crates/opaque-approver/README.md`): the `paired_workstation` full-manifest review flow
+- [Trusted workstation approvals](https://github.com/kcirtapfromspace/opaque/blob/main/crates/opaque-approver/README.md): installation, enrollment and the `paired_workstation` full-manifest review flow
 - [HashiCorp Vault](vault.md): the SSH certificate signer for `SshHealth` actions
 - [Enterprise architecture](enterprise-architecture.md): tenant/IdP wiring for `Inference` actions

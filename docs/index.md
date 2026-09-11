@@ -22,7 +22,7 @@ Execute → Sanitize → Audit; multi-step work adds plan → review → approve
 run → inspect.
 
 Opaque is not another secrets manager or agent framework. It decides what
-may pass between the two you already have, and proves what did. Security
+may pass between the two you already have, and records observed outcomes. Security
 owns policy and custody; developers and agents finish the work.
 
 - **Bounded agent work**: a pinned task manifest approved once as a whole;
@@ -34,8 +34,9 @@ owns policy and custody; developers and agents finish the work.
   second device (Ed25519), FIDO2 hardware keys and passkeys, and a
   trusted-workstation full-manifest reviewer for tasks, all verified
   daemon-side.
-- **Tamper-evident audit**: an HMAC hash chain in SQLite, verified with
-  `opaque audit verify`.
+- **Tamper-evident audit**: an HMAC chain with an authenticated retained head,
+  verified with `opaque audit verify`; [portable checkpoints](evidence-checkpoints.md)
+  support independent export verification.
 - **Sandboxed execution**: bubblewrap, Landlock, and seccomp applied to exec
   children; typestate-enforced response sanitization.
 - **Identity substrate**: OIDC human login (PKCE, daemon-owned), Ed25519
@@ -50,6 +51,11 @@ Install: `brew install kcirtapfromspace/tap/opaque`, the shell installer, or
 `cargo install`. Licensed BUSL-1.1. New here? Start with the
 [tutorial](tutorial.md). Then: [getting started](getting-started.md), the
 [policy engine](policy.md), [bounded agent work](bounded-work.md),
-[MCP integration](mcp-integration.md), [identity](identity.md),
+[MCP integration](mcp-integration.md), [qualified MCP tools](mcp-qualified-tools.md),
+[workstation review](remote-approvals.md), [identity](identity.md),
 [deployment](deployment.md), [federation](federation.md), and
 [architecture](architecture.md).
+
+The new reviewer app, MCP v2 projections and portable checkpoints are unreleased
+source capabilities. See [getting started](getting-started.md) before choosing a
+tagged package or upgrading an existing audit store.

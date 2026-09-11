@@ -4,7 +4,7 @@ use std::io::Read;
 use std::path::Path;
 
 use opaque_mcp::gateway_contract::{
-    MAX_CALL_BYTES, MAX_REGISTRY_BYTES, PREPARED_CONTRACT_VERSION, Registry,
+    MAX_CALL_BYTES, MAX_CATALOG_BYTES, MAX_REGISTRY_BYTES, Registry,
 };
 use serde_json::json;
 
@@ -30,15 +30,18 @@ fn run(args: &[String]) -> Result<(), String> {
     if args == ["--help"] || args == ["-h"] {
         println!("Usage: opaque-mcp-contract validate REGISTRY.json");
         println!("       opaque-mcp-contract prepare REGISTRY.json CALL.json");
+        println!("       opaque-mcp-contract qualify REGISTRY.json CATALOG.json");
         println!("Offline contract checks only; no network, authorization or execution.");
         return Ok(());
     }
     let (command, registry_path, call_path) = match args {
         [command, registry] if command == "validate" => (command, registry, None),
-        [command, registry, call] if command == "prepare" => (command, registry, Some(call)),
+        [command, registry, call] if matches!(command.as_str(), "prepare" | "qualify") => {
+            (command, registry, Some(call))
+        }
         _ => {
             return Err(
-                "expected validate REGISTRY.json or prepare REGISTRY.json CALL.json".into(),
+                "expected validate REGISTRY.json, prepare REGISTRY.json CALL.json, or qualify REGISTRY.json CATALOG.json".into(),
             );
         }
     };
@@ -48,6 +51,22 @@ fn run(args: &[String]) -> Result<(), String> {
     let output = if command == "validate" {
         json!({"mode":"offline_contract", "registry_valid":true,
             "route_count":registry.route_count(), "runtime_gateway_enabled":false})
+    } else if command == "qualify" {
+        let bytes = read_bounded(
+            Path::new(call_path.expect("qualify includes catalog")),
+            MAX_CATALOG_BYTES,
+        )?;
+        let routes = registry
+            .qualify_catalog(&bytes)
+            .map_err(|error| error.to_string())?;
+        let compatible = routes.iter().all(|route| route.compatible);
+        let output = json!({"mode":"offline_contract", "scope":"catalog_pin_match_only", "compatible":compatible, "routes":routes, "runtime_gateway_enabled":false});
+        println!("{output}");
+        return if compatible {
+            Ok(())
+        } else {
+            Err("catalog qualification failed; no call authorized or executed".into())
+        };
     } else {
         let bytes = read_bounded(
             Path::new(call_path.expect("prepare includes call")),
@@ -58,7 +77,7 @@ fn run(args: &[String]) -> Result<(), String> {
             .map_err(|error| error.to_string())?;
         json!({"mode":"offline_contract", "status":"prepared_not_authorized",
             "runtime_gateway_enabled":false, "route":call.route().alias,
-            "prepared_contract_version":PREPARED_CONTRACT_VERSION, "action_digest":call.action_digest(), "output_policy":call.route().output_policy})
+            "prepared_contract_version":call.route().prepared_contract_version(), "action_digest":call.action_digest(), "output_policy":call.route().output_policy})
     };
     println!("{output}");
     Ok(())

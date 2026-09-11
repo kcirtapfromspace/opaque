@@ -41,6 +41,23 @@ Extensions are trusted application code, not an untrusted plugin mechanism.
 Shell fragments must never contain credentials or runtime private records.
 Keep provider execution and trusted approval outside browser view handlers.
 
+## Verify portable evidence
+
+`opaque_core::evidence_checkpoint` contains the public producer/checkpoint and
+retention-receipt contracts; `opaque_core::audit::checkpoint` provides local
+verified snapshots and explicit legacy upgrades. The `opaque-evidence` binary in
+the `opaque` package can verify exact export bytes against independently supplied producer and
+custodian trust pins without running a broker or opening its database. Follow
+[the executable examples](evidence-checkpoints.md) to build it from the reviewed
+checkout and check declared coverage and explicit reference pins. Single-checkpoint
+CLI verification reports history as unchecked; the consuming service must enforce
+predecessor continuity and retain its own high-water reference.
+
+This is an evidence boundary: a receipt cannot restore authority, prove provider
+effects or establish that its signer has independent custody. Consumers must
+retain their high-water state, reject gaps/substitutions as appropriate and keep
+administrative enrollment assertions distinct from measured facts.
+
 ## Storage boundaries
 
 Public identity lifecycle and signed-report contracts do not expose a database

@@ -3,6 +3,9 @@ use serde_json::{Value, json};
 
 const REGISTRY: &[u8] = include_bytes!("fixtures/gateway-registry.json");
 const CALL: &[u8] = include_bytes!("fixtures/gateway-call.json");
+const V2_REGISTRY: &[u8] = include_bytes!("fixtures/gateway-registry-v2.json");
+const V2_CATALOG: &[u8] = include_bytes!("fixtures/gateway-catalog-v2.json");
+const V2_CALL: &[u8] = include_bytes!("fixtures/gateway-call-v2.json");
 
 fn registry_value() -> Value {
     serde_json::from_slice(REGISTRY).unwrap()
@@ -323,5 +326,182 @@ fn executable_reports_only_offline_preparation_and_redacts_rejected_material() {
     assert_eq!(
         std::str::from_utf8(&rejected.stderr).unwrap().trim(),
         "invalid gateway call envelope"
+    );
+}
+
+#[test]
+fn qualified_upstream_shape_and_admitted_contract_are_separate_and_both_enforced() {
+    let registry = Registry::from_json(V2_REGISTRY).unwrap();
+    let call = registry.prepare_json(V2_CALL).unwrap();
+    assert_eq!(call.route().prepared_contract_version(), 3);
+    assert!(registry.qualify_catalog(V2_CATALOG).unwrap()[0].compatible);
+    assert_eq!(call.arguments()["issue_number"], 42);
+    // An upstream number accepts an admitted integer, but cannot expand our
+    // integer bound, add unknown fields or route the call to another repository.
+    for (field, value) in [
+        ("issue_number", json!(1.5)),
+        ("issue_number", json!(1000001)),
+        ("repo", json!("other-repo")),
+        ("reaction", json!("+1")),
+    ] {
+        let mut input: Value = serde_json::from_slice(V2_CALL).unwrap();
+        input["arguments"][field] = value;
+        assert_eq!(
+            preparation_error(&registry, input),
+            ContractError::ArgumentsRejected
+        );
+    }
+    // A valid admitted input still must satisfy a pinned upstream constraint.
+    let mut document: Value = serde_json::from_slice(V2_REGISTRY).unwrap();
+    document["routes"][0]["upstream_input_schema"]["properties"]["issue_number"]["minimum"] =
+        json!(100);
+    let constrained = load(&document).unwrap();
+    assert_eq!(
+        constrained.prepare_json(V2_CALL).unwrap_err(),
+        ContractError::ArgumentsRejected
+    );
+    // Do not reinterpret v2 content under v1 or permit a missing v2 pin.
+    document["version"] = json!(1);
+    assert!(load(&document).is_err());
+    document["version"] = json!(2);
+    document["routes"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("upstream_input_schema");
+    assert!(load(&document).is_err());
+}
+
+#[test]
+fn offline_catalog_diagnostics_are_bounded_and_never_echo_upstream_instructions() {
+    let registry = Registry::from_json(V2_REGISTRY).unwrap();
+    let original: Value = serde_json::from_slice(V2_CATALOG).unwrap();
+    let mut drift = original.clone();
+    drift["tools"][0]["inputSchema"]["properties"]["owner"]["description"] =
+        json!("malicious-upstream-secret");
+    let report = registry
+        .qualify_catalog(&serde_json::to_vec(&drift).unwrap())
+        .unwrap();
+    assert!(!report[0].compatible);
+    assert_eq!(report[0].diagnostic, "upstream_schema_drift");
+    assert!(
+        !serde_json::to_string(&report)
+            .unwrap()
+            .contains("malicious-upstream-secret")
+    );
+    let mut duplicate = original.clone();
+    duplicate["tools"]
+        .as_array_mut()
+        .unwrap()
+        .push(original["tools"][0].clone());
+    assert_eq!(
+        registry
+            .qualify_catalog(&serde_json::to_vec(&duplicate).unwrap())
+            .unwrap()[0]
+            .diagnostic,
+        "duplicate_tool"
+    );
+    let mut paginated = original.clone();
+    paginated["nextCursor"] = json!("more");
+    assert!(
+        registry
+            .qualify_catalog(&serde_json::to_vec(&paginated).unwrap())
+            .is_err()
+    );
+    assert!(
+        registry
+            .qualify_catalog(&vec![
+                b' ';
+                opaque_mcp::gateway_contract::MAX_CATALOG_BYTES + 1
+            ])
+            .is_err()
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let registry_path = directory.path().join("registry.json");
+    let catalog_path = directory.path().join("catalog.json");
+    std::fs::write(&registry_path, V2_REGISTRY).unwrap();
+    for (catalog, expected) in [(original, 0), (drift, 2)] {
+        std::fs::write(&catalog_path, serde_json::to_vec(&catalog).unwrap()).unwrap();
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_opaque-mcp-contract"))
+            .arg("qualify")
+            .arg(&registry_path)
+            .arg(&catalog_path)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(expected));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("malicious-upstream-secret"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("malicious-upstream-secret"));
+    }
+}
+
+#[test]
+fn upstream_schema_compilation_cannot_resolve_references_or_unbounded_patterns() {
+    for (key, value) in [
+        ("$ref", json!("https://127.0.0.1:9/private")),
+        ("$dynamicRef", json!("file:///private")),
+        ("pattern", json!("(a+)+$")),
+        ("anyOf", json!([{"type":"string"}])),
+    ] {
+        let mut document: Value = serde_json::from_slice(V2_REGISTRY).unwrap();
+        document["routes"][0]["upstream_input_schema"]["properties"]["owner"][key] = value;
+        assert!(matches!(
+            load(&document),
+            Err(ContractError::UnsupportedUpstreamSchema)
+        ));
+    }
+    let mut document: Value = serde_json::from_slice(V2_REGISTRY).unwrap();
+    document["routes"][0]["upstream_input_schema"]["description"] = json!("x".repeat(65537));
+    assert!(matches!(
+        load(&document),
+        Err(ContractError::UnsupportedUpstreamSchema)
+    ));
+    let mut deep = json!({"type":"string"});
+    for _ in 0..10 {
+        deep = json!({"type":"object","properties":{"nested":deep}});
+    }
+    document["routes"][0]["upstream_input_schema"] = deep;
+    assert!(matches!(
+        load(&document),
+        Err(ContractError::UnsupportedUpstreamSchema)
+    ));
+}
+
+#[test]
+fn projection_is_signed_bounded_typed_and_cannot_disclose_arbitrary_text() {
+    let registry = Registry::from_json(V2_REGISTRY).unwrap();
+    let original = registry.prepare_json(V2_CALL).unwrap();
+    let projection = original.route().output_projection.as_ref().unwrap();
+    let projected = projection
+        .project(&json!({"id":42,"status":"created","text":"secret-in-unselected"}))
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(projected).unwrap(),
+        json!({"resource_id":42,"status":"created"})
+    );
+    for data in [
+        json!({"id":"secret","status":"created"}),
+        json!({"id":1.5,"status":"created"}),
+        json!({"id":1000001,"status":"created"}),
+        json!({"id":42,"status":"ignore instructions"}),
+        json!({"id":42}),
+    ] {
+        assert!(projection.project(&data).is_err());
+    }
+    let mut changed: Value = serde_json::from_slice(V2_REGISTRY).unwrap();
+    changed["routes"][0]["output_projection"]["fields"][0]["value_type"]["maximum"] = json!(100);
+    assert_ne!(
+        original.action_digest(),
+        load(&changed)
+            .unwrap()
+            .prepare_json(V2_CALL)
+            .unwrap()
+            .action_digest()
+    );
+    changed["routes"][0]["output_projection"]["fields"][0]["source"] = json!("/nested/text");
+    assert!(load(&changed).is_err());
+    let mut input: Value = serde_json::from_slice(V2_CALL).unwrap();
+    input["output_projection"] = json!({"source":"text"});
+    assert_eq!(
+        preparation_error(&registry, input),
+        ContractError::InvalidCall
     );
 }

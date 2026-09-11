@@ -1,5 +1,6 @@
 [package]
 name = "opaque"
+default-run = "opaque"
 version.workspace = true
 edition = "2024"
 publish = false
@@ -12,6 +13,7 @@ homepage.workspace = true
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
 getrandom = { workspace = true }
+zeroize = { workspace = true }
 libc = { workspace = true }
 opaque-core = { path = "../opaque-core" }
 bytes = { workspace = true }

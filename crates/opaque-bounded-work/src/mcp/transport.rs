@@ -1,7 +1,7 @@
 //! Bounded MCP 2025-06-18 Streamable HTTP subset. One connection destination,
 //! one tool invocation, no redirects/retries/proxies or server-initiated work.
 use super::unavailable;
-use opaque_core::mcp::{PROTOCOL_VERSION, PreparedCall};
+use opaque_core::mcp::{OutputPolicy, PROTOCOL_VERSION, PreparedCall};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -9,12 +9,14 @@ use std::{
     time::Duration,
 };
 
-#[derive(Debug)]
 pub struct Outcome {
     pub state: &'static str,
     pub code: &'static str,
     pub response_sha256: Option<String>,
     pub response_bytes: Option<usize>,
+    pub output: Option<std::collections::BTreeMap<String, Value>>,
+    pub disclosure: Option<&'static str>,
+    pub dispatched: bool,
 }
 impl Outcome {
     pub fn rejected(code: &'static str) -> Self {
@@ -23,6 +25,9 @@ impl Outcome {
             code,
             response_sha256: None,
             response_bytes: None,
+            output: None,
+            disclosure: None,
+            dispatched: false,
         }
     }
     fn unknown() -> Self {
@@ -31,6 +36,9 @@ impl Outcome {
             code: "outcome_unknown",
             response_sha256: None,
             response_bytes: None,
+            output: None,
+            disclosure: None,
+            dispatched: true,
         }
     }
 }
@@ -285,7 +293,7 @@ where
             .iter()
             .filter(|tool| tool.get("name") == Some(&json!(route.tool)))
             .collect();
-        if matches.len() != 1 || matches[0].get("inputSchema") != Some(&route.input_schema) {
+        if matches.len() != 1 || matches[0].get("inputSchema") != Some(route.upstream_schema()) {
             return Err(unavailable());
         }
         let message = json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":route.tool,"arguments":call.arguments()}});
@@ -316,6 +324,23 @@ where
         {
             return Err(unavailable());
         }
+        let is_error = result.get("isError") == Some(&json!(true));
+        let (output, disclosure) = if route.output_policy == OutputPolicy::TypedFields {
+            if is_error {
+                (None, Some("withheld_tool_error"))
+            } else {
+                match route
+                    .output_projection
+                    .as_ref()
+                    .and_then(|p| p.project(result.get("structuredContent")?).ok())
+                {
+                    Some(fields) => (Some(fields), Some("projected")),
+                    None => (None, Some("withheld_invalid_projection")),
+                }
+            }
+        } else {
+            (None, None)
+        };
         Ok(Outcome {
             state: if result.get("isError") == Some(&json!(true)) {
                 "rejected"
@@ -329,6 +354,9 @@ where
             },
             response_sha256: Some(format!("{:x}", Sha256::digest(&bytes))),
             response_bytes: Some(bytes.len()),
+            output,
+            disclosure,
+            dispatched: true,
         })
     };
     match tokio::time::timeout(Duration::from_millis(call.route().timeout_ms), exchange).await {

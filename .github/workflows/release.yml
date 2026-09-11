@@ -52,13 +52,13 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build release binaries
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 
       - name: Strip binaries
         run: |
-          for bin in opaqued opaque opaque-mcp opaque-approve-helper; do
+          for bin in opaqued opaque opaque-mcp opaque-approve-helper opaque-approver opaque-evidence opaque-web; do
             strip "target/${{ matrix.target }}/release/$bin" 2>/dev/null || true
           done
 
@@ -67,6 +67,7 @@ jobs:
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY || secrets.APPLE_TEAM_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           # Import certificate to keychain
@@ -81,10 +82,23 @@ jobs:
           security list-keychain -d user -s "$KEYCHAIN_PATH"
 
           # Sign each binary
-          for bin in opaqued opaque opaque-mcp opaque-approve-helper opaque-web; do
-            codesign --force --options runtime --sign "$APPLE_TEAM_ID" \
+          for bin in opaqued opaque opaque-mcp opaque-approve-helper opaque-approver opaque-evidence opaque-web; do
+            codesign --force --options runtime --sign "$APPLE_SIGNING_IDENTITY" \
               "target/${{ matrix.target }}/release/$bin"
           done
+
+      - name: Package signed macOS reviewer application
+        if: contains(matrix.target, 'apple-darwin')
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY || secrets.APPLE_TEAM_ID }}
+        run: |
+          ARCH="arm64"
+          if [[ "${{ matrix.target }}" == x86_64-* ]]; then ARCH="x86_64"; fi
+          python3 scripts/package-reviewer-macos.py \
+            --binary-dir "target/${{ matrix.target }}/release" \
+            --output "target/${{ matrix.target }}/release/Opaque Reviewer.app" \
+            --architecture "$ARCH" --version "${GITHUB_REF_NAME#v}" \
+            --sign-identity "$APPLE_SIGNING_IDENTITY"
 
       - name: Notarize macOS binaries
         if: contains(matrix.target, 'apple-darwin')
@@ -94,23 +108,29 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           # notarytool only accepts .zip/.pkg/.dmg, not the .tar.gz we ship —
-          # zip the signed binaries just for submission. Standalone binaries
+          # Submit the signed application together with standalone binaries.
+          # The app receives a stapled ticket; standalone binaries
           # can't be stapled (that only applies to .app/.pkg/.dmg), so
           # Gatekeeper looks the ticket up online by CDHash on first run;
           # the ticket applies regardless of which archive format we later
           # distribute the same signed bytes in.
           NOTARIZE_ZIP="notarize-${{ matrix.target }}.zip"
+          ditto -c -k --keepParent "target/${{ matrix.target }}/release/Opaque Reviewer.app" "$NOTARIZE_ZIP"
           zip -j "$NOTARIZE_ZIP" \
             target/${{ matrix.target }}/release/opaqued \
             target/${{ matrix.target }}/release/opaque \
             target/${{ matrix.target }}/release/opaque-mcp \
             target/${{ matrix.target }}/release/opaque-approve-helper \
+            target/${{ matrix.target }}/release/opaque-approver \
+            target/${{ matrix.target }}/release/opaque-evidence \
             target/${{ matrix.target }}/release/opaque-web
           xcrun notarytool submit "$NOTARIZE_ZIP" \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_ID_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
             --wait
+          xcrun stapler staple "target/${{ matrix.target }}/release/Opaque Reviewer.app"
+          xcrun stapler validate "target/${{ matrix.target }}/release/Opaque Reviewer.app"
           rm -f "$NOTARIZE_ZIP"
 
       - name: Create tarball
@@ -118,9 +138,11 @@ jobs:
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
           ARCHIVE="opaque-${TAG#v}-${{ matrix.target }}.tar.gz"
+          EXTRAS=()
+          if [[ "${{ matrix.target }}" == *apple-darwin ]]; then EXTRAS+=("Opaque Reviewer.app"); fi
           tar czf "$ARCHIVE" \
             -C "target/${{ matrix.target }}/release" \
-            opaqued opaque opaque-mcp opaque-approve-helper opaque-web
+            opaqued opaque opaque-mcp opaque-approve-helper opaque-approver opaque-evidence opaque-web "${EXTRAS[@]}"
           echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
 
       - name: Generate SHA256 checksum

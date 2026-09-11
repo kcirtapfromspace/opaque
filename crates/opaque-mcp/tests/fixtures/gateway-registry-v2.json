@@ -1,0 +1,118 @@
+{
+  "version": 2,
+  "routes": [
+    {
+      "protocol_version": "2025-06-18",
+      "alias": "issue_note",
+      "server_id": "synthetic_github_shape",
+      "endpoint": {
+        "host": "mcp.example.com",
+        "path": "/mcp"
+      },
+      "tool": "add_issue_comment",
+      "credential_binding": "fixture_only",
+      "input_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "owner": {
+            "type": "string",
+            "maxLength": 64,
+            "enum": [
+              "example-org"
+            ]
+          },
+          "repo": {
+            "type": "string",
+            "maxLength": 64,
+            "enum": [
+              "disposable-pilot"
+            ]
+          },
+          "issue_number": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000000
+          },
+          "body": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "required": [
+          "owner",
+          "repo",
+          "issue_number",
+          "body"
+        ]
+      },
+      "upstream_input_schema": {
+        "type": "object",
+        "properties": {
+          "owner": {
+            "type": "string",
+            "description": "Repository owner"
+          },
+          "repo": {
+            "type": "string",
+            "description": "Repository name"
+          },
+          "issue_number": {
+            "type": "number",
+            "description": "Issue number"
+          },
+          "body": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Comment body"
+          },
+          "reaction": {
+            "type": "string",
+            "enum": [
+              "+1",
+              "-1",
+              "laugh"
+            ]
+          },
+          "comment_id": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "owner",
+          "repo",
+          "issue_number"
+        ]
+      },
+      "output_policy": "typed_fields",
+      "output_projection": {
+        "fields": [
+          {
+            "source": "id",
+            "name": "resource_id",
+            "value_type": {
+              "kind": "integer_id",
+              "maximum": 1000000
+            }
+          },
+          {
+            "source": "status",
+            "name": "status",
+            "value_type": {
+              "kind": "status",
+              "values": [
+                "created",
+                "queued"
+              ]
+            }
+          }
+        ]
+      },
+      "max_request_bytes": 4096,
+      "max_response_bytes": 4096,
+      "timeout_ms": 1000
+    }
+  ]
+}

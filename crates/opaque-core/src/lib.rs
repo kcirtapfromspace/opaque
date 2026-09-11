@@ -4,6 +4,7 @@ pub mod audit;
 pub mod bundle;
 pub mod capability;
 pub mod enclave_facade;
+pub mod evidence_checkpoint;
 pub mod execve_map;
 pub mod identity;
 pub mod identity_lifecycle;

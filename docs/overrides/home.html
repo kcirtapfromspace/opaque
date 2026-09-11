@@ -23,7 +23,7 @@
       <div class="op-wrap op-hero__grid">
         <div class="op-hero__copy">
           <p class="op-eyebrow"><span class="op-brand-glyph" aria-hidden="true"></span> Authority, by design.</p>
-          <h1>
+          <h1 id="opaque">
             Secrets stay <span class="op-redacted">secret</span>.<br>
             Agents stay powerful.
           </h1>
@@ -335,12 +335,13 @@
         </div>
         <div class="op-modes">
           <div class="op-mode">
-            <h3>Session mode <small>tamper-evident</small></h3>
+            <h3>Session mode <small>shared user custody</small></h3>
             <p>
               The default. The daemon runs as your own user, inside your GUI session, and
               approvals are local: Touch&nbsp;ID on macOS, polkit on Linux. A process
-              sharing your uid could read the chain key and rewrite state. You would
-              detect it after the fact with <code>opaque audit verify</code>.
+              sharing your uid could obtain the chain key and forge history that passes
+              <code>opaque audit verify</code>. Separate custody is needed to resist
+              that attacker.
             </p>
             <samp>~/.opaque, LaunchAgent / systemd --user</samp>
           </div>
@@ -448,7 +449,7 @@
       <div class="op-wrap">
         <div class="op-kicker">
           <h2>Install</h2>
-          <p>Three binaries: the trusted daemon, the CLI, and the MCP server.</p>
+          <p>Start with the trusted daemon, the CLI, and the MCP server.</p>
         </div>
         <div class="op-install">
           <div class="op-install__item">
@@ -468,8 +469,8 @@
           <div class="op-install__item">
             <h3>Cargo (from source)</h3>
             <div class="op-install__code">
-              <code>cargo install --git https://github.com/kcirtapfromspace/opaque.git opaque opaqued opaque-mcp</code>
-              <button class="op-copy" type="button" data-copy="cargo install --git https://github.com/kcirtapfromspace/opaque.git opaque opaqued opaque-mcp">Copy</button>
+              <code>cargo install --locked --git https://github.com/kcirtapfromspace/opaque.git opaque opaqued opaque-mcp opaque-approve-helper</code>
+              <button class="op-copy" type="button" data-copy="cargo install --locked --git https://github.com/kcirtapfromspace/opaque.git opaque opaqued opaque-mcp opaque-approve-helper">Copy</button>
             </div>
           </div>
         </div>
@@ -478,6 +479,13 @@
           <code>opaque</code> is the CLI; <code>opaque-mcp</code> is the MCP server for
           Claude Code. Service definitions for launchd, systemd, docker-compose, and
           Kubernetes ship in the repository's <code>deploy/</code> directory.
+        </p>
+        <p class="op-install-notes">
+          New source capabilities: <a href="{{ 'remote-approvals/' | url }}">workstation reviewer</a>,
+          <a href="{{ 'mcp-qualified-tools/' | url }}">signed MCP contracts</a>, and
+          <a href="{{ 'evidence-checkpoints/' | url }}">portable evidence checkpoints</a>.
+          These are unreleased; tagged packages may omit them. Follow
+          <a href="{{ 'getting-started/' | url }}">source build and audit upgrade instructions</a>.
         </p>
         <p class="op-install-notes">
           Start with a preset, <code>opaque init --preset github-secrets</code>,

@@ -86,6 +86,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run native workspace tests
         run: cargo test --locked --workspace --all-features
+      - name: Verify native reviewer package without installing
+        run: |
+          cargo build --locked -p opaque-approver -p opaque-approve-helper
+          reviewer_pkg_dir=$(mktemp -d "${RUNNER_TEMP}/opaque-reviewer.XXXXXX")
+          trap 'rm -rf "$reviewer_pkg_dir"' EXIT
+          python3 scripts/package-reviewer-macos.py --binary-dir target/debug --output "$reviewer_pkg_dir/OpaqueReviewer.app" --architecture "$(uname -m)" --ad-hoc
+          "$reviewer_pkg_dir/OpaqueReviewer.app/Contents/MacOS/OpaqueReviewer" --self-test
+          codesign --verify --deep --strict "$reviewer_pkg_dir/OpaqueReviewer.app"
 
   python:
     name: Python protocol, evidence and operator tests

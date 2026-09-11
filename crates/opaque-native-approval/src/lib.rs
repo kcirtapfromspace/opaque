@@ -182,11 +182,53 @@ fn task_review_text(reason: &str) -> Result<(String, String), ApprovalError> {
 /// then authenticate a short reason bound to the same reviewed description.
 /// Review confirmation never substitutes for the configured native factor.
 pub async fn prompt_task(reason: &str) -> Result<PromptOutcome, ApprovalError> {
+    prompt_task_inner(reason, None).await
+}
+
+/// A remote challenge has an absolute deadline. Never begin authentication
+/// after it, and bound both review and authentication by remaining time.
+pub async fn prompt_task_until(
+    reason: &str,
+    expires_at: i64,
+) -> Result<PromptOutcome, ApprovalError> {
+    prompt_task_inner(reason, Some(expires_at)).await
+}
+
+fn remaining(
+    expires_at: Option<i64>,
+    maximum_secs: u64,
+) -> Result<std::time::Duration, ApprovalError> {
+    let maximum = std::time::Duration::from_secs(maximum_secs);
+    let Some(expiry) = expires_at else {
+        return Ok(maximum);
+    };
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| ApprovalError::Unavailable)?;
+    let deadline = std::time::Duration::from_secs(
+        u64::try_from(expiry).map_err(|_| ApprovalError::Unavailable)?,
+    );
+    let remaining = deadline
+        .checked_sub(elapsed)
+        .filter(|d| !d.is_zero())
+        .ok_or_else(|| {
+            ApprovalError::Failed(
+                "approval expired; no decision sent, request a fresh review".into(),
+            )
+        })?;
+    Ok(remaining.min(maximum))
+}
+
+async fn prompt_task_inner(
+    reason: &str,
+    expires_at: Option<i64>,
+) -> Result<PromptOutcome, ApprovalError> {
     let (review, digest) = task_review_text(reason)?;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
+        let deadline = remaining(expires_at, 90)?;
         let helper = find_approve_helper()?;
-        if !run_task_review(&helper, &review, std::time::Duration::from_secs(90)).await? {
+        if !run_task_review(&helper, &review, deadline).await? {
             return Ok(PromptOutcome::Denied);
         }
         let short_reason = format!(
@@ -194,7 +236,25 @@ pub async fn prompt_task(reason: &str) -> Result<PromptOutcome, ApprovalError> {
             &digest[..16]
         );
         println!("opaque-review-stage: authenticating");
-        let outcome = prompt(&short_reason).await;
+        let timeout = remaining(expires_at, 60)?;
+        #[cfg(target_os = "macos")]
+        let outcome =
+            tokio::task::spawn_blocking(move || prompt_macos_blocking_for(&short_reason, timeout))
+                .await
+                .map_err(|_| ApprovalError::Unavailable)?
+                .map(|approved| {
+                    if approved {
+                        PromptOutcome::Approved { account: None }
+                    } else {
+                        PromptOutcome::Denied
+                    }
+                });
+        #[cfg(target_os = "linux")]
+        let outcome = if expires_at.is_some() {
+            prompt_linux_bounded(&short_reason, timeout).await
+        } else {
+            prompt(&short_reason).await
+        };
         if outcome.is_err() {
             eprintln!("opaque-review-stage: authentication-failed");
         }
@@ -221,8 +281,15 @@ async fn prompt_macos(reason: &str) -> Result<bool, ApprovalError> {
 
 #[cfg(target_os = "macos")]
 fn prompt_macos_blocking(reason: &str) -> Result<bool, ApprovalError> {
+    prompt_macos_blocking_for(reason, std::time::Duration::from_secs(60))
+}
+
+#[cfg(target_os = "macos")]
+fn prompt_macos_blocking_for(
+    reason: &str,
+    timeout: std::time::Duration,
+) -> Result<bool, ApprovalError> {
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
 
     use block2::RcBlock;
     use objc2::runtime::Bool;
@@ -262,11 +329,52 @@ fn prompt_macos_blocking(reason: &str) -> Result<bool, ApprovalError> {
     // US-009: Reduced from 120s to 60s. The approval semaphore in the enclave
     // is released via future cancellation if the client disconnects, so a
     // shorter timeout here limits how long an orphaned prompt can block.
-    match rx.recv_timeout(Duration::from_secs(60)) {
+    match rx.recv_timeout(timeout) {
         Ok(ok) => Ok(ok),
-        Err(e) => Err(ApprovalError::Failed(format!(
-            "approval timed out or failed: {e}"
-        ))),
+        Err(e) => {
+            unsafe {
+                ctx.invalidate();
+            }
+            Err(ApprovalError::Failed(format!(
+                "approval timed out or failed: {e}"
+            )))
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn prompt_linux_bounded(
+    reason: &str,
+    timeout: std::time::Duration,
+) -> Result<PromptOutcome, ApprovalError> {
+    use tokio::io::AsyncReadExt;
+    let helper = find_approve_helper()?;
+    let mut child = tokio::process::Command::new(helper)
+        .args(["--reason", reason])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|_| ApprovalError::Unavailable)?;
+    let status = tokio::time::timeout(timeout, child.wait()).await;
+    match status {
+        Ok(Ok(status)) if status.code() == Some(0) => {
+            let mut output = Vec::new();
+            if let Some(stdout) = child.stdout.take() {
+                let _ = stdout.take(4096).read_to_end(&mut output).await;
+            }
+            Ok(PromptOutcome::Approved {
+                account: parse_helper_account(&output),
+            })
+        }
+        Ok(Ok(status)) if status.code() == Some(1) => Ok(PromptOutcome::Denied),
+        _ => {
+            let _ = child.kill().await;
+            Err(ApprovalError::Failed(
+                "authentication expired or unavailable; no decision sent".into(),
+            ))
+        }
     }
 }
 
@@ -384,6 +492,24 @@ mod tests {
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[tokio::test]
+    async fn expired_challenge_never_starts_native_review() {
+        let error = prompt_task_until("Exact immutable task", 1)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("expired"));
+        assert_eq!(
+            remaining(None, 90).unwrap(),
+            std::time::Duration::from_secs(90)
+        );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert!(remaining(Some(now + 2), 90).unwrap() <= std::time::Duration::from_secs(2));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
     async fn review_diagnostics_accept_only_fixed_markers() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let stage = AtomicUsize::new(0);
@@ -418,17 +544,25 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[tokio::test]
     async fn review_timeout_reports_last_stage_and_reaps_helper() {
+        // Model a helper that has received the complete review and then stalls
+        // at the window stage. The separate unread-input test covers a helper
+        // that never consumes its stdin.
         let (_directory, helper) = review_test_helper(
-            "printf '%s\\n' $$ > \"$0.pid\"\nprintf '%s\\n' 'opaque-review-stage: window-ordered'\nexec /bin/sleep 5",
+            "cat > \"$0.review\" || exit 2\nprintf '%s\\n' $$ > \"$0.pid\"\nprintf '%s\\n' 'opaque-review-stage: window-ordered'\nexec /bin/sleep 5",
         );
+        let review = "complete task";
         let started = std::time::Instant::now();
-        let error = run_task_review(&helper, "complete task", std::time::Duration::from_secs(1))
+        let error = run_task_review(&helper, review, std::time::Duration::from_secs(1))
             .await
             .unwrap_err()
             .to_string();
-        assert!(error.contains("task review timed out"));
-        assert!(error.contains("last stage: window-ordered"));
+        assert!(error.contains("task review timed out"), "{error}");
+        assert!(error.contains("last stage: window-ordered"), "{error}");
         assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        assert_eq!(
+            std::fs::read_to_string(helper.with_extension("review")).unwrap(),
+            review
+        );
         let pid: i32 = std::fs::read_to_string(helper.with_extension("pid"))
             .unwrap()
             .trim()
@@ -456,7 +590,7 @@ mod tests {
         .await
         .unwrap_err()
         .to_string();
-        assert!(error.contains("task review timed out"));
+        assert!(error.contains("task review timed out"), "{error}");
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
@@ -476,7 +610,7 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(error.contains("native review UI unavailable"));
+        assert!(error.contains("native review UI unavailable"), "{error}");
     }
 
     #[test]

@@ -69,6 +69,13 @@ enum Command {
         #[arg(long)]
         notice: String,
     },
+    /// Validate an opaque notice and fetch its typed context without opening native UI.
+    Inspect {
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long)]
+        notice: String,
+    },
     /// Retrieve a retained signed decision over the enrolled pinned connection.
     Receipt {
         #[arg(long)]
@@ -207,15 +214,51 @@ async fn run(mut args: Args) -> Result<(), String> {
                     .map_err(|_| "pending metadata encoding failed")?
             );
         }
+        Command::Inspect { state_dir, notice } => {
+            let (state, _) = custody::load(&state_dir)?;
+            let enrollment = state.enrollment.ok_or("workstation is not enrolled")?;
+            let id = opaque_core::workstation::resolve_notice(&notice, &enrollment.broker_id)
+                .map_err(|_| "notice does not refer to this enrolled broker")?;
+            let client = BrokerClient::new(&enrollment.endpoint, &enrollment.tls_fingerprint)?;
+            let review: WorkstationReview = client
+                .request(
+                    reqwest::Method::GET,
+                    &format!("/workstation/approvals/{id}"),
+                    None,
+                    Some((&enrollment.device_id, &enrollment.token)),
+                )
+                .await?;
+            review
+                .validate(&enrollment.broker_id, now())
+                .map_err(|e| e.to_string())?;
+            if review.challenge.approval_id != id
+                || review
+                    .challenge
+                    .authority
+                    .as_ref()
+                    .is_some_and(|a| a.public_key_hex != state.public_key_hex)
+            {
+                return Err("review does not match this round and enrollment".into());
+            }
+            println!(
+                "{}",
+                serde_json::to_string(&opaque_approver::review::ReviewContext::from(&review))
+                    .map_err(|_| "context encoding failed")?
+            );
+        }
         Command::Review {
             state_dir,
             approval_id,
         } => {
+            let _review_lock = opaque_approver::instance::ReviewLock::acquire(&state_dir)?;
             if uuid_like(&approval_id).is_none() {
                 return Err("approval_id must be a broker-issued UUID".into());
             }
             let (state, key) = custody::load(&state_dir)?;
-            let enrollment = state.enrollment.ok_or("workstation is not enrolled")?;
+            let enrollment = state
+                .enrollment
+                .clone()
+                .ok_or("workstation is not enrolled")?;
             let client = BrokerClient::new(&enrollment.endpoint, &enrollment.tls_fingerprint)?;
             let route = format!("/workstation/approvals/{approval_id}");
             let review: WorkstationReview = client
@@ -237,26 +280,9 @@ async fn run(mut args: Args) -> Result<(), String> {
             {
                 return Err("approval is assigned to a different enrolled workstation key".into());
             }
-            let mut reason = format!(
-                "Trusted broker: {}\nApproval: {}\nRequest: {}\nOperation: {}\nChallenge expires: {}\nReview content SHA256: {}\n\n{}",
-                review.challenge.broker_id,
-                approval_id,
-                review.challenge.request_id,
-                review.challenge.operation,
-                review.challenge.expires_at,
-                review.challenge.content_hash,
-                review.review_text
-            );
-            if let Some(authority) = &review.challenge.authority {
-                reason.push_str(&format!(
-                    "\n\nSigned authority:\nTenant: {}\nBroker lineage: {}\nTask: {}\nManifest SHA256: {}\nEffective policy SHA256: {}\nRequester: {}\nReviewer: {}\nRequired role: {}\nReviewer authority epoch: {}",
-                    authority.binding.tenant.tenant_id,authority.binding.tenant.broker_id,
-                    authority.binding.task_id,authority.binding.manifest_digest,authority.binding.policy_digest,
-                    authority.binding.requester,authority.principal_id,authority.required_role,authority.authority_epoch,
-                ));
-            }
+            let reason = opaque_approver::review::display(&review, now());
             let approved = matches!(
-                native::prompt_task(&reason)
+                native::prompt_task_until(&reason, review.challenge.expires_at)
                     .await
                     .map_err(|error| error.to_string())?,
                 native::PromptOutcome::Approved { .. }
@@ -288,19 +314,12 @@ async fn run(mut args: Args) -> Result<(), String> {
                     .sign(&workstation_decision_bytes(&review.challenge, approved))
                     .to_bytes()),
             };
-            let _: serde_json::Value = client
-                .request(
-                    reqwest::Method::POST,
-                    &format!("{route}/respond"),
-                    Some(serde_json::to_value(response).map_err(|_| "decision encoding failed")?),
-                    Some((&enrollment.device_id, &enrollment.token)),
-                )
-                .await?;
+            let report =
+                opaque_approver::review::submit(&client, &enrollment, &state, &review, response)
+                    .await?;
             println!(
-                "{} request {} on {}.",
-                if approved { "Approved" } else { "Rejected" },
-                review.challenge.request_id,
-                enrollment.broker_id
+                "{}",
+                serde_json::to_string(&report).map_err(|_| "decision report encoding failed")?
             );
         }
         Command::Receipt {
@@ -311,29 +330,13 @@ async fn run(mut args: Args) -> Result<(), String> {
                 return Err("approval_id must be a UUID".into());
             }
             let (state, _) = custody::load(&state_dir)?;
-            let enrollment = state.enrollment.ok_or("workstation is not enrolled")?;
+            let enrollment = state
+                .enrollment
+                .as_ref()
+                .ok_or("workstation is not enrolled")?;
             let client = BrokerClient::new(&enrollment.endpoint, &enrollment.tls_fingerprint)?;
-            let receipt: opaque_core::workstation::SignedWorkstationReceipt = client
-                .request(
-                    reqwest::Method::GET,
-                    &format!("/workstation/receipts/{approval_id}"),
-                    None,
-                    Some((&enrollment.device_id, &enrollment.token)),
-                )
-                .await?;
-            receipt.verify().map_err(|_| "invalid signed receipt")?;
-            if receipt.review.challenge.approval_id != approval_id
-                || receipt.review.challenge.broker_id != enrollment.broker_id
-                || receipt.response.device_id != enrollment.device_id
-                || receipt
-                    .review
-                    .challenge
-                    .authority
-                    .as_ref()
-                    .is_none_or(|a| a.public_key_hex != state.public_key_hex)
-            {
-                return Err("receipt belongs to another enrollment".into());
-            }
+            let receipt =
+                opaque_approver::review::receipt(&client, enrollment, &state, &approval_id).await?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&receipt).map_err(|_| "receipt encoding failed")?

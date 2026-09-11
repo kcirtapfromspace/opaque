@@ -78,7 +78,7 @@ impl Action {
     }
     pub fn target(&self) -> HashMap<String, String> {
         let route = self.call.route();
-        HashMap::from([
+        let mut target = HashMap::from([
             ("invocation_id".into(), self.invocation_id.clone()),
             ("route".into(), route.alias.clone()),
             ("server_id".into(), route.server_id.clone()),
@@ -100,7 +100,7 @@ impl Action {
                 "arguments".into(),
                 serde_json::to_string(self.call.arguments()).expect("arguments serialize"),
             ),
-            ("output_policy".into(), "withhold".into()),
+            ("output_policy".into(), route.output_policy.as_str().into()),
             ("credential_ref".into(), self.credential_ref.clone()),
             (
                 "max_request_bytes".into(),
@@ -119,7 +119,60 @@ impl Action {
                     .clone()
                     .unwrap_or_else(|| "disabled".into()),
             ),
-        ])
+        ]);
+        if route.upstream_input_schema.is_some() {
+            target.insert(
+                "upstream_schema_digest".into(),
+                digest(route.upstream_schema()),
+            );
+        }
+        if let Some(projection) = &route.output_projection {
+            target.insert("output_projection_digest".into(), digest(projection));
+            target.insert(
+                "output_projection".into(),
+                serde_json::to_string(projection).expect("projection serializes"),
+            );
+        }
+        target
+    }
+}
+
+/// The durable receipt is always available to its owner. Projected values are
+/// ephemeral and only emitted with a current disclosure authorization; receipt
+/// reads never replay them. Debug intentionally omits these potentially sensitive values.
+#[derive(Serialize)]
+pub struct InvocationResult {
+    pub receipt: store::Receipt,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<BTreeMap<String, serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disclosure: Option<&'static str>,
+}
+impl std::ops::Deref for InvocationResult {
+    type Target = store::Receipt;
+    fn deref(&self) -> &Self::Target {
+        &self.receipt
+    }
+}
+impl std::fmt::Debug for InvocationResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InvocationResult")
+            .field("receipt", &self.receipt)
+            .field("disclosure", &self.disclosure)
+            .finish_non_exhaustive()
+    }
+}
+impl InvocationResult {
+    pub fn has_disclosable_values(&self) -> bool {
+        self.output.is_some()
+            || self.receipt.response_sha256.is_some()
+            || self.receipt.response_bytes.is_some()
+    }
+    pub fn withhold_authority_changed(&mut self) {
+        self.output = None;
+        self.receipt.response_sha256 = None;
+        self.receipt.response_bytes = None;
+        self.disclosure = Some("withheld_authority_changed");
     }
 }
 
@@ -199,14 +252,23 @@ impl Gateway {
     }
     pub fn catalog(&self) -> Result<serde_json::Value, String> {
         let (registry, signed) = self.registry()?;
-        let tools:Vec<_>=registry.routes().into_iter().map(|r|serde_json::json!({
+        let tools:Vec<_>=registry.routes().into_iter().map(|r| { let mut entry = serde_json::json!({
             "name":format!("opaque_mcp_tool_{}",r.alias),"description":"One broker-approved invocation; arbitrary upstream output is withheld. Reuse the invocation ID only to inspect its receipt, never to retry.",
             "inputSchema":{"type":"object","additionalProperties":false,"required":["invocation_id","arguments","expires_in_secs"],"properties":{
                 "invocation_id":{"type":"string","minLength":36,"maxLength":36},"expires_in_secs":{"type":"integer","minimum":1,"maximum":300},"arguments":r.input_schema.clone()}},
             "route":r.alias,"registry_digest":signed.digest,
             "secret_ref":format!("file:{}",self.config.credentials[&r.credential_binding].display()),
-            "policy_target":{"route":r.alias,"server_id":r.server_id,"endpoint":format!("https://{}{}",r.endpoint.host,r.endpoint.path),"tool":r.tool,"protocol_version":r.protocol_version,"registry_digest":signed.digest,"registry_version":signed.payload.version.to_string(),"schema_digest":digest(&r.input_schema),"output_policy":"withhold","credential_ref":format!("file:{}",self.config.credentials[&r.credential_binding].display()),"max_request_bytes":r.max_request_bytes.to_string(),"max_response_bytes":r.max_response_bytes.to_string(),"timeout_ms":r.timeout_ms.to_string(),"attempt_limit":"1","fixture_origin":self.config.fixture_origin.clone().unwrap_or_else(||"disabled".into())}
-        })).collect();
+            "policy_target":{"route":r.alias,"server_id":r.server_id,"endpoint":format!("https://{}{}",r.endpoint.host,r.endpoint.path),"tool":r.tool,"protocol_version":r.protocol_version,"registry_digest":signed.digest,"registry_version":signed.payload.version.to_string(),"schema_digest":digest(&r.input_schema),"output_policy":r.output_policy.as_str(),"credential_ref":format!("file:{}",self.config.credentials[&r.credential_binding].display()),"max_request_bytes":r.max_request_bytes.to_string(),"max_response_bytes":r.max_response_bytes.to_string(),"timeout_ms":r.timeout_ms.to_string(),"attempt_limit":"1","fixture_origin":self.config.fixture_origin.clone().unwrap_or_else(||"disabled".into())}
+        });
+        if r.upstream_input_schema.is_some() {
+            entry["policy_target"]["upstream_schema_digest"] = serde_json::json!(digest(r.upstream_schema()));
+        }
+        if let Some(projection) = &r.output_projection {
+            entry["policy_target"]["output_projection_digest"] = serde_json::json!(digest(projection));
+            entry["policy_target"]["output_projection"] = serde_json::json!(serde_json::to_string(projection).expect("projection serializes"));
+        }
+        entry
+        }).collect();
         Ok(serde_json::json!({"tools":tools}))
     }
     pub fn prepare(&self, input: CallInput) -> Result<Action, String> {
@@ -280,7 +342,7 @@ impl Gateway {
         action: &Action,
         before_call: F,
         mut final_authority: G,
-    ) -> Result<store::Receipt, String>
+    ) -> Result<InvocationResult, String>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<(), String>>,
@@ -321,7 +383,26 @@ impl Gateway {
         let outcome = result.unwrap_or_else(|_| {
             transport::Outcome::rejected("admission_or_credential_unavailable")
         });
-        self.ledger.finish(owner, action, &outcome)
+        let receipt = self.ledger.finish(owner, action, &outcome)?;
+        let mut result = InvocationResult {
+            receipt,
+            output: outcome.output,
+            disclosure: outcome.disclosure,
+        };
+        if result.has_disclosable_values()
+            && final_authority(&mut || {
+                self.revalidate(action)?;
+                if result.output.is_some() {
+                    self.ledger.authorize_disclosure(owner, action)
+                } else {
+                    self.ledger.authorize_result(owner, action)
+                }
+            })
+            .is_err()
+        {
+            result.withhold_authority_changed();
+        }
+        Ok(result)
     }
 }
 

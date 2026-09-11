@@ -12,7 +12,7 @@ guide is scoped by which one you choose:
 | | **Session mode** (default) | **Trust-domain split** |
 |---|---|---|
 | Daemon runs as | your own user, in your GUI session | a dedicated service account (`opaque`), as a system service |
-| Integrity posture | tamper-**evident**: an agent sharing your uid can read the audit chain key and rewrite state; you detect it after the fact | tamper-**prevented**: custody files are unreadable/unwritable at the agent's uid, verified at every startup (fail closed) |
+| Integrity posture | an agent sharing your uid may obtain the audit key and forge locally valid history | custody files are unreadable/unwritable at the agent's uid, checked at startup; daemon/admin remain trusted |
 | Approval factors | local biometric (macOS `LocalAuthentication`), polkit; both need your GUI session | out-of-band factors that don't need the daemon to own a session: paired second device, FIDO2 key, passkey |
 | Service manager | LaunchAgent / systemd **user** service | LaunchDaemon / systemd **system** service (`deploy/`) |
 | Config | `~/.opaque/config.toml` | `/etc/opaque/config.toml` with `[trust_domain] enforce = true` (see `deploy/config.trust-domain.example.toml`) |
@@ -94,13 +94,27 @@ before connecting.
 
 ---
 
+## Upgrading existing custody
+
+The current source writer authenticates the retained audit head and refuses
+unsupported older stores. Before replacing a running binary, close admission,
+reconcile in-flight work, stop/fence every writer and follow the explicit
+[audit-store upgrade procedure](evidence-checkpoints.md#authenticated-local-head-and-older-databases).
+It requires independently retained evidence; hashing the current suspect store
+is not a substitute. Preserve the original custody on refusal. The service
+manager does not perform this migration for you.
+
+Do not roll back task, identity, revocation or replay ledgers to recover service.
+An older intact snapshot can pass integrity checks and still resurrect authority.
+See [storage and recovery boundaries](storage.md).
+
 ## macOS
 
 ### Packaging Model
 
-**v1: Code-signed binary + LaunchAgent plist**
+**Daemon packaging direction: code-signed binary + LaunchAgent plist**
 
-Ship a `.pkg` installer that places:
+The proposed daemon `.pkg` would place:
 
 ```
 /usr/local/bin/opaqued          (code-signed, notarized)
@@ -108,9 +122,14 @@ Ship a `.pkg` installer that places:
 ~/Library/LaunchAgents/com.opaque.daemon.plist
 ```
 
-**v1.1+: Migrate to SMAppService app bundle**
+**Deferred daemon integration: SMAppService app bundle**
 
 Use `SMAppService.agent(plistName:)` (macOS 13+) to register the LaunchAgent from within an `.app` bundle. Benefits: macOS manages lifecycle, the binary lives inside the signed bundle (tamper-evident), and install/uninstall is cleaner. Deferred from v1 because it requires a `.app` build target and `Info.plist`, which are orthogonal to getting the core security right.
+
+The source-built `Opaque Reviewer.app` is a separate workstation client. It does
+not install the daemon or implement this deferred SMAppService lifecycle. The
+current release workflow packages tar archives; see [installation](getting-started.md)
+and [reviewer setup](remote-approvals.md) for released versus source-only paths.
 
 ### LaunchAgent Plist
 

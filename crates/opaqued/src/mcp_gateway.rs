@@ -155,11 +155,28 @@ async fn inner(
         }
         let reference: Reference =
             serde_json::from_value(req.params.clone()).map_err(|_| "invalid reference")?;
-        let receipt = if req.method == "mcp_revoke" {
+        let mut receipt = if req.method == "mcp_revoke" {
             gateway.ledger.revoke(&owner, &reference.invocation_id)?
         } else {
             gateway.ledger.get(&owner, &reference.invocation_id)?
         };
+        if receipt.response_sha256.is_some() || receipt.response_bytes.is_some() {
+            let action = gateway
+                .ledger
+                .get_action(&owner, &reference.invocation_id)?;
+            let mut request = base(identity, client_type, principal);
+            request.target = action.target();
+            request.params =
+                serde_json::to_value(&action).map_err(|_| "MCP action encoding failed")?;
+            request.secret_ref_names = vec![action.credential_ref.clone()];
+            state.enclave.filter_mcp_receipt_metadata(
+                gateway,
+                &owner,
+                &request,
+                &action,
+                &mut receipt,
+            );
+        }
         return Ok(serde_json::json!({"receipt":receipt}));
     }
     let mut params = req.params.clone();
@@ -171,7 +188,7 @@ async fn inner(
     let mut request = base(identity, client_type, principal);
     request.workspace = workspace?;
     let claimed_workspace = request.workspace.clone();
-    let receipt = state
+    let result = state
         .enclave
         .execute_mcp(gateway, &owner, request, action, || async {
             if let Some(claimed) = &claimed_workspace {
@@ -180,7 +197,7 @@ async fn inner(
             resolve_principal_context(state, session_id).await
         })
         .await?;
-    Ok(serde_json::json!({"receipt":receipt}))
+    serde_json::to_value(result).map_err(|_| "MCP result encoding failed".into())
 }
 
 /// Configured dedicated runner availability; the raw generic execute route

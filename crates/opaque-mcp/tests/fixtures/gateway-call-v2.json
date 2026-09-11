@@ -1,0 +1,9 @@
+{
+  "route": "issue_note",
+  "arguments": {
+    "owner": "example-org",
+    "repo": "disposable-pilot",
+    "issue_number": 42,
+    "body": "Synthetic bounded pilot note"
+  }
+}

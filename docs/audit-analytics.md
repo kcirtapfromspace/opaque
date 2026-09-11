@@ -2,7 +2,7 @@
 
 You want three things simultaneously:
 
-1. **Audit**: an append-only tamper-evident-ish record of what happened (requests, approvals, operations).
+1. **Audit**: a keyed, tamper-evident record of instrumented requests, approvals and operations, with explicit retention boundaries.
 2. **Live feed**: a real-time stream for UI/monitoring (pending approvals, durations, outcomes).
 3. **Analytics + semantic search**: fast queries and “find similar events” without leaking secret material.
 
@@ -16,20 +16,26 @@ Registered operation execution waits for audit durability before dispatch and be
 
 CLI retries cover connection establishment only. Neither CLI nor MCP automatically replays a dispatched operation after a lost response or deadline. A request ID correlates evidence; it is not a general provider idempotency guarantee.
 
-The chain depends on custody of its key and database. A process that can replace both can forge history. Preserve the database, WAL, and chain key when investigating integrity errors; do not edit rows or remove the key to force startup. Keep backups and exports under the same access controls as audit metadata.
+The chain depends on custody of its key and database. A process that controls the audit HMAC key can forge history; a storage writer can also restore an older intact database and authentic head. The local verifier cannot detect that rollback alone. Preserve a consistent database, any WAL/SHM state, and the matching sibling `.hmac` key when investigating integrity errors; do not edit rows or remove the key to force startup. Keep backups and exports under the same access controls as audit metadata, with independent checkpoint/receipt references outside the producer's administration.
 
-## 1. Storage Strategy (Layered)
+The local tail head is now versioned and authenticated. Older unversioned heads require an explicit offline upgrade against independently trusted export bytes; startup does not silently bless them. [Signed evidence checkpoints](evidence-checkpoints.md) documents the upgrade, dedicated producer-key enrollment, transactional snapshot signing, public verification and retention receipts. These authenticate declared ranges and custody commitments; they do not establish global completeness or safe authorization-state recovery.
 
-### System of record: SQLite (transactional)
+The migration guide requires an independently archived export of the exact retained
+range in the expected JSONL framing. An arbitrary SIEM export or today's locally
+calculated digest is not an upgrade anchor. Empty legacy exports are refused because
+their digest cannot bind the historical sequence frontier. Preserve consumed authority and
+revocation history separately: audit exports neither reconstruct grants nor prove
+whether an external effect completed.
 
-- Primary store for:
-  - audit events (append-only)
-  - device pairings (public keys)
-  - client identities (exe hashes, uid/gid)
-  - provider metadata (non-secret config)
-  - profiles (name -> secret refs)
+## 1. Proposed storage strategy
 
-SQLite gives durability, migrations, constraints, and low operational overhead.
+### Audit system of record: SQLite (transactional)
+
+The current audit implementation stores events, retention boundaries and its
+authenticated head transactionally in SQLite. Other custody and authority stores
+keep their existing formats and recovery contracts; this proposal does not migrate
+device pairings, identities, profiles or provider configuration into the audit
+database. Arrow/Parquet and semantic indexing below are proposed derived views.
 
 ### Analytics store: Arrow/Parquet dataset
 
@@ -231,7 +237,7 @@ Audit can grow without bound.
 Recommended:
 
 - SQLite retains recent window (e.g. 30-90 days)
-- daemon retention cleanup purges SQLite rows older than the configured window
+- daemon retention cleanup removes only an authenticated expired insertion-order prefix; it does not delete every row with an old timestamp
 - older events can later be rolled to Parquet when that pipeline is enabled
 - embeddings store follows the same retention window
 - live feed uses bounded channels (drop-oldest or apply backpressure)
