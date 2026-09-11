@@ -23,7 +23,8 @@ class InstallDeliveryTests(unittest.TestCase):
         root = Path(temporary.name)
         commands = root / "commands"
         commands.mkdir()
-        for command in ("tar", "mktemp", "install", "mkdir", "rm", "awk", "sed", "head"):
+        # GNU tar invokes gzip through PATH; BSD tar handles gzip internally.
+        for command in ("tar", "gzip", "mktemp", "install", "mkdir", "rm", "awk", "sed", "head"):
             located = shutil.which(command)
             self.assertIsNotNone(located, command)
             (commands / command).symlink_to(located)
