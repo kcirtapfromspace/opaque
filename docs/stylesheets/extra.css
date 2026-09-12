@@ -145,7 +145,7 @@
 
 .op-home section {
   border-top: 1px solid var(--op-line);
-  padding: clamp(3.25rem, 7vw, 5.25rem) 0;
+  padding: clamp(2.5rem, 4.5vw, 4rem) 0;
 }
 
 .op-home section:first-child {
@@ -179,7 +179,7 @@
 
 .op-kicker {
   max-width: 44rem;
-  margin-bottom: 2.75rem;
+  margin-bottom: 1.75rem;
 }
 
 .op-kicker h2 {
@@ -207,8 +207,8 @@
 
 /* ---- Hero ---------------------------------------------------------------- */
 
-.op-hero {
-  padding-top: clamp(3.5rem, 8vw, 6rem);
+.op-home .op-hero {
+  padding: clamp(1.25rem, 3vh, 3rem) 0 clamp(1.75rem, 5vh, 3.5rem);
 }
 
 .op-hero__grid {
@@ -283,7 +283,7 @@
 }
 
 .op-hero__lede {
-  margin-top: 1.75rem;
+  margin-top: 1.2rem;
   max-width: 34rem;
   font-size: 1.04rem;
   color: var(--op-text-dim);
@@ -307,7 +307,7 @@
   flex-wrap: wrap;
   align-items: center;
   gap: 0.7rem;
-  margin-top: 1.9rem;
+  margin-top: 1.3rem;
 }
 
 .op-home .op-btn {
@@ -733,7 +733,7 @@
   display: flex;
   align-items: center;
   gap: 0.7rem;
-  margin-bottom: 1.8rem;
+  margin-bottom: 1.1rem;
   color: var(--op-accent);
   font-family: var(--md-code-font-family);
   font-size: 0.63rem;
@@ -973,7 +973,7 @@
   grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.15fr);
   align-items: center;
   gap: clamp(1.5rem, 5vw, 4rem);
-  padding: 2.2rem 0;
+  padding: 1.6rem 0;
   border-top: 1px solid var(--op-line);
 }
 .op-step {
