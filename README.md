@@ -6,30 +6,24 @@
 
 **Approve the work. Keep secrets secret.**
 
-Opaque is a local broker for Claude Code, Codex, and MCP clients. It checks
-policy, requests required human approval, and performs supported operations
-using credentials held by the broker. The agent receives the permitted result.
+Give coding agents a reviewed task with a fixed scope and expiry. Opaque is a
+local broker for Claude Code, Codex, and other MCP clients: it checks authority
+before dispatch and keeps credentials with the broker.
 
-Start with one task: publish a GitHub Actions secret using a stored reference,
-without returning the secret value to the agent. The [tutorial](docs/tutorial.md)
-walks through setup, approval, and inspection of the broker's observed outcome.
+## Try one data read
 
-## Start here
+[Open the demo](https://demo.opaque.info/). Review a task that reads fictional
+loan-application metrics. Approve it, run it once, inspect the result, then try
+again to see Opaque block the repeat.
 
-| Your question | Read |
-| --- | --- |
-| Can I use it for a real task? | [First operation](docs/tutorial.md) |
-| Where does the security boundary hold? | [Architecture and evidence](docs/architecture.md) |
-| How do I install or upgrade? | [Install and command reference](docs/getting-started.md) |
-| How do we evaluate it as a team? | [Scope one workflow](https://opaque.info/#op-pilot) |
+The hosted demo uses synthetic data and a separate workflow; it does not connect
+to your repository. See the [demo guide](docs/hosted-demo.md) for session limits
+and approval methods.
 
-For a quick hosted exploration, [try the demo](https://demo.opaque.info/).
-It uses fictional portfolio data and a separate demo workflow; it does not
-connect to your repository. See the [demo guide](docs/hosted-demo.md).
+## Run a local operation
 
-## One operation
-
-After completing the tutorial's credential and policy setup:
+Follow the [tutorial](docs/tutorial.md) to configure credentials and policy, then
+publish a GitHub Actions secret using a stored reference:
 
 ```sh
 opaque github set-secret \
@@ -38,10 +32,13 @@ opaque github set-secret \
   --value-ref keychain:opaque/api-key
 ```
 
-The broker checks the request, obtains the required approval, calls GitHub,
-and records the observed result. [Bounded tasks](docs/bounded-work.md) add
-reviewed manifests and durable action limits. [Qualified MCP calls](docs/mcp-qualified-tools.md)
-have a separate signed contract and review path.
+The broker checks policy, obtains the required approval, calls GitHub, and records
+the observed result without returning the secret value to the agent.
+
+[Bounded tasks](docs/bounded-work.md) bind approval to an exact manifest, expiry,
+and action limit. Changing the task requires a new review; an uncertain outcome
+does not restore a consumed attempt. [Qualified MCP calls](docs/mcp-qualified-tools.md)
+use a separate signed contract and review path.
 
 ## What the boundary covers
 
@@ -50,6 +47,7 @@ readable files, and direct access remain outside that boundary. Use a
 [dedicated broker identity](docs/deployment.md) to isolate custody from the
 agent's OS user; the default same-user setup does not provide that isolation.
 The broker, its administrators, and configured approval factors remain trusted.
+See the [architecture](docs/architecture.md) for these trust boundaries.
 
 Audit verification checks recorded evidence under specified trust assumptions.
 It does not independently prove every provider effect or that every action was
