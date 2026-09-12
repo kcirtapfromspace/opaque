@@ -11,7 +11,7 @@ hide:
 Give coding agents a reviewed task with a fixed scope and expiry.
 Opaque checks authority before dispatch and keeps credentials with the broker.
 
-[Explore task controls](bounded-work.md) · [Architecture](architecture.md) ·
+[Try it out](https://demo.opaque.info/) · [Architecture](architecture.md) ·
 [Installation and release status](getting-started.md)
 
 ## Approve one staging release. Keep the scope fixed. { #approve-one-staging-release }
@@ -43,5 +43,5 @@ controls apply to work routed through Opaque. Read the [architecture and evidenc
 ## Start with one task
 
 Set up Opaque with the secret-write tutorial, or bring a staging workflow to a pilot
-conversation. [Demo and pilot invitation](https://demo.opaque.info/). The hosted
+conversation. [Try it out](https://demo.opaque.info/) or [set up locally](tutorial.md). The hosted
 demo uses fictional portfolio data and a separate workflow; see the [guide](hosted-demo.md).

@@ -39,7 +39,7 @@
             Opaque checks authority before dispatch and keeps credentials with the broker.
           </p>
           <div class="op-actions">
-            <a class="op-btn op-btn--solid" href="{{ 'bounded-work/' | url }}">Explore task controls</a>
+            <a class="op-btn op-btn--solid" href="https://demo.opaque.info/">Try it out</a>
             <a class="op-text-link" href="{{ 'architecture/' | url }}">Architecture &rarr;</a>
           </div>
           <p class="op-meta">Local &middot; macOS and Linux &middot;
@@ -48,7 +48,6 @@
         <figure id="task-illustration" class="op-task-scene" data-case="allowed" data-phase="result" data-consumed="true" aria-labelledby="op-task-title">
           <figcaption class="op-task-heading">
             <span id="op-task-title">One task. Finite authority.</span>
-            <span>Interactive illustration</span>
           </figcaption>
           <div class="op-task-cases" role="group" aria-label="Choose a task scenario" hidden>
             <button type="button" data-case="allowed" aria-pressed="true">Approved</button>
@@ -58,13 +57,13 @@
           </div>
           <div class="op-flow" aria-hidden="true">
             <div class="op-flow-map">
-              <svg class="op-flow-wires op-flow-wires--wide" viewBox="0 0 1000 370" preserveAspectRatio="none">
+              <svg class="op-flow-wires op-flow-wires--wide" viewBox="0 0 1000 330" preserveAspectRatio="none">
                 <defs><marker id="op-flow-arrow-wide" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M1 1l4 2.5L1 6" fill="none" stroke="var(--op-text-dim)" stroke-width="1"/></marker></defs>
-                <g class="op-flow-route" data-flow="request" data-state="complete"><path class="op-flow-wire" marker-end="url(#op-flow-arrow-wide)" d="M270 180H370" pathLength="1"/><path class="op-flow-trace" d="M270 180H370" pathLength="1"/></g>
-                <g class="op-flow-route" data-flow="review" data-state="complete"><path class="op-flow-wire" marker-end="url(#op-flow-arrow-wide)" d="M510 72V106" pathLength="1"/><path class="op-flow-trace" d="M510 72V106" pathLength="1"/></g>
-                <g class="op-flow-route" data-flow="dispatch" data-state="complete"><path class="op-flow-wire" marker-end="url(#op-flow-arrow-wide)" d="M650 180H750" pathLength="1"/><path class="op-flow-trace" d="M650 180H750" pathLength="1"/></g>
-                <g class="op-flow-route" data-flow="response" data-state="complete"><path class="op-flow-wire" marker-end="url(#op-flow-arrow-wide)" d="M855 228V312Q855 326 841 326H574Q560 326 560 312V290" pathLength="1"/><path class="op-flow-trace" d="M855 228V312Q855 326 841 326H574Q560 326 560 312V290" pathLength="1"/></g>
-                <g class="op-flow-route" data-flow="status" data-state="complete"><path class="op-flow-wire" marker-end="url(#op-flow-arrow-wide)" d="M430 290V312Q430 326 416 326H169Q155 326 155 312V228" pathLength="1"/><path class="op-flow-trace" d="M430 290V312Q430 326 416 326H169Q155 326 155 312V228" pathLength="1"/></g>
+                <g class="op-flow-route" data-flow="request" data-state="complete"><path class="op-flow-wire" marker-end="url(#op-flow-arrow-wide)" d="M270 154H370" pathLength="1"/><path class="op-flow-trace" d="M270 154H370" pathLength="1"/></g>
+                <g class="op-flow-route" data-flow="review" data-state="complete"><path class="op-flow-wire" marker-end="url(#op-flow-arrow-wide)" d="M510 64V84" pathLength="1"/><path class="op-flow-trace" d="M510 64V84" pathLength="1"/></g>
+                <g class="op-flow-route" data-flow="dispatch" data-state="complete"><path class="op-flow-wire" marker-end="url(#op-flow-arrow-wide)" d="M650 154H750" pathLength="1"/><path class="op-flow-trace" d="M650 154H750" pathLength="1"/></g>
+                <g class="op-flow-route" data-flow="response" data-state="complete"><path class="op-flow-wire" marker-end="url(#op-flow-arrow-wide)" d="M855 198V278Q855 292 841 292H574Q560 292 560 278V260" pathLength="1"/><path class="op-flow-trace" d="M855 198V278Q855 292 841 292H574Q560 292 560 278V260" pathLength="1"/></g>
+                <g class="op-flow-route" data-flow="status" data-state="complete"><path class="op-flow-wire" marker-end="url(#op-flow-arrow-wide)" d="M430 260V278Q430 292 416 292H169Q155 292 155 278V198" pathLength="1"/><path class="op-flow-trace" d="M430 260V278Q430 292 416 292H169Q155 292 155 278V198" pathLength="1"/></g>
               </svg>
               <svg class="op-flow-wires op-flow-wires--narrow" viewBox="0 0 1000 470" preserveAspectRatio="none">
                 <defs><marker id="op-flow-arrow-narrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M1 1l4 2.5L1 6" fill="none" stroke="var(--op-text-dim)" stroke-width="1"/></marker></defs>
@@ -229,8 +228,8 @@ opaque task reconcile &lt;task-id&gt;</code></pre>
         </div>
         <div>
           <div class="op-actions">
-            <a class="op-btn op-btn--solid" href="{{ 'tutorial/' | url }}">Try the tutorial</a>
-            <a class="op-text-link" href="https://demo.opaque.info/">Demo and pilot invitation &rarr;</a>
+            <a class="op-btn op-btn--solid" href="https://demo.opaque.info/">Try it out</a>
+            <a class="op-text-link" href="{{ 'tutorial/' | url }}">Set up locally &rarr;</a>
           </div>
           <p class="op-meta">The hosted demo uses fictional portfolio data and a separate workflow.
             <a href="{{ 'hosted-demo/' | url }}">Demo guide</a> &middot;
