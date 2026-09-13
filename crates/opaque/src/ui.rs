@@ -1025,6 +1025,13 @@ fn format_leases_result(result: &serde_json::Value) {
             if one_time {
                 meta.push("one-time".into());
             }
+            if let Some(remaining) = lease.get("remaining_uses").and_then(|v| v.as_u64()) {
+                let spent = lease.get("spent").and_then(|v| v.as_u64()).unwrap_or(0);
+                meta.push(format!("{remaining} attempts remaining, {spent} spent"));
+                if remaining == 0 {
+                    meta.push("exhausted".into());
+                }
+            }
             println!(
                 "      {} {}",
                 style("meta:").dim(),

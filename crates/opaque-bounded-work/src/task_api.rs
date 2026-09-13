@@ -272,6 +272,12 @@ async fn handle_inner(
             crate::ssh::prepare_ssh_manifest(&mut manifest, kernel.enclave.ssh_profile()?)?;
         } else if manifest.is_inference() {
             require_tenant_identity(kernel, request.principal.as_ref())?;
+            if req.method == "task_plan" && kernel.enclave.inference_profile()?.github_ci.is_some()
+            {
+                return Err(
+                    "use task plan-inference to capture the configured public GitHub source".into(),
+                );
+            }
             let boundary = kernel.tenant.ok_or("tenant boundary unavailable")?;
             for action in &manifest.actions {
                 let action = action.as_inference().ok_or("invalid inference action")?;

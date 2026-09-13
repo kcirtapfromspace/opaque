@@ -487,6 +487,7 @@ fn keychain_delete() -> Result<(), SealError> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use std::fs;

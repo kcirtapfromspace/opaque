@@ -8,9 +8,9 @@
 //!   `aws.get_parameters_by_path`, `aws.delete_parameter`
 //! - **Secret resolution** via `aws:<secret-name>` or `aws:ssm:<param-name>` refs
 //!
-//! Production AWS support is disabled pending Signature V4. Mock use requires
-//! `OPAQUE_AWS_ALLOW_INSECURE=1` and a loopback `OPAQUE_AWS_MOCK_URL`, with
-//! disposable credentials supplied through the configured base resolver refs.
+//! Production requests use the official AWS Signature V4 signer and canonical
+//! regional endpoints. Select `OPAQUE_AWS_REGION` and explicit base credential
+//! references. Loopback fixtures require opt-in and fixed synthetic credentials.
 
 mod action;
 pub mod client;
@@ -78,39 +78,57 @@ impl AwsHandler {
     }
 
     /// Resolve the AWS access key.
-    fn resolve_access_key(&self) -> Result<String, String> {
+    fn resolve_access_key(&self) -> Result<zeroize::Zeroizing<String>, String> {
         let base = BaseResolver::new();
         let value = base
             .resolve(&self.access_key_ref)
-            .map_err(|e| format!("failed to resolve AWS access key: {e}"))?;
+            .map_err(|_| "AWS access credential unavailable")?;
         value
             .as_str()
-            .map(|s| s.to_owned())
+            .map(|s| zeroize::Zeroizing::new(s.to_owned()))
             .ok_or_else(|| "AWS access key is not valid UTF-8".to_string())
     }
 
     /// Resolve the AWS secret access key.
-    fn resolve_secret_key(&self) -> Result<String, String> {
+    fn resolve_secret_key(&self) -> Result<zeroize::Zeroizing<String>, String> {
         let base = BaseResolver::new();
         let value = base
             .resolve(&self.secret_key_ref)
-            .map_err(|e| format!("failed to resolve AWS secret key: {e}"))?;
+            .map_err(|_| "AWS secret credential unavailable")?;
         value
             .as_str()
-            .map(|s| s.to_owned())
+            .map(|s| zeroize::Zeroizing::new(s.to_owned()))
             .ok_or_else(|| "AWS secret key is not valid UTF-8".to_string())
     }
 }
 
 impl OperationHandler for AwsHandler {
     fn fixture_only(&self) -> bool {
-        // AwsClient deliberately has no production SigV4 transport.
-        true
+        self.client.fixture_only()
     }
 
     fn prepare<'a>(&'a self, request: &OperationRequest) -> Result<PreparedOperation<'a>, String> {
         let action = AwsAction::parse(&request.operation, &request.params)?;
+        self.client
+            .ensure_configuration()
+            .map_err(|e| e.to_string())?;
         let mut secret_refs = vec![self.access_key_ref.clone(), self.secret_key_ref.clone()];
+        if let Some(reference) = self.client.session_token_ref() {
+            secret_refs.push(reference.into());
+        }
+        if secret_refs
+            .iter()
+            .any(|reference| !client::valid_credential_ref(reference))
+            || secret_refs
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != secret_refs.len()
+        {
+            return Err(
+                "AWS credentials require distinct explicit base resolver references".into(),
+            );
+        }
         // Resource selectors were already part of read-operation secret_names
         // policy. Credential refs supplement that authority, never replace it.
         match &action {
@@ -124,13 +142,16 @@ impl OperationHandler for AwsHandler {
             .endpoint_for_operation(&request.operation)
             .ok_or("unknown AWS operation")?
             .to_owned();
-        let backend = "unsigned_loopback_fixture";
+        let backend = self.client.backend();
+        let region = self.client.region().to_owned();
+        target.insert("aws_region".into(), region.clone());
         target.insert("aws_backend".into(), backend.into());
         target.insert("aws_api_url".into(), api_url.clone());
         let action = action::BoundAction {
             action,
             backend,
             api_url,
+            region,
         };
         let request_id = request.request_id;
         let operation = request.operation.clone();
@@ -266,9 +287,19 @@ impl OperationHandler for AwsHandler {
                         .await
                         .map_err(|e| format!("GetSecretValue failed: {e}"))?;
 
-                    let value = sv
-                        .secret_string
-                        .ok_or_else(|| format!("secret '{secret_id}' has no string value"))?;
+                    let binary = sv.secret_binary.is_some();
+                    let name = sv.name.clone();
+                    let bytes = zeroize::Zeroizing::new(
+                        sv.into_secret_bytes()
+                            .map_err(|e| format!("GetSecretValue failed: {e}"))?,
+                    );
+                    let value = if binary {
+                        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &*bytes)
+                    } else {
+                        std::str::from_utf8(&bytes)
+                            .map_err(|_| "invalid AWS string response")?
+                            .to_owned()
+                    };
 
                     audit.emit(
                         AuditEvent::new(AuditEventKind::ProviderFetchFinished)
@@ -281,10 +312,11 @@ impl OperationHandler for AwsHandler {
                             )),
                     );
 
-                    Ok(serde_json::json!({
-                        "name": sv.name,
-                        "value": value,
-                    }))
+                    let mut result = serde_json::json!({"name": name, "value": value});
+                    if binary {
+                        result["encoding"] = "base64".into();
+                    }
+                    Ok(result)
                 }
 
                 AwsAction::CreateSecret {
@@ -591,6 +623,7 @@ mod tests {
                 exe_path: None,
                 exe_sha256: None,
                 codesign_team_id: None,
+                workload: None,
             },
             client_type: ClientType::Human,
             operation: operation.into(),
@@ -637,7 +670,7 @@ mod tests {
             let prepared = handler.prepare(&request).unwrap();
             assert_eq!(prepared.target()["aws_api_url"], expected);
             assert_eq!(prepared.params()["api_url"], expected);
-            assert_eq!(prepared.params()["backend"], "unsigned_loopback_fixture");
+            assert_eq!(prepared.params()["backend"], "signed_loopback_fixture");
             assert_ne!(
                 prepared.params(),
                 changed.prepare(&request).unwrap().params()
@@ -649,7 +682,7 @@ mod tests {
     #[test]
     fn handler_debug() {
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let client = AwsClient::new_single("http://localhost:8080");
+        let client = AwsClient::new_single("http://127.0.0.1:8080");
         let handler = AwsHandler::new(audit, client);
         let debug = format!("{handler:?}");
         assert!(debug.contains("AwsHandler"));
@@ -658,7 +691,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_operation_rejected() {
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let client = AwsClient::new_single("http://localhost:8080");
+        let client = AwsClient::new_single("http://127.0.0.1:8080");
         let handler = AwsHandler::new(audit, client);
         let request = make_request("aws.unknown", serde_json::json!({}));
         let result = handler.execute(&request).await;
@@ -669,7 +702,7 @@ mod tests {
     #[tokio::test]
     async fn get_secret_value_missing_id_rejected() {
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let client = AwsClient::new_single("http://localhost:8080");
+        let client = AwsClient::new_single("http://127.0.0.1:8080");
         let handler = AwsHandler::new(audit, client);
         let request = make_request("aws.get_secret_value", serde_json::json!({}));
         let result = handler.execute(&request).await;
@@ -680,7 +713,7 @@ mod tests {
     #[tokio::test]
     async fn assume_role_missing_arn_rejected() {
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let client = AwsClient::new_single("http://localhost:8080");
+        let client = AwsClient::new_single("http://127.0.0.1:8080");
         let handler = AwsHandler::new(audit, client);
         let request = make_request("aws.assume_role", serde_json::json!({}));
         let result = handler.execute(&request).await;
@@ -691,7 +724,7 @@ mod tests {
     #[tokio::test]
     async fn create_secret_missing_name_rejected() {
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let client = AwsClient::new_single("http://localhost:8080");
+        let client = AwsClient::new_single("http://127.0.0.1:8080");
         let handler = AwsHandler::new(audit, client);
         let request = make_request("aws.create_secret", serde_json::json!({}));
         let result = handler.execute(&request).await;
@@ -702,7 +735,7 @@ mod tests {
     #[tokio::test]
     async fn get_parameter_missing_name_rejected() {
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let client = AwsClient::new_single("http://localhost:8080");
+        let client = AwsClient::new_single("http://127.0.0.1:8080");
         let handler = AwsHandler::new(audit, client);
         let request = make_request("aws.get_parameter", serde_json::json!({}));
         let result = handler.execute(&request).await;
@@ -713,7 +746,7 @@ mod tests {
     #[tokio::test]
     async fn get_parameters_by_path_missing_path_rejected() {
         let audit = Arc::new(InMemoryAuditEmitter::new());
-        let client = AwsClient::new_single("http://localhost:8080");
+        let client = AwsClient::new_single("http://127.0.0.1:8080");
         let handler = AwsHandler::new(audit, client);
         let request = make_request("aws.get_parameters_by_path", serde_json::json!({}));
         let result = handler.execute(&request).await;
@@ -761,21 +794,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn binary_secret_reveal_is_explicitly_encoded() {
+        let (_env_guard, handler, mock_server, _) = setup_handler_with_mock().await;
+        Mock::given(method("POST"))
+            .and(header("X-Amz-Target", "secretsmanager.GetSecretValue"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"Name":"binary-value","SecretBinary":"AP8="}),
+                ),
+            )
+            .mount(&mock_server)
+            .await;
+        let result = handler
+            .execute(&make_request(
+                "aws.get_secret_value",
+                serde_json::json!({"secret_id":"binary-value"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({"name":"binary-value","value":"AP8=","encoding":"base64"})
+        );
+        cleanup_env();
+    }
+
+    #[tokio::test]
     async fn get_caller_identity_via_handler() {
         let (_env_guard, handler, mock_server, audit) = setup_handler_with_mock().await;
 
         Mock::given(method("POST"))
             .and(path("/"))
             .and(header(
-                "X-Amz-Target",
-                "AWSSecurityTokenServiceV20110615.GetCallerIdentity",
+                "Content-Type", "application/x-www-form-urlencoded",
             ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "Account": "123456789012",
-                "Arn": "arn:aws:iam::123456789012:user/test",
-                "UserId": "AIDEXAMPLE"
-            })))
-            .expect(1)
+            .respond_with(ResponseTemplate::new(200).set_body_string("<GetCallerIdentityResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\"><GetCallerIdentityResult><Account>123456789012</Account><Arn>arn:aws:iam::123456789012:user/test</Arn><UserId>AIDEXAMPLE</UserId></GetCallerIdentityResult></GetCallerIdentityResponse>"))
             .mount(&mock_server)
             .await;
 
@@ -799,18 +852,9 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/"))
             .and(header(
-                "X-Amz-Target",
-                "AWSSecurityTokenServiceV20110615.AssumeRole",
+                "Content-Type", "application/x-www-form-urlencoded",
             ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "Credentials": {
-                    "AccessKeyId": "ASIAEXAMPLE",
-                    "SecretAccessKey": "newsecret",
-                    "SessionToken": "FwoGZX...",
-                    "Expiration": "2026-02-25T00:00:00Z"
-                }
-            })))
-            .expect(1)
+            .respond_with(ResponseTemplate::new(200).set_body_string("<AssumeRoleResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\"><AssumeRoleResult><Credentials><AccessKeyId>ASIAEXAMPLE</AccessKeyId><SecretAccessKey>newsecret</SecretAccessKey><SessionToken>FwoGZX...</SessionToken><Expiration>2026-03-01T13:00:00Z</Expiration></Credentials></AssumeRoleResult></AssumeRoleResponse>"))
             .mount(&mock_server)
             .await;
 
@@ -973,7 +1017,7 @@ mod tests {
             .and(path("/"))
             .and(header("X-Amz-Target", "secretsmanager.DeleteSecret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "Name": "old-secret"
+                "Name": "old-secret", "DeletionDate": 1900000000.0
             })))
             .expect(1)
             .mount(&mock_server)
@@ -1122,7 +1166,11 @@ mod tests {
         let result = handler.execute(&request).await;
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("authentication failed"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("authentication or authorization failed")
+        );
 
         cleanup_env();
     }
@@ -1201,8 +1249,9 @@ mod tests {
                 .push("raw-secret-must-not-bind".into());
             let prepared = handler.prepare(&request).unwrap();
             let mut expected = expected;
-            expected["aws_backend"] = "unsigned_loopback_fixture".into();
+            expected["aws_backend"] = "signed_loopback_fixture".into();
             expected["aws_api_url"] = "http://127.0.0.1:1".into();
+            expected["aws_region"] = "us-east-1".into();
             assert_eq!(serde_json::to_value(prepared.target()).unwrap(), expected);
             let mut expected_refs = vec![
                 "env:OPAQUE_MISSING_CANONICAL_AWS_AK".to_string(),

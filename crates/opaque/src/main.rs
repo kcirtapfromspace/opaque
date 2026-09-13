@@ -128,6 +128,10 @@ enum Cmd {
         /// Operation name (e.g. "test.noop", "github.set_actions_secret").
         operation: String,
 
+        /// Operation parameters as a JSON object. Prefer secret references in this file.
+        #[arg(long)]
+        params_file: Option<PathBuf>,
+
         /// Target key=value pairs (repeatable). E.g. --target repo=org/myrepo
         #[arg(long, short = 't', value_parser = parse_kv)]
         target: Vec<(String, String)>,
@@ -2799,10 +2803,18 @@ async fn main() {
         },
         Cmd::Execute {
             operation,
+            params_file,
             target,
             secret,
             workspace: attach_ws,
         } => {
+            let operation_params = match read_operation_params(params_file.as_deref()) {
+                Ok(params) => params,
+                Err(error) => {
+                    ui::error(&error);
+                    std::process::exit(EXIT_USAGE);
+                }
+            };
             let target_map: serde_json::Map<String, serde_json::Value> = target
                 .into_iter()
                 .map(|(k, v)| (k, serde_json::Value::String(v)))
@@ -2814,6 +2826,7 @@ async fn main() {
             };
             let params = serde_json::json!({
                 "operation": operation,
+                "params": operation_params,
                 "target": target_map,
                 "secret_ref_names": secret,
                 "workspace": ws,
@@ -3114,8 +3127,8 @@ async fn main() {
 
     // Verbose: show what we're about to call.
     ui::debug(&format!("method={method} socket={}", sock.display()));
-    if verbose && let Ok(params_json) = serde_json::to_string(&params) {
-        ui::debug(&format!("params={params_json}"));
+    if verbose {
+        ui::debug("request parameters omitted because they may contain confidential values");
     }
 
     let sp = if json_output || quiet {
@@ -3363,6 +3376,35 @@ fn provisioning_command_params(
     })
 }
 
+fn read_operation_params(path: Option<&std::path::Path>) -> Result<serde_json::Value, String> {
+    use std::io::Read;
+    let Some(path) = path else {
+        return Ok(serde_json::json!({}));
+    };
+    let file = std::fs::File::open(path).map_err(|_| "cannot open operation parameters file")?;
+    if !file
+        .metadata()
+        .map_err(|_| "cannot inspect operation parameters file")?
+        .is_file()
+    {
+        return Err("operation parameters must be a regular JSON file".into());
+    }
+    let limit = opaque_core::MAX_FRAME_LENGTH.saturating_sub(8192);
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "cannot read operation parameters file")?;
+    if bytes.len() > limit {
+        return Err("operation parameters exceed the IPC size limit".into());
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| "operation parameters require valid JSON")?;
+    if !value.is_object() {
+        return Err("operation parameters require a JSON object".into());
+    }
+    Ok(value)
+}
+
 fn task_command_params(action: TaskAction) -> Result<(&'static str, serde_json::Value), String> {
     use serde_json::json;
     Ok(match action {
@@ -3517,6 +3559,19 @@ fn render_task_receipt(task: &opaque_core::task::TaskRecord) -> String {
                         state
                     }
                 );
+                if let Some(contract) = &action.health_contract {
+                    let _ = writeln!(
+                        output,
+                        "    Health contract: {} / {} at {}:{}{}",
+                        contract.service,
+                        contract.version,
+                        contract.host,
+                        contract.port,
+                        contract.path
+                    );
+                } else {
+                    output.push_str("    Health contract: legacy fixture-api / version 1\n");
+                }
             }
             opaque_core::task::TaskAction::Inference(action) => {
                 let _ = writeln!(
@@ -3532,6 +3587,24 @@ fn render_task_receipt(task: &opaque_core::task::TaskRecord) -> String {
                     slot.id,
                     state
                 );
+                if let Some(snapshot) = &action.github_ci_snapshot {
+                    let _ = writeln!(
+                        output,
+                        "    GitHub repository: {} | Workflow: {} | Branch: {}\n    Observed: {} (Unix seconds), {} sampled runs",
+                        snapshot.source.repository,
+                        snapshot.source.workflow_id,
+                        snapshot.source.branch,
+                        snapshot.observed_at,
+                        snapshot.runs.len()
+                    );
+                    for run in &snapshot.runs {
+                        let _ = writeln!(
+                            output,
+                            "      Run {} attempt {}: {:?} / {:?} at {}",
+                            run.id, run.attempt, run.status, run.conclusion, run.head_sha
+                        );
+                    }
+                }
             }
             opaque_core::task::TaskAction::PublishSecret(action) => {
                 let _ = writeln!(
@@ -4199,6 +4272,14 @@ fn policy_check_path(file: Option<&Path>) -> Result<String, String> {
         {
             errors.push(format!("{prefix}: approval.lease_ttl must be > 0"));
         }
+        if rule.approval.budget.is_some()
+            && (rule.approval.require != opaque_core::operation::ApprovalRequirement::FirstUse
+                || rule.approval.budget == Some(0))
+        {
+            errors.push(format!(
+                "{prefix}: approval.budget requires first_use and must be > 0"
+            ));
+        }
     }
 
     if !errors.is_empty() {
@@ -4274,6 +4355,9 @@ fn policy_show(file: Option<&Path>) -> Result<(), String> {
             || rule.client.exe_sha256.is_some()
             || rule.client.codesign_team_id.is_some()
             || rule.client.uid.is_some()
+            || rule.client.attestor.is_some()
+            || rule.client.min_attestation.is_some()
+            || !rule.client.selectors.is_empty()
         {
             let mut parts = Vec::new();
             if let Some(ref p) = rule.client.exe_path {
@@ -4287,6 +4371,15 @@ fn policy_show(file: Option<&Path>) -> Result<(), String> {
             }
             if let Some(uid) = rule.client.uid {
                 parts.push(format!("uid={uid}"));
+            }
+            if let Some(attestor) = &rule.client.attestor {
+                parts.push(format!("attestor={}", attestor.as_str()));
+            }
+            if let Some(strength) = rule.client.min_attestation {
+                parts.push(format!("min_attestation={strength:?}").to_lowercase());
+            }
+            for selector in &rule.client.selectors {
+                parts.push(format!("selector={selector}"));
             }
             println!("      {} {}", style("client:").dim(), parts.join(", "));
         }
@@ -4347,6 +4440,9 @@ fn policy_show(file: Option<&Path>) -> Result<(), String> {
         if rule.approval.one_time {
             approval_parts.push("one-time".into());
         }
+        if let Some(budget) = rule.approval.budget {
+            approval_parts.push(format!("budget={budget} total attempts"));
+        }
         println!(
             "      {} {}",
             style("approval:").dim(),
@@ -4398,6 +4494,7 @@ fn policy_simulate(
             exe_path: std::env::current_exe().ok(),
             exe_sha256: None,
             codesign_team_id: None,
+            workload: None,
         },
         client_type,
         operation: operation.into(),
@@ -4456,6 +4553,9 @@ fn policy_simulate(
         }
         if decision.one_time {
             println!("  {} yes", style("one-time:").dim(),);
+        }
+        if let Some(budget) = decision.budget {
+            println!("  {} {} total attempts", style("budget:").dim(), budget);
         }
     } else {
         ui::error(&format!(
@@ -7152,6 +7252,9 @@ fn generate_repo_policy(remote_url: &str, preset_content: Option<&str>) -> Strin
             if let Some(ttl) = rule.approval.lease_ttl {
                 result.push_str(&format!("lease_ttl = {}\n", ttl.as_secs()));
             }
+            if let Some(budget) = rule.approval.budget {
+                result.push_str(&format!("budget = {budget}\n"));
+            }
             result.push('\n');
         }
 
@@ -7332,6 +7435,27 @@ fn preset_checklist(preset_name: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn operation_parameters_file_is_bounded_and_requires_an_object() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("params.json");
+        assert_eq!(read_operation_params(None).unwrap(), serde_json::json!({}));
+        fs::write(
+            &path,
+            r#"{"project":"example-project","secret_id":"demo","value_ref":"env:DEMO_SECRET"}"#,
+        )
+        .unwrap();
+        let params = read_operation_params(Some(&path)).unwrap();
+        assert_eq!(params["value_ref"], "env:DEMO_SECRET");
+        for invalid in ["[]", "null", "not json"] {
+            fs::write(&path, invalid).unwrap();
+            assert!(read_operation_params(Some(&path)).is_err());
+        }
+        fs::write(&path, vec![b' '; opaque_core::MAX_FRAME_LENGTH]).unwrap();
+        assert!(read_operation_params(Some(&path)).is_err());
+        assert!(read_operation_params(Some(directory.path())).is_err());
+    }
 
     /// Write a TOML string to a temp file and run policy_check_path on it.
     fn check_toml(content: &str) -> Result<String, String> {

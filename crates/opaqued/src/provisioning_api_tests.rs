@@ -41,6 +41,7 @@ fn peer(uid: u32) -> ClientIdentity {
         exe_path: None,
         exe_sha256: None,
         codesign_team_id: None,
+        workload: None,
     }
 }
 

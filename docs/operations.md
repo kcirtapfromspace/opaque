@@ -85,13 +85,15 @@ Result:
 - `duration_ms`: u64
 - `stdout_length`: u64
 - `stderr_length`: u64
-- `stdout`: string (captured; may be empty)
-- `stderr`: string (captured; may be empty)
 - `truncated`: bool (true when capture was capped)
 
 Notes:
 
-- The current implementation **returns captured stdout/stderr** (and the CLI prints it). Treat this as `SENSITIVE_OUTPUT`: agent clients should not be allowed by default, and sandboxed commands must not print secret material.
+- The broker returns output lengths and execution metadata. Captured stdout and
+  stderr remain inside the sandbox execution boundary and are not returned to
+  the caller. `SENSITIVE_OUTPUT` still requires approval through a trusted review
+  surface; sandboxed commands must not disclose secret material through other
+  channels.
 
 ### `github.set_actions_secret` (`SAFE`)
 

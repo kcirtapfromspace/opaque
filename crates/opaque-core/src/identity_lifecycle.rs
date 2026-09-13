@@ -199,6 +199,7 @@ async fn exchange(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod transport_tests {
     use super::*;
     use tokio::io::AsyncReadExt;

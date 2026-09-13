@@ -357,6 +357,7 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

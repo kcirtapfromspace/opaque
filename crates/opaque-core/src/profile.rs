@@ -359,6 +359,7 @@ pub fn load_named_profile(name: &str) -> Result<ExecProfile, ProfileError> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

@@ -1,0 +1,27 @@
+[Unit]
+Description=Opaque bounded SSH host guard
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I /opt/opaque-ssh/host_daemon.py guard
+# The system service defaults to root; host_daemon verifies euid before startup.
+# Keep the supervisor privileged so each probe can drop all supplementary groups.
+UMask=0077
+RuntimeDirectory=opaque-ssh
+RuntimeDirectoryMode=0755
+StateDirectory=opaque-ssh
+StateDirectoryMode=0700
+Restart=on-failure
+RestartSec=2
+KillMode=control-group
+TimeoutStopSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/run/opaque-ssh /var/lib/opaque-ssh
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

@@ -819,6 +819,7 @@ fn generate_challenge() -> Result<[u8; 32], Fido2Error> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use p256::ecdsa::SigningKey;

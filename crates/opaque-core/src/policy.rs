@@ -14,6 +14,7 @@ use crate::operation::{
     ApprovalFactor, ApprovalRequirement, ClientIdentity, ClientType, OperationRequest,
     OperationSafety, WorkspaceContext,
 };
+use crate::workload::{AttestationStrength, AttestorId, Selector};
 
 // ---------------------------------------------------------------------------
 // Client match pattern
@@ -22,6 +23,7 @@ use crate::operation::{
 /// Pattern for matching a client identity. All present fields must match.
 /// Absent (None) fields are treated as "any".
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientMatch {
     /// Match on UID.
     pub uid: Option<u32>,
@@ -34,11 +36,46 @@ pub struct ClientMatch {
 
     /// Exact match on macOS code signature Team ID.
     pub codesign_team_id: Option<String>,
+
+    /// Exact trusted listener attestor. A request cannot select its own attestor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestor: Option<AttestorId>,
+
+    /// Minimum achieved attestation strength; no caller claims are accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_attestation: Option<AttestationStrength>,
+
+    /// Every selector must be present exactly in the trusted observation set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selectors: Vec<Selector>,
 }
 
 impl ClientMatch {
     /// Returns `true` if the given identity matches this pattern.
     pub fn matches(&self, identity: &ClientIdentity) -> bool {
+        if self.attestor.is_some() || self.min_attestation.is_some() || !self.selectors.is_empty() {
+            let Some(workload) = identity
+                .workload
+                .as_ref()
+                .filter(|value| value.is_attested())
+            else {
+                return false;
+            };
+            if self
+                .attestor
+                .as_ref()
+                .is_some_and(|expected| expected != &workload.source)
+                || self
+                    .min_attestation
+                    .is_some_and(|minimum| workload.strength < minimum)
+                || self
+                    .selectors
+                    .iter()
+                    .any(|selector| !workload.selectors.contains(selector))
+            {
+                return false;
+            }
+        }
         if let Some(uid) = self.uid
             && identity.uid != uid
         {
@@ -367,6 +404,12 @@ pub struct ApprovalConfig {
     #[serde(default)]
     pub one_time: bool,
 
+    /// Total attempts authorized by one first-use approval, including the
+    /// approving request. Exhaustion denies reuse until expiry or revocation.
+    /// Absent preserves the legacy unlimited-within-TTL behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<u32>,
+
     /// Break-glass segregation of duties: the approver must be a different
     /// principal than the one the operation is performed on behalf of
     /// (`sub`). Fails closed when the request carries no principal context
@@ -383,6 +426,7 @@ impl Default for ApprovalConfig {
             factors: vec![],
             lease_ttl: None,
             one_time: false,
+            budget: None,
             require_distinct_approver: false,
         }
     }
@@ -535,6 +579,10 @@ pub struct PolicyDecision {
     /// If true, the approval is consumed after one use.
     pub one_time: bool,
 
+    /// Total attempts covered by a first-use approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<u32>,
+
     /// If true, the approver must differ from the request's `sub` principal.
     #[serde(default)]
     pub require_distinct_approver: bool,
@@ -555,6 +603,7 @@ impl PolicyDecision {
             approval_requirement: ApprovalRequirement::Never,
             lease_ttl: None,
             one_time: false,
+            budget: None,
             require_distinct_approver: false,
             matched_rule: None,
             denial_reason: Some(reason.into()),
@@ -651,6 +700,7 @@ impl PolicyEngine {
                         approval_requirement: ApprovalRequirement::Never,
                         lease_ttl: None,
                         one_time: false,
+                        budget: None,
                         require_distinct_approver: false,
                         matched_rule: Some(rule.name.clone()),
                         denial_reason: Some(format!("denied by rule: {}", rule.name)),
@@ -661,12 +711,21 @@ impl PolicyEngine {
                 // client classification here. Classification is audit-only; the
                 // enclave clamps SensitiveOutput to mandatory out-of-band approval
                 // instead — a sound presence signal at a shared uid.
+                if rule.approval.budget.is_some()
+                    && (rule.approval.require != ApprovalRequirement::FirstUse
+                        || rule.approval.budget == Some(0))
+                {
+                    return PolicyDecision::deny(
+                        "approval budget requires first_use and a positive count",
+                    );
+                }
                 return PolicyDecision {
                     allowed: true,
                     required_factors: rule.approval.factors.clone(),
                     approval_requirement: rule.approval.require,
                     lease_ttl: rule.approval.lease_ttl,
                     one_time: rule.approval.one_time,
+                    budget: rule.approval.budget,
                     require_distinct_approver: rule.approval.require_distinct_approver,
                     matched_rule: Some(rule.name.clone()),
                     denial_reason: None,
@@ -686,6 +745,7 @@ impl Default for PolicyEngine {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -705,6 +765,7 @@ mod tests {
             exe_path: Some("/usr/bin/claude-code".into()),
             exe_sha256: Some("aabbccdd".into()),
             codesign_team_id: None,
+            workload: None,
         }
     }
 
@@ -726,6 +787,122 @@ mod tests {
             workspace: None,
             principal: None,
         }
+    }
+
+    fn workload_identity(strength: AttestationStrength) -> crate::workload::WorkloadIdentity {
+        crate::workload::WorkloadIdentity {
+            source: "peercred".to_owned().try_into().unwrap(),
+            strength,
+            selectors: ["peercred:uid:501", "peercred:exe_path:/usr/bin/claude-code"]
+                .into_iter()
+                .map(|value| value.parse().unwrap())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn workload_constraints_require_trusted_exact_selectors_source_and_strength() {
+        let matcher: ClientMatch = serde_json::from_value(serde_json::json!({
+            "uid": 501,
+            "attestor": "peercred",
+            "min_attestation": "medium",
+            "selectors": ["peercred:uid:501", "peercred:exe_path:/usr/bin/claude-code"]
+        }))
+        .unwrap();
+        let mut identity = test_identity();
+        assert!(!matcher.matches(&identity));
+        identity.workload = Some(workload_identity(AttestationStrength::Weak));
+        assert!(!matcher.matches(&identity));
+        identity.workload = Some(workload_identity(AttestationStrength::Medium));
+        assert!(matcher.matches(&identity));
+        identity.workload.as_mut().unwrap().source = "other".to_owned().try_into().unwrap();
+        assert!(!matcher.matches(&identity));
+        identity.workload = Some(workload_identity(AttestationStrength::Strong));
+        identity
+            .workload
+            .as_mut()
+            .unwrap()
+            .selectors
+            .remove(&"peercred:exe_path:/usr/bin/claude-code".parse().unwrap());
+        assert!(!matcher.matches(&identity));
+        let wildcard: ClientMatch = serde_json::from_value(serde_json::json!({
+            "selectors": ["peercred:uid:*"]
+        }))
+        .unwrap();
+        assert!(
+            !wildcard.matches(&identity),
+            "selectors are literal, never globs"
+        );
+    }
+
+    #[test]
+    fn workload_policy_fails_closed_without_attestation_even_for_none_floor() {
+        let matcher: ClientMatch = serde_json::from_value(serde_json::json!({
+            "min_attestation": "none"
+        }))
+        .unwrap();
+        let mut identity = test_identity();
+        assert!(!matcher.matches(&identity));
+        identity.workload = Some(crate::workload::WorkloadIdentity::unavailable(
+            "peercred".to_owned().try_into().unwrap(),
+        ));
+        assert!(!matcher.matches(&identity));
+        identity.workload = Some(workload_identity(AttestationStrength::Weak));
+        assert!(matcher.matches(&identity));
+    }
+
+    #[test]
+    fn workload_claims_cannot_survive_client_identity_deserialization() {
+        let mut identity = test_identity();
+        identity.workload = Some(workload_identity(AttestationStrength::Strong));
+        let mut wire = serde_json::to_value(&identity).unwrap();
+        assert!(wire.get("workload").is_none());
+        wire["workload"] = serde_json::to_value(identity.workload.unwrap()).unwrap();
+        let decoded: ClientIdentity = serde_json::from_value(wire).unwrap();
+        assert!(decoded.workload.is_none());
+        let matcher: ClientMatch = serde_json::from_value(serde_json::json!({
+            "min_attestation": "weak"
+        }))
+        .unwrap();
+        assert!(!matcher.matches(&decoded));
+        assert!(
+            serde_json::from_value::<ClientMatch>(serde_json::json!({
+                "agent_instance": "caller-chosen"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ClientMatch>(serde_json::json!({
+                "min_attestation": "hardware"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn workload_reaches_policy_evaluation_and_changes_approval_content_hash() {
+        let mut rule = allow_rule();
+        rule.client.min_attestation = Some(AttestationStrength::Medium);
+        let engine = PolicyEngine::with_rules(vec![rule]);
+        let mut request = test_request("github.list_secrets", ClientType::Agent);
+        let absent_hash = request.content_hash();
+        assert!(!engine.evaluate(&request, OperationSafety::Safe).allowed);
+        request.client_identity.workload = Some(workload_identity(AttestationStrength::Medium));
+        assert!(engine.evaluate(&request, OperationSafety::Safe).allowed);
+        let approved_hash = request.content_hash();
+        assert_ne!(approved_hash, absent_hash);
+        request.client_identity.workload.as_mut().unwrap().strength = AttestationStrength::Weak;
+        assert!(!engine.evaluate(&request, OperationSafety::Safe).allowed);
+        assert_ne!(request.content_hash(), approved_hash);
+        request.client_identity.workload = Some(workload_identity(AttestationStrength::Medium));
+        request
+            .client_identity
+            .workload
+            .as_mut()
+            .unwrap()
+            .selectors
+            .insert("peercred:codesign_team_id:TEAM123".parse().unwrap());
+        assert_ne!(request.content_hash(), approved_hash);
     }
 
     fn allow_rule() -> PolicyRule {
@@ -754,6 +931,7 @@ mod tests {
                 factors: vec![ApprovalFactor::LocalBio],
                 lease_ttl: None,
                 one_time: true,
+                budget: None,
                 require_distinct_approver: false,
             },
         }
@@ -850,6 +1028,7 @@ mod tests {
             approval_requirement: ApprovalRequirement::Never,
             lease_ttl: None,
             one_time: false,
+            budget: None,
             require_distinct_approver: false,
             matched_rule: Some("test-rule".into()),
             denial_reason: None,
@@ -1003,6 +1182,7 @@ mod tests {
             approval_requirement: ApprovalRequirement::Never,
             lease_ttl: None,
             one_time: false,
+            budget: None,
             require_distinct_approver: false,
             matched_rule: None,
             denial_reason: None,
@@ -1018,6 +1198,7 @@ mod tests {
             approval_requirement: ApprovalRequirement::Never,
             lease_ttl: None,
             one_time: false,
+            budget: None,
             require_distinct_approver: false,
             matched_rule: None,
             denial_reason: None,
@@ -1032,6 +1213,7 @@ mod tests {
             factors: vec![ApprovalFactor::LocalBio],
             lease_ttl: Some(Duration::from_secs(300)),
             one_time: false,
+            budget: None,
             require_distinct_approver: false,
         };
         let json = serde_json::to_string(&config).unwrap();
@@ -1046,6 +1228,7 @@ mod tests {
             factors: vec![],
             lease_ttl: None,
             one_time: true,
+            budget: None,
             require_distinct_approver: false,
         };
         let json = serde_json::to_string(&config).unwrap();

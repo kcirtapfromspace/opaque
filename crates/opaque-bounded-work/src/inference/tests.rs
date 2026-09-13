@@ -4,6 +4,85 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[tokio::test]
+async fn github_capture_is_bound_to_each_prompt_and_seed_cannot_execute() {
+    use opaque_core::inference::github::{GithubCiRun, GithubCiSnapshot, RunConclusion, RunStatus};
+    let (server, mut profile, _) = fixture().await;
+    profile.config.source_id = GITHUB_SOURCE_ID.into();
+    profile.config.source_snapshot_sha256.clear();
+    profile.config.github_ci = Some(GithubCiSource {
+        repository: "owner/repository".into(),
+        workflow_id: 7,
+        branch: "main".into(),
+    });
+    let mut manifest = public_demo_manifest(&profile, "CI review".into(), 600).unwrap();
+    let seed = manifest.clone();
+    let result = execute_inference_action(
+        &seed,
+        seed.actions[0].as_inference().unwrap(),
+        &profile,
+        || async { Ok(()) },
+    )
+    .await;
+    assert_eq!(result.outcome.state, SlotState::Rejected);
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "an uncaptured seed must not resolve credentials or contact the model"
+    );
+    let snapshot = GithubCiSnapshot {
+        source: profile.github_ci.clone().unwrap(),
+        repository_id: 9,
+        observed_at: 100,
+        runs: vec![GithubCiRun {
+            id: 10,
+            attempt: 1,
+            head_sha: "a".repeat(40),
+            status: RunStatus::Completed,
+            conclusion: Some(RunConclusion::Failure),
+        }],
+    };
+    attach_github_snapshot(&mut manifest, &profile, snapshot.clone()).unwrap();
+    assert_ne!(manifest.digest().unwrap(), seed.digest().unwrap());
+    for action in &manifest.actions {
+        let action = action.as_inference().unwrap();
+        assert_eq!(action.source_snapshot_sha256, snapshot.digest());
+        assert_eq!(
+            action.prompt_sha256,
+            sha256(action_prompt(&profile, action).unwrap().as_bytes())
+        );
+    }
+    let mut changed = manifest.clone();
+    changed.actions[0]
+        .as_inference_mut()
+        .unwrap()
+        .github_ci_snapshot
+        .as_mut()
+        .unwrap()
+        .runs[0]
+        .conclusion = Some(RunConclusion::Success);
+    assert!(prepare_inference_manifest(&mut changed, &profile).is_err());
+    let mut other_profile = profile.clone();
+    other_profile.config.github_ci.as_mut().unwrap().workflow_id = 8;
+    assert!(prepare_inference_manifest(&mut manifest.clone(), &other_profile).is_err());
+    Mock::given(method("POST"))
+        .and(path("/completion"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(completion(&profile)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let action = manifest.actions[0].as_inference().unwrap();
+    let result = execute_inference_action(&manifest, action, &profile, || async { Ok(()) }).await;
+    assert_eq!(result.outcome.state, SlotState::ApiAccepted);
+    result.receipt.unwrap().validate(action).unwrap();
+    let requests = server.received_requests().await.unwrap();
+    let template = requests
+        .iter()
+        .find(|request| request.url.path() == "/apply-template")
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&template.body).unwrap();
+    assert_eq!(body["messages"][0]["content"], snapshot.prompt(1).unwrap());
+}
+
 async fn fixture() -> (MockServer, TrustedInferenceProfile, TaskManifest) {
     let server = MockServer::start().await;
     let tenant = TenantBinding::new(
@@ -21,6 +100,7 @@ async fn fixture() -> (MockServer, TrustedInferenceProfile, TaskManifest) {
         server_build: "b1-fixture".into(),
         service_uid: uuid::Uuid::new_v4(),
         source_id: DEMO_SOURCE_ID.into(),
+        github_ci: None,
         source_snapshot_sha256: demo_source_snapshot_sha256(),
         credential_ref: None,
         allow_loopback_http: true,
@@ -364,6 +444,7 @@ fn trusted_profile_rejects_endpoint_source_and_credential_expansion() {
         server_build: "b1-fixture".into(),
         service_uid: uuid::Uuid::new_v4(),
         source_id: DEMO_SOURCE_ID.into(),
+        github_ci: None,
         source_snapshot_sha256: demo_source_snapshot_sha256(),
         credential_ref: None,
         allow_loopback_http: false,

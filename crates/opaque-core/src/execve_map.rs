@@ -197,6 +197,7 @@ fn build_command_string(executable: &str, args: &[String]) -> String {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

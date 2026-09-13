@@ -4,12 +4,8 @@
 //! - **Secret resolution** via `bitwarden:<secret-id>` or `bitwarden:<project>/<key>` refs
 //! - **CLI browsing** via `bitwarden.list_projects` and `bitwarden.list_secrets` operations
 //!
-//! Uses the Bitwarden Secrets Manager REST API with service account access tokens.
-//!
-//! Backend selection:
-//! 1. If `OPAQUE_BITWARDEN_URL` is set → use that URL
-//! 2. Otherwise → use default `https://api.bitwarden.com`
-//! 3. If no token is configured → disabled
+//! Uses the official `bws` CLI for machine-token authentication and decryption.
+//! Requires an installed trusted executable and the configured machine token ref.
 
 mod action;
 pub mod client;
@@ -27,6 +23,7 @@ use action::BitwardenAction;
 use opaque_core::resolver::{BaseResolver, SecretResolver};
 
 use client::BitwardenClient;
+use zeroize::Zeroizing;
 
 /// Default keychain ref for the Bitwarden access token.
 const DEFAULT_TOKEN_REF: &str = "keychain:opaque/bitwarden-token";
@@ -66,14 +63,14 @@ impl BitwardenHandler {
     }
 
     /// Resolve the Bitwarden access token.
-    fn resolve_token(&self) -> Result<String, String> {
+    fn resolve_token(&self) -> Result<Zeroizing<String>, String> {
         let base = BaseResolver::new();
         let token_value = base
             .resolve(&self.token_ref)
             .map_err(|e| format!("failed to resolve Bitwarden access token: {e}"))?;
         token_value
             .as_str()
-            .map(|s| s.to_owned())
+            .map(|s| Zeroizing::new(s.to_owned()))
             .ok_or_else(|| "Bitwarden access token is not valid UTF-8".to_string())
     }
 }
@@ -90,7 +87,18 @@ impl OperationHandler for BitwardenHandler {
         let mut target = action.target();
         let api_url = self.client.base_url().to_owned();
         target.insert("bitwarden_api_url".into(), api_url.clone());
-        let action = action::BoundAction { action, api_url };
+        let identity_url = self.client.identity_url().to_owned();
+        let executable = self.client.executable_path().to_string_lossy().into_owned();
+        let executable_sha256 = self.client.executable_sha256().to_owned();
+        target.insert("bitwarden_identity_url".into(), identity_url.clone());
+        target.insert("bitwarden_cli_sha256".into(), executable_sha256.clone());
+        let action = action::BoundAction {
+            action,
+            api_url,
+            identity_url,
+            executable,
+            executable_sha256,
+        };
         let request_id = request.request_id;
         let operation = request.operation.clone();
         let audit = self.audit.clone();
@@ -202,7 +210,7 @@ impl OperationHandler for BitwardenHandler {
                     );
 
                     let token = self.resolve_token()?;
-                    let secret = self
+                    let mut secret = self
                         .client
                         .get_secret(&token, secret_id)
                         .await
@@ -210,6 +218,7 @@ impl OperationHandler for BitwardenHandler {
 
                     let value = secret
                         .value
+                        .take()
                         .ok_or_else(|| format!("secret '{secret_id}' has no value"))?;
 
                     audit.emit(
@@ -238,496 +247,8 @@ impl OperationHandler for BitwardenHandler {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use opaque_core::audit::InMemoryAuditEmitter;
-    use opaque_core::operation::{ClientIdentity, ClientType};
-
-    fn make_request(operation: &str, params: serde_json::Value) -> OperationRequest {
-        OperationRequest {
-            principal: None,
-            request_id: uuid::Uuid::new_v4(),
-            client_identity: ClientIdentity {
-                uid: 501,
-                gid: 20,
-                pid: Some(1234),
-                exe_path: None,
-                exe_sha256: None,
-                codesign_team_id: None,
-            },
-            client_type: ClientType::Human,
-            operation: operation.into(),
-            target: std::collections::HashMap::new(),
-            secret_ref_names: vec![],
-            created_at: std::time::SystemTime::now(),
-            expires_at: None,
-            params,
-            workspace: None,
-        }
-    }
-
-    #[test]
-    fn handler_debug() {
-        let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = BitwardenHandler::new(audit, "http://localhost:8080").unwrap();
-        let debug = format!("{handler:?}");
-        assert!(debug.contains("BitwardenHandler"));
-    }
-
-    #[tokio::test]
-    async fn unknown_operation_rejected() {
-        let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = BitwardenHandler::new(audit, "http://localhost:8080").unwrap();
-        let request = make_request("bitwarden.unknown", serde_json::json!({}));
-        let result = handler.execute(&request).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("unknown Bitwarden operation"));
-    }
-
-    #[tokio::test]
-    async fn read_secret_missing_id_rejected() {
-        let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = BitwardenHandler::new(audit, "http://localhost:8080").unwrap();
-        let request = make_request("bitwarden.read_secret", serde_json::json!({}));
-        let result = handler.execute(&request).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("missing 'secret_id'"));
-    }
-
-    // -----------------------------------------------------------------------
-    // Integration tests using wiremock
-    // -----------------------------------------------------------------------
-
-    use wiremock::matchers::{header, method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    /// These tests share one process-global env var (OPAQUE_BITWARDEN_TOKEN_REF)
-    /// and cleanup_env() removes it — run in parallel, one test's cleanup can
-    /// race another's token resolution, which then falls back to the keychain
-    /// (absent in CI containers). Serialize them.
-    static ENV_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        match ENV_SERIAL.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        }
-    }
-
-    /// Set up a handler pointing at a mock server with the access token
-    /// provided via env var.
-    async fn setup_handler_with_mock() -> (BitwardenHandler, MockServer, Arc<InMemoryAuditEmitter>)
-    {
-        let mock_server = MockServer::start().await;
-        let audit = Arc::new(InMemoryAuditEmitter::new());
-
-        // Provide the access token via env var so resolve_token()
-        // uses env resolver instead of keychain.
-        let token_env = format!("OPAQUE_TEST_BW_TOKEN_{}", uuid::Uuid::new_v4().as_simple());
-        unsafe { std::env::set_var(&token_env, "test-bw-token") };
-        unsafe { std::env::set_var(TOKEN_REF_ENV, format!("env:{token_env}")) };
-
-        let handler = BitwardenHandler::new(audit.clone(), &mock_server.uri()).unwrap();
-        (handler, mock_server, audit)
-    }
-
-    /// Clean up env vars after test.
-    fn cleanup_env() {
-        unsafe { std::env::remove_var(TOKEN_REF_ENV) };
-    }
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: serialize env-var tests
-    async fn list_projects_via_handler() {
-        let _env = env_guard();
-        let (handler, mock_server, audit) = setup_handler_with_mock().await;
-
-        Mock::given(method("GET"))
-            .and(path("/api/projects"))
-            .and(header("Authorization", "Bearer test-bw-token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"id": "p1", "name": "Production"},
-                {"id": "p2", "name": "Staging"}
-            ])))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let request = make_request("bitwarden.list_projects", serde_json::json!({}));
-        let result = handler.execute(&request).await.unwrap();
-
-        // Response should contain sanitized projects (names only, no IDs).
-        let projects = result["projects"].as_array().unwrap();
-        assert_eq!(projects.len(), 2);
-        assert_eq!(projects[0]["name"], "Production");
-        assert!(projects[0].get("id").is_none()); // ID must not leak
-        assert_eq!(projects[1]["name"], "Staging");
-
-        // Verify audit events were emitted.
-        let events = audit.events();
-        assert!(events.len() >= 2); // ProviderFetchStarted + ProviderFetchFinished
-
-        cleanup_env();
-    }
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: serialize env-var tests
-    async fn list_secrets_via_handler() {
-        let _env = env_guard();
-        let (handler, mock_server, _audit) = setup_handler_with_mock().await;
-
-        // Mock list_projects to resolve project name → ID
-        Mock::given(method("GET"))
-            .and(path("/api/projects"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"id": "p1", "name": "Production"}
-            ])))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        // Mock list_secrets for the resolved project ID
-        Mock::given(method("GET"))
-            .and(path("/api/secrets"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"id": "s1", "key": "DB_PASSWORD"},
-                {"id": "s2", "key": "API_KEY"}
-            ])))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let request = make_request(
-            "bitwarden.list_secrets",
-            serde_json::json!({"project": "Production"}),
-        );
-        let result = handler.execute(&request).await.unwrap();
-
-        // Response should contain sanitized secrets (keys only, no IDs).
-        assert_eq!(result["project"], "Production");
-        let secrets = result["secrets"].as_array().unwrap();
-        assert_eq!(secrets.len(), 2);
-        assert_eq!(secrets[0]["key"], "DB_PASSWORD");
-        assert!(secrets[0].get("id").is_none()); // ID must not leak
-        assert_eq!(secrets[1]["key"], "API_KEY");
-
-        cleanup_env();
-    }
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: serialize env-var tests
-    async fn list_secrets_no_project_filter() {
-        let _env = env_guard();
-        let (handler, mock_server, _audit) = setup_handler_with_mock().await;
-
-        Mock::given(method("GET"))
-            .and(path("/api/secrets"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"id": "s1", "key": "DB_PASSWORD"}
-            ])))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let request = make_request("bitwarden.list_secrets", serde_json::json!({}));
-        let result = handler.execute(&request).await.unwrap();
-
-        let secrets = result["secrets"].as_array().unwrap();
-        assert_eq!(secrets.len(), 1);
-        assert_eq!(secrets[0]["key"], "DB_PASSWORD");
-
-        cleanup_env();
-    }
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: serialize env-var tests
-    async fn list_projects_auth_failure() {
-        let _env = env_guard();
-        let (handler, mock_server, _audit) = setup_handler_with_mock().await;
-
-        Mock::given(method("GET"))
-            .and(path("/api/projects"))
-            .respond_with(ResponseTemplate::new(401))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let request = make_request("bitwarden.list_projects", serde_json::json!({}));
-        let result = handler.execute(&request).await;
-
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("authentication failed"));
-
-        cleanup_env();
-    }
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: serialize env-var tests
-    async fn read_secret_via_handler() {
-        let _env = env_guard();
-        let (handler, mock_server, audit) = setup_handler_with_mock().await;
-
-        Mock::given(method("GET"))
-            .and(path("/api/secrets/sec-123"))
-            .and(header("Authorization", "Bearer test-bw-token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "sec-123",
-                "key": "DB_PASSWORD",
-                "value": "supersecret",
-                "projectId": "p1"
-            })))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let request = make_request(
-            "bitwarden.read_secret",
-            serde_json::json!({"secret_id": "sec-123"}),
-        );
-        let result = handler.execute(&request).await.unwrap();
-
-        assert_eq!(result["secret_id"], "sec-123");
-        assert_eq!(result["key"], "DB_PASSWORD");
-        assert_eq!(result["value"], "supersecret");
-
-        let events = audit.events();
-        assert!(events.len() >= 2);
-
-        cleanup_env();
-    }
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: serialize env-var tests
-    async fn read_secret_not_found() {
-        let _env = env_guard();
-        let (handler, mock_server, _audit) = setup_handler_with_mock().await;
-
-        Mock::given(method("GET"))
-            .and(path("/api/secrets/missing"))
-            .respond_with(ResponseTemplate::new(404))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let request = make_request(
-            "bitwarden.read_secret",
-            serde_json::json!({"secret_id": "missing"}),
-        );
-        let result = handler.execute(&request).await;
-
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not found"));
-
-        cleanup_env();
-    }
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: serialize env-var tests
-    async fn list_secrets_project_not_found() {
-        let _env = env_guard();
-        let (handler, mock_server, _audit) = setup_handler_with_mock().await;
-
-        // Project lookup returns empty list → project not found
-        Mock::given(method("GET"))
-            .and(path("/api/projects"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let request = make_request(
-            "bitwarden.list_secrets",
-            serde_json::json!({"project": "Nonexistent"}),
-        );
-        let result = handler.execute(&request).await;
-
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("project lookup failed"));
-
-        cleanup_env();
-    }
-
-    #[test]
-    fn prepared_actions_distinguish_all_projects_from_an_exact_project() {
-        let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = BitwardenHandler {
-            audit: audit.clone(),
-            client: BitwardenClient::new("http://127.0.0.1:1").unwrap(),
-            token_ref: "env:OPAQUE_MISSING_CANONICAL_BW_TOKEN".into(),
-        };
-        for (operation, params, expected) in [
-            (
-                "bitwarden.list_projects",
-                serde_json::json!({}),
-                serde_json::json!({}),
-            ),
-            (
-                "bitwarden.list_secrets",
-                serde_json::json!({}),
-                serde_json::json!({}),
-            ),
-            (
-                "bitwarden.list_secrets",
-                serde_json::json!({"project":null}),
-                serde_json::json!({}),
-            ),
-            (
-                "bitwarden.list_secrets",
-                serde_json::json!({"project":"Exact Project"}),
-                serde_json::json!({"project":"Exact Project"}),
-            ),
-            (
-                "bitwarden.read_secret",
-                serde_json::json!({"secret_id":"secret-123"}),
-                serde_json::json!({"secret_id":"secret-123"}),
-            ),
-        ] {
-            let mut request = make_request(operation, params);
-            request.target.insert("project".into(), "decoy".into());
-            let prepared = handler.prepare(&request).unwrap();
-            let mut expected = expected;
-            expected["bitwarden_api_url"] = "http://127.0.0.1:1".into();
-            assert_eq!(serde_json::to_value(prepared.target()).unwrap(), expected);
-            let mut expected_refs = vec!["env:OPAQUE_MISSING_CANONICAL_BW_TOKEN".to_string()];
-            if operation == "bitwarden.read_secret" {
-                expected_refs.push("secret-123".into());
-            }
-            assert_eq!(prepared.secret_ref_names(), expected_refs);
-            assert_eq!(prepared.params()["action"], format!("{operation}.v1"));
-        }
-        let absent = handler
-            .prepare(&make_request(
-                "bitwarden.list_secrets",
-                serde_json::json!({}),
-            ))
-            .unwrap();
-        let null = handler
-            .prepare(&make_request(
-                "bitwarden.list_secrets",
-                serde_json::json!({"project":null}),
-            ))
-            .unwrap();
-        assert_eq!(absent.params(), null.params());
-        assert!(audit.events().is_empty());
-    }
-
-    #[tokio::test]
-    async fn malformed_and_path_ambiguous_actions_fail_before_provider_work() {
-        let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = BitwardenHandler::new(audit.clone(), "http://127.0.0.1:1").unwrap();
-        for (operation, params) in [
-            (
-                "bitwarden.list_projects",
-                serde_json::json!({"project":"hidden-scope"}),
-            ),
-            ("bitwarden.list_projects", serde_json::json!([])),
-            (
-                "bitwarden.list_secrets",
-                serde_json::json!({"project":false}),
-            ),
-            ("bitwarden.list_secrets", serde_json::json!({"project":""})),
-            (
-                "bitwarden.read_secret",
-                serde_json::json!({"secret_id":"../projects"}),
-            ),
-            (
-                "bitwarden.read_secret",
-                serde_json::json!({"secret_id":"id?other=secret"}),
-            ),
-            (
-                "bitwarden.read_secret",
-                serde_json::json!({"secret_id":"id%2fother"}),
-            ),
-            (
-                "bitwarden.read_secret",
-                serde_json::json!({"secret_id":"id","project":"ignored"}),
-            ),
-        ] {
-            assert!(
-                handler
-                    .execute(&make_request(operation, params))
-                    .await
-                    .is_err()
-            );
-        }
-        assert!(audit.events().is_empty());
-    }
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn prepared_read_executes_original_id_after_request_changes() {
-        let _guard = env_guard();
-        let (handler, mock_server, _) = setup_handler_with_mock().await;
-        Mock::given(method("GET"))
-            .and(path("/api/secrets/approved-id"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id":"approved-id","key":"key","value":"synthetic-fixture"
-            })))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-        let mut request = make_request(
-            "bitwarden.read_secret",
-            serde_json::json!({"secret_id":"approved-id"}),
-        );
-        let prepared = handler.prepare(&request).unwrap();
-        request.params["secret_id"] = "changed-id".into();
-        assert_eq!(prepared.target()["secret_id"], "approved-id");
-        assert_eq!(
-            prepared.execute().await.unwrap()["secret_id"],
-            "approved-id"
-        );
-        assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
-        cleanup_env();
-    }
-
-    #[test]
-    fn resource_secret_name_policy_keeps_the_legacy_id_constraint() {
-        use opaque_core::policy::SecretNameMatch;
-        let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = BitwardenHandler {
-            audit: audit.clone(),
-            client: BitwardenClient::new("http://127.0.0.1:1").unwrap(),
-            token_ref: "env:FIXTURE_BW_AUTH".into(),
-        };
-        let policy = SecretNameMatch {
-            patterns: vec!["env:FIXTURE_BW_AUTH".into(), "allowed-id".into()],
-        };
-        let approved = handler
-            .prepare(&make_request(
-                "bitwarden.read_secret",
-                serde_json::json!({"secret_id":"allowed-id"}),
-            ))
-            .unwrap();
-        let mut request = make_request(
-            "bitwarden.read_secret",
-            serde_json::json!({"secret_id":"other-id"}),
-        );
-        request.secret_ref_names = vec!["allowed-id".into()];
-        let denied = handler.prepare(&request).unwrap();
-        assert!(policy.matches(approved.secret_ref_names()));
-        assert!(!policy.matches(denied.secret_ref_names()));
-        assert!(
-            !SecretNameMatch {
-                patterns: vec!["env:FIXTURE_BW_AUTH".into()]
-            }
-            .matches(approved.secret_ref_names())
-        );
-        assert!(audit.events().is_empty());
-    }
-
-    #[test]
-    fn prepared_hash_payload_distinguishes_configured_endpoints() {
-        let audit = Arc::new(InMemoryAuditEmitter::new());
-        let first = BitwardenHandler::new(audit.clone(), "http://127.0.0.1:1").unwrap();
-        let second = BitwardenHandler::new(audit.clone(), "http://127.0.0.1:2").unwrap();
-        let request = make_request("bitwarden.list_projects", serde_json::json!({}));
-        let first = first.prepare(&request).unwrap();
-        let second = second.prepare(&request).unwrap();
-        assert_ne!(first.params(), second.params());
-        assert_eq!(first.params()["api_url"], "http://127.0.0.1:1");
-        assert_eq!(first.target()["bitwarden_api_url"], "http://127.0.0.1:1");
-        assert!(audit.events().is_empty());
-    }
-}
+#[cfg(all(test, unix))]
+mod test_support;
+#[cfg(all(test, unix))]
+#[path = "handler_tests.rs"]
+mod tests;

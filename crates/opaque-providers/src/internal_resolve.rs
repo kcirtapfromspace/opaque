@@ -66,17 +66,31 @@ pub(crate) fn default_secret_resolvers() -> Vec<Box<dyn SecretResolver>> {
         }
     }
 
-    // AWS remains disabled until SigV4 exists. Only explicitly configured
-    // loopback mocks can be reached by any aws: secret resolution path.
+    // AWS uses the configured region and explicit credential references.
     #[cfg(feature = "aws")]
     {
-        match crate::aws::client::AwsClient::from_mock_env() {
+        match crate::aws::client::AwsClient::from_env() {
             Ok(Some(client)) => {
                 resolvers.push(Box::new(crate::aws::resolve::AwsResolver::new(client)))
             }
             Ok(None) => {}
             Err(e) => tracing::warn!("AWS client disabled: {e}"),
         }
+    }
+
+    #[cfg(feature = "gcp")]
+    match crate::gcp::client::GcpSecretManagerClient::from_env() {
+        Ok(Some(client)) => resolvers.push(Box::new(crate::gcp::resolve::GcpResolver::new(client))),
+        Ok(None) => {}
+        Err(e) => tracing::warn!("GCP client disabled: {e}"),
+    }
+    #[cfg(feature = "azure")]
+    match crate::azure::client::AzureKeyVaultClient::from_env() {
+        Ok(Some(client)) => {
+            resolvers.push(Box::new(crate::azure::resolve::AzureResolver::new(client)))
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!("Azure client disabled: {e}"),
     }
 
     // Vault backend: available if URL scheme is valid.
@@ -117,6 +131,31 @@ impl CompositeResolver {
 }
 
 impl SecretResolver for CompositeResolver {
+    fn resolve_batch(&self, refs: &[&str]) -> Result<Vec<SecretValue>, ResolveError> {
+        opaque_core::resolver::resolve_batch_by_scheme(refs, |group| {
+            let first = group[0];
+            if first.starts_with("env:") {
+                return self.env.resolve_batch(group);
+            }
+            if first.starts_with("keychain:") {
+                return self.keychain.resolve_batch(group);
+            }
+            if first.starts_with("profile:") {
+                return self.profile.resolve_batch(group);
+            }
+            for provider in &self.providers {
+                match provider.resolve_batch(group) {
+                    Err(ResolveError::UnknownScheme(_)) => continue,
+                    result => return result,
+                }
+            }
+            group
+                .iter()
+                .map(|reference| self.resolve(reference))
+                .collect()
+        })
+    }
+
     fn resolve(&self, ref_str: &str) -> Result<SecretValue, ResolveError> {
         if ref_str.starts_with("env:") {
             return self.env.resolve(ref_str);
@@ -148,13 +187,26 @@ impl SecretResolver for CompositeResolver {
         if ref_str.starts_with("bitwarden:") {
             return Err(ResolveError::BitwardenError(
                 ref_str.to_owned(),
-                "Bitwarden not configured".into(),
+                "Bitwarden not configured (install bws or set OPAQUE_BITWARDEN_CLI_PATH)".into(),
             ));
         }
         if ref_str.starts_with("aws:") {
             return Err(ResolveError::AwsError(
                 ref_str.to_owned(),
-                "AWS support disabled pending SigV4 (only explicit loopback mock configuration is supported)".into(),
+                "AWS not configured (set OPAQUE_AWS_REGION and explicit credential references)"
+                    .into(),
+            ));
+        }
+        if ref_str.starts_with("gcp:") {
+            return Err(ResolveError::GcpError(
+                ref_str.to_owned(),
+                "GCP not configured (see docs/gcp.md)".into(),
+            ));
+        }
+        if ref_str.starts_with("azure:") {
+            return Err(ResolveError::AzureError(
+                ref_str.to_owned(),
+                "Azure not configured (see docs/azure.md)".into(),
             ));
         }
         if ref_str.starts_with("vault:") {

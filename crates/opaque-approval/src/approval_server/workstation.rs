@@ -403,6 +403,7 @@ pub(super) async fn notice_feed_handler(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::pairing::{WorkstationApproverConfig, store::DeviceStore};

@@ -276,6 +276,7 @@ impl WorkstationChallenge {
                 "github.publish_manifest"
                     | "github.release_manifest"
                     | "inference.fixed_manifest"
+                    | "ssh.health_manifest"
                     | "agent_session_start"
                     | "identity.provisioning.bind_start"
                     | "identity.provisioning.mandate_start"
@@ -405,6 +406,7 @@ pub fn verify_signature(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
@@ -487,6 +489,103 @@ mod tests {
         review.review_text.push('\0');
         review.challenge.content_hash = review_hash(&review.review_text);
         assert!(review.validate("opq-broker", 101).is_err());
+    }
+
+    #[test]
+    fn ssh_workstation_review_binds_exact_health_contract_and_task_operation() {
+        let mut review = review();
+        review.challenge.operation = crate::ssh::SSH_TASK_OPERATION.into();
+        review.review_text = "SSH service health\nHost: service-host\nPrincipal: health-reader\nHealth contract: api/2026.09.12 at 127.0.0.1:9000/ready\nAllowance: 1 connection attempt".into();
+        review.challenge.content_hash = review_hash(&review.review_text);
+        review.validate("opq-broker", 101).unwrap();
+        let key = SigningKey::from_bytes(&[43; 32]);
+        let public = hex(key.verifying_key().as_bytes());
+        let signature = hex(&key
+            .sign(&workstation_decision_bytes(&review.challenge, true))
+            .to_bytes());
+        verify_signature(
+            &public,
+            &signature,
+            &workstation_decision_bytes(&review.challenge, true),
+        )
+        .unwrap();
+        let mut changed = review.clone();
+        changed.review_text = changed.review_text.replace("/ready", "/admin");
+        assert!(changed.validate("opq-broker", 101).is_err());
+        changed.challenge.content_hash = review_hash(&changed.review_text);
+        changed.validate("opq-broker", 101).unwrap();
+        assert!(
+            verify_signature(
+                &public,
+                &signature,
+                &workstation_decision_bytes(&changed.challenge, true)
+            )
+            .is_err()
+        );
+        for operation in [
+            crate::ssh::SSH_OPERATION,
+            "ssh.exec",
+            "ssh.health_manifest.other",
+        ] {
+            let mut changed = review.challenge.clone();
+            changed.operation = operation.into();
+            assert!(changed.validate("opq-broker", 101).is_err());
+        }
+        assert!(review.validate("opq-broker", 200).is_err());
+
+        review.challenge.schema_version = 2;
+        review.challenge.authority = Some(WorkstationAuthority {
+            binding: ApprovalBinding {
+                tenant: crate::tenant::TenantBinding::new(
+                    crate::tenant::TenantId::parse("ssh-acceptance").unwrap(),
+                    uuid::Uuid::new_v4(),
+                )
+                .unwrap(),
+                task_id: uuid::Uuid::new_v4().to_string(),
+                manifest_digest: "ab".repeat(32),
+                request_hash: "cd".repeat(32),
+                policy_digest: "ef".repeat(32),
+                requester: "requester".into(),
+            },
+            principal_id: "reviewer".into(),
+            public_key_hex: public,
+            required_role: "approver".into(),
+            authority_epoch: 1,
+        });
+        let response = WorkstationResponse {
+            device_id: uuid::Uuid::new_v4().to_string(),
+            decision: WorkstationDecision::Approve,
+            signature: hex(&key
+                .sign(&workstation_decision_bytes(&review.challenge, true))
+                .to_bytes()),
+        };
+        let receipt = SignedWorkstationReceipt {
+            schema_version: 1,
+            review,
+            response,
+            accepted_at: 101,
+        };
+        receipt.verify().unwrap();
+        let mut changed = receipt.clone();
+        changed
+            .review
+            .challenge
+            .authority
+            .as_mut()
+            .unwrap()
+            .binding
+            .task_id = uuid::Uuid::new_v4().to_string();
+        assert!(changed.verify().is_err());
+        let mut changed = receipt;
+        changed
+            .review
+            .challenge
+            .authority
+            .as_mut()
+            .unwrap()
+            .binding
+            .requester = "reviewer".into();
+        assert!(changed.verify().is_err());
     }
 
     #[test]

@@ -37,3 +37,6 @@ tempfile = "3"
 [[bench]]
 name = "validation"
 harness = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }

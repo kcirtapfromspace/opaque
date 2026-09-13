@@ -1,0 +1,455 @@
+{
+  "schema": "opaque.synthesized-suite.v1",
+  "scope": "Only the declared public-core acceptance requirements selected from this manifest. A pass is not overall product, line/branch, real-vendor, real-model or native-human coverage.",
+  "profiles": [
+    "protocol",
+    "contained",
+    "model",
+    "packaged"
+  ],
+  "targets": [
+    {
+      "id": "oidc",
+      "package": "opaqued",
+      "kind": "test",
+      "name": "identity_e2e",
+      "features": [],
+      "platforms": [
+        "linux",
+        "darwin"
+      ],
+      "root": false,
+      "tools": [],
+      "build_timeout_seconds": 1800
+    },
+    {
+      "id": "workstation",
+      "package": "opaque-approval",
+      "kind": "lib",
+      "name": "opaque_approval",
+      "features": [],
+      "platforms": [
+        "linux",
+        "darwin"
+      ],
+      "root": false,
+      "tools": [],
+      "build_timeout_seconds": 1800
+    },
+    {
+      "id": "remote-task",
+      "package": "opaqued",
+      "kind": "bin",
+      "name": "opaqued",
+      "features": [],
+      "platforms": [
+        "linux",
+        "darwin"
+      ],
+      "root": false,
+      "tools": [],
+      "build_timeout_seconds": 1800
+    },
+    {
+      "id": "composed-review",
+      "package": "opaqued",
+      "kind": "test",
+      "name": "synthesized_review_e2e",
+      "features": [],
+      "platforms": [
+        "linux"
+      ],
+      "root": true,
+      "tools": [
+        "rustc",
+        "setpriv",
+        "getent",
+        "useradd",
+        "userdel",
+        "groupadd",
+        "groupdel"
+      ],
+      "build_timeout_seconds": 1800,
+      "requires_sys_ptrace": true
+    },
+    {
+      "id": "state-model",
+      "package": "opaque-bounded-work",
+      "kind": "test",
+      "name": "task_state_model",
+      "features": [],
+      "platforms": [
+        "linux",
+        "darwin"
+      ],
+      "root": false,
+      "tools": [],
+      "build_timeout_seconds": 1800
+    },
+    {
+      "id": "task-store",
+      "package": "opaque-bounded-work",
+      "kind": "lib",
+      "name": "opaque_bounded_work",
+      "features": [],
+      "platforms": [
+        "linux",
+        "darwin"
+      ],
+      "root": false,
+      "tools": [],
+      "build_timeout_seconds": 1800
+    }
+  ],
+  "tests": [
+    {
+      "id": "oidc-login",
+      "target": "oidc",
+      "name": "login_end_to_end_against_real_daemon",
+      "timeout_seconds": 120,
+      "include_ignored": false
+    },
+    {
+      "id": "oidc-delegation",
+      "target": "oidc",
+      "name": "delegation_lifecycle_end_to_end",
+      "timeout_seconds": 120,
+      "include_ignored": false
+    },
+    {
+      "id": "listener-identity",
+      "target": "oidc",
+      "name": "workload_attestor_uses_listener_evidence_and_refuses_claims",
+      "timeout_seconds": 120,
+      "include_ignored": false
+    },
+    {
+      "id": "oidc-nonce",
+      "target": "oidc",
+      "name": "login_rejects_forged_nonce_end_to_end",
+      "timeout_seconds": 120,
+      "include_ignored": false
+    },
+    {
+      "id": "oidc-pkce",
+      "target": "oidc",
+      "name": "login_rejects_pkce_challenge_substitution_before_creating_authority",
+      "timeout_seconds": 120,
+      "include_ignored": false
+    },
+    {
+      "id": "oidc-replay",
+      "target": "oidc",
+      "name": "login_rejects_replayed_code_after_logout_without_restoring_session",
+      "timeout_seconds": 120,
+      "include_ignored": false
+    },
+    {
+      "id": "oidc-code-binding",
+      "target": "oidc",
+      "name": "oidc::tests::stateful_idp_enforces_registered_authorization_and_exact_exchange_binding",
+      "timeout_seconds": 120,
+      "include_ignored": false
+    },
+    {
+      "id": "oidc-atomic-code",
+      "target": "oidc",
+      "name": "oidc::tests::stateful_idp_consumes_code_atomically_and_rejects_identical_replay",
+      "timeout_seconds": 120,
+      "include_ignored": false
+    },
+    {
+      "id": "review-tls",
+      "target": "workstation",
+      "name": "approval_server::workstation::tests::workstation_real_tls_pins_enrollment_full_review_and_signed_rejection",
+      "timeout_seconds": 120,
+      "include_ignored": false
+    },
+    {
+      "id": "review-signature",
+      "target": "workstation",
+      "name": "approval_server::workstation::tests::workstation_rejects_unsigned_changed_and_duplicate_decisions_without_consuming_valid_round",
+      "timeout_seconds": 120,
+      "include_ignored": false
+    },
+    {
+      "id": "review-revocation",
+      "target": "workstation",
+      "name": "approval_server::workstation::tests::workstation_revocation_and_legacy_kind_deny_access_and_signing",
+      "timeout_seconds": 120,
+      "include_ignored": false
+    },
+    {
+      "id": "review-expiry",
+      "target": "workstation",
+      "name": "approval_server::workstation::tests::workstation_cancellation_and_exact_expiry_remove_authority",
+      "timeout_seconds": 120,
+      "include_ignored": false
+    },
+    {
+      "id": "remote-once",
+      "target": "remote-task",
+      "name": "enclave::task::remote_tests::signed_remote_receipt_drives_real_bounded_effects_once_and_survives_restart",
+      "timeout_seconds": 120,
+      "include_ignored": false
+    },
+    {
+      "id": "remote-fence",
+      "target": "remote-task",
+      "name": "enclave::task::remote_tests::requester_reviewer_and_device_revocation_at_real_dispatch_fence_block_all_effects",
+      "timeout_seconds": 120,
+      "include_ignored": false
+    },
+    {
+      "id": "composed-lifecycle",
+      "target": "composed-review",
+      "name": "synthesized_oidc_review_receipt_and_restart_preserve_authority",
+      "timeout_seconds": 120,
+      "include_ignored": true
+    },
+    {
+      "id": "composed-rejection",
+      "target": "composed-review",
+      "name": "synthesized_signed_rejection_leaves_task_uncharged",
+      "timeout_seconds": 120,
+      "include_ignored": true
+    },
+    {
+      "id": "composed-timeout",
+      "target": "composed-review",
+      "name": "synthesized_review_timeout_rejects_late_signature_without_effects",
+      "timeout_seconds": 120,
+      "include_ignored": true
+    },
+    {
+      "id": "state-model",
+      "target": "state-model",
+      "name": "bounded_task_store_matches_reference_state_graph",
+      "timeout_seconds": 120,
+      "include_ignored": false,
+      "proof": "task_state_model"
+    },
+    {
+      "id": "ledger-hundred-workers",
+      "target": "task-store",
+      "name": "task_store::tests::hundred_workers_cannot_exceed_six_slots_or_repeat_any_slot",
+      "timeout_seconds": 120,
+      "include_ignored": false
+    },
+    {
+      "id": "ledger-claim-approval",
+      "target": "task-store",
+      "name": "task_store::tests::only_one_worker_can_claim_approval_and_claim_is_not_approval",
+      "timeout_seconds": 120,
+      "include_ignored": false
+    },
+    {
+      "id": "ledger-revoke-race",
+      "target": "task-store",
+      "name": "task_store::tests::revocation_and_reservation_have_one_transactional_order",
+      "timeout_seconds": 120,
+      "include_ignored": false
+    },
+    {
+      "id": "ledger-tenant",
+      "target": "task-store",
+      "name": "task_store::tests::tenant_ledger_refuses_foreign_owner_actions_approval_and_reopen",
+      "timeout_seconds": 120,
+      "include_ignored": false
+    },
+    {
+      "id": "ledger-typed-receipt",
+      "target": "task-store",
+      "name": "task_store::tests::inference_ledger_refuses_fabricated_completion_and_cross_slot_evidence",
+      "timeout_seconds": 120,
+      "include_ignored": false
+    },
+    {
+      "id": "ledger-exclusive-writer",
+      "target": "task-store",
+      "name": "task_store::tests::second_writer_and_alternate_hardlink_cannot_recover_live_reservations",
+      "timeout_seconds": 120,
+      "include_ignored": false
+    },
+    {
+      "id": "ledger-corruption",
+      "target": "task-store",
+      "name": "task_store::tests::malformed_or_semantically_corrupt_ledgers_fail_closed",
+      "timeout_seconds": 120,
+      "include_ignored": false
+    }
+  ],
+  "requirements": [
+    {
+      "id": "oidc.authenticated-lifecycle",
+      "profile": "protocol",
+      "status": "implemented",
+      "tests": [
+        "oidc-login",
+        "oidc-delegation"
+      ],
+      "description": "Actual daemon signed-token login, delegated session lifecycle and revocation against a stateful controlled IdP."
+    },
+    {
+      "id": "identity.listener-evidence",
+      "profile": "protocol",
+      "status": "implemented",
+      "tests": [
+        "listener-identity"
+      ],
+      "description": "Actual listener-derived workload identity rejects caller-substituted claims."
+    },
+    {
+      "id": "oidc.code-binding",
+      "profile": "protocol",
+      "status": "implemented",
+      "tests": [
+        "oidc-nonce",
+        "oidc-pkce",
+        "oidc-replay",
+        "oidc-code-binding",
+        "oidc-atomic-code"
+      ],
+      "description": "Authorization code, nonce, S256 PKCE, client and redirect bindings; one-time atomic redemption and no authority after failed flows."
+    },
+    {
+      "id": "approval.pinned-tls",
+      "profile": "protocol",
+      "status": "implemented",
+      "tests": [
+        "review-tls"
+      ],
+      "description": "Actual TLS pinning, enrollment, complete review and signed decision transport."
+    },
+    {
+      "id": "approval.rejection-boundaries",
+      "profile": "protocol",
+      "status": "implemented",
+      "tests": [
+        "review-signature",
+        "review-revocation",
+        "review-expiry"
+      ],
+      "description": "Unsigned, changed, repeated, revoked, legacy-kind, cancelled and expired decisions cannot retain approval authority."
+    },
+    {
+      "id": "task.durable-once",
+      "profile": "protocol",
+      "status": "implemented",
+      "tests": [
+        "remote-once"
+      ],
+      "description": "Signed remote decision, counted bounded fixture effects, exact receipt and durable consumed-task state."
+    },
+    {
+      "id": "task.dispatch-authority",
+      "profile": "protocol",
+      "status": "implemented",
+      "tests": [
+        "remote-fence"
+      ],
+      "description": "Requester, reviewer and device revocation at dispatch prevent protected effects."
+    },
+    {
+      "id": "composed.authenticated-review",
+      "profile": "protocol",
+      "status": "implemented",
+      "tests": [
+        "composed-lifecycle"
+      ],
+      "description": "Linux split-UID actual daemon combines distinct synthetic OIDC identities, agent delegation, scripted test-only signed v2 review, exact task/public receipt and restart."
+    },
+    {
+      "id": "composed.rejection",
+      "profile": "protocol",
+      "status": "implemented",
+      "tests": [
+        "composed-rejection"
+      ],
+      "description": "Signed rejection of the exact task creates no slot reservation or protected provider effect."
+    },
+    {
+      "id": "composed.timeout",
+      "profile": "protocol",
+      "status": "implemented",
+      "tests": [
+        "composed-timeout"
+      ],
+      "description": "Expired real review and late signed response create no slot reservation or protected provider effect."
+    },
+    {
+      "id": "ledger.finite-state-model",
+      "profile": "protocol",
+      "status": "implemented",
+      "tests": [
+        "state-model"
+      ],
+      "description": "Every outgoing transition of a declared finite sequential one-slot abstraction is compared with actual SQLite state; not all histories or concurrent schedules."
+    },
+    {
+      "id": "contained.vault-openssh-systemd",
+      "profile": "contained",
+      "status": "missing",
+      "tests": [],
+      "description": "Unattended real Vault, OpenSSH, systemd guard, distinct UIDs and signed health task have not yet been composed in public core."
+    },
+    {
+      "id": "model.pinned-actual-completions",
+      "profile": "model",
+      "status": "missing",
+      "tests": [],
+      "description": "A reproducible unattended pinned local model and controlled-source profile is not implemented by this runner."
+    },
+    {
+      "id": "packaged.linux-installed-custody",
+      "profile": "packaged",
+      "status": "missing",
+      "tests": [],
+      "description": "Installed Linux release artifacts and actual account/HOME/custody acceptance are not composed by this runner."
+    },
+    {
+      "id": "packaged.macos-installed-runtime",
+      "profile": "packaged",
+      "status": "missing",
+      "tests": [],
+      "description": "Installed macOS artifact and native package diagnostics are not composed by this runner; human approval remains separate."
+    },
+    {
+      "id": "external.vendor-accounts",
+      "profile": "external",
+      "status": "external",
+      "tests": [],
+      "description": "Actual customer/vendor account qualification is opt-in and not established by controlled protocol peers."
+    },
+    {
+      "id": "external.native-human",
+      "profile": "external",
+      "status": "external",
+      "tests": [],
+      "description": "Actual human native-platform authentication is never synthesized or launched by this unattended runner."
+    },
+    {
+      "id": "ledger.concurrent-boundaries",
+      "profile": "protocol",
+      "status": "implemented",
+      "tests": [
+        "ledger-hundred-workers",
+        "ledger-claim-approval",
+        "ledger-revoke-race"
+      ],
+      "description": "Named concurrent approval/reservation/revocation regressions complement the finite sequential model without claiming exhaustive interleavings."
+    },
+    {
+      "id": "ledger.tenant-and-corruption",
+      "profile": "protocol",
+      "status": "implemented",
+      "tests": [
+        "ledger-tenant",
+        "ledger-typed-receipt",
+        "ledger-exclusive-writer",
+        "ledger-corruption"
+      ],
+      "description": "Foreign tenant bindings, fabricated completion, multiple writers and corrupt durable state fail closed."
+    }
+  ]
+}

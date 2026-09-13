@@ -432,28 +432,22 @@ async fn unlisted_provider_operation_is_policy_denied() {
 
 /// AWS has no dedicated RPC method (unlike github/gitlab/onepassword/
 /// bitwarden) — it is reachable only through the generic `execute` method
-/// with a client-supplied `operation` string. Production AWS transport is
-/// permanently disabled pending SigV4; the only AWS path that can ever run
-/// is the explicit loopback mock (`OPAQUE_AWS_ALLOW_INSECURE=1` +
-/// `OPAQUE_AWS_MOCK_URL`), so that is what this test drives end to end:
-/// ref resolution (access/secret key via `env:` refs), policy, approval,
-/// the mocked STS `GetCallerIdentity` call, and the response shape. Does
-/// NOT cover real (signed) AWS transport, which does not exist yet.
+/// with a client-supplied `operation` string. This drives the signed AWS
+/// transport against an explicit loopback fixture using public synthetic
+/// credentials: ref resolution, policy, approval, the real STS Query/XML
+/// protocol and sanitized response. Live AWS/IAM qualification is separate.
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn aws_get_caller_identity_succeeds_end_to_end() {
     let _serial = serial_guard();
     let aws = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(header(
-            "x-amz-target",
-            "AWSSecurityTokenServiceV20110615.GetCallerIdentity",
+        .and(header("content-type", "application/x-www-form-urlencoded"))
+        .and(wiremock::matchers::body_string("Action=GetCallerIdentity&Version=2011-06-15"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            "<GetCallerIdentityResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\"><GetCallerIdentityResult><Account>123456789012</Account><Arn>arn:aws:iam::123456789012:user/e2e-test</Arn><UserId>AIDAE2ETEST</UserId></GetCallerIdentityResult></GetCallerIdentityResponse>",
+            "text/xml",
         ))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "Account": "123456789012",
-            "Arn": "arn:aws:iam::123456789012:user/e2e-test",
-            "UserId": "AIDAE2ETEST",
-        })))
         .mount(&aws)
         .await;
 
@@ -480,8 +474,11 @@ factors = ["local_bio"]
             ("OPAQUE_AWS_MOCK_URL", aws_uri.as_str()),
             ("OPAQUE_AWS_ACCESS_KEY_REF", "env:OPAQUE_E2E_AWS_AK"),
             ("OPAQUE_AWS_SECRET_KEY_REF", "env:OPAQUE_E2E_AWS_SK"),
-            ("OPAQUE_E2E_AWS_AK", "test-access-key"),
-            ("OPAQUE_E2E_AWS_SK", "test-secret-key"),
+            ("OPAQUE_E2E_AWS_AK", "AKIAIOSFODNN7EXAMPLE"),
+            (
+                "OPAQUE_E2E_AWS_SK",
+                "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            ),
         ],
     );
 
@@ -513,6 +510,17 @@ factors = ["local_bio"]
         !requests.is_empty(),
         "no request reached the mocked AWS STS endpoint"
     );
+
+    let authorization = requests[0]
+        .headers
+        .get("authorization")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(authorization.starts_with("AWS4-HMAC-SHA256 "));
+    assert!(authorization.contains("/us-east-1/sts/aws4_request"));
+    assert!(!requests[0].headers.contains_key("x-amz-secret-key"));
+    assert!(!requests[0].headers.contains_key("x-amz-access-key"));
 
     daemon.shutdown();
 }
@@ -602,27 +610,44 @@ factors = ["local_bio"]
     daemon.shutdown();
 }
 
-/// Bitwarden's handler is always registered (unlike 1Password, it has no
-/// "is this even configured" gate — it defaults to the real Bitwarden URL
-/// unless overridden), so this only needs to override the URL and token ref
-/// to redirect it at a mock. Drives `bitwarden.list_projects` end to end:
-/// token resolution via an `env:` ref, policy, approval, the mocked
-/// `GET /api/projects` call, and the sanitized (names-only) response shape.
+/// Explicit test fixture for the official `bws` subprocess contract. Production
+/// uses an installed official executable; this file exists only inside the test.
+#[cfg(unix)]
+fn bitwarden_cli_fixture(fixture: &Fixture) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let executable = fixture.home.path().join("bws-fixture");
+    std::fs::write(
+        &executable,
+        r#"#!/bin/sh
+set -eu
+[ -n "$0" ] && : > "$0.invoked"
+[ "${BWS_ACCESS_TOKEN-}" = 'test-bw-token' ] || exit 9
+[ "$1" = '--config-file' ] && [ -f "$2" ] || exit 10
+[ "$3 $4 $5 $6 $7 $8" = '--profile opaque --output json --color no' ] || exit 11
+case "$9 ${10}" in
+  'project list') printf '%s' '[{"id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","name":"backend-secrets"}]' ;;
+  'secret get')
+    [ "${11}" = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' ] || exit 12
+    printf '%s' '{"id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","key":"TUTORIAL_KEY","value":"tutorial-value-plaintext","note":"private fixture note"}' ;;
+  *) exit 13 ;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    executable
+}
+
+/// Daemon policy, approval, environment-ref token resolution, official CLI
+/// command shape, and sanitized project browsing. This is a subprocess fixture
+/// test; the ignored provider acceptance test separately exercises a live account.
+#[cfg(unix)]
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn bitwarden_list_projects_succeeds_end_to_end() {
     let _serial = serial_guard();
-    let bw_server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/api/projects"))
-        .and(header("authorization", "Bearer test-bw-token"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-            {"id": "proj123", "name": "backend-secrets"}
-        ])))
-        .mount(&bw_server)
-        .await;
-
     let fixture = Fixture::new();
+    let executable = bitwarden_cli_fixture(&fixture);
     let config_path = fixture.write_config_with_rules(
         r#"
 [[rules]]
@@ -636,12 +661,16 @@ require = "always"
 factors = ["local_bio"]
 "#,
     );
-    let bw_uri = bw_server.uri();
     let daemon = fixture.spawn_with_env(
         &config_path,
         "https://api.github.com",
         &[
-            ("OPAQUE_BITWARDEN_URL", bw_uri.as_str()),
+            ("OPAQUE_BITWARDEN_URL", "https://api.bitwarden.com"),
+            (
+                "OPAQUE_BITWARDEN_IDENTITY_URL",
+                "https://identity.bitwarden.com",
+            ),
+            ("OPAQUE_BITWARDEN_CLI_PATH", executable.to_str().unwrap()),
             ("OPAQUE_BITWARDEN_TOKEN_REF", "env:OPAQUE_E2E_BW_TOKEN"),
             ("OPAQUE_E2E_BW_TOKEN", "test-bw-token"),
         ],
@@ -663,22 +692,81 @@ factors = ["local_bio"]
         "bitwarden.list_projects failed: {resp}"
     );
     let result = resp.get("result").expect("result");
-    let projects = result
-        .get("projects")
-        .and_then(Value::as_array)
-        .expect("projects array");
-    assert!(
-        projects
-            .iter()
-            .any(|p| p.get("name").and_then(Value::as_str) == Some("backend-secrets")),
-        "expected project 'backend-secrets' in sanitized response: {result}"
-    );
+    assert_eq!(result, &json!({"projects":[{"name":"backend-secrets"}]}));
     let rendered = serde_json::to_string(&resp).unwrap();
-    assert!(
-        !rendered.contains("proj123"),
-        "project id leaked into the response: {rendered}"
-    );
+    assert!(!rendered.contains("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"));
+    assert!(!rendered.contains("test-bw-token"));
+    daemon.shutdown();
+}
 
+/// A decrypted BWS fixture value reaches the real GitHub sealed-box path through
+/// the daemon's composite resolver without leaking into the RPC response or log.
+#[cfg(unix)]
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn bitwarden_value_ref_reaches_github_end_to_end() {
+    use base64::Engine as _;
+    let _serial = serial_guard();
+    let github = mock_github().await;
+    let key = crypto_box::SecretKey::from([42u8; 32]);
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/widgets/actions/secrets/public-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "key_id":"568250167",
+            "key":base64::engine::general_purpose::STANDARD.encode(key.public_key().as_bytes())
+        })))
+        .with_priority(1)
+        .mount(&github)
+        .await;
+    let fixture = Fixture::new();
+    let executable = bitwarden_cli_fixture(&fixture);
+    let config_path = fixture.write_config();
+    let daemon = fixture.spawn_with_env(
+        &config_path,
+        &github.uri(),
+        &[
+            ("OPAQUE_BITWARDEN_URL", "https://api.bitwarden.com"),
+            (
+                "OPAQUE_BITWARDEN_IDENTITY_URL",
+                "https://identity.bitwarden.com",
+            ),
+            ("OPAQUE_BITWARDEN_CLI_PATH", executable.to_str().unwrap()),
+            ("OPAQUE_BITWARDEN_TOKEN_REF", "env:OPAQUE_E2E_BW_TOKEN"),
+            ("OPAQUE_E2E_BW_TOKEN", "test-bw-token"),
+        ],
+    );
+    let response = daemon
+        .call(
+            "github",
+            json!({
+                "scope":"repo_actions", "repo":"acme/widgets", "secret_name":"TUTORIAL_KEY",
+                "value_ref":"bitwarden:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                "github_token_ref":"env:OPAQUE_E2E_PAT"
+            }),
+        )
+        .await;
+    assert!(
+        response.get("error").is_none_or(Value::is_null),
+        "BWS value ref failed: {response}"
+    );
+    let requests = github.received_requests().await.unwrap();
+    let write = requests
+        .iter()
+        .find(|r| r.method.as_str() == "PUT")
+        .expect("sealed GitHub write");
+    let body: Value = serde_json::from_slice(&write.body).unwrap();
+    let ciphertext = base64::engine::general_purpose::STANDARD
+        .decode(body["encrypted_value"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(key.unseal(&ciphertext).unwrap(), TEST_VALUE.as_bytes());
+    let rendered = format!(
+        "{response} {}",
+        std::fs::read_to_string(&daemon.log).unwrap()
+    );
+    for sensitive in [TEST_VALUE, "test-bw-token", "private fixture note"] {
+        assert!(!rendered.contains(sensitive));
+        assert!(!String::from_utf8_lossy(&write.body).contains(sensitive));
+    }
     daemon.shutdown();
 }
 
@@ -768,94 +856,223 @@ async fn github_set_actions_secret_resolves_vault_value_ref_end_to_end() {
     daemon.shutdown();
 }
 
-/// Azure is not wired into `main.rs`'s `default_secret_resolvers()` or
-/// `Enclave::builder()` at all (dormant — `#[allow(dead_code)]` on its
-/// module, same before and after this extraction; confirmed no
-/// `azure.*` operation is registered anywhere in `main.rs`). This proves
-/// the honest current behavior — a syntactically well-formed request for a
-/// real azure operation name is rejected as `unknown_operation` at the
-/// registry, before policy or any handler — rather than crashing, hanging,
-/// or silently mis-dispatching to another provider. Does NOT exercise
-/// `opaque_providers::azure`'s own client/resolver code, which this build
-/// never wires up; that is covered by its inline unit tests only. Wiring
-/// azure in (and giving it this test's stronger, mocked round-trip
-/// coverage) is future feature-gating work, not part of this extraction.
+/// Production cloud endpoints stay fixed. These daemon checks deliberately
+/// stop before authentication: missing credentials prove preparation and policy
+/// do not silently resolve secrets or perform an OAuth/API request.
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
-async fn azure_operation_is_unknown_end_to_end() {
+async fn azure_registration_and_policy_fail_closed_end_to_end() {
     let _serial = serial_guard();
-    let fixture = Fixture::new();
-    let config_path = fixture.write_config_with_rules("");
-    let daemon = fixture.spawn(&config_path, "https://api.github.com");
-
-    let resp = daemon
-        .call(
-            "execute",
-            json!({
-                "operation": "azure.list_secrets",
-                "target": {},
-                "params": {},
-            }),
-        )
-        .await;
-
-    let code = resp
-        .get("error")
-        .and_then(|e| e.get("code"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    assert_eq!(
-        code, "unknown_operation",
-        "expected azure.list_secrets to be unregistered (dormant provider), got: {resp}"
-    );
-
-    daemon.shutdown();
+    for configured in [false, true] {
+        let fixture = Fixture::new();
+        let config_path = fixture.write_config_with_rules("");
+        let daemon = fixture.spawn_with_env(
+            &config_path,
+            "https://api.github.com",
+            &[
+                (
+                    "OPAQUE_AZURE_VAULT_URL",
+                    if configured {
+                        "https://opaque-e2e.vault.azure.net"
+                    } else {
+                        ""
+                    },
+                ),
+                (
+                    "OPAQUE_AZURE_TENANT_ID",
+                    "00000000-0000-0000-0000-000000000001",
+                ),
+                (
+                    "OPAQUE_AZURE_CLIENT_ID",
+                    "00000000-0000-0000-0000-000000000002",
+                ),
+                (
+                    "OPAQUE_AZURE_CLIENT_SECRET_REF",
+                    "env:OPAQUE_E2E_INTENTIONALLY_ABSENT_CLOUD_SECRET",
+                ),
+            ],
+        );
+        let catalog = daemon.call("operations", json!({})).await;
+        let operations = catalog["result"]["operations"].as_array().unwrap();
+        let cloud: Vec<_> = operations
+            .iter()
+            .filter(|row| row["provider"] == "azure")
+            .collect();
+        assert_eq!(cloud.len(), 5, "{catalog}");
+        for row in cloud {
+            assert_eq!(
+                row["availability"],
+                if configured { "enabled" } else { "disabled" }
+            );
+            assert_eq!(
+                row["execution_paths"],
+                if configured {
+                    json!(["operation"])
+                } else {
+                    json!([])
+                }
+            );
+        }
+        let response = daemon
+            .call(
+                "execute",
+                json!({
+                    "operation": "azure.list_secrets", "target": {}, "params": {},
+                    "secret_ref_names": [],
+                }),
+            )
+            .await;
+        assert_error(
+            &response,
+            if configured {
+                "policy_denied"
+            } else {
+                "bad_request"
+            },
+        );
+        if configured {
+            let invalid = daemon
+                .call(
+                    "execute",
+                    json!({
+                        "operation": "azure.get_secret", "params": {"name": "../escape"},
+                    }),
+                )
+                .await;
+            assert_error(&invalid, "invalid_params");
+            let mismatch = daemon
+                .call(
+                    "execute",
+                    json!({
+                        "operation": "azure.list_secrets", "params": {},
+                        "target": {"azure_vault_url": "https://other-vault.vault.azure.net"},
+                    }),
+                )
+                .await;
+            assert_error(&mismatch, "bad_request");
+        }
+        daemon.shutdown();
+        let events = audit_events(&fixture);
+        assert_no_approval_or_execution(&events);
+        if configured {
+            let received = events
+                .iter()
+                .find(|event| {
+                    event.operation.as_deref() == Some("azure.list_secrets")
+                        && event.kind == opaque_core::audit::AuditEventKind::RequestReceived
+                })
+                .unwrap();
+            assert_eq!(
+                received.secret_names,
+                ["env:OPAQUE_E2E_INTENTIONALLY_ABSENT_CLOUD_SECRET"]
+            );
+        }
+    }
 }
 
-/// GCP is not wired into `main.rs` at all today (dormant, same as azure
-/// above — no `gcp.*` operation is registered). See
-/// `azure_operation_is_unknown_end_to_end` for the full rationale; this is
-/// the same shape for GCP. Does NOT exercise
-/// `opaque_providers::gcp`'s own client/resolver code (inline-unit-tested
-/// only).
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
-async fn gcp_operation_is_unknown_end_to_end() {
+async fn gcp_registration_and_policy_fail_closed_end_to_end() {
     let _serial = serial_guard();
-    let fixture = Fixture::new();
-    let config_path = fixture.write_config_with_rules("");
-    let daemon = fixture.spawn(&config_path, "https://api.github.com");
-
-    let resp = daemon
-        .call(
-            "execute",
-            json!({
-                "operation": "gcp.list_secrets",
-                "target": {},
-                "params": {},
-            }),
-        )
-        .await;
-
-    let code = resp
-        .get("error")
-        .and_then(|e| e.get("code"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    assert_eq!(
-        code, "unknown_operation",
-        "expected gcp.list_secrets to be unregistered (dormant provider), got: {resp}"
-    );
-
-    daemon.shutdown();
+    for configured in [false, true] {
+        let fixture = Fixture::new();
+        let config_path = fixture.write_config_with_rules("");
+        let daemon = fixture.spawn_with_env(
+            &config_path,
+            "https://api.github.com",
+            &[
+                (
+                    "OPAQUE_GCP_SM_URL",
+                    "https://secretmanager.googleapis.com/v1",
+                ),
+                (
+                    "OPAQUE_GCP_TOKEN_REF",
+                    if configured {
+                        "env:OPAQUE_E2E_INTENTIONALLY_ABSENT_CLOUD_TOKEN"
+                    } else {
+                        ""
+                    },
+                ),
+                ("OPAQUE_GCP_SERVICE_ACCOUNT_REF", ""),
+                ("OPAQUE_GCP_SERVICE_ACCOUNT_KEY", ""),
+                ("OPAQUE_GCP_ACCESS_TOKEN", ""),
+            ],
+        );
+        let catalog = daemon.call("operations", json!({})).await;
+        let operations = catalog["result"]["operations"].as_array().unwrap();
+        let cloud: Vec<_> = operations
+            .iter()
+            .filter(|row| row["provider"] == "gcp")
+            .collect();
+        assert_eq!(cloud.len(), 4, "{catalog}");
+        for row in cloud {
+            assert_eq!(
+                row["availability"],
+                if configured { "enabled" } else { "disabled" }
+            );
+            assert_eq!(
+                row["execution_paths"],
+                if configured {
+                    json!(["operation"])
+                } else {
+                    json!([])
+                }
+            );
+        }
+        let response = daemon.call("execute", json!({
+            "operation": "gcp.list_secrets", "target": {}, "params": {"project":"123456789012"},
+            "secret_ref_names": [],
+        })).await;
+        assert_error(
+            &response,
+            if configured {
+                "policy_denied"
+            } else {
+                "bad_request"
+            },
+        );
+        if configured {
+            let invalid = daemon
+                .call(
+                    "execute",
+                    json!({
+                        "operation": "gcp.list_secrets", "params": {"project": "../escape"},
+                    }),
+                )
+                .await;
+            assert_error(&invalid, "invalid_params");
+            let mismatch = daemon
+                .call(
+                    "execute",
+                    json!({
+                        "operation": "gcp.list_secrets", "params": {"project":"123456789012"},
+                        "target": {"project": "987654321098"},
+                    }),
+                )
+                .await;
+            assert_error(&mismatch, "bad_request");
+        }
+        daemon.shutdown();
+        let events = audit_events(&fixture);
+        assert_no_approval_or_execution(&events);
+        if configured {
+            let received = events
+                .iter()
+                .find(|event| {
+                    event.operation.as_deref() == Some("gcp.list_secrets")
+                        && event.kind == opaque_core::audit::AuditEventKind::RequestReceived
+                })
+                .unwrap();
+            assert_eq!(
+                received.secret_names,
+                ["env:OPAQUE_E2E_INTENTIONALLY_ABSENT_CLOUD_TOKEN"]
+            );
+        }
+    }
 }
 
-/// Doppler is not wired into `main.rs` at all today (dormant, same as azure
-/// above — no `doppler.*` operation is registered). See
-/// `azure_operation_is_unknown_end_to_end` for the full rationale; this is
-/// the same shape for Doppler. Does NOT exercise
-/// `opaque_providers::doppler`'s own client/resolver code (inline-unit-tested
-/// only).
+/// Doppler remains unregistered. Its standalone client unit tests are not
+/// daemon integration evidence.
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn doppler_operation_is_unknown_end_to_end() {
@@ -1114,6 +1331,7 @@ async fn canonical_action_rejects_malformed_targets_and_unknown_provider_fields(
     let _serial = serial_guard();
     let github = mock_github().await;
     let fixture = Fixture::new();
+    let executable = bitwarden_cli_fixture(&fixture);
     let config = fixture.write_config();
     let daemon = fixture.spawn_with_env(
         &config,
@@ -1121,6 +1339,16 @@ async fn canonical_action_rejects_malformed_targets_and_unknown_provider_fields(
         &[
             ("OPAQUE_1PASSWORD_CONNECT_URL", &github.uri()),
             ("OPAQUE_1PASSWORD_TOKEN_REF", "env:OPAQUE_E2E_PAT"),
+            ("OPAQUE_BITWARDEN_URL", "https://api.bitwarden.com"),
+            (
+                "OPAQUE_BITWARDEN_IDENTITY_URL",
+                "https://identity.bitwarden.com",
+            ),
+            ("OPAQUE_BITWARDEN_CLI_PATH", executable.to_str().unwrap()),
+            (
+                "OPAQUE_BITWARDEN_TOKEN_REF",
+                "env:OPAQUE_E2E_MISSING_BW_TOKEN",
+            ),
         ],
     );
     for target in [
@@ -1166,6 +1394,7 @@ async fn canonical_action_rejects_malformed_targets_and_unknown_provider_fields(
         )
         .await;
     assert_error(&malformed_project, "invalid_params");
+    assert!(!executable.with_extension("invoked").exists());
     let unknown_option = daemon
         .call(
             "onepassword",

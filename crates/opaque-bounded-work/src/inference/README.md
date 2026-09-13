@@ -1,22 +1,28 @@
 # Fixed public-data inference adapter
 
-This adapter implements the initial synthetic-data demonstration. It does not
-implement datasource OAuth, warehouse queries, private document retrieval, or
-shared-server tenant isolation. The broker selects the tenant and model profile;
-the agent supplies neither an endpoint nor model options.
+The broker selects a public GitHub CI source or the legacy synthetic source,
+plus the tenant and model profile. The caller supplies a title and expiry, never
+an endpoint, repository override, prompt or generation options. Private source
+OAuth, warehouse queries and shared-server tenant isolation are not implemented.
 
-`InferenceProfileConfig::bind` adds the broker's persisted `TenantBinding` at
-runtime. The profile digest covers that binding, endpoint, credential reference,
-reported server/model identities, template hash, and exact public source
-snapshot. `public_demo_manifest` constructs three actions from this profile.
-`prepare_inference_manifest` validates the entire offered manifest and rejects
-changed authority; it does not repair or overwrite a mismatched request.
+`InferenceProfileConfig::bind` adds the persisted `TenantBinding`. The profile
+digest binds that tenant, endpoint, credential reference, operator-attested model
+identity, template hash and source selection. For `github-ci-v1`, selection means
+an exact public repository, numeric workflow ID and branch.
 
-The source snapshot is SHA-256 over the canonical JSON array of the three
-compiled public prompts. Each action also binds its exact prompt digest and
-ordinal. Only this known source is supported by this adapter. The core fields
-`source_id` and `source_snapshot_sha256` provide a binding for later governed
-sources; they do not establish that a datasource authorization flow exists.
+`public_demo_manifest` builds three actions. For GitHub these are planning seeds,
+not executable source evidence: `action_prompt` refuses a seed before credentials
+or model I/O. After policy preflight, `plan_inference_manifest` captures up to
+three typed runs anonymously from the fixed GitHub API, attaches the same snapshot
+to each action, and computes the exact snapshot/prompt digests. Full preflight
+runs again before persistence. Raw `task_plan` cannot supply a GitHub snapshot.
+
+Only numeric identifiers, commit hashes, bounded labels, enumerated statuses and
+conclusions, plus the observation time enter the prompts. Repository text, logs
+and titles are discarded. The snapshot is immutable after review; it is a sample
+of observed runs, not branch-HEAD, deployment or service-health evidence. The
+legacy source keeps its existing digest over the three compiled public prompts.
+See [source configuration](../../../../docs/github-ci-inference.md).
 
 ## Provider requests
 
@@ -28,7 +34,7 @@ from an agent-supplied manifest.
 1. Read `/health`, `/props`, and `/v1/models`. Require one ready model matching
    the configured model name, path, build string, template hash, and one server
    slot with sufficient context.
-2. Apply the server's chat template to one compiled public user message, then
+2. Apply the server's chat template to one reviewed public user message, then
    tokenize the formatted prompt. Both responses have bounded sizes. Reject
    empty, invalid, or more than 512 token IDs.
 3. Recheck provider identity after asynchronous preparation, then invoke the
@@ -42,8 +48,8 @@ from an agent-supplied manifest.
 Using token IDs prevents a later implicit string-tokenization step from adding
 unaccounted prompt tokens. The generation request has a 30-second client
 deadline. Metadata and preprocessing requests have ten-second deadlines.
-Planning may send **only these compiled public prompts** to the template and
-tokenizer endpoints. Any future private-source preprocessing must happen after
+Planning may send the configured **public snapshot and its fixed questions**
+to the template and tokenizer endpoints. Any future private-source preprocessing must happen after
 approval, reservation, and live authorization because preprocessing also sends
 data to the provider.
 
@@ -53,7 +59,7 @@ including template application, tokenizer options, and token-array completion
 prompts. The documented prediction ceiling has a UTF-8 caveat; the corresponding
 [server implementation](https://github.com/ggml-org/llama.cpp/blob/268d61e/tools/server/server-context.cpp)
 checks its remaining token budget during generation. This source comparison is
-not proof of the bytes currently running on the discovered cluster.
+not proof of the bytes running on an operator’s model service.
 
 ## Receipts and uncertainty
 
@@ -79,14 +85,15 @@ unknown result. A new task requires fresh authority. This does not establish
 global backend concurrency or cancellation across broker restarts or operators.
 
 The HTTP API does not prove the GGUF or executable hash. `model_artifact_sha256`
-and service UID are operator-attested profile metadata. The discovered Gemma
-service had an empty model digest and mutable host-mounted weights/executable.
-No live generation or tokenizer request has been performed by this work.
+and service UID are operator-attested profile metadata. Deployment acceptance
+must verify those artifacts separately. Protocol fixtures alone do not qualify
+a live generation service.
 
 ## Local evidence
 
-Nine provider fixture tests cover the exact request body and output receipt,
+Provider fixture tests cover the exact request body and output receipt,
 scope/digest/credential tampering, delayed final-gate denial, tokenizer overflow,
 model drift, 4xx/408/5xx/redirect accounting, malformed/overrun/unsafe output,
-deadline uncertainty, and trusted profile restrictions. The fixtures use no
+deadline uncertainty, trusted profile restrictions, typed GitHub capture,
+snapshot substitution and rejection of uncaptured planning seeds. The fixtures use no
 live credentials and perform no cluster operations.

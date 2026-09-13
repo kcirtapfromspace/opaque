@@ -11,15 +11,12 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serde_json::{Value, json};
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
-
-const TEST_RSA_PEM: &str = include_str!("fixtures/test_rsa_key.pem");
-const TEST_JWKS: &str = include_str!("fixtures/test_idp_jwks.json");
-const TEST_KID: &str = "test-key-1";
+#[path = "support/oidc.rs"]
+mod oidc;
+use oidc::{Counts, MockOidc, TestIdentity};
 const CLIENT_ID: &str = "opaque-e2e";
 
 /// Each test spawns a real daemon + a wiremock IdP + reqwest clients; running
@@ -33,115 +30,11 @@ fn serial_guard() -> std::sync::MutexGuard<'static, ()> {
     E2E_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-// ---------------------------------------------------------------------------
-// Mock IdP helpers
-// ---------------------------------------------------------------------------
-
-async fn mount_idp(server: &MockServer) {
-    let base = server.uri();
-    Mock::given(method("GET"))
-        .and(path("/.well-known/openid-configuration"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "issuer": base,
-            "authorization_endpoint": format!("{base}/authorize"),
-            "token_endpoint": format!("{base}/token"),
-            "jwks_uri": format!("{base}/jwks"),
-        })))
-        .mount(server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/jwks"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::from_str::<Value>(TEST_JWKS).unwrap()),
-        )
-        .mount(server)
-        .await;
-}
-
-fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
-}
-
-fn sign_id_token(claims: Value) -> String {
-    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
-    header.kid = Some(TEST_KID.to_owned());
-    let key = jsonwebtoken::EncodingKey::from_rsa_pem(TEST_RSA_PEM.as_bytes()).unwrap();
-    jsonwebtoken::encode(&header, &claims, &key).unwrap()
-}
-
-fn id_token_claims(issuer: &str, nonce: &str, email: &str) -> Value {
-    json!({
-        "iss": issuer,
-        "aud": CLIENT_ID,
-        "sub": "e2e-user-1",
-        "email": email,
-        "name": "E2E Human",
-        "nonce": nonce,
-        "iat": now_unix(),
-        "exp": now_unix() + 600,
-    })
-}
-
-/// Mount the token endpoint AFTER the nonce is known (it must be embedded in
-/// the signed id_token).
-async fn mount_token_endpoint(server: &MockServer, id_token: String) {
-    Mock::given(method("POST"))
-        .and(path("/token"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "access_token": "unused",
-            "token_type": "Bearer",
-            "id_token": id_token,
-        })))
-        .mount(server)
-        .await;
-}
-
-// ---------------------------------------------------------------------------
-// URL helpers (tiny, test-only)
-// ---------------------------------------------------------------------------
-
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
-                if let Ok(b) = u8::from_str_radix(hex, 16) {
-                    out.push(b);
-                    i += 3;
-                } else {
-                    out.push(bytes[i]);
-                    i += 1;
-                }
-            }
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 fn query_param(url: &str, name: &str) -> Option<String> {
-    let (_, query) = url.split_once('?')?;
-    for pair in query.split('&') {
-        let (k, v) = pair.split_once('=')?;
-        if k == name {
-            return Some(percent_decode(v));
-        }
-    }
-    None
+    reqwest::Url::parse(url)
+        .ok()?
+        .query_pairs()
+        .find_map(|(key, value)| (key == name).then(|| value.into_owned()))
 }
 
 // ---------------------------------------------------------------------------
@@ -150,7 +43,7 @@ fn query_param(url: &str, name: &str) -> Option<String> {
 
 struct TestDaemon {
     child: Child,
-    home: tempfile::TempDir,
+    home: Option<tempfile::TempDir>,
     runtime_dir: PathBuf,
     sock: PathBuf,
     daemon_token: String,
@@ -212,7 +105,7 @@ impl TestDaemon {
 
         Self {
             child,
-            home,
+            home: Some(home),
             runtime_dir,
             sock,
             daemon_token,
@@ -220,7 +113,12 @@ impl TestDaemon {
     }
 
     fn audit_db(&self) -> PathBuf {
-        self.home.path().join(".opaque").join("audit.db")
+        self.home
+            .as_ref()
+            .unwrap()
+            .path()
+            .join(".opaque")
+            .join("audit.db")
     }
 
     /// One request over a fresh connection, exactly like the CLI: handshake
@@ -309,7 +207,7 @@ impl TestDaemon {
         }
         let db = self.audit_db();
         let _ = std::fs::remove_dir_all(&self.runtime_dir);
-        (db, self.home)
+        (db, self.home.take().unwrap())
     }
 }
 
@@ -320,6 +218,18 @@ fn rand_u32() -> u32 {
         .unwrap()
         .subsec_nanos()
         ^ std::process::id().rotate_left(16)
+}
+
+impl Drop for TestDaemon {
+    fn drop(&mut self) {
+        // A failed assertion must not leave a test broker running after its
+        // temporary custody directory has been removed.
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        let _ = std::fs::remove_dir_all(&self.runtime_dir);
+    }
 }
 
 fn identity_config(issuer: &str) -> String {
@@ -333,7 +243,10 @@ fn identity_config(issuer: &str) -> String {
 fn identity_config_with(issuer: &str, top_level: &str) -> String {
     // The test binary itself is the "human" client (exe allowlist) so whoami
     // exercises the full human-classified response shape.
-    let exe = std::env::current_exe().unwrap();
+    // The kernel reports a canonical executable path. A Cargo target under
+    // macOS /tmp otherwise allowlists an alias of /private/tmp and classifies
+    // this intended human test client as an agent.
+    let exe = std::env::current_exe().unwrap().canonicalize().unwrap();
     format!(
         r#"{top_level}
 
@@ -350,47 +263,130 @@ session_ttl_secs = 3600
     )
 }
 
-/// Drive the full browser-side of the login: start the attempt, extract
-/// state/nonce/redirect from the auth URL, arm the token endpoint with a
-/// signed id_token, then hit the daemon's loopback callback like the IdP
-/// redirect would.
-async fn drive_login(
-    daemon: &TestDaemon,
-    idp: &MockServer,
+struct LoginAttempt {
+    id: String,
+    auth_url: String,
+    state: String,
+    redirect: String,
+}
+
+async fn begin_login(daemon: &TestDaemon, idp: &MockOidc) -> LoginAttempt {
+    let start = daemon.call_ok("identity.login_start", Value::Null).await;
+    let auth_url = start["auth_url"].as_str().expect("auth_url").to_owned();
+    let redirect = query_param(&auth_url, "redirect_uri").expect("redirect_uri");
+    // Dynamic loopback ports are explicitly registered before the request;
+    // changing an authorization URL cannot silently change registration.
+    idp.register_redirect(&redirect);
+    LoginAttempt {
+        id: start["attempt_id"].as_str().unwrap().into(),
+        state: query_param(&auth_url, "state").unwrap(),
+        auth_url,
+        redirect,
+    }
+}
+
+async fn request_code(
+    idp: &MockOidc,
+    auth_url: &str,
     email: &str,
     forge_nonce: Option<&str>,
-) -> Value {
-    let start = daemon.call_ok("identity.login_start", Value::Null).await;
-    let attempt_id = start["attempt_id"].as_str().expect("attempt_id").to_owned();
-    let auth_url = start["auth_url"].as_str().expect("auth_url").to_owned();
+) -> String {
+    idp.select_identity(
+        &query_param(auth_url, "state").unwrap(),
+        TestIdentity {
+            subject: "e2e-user-1".into(),
+            email: email.into(),
+            token_nonce_override: forge_nonce.map(str::to_owned),
+        },
+    );
+    let response = idp.authorize(auth_url).await;
+    assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+    let callback = response.headers()["location"].to_str().unwrap().to_owned();
+    assert_eq!(
+        query_param(&callback, "state"),
+        query_param(auth_url, "state")
+    );
+    callback
+}
 
-    let state = query_param(&auth_url, "state").expect("state in auth_url");
-    let nonce = query_param(&auth_url, "nonce").expect("nonce in auth_url");
-    let redirect_uri = query_param(&auth_url, "redirect_uri").expect("redirect_uri in auth_url");
-
-    let token_nonce = forge_nonce.unwrap_or(&nonce);
-    let id_token = sign_id_token(id_token_claims(&idp.uri(), token_nonce, email));
-    mount_token_endpoint(idp, id_token).await;
-
-    // The "browser redirect": GET the daemon's loopback callback.
-    let callback = format!("{redirect_uri}?code=e2e-code&state={state}");
-    let resp = reqwest::get(&callback).await.expect("callback reachable");
+async fn finish_login(daemon: &TestDaemon, attempt: &LoginAttempt, callback: &str) -> Value {
+    let resp = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap()
+        .get(callback)
+        .send()
+        .await
+        .expect("callback reachable");
     assert!(resp.status().is_success() || resp.status().is_client_error());
-
-    // Poll login_status until terminal.
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let status = daemon
-            .call_ok("identity.login_status", json!({"attempt_id": attempt_id}))
+            .call_ok("identity.login_status", json!({"attempt_id": attempt.id}))
             .await;
-        match status["status"].as_str() {
-            Some("pending") => {
-                assert!(Instant::now() < deadline, "login never became terminal");
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            _ => return status,
+        if status["status"] != "pending" {
+            return status;
         }
+        assert!(Instant::now() < deadline, "login never became terminal");
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// Drive the actual authorization request and callback. The IdP verifies the
+/// daemon's real verifier against its issued code's S256 challenge at /token.
+async fn drive_login(
+    daemon: &TestDaemon,
+    idp: &MockOidc,
+    email: &str,
+    forge_nonce: Option<&str>,
+) -> Value {
+    let attempt = begin_login(daemon, idp).await;
+    let callback = request_code(idp, &attempt.auth_url, email, forge_nonce).await;
+    finish_login(daemon, &attempt, &callback).await
+}
+
+async fn assert_no_session_and_sanitized_failure(
+    daemon: TestDaemon,
+    status: &Value,
+    code: &str,
+    prior_logins: u64,
+) {
+    assert_eq!(status["status"], "failed");
+    assert!(!status.to_string().contains(code));
+    assert!(daemon.call_ok("whoami", Value::Null).await["identity"].is_null());
+    assert_eq!(
+        daemon.call_ok("agent_session_list", Value::Null).await["count"],
+        0
+    );
+    let (db, _home) = daemon.shutdown();
+    assert!(opaque_core::audit::verify_audit_chain(&db).unwrap().ok);
+    let events =
+        opaque_core::audit::query_audit_db(&db, &opaque_core::audit::AuditFilter::default())
+            .unwrap();
+    assert!(!serde_json::to_string(&events).unwrap().contains(code));
+    // Read the isolated stopped daemon's durable records as well as the public
+    // API: a failed flow must not leave an orphan principal or hidden session.
+    let identity = rusqlite::Connection::open_with_flags(
+        db.with_file_name("identity.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let count = |query: &str| {
+        identity
+            .query_row(query, [], |row| row.get::<_, u64>(0))
+            .unwrap()
+    };
+    assert_eq!(
+        count("SELECT COUNT(*) FROM principals WHERE kind = 'human'"),
+        prior_logins
+    );
+    assert_eq!(count("SELECT COUNT(*) FROM human_sessions"), prior_logins);
+    assert_eq!(
+        count("SELECT COUNT(*) FROM human_sessions WHERE revoked_at IS NULL"),
+        0
+    );
+    assert_eq!(count("SELECT COUNT(*) FROM delegations"), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -528,8 +524,7 @@ async fn workload_attestor_uses_listener_evidence_and_refuses_claims() {
 #[allow(clippy::await_holding_lock)] // deliberate: serialize heavy e2e daemons (current-thread runtime)
 async fn login_end_to_end_against_real_daemon() {
     let _serial = serial_guard();
-    let idp = MockServer::start().await;
-    mount_idp(&idp).await;
+    let idp = MockOidc::start(CLIENT_ID).await;
 
     let daemon = TestDaemon::spawn(&identity_config(&idp.uri()));
 
@@ -539,6 +534,15 @@ async fn login_end_to_end_against_real_daemon() {
 
     let status = drive_login(&daemon, &idp, "dev@example.com", None).await;
     assert_eq!(status["status"], "complete", "login failed: {status}");
+    assert_eq!(
+        idp.counts(),
+        Counts {
+            codes_issued: 1,
+            token_requests: 1,
+            tokens_issued: 1,
+            token_rejections: 0
+        }
+    );
     let identity = &status["identity"];
     assert_eq!(identity["label"], "dev@example.com");
     let roles: Vec<String> = identity["roles"]
@@ -588,8 +592,7 @@ async fn login_end_to_end_against_real_daemon() {
 #[allow(clippy::await_holding_lock)] // deliberate: serialize heavy e2e daemons (current-thread runtime)
 async fn delegation_lifecycle_end_to_end() {
     let _serial = serial_guard();
-    let idp = MockServer::start().await;
-    mount_idp(&idp).await;
+    let idp = MockOidc::start(CLIENT_ID).await;
 
     // Identity + session enforcement + the LOUDLY-GUARDED auto-approve test
     // backend (config value AND env var both required — see Stage D). These
@@ -602,6 +605,15 @@ async fn delegation_lifecycle_end_to_end() {
 
     let status = drive_login(&daemon, &idp, "dev@example.com", None).await;
     assert_eq!(status["status"], "complete", "login failed: {status}");
+    assert_eq!(
+        idp.counts(),
+        Counts {
+            codes_issued: 1,
+            token_requests: 1,
+            tokens_issued: 1,
+            token_rejections: 0
+        }
+    );
 
     // Mint a delegated agent session. Approval is satisfied by the insecure
     // test backend; the response must carry the delegation shape.
@@ -694,22 +706,116 @@ async fn delegation_lifecycle_end_to_end() {
 #[allow(clippy::await_holding_lock)] // deliberate: serialize heavy e2e daemons (current-thread runtime)
 async fn login_rejects_forged_nonce_end_to_end() {
     let _serial = serial_guard();
-    let idp = MockServer::start().await;
-    mount_idp(&idp).await;
+    let idp = MockOidc::start(CLIENT_ID).await;
 
     let daemon = TestDaemon::spawn(&identity_config(&idp.uri()));
 
-    let status = drive_login(&daemon, &idp, "dev@example.com", Some("forged-nonce")).await;
+    let attempt = begin_login(&daemon, &idp).await;
+    let callback = request_code(
+        &idp,
+        &attempt.auth_url,
+        "dev@example.com",
+        Some("forged-nonce"),
+    )
+    .await;
+    let status = finish_login(&daemon, &attempt, &callback).await;
     assert_eq!(
-        status["status"], "failed",
-        "forged nonce must fail login: {status}"
+        idp.counts(),
+        Counts {
+            codes_issued: 1,
+            token_requests: 1,
+            tokens_issued: 1,
+            token_rejections: 0
+        },
+        "the real daemon must reject the signed nonce after a valid PKCE exchange"
+    );
+    assert_no_session_and_sanitized_failure(
+        daemon,
+        &status,
+        &query_param(&callback, "code").unwrap(),
+        0,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn login_rejects_pkce_challenge_substitution_before_creating_authority() {
+    let _serial = serial_guard();
+    let idp = MockOidc::start(CLIENT_ID).await;
+    let daemon = TestDaemon::spawn(&identity_config(&idp.uri()));
+    let attempt = begin_login(&daemon, &idp).await;
+    let mut changed = reqwest::Url::parse(&attempt.auth_url).unwrap();
+    let pairs: Vec<_> = changed.query_pairs().into_owned().collect();
+    changed
+        .query_pairs_mut()
+        .clear()
+        .extend_pairs(pairs.into_iter().map(|(key, value)| {
+            if key == "code_challenge" {
+                (key, oidc::challenge(&"attacker-verifier".repeat(4)))
+            } else {
+                (key, value)
+            }
+        }));
+    // The IdP binds this code to the modified challenge. The real daemon has
+    // only its original private verifier, so its token exchange must fail.
+    let callback = request_code(&idp, changed.as_str(), "dev@example.com", None).await;
+    let status = finish_login(&daemon, &attempt, &callback).await;
+    assert_eq!(
+        idp.counts(),
+        Counts {
+            codes_issued: 1,
+            token_requests: 1,
+            tokens_issued: 0,
+            token_rejections: 1
+        }
+    );
+    let principals = daemon.call_ok("identity.principal_list", Value::Null).await;
+    assert!(principals["principals"].as_array().unwrap().is_empty());
+    assert_no_session_and_sanitized_failure(
+        daemon,
+        &status,
+        &query_param(&callback, "code").unwrap(),
+        0,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn login_rejects_replayed_code_after_logout_without_restoring_session() {
+    let _serial = serial_guard();
+    let idp = MockOidc::start(CLIENT_ID).await;
+    let daemon = TestDaemon::spawn(&identity_config(&idp.uri()));
+    let first = begin_login(&daemon, &idp).await;
+    let callback = request_code(&idp, &first.auth_url, "dev@example.com", None).await;
+    assert_eq!(
+        finish_login(&daemon, &first, &callback).await["status"],
+        "complete"
+    );
+    let code = query_param(&callback, "code").unwrap();
+    assert!(
+        daemon.call_ok("identity.logout", Value::Null).await["revoked"]
+            .as_u64()
+            .unwrap()
+            >= 1
     );
 
-    // No session was created.
-    let who = daemon.call_ok("whoami", Value::Null).await;
-    assert!(who["identity"].is_null());
-
-    let (db, _home) = daemon.shutdown();
-    let v = opaque_core::audit::verify_audit_chain(&db).expect("verify runs");
-    assert!(v.ok);
+    let second = begin_login(&daemon, &idp).await;
+    let mut replay = reqwest::Url::parse(&second.redirect).unwrap();
+    replay
+        .query_pairs_mut()
+        .append_pair("code", &code)
+        .append_pair("state", &second.state);
+    let failed = finish_login(&daemon, &second, replay.as_str()).await;
+    assert_eq!(
+        idp.counts(),
+        Counts {
+            codes_issued: 1,
+            token_requests: 2,
+            tokens_issued: 1,
+            token_rejections: 1
+        }
+    );
+    assert_no_session_and_sanitized_failure(daemon, &failed, &code, 1).await;
 }

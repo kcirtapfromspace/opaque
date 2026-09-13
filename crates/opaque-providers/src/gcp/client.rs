@@ -1,117 +1,76 @@
-//! Google Cloud Secret Manager API client.
-//!
-//! Wraps the REST endpoints needed to list, create, and access secrets
-//! via the GCP Secret Manager API v1.
-//!
-//! **Never** leaks raw API error bodies to callers -- all errors are
-//! mapped to sanitized strings.
-//!
-//! Authentication:
-//! - `OPAQUE_GCP_ACCESS_TOKEN` env var for direct token
-//! - `OPAQUE_GCP_SERVICE_ACCOUNT_KEY` env var for service account JSON key file
-//! - JWT creation: sign with RS256, exchange at `https://oauth2.googleapis.com/token`
-//! - Token caching with expiry
-
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
-
+//! Google Secret Manager REST v1 with fixed OAuth authority and deferred credentials.
 use base64::Engine;
-use serde::{Deserialize, Serialize};
+use opaque_core::resolver::{BaseResolver, SecretResolver};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::collections::HashSet;
+use std::io::Read;
+use std::time::{Duration, Instant};
+use zeroize::{Zeroize, Zeroizing};
 
-/// Environment variable to override the default GCP Secret Manager base URL.
 pub const GCP_SM_URL_ENV: &str = "OPAQUE_GCP_SM_URL";
-
-/// Default GCP Secret Manager API base URL.
 pub const DEFAULT_BASE_URL: &str = "https://secretmanager.googleapis.com/v1";
-
-/// Environment variable for a direct GCP access token.
 pub const GCP_ACCESS_TOKEN_ENV: &str = "OPAQUE_GCP_ACCESS_TOKEN";
-
-/// Environment variable for the path to a GCP service account JSON key file.
 pub const GCP_SERVICE_ACCOUNT_KEY_ENV: &str = "OPAQUE_GCP_SERVICE_ACCOUNT_KEY";
+pub const GCP_TOKEN_REF_ENV: &str = "OPAQUE_GCP_TOKEN_REF";
+pub const GCP_SERVICE_ACCOUNT_REF_ENV: &str = "OPAQUE_GCP_SERVICE_ACCOUNT_REF";
+const OAUTH2_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const MAX_BODY: usize = 256 * 1024;
+const MAX_SECRET: usize = 64 * 1024;
 
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
-    use std::sync::{Mutex, OnceLock};
-
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .expect("gcp test env lock poisoned")
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// Google OAuth2 token endpoint.
-const OAUTH2_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
-
-/// GCP Secret Manager API error types. Raw API error messages are never exposed.
 #[derive(Debug, thiserror::Error)]
 pub enum GcpApiError {
-    #[error("invalid URL: {0}")]
+    #[error("invalid GCP endpoint or selector: {0}")]
     InvalidUrl(String),
-
     #[error("network error communicating with GCP Secret Manager")]
     HttpError(#[source] reqwest::Error),
-
     #[error("GCP Secret Manager authentication failed")]
     AuthError(String),
-
     #[error("resource not found: {0}")]
     NotFound(String),
-
     #[error("GCP Secret Manager permission denied")]
     PermissionDenied,
-
     #[error("GCP Secret Manager server error")]
     ServerError,
-
     #[error("unexpected GCP Secret Manager response: status {0}")]
     UnexpectedStatus(u16),
+    #[error("GCP returned invalid, oversized or incomplete data")]
+    InvalidResponse,
 }
-
-/// A GCP secret resource.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GcpSecret {
-    /// Full resource name: `projects/*/secrets/*`
     pub name: String,
-    /// Replication policy (simplified).
     #[serde(default)]
     pub replication: Option<serde_json::Value>,
-    /// Create time.
     #[serde(default, rename = "createTime")]
     pub create_time: Option<String>,
 }
-
-/// A GCP secret version resource.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GcpSecretVersion {
-    /// Full resource name: `projects/*/secrets/*/versions/*`
     pub name: String,
-    /// State of the version.
     #[serde(default)]
     pub state: Option<String>,
-    /// Create time.
     #[serde(default, rename = "createTime")]
     pub create_time: Option<String>,
 }
-
-/// Payload returned by the access endpoint.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, Zeroize)]
+#[zeroize(drop)]
 pub struct GcpSecretPayload {
-    /// Base64-encoded secret data.
     pub data: String,
+    #[serde(default, rename = "dataCrc32c")]
+    pub data_crc32c: Option<String>,
 }
-
-/// Response from the access endpoint.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct GcpAccessSecretVersionResponse {
-    /// The secret version name.
     #[serde(default)]
     pub name: Option<String>,
-    /// The actual secret payload.
     pub payload: GcpSecretPayload,
 }
-
-/// Response from the list secrets endpoint.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GcpListSecretsResponse {
     #[serde(default)]
@@ -119,262 +78,460 @@ pub struct GcpListSecretsResponse {
     #[serde(default, rename = "nextPageToken")]
     pub next_page_token: Option<String>,
 }
-
-/// Request body for adding a new secret version.
-#[derive(Debug, Serialize)]
-struct AddSecretVersionRequest {
-    payload: AddSecretVersionPayload,
+#[derive(Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AuthBinding {
+    AccessToken { credential_ref: String },
+    ServiceAccount { credential_ref: String },
+    ServiceAccountFile { path: String },
 }
-
-#[derive(Debug, Serialize)]
-struct AddSecretVersionPayload {
-    data: String,
+impl AuthBinding {
+    pub fn refs(&self) -> Vec<String> {
+        match self {
+            Self::AccessToken { credential_ref } | Self::ServiceAccount { credential_ref } => {
+                vec![credential_ref.clone()]
+            }
+            Self::ServiceAccountFile { path } => vec![format!("gcp-service-account-file:{path}")],
+        }
+    }
 }
-
-/// Request body for creating a new secret.
-#[derive(Debug, Serialize)]
-struct CreateSecretRequest {
-    replication: CreateSecretReplication,
-}
-
-#[derive(Debug, Serialize)]
-struct CreateSecretReplication {
-    automatic: serde_json::Value,
-}
-
-/// Cached OAuth2 access token.
-#[derive(Debug)]
 struct CachedToken {
-    token: String,
+    token: Zeroizing<String>,
     expires_at: Instant,
+    credential_sha256: String,
 }
-
-/// Service account key file structure.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize, Zeroize)]
+#[zeroize(drop)]
 struct ServiceAccountKey {
     client_email: String,
     private_key: String,
     token_uri: Option<String>,
 }
-
-/// OAuth2 token response.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize, Zeroize)]
+#[zeroize(drop)]
 struct TokenResponse {
     access_token: String,
     expires_in: u64,
+    #[serde(default)]
+    token_type: Option<String>,
 }
 
-/// Validate that a URL uses `https://`, allowing `http://` only for localhost.
-fn validate_url_scheme(url: &str) -> Result<(), GcpApiError> {
-    if url.starts_with("https://") {
+pub fn validate_ref(value: &str) -> Result<(), String> {
+    if let Some(name) = value.strip_prefix("env:") {
+        if !name.is_empty()
+            && name.len() <= 256
+            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            return Ok(());
+        }
+    } else if let Some(path) = value.strip_prefix("keychain:")
+        && path.len() <= 512
+        && path
+            .split_once('/')
+            .is_some_and(|(a, b)| !a.is_empty() && !b.is_empty())
+        && path.bytes().all(|b| b.is_ascii_graphic())
+    {
         return Ok(());
     }
-    if url.starts_with("http://") {
-        if let Some(host_part) = url.strip_prefix("http://") {
-            let host = host_part.split('/').next().unwrap_or("");
-            let host_no_port = host.split(':').next().unwrap_or("");
-            if host_no_port == "localhost" || host_no_port == "127.0.0.1" {
-                return Ok(());
-            }
-        }
-        return Err(GcpApiError::InvalidUrl(format!(
-            "insecure HTTP URL rejected: {url}. \
-             Only https:// URLs are allowed (http:// is permitted for localhost/127.0.0.1 only)"
-        )));
+    Err(
+        "credential/value reference must be an explicit env:NAME or keychain:service/account"
+            .into(),
+    )
+}
+fn canonical_number(value: &str) -> bool {
+    !value.starts_with('0')
+        && value.len() <= 20
+        && value.bytes().all(|b| b.is_ascii_digit())
+        && value.parse::<u64>().is_ok_and(|n| n > 0)
+}
+/// Canonical project numbers avoid an implicit project-ID-to-number mapping.
+pub fn validate_project(value: &str) -> Result<(), GcpApiError> {
+    if canonical_number(value) {
+        Ok(())
+    } else {
+        Err(GcpApiError::InvalidUrl(
+            "numeric project number required".into(),
+        ))
     }
-    Err(GcpApiError::InvalidUrl(format!(
-        "unsupported URL scheme: {url}. \
-         Only https:// URLs are allowed (http:// is permitted for localhost/127.0.0.1 only)"
-    )))
+}
+fn validate_returned_resource(
+    value: &str,
+    project: &str,
+    secret: Option<&str>,
+    versioned: bool,
+    requested_version: Option<&str>,
+) -> Result<(), GcpApiError> {
+    let parts: Vec<_> = value.split('/').collect();
+    if parts.len() != if versioned { 6 } else { 4 }
+        || parts[0] != "projects"
+        || parts[1] != project
+        || parts[2] != "secrets"
+        || validate_secret(parts[3]).is_err()
+        || secret.is_some_and(|expected| parts[3] != expected)
+        || versioned && (parts[4] != "versions" || !canonical_number(parts[5]))
+        || requested_version
+            .is_some_and(|expected| canonical_number(expected) && parts[5] != expected)
+    {
+        return Err(GcpApiError::InvalidResponse);
+    }
+    Ok(())
+}
+pub fn validate_secret(value: &str) -> Result<(), GcpApiError> {
+    if !value.is_empty()
+        && value.len() <= 255
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        Ok(())
+    } else {
+        Err(GcpApiError::InvalidUrl("invalid secret ID".into()))
+    }
+}
+pub fn validate_version(value: &str) -> Result<(), GcpApiError> {
+    if canonical_number(value)
+        || !value.is_empty()
+            && value.len() <= 63
+            && value.as_bytes()[0].is_ascii_alphabetic()
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        Ok(())
+    } else {
+        Err(GcpApiError::InvalidUrl(
+            "invalid version number or alias".into(),
+        ))
+    }
+}
+fn validate_url_scheme(value: &str) -> Result<(), GcpApiError> {
+    let u =
+        reqwest::Url::parse(value).map_err(|_| GcpApiError::InvalidUrl("invalid URL".into()))?;
+    if u.host_str().is_none()
+        || !u.username().is_empty()
+        || u.password().is_some()
+        || u.query().is_some()
+        || u.fragment().is_some()
+        || !(u.scheme() == "https"
+            || cfg!(test)
+                && u.scheme() == "http"
+                && matches!(u.host_str(), Some("localhost" | "127.0.0.1")))
+    {
+        return Err(GcpApiError::InvalidUrl(
+            "trusted HTTPS endpoint required".into(),
+        ));
+    }
+    Ok(())
 }
 
-/// GCP Secret Manager REST API client.
-///
-/// Follows the same pattern as `BitwardenClient`: timeouts, user-agent,
-/// and URL validation. Supports both direct token and service account
-/// JWT-based authentication.
-#[derive(Debug)]
+#[derive(Clone)]
 pub struct GcpSecretManagerClient {
     http: reqwest::Client,
     base_url: String,
-    /// Cached OAuth2 token (from JWT exchange).
-    token_cache: Mutex<Option<CachedToken>>,
+    auth: AuthBinding,
+    token_cache: std::sync::Arc<tokio::sync::Mutex<Option<CachedToken>>>,
+    #[cfg(test)]
+    token_endpoint_override: Option<String>,
 }
-
+impl std::fmt::Debug for GcpSecretManagerClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GcpSecretManagerClient")
+            .finish_non_exhaustive()
+    }
+}
 impl GcpSecretManagerClient {
-    /// Build the user-agent string from the crate version.
     fn user_agent() -> String {
         format!("opaqued/{}", env!("CARGO_PKG_VERSION"))
     }
-
-    /// Create a new client pointing at the given GCP Secret Manager URL.
-    ///
-    /// Returns an error if the base URL uses an unsupported scheme.
+    pub fn from_env() -> Result<Option<Self>, GcpApiError> {
+        if ![
+            GCP_TOKEN_REF_ENV,
+            GCP_SERVICE_ACCOUNT_REF_ENV,
+            GCP_SERVICE_ACCOUNT_KEY_ENV,
+            GCP_ACCESS_TOKEN_ENV,
+        ]
+        .iter()
+        .any(|n| std::env::var_os(n).is_some_and(|value| !value.is_empty()))
+        {
+            return Ok(None);
+        }
+        Self::new(&std::env::var(GCP_SM_URL_ENV).unwrap_or_else(|_| DEFAULT_BASE_URL.into()))
+            .map(Some)
+    }
     pub fn new(base_url: &str) -> Result<Self, GcpApiError> {
+        let auth = if let Some(credential_ref) = std::env::var(GCP_SERVICE_ACCOUNT_REF_ENV)
+            .ok()
+            .filter(|value| !value.is_empty())
+        {
+            AuthBinding::ServiceAccount { credential_ref }
+        } else if let Some(path) = std::env::var(GCP_SERVICE_ACCOUNT_KEY_ENV)
+            .ok()
+            .filter(|value| !value.is_empty())
+        {
+            if !std::path::Path::new(&path).is_absolute() {
+                return Err(GcpApiError::AuthError("absolute key path required".into()));
+            }
+            AuthBinding::ServiceAccountFile { path }
+        } else {
+            AuthBinding::AccessToken {
+                credential_ref: std::env::var(GCP_TOKEN_REF_ENV)
+                    .ok()
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| format!("env:{GCP_ACCESS_TOKEN_ENV}")),
+            }
+        };
+        Self::with_auth(base_url, auth)
+    }
+    pub fn with_auth(base_url: &str, auth: AuthBinding) -> Result<Self, GcpApiError> {
         validate_url_scheme(base_url)?;
-
+        let base_url = base_url.trim_end_matches('/').to_owned();
+        if !cfg!(test) {
+            validate_production_endpoint(&base_url)?;
+        }
+        match &auth {
+            AuthBinding::AccessToken { credential_ref }
+            | AuthBinding::ServiceAccount { credential_ref } => {
+                validate_ref(credential_ref).map_err(GcpApiError::AuthError)?
+            }
+            AuthBinding::ServiceAccountFile { path } => {
+                if !std::path::Path::new(path).is_absolute() {
+                    return Err(GcpApiError::AuthError("absolute key path required".into()));
+                }
+            }
+        }
         let http = reqwest::Client::builder()
             .user_agent(Self::user_agent())
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(5))
+            .retry(reqwest::retry::never())
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(GcpApiError::HttpError)?;
-
         Ok(Self {
             http,
-            base_url: base_url.trim_end_matches('/').to_owned(),
-            token_cache: Mutex::new(None),
+            base_url,
+            auth,
+            token_cache: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            #[cfg(test)]
+            token_endpoint_override: None,
         })
     }
-
-    /// Obtain a valid access token.
-    ///
-    /// Priority:
-    /// 1. Direct token from `OPAQUE_GCP_ACCESS_TOKEN`
-    /// 2. Cached token (if not expired)
-    /// 3. Fresh token from service account JWT exchange
-    pub async fn get_access_token(&self) -> Result<String, GcpApiError> {
-        // 1. Direct token from env var.
-        if let Ok(token) = std::env::var(GCP_ACCESS_TOKEN_ENV)
-            && !token.is_empty()
-        {
-            return Ok(token);
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+    pub fn auth_binding(&self) -> &AuthBinding {
+        &self.auth
+    }
+    pub fn token_endpoint(&self) -> &str {
+        #[cfg(test)]
+        if let Some(url) = &self.token_endpoint_override {
+            return url;
         }
-
-        // 2. Check cached token.
-        {
-            let cache = self.token_cache.lock().unwrap();
-            if let Some(ref cached) = *cache
-                && cached.expires_at > Instant::now()
-            {
-                return Ok(cached.token.clone());
+        OAUTH2_TOKEN_URL
+    }
+    fn credentials(&self) -> Result<Zeroizing<Vec<u8>>, GcpApiError> {
+        let failed = || GcpApiError::AuthError("credential unavailable".into());
+        match &self.auth {
+            AuthBinding::AccessToken { credential_ref }
+            | AuthBinding::ServiceAccount { credential_ref } => {
+                let value = BaseResolver::new()
+                    .resolve(credential_ref)
+                    .map_err(|_| failed())?;
+                if value.as_bytes().len() > MAX_SECRET {
+                    return Err(failed());
+                }
+                Ok(Zeroizing::new(value.as_bytes().to_vec()))
+            }
+            AuthBinding::ServiceAccountFile { path } => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+                    let file = std::fs::OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                        .open(path)
+                        .map_err(|_| failed())?;
+                    let meta = file.metadata().map_err(|_| failed())?;
+                    if !meta.is_file()
+                        || meta.mode() & 0o077 != 0
+                        || meta.uid() != unsafe { libc::geteuid() }
+                        || meta.len() > MAX_SECRET as u64
+                    {
+                        return Err(failed());
+                    }
+                    let mut bytes = Zeroizing::new(Vec::new());
+                    file.take(MAX_SECRET as u64 + 1)
+                        .read_to_end(&mut bytes)
+                        .map_err(|_| failed())?;
+                    if bytes.len() > MAX_SECRET {
+                        return Err(failed());
+                    }
+                    Ok(bytes)
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = path;
+                    Err(failed())
+                }
             }
         }
-
-        // 3. Exchange service account JWT for access token.
-        let key_path = std::env::var(GCP_SERVICE_ACCOUNT_KEY_ENV).map_err(|_| {
-            GcpApiError::AuthError(format!(
-                "neither {GCP_ACCESS_TOKEN_ENV} nor {GCP_SERVICE_ACCOUNT_KEY_ENV} is set"
-            ))
-        })?;
-
-        let key_contents = std::fs::read_to_string(&key_path).map_err(|e| {
-            GcpApiError::AuthError(format!("failed to read service account key file: {e}"))
-        })?;
-
-        let sa_key: ServiceAccountKey = serde_json::from_str(&key_contents).map_err(|e| {
-            GcpApiError::AuthError(format!("failed to parse service account key JSON: {e}"))
-        })?;
-
-        let token_uri = sa_key.token_uri.as_deref().unwrap_or(OAUTH2_TOKEN_URL);
-
+    }
+    pub async fn get_access_token(&self) -> Result<Zeroizing<String>, GcpApiError> {
+        let bytes = self.credentials()?;
+        if matches!(self.auth, AuthBinding::AccessToken { .. }) {
+            let token = std::str::from_utf8(&bytes)
+                .map_err(|_| GcpApiError::AuthError("invalid token".into()))?;
+            check_token(token)?;
+            return Ok(Zeroizing::new(token.to_owned()));
+        }
+        use sha2::{Digest, Sha256};
+        let fingerprint = format!("{:x}", Sha256::digest(&bytes));
+        let mut cache = self.token_cache.lock().await;
+        if let Some(cached) = cache.as_ref()
+            && cached.expires_at > Instant::now()
+            && cached.credential_sha256 == fingerprint
+        {
+            return Ok(cached.token.clone());
+        }
+        let key: ServiceAccountKey = serde_json::from_slice(&bytes)
+            .map_err(|_| GcpApiError::AuthError("invalid service account key".into()))?;
+        if key
+            .token_uri
+            .as_deref()
+            .is_some_and(|v| v != OAUTH2_TOKEN_URL)
+            || !key.client_email.ends_with(".gserviceaccount.com")
+            || key.client_email.len() > 320
+        {
+            return Err(GcpApiError::AuthError(
+                "invalid service account authority".into(),
+            ));
+        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .map_err(|_| GcpApiError::AuthError("clock unavailable".into()))?
             .as_secs();
-
-        let jwt = create_jwt(&sa_key.client_email, &sa_key.private_key, now)?;
-
-        let token_resp = self
+        let jwt = Zeroizing::new(create_jwt(&key.client_email, &key.private_key, now)?);
+        let response = self
             .http
-            .post(token_uri)
+            .post(self.token_endpoint())
             .form(&[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
-                ("assertion", &jwt),
+                ("assertion", jwt.as_str()),
             ])
             .send()
             .await
-            .map_err(|e| GcpApiError::AuthError(format!("token exchange failed: {e}")))?;
-
-        if !token_resp.status().is_success() {
-            return Err(GcpApiError::AuthError(
-                "OAuth2 token exchange returned non-success status".into(),
-            ));
+            .map_err(GcpApiError::HttpError)?;
+        if response.status() != reqwest::StatusCode::OK {
+            return Err(GcpApiError::AuthError("token exchange failed".into()));
         }
-
-        let token_data: TokenResponse = token_resp
-            .json()
-            .await
-            .map_err(|e| GcpApiError::AuthError(format!("failed to parse token response: {e}")))?;
-
-        // Cache with 60 second margin.
-        let expires_at =
-            Instant::now() + Duration::from_secs(token_data.expires_in.saturating_sub(60));
-        let token = token_data.access_token.clone();
+        let data: TokenResponse = read_json(response, 16 * 1024).await?;
+        check_token(&data.access_token)?;
+        if !(1..=86400).contains(&data.expires_in)
+            || data
+                .token_type
+                .as_deref()
+                .is_some_and(|v| !v.eq_ignore_ascii_case("bearer"))
         {
-            let mut cache = self.token_cache.lock().unwrap();
-            *cache = Some(CachedToken {
-                token: token_data.access_token,
-                expires_at,
-            });
+            return Err(GcpApiError::AuthError("invalid token response".into()));
         }
-
+        let token = Zeroizing::new(data.access_token.clone());
+        *cache = Some(CachedToken {
+            token: token.clone(),
+            expires_at: Instant::now() + Duration::from_secs(data.expires_in.saturating_sub(60)),
+            credential_sha256: fingerprint,
+        });
         Ok(token)
     }
-
-    /// List all secrets in a project.
+    fn url(
+        &self,
+        project: &str,
+        secret: Option<&str>,
+        suffix: &str,
+    ) -> Result<reqwest::Url, GcpApiError> {
+        validate_project(project)?;
+        if let Some(secret) = secret {
+            validate_secret(secret)?;
+        }
+        reqwest::Url::parse(&format!(
+            "{}/projects/{project}/secrets{}{suffix}",
+            self.base_url,
+            secret.map(|s| format!("/{s}")).unwrap_or_default()
+        ))
+        .map_err(|_| GcpApiError::InvalidUrl("invalid API path".into()))
+    }
+    async fn fetch<T: DeserializeOwned>(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<T, GcpApiError> {
+        let response = request.send().await.map_err(GcpApiError::HttpError)?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            *self.token_cache.lock().await = None;
+        }
+        match response.status().as_u16() {
+            200..=299 => read_json(response, MAX_BODY).await,
+            401 => Err(GcpApiError::AuthError("rejected".into())),
+            403 => Err(GcpApiError::PermissionDenied),
+            404 => Err(GcpApiError::NotFound("requested resource".into())),
+            500..=599 => Err(GcpApiError::ServerError),
+            status => Err(GcpApiError::UnexpectedStatus(status)),
+        }
+    }
     pub async fn list_secrets(
         &self,
         token: &str,
         project: &str,
     ) -> Result<Vec<GcpSecret>, GcpApiError> {
-        let url = format!("{}/projects/{}/secrets", self.base_url, project);
-
-        let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(token)
-            .send()
-            .await
-            .map_err(GcpApiError::HttpError)?;
-
-        match resp.status().as_u16() {
-            200 => {
-                let list_resp: GcpListSecretsResponse =
-                    resp.json().await.map_err(GcpApiError::HttpError)?;
-                Ok(list_resp.secrets)
+        let base = self.url(project, None, "")?;
+        let mut results = Vec::new();
+        let mut page: Option<String> = None;
+        let mut seen = HashSet::new();
+        for _ in 0..40 {
+            let mut url = base.clone();
+            url.query_pairs_mut().append_pair("pageSize", "100");
+            if let Some(p) = &page {
+                url.query_pairs_mut().append_pair("pageToken", p);
             }
-            401 => Err(GcpApiError::AuthError("authentication failed".into())),
-            403 => Err(GcpApiError::PermissionDenied),
-            404 => Err(GcpApiError::NotFound(format!("project {project}"))),
-            500..=599 => Err(GcpApiError::ServerError),
-            other => Err(GcpApiError::UnexpectedStatus(other)),
+            let data: GcpListSecretsResponse =
+                self.fetch(self.http.get(url).bearer_auth(token)).await?;
+            if data.secrets.len() > 100 || results.len() + data.secrets.len() > 4000 {
+                return Err(GcpApiError::InvalidResponse);
+            }
+            for secret in &data.secrets {
+                validate_returned_resource(&secret.name, project, None, false, None)?;
+            }
+            results.extend(data.secrets);
+            match data.next_page_token.filter(|v| !v.is_empty()) {
+                None => return Ok(results),
+                Some(next) => {
+                    if next.len() > 4096
+                        || next.chars().any(char::is_control)
+                        || !seen.insert(next.clone())
+                    {
+                        return Err(GcpApiError::InvalidResponse);
+                    }
+                    page = Some(next);
+                }
+            }
         }
+        Err(GcpApiError::InvalidResponse)
     }
-
-    /// Get a single secret resource.
     pub async fn get_secret(
         &self,
         token: &str,
         project: &str,
         secret_id: &str,
     ) -> Result<GcpSecret, GcpApiError> {
-        let url = format!(
-            "{}/projects/{}/secrets/{}",
-            self.base_url, project, secret_id
-        );
-
-        let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(token)
-            .send()
-            .await
-            .map_err(GcpApiError::HttpError)?;
-
-        match resp.status().as_u16() {
-            200 => resp
-                .json::<GcpSecret>()
-                .await
-                .map_err(GcpApiError::HttpError),
-            401 => Err(GcpApiError::AuthError("authentication failed".into())),
-            403 => Err(GcpApiError::PermissionDenied),
-            404 => Err(GcpApiError::NotFound(format!("secret {secret_id}"))),
-            500..=599 => Err(GcpApiError::ServerError),
-            other => Err(GcpApiError::UnexpectedStatus(other)),
-        }
+        let result: GcpSecret = self
+            .fetch(
+                self.http
+                    .get(self.url(project, Some(secret_id), "")?)
+                    .bearer_auth(token),
+            )
+            .await?;
+        validate_returned_resource(&result.name, project, Some(secret_id), false, None)?;
+        Ok(result)
     }
-
-    /// Access a specific version of a secret (returns the payload data).
     pub async fn access_secret_version(
         &self,
         token: &str,
@@ -382,156 +539,125 @@ impl GcpSecretManagerClient {
         secret_id: &str,
         version: &str,
     ) -> Result<GcpAccessSecretVersionResponse, GcpApiError> {
-        let url = format!(
-            "{}/projects/{}/secrets/{}/versions/{}:access",
-            self.base_url, project, secret_id, version
+        validate_version(version)?;
+        let value: GcpAccessSecretVersionResponse = self
+            .fetch(
+                self.http
+                    .get(self.url(
+                        project,
+                        Some(secret_id),
+                        &format!("/versions/{version}:access"),
+                    )?)
+                    .bearer_auth(token),
+            )
+            .await?;
+        let returned = value.name.as_deref().ok_or(GcpApiError::InvalidResponse)?;
+        validate_returned_resource(returned, project, Some(secret_id), true, Some(version))?;
+        let decoded = Zeroizing::new(
+            base64::engine::general_purpose::STANDARD
+                .decode(&value.payload.data)
+                .map_err(|_| GcpApiError::InvalidResponse)?,
         );
-
-        let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(token)
-            .send()
-            .await
-            .map_err(GcpApiError::HttpError)?;
-
-        match resp.status().as_u16() {
-            200 => resp
-                .json::<GcpAccessSecretVersionResponse>()
-                .await
-                .map_err(GcpApiError::HttpError),
-            401 => Err(GcpApiError::AuthError("authentication failed".into())),
-            403 => Err(GcpApiError::PermissionDenied),
-            404 => Err(GcpApiError::NotFound(format!(
-                "secret {secret_id} version {version}"
-            ))),
-            500..=599 => Err(GcpApiError::ServerError),
-            other => Err(GcpApiError::UnexpectedStatus(other)),
+        if decoded.len() > MAX_SECRET {
+            return Err(GcpApiError::InvalidResponse);
         }
+        if let Some(checksum) = &value.payload.data_crc32c
+            && checksum.parse::<u32>().ok() != Some(crc32c(&decoded))
+        {
+            return Err(GcpApiError::InvalidResponse);
+        }
+        Ok(value)
     }
-
-    /// Add a new version to an existing secret.
     pub async fn add_secret_version(
         &self,
         token: &str,
         project: &str,
         secret_id: &str,
-        payload: &[u8],
+        value: &[u8],
     ) -> Result<GcpSecretVersion, GcpApiError> {
-        let url = format!(
-            "{}/projects/{}/secrets/{}:addVersion",
-            self.base_url, project, secret_id
-        );
-
-        let encoded = base64::engine::general_purpose::STANDARD.encode(payload);
-        let body = AddSecretVersionRequest {
-            payload: AddSecretVersionPayload { data: encoded },
-        };
-
-        let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(token)
-            .json(&body)
-            .send()
-            .await
-            .map_err(GcpApiError::HttpError)?;
-
-        match resp.status().as_u16() {
-            200 => resp
-                .json::<GcpSecretVersion>()
-                .await
-                .map_err(GcpApiError::HttpError),
-            401 => Err(GcpApiError::AuthError("authentication failed".into())),
-            403 => Err(GcpApiError::PermissionDenied),
-            404 => Err(GcpApiError::NotFound(format!("secret {secret_id}"))),
-            500..=599 => Err(GcpApiError::ServerError),
-            other => Err(GcpApiError::UnexpectedStatus(other)),
+        let url = self.url(project, Some(secret_id), ":addVersion")?;
+        if value.len() > MAX_SECRET {
+            return Err(GcpApiError::InvalidResponse);
         }
+        let payload = Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(value));
+        let body = Zeroizing::new(format!(
+            "{{\"payload\":{{\"data\":\"{}\",\"dataCrc32c\":\"{}\"}}}}",
+            payload.as_str(),
+            crc32c(value)
+        ));
+        let result: GcpSecretVersion = self
+            .fetch(
+                self.http
+                    .post(url)
+                    .bearer_auth(token)
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(body.as_bytes().to_vec()),
+            )
+            .await?;
+        validate_returned_resource(&result.name, project, Some(secret_id), true, None)?;
+        Ok(result)
     }
-
-    /// Create a new secret in a project.
     pub async fn create_secret(
         &self,
         token: &str,
         project: &str,
         secret_id: &str,
     ) -> Result<GcpSecret, GcpApiError> {
-        let url = format!(
-            "{}/projects/{}/secrets?secretId={}",
-            self.base_url, project, secret_id
-        );
-
-        let body = CreateSecretRequest {
-            replication: CreateSecretReplication {
-                automatic: serde_json::json!({}),
-            },
-        };
-
-        let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(token)
-            .json(&body)
-            .send()
-            .await
-            .map_err(GcpApiError::HttpError)?;
-
-        match resp.status().as_u16() {
-            200 => resp
-                .json::<GcpSecret>()
-                .await
-                .map_err(GcpApiError::HttpError),
-            401 => Err(GcpApiError::AuthError("authentication failed".into())),
-            403 => Err(GcpApiError::PermissionDenied),
-            404 => Err(GcpApiError::NotFound(format!("project {project}"))),
-            409 => Err(GcpApiError::UnexpectedStatus(409)), // Conflict -- secret already exists
-            500..=599 => Err(GcpApiError::ServerError),
-            other => Err(GcpApiError::UnexpectedStatus(other)),
-        }
+        validate_secret(secret_id)?;
+        let mut url = self.url(project, None, "")?;
+        url.query_pairs_mut().append_pair("secretId", secret_id);
+        let result: GcpSecret = self
+            .fetch(
+                self.http
+                    .post(url)
+                    .bearer_auth(token)
+                    .json(&serde_json::json!({"replication":{"automatic":{}}})),
+            )
+            .await?;
+        validate_returned_resource(&result.name, project, Some(secret_id), false, None)?;
+        Ok(result)
     }
 }
-
-/// Create a signed JWT assertion for the Google OAuth2 token exchange.
-///
-/// The JWT is signed using RS256 (RSA + SHA-256) as required by Google's
-/// OAuth2 server-to-server flow.
-fn create_jwt(
-    client_email: &str,
-    private_key_pem: &str,
-    now_secs: u64,
-) -> Result<String, GcpApiError> {
-    let header = serde_json::json!({
-        "alg": "RS256",
-        "typ": "JWT"
-    });
-
-    let claims = serde_json::json!({
-        "iss": client_email,
-        "scope": "https://www.googleapis.com/auth/cloud-platform",
-        "aud": OAUTH2_TOKEN_URL,
-        "iat": now_secs,
-        "exp": now_secs + 3600,
-    });
-
-    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    let header_b64 = b64.encode(serde_json::to_vec(&header).unwrap());
-    let claims_b64 = b64.encode(serde_json::to_vec(&claims).unwrap());
-    let signing_input = format!("{header_b64}.{claims_b64}");
-
-    let key = jsonwebtoken::EncodingKey::from_rsa_pem(private_key_pem.as_bytes())
-        .map_err(|e| GcpApiError::AuthError(format!("invalid RSA private key: {e}")))?;
-
-    let signature = jsonwebtoken::crypto::sign(
-        signing_input.as_bytes(),
-        &key,
-        jsonwebtoken::Algorithm::RS256,
-    )
-    .map_err(|e| GcpApiError::AuthError(format!("JWT signing failed: {e}")))?;
-
-    Ok(format!("{signing_input}.{signature}"))
+fn check_token(token: &str) -> Result<(), GcpApiError> {
+    if token.is_empty() || token.len() > 8192 || !token.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(GcpApiError::AuthError("invalid token".into()));
+    }
+    Ok(())
 }
-
+async fn read_json<T: DeserializeOwned>(
+    mut response: reqwest::Response,
+    max: usize,
+) -> Result<T, GcpApiError> {
+    if response
+        .content_length()
+        .is_some_and(|len| len > max as u64)
+    {
+        return Err(GcpApiError::InvalidResponse);
+    }
+    let mut data = Zeroizing::new(Vec::new());
+    while let Some(chunk) = response.chunk().await.map_err(GcpApiError::HttpError)? {
+        if chunk.len() > max.saturating_sub(data.len()) {
+            return Err(GcpApiError::InvalidResponse);
+        }
+        data.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&data).map_err(|_| GcpApiError::InvalidResponse)
+}
+fn create_jwt(email: &str, key: &str, now: u64) -> Result<String, GcpApiError> {
+    let key = jsonwebtoken::EncodingKey::from_rsa_pem(key.as_bytes())
+        .map_err(|_| GcpApiError::AuthError("invalid RSA key".into()))?;
+    jsonwebtoken::encode(&jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),&serde_json::json!({"iss":email,"scope":"https://www.googleapis.com/auth/cloud-platform","aud":OAUTH2_TOKEN_URL,"iat":now,"exp":now+3600}),&key).map_err(|_|GcpApiError::AuthError("JWT signing failed".into()))
+}
+fn crc32c(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0x82f63b78u32.wrapping_mul(crc & 1));
+        }
+    }
+    !crc
+}
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -561,26 +687,26 @@ mod tests {
 
     #[test]
     fn gcp_secret_deserialize() {
-        let json = r#"{"name":"projects/my-project/secrets/my-secret","createTime":"2024-01-01T00:00:00Z"}"#;
+        let json = r#"{"name":"projects/123456789012/secrets/my-secret","createTime":"2024-01-01T00:00:00Z"}"#;
         let secret: GcpSecret = serde_json::from_str(json).unwrap();
-        assert_eq!(secret.name, "projects/my-project/secrets/my-secret");
+        assert_eq!(secret.name, "projects/123456789012/secrets/my-secret");
         assert_eq!(secret.create_time.as_deref(), Some("2024-01-01T00:00:00Z"));
     }
 
     #[test]
     fn gcp_secret_deserialize_minimal() {
-        let json = r#"{"name":"projects/p/secrets/s"}"#;
+        let json = r#"{"name":"projects/123456789012/secrets/s"}"#;
         let secret: GcpSecret = serde_json::from_str(json).unwrap();
-        assert_eq!(secret.name, "projects/p/secrets/s");
+        assert_eq!(secret.name, "projects/123456789012/secrets/s");
         assert!(secret.create_time.is_none());
         assert!(secret.replication.is_none());
     }
 
     #[test]
     fn gcp_secret_version_deserialize() {
-        let json = r#"{"name":"projects/p/secrets/s/versions/1","state":"ENABLED","createTime":"2024-01-01T00:00:00Z"}"#;
+        let json = r#"{"name":"projects/123456789012/secrets/s/versions/1","state":"ENABLED","createTime":"2024-01-01T00:00:00Z"}"#;
         let version: GcpSecretVersion = serde_json::from_str(json).unwrap();
-        assert_eq!(version.name, "projects/p/secrets/s/versions/1");
+        assert_eq!(version.name, "projects/123456789012/secrets/s/versions/1");
         assert_eq!(version.state.as_deref(), Some("ENABLED"));
     }
 
@@ -597,23 +723,22 @@ mod tests {
 
     #[test]
     fn gcp_access_response_deserialize() {
-        let json = r#"{"name":"projects/p/secrets/s/versions/1","payload":{"data":"c2VjcmV0"}}"#;
+        let json = r#"{"name":"projects/123456789012/secrets/s/versions/1","payload":{"data":"c2VjcmV0"}}"#;
         let resp: GcpAccessSecretVersionResponse = serde_json::from_str(json).unwrap();
         assert_eq!(
             resp.name.as_deref(),
-            Some("projects/p/secrets/s/versions/1")
+            Some("projects/123456789012/secrets/s/versions/1")
         );
         assert_eq!(resp.payload.data, "c2VjcmV0");
     }
 
     #[test]
     fn gcp_list_secrets_response_deserialize() {
-        let json =
-            r#"{"secrets":[{"name":"projects/p/secrets/a"},{"name":"projects/p/secrets/b"}]}"#;
+        let json = r#"{"secrets":[{"name":"projects/123456789012/secrets/a"},{"name":"projects/123456789012/secrets/b"}]}"#;
         let resp: GcpListSecretsResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.secrets.len(), 2);
-        assert_eq!(resp.secrets[0].name, "projects/p/secrets/a");
-        assert_eq!(resp.secrets[1].name, "projects/p/secrets/b");
+        assert_eq!(resp.secrets[0].name, "projects/123456789012/secrets/a");
+        assert_eq!(resp.secrets[1].name, "projects/123456789012/secrets/b");
     }
 
     #[test]
@@ -641,7 +766,7 @@ mod tests {
         assert!(format!("{err}").contains("418"));
 
         let err = GcpApiError::InvalidUrl("bad://url".into());
-        assert!(format!("{err}").contains("invalid URL"));
+        assert!(format!("{err}").contains("endpoint or selector"));
     }
 
     #[test]
@@ -659,14 +784,14 @@ mod tests {
     fn validate_url_scheme_rejects_remote_http() {
         let err = validate_url_scheme("http://secretmanager.googleapis.com/v1").unwrap_err();
         assert!(matches!(err, GcpApiError::InvalidUrl(_)));
-        assert!(format!("{err}").contains("insecure HTTP URL rejected"));
+        assert!(format!("{err}").contains("HTTPS"));
     }
 
     #[test]
     fn validate_url_scheme_rejects_ftp() {
         let err = validate_url_scheme("ftp://example.com/file").unwrap_err();
         assert!(matches!(err, GcpApiError::InvalidUrl(_)));
-        assert!(format!("{err}").contains("unsupported URL scheme"));
+        assert!(format!("{err}").contains("HTTPS"));
     }
 
     // -----------------------------------------------------------------------
@@ -681,12 +806,12 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/projects/my-project/secrets"))
+            .and(path("/projects/123456789012/secrets"))
             .and(header("Authorization", "Bearer test-token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "secrets": [
-                    {"name": "projects/my-project/secrets/db-password"},
-                    {"name": "projects/my-project/secrets/api-key"}
+                    {"name": "projects/123456789012/secrets/db-password"},
+                    {"name": "projects/123456789012/secrets/api-key"}
                 ]
             })))
             .expect(1)
@@ -695,13 +820,13 @@ mod tests {
 
         let client = GcpSecretManagerClient::new(&mock_server.uri()).unwrap();
         let secrets = client
-            .list_secrets("test-token", "my-project")
+            .list_secrets("test-token", "123456789012")
             .await
             .unwrap();
 
         assert_eq!(secrets.len(), 2);
-        assert_eq!(secrets[0].name, "projects/my-project/secrets/db-password");
-        assert_eq!(secrets[1].name, "projects/my-project/secrets/api-key");
+        assert_eq!(secrets[0].name, "projects/123456789012/secrets/db-password");
+        assert_eq!(secrets[1].name, "projects/123456789012/secrets/api-key");
     }
 
     #[tokio::test]
@@ -709,7 +834,7 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/projects/my-project/secrets"))
+            .and(path("/projects/123456789012/secrets"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
             .expect(1)
             .mount(&mock_server)
@@ -717,7 +842,7 @@ mod tests {
 
         let client = GcpSecretManagerClient::new(&mock_server.uri()).unwrap();
         let secrets = client
-            .list_secrets("test-token", "my-project")
+            .list_secrets("test-token", "123456789012")
             .await
             .unwrap();
         assert!(secrets.is_empty());
@@ -728,14 +853,14 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/projects/my-project/secrets"))
+            .and(path("/projects/123456789012/secrets"))
             .respond_with(ResponseTemplate::new(401))
             .expect(1)
             .mount(&mock_server)
             .await;
 
         let client = GcpSecretManagerClient::new(&mock_server.uri()).unwrap();
-        let result = client.list_secrets("bad-token", "my-project").await;
+        let result = client.list_secrets("bad-token", "123456789012").await;
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), GcpApiError::AuthError(_)));
@@ -746,14 +871,14 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/projects/my-project/secrets"))
+            .and(path("/projects/123456789012/secrets"))
             .respond_with(ResponseTemplate::new(403))
             .expect(1)
             .mount(&mock_server)
             .await;
 
         let client = GcpSecretManagerClient::new(&mock_server.uri()).unwrap();
-        let result = client.list_secrets("token", "my-project").await;
+        let result = client.list_secrets("token", "123456789012").await;
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), GcpApiError::PermissionDenied));
@@ -764,14 +889,14 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/projects/my-project/secrets"))
+            .and(path("/projects/123456789012/secrets"))
             .respond_with(ResponseTemplate::new(500))
             .expect(1)
             .mount(&mock_server)
             .await;
 
         let client = GcpSecretManagerClient::new(&mock_server.uri()).unwrap();
-        let result = client.list_secrets("token", "my-project").await;
+        let result = client.list_secrets("token", "123456789012").await;
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), GcpApiError::ServerError));
@@ -782,10 +907,10 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/projects/my-project/secrets/my-secret"))
+            .and(path("/projects/123456789012/secrets/my-secret"))
             .and(header("Authorization", "Bearer test-token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "name": "projects/my-project/secrets/my-secret",
+                "name": "projects/123456789012/secrets/my-secret",
                 "createTime": "2024-01-01T00:00:00Z"
             })))
             .expect(1)
@@ -794,11 +919,11 @@ mod tests {
 
         let client = GcpSecretManagerClient::new(&mock_server.uri()).unwrap();
         let secret = client
-            .get_secret("test-token", "my-project", "my-secret")
+            .get_secret("test-token", "123456789012", "my-secret")
             .await
             .unwrap();
 
-        assert_eq!(secret.name, "projects/my-project/secrets/my-secret");
+        assert_eq!(secret.name, "projects/123456789012/secrets/my-secret");
         assert_eq!(secret.create_time.as_deref(), Some("2024-01-01T00:00:00Z"));
     }
 
@@ -807,14 +932,14 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/projects/my-project/secrets/missing"))
+            .and(path("/projects/123456789012/secrets/missing"))
             .respond_with(ResponseTemplate::new(404))
             .expect(1)
             .mount(&mock_server)
             .await;
 
         let client = GcpSecretManagerClient::new(&mock_server.uri()).unwrap();
-        let result = client.get_secret("token", "my-project", "missing").await;
+        let result = client.get_secret("token", "123456789012", "missing").await;
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), GcpApiError::NotFound(_)));
@@ -826,11 +951,11 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path(
-                "/projects/my-project/secrets/my-secret/versions/latest:access",
+                "/projects/123456789012/secrets/my-secret/versions/latest:access",
             ))
             .and(header("Authorization", "Bearer test-token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "name": "projects/my-project/secrets/my-secret/versions/1",
+                "name": "projects/123456789012/secrets/my-secret/versions/1",
                 "payload": {
                     "data": "c2VjcmV0LXZhbHVl"
                 }
@@ -841,7 +966,7 @@ mod tests {
 
         let client = GcpSecretManagerClient::new(&mock_server.uri()).unwrap();
         let resp = client
-            .access_secret_version("test-token", "my-project", "my-secret", "latest")
+            .access_secret_version("test-token", "123456789012", "my-secret", "latest")
             .await
             .unwrap();
 
@@ -858,7 +983,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path(
-                "/projects/my-project/secrets/my-secret/versions/99:access",
+                "/projects/123456789012/secrets/my-secret/versions/99:access",
             ))
             .respond_with(ResponseTemplate::new(404))
             .expect(1)
@@ -867,7 +992,7 @@ mod tests {
 
         let client = GcpSecretManagerClient::new(&mock_server.uri()).unwrap();
         let result = client
-            .access_secret_version("token", "my-project", "my-secret", "99")
+            .access_secret_version("token", "123456789012", "my-secret", "99")
             .await;
 
         assert!(result.is_err());
@@ -879,10 +1004,10 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(path("/projects/my-project/secrets/my-secret:addVersion"))
+            .and(path("/projects/123456789012/secrets/my-secret:addVersion"))
             .and(header("Authorization", "Bearer test-token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "name": "projects/my-project/secrets/my-secret/versions/2",
+                "name": "projects/123456789012/secrets/my-secret/versions/2",
                 "state": "ENABLED"
             })))
             .expect(1)
@@ -891,13 +1016,13 @@ mod tests {
 
         let client = GcpSecretManagerClient::new(&mock_server.uri()).unwrap();
         let version = client
-            .add_secret_version("test-token", "my-project", "my-secret", b"new-value")
+            .add_secret_version("test-token", "123456789012", "my-secret", b"new-value")
             .await
             .unwrap();
 
         assert_eq!(
             version.name,
-            "projects/my-project/secrets/my-secret/versions/2"
+            "projects/123456789012/secrets/my-secret/versions/2"
         );
         assert_eq!(version.state.as_deref(), Some("ENABLED"));
     }
@@ -907,7 +1032,7 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(path("/projects/my-project/secrets/missing:addVersion"))
+            .and(path("/projects/123456789012/secrets/missing:addVersion"))
             .respond_with(ResponseTemplate::new(404))
             .expect(1)
             .mount(&mock_server)
@@ -915,7 +1040,7 @@ mod tests {
 
         let client = GcpSecretManagerClient::new(&mock_server.uri()).unwrap();
         let result = client
-            .add_secret_version("token", "my-project", "missing", b"val")
+            .add_secret_version("token", "123456789012", "missing", b"val")
             .await;
 
         assert!(result.is_err());
@@ -927,11 +1052,11 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(path("/projects/my-project/secrets"))
+            .and(path("/projects/123456789012/secrets"))
             .and(query_param("secretId", "new-secret"))
             .and(header("Authorization", "Bearer test-token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "name": "projects/my-project/secrets/new-secret",
+                "name": "projects/123456789012/secrets/new-secret",
                 "createTime": "2024-06-01T00:00:00Z"
             })))
             .expect(1)
@@ -940,11 +1065,11 @@ mod tests {
 
         let client = GcpSecretManagerClient::new(&mock_server.uri()).unwrap();
         let secret = client
-            .create_secret("test-token", "my-project", "new-secret")
+            .create_secret("test-token", "123456789012", "new-secret")
             .await
             .unwrap();
 
-        assert_eq!(secret.name, "projects/my-project/secrets/new-secret");
+        assert_eq!(secret.name, "projects/123456789012/secrets/new-secret");
     }
 
     #[tokio::test]
@@ -952,7 +1077,7 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(path("/projects/my-project/secrets"))
+            .and(path("/projects/123456789012/secrets"))
             .respond_with(ResponseTemplate::new(403))
             .expect(1)
             .mount(&mock_server)
@@ -960,7 +1085,7 @@ mod tests {
 
         let client = GcpSecretManagerClient::new(&mock_server.uri()).unwrap();
         let result = client
-            .create_secret("token", "my-project", "new-secret")
+            .create_secret("token", "123456789012", "new-secret")
             .await;
 
         assert!(result.is_err());
@@ -972,7 +1097,7 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/projects/proj/secrets"))
+            .and(path("/projects/123456789012/secrets"))
             .and(header("Authorization", "Bearer my-secret-token"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({"secrets": []})),
@@ -983,7 +1108,7 @@ mod tests {
 
         let client = GcpSecretManagerClient::new(&mock_server.uri()).unwrap();
         let secrets = client
-            .list_secrets("my-secret-token", "proj")
+            .list_secrets("my-secret-token", "123456789012")
             .await
             .unwrap();
         assert!(secrets.is_empty());
@@ -994,7 +1119,7 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/projects/proj/secrets"))
+            .and(path("/projects/123456789012/secrets"))
             .and(header(
                 "user-agent",
                 &format!("opaqued/{}", env!("CARGO_PKG_VERSION")),
@@ -1007,7 +1132,7 @@ mod tests {
             .await;
 
         let client = GcpSecretManagerClient::new(&mock_server.uri()).unwrap();
-        client.list_secrets("token", "proj").await.unwrap();
+        client.list_secrets("token", "123456789012").await.unwrap();
     }
 
     #[tokio::test]
@@ -1015,14 +1140,14 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/projects/proj/secrets"))
+            .and(path("/projects/123456789012/secrets"))
             .respond_with(ResponseTemplate::new(418))
             .expect(1)
             .mount(&mock_server)
             .await;
 
         let client = GcpSecretManagerClient::new(&mock_server.uri()).unwrap();
-        let result = client.list_secrets("token", "proj").await;
+        let result = client.list_secrets("token", "123456789012").await;
         assert!(matches!(
             result.unwrap_err(),
             GcpApiError::UnexpectedStatus(418)
@@ -1042,7 +1167,7 @@ mod tests {
                 "expires_in": 3600,
                 "token_type": "Bearer"
             })))
-            .expect(1)
+            .expect(3)
             .mount(&mock_server)
             .await;
 
@@ -1050,7 +1175,7 @@ mod tests {
         let sa_key = serde_json::json!({
             "client_email": "test@project.iam.gserviceaccount.com",
             "private_key": include_str!("../../tests/fixtures/test_rsa_key.pem"),
-            "token_uri": format!("{}/token", mock_server.uri())
+            "token_uri": OAUTH2_TOKEN_URL
         });
 
         let tmp_dir =
@@ -1058,6 +1183,8 @@ mod tests {
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let key_path = tmp_dir.join("sa_key.json");
         std::fs::write(&key_path, serde_json::to_string(&sa_key).unwrap()).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
         // Set env vars for service account auth.
         unsafe {
@@ -1065,14 +1192,28 @@ mod tests {
             std::env::set_var(GCP_SERVICE_ACCOUNT_KEY_ENV, key_path.to_str().unwrap());
         }
 
-        let client = GcpSecretManagerClient::new(&mock_server.uri()).unwrap();
+        let mut client = GcpSecretManagerClient::new(&mock_server.uri()).unwrap();
+        client.token_endpoint_override = Some(format!("{}/token", mock_server.uri()));
         let token = client.get_access_token().await.unwrap();
-        assert_eq!(token, "ya29.exchanged-token");
+        assert_eq!(token.as_str(), "ya29.exchanged-token");
 
-        // Second call should use cached token.
-        // (Mock expects exactly 1 call, so a second HTTP call would fail.)
-        let token2 = client.get_access_token().await.unwrap();
-        assert_eq!(token2, "ya29.exchanged-token");
+        // A cloned handler shares the same session cache.
+        let token2 = client.clone().get_access_token().await.unwrap();
+        assert_eq!(token2.as_str(), "ya29.exchanged-token");
+
+        // Expired sessions and changed credentials must each exchange again.
+        client.token_cache.lock().await.as_mut().unwrap().expires_at = Instant::now();
+        assert_eq!(
+            client.get_access_token().await.unwrap().as_str(),
+            "ya29.exchanged-token"
+        );
+        let mut rotated = sa_key.clone();
+        rotated["client_email"] = serde_json::json!("rotated@project.iam.gserviceaccount.com");
+        std::fs::write(&key_path, serde_json::to_string(&rotated).unwrap()).unwrap();
+        assert_eq!(
+            client.get_access_token().await.unwrap().as_str(),
+            "ya29.exchanged-token"
+        );
 
         // Cleanup.
         unsafe {
@@ -1091,7 +1232,7 @@ mod tests {
 
         let client = GcpSecretManagerClient::new("http://localhost:9999").unwrap();
         let token = client.get_access_token().await.unwrap();
-        assert_eq!(token, unique_token);
+        assert_eq!(token.as_str(), unique_token);
 
         unsafe {
             std::env::remove_var(GCP_ACCESS_TOKEN_ENV);
@@ -1110,5 +1251,322 @@ mod tests {
         let result = client.get_access_token().await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), GcpApiError::AuthError(_)));
+    }
+}
+
+impl std::fmt::Debug for GcpSecretPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GcpSecretPayload([REDACTED])")
+    }
+}
+impl std::fmt::Debug for GcpAccessSecretVersionResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GcpAccessSecretVersionResponse([REDACTED])")
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    use serde_json::json;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path, query_param},
+    };
+    #[tokio::test]
+    async fn pagination_encodes_tokens_and_rejects_repetition() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/projects/123456789012/secrets")).and(query_param("pageSize","100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"secrets":[{"name":"projects/123456789012/secrets/first"}],"nextPageToken":"next+page/&x=1"}))).with_priority(2).mount(&server).await;
+        Mock::given(method("GET"))
+            .and(query_param("pageToken", "next+page/&x=1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"secrets":[{"name":"projects/123456789012/secrets/second"}]}),
+            ))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let client = GcpSecretManagerClient::with_auth(
+            &server.uri(),
+            AuthBinding::AccessToken {
+                credential_ref: "env:UNREAD".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            client
+                .list_secrets("synthetic", "123456789012")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        server.reset().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"nextPageToken":"loop"})))
+            .mount(&server)
+            .await;
+        assert!(matches!(
+            client.list_secrets("synthetic", "123456789012").await,
+            Err(GcpApiError::InvalidResponse)
+        ));
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+    #[tokio::test]
+    async fn redirects_checksums_and_oversized_payloads_fail_closed() {
+        let server = MockServer::start().await;
+        let trap = MockServer::start().await;
+        let client = GcpSecretManagerClient::with_auth(
+            &server.uri(),
+            AuthBinding::AccessToken {
+                credential_ref: "env:UNREAD".into(),
+            },
+        )
+        .unwrap();
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/stolen", trap.uri())),
+            )
+            .mount(&server)
+            .await;
+        assert!(
+            client
+                .get_secret("synthetic", "123456789012", "secret")
+                .await
+                .is_err()
+        );
+        assert!(trap.received_requests().await.unwrap().is_empty());
+        server.reset().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"name":"projects/123456789012/secrets/secret/versions/1","payload":{"data":"c2VjcmV0","dataCrc32c":"1"}})),
+            )
+            .mount(&server)
+            .await;
+        assert!(matches!(
+            client
+                .access_secret_version("synthetic", "123456789012", "secret", "latest")
+                .await,
+            Err(GcpApiError::InvalidResponse)
+        ));
+        server.reset().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("x".repeat(MAX_BODY + 1)))
+            .mount(&server)
+            .await;
+        assert!(matches!(
+            client.list_secrets("synthetic", "123456789012").await,
+            Err(GcpApiError::InvalidResponse)
+        ));
+    }
+    #[test]
+    fn secret_debug_is_redacted_and_crc_has_standard_value() {
+        assert_eq!(crc32c(b"123456789"), 0xe3069283);
+        let payload = GcpSecretPayload {
+            data: "synthetic-secret".into(),
+            data_crc32c: None,
+        };
+        assert!(!format!("{payload:?}").contains("synthetic-secret"));
+        for url in [
+            "https://user:pass@secretmanager.googleapis.com/v1",
+            "https://secretmanager.googleapis.com/v1?x=1",
+            "http://127.0.0.1.evil.invalid/v1",
+            "https://secretmanager.googleapis.com/v1#token",
+        ] {
+            assert!(validate_url_scheme(url).is_err());
+        }
+    }
+    #[tokio::test]
+    async fn credential_file_must_be_private_and_cannot_supply_token_endpoint() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("sa.json");
+        std::fs::write(&file,serde_json::to_vec(&json!({"client_email":"test@project.iam.gserviceaccount.com","private_key":"synthetic-invalid-key","token_uri":"https://attacker.invalid/token"})).unwrap()).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let client = GcpSecretManagerClient::with_auth(
+            DEFAULT_BASE_URL,
+            AuthBinding::ServiceAccountFile {
+                path: file.to_str().unwrap().into(),
+            },
+        )
+        .unwrap();
+        assert!(client.credentials().is_err());
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(
+            client.get_access_token().await,
+            Err(GcpApiError::AuthError(_))
+        ));
+        let link = directory.path().join("link.json");
+        symlink(&file, &link).unwrap();
+        let linked = GcpSecretManagerClient::with_auth(
+            DEFAULT_BASE_URL,
+            AuthBinding::ServiceAccountFile {
+                path: link.to_str().unwrap().into(),
+            },
+        )
+        .unwrap();
+        assert!(linked.credentials().is_err());
+    }
+    #[tokio::test]
+    async fn invalid_ids_never_reach_http() {
+        let server = MockServer::start().await;
+        let client = GcpSecretManagerClient::with_auth(
+            &server.uri(),
+            AuthBinding::AccessToken {
+                credential_ref: "env:UNREAD".into(),
+            },
+        )
+        .unwrap();
+        assert!(
+            client
+                .list_secrets("synthetic", "x?alt=json")
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .access_secret_version("synthetic", "123456789012", "secret", "../../other")
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .create_secret("synthetic", "123456789012", "x&secretId=other")
+                .await
+                .is_err()
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn returned_resources_match_prepared_project_secret_and_version() {
+        let server = MockServer::start().await;
+        let client = GcpSecretManagerClient::with_auth(
+            &server.uri(),
+            AuthBinding::AccessToken {
+                credential_ref: "env:UNUSED".into(),
+            },
+        )
+        .unwrap();
+        let expected = "123456789012";
+        for name in [
+            "projects/987654321098/secrets/secret",
+            "projects/123456789012/secrets/other",
+        ] {
+            server.reset().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"name":name})))
+                .mount(&server)
+                .await;
+            assert!(matches!(
+                client.get_secret("synthetic", expected, "secret").await,
+                Err(GcpApiError::InvalidResponse)
+            ));
+            server.reset().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"name":name})))
+                .mount(&server)
+                .await;
+            assert!(matches!(
+                client.create_secret("synthetic", expected, "secret").await,
+                Err(GcpApiError::InvalidResponse)
+            ));
+        }
+        for name in [
+            "projects/987654321098/secrets/secret/versions/1",
+            "projects/123456789012/secrets/other/versions/1",
+            "projects/123456789012/secrets/secret/versions/latest",
+        ] {
+            server.reset().await;
+            Mock::given(method("GET"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"name":name,"payload":{"data":"c3ludGhldGlj"}})),
+                )
+                .mount(&server)
+                .await;
+            assert!(matches!(
+                client
+                    .access_secret_version("synthetic", expected, "secret", "latest")
+                    .await,
+                Err(GcpApiError::InvalidResponse)
+            ));
+            server.reset().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"name":name,"state":"ENABLED"})),
+                )
+                .mount(&server)
+                .await;
+            assert!(matches!(
+                client
+                    .add_secret_version("synthetic", expected, "secret", b"synthetic")
+                    .await,
+                Err(GcpApiError::InvalidResponse)
+            ));
+        }
+        server.reset().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"secrets":[{"name":"projects/987654321098/secrets/secret"}]}),
+            ))
+            .mount(&server)
+            .await;
+        assert!(matches!(
+            client.list_secrets("synthetic", expected).await,
+            Err(GcpApiError::InvalidResponse)
+        ));
+        server.reset().await;
+        Mock::given(method("GET")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"name":"projects/123456789012/secrets/secret/versions/2","payload":{"data":"c3ludGhldGlj"}}))).mount(&server).await;
+        assert!(matches!(
+            client
+                .access_secret_version("synthetic", expected, "secret", "1")
+                .await,
+            Err(GcpApiError::InvalidResponse)
+        ));
+    }
+    #[test]
+    fn numeric_projects_and_version_aliases_are_explicit() {
+        assert!(validate_project("123456789012").is_ok());
+        for value in [
+            "my-project",
+            "00123456789012",
+            "0",
+            "",
+            "123/456",
+            "18446744073709551616",
+        ] {
+            assert!(validate_project(value).is_err(), "{value}");
+        }
+        for value in ["1", "latest", "deploy_2026"] {
+            assert!(validate_version(value).is_ok(), "{value}");
+        }
+        for value in ["01", "0", "-alias", "../version", "", "2alias"] {
+            assert!(validate_version(value).is_err(), "{value}");
+        }
+    }
+}
+
+fn validate_production_endpoint(value: &str) -> Result<(), GcpApiError> {
+    if value != DEFAULT_BASE_URL {
+        return Err(GcpApiError::InvalidUrl(
+            "only the global Google Secret Manager endpoint is supported".into(),
+        ));
+    }
+    Ok(())
+}
+#[cfg(test)]
+#[test]
+fn production_endpoint_is_independent_of_fixture_transport() {
+    assert!(validate_production_endpoint(DEFAULT_BASE_URL).is_ok());
+    for endpoint in [
+        "http://127.0.0.1:8000/v1",
+        "https://other.googleapis.com/v1",
+        "https://secretmanager.googleapis.com.evil.invalid/v1",
+        "https://user@secretmanager.googleapis.com/v1",
+    ] {
+        assert!(validate_production_endpoint(endpoint).is_err());
     }
 }

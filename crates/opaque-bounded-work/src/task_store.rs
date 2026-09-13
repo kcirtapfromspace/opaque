@@ -986,6 +986,7 @@ fn verify_tenant(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use opaque_core::task::PublishAction;

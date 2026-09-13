@@ -323,6 +323,7 @@ fn sign_apns_jwt(team_id: &str, key_id: &str, private_key_pem: &str) -> Result<S
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

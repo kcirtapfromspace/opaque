@@ -257,8 +257,25 @@ pub(super) fn approval_description(
         opaque_bounded_work::ssh::prepare_ssh_manifest(&mut manifest.clone(), profile)
             .map_err(|_| EnclaveError::InvalidInput("SSH destination or signer changed".into()))?;
         let action = manifest.actions[0].as_ssh().expect("validated SSH action");
+        let health_contract = action.health_contract.as_ref().map_or_else(
+            || "legacy fixture-api / version 1 contract".to_owned(),
+            |contract| {
+                format!(
+                    "service {} / version {} / GET http://{}:{}{}",
+                    contract.service,
+                    contract.version,
+                    if contract.host.contains(':') {
+                        format!("[{}]", contract.host)
+                    } else {
+                        contract.host.clone()
+                    },
+                    contract.port,
+                    contract.path
+                )
+            },
+        );
         return Ok(format!(
-            "\nTask: {}\n{}Subject: {}\nDelegation session: {}\nObserved workload UID: {}\nExecutable SHA-256: {}\nProfile: {}\nProfile SHA-256: {}\nSSH destination: {}:{}\nHost key SHA-256: {}\nPrincipal: {}\nLogin user: {}\nAllowed source IP: {}\nExact command: {}\nGrant ID: {}\nVault role: {}\nVault CA SHA-256: {}\nVault credential reference: {}\nVault signing API: {}\nVault SSH mount: {}\nHost control API: {}\nHost receipt signer (Ed25519 public key hex): {}\nBroker grant signer file: {}\nAllowance: 1 connection attempt, permanently consumed before dispatch\nSession limit: {} seconds\nExpires: {}\n\nThe broker requests an ephemeral certificate from the configured Vault signer after approval and retains the private key. Shells, caller arguments, PTY, forwarding and subsystems are disabled. A verified host receipt reports only this fixed health observation. Unknown attempts consume allowance and cannot be retried under this task. Cancellation cannot undo a source read already accepted by the host. Host enforcement and the signing key are operator-managed; no hardware enclave attestation is claimed.\n",
+            "\nTask: {}\n{}Subject: {}\nDelegation session: {}\nObserved workload UID: {}\nExecutable SHA-256: {}\nProfile: {}\nProfile SHA-256: {}\nSSH destination: {}:{}\nHost key SHA-256: {}\nPrincipal: {}\nLogin user: {}\nAllowed source IP: {}\nExact command: {}\nHealth contract: {}\nGrant ID: {}\nVault role: {}\nVault CA SHA-256: {}\nVault credential reference: {}\nVault signing API: {}\nVault SSH mount: {}\nHost control API: {}\nHost receipt signer (Ed25519 public key hex): {}\nBroker grant signer file: {}\nAllowance: 1 connection attempt, permanently consumed before dispatch\nSession limit: {} seconds\nExpires: {}\n\nThe broker requests an ephemeral certificate from the configured Vault signer after approval and retains the private key. Shells, caller arguments, PTY, forwarding and subsystems are disabled. A verified host receipt reports only this fixed health observation. Unknown attempts consume allowance and cannot be retried under this task. Cancellation cannot undo a source read already accepted by the host. Host enforcement and the signing key are operator-managed; no hardware enclave attestation is claimed.\n",
             manifest.title,
             action.tenant.approval_context(),
             action.subject,
@@ -277,6 +294,7 @@ pub(super) fn approval_description(
             action.login_user,
             action.source_address,
             action.command,
+            health_contract,
             action.grant_id,
             action.vault_role,
             action.vault_ca_sha256,
@@ -322,11 +340,16 @@ pub(super) fn approval_description(
         for action in &manifest.actions {
             let action = action.as_inference().expect("validated inference");
             text.push_str(&format!("\n{}. Fixed public source request\n   Prompt SHA-256: {}\n   Credential reference: {}\n", action.ordinal, action.prompt_sha256, action.credential_ref.as_deref().unwrap_or("none")));
-            if let Some(prompt) = opaque_bounded_work::inference::demo_prompt(action.ordinal) {
+            if let Some(prompt) = opaque_bounded_work::inference::action_prompt(profile, action) {
                 text.push_str(&format!("   Complete source and prompt: {prompt}\n"));
             }
         }
-        text.push_str("\nThis grant permits disclosure of these synthetic public source records to the configured model provider. It permits no other sources, prompts, models, or generation options. Output limits are requested and checked; they do not attest GPU time or server cancellation. Unknown attempts consume allowance and stop later requests. No hardware enclave attestation is claimed.\n");
+        let provenance = if profile.github_ci.is_some() {
+            "captured public GitHub CI observations (a sample of at most three runs, not complete history)"
+        } else {
+            "synthetic public source records"
+        };
+        text.push_str(&format!("\nThis grant permits disclosure of these {provenance} to the configured model provider. It permits no other sources, prompts, models, or generation options. Output limits are requested and checked; they do not attest GPU time or server cancellation. Unknown attempts consume allowance and stop later requests. No hardware enclave attestation is claimed.\n"));
         return Ok(text);
     }
     let mut text = format!(
@@ -924,6 +947,7 @@ mod tests {
                 exe_path: None,
                 exe_sha256: None,
                 codesign_team_id: None,
+                workload: None,
             },
             operation: "github.publish_manifest".into(),
             target: HashMap::new(),
@@ -1071,6 +1095,7 @@ mod tests {
                 server_build: "review-fixture-v1".into(),
                 service_uid: Uuid::new_v4(),
                 source_id: opaque_bounded_work::inference::DEMO_SOURCE_ID.into(),
+                github_ci: None,
                 source_snapshot_sha256: opaque_bounded_work::inference::demo_source_snapshot_sha256(
                 ),
                 credential_ref: Some("keychain:opaque/inference-fixture".into()),

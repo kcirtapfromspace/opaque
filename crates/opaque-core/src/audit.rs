@@ -2332,6 +2332,7 @@ impl AuditSink for MultiAuditSink {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::operation::{ApprovalRequirement, ClientIdentity, ClientType, OperationSafety};
@@ -2420,6 +2421,7 @@ mod tests {
                 "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".into(),
             ),
             codesign_team_id: Some("TEAM123".into()),
+            workload: None,
         };
         let summary = ClientSummary::from((&id, ClientType::Agent));
         assert_eq!(summary.uid, 501);
@@ -2548,6 +2550,7 @@ mod tests {
             approval_requirement: ApprovalRequirement::Never,
             lease_ttl: None,
             one_time: false,
+            budget: None,
             require_distinct_approver: false,
             matched_rule: Some("deny-rule".into()),
             denial_reason: Some("denied".into()),
@@ -2567,6 +2570,7 @@ mod tests {
             exe_path: None,
             exe_sha256: None,
             codesign_team_id: None,
+            workload: None,
         };
         let summary = ClientSummary::from((&id, ClientType::Human));
         assert!(summary.exe_sha256_prefix.is_none());
@@ -2583,6 +2587,7 @@ mod tests {
             exe_path: None,
             exe_sha256: Some("abcdef01".into()),
             codesign_team_id: None,
+            workload: None,
         };
         let summary = ClientSummary::from((&id, ClientType::Agent));
         assert_eq!(summary.exe_sha256_prefix.as_deref(), Some("abcdef01"));
@@ -4027,5 +4032,6 @@ mod tests {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "audit/regression_tests.rs"]
 mod regression_tests;

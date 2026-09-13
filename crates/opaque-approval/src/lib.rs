@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 //! Approval mechanisms for the Opaque daemon.
 //!
 //! This crate hosts the *mechanisms* backing `opaque_core::approval_gate`'s

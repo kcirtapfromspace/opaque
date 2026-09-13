@@ -93,6 +93,32 @@ impl CompositeResolver {
 }
 
 impl SecretResolver for CompositeResolver {
+    fn resolve_batch(&self, refs: &[&str]) -> Result<Vec<SecretValue>, ResolveError> {
+        opaque_core::resolver::resolve_batch_by_scheme(refs, |group| {
+            let first = group[0];
+            if first.starts_with("env:") {
+                return self.env.resolve_batch(group);
+            }
+            if first.starts_with("keychain:") {
+                return self.keychain.resolve_batch(group);
+            }
+            if first.starts_with("profile:") {
+                return self.profile.resolve_batch(group);
+            }
+            for provider in &self.providers {
+                match provider.resolve_batch(group) {
+                    Err(ResolveError::UnknownScheme(_)) => continue,
+                    result => return result,
+                }
+            }
+            // Preserve the same actionable unavailable-provider diagnostics.
+            group
+                .iter()
+                .map(|reference| self.resolve(reference))
+                .collect()
+        })
+    }
+
     fn resolve(&self, ref_str: &str) -> Result<SecretValue, ResolveError> {
         if ref_str.starts_with("env:") {
             return self.env.resolve(ref_str);
@@ -124,13 +150,26 @@ impl SecretResolver for CompositeResolver {
         if ref_str.starts_with("bitwarden:") {
             return Err(ResolveError::BitwardenError(
                 ref_str.to_owned(),
-                "Bitwarden not configured".into(),
+                "Bitwarden not configured (install bws or set OPAQUE_BITWARDEN_CLI_PATH)".into(),
             ));
         }
         if ref_str.starts_with("aws:") {
             return Err(ResolveError::AwsError(
                 ref_str.to_owned(),
-                "AWS support disabled pending SigV4 (only explicit loopback mock configuration is supported)".into(),
+                "AWS not configured (set OPAQUE_AWS_REGION and explicit credential references)"
+                    .into(),
+            ));
+        }
+        if ref_str.starts_with("gcp:") {
+            return Err(ResolveError::GcpError(
+                ref_str.to_owned(),
+                "GCP not configured (see docs/gcp.md)".into(),
+            ));
+        }
+        if ref_str.starts_with("azure:") {
+            return Err(ResolveError::AzureError(
+                ref_str.to_owned(),
+                "Azure not configured (see docs/azure.md)".into(),
             ));
         }
         if ref_str.starts_with("vault:") {
@@ -152,8 +191,16 @@ pub fn resolve_all(
     resolver: &dyn SecretResolver,
 ) -> Result<HashMap<String, SecretValue>, ResolveError> {
     let mut resolved = HashMap::with_capacity(secrets.len());
-    for (env_name, ref_str) in secrets {
-        let value = resolver.resolve(ref_str)?;
+    let entries: Vec<_> = secrets.iter().collect();
+    let refs: Vec<&str> = entries
+        .iter()
+        .map(|(_, reference)| reference.as_str())
+        .collect();
+    let values = resolver.resolve_batch(&refs)?;
+    if values.len() != entries.len() {
+        return Err(ResolveError::InvalidBatch);
+    }
+    for ((env_name, _), value) in entries.into_iter().zip(values) {
         value.mlock();
         resolved.insert(env_name.clone(), value);
     }
@@ -172,6 +219,63 @@ pub fn resolve_all(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct SnapshotResolver;
+    impl SecretResolver for SnapshotResolver {
+        fn resolve(&self, _: &str) -> Result<SecretValue, ResolveError> {
+            panic!("compound injection must use one provider batch");
+        }
+        fn resolve_batch(&self, refs: &[&str]) -> Result<Vec<SecretValue>, ResolveError> {
+            assert_eq!(refs.len(), 2);
+            assert!(refs.iter().all(|r| r.starts_with("vault:")));
+            Ok(refs
+                .iter()
+                .map(|r| SecretValue::new(r.as_bytes().to_vec()))
+                .collect())
+        }
+    }
+
+    #[test]
+    fn compound_credentials_reach_one_provider_batch_and_keep_env_mapping() {
+        let resolver = CompositeResolver::new(vec![Box::new(SnapshotResolver)]);
+        let refs = HashMap::from([
+            ("DB_USER".into(), "vault:database/creds/app#username".into()),
+            (
+                "DB_PASSWORD".into(),
+                "vault:database/creds/app#password".into(),
+            ),
+        ]);
+        let values = resolve_all(&refs, &resolver).unwrap();
+        for (name, reference) in &refs {
+            assert_eq!(values[name].as_str(), Some(reference.as_str()));
+        }
+    }
+
+    #[derive(Debug)]
+    struct BrokenBatch;
+    impl SecretResolver for BrokenBatch {
+        fn resolve(&self, _: &str) -> Result<SecretValue, ResolveError> {
+            unreachable!()
+        }
+        fn resolve_batch(&self, _: &[&str]) -> Result<Vec<SecretValue>, ResolveError> {
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn invalid_provider_batch_fails_injection_instead_of_omitting_credentials() {
+        let refs = HashMap::from([("TOKEN".into(), "vault:secret/data/app#token".into())]);
+        for resolver in [
+            &BrokenBatch as &dyn SecretResolver,
+            &CompositeResolver::new(vec![Box::new(BrokenBatch)]),
+        ] {
+            assert!(matches!(
+                resolve_all(&refs, resolver),
+                Err(ResolveError::InvalidBatch)
+            ));
+        }
+    }
 
     #[test]
     fn composite_resolver_dispatches_env() {
@@ -256,7 +360,7 @@ mod tests {
         for reference in ["aws:prod/db-password", "aws:ssm:/prod/password"] {
             let err = resolver.resolve(reference).unwrap_err();
             assert!(matches!(err, ResolveError::AwsError(..)));
-            assert!(err.to_string().contains("disabled pending SigV4"));
+            assert!(err.to_string().contains("AWS not configured"));
         }
     }
 

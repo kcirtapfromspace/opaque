@@ -74,6 +74,106 @@ jobs:
           cargo test --locked -p opaqued tests::enforce_agent_sessions_rejects_unwrapped_and_allows_session_token -- --exact 2>&1 | tee /tmp/wrapper-test.out
           grep -q "test result: ok. 1 passed" /tmp/wrapper-test.out
 
+  unattended-acceptance:
+    name: Declared unattended protocol acceptance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12.11"
+      - name: Verify strict runner regressions
+        run: python3 -B -m unittest discover -s scripts -p test_synthesized_suite.py -v
+      - name: Run exact declared tests with real split-UID prerequisites
+        # The three composed tests are ignored in ordinary nonroot workspace
+        # runs. The manifest explicitly executes them with zero ignored tests.
+        # It never invokes the native approval UI.
+        run: |
+          sudo -n env \
+            PATH="$PATH" \
+            CARGO_HOME="$HOME/.cargo" \
+            RUSTUP_HOME="$HOME/.rustup" \
+            RUSTUP_TOOLCHAIN=1.95.0 \
+            python3 -B scripts/synthesized_suite.py \
+              --profile protocol \
+              --target-dir "$GITHUB_WORKSPACE/target" \
+              --output "$RUNNER_TEMP/synthesized-protocol"
+      - name: Restore report and build-cache ownership
+        if: always()
+        run: |
+          # Root compiles the split-UID fixtures. Return generated directories
+          # to the runner before artifact upload and rust-cache's post step.
+          for generated_path in \
+            "$RUNNER_TEMP/synthesized-protocol" \
+            "$GITHUB_WORKSPACE/target" \
+            "$HOME/.cargo/registry" \
+            "$HOME/.cargo/git"; do
+            if [ -d "$generated_path" ]; then
+              sudo -n chown -R --no-dereference "$(id -u):$(id -g)" "$generated_path"
+            fi
+          done
+      - name: Retain scoped acceptance results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: declared-protocol-acceptance
+          path: |
+            ${{ runner.temp }}/synthesized-protocol/report.json
+            ${{ runner.temp }}/synthesized-protocol/junit.xml
+          if-no-files-found: error
+
+  measured-code-coverage:
+    name: Critical production source line and branch coverage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+        with:
+          toolchain: nightly-2026-09-13
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12.11"
+      - name: Verify strict measured-coverage regressions
+        run: python3 -B -m unittest discover -s scripts -p test_check_llvm_coverage.py -v
+      - name: Install pinned coverage collector
+        run: cargo install cargo-llvm-cov --version 0.9.1 --locked
+      - name: Instrument critical production source lines and branches
+        # Pinned nightly measures branches without changing the product's stable
+        # toolchain. Test-only modules use coverage(off) under coverage_nightly;
+        # standalone integration-test sources are excluded by the path filter.
+        run: |
+          cargo llvm-cov --locked \
+            -p opaque-core -p opaque-bounded-work -p opaque-approval \
+            --tests --all-features --branch --json \
+            --ignore-filename-regex '(^|/)tests/' \
+            --output-path "$RUNNER_TEMP/critical-branch-llvm-coverage.json"
+      - name: Require the declared 100 percent line and branch targets
+        # Both measured targets deliberately fail until uncovered code closes.
+        run: |
+          python3 -B scripts/check_llvm_coverage.py \
+            --report "$RUNNER_TEMP/critical-branch-llvm-coverage.json" \
+            --source-root "$GITHUB_WORKSPACE" \
+            --require-file crates/opaque-bounded-work/src/task_store.rs \
+            --require-file crates/opaque-core/src/task.rs \
+            --require-file crates/opaque-approval/src/approval_server/workstation.rs \
+            --require-branches \
+            --output "$RUNNER_TEMP/critical-branch-coverage-summary.json"
+      - name: Retain measured line and branch coverage summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: critical-production-line-and-branch-coverage
+          path: ${{ runner.temp }}/critical-branch-coverage-summary.json
+          if-no-files-found: error
+
   test-macos:
     name: Native macOS tests
     runs-on: macos-15
@@ -113,11 +213,13 @@ jobs:
       - name: Run every Python regression without skips
         # Linux runs the real peer-credential/parent-death cases. Installing the
         # pinned FIDO2 library makes its API-contract cases mandatory as well.
+        # The packaged SSH host's signed-control and health-contract tests are
+        # a separate discovery root and must also run without skips.
         run: |
           python -B - <<'PYTEST'
           import sys
           import unittest
-          for directory in ("scripts",):
+          for directory in ("scripts", "packaging/ssh-host/tests"):
               suite = unittest.TestLoader().discover(directory, pattern="test_*.py")
               result = unittest.TextTestRunner(verbosity=2).run(suite)
               if not result.wasSuccessful() or not result.testsRun or result.skipped:

@@ -149,8 +149,9 @@ impl OpCliClient {
         field: &str,
     ) -> Result<String, OpCliError> {
         let uri = format!("op://{vault}/{item}/{field}");
-        let value = self.run(&["read", &uri]).await?;
-        Ok(value.trim_end().to_owned())
+        // Suppress only the CLI's added terminator. Whitespace (including a
+        // trailing newline) can be part of the stored value and must survive.
+        self.run(&["read", &uri, "--no-newline"]).await
     }
 }
 
@@ -243,6 +244,50 @@ impl From<CliField> for Field {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn read_fixture(value: &[u8]) -> (tempfile::TempDir, OpCliClient) {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("op");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\n[ \"$#\" -eq 3 ] && [ \"$1\" = read ] && [ \"$2\" = op://vault/item/field ] && [ \"$3\" = --no-newline ] || exit 2\nexec /bin/cat \"$0.value\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(directory.path().join("op.value"), value).unwrap();
+        let client = OpCliClient {
+            op_path: executable.to_str().unwrap().into(),
+        };
+        (directory, client)
+    }
+
+    #[tokio::test]
+    async fn read_field_preserves_exact_value_and_requests_no_cli_terminator() {
+        for expected in [
+            "",
+            "two spaces  ",
+            "tabs\t\t",
+            "\nleading and trailing\n",
+            "first line\r\nsecond line\n\n",
+            "  \t\r\n",
+            "unicode: café 🔑\t \n",
+        ] {
+            let (_directory, client) = read_fixture(expected.as_bytes());
+            let value = client.read_field("vault", "item", "field").await.unwrap();
+            assert_eq!(value.as_bytes(), expected.as_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn read_field_rejects_non_utf8_without_lossy_replacement() {
+        let (_directory, client) = read_fixture(b"value\xff");
+        let error = client
+            .read_field("vault", "item", "field")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, OpCliError::ParseError(_)));
+    }
 
     #[test]
     fn cli_vault_to_vault() {

@@ -1,0 +1,25 @@
+[Unit]
+Description=Opaque signed SSH grant control
+After=network.target opaque-ssh-guard.service
+Requires=opaque-ssh-guard.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I /opt/opaque-ssh/host_daemon.py control
+User=root
+Group=root
+UMask=0077
+StateDirectory=opaque-ssh
+StateDirectoryMode=0700
+Restart=on-failure
+RestartSec=2
+KillMode=control-group
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/opaque-ssh
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

@@ -21,6 +21,8 @@ pub enum ProviderType {
     OnePassword,
     Bitwarden,
     Aws,
+    Gcp,
+    Azure,
 }
 
 impl ProviderType {
@@ -32,6 +34,8 @@ impl ProviderType {
         ProviderType::OnePassword,
         ProviderType::Bitwarden,
         ProviderType::Aws,
+        ProviderType::Gcp,
+        ProviderType::Azure,
     ];
 
     /// Human-readable name.
@@ -43,6 +47,8 @@ impl ProviderType {
             ProviderType::OnePassword => "1Password",
             ProviderType::Bitwarden => "Bitwarden",
             ProviderType::Aws => "AWS",
+            ProviderType::Gcp => "Google Secret Manager",
+            ProviderType::Azure => "Azure Key Vault",
         }
     }
 }
@@ -50,7 +56,7 @@ impl ProviderType {
 /// How much of a provider's configuration was detected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetectionStatus {
-    /// All required credentials / tools found.
+    /// Required local configuration found; this does not verify a provider login.
     Ready,
     /// Some credentials found but others missing.
     Partial,
@@ -131,6 +137,8 @@ fn detect_single(pt: ProviderType, env: &dyn Environment) -> DetectedProvider {
         ProviderType::OnePassword => detect_onepassword(env),
         ProviderType::Bitwarden => detect_bitwarden(env),
         ProviderType::Aws => detect_aws(env),
+        ProviderType::Gcp => detect_gcp(env),
+        ProviderType::Azure => detect_azure(env),
     }
 }
 
@@ -183,34 +191,36 @@ fn detect_gitlab(env: &dyn Environment) -> DetectedProvider {
     }
 }
 
+fn present(env: &dyn Environment, key: &str) -> bool {
+    env.var(key).is_some_and(|value| !value.is_empty())
+}
+
+/// Detection never retrieves keychain values or performs a provider login.
+fn ref_available(env: &dyn Environment, reference: &str) -> bool {
+    reference
+        .strip_prefix("env:")
+        .is_some_and(|name| !name.is_empty() && present(env, name))
+}
+
 fn detect_vault(env: &dyn Environment) -> DetectedProvider {
-    let addr = env.var("VAULT_ADDR");
-    let token = env.var("VAULT_TOKEN");
-
-    let mut hints = Vec::new();
-
-    let status = if addr.is_some() && token.is_some() {
-        hints.push("VAULT_ADDR and VAULT_TOKEN found".into());
+    let endpoint = present(env, "OPAQUE_VAULT_URL");
+    let reference = env.var("OPAQUE_VAULT_TOKEN_REF");
+    let credential = reference.as_deref().is_some_and(|r| ref_available(env, r));
+    let status = if endpoint && credential {
         DetectionStatus::Ready
-    } else if addr.is_some() {
-        hints.push("VAULT_ADDR found".into());
-        hints.push("Set VAULT_TOKEN to complete configuration".into());
-        DetectionStatus::Partial
-    } else if token.is_some() {
-        hints.push("VAULT_TOKEN found".into());
-        hints.push("Set VAULT_ADDR to complete configuration".into());
+    } else if endpoint
+        || reference.is_some()
+        || present(env, "VAULT_ADDR")
+        || present(env, "VAULT_TOKEN")
+    {
         DetectionStatus::Partial
     } else {
-        hints.push("Set VAULT_ADDR and VAULT_TOKEN".into());
         DetectionStatus::NotFound
     };
-
-    DetectedProvider {
-        name: "HashiCorp Vault".into(),
-        provider_type: ProviderType::Vault,
-        status,
-        config_hints: hints,
-    }
+    DetectedProvider { name: "HashiCorp Vault".into(), provider_type: ProviderType::Vault, status,
+        config_hints: vec!["Set OPAQUE_VAULT_URL and OPAQUE_VAULT_TOKEN_REF (for example env:VAULT_TOKEN); VAULT_ADDR is not loaded automatically".into(),
+            "Without an explicit token ref, the broker uses keychain:opaque/vault-token; keychain contents are not inspected during setup".into(),
+            "Vault is a credential resolver for authorized consumers; setup does not grant a vault.read or vault.list operation".into()] }
 }
 
 fn detect_onepassword(env: &dyn Environment) -> DetectedProvider {
@@ -239,51 +249,100 @@ fn detect_onepassword(env: &dyn Environment) -> DetectedProvider {
 }
 
 fn detect_bitwarden(env: &dyn Environment) -> DetectedProvider {
-    let token = env.var("BWS_ACCESS_TOKEN");
-
-    let mut hints = Vec::new();
-
-    let status = if token.is_some() {
-        hints.push("BWS_ACCESS_TOKEN found".into());
+    let cli = env
+        .var("OPAQUE_BITWARDEN_CLI_PATH")
+        .is_some_and(|path| Path::new(&path).is_absolute() && env.path_exists(Path::new(&path)))
+        || env.has_command("bws");
+    let reference = env.var("OPAQUE_BITWARDEN_TOKEN_REF");
+    let credential = reference.as_deref().is_some_and(|r| ref_available(env, r));
+    let status = if cli && credential {
         DetectionStatus::Ready
+    } else if cli || reference.is_some() || present(env, "BWS_ACCESS_TOKEN") {
+        DetectionStatus::Partial
     } else {
-        hints.push("Set BWS_ACCESS_TOKEN for Bitwarden Secrets Manager".into());
         DetectionStatus::NotFound
     };
-
-    DetectedProvider {
-        name: "Bitwarden".into(),
-        provider_type: ProviderType::Bitwarden,
-        status,
-        config_hints: hints,
-    }
+    DetectedProvider { name: "Bitwarden".into(), provider_type: ProviderType::Bitwarden, status,
+        config_hints: vec!["Install the official bws CLI or set its absolute path in OPAQUE_BITWARDEN_CLI_PATH".into(),
+            "Set OPAQUE_BITWARDEN_TOKEN_REF=env:BWS_ACCESS_TOKEN to use that environment token; the default is keychain:opaque/bitwarden-token".into(),
+            "The broker verifies and binds the bws executable before authorizing an operation".into()] }
 }
 
 fn detect_aws(env: &dyn Environment) -> DetectedProvider {
-    let key_id = env.var("AWS_ACCESS_KEY_ID");
-    let home = env.home_dir();
-    let creds_file = home.join(".aws").join("credentials");
-    let has_creds_file = env.path_exists(&creds_file);
-
-    let mut hints = Vec::new();
-
-    let status = if key_id.is_some() {
-        hints.push("AWS_ACCESS_KEY_ID found".into());
+    let region = present(env, "OPAQUE_AWS_REGION");
+    let access = env.var("OPAQUE_AWS_ACCESS_KEY_REF");
+    let secret = env.var("OPAQUE_AWS_SECRET_KEY_REF");
+    let credentials = access.as_deref().is_some_and(|r| ref_available(env, r))
+        && secret.as_deref().is_some_and(|r| ref_available(env, r));
+    let session = env.var("OPAQUE_AWS_SESSION_TOKEN_REF");
+    let session_ready = session.as_deref().is_none_or(|r| ref_available(env, r));
+    let ambient = present(env, "AWS_ACCESS_KEY_ID")
+        || present(env, "AWS_SECRET_ACCESS_KEY")
+        || env.path_exists(&env.home_dir().join(".aws/credentials"));
+    let status = if region && credentials && session_ready {
         DetectionStatus::Ready
-    } else if has_creds_file {
-        hints.push(format!("{} found", creds_file.display()));
-        DetectionStatus::Ready
+    } else if region || access.is_some() || secret.is_some() || session.is_some() || ambient {
+        DetectionStatus::Partial
     } else {
-        hints.push("Set AWS_ACCESS_KEY_ID or configure ~/.aws/credentials".into());
         DetectionStatus::NotFound
     };
+    DetectedProvider { name: "AWS".into(), provider_type: ProviderType::Aws, status,
+        config_hints: vec!["Set OPAQUE_AWS_REGION and explicit OPAQUE_AWS_ACCESS_KEY_REF / OPAQUE_AWS_SECRET_KEY_REF".into(),
+            "For environment credentials, use env:AWS_ACCESS_KEY_ID and env:AWS_SECRET_ACCESS_KEY; temporary credentials also require OPAQUE_AWS_SESSION_TOKEN_REF=env:AWS_SESSION_TOKEN".into(),
+            "Ambient AWS variables, AWS profiles and ~/.aws/credentials are not loaded automatically; default refs use the opaque AWS keychain entries".into()] }
+}
 
-    DetectedProvider {
-        name: "AWS".into(),
-        provider_type: ProviderType::Aws,
-        status,
-        config_hints: hints,
-    }
+fn detect_gcp(env: &dyn Environment) -> DetectedProvider {
+    let service_ref = env
+        .var("OPAQUE_GCP_SERVICE_ACCOUNT_REF")
+        .filter(|value| !value.is_empty());
+    let service_file = env
+        .var("OPAQUE_GCP_SERVICE_ACCOUNT_KEY")
+        .filter(|value| !value.is_empty());
+    let token_ref = env
+        .var("OPAQUE_GCP_TOKEN_REF")
+        .filter(|value| !value.is_empty());
+    let configured = service_ref.is_some()
+        || service_file.is_some()
+        || token_ref.is_some()
+        || present(env, "OPAQUE_GCP_ACCESS_TOKEN");
+    let available = if let Some(reference) = service_ref {
+        ref_available(env, &reference)
+    } else if let Some(path) = service_file {
+        Path::new(&path).is_absolute() && env.path_exists(Path::new(&path))
+    } else if let Some(reference) = token_ref {
+        ref_available(env, &reference)
+    } else {
+        present(env, "OPAQUE_GCP_ACCESS_TOKEN")
+    };
+    DetectedProvider { name: "Google Secret Manager".into(), provider_type: ProviderType::Gcp,
+        status: if available { DetectionStatus::Ready } else if configured { DetectionStatus::Partial } else { DetectionStatus::NotFound },
+        config_hints: vec!["Use OPAQUE_GCP_TOKEN_REF (env: or keychain:), OPAQUE_GCP_ACCESS_TOKEN, or OPAQUE_GCP_SERVICE_ACCOUNT_REF containing service-account JSON".into(),
+            "OPAQUE_GCP_SERVICE_ACCOUNT_KEY supports an absolute private key-file path; the broker verifies ownership and permissions before reading it".into(),
+            "Service-account tokens refresh automatically; the endpoint is the global Google Secret Manager API. ADC and gcloud profiles are not loaded automatically".into(),
+            "GCP operation project parameters and gcp: references require the canonical numeric project number, not the project ID".into()] }
+}
+
+fn detect_azure(env: &dyn Environment) -> DetectedProvider {
+    let configuration = [
+        "OPAQUE_AZURE_VAULT_URL",
+        "OPAQUE_AZURE_TENANT_ID",
+        "OPAQUE_AZURE_CLIENT_ID",
+    ];
+    let required = configuration.iter().all(|key| present(env, key));
+    let reference = env.var("OPAQUE_AZURE_CLIENT_SECRET_REF");
+    let credential = reference.as_deref().map_or_else(
+        || present(env, "OPAQUE_AZURE_CLIENT_SECRET"),
+        |r| ref_available(env, r),
+    );
+    let any = configuration.iter().any(|key| present(env, key))
+        || reference.is_some()
+        || present(env, "OPAQUE_AZURE_CLIENT_SECRET");
+    DetectedProvider { name: "Azure Key Vault".into(), provider_type: ProviderType::Azure,
+        status: if required && credential { DetectionStatus::Ready } else if any { DetectionStatus::Partial } else { DetectionStatus::NotFound },
+        config_hints: vec!["Set OPAQUE_AZURE_VAULT_URL=https://<vault>.vault.azure.net, OPAQUE_AZURE_TENANT_ID and OPAQUE_AZURE_CLIENT_ID".into(),
+            "Set OPAQUE_AZURE_CLIENT_SECRET_REF to an env: or keychain: ref; the default is env:OPAQUE_AZURE_CLIENT_SECRET".into(),
+            "Entra client-credentials tokens refresh automatically. The resolver accepts only the configured vault".into()] }
 }
 
 // ---------------------------------------------------------------------------
@@ -538,24 +597,7 @@ pub fn generate_config(providers: &[DetectedProvider], options: &WizardOptions) 
             }
             ProviderType::Vault => {
                 write_provider_section(&mut out, "HashiCorp Vault");
-                write_rule(
-                    &mut out,
-                    "allow-vault-read",
-                    "vault.read",
-                    approval_require,
-                    factors,
-                    options.lease_ttl,
-                    &["agent", "human"],
-                );
-                write_rule(
-                    &mut out,
-                    "allow-vault-list",
-                    "vault.list",
-                    approval_require,
-                    factors,
-                    options.lease_ttl,
-                    &["agent", "human"],
-                );
+                out.push_str("# Vault refs supply credentials to authorized consumer operations.\n# Add an exact consumer operation and its secret-ref policy; no generic Vault read/list operation is granted.\n\n");
             }
             ProviderType::OnePassword => {
                 write_provider_section(&mut out, "1Password");
@@ -589,45 +631,64 @@ pub fn generate_config(providers: &[DetectedProvider], options: &WizardOptions) 
             }
             ProviderType::Bitwarden => {
                 write_provider_section(&mut out, "Bitwarden");
-                write_rule(
-                    &mut out,
-                    "allow-bitwarden-list",
-                    "bitwarden.list",
-                    approval_require,
-                    factors,
-                    options.lease_ttl,
-                    &["agent", "human"],
-                );
-                write_rule(
-                    &mut out,
-                    "allow-bitwarden-read",
-                    "bitwarden.read",
-                    approval_require,
-                    factors,
-                    options.lease_ttl,
-                    &["human"],
-                );
+                for operation in ["bitwarden.list_projects", "bitwarden.list_secrets"] {
+                    write_rule(
+                        &mut out,
+                        &format!("allow-{}", operation.replace('.', "-")),
+                        operation,
+                        approval_require,
+                        factors,
+                        options.lease_ttl,
+                        &["agent", "human"],
+                    );
+                }
             }
             ProviderType::Aws => {
                 write_provider_section(&mut out, "AWS");
-                write_rule(
-                    &mut out,
-                    "allow-aws-secrets-list",
-                    "aws.secrets_manager.list",
-                    approval_require,
-                    factors,
-                    options.lease_ttl,
-                    &["agent", "human"],
-                );
-                write_rule(
-                    &mut out,
-                    "allow-aws-secrets-read",
-                    "aws.secrets_manager.read",
-                    approval_require,
-                    factors,
-                    options.lease_ttl,
-                    &["human"],
-                );
+                for operation in ["aws.get_caller_identity", "aws.list_secrets"] {
+                    write_rule(
+                        &mut out,
+                        &format!("allow-{}", operation.replace('.', "-")),
+                        operation,
+                        approval_require,
+                        factors,
+                        options.lease_ttl,
+                        &["agent", "human"],
+                    );
+                }
+            }
+            ProviderType::Gcp => {
+                write_provider_section(&mut out, "Google Secret Manager");
+                for operation in ["gcp.list_secrets", "gcp.get_secret"] {
+                    write_rule(
+                        &mut out,
+                        &format!("allow-{}", operation.replace('.', "-")),
+                        operation,
+                        approval_require,
+                        factors,
+                        options.lease_ttl,
+                        &["agent", "human"],
+                    );
+                }
+            }
+            ProviderType::Azure => {
+                write_provider_section(&mut out, "Azure Key Vault");
+                for operation in [
+                    "azure.list_secrets",
+                    "azure.list_keys",
+                    "azure.list_certificates",
+                    "azure.get_secret",
+                ] {
+                    write_rule(
+                        &mut out,
+                        &format!("allow-{}", operation.replace('.', "-")),
+                        operation,
+                        approval_require,
+                        factors,
+                        options.lease_ttl,
+                        &["agent", "human"],
+                    );
+                }
             }
         }
     }
@@ -905,7 +966,7 @@ fn print_detection_results(providers: &[DetectedProvider]) {
     let mut rows: Vec<Vec<String>> = Vec::new();
     for p in providers {
         let badge = match p.status {
-            DetectionStatus::Ready => ui::status_badge("READY", ui::BadgeState::Ok),
+            DetectionStatus::Ready => ui::status_badge("CONFIGURED", ui::BadgeState::Ok),
             DetectionStatus::Partial => ui::status_badge("PARTIAL", ui::BadgeState::Warn),
             DetectionStatus::NotFound => ui::status_badge("NOT FOUND", ui::BadgeState::Info),
         };
@@ -922,7 +983,7 @@ fn select_providers<'a>(
     println!("  Which providers do you want to configure?");
     for (i, p) in available.iter().enumerate() {
         let status_tag = match p.status {
-            DetectionStatus::Ready => "(ready)",
+            DetectionStatus::Ready => "(configured)",
             DetectionStatus::Partial => "(partial)",
             DetectionStatus::NotFound => "",
         };
@@ -1210,7 +1271,8 @@ mod tests {
     #[test]
     fn test_detect_vault_addr() {
         let env = FakeEnv::new()
-            .with_var("VAULT_ADDR", "https://vault.example.com")
+            .with_var("OPAQUE_VAULT_URL", "https://vault.example.com")
+            .with_var("OPAQUE_VAULT_TOKEN_REF", "env:VAULT_TOKEN")
             .with_var("VAULT_TOKEN", "s.abc123");
         let result = detect_vault(&env);
         assert_eq!(result.provider_type, ProviderType::Vault);
@@ -1269,7 +1331,10 @@ mod tests {
 
     #[test]
     fn test_detect_bitwarden() {
-        let env = FakeEnv::new().with_var("BWS_ACCESS_TOKEN", "bws.abc");
+        let env = FakeEnv::new()
+            .with_command("bws")
+            .with_var("OPAQUE_BITWARDEN_TOKEN_REF", "env:BWS_ACCESS_TOKEN")
+            .with_var("BWS_ACCESS_TOKEN", "bws.abc");
         let result = detect_bitwarden(&env);
         assert_eq!(result.provider_type, ProviderType::Bitwarden);
         assert_eq!(result.status, DetectionStatus::Ready);
@@ -1284,7 +1349,12 @@ mod tests {
 
     #[test]
     fn test_detect_aws_credentials_env() {
-        let env = FakeEnv::new().with_var("AWS_ACCESS_KEY_ID", "AKIA...");
+        let env = FakeEnv::new()
+            .with_var("OPAQUE_AWS_REGION", "us-east-1")
+            .with_var("OPAQUE_AWS_ACCESS_KEY_REF", "env:AWS_ACCESS_KEY_ID")
+            .with_var("OPAQUE_AWS_SECRET_KEY_REF", "env:AWS_SECRET_ACCESS_KEY")
+            .with_var("AWS_ACCESS_KEY_ID", "AKIA...")
+            .with_var("AWS_SECRET_ACCESS_KEY", "synthetic");
         let result = detect_aws(&env);
         assert_eq!(result.provider_type, ProviderType::Aws);
         assert_eq!(result.status, DetectionStatus::Ready);
@@ -1294,7 +1364,7 @@ mod tests {
     fn test_detect_aws_credentials_file() {
         let env = FakeEnv::new().with_path("/home/testuser/.aws/credentials");
         let result = detect_aws(&env);
-        assert_eq!(result.status, DetectionStatus::Ready);
+        assert_eq!(result.status, DetectionStatus::Partial);
         assert!(
             result
                 .config_hints
@@ -1325,11 +1395,23 @@ mod tests {
         let env = FakeEnv::new()
             .with_var("GITHUB_TOKEN", "ghp_abc")
             .with_var("GITLAB_TOKEN", "glpat-abc")
-            .with_var("VAULT_ADDR", "https://vault.example.com")
+            .with_var("OPAQUE_VAULT_URL", "https://vault.example.com")
+            .with_var("OPAQUE_VAULT_TOKEN_REF", "env:VAULT_TOKEN")
             .with_var("VAULT_TOKEN", "s.abc")
             .with_command("op")
+            .with_command("bws")
+            .with_var("OPAQUE_BITWARDEN_TOKEN_REF", "env:BWS_ACCESS_TOKEN")
             .with_var("BWS_ACCESS_TOKEN", "bws.abc")
-            .with_var("AWS_ACCESS_KEY_ID", "AKIA...");
+            .with_var("OPAQUE_AWS_REGION", "us-east-1")
+            .with_var("OPAQUE_AWS_ACCESS_KEY_REF", "env:AWS_ACCESS_KEY_ID")
+            .with_var("OPAQUE_AWS_SECRET_KEY_REF", "env:AWS_SECRET_ACCESS_KEY")
+            .with_var("AWS_ACCESS_KEY_ID", "synthetic")
+            .with_var("AWS_SECRET_ACCESS_KEY", "synthetic")
+            .with_var("OPAQUE_GCP_ACCESS_TOKEN", "synthetic")
+            .with_var("OPAQUE_AZURE_VAULT_URL", "https://myvault.vault.azure.net")
+            .with_var("OPAQUE_AZURE_TENANT_ID", "tenant")
+            .with_var("OPAQUE_AZURE_CLIENT_ID", "client")
+            .with_var("OPAQUE_AZURE_CLIENT_SECRET", "synthetic");
         let providers = detect_providers(&env);
 
         let ready_count = providers
@@ -1849,6 +1931,126 @@ mod tests {
 
     #[test]
     fn test_provider_type_all_covered() {
-        assert_eq!(ProviderType::ALL.len(), 6);
+        assert_eq!(ProviderType::ALL.len(), 8);
+    }
+    #[test]
+    fn aws_ambient_keys_do_not_claim_configured_provider() {
+        let ambient = FakeEnv::new()
+            .with_var("AWS_ACCESS_KEY_ID", "synthetic-access")
+            .with_var("AWS_SECRET_ACCESS_KEY", "synthetic-secret")
+            .with_path("/home/testuser/.aws/credentials");
+        assert_eq!(detect_aws(&ambient).status, DetectionStatus::Partial);
+        assert!(
+            detect_aws(&ambient)
+                .config_hints
+                .iter()
+                .any(|h| h.contains("not loaded automatically"))
+        );
+        let incomplete = ambient
+            .with_var("OPAQUE_AWS_REGION", "us-east-1")
+            .with_var("OPAQUE_AWS_ACCESS_KEY_REF", "env:AWS_ACCESS_KEY_ID");
+        assert_eq!(detect_aws(&incomplete).status, DetectionStatus::Partial);
+    }
+
+    #[test]
+    fn bitwarden_requires_bws_and_explicit_environment_token_binding() {
+        let token_only = FakeEnv::new().with_var("BWS_ACCESS_TOKEN", "synthetic");
+        assert_eq!(
+            detect_bitwarden(&token_only).status,
+            DetectionStatus::Partial
+        );
+        let tool_and_token = token_only.with_command("bws");
+        assert_eq!(
+            detect_bitwarden(&tool_and_token).status,
+            DetectionStatus::Partial
+        );
+        let bound = tool_and_token.with_var("OPAQUE_BITWARDEN_TOKEN_REF", "env:BWS_ACCESS_TOKEN");
+        assert_eq!(detect_bitwarden(&bound).status, DetectionStatus::Ready);
+    }
+
+    #[test]
+    fn gcp_detects_exact_auth_priority_without_assuming_adc() {
+        let adc = FakeEnv::new()
+            .with_command("gcloud")
+            .with_var("GOOGLE_APPLICATION_CREDENTIALS", "/tmp/key.json");
+        assert_eq!(detect_gcp(&adc).status, DetectionStatus::NotFound);
+        let direct = adc.with_var("OPAQUE_GCP_ACCESS_TOKEN", "synthetic-token");
+        assert_eq!(detect_gcp(&direct).status, DetectionStatus::Ready);
+        let broken_override = direct.with_var("OPAQUE_GCP_SERVICE_ACCOUNT_REF", "env:MISSING_KEY");
+        assert_eq!(
+            detect_gcp(&broken_override).status,
+            DetectionStatus::Partial
+        );
+        let service = broken_override.with_var("MISSING_KEY", "synthetic-service-account-json");
+        assert_eq!(detect_gcp(&service).status, DetectionStatus::Ready);
+        assert!(
+            detect_gcp(&service)
+                .config_hints
+                .iter()
+                .all(|h| !h.contains("synthetic-service-account-json"))
+        );
+    }
+
+    #[test]
+    fn azure_needs_vault_tenant_application_and_credential() {
+        let base = FakeEnv::new()
+            .with_var("OPAQUE_AZURE_VAULT_URL", "https://myvault.vault.azure.net")
+            .with_var("OPAQUE_AZURE_TENANT_ID", "tenant")
+            .with_var("OPAQUE_AZURE_CLIENT_ID", "client");
+        assert_eq!(detect_azure(&base).status, DetectionStatus::Partial);
+        let configured = base.with_var("OPAQUE_AZURE_CLIENT_SECRET", "synthetic-secret");
+        assert_eq!(detect_azure(&configured).status, DetectionStatus::Ready);
+        let missing_ref =
+            configured.with_var("OPAQUE_AZURE_CLIENT_SECRET_REF", "env:MISSING_SECRET");
+        assert_eq!(detect_azure(&missing_ref).status, DetectionStatus::Partial);
+    }
+
+    #[test]
+    fn selected_provider_policies_use_registered_metadata_operations_only() {
+        let providers = [
+            ProviderType::Vault,
+            ProviderType::Bitwarden,
+            ProviderType::Aws,
+            ProviderType::Gcp,
+            ProviderType::Azure,
+        ]
+        .into_iter()
+        .map(|provider_type| DetectedProvider {
+            name: provider_type.label().into(),
+            provider_type,
+            status: DetectionStatus::Ready,
+            config_hints: vec![],
+        })
+        .collect::<Vec<_>>();
+        let config = generate_config(&providers, &WizardOptions::default());
+        let parsed = config.parse::<toml_edit::DocumentMut>().unwrap();
+        let rules = parsed["rules"].as_array_of_tables().unwrap();
+        let actual = rules
+            .iter()
+            .filter(|r| r["allow"].as_bool() == Some(true))
+            .map(|r| r["operation_pattern"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            [
+                "bitwarden.list_projects",
+                "bitwarden.list_secrets",
+                "aws.get_caller_identity",
+                "aws.list_secrets",
+                "gcp.list_secrets",
+                "gcp.get_secret",
+                "azure.list_secrets",
+                "azure.list_keys",
+                "azure.list_certificates",
+                "azure.get_secret",
+                "test.noop"
+            ]
+        );
+        assert!(
+            !actual
+                .iter()
+                .any(|operation| operation.starts_with("vault.")
+                    || operation.contains("secrets_manager"))
+        );
     }
 }

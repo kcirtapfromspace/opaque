@@ -57,7 +57,7 @@ Each `[[rules]]` has:
 
 Nested tables:
 
-- `[rules.client]`: match on client identity (`uid`, `exe_path`, `exe_sha256`, `codesign_team_id`)
+- `[rules.client]`: match on client identity (`uid`, `exe_path`, `exe_sha256`, `codesign_team_id`) and trusted [workload observations](workload-attestation.md) (`attestor`, `min_attestation`, `selectors`)
 - `[rules.target]`: match on operation target fields (glob patterns); each operation declares which keys it accepts (`repo`, `secret_name`, `environment`, `org`, `project`, …; see [operations](operations.md))
 - `[rules.workspace]`: match on git workspace context (`remote_url_pattern`, `branch_pattern`, `require_clean`)
 - `[rules.secret_names]`: constrain referenced secret *names* (not values) via glob patterns
@@ -74,11 +74,29 @@ Note: `secret_names` enforcement depends on `secret_ref_names`, which the daemon
 - `factors`: approval factors (any-of)
 - `lease_ttl`: seconds (optional; for `first_use`)
 - `one_time`: bool (optional; defaults to `false`)
+- `budget`: positive integer (optional; valid with `first_use` only). Total
+  attempts covered by an approval, including the approving request.
+
 - `require_distinct_approver`: bool (optional; defaults to `false`). Forces
   break-glass segregation of duties: the approver must be a different
   principal than the one the operation runs on behalf of. Fails closed
   without a verified principal, and requires `require` to be something other
   than `never`. See [identity: break-glass](identity.md#access-modes).
+
+For example, `require = "first_use"`, `lease_ttl = 300`, and `budget = 5`
+permit at most five attempts within five minutes after one approval. The prompt
+shows this allowance. Concurrent requests reserve units atomically before
+execution; failed and uncertain attempts count. The sixth request is refused,
+without automatically opening another approval prompt. Expiry or an operator policy reload permits a fresh approval. Restart discards allowances and requires
+fresh approval; it never restores them silently. Lease introspection includes
+the budget, spent attempts and remaining uses.
+
+`one_time = true` permits only the approving attempt, even if a larger budget is
+configured. This corrects the earlier behavior that allowed an extra reuse.
+Without `budget` or `one_time`, existing unlimited reuse within the TTL remains.
+Leases bind the operation, parameters, targets, secret references and verified
+principal/delegation. Co-resident processes sharing those identities share that
+allowance; a count does not establish independent agent identities.
 
 Approval factors (any-of):
 

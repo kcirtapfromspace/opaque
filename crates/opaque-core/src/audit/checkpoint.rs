@@ -251,6 +251,7 @@ pub fn upgrade_legacy_head(path: &Path, trusted_export_sha256: &str) -> Result<(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::audit::{AuditEvent, AuditEventKind, CHAIN_GENESIS, SqliteAuditSink};

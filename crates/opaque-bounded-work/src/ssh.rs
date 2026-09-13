@@ -14,8 +14,8 @@ use opaque_core::identity::{PrincipalContext, now_unix};
 use opaque_core::inference::{sha256, valid_sha256};
 use opaque_core::operation::ClientIdentity;
 use opaque_core::ssh::{
-    SSH_FIXED_COMMAND, SSH_OPERATION, SshHealthAction, SshReceipt, SshReceiptCode, canonical_ip,
-    valid_ssh_label,
+    SSH_FIXED_COMMAND, SSH_OPERATION, SshHealthAction, SshHealthContract, SshReceipt,
+    SshReceiptCode, canonical_ip, valid_ssh_label,
 };
 use opaque_core::task::{SlotOutcome, SlotState, TaskAction, TaskManifest};
 use opaque_core::tenant::TenantBinding;
@@ -46,6 +46,8 @@ pub struct SshProfileConfig {
     pub login_user: String,
     pub source_address: String,
     pub max_session_secs: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_contract: Option<SshHealthContract>,
     pub vault_url: String,
     pub vault_mount: String,
     pub vault_role: String,
@@ -164,6 +166,9 @@ impl TrustedSshProfile {
         {
             return Err(unavailable());
         }
+        if let Some(contract) = &self.health_contract {
+            contract.validate().map_err(|_| unavailable())?;
+        }
         VerifyingKey::from_bytes(&decode_hex::<32>(&self.receipt_public_key_hex)?)
             .map_err(|_| unavailable())?;
         if let Some(pem) = &self.tls_ca_pem {
@@ -239,6 +244,7 @@ pub fn health_manifest(
         login_user: profile.login_user.clone(),
         source_address: profile.source_address.clone(),
         command: SSH_FIXED_COMMAND.into(),
+        health_contract: profile.health_contract.clone(),
         max_session_secs: profile.max_session_secs,
         grant_id: uuid::Uuid::new_v4().to_string(),
         vault_role: profile.vault_role.clone(),
@@ -283,6 +289,7 @@ fn validate_profile_action(
         || action.principal != profile.principal
         || action.login_user != profile.login_user
         || action.source_address != profile.source_address
+        || action.health_contract != profile.health_contract
         || action.max_session_secs != profile.max_session_secs
         || action.vault_role != profile.vault_role
         || action.vault_ca_sha256 != profile.vault_ca_sha256
@@ -622,7 +629,13 @@ fn host_outcome(
             return Err(unavailable());
         }
         let health: Value = serde_json::from_str(output).map_err(|_| unavailable())?;
-        if health != json!({"service":"fixture-api", "status":"ok", "version":"1"}) {
+        if health
+            != action
+                .health_contract
+                .as_ref()
+                .map(SshHealthContract::expected_response)
+                .unwrap_or_else(|| json!({"service":"fixture-api", "status":"ok", "version":"1"}))
+        {
             return Err(unavailable());
         }
     }
@@ -718,7 +731,7 @@ pub fn test_profile() -> TrustedSshProfile {
         config: SshProfileConfig {
             profile_id: "fixture-health".into(), destination_host: "192.0.2.1".into(), destination_port: 22,
             host_key_sha256: key_digest(&host_public_key).unwrap(), host_public_key,
-            principal: "fixture-health".into(), login_user: "opaque".into(), source_address: "192.0.2.2".into(), max_session_secs: 30,
+            principal: "fixture-health".into(), login_user: "opaque".into(), source_address: "192.0.2.2".into(), max_session_secs: 30, health_contract: None,
             vault_url: "https://vault.example.test".into(), vault_mount: "ssh".into(), vault_role: "fixture-health".into(),
             vault_token_ref: "env:VAULT_SIGNER_TOKEN".into(), vault_ca_sha256: key_digest(&vault_ca_public_key).unwrap(), vault_ca_public_key,
             control_url: "https://192.0.2.1:8443".into(), tls_ca_pem: None,
@@ -924,6 +937,7 @@ where
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
@@ -941,6 +955,7 @@ mod tests {
             exe_path: None,
             exe_sha256: None,
             codesign_team_id: None,
+            workload: None,
         };
         health_manifest(
             profile,
@@ -974,6 +989,64 @@ mod tests {
             signature: hex(&key.sign(&message).to_bytes()),
         })
         .unwrap()
+    }
+
+    #[test]
+    fn configured_health_is_signed_and_pinned_in_profile_and_host_evidence() {
+        let mut profile = test_profile();
+        profile.config.health_contract = Some(SshHealthContract {
+            service: "payments-api".into(),
+            version: "2026.09.1".into(),
+            host: "127.0.0.1".into(),
+            port: 9000,
+            path: "/ready/health".into(),
+        });
+        let action = test_action(&profile);
+        assert_eq!(action.health_contract, profile.health_contract);
+        validate_profile_action(&action, &profile).unwrap();
+        for (field, value) in [
+            ("service", json!("billing-api")),
+            ("version", json!("2026.09.2")),
+            ("host", json!("::1")),
+            ("port", json!(9001)),
+            ("path", json!("/health")),
+        ] {
+            let mut changed = serde_json::to_value(&action).unwrap();
+            changed["health_contract"][field] = value;
+            let changed: SshHealthAction = serde_json::from_value(changed).unwrap();
+            assert!(
+                validate_profile_action(&changed, &profile).is_err(),
+                "accepted {field}"
+            );
+        }
+        let now = now_unix();
+        let expiry = now + 60;
+        let response = |service: &str, version: &str| {
+            let output =
+                serde_json::to_string(&json!({"service":service,"status":"ok","version":version}))
+                    .unwrap();
+            json!({"status":"completed","output_text":output,"receipt":{"grant_id":action.grant_id,"principal":action.principal,"operation":SSH_FIXED_COMMAND,"host":"payments-host","status":"completed","result_code":"ok","started_at":now-1,"finished_at":now,"output_sha256":sha256(output.as_bytes()),"output_bytes":output.len(),"output_complete":true}})
+        };
+        let bytes = signed_response(
+            &mut profile,
+            &action,
+            expiry,
+            response("payments-api", "2026.09.1"),
+        );
+        assert_eq!(
+            host_outcome(&profile, &action, expiry, &bytes)
+                .unwrap()
+                .state,
+            SlotState::ApiAccepted
+        );
+        for (service, version) in [
+            ("billing-api", "2026.09.1"),
+            ("payments-api", "2026.09.2"),
+            ("fixture-api", "1"),
+        ] {
+            let bytes = signed_response(&mut profile, &action, expiry, response(service, version));
+            assert!(host_outcome(&profile, &action, expiry, &bytes).is_err());
+        }
     }
 
     #[test]

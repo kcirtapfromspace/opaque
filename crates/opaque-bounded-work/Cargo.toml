@@ -36,3 +36,6 @@ tempfile = "3"
 [dev-dependencies]
 jsonwebtoken = { workspace = true }
 wiremock = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }

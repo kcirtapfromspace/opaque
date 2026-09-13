@@ -99,12 +99,13 @@ For the full config format, see [Policy](policy.md) and `examples/policy.toml`.
 
 Opaque can resolve secrets from Bitwarden Secrets Manager using the `bitwarden:` ref scheme.
 
-1. Create a Bitwarden service account and store the access token:
+1. Install the official `bws` Secrets Manager CLI on the broker host, then
+   create a machine account with read access to the required projects.
+2. Store its access token through the interactive secret-entry command:
    ```bash
-   security add-generic-password -a opaque -s opaque/bitwarden-token -w '<token>'
+   opaque secrets add bitwarden-token
    ```
-
-2. Use `bitwarden:` refs in profiles or `--value-ref` arguments:
+3. Use `bitwarden:` refs in profiles or `--value-ref` arguments:
    ```bash
    opaque github set-secret \
      --repo myorg/myrepo \
@@ -412,6 +413,9 @@ operation families, and what's production-ready today.
 - [MCP integration (Claude Code)](mcp-integration.md)
 - [Identity, delegation, and approval factors](identity.md)
 - [Federation: signed policy, SIEM export, attestation](federation.md)
+- [AWS setup](aws.md)
+- [Google Secret Manager setup](gcp.md)
+- [Azure Key Vault setup](azure.md)
 - [Bitwarden setup](bitwarden.md)
 - [Demo recordings](demos.md)
 - [Deployment & OS approval backends](deployment.md)

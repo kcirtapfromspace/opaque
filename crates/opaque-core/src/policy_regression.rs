@@ -80,6 +80,8 @@ pub struct DecisionSnapshot {
     pub lease_ttl_seconds: Option<u64>,
     #[serde(default)]
     pub one_time: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<u32>,
     #[serde(default)]
     pub require_distinct_approver: bool,
 }
@@ -105,6 +107,7 @@ impl DecisionSnapshot {
             required_factors: decision.required_factors,
             lease_ttl_seconds: decision.lease_ttl.map(|ttl| ttl.as_secs()),
             one_time: decision.one_time,
+            budget: decision.budget,
             require_distinct_approver: decision.require_distinct_approver,
         }
         .normalize()
@@ -311,6 +314,7 @@ pub fn compare(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -412,6 +416,39 @@ mod tests {
         assert!(!report.passed);
         assert_eq!(report.expectation_failures, 1);
         assert_eq!(report.cases[0].changes, [DecisionChange::ApprovalChanged]);
+    }
+
+    #[test]
+    fn first_use_budget_changes_are_visible_in_policy_regression() {
+        let baseline = policy(json!([{"name":"gate","operation_pattern":"*","approval":{
+            "require":"first_use","factors":["local_bio"],"budget":5
+        }}]));
+        let mut candidate = baseline.clone();
+        candidate.rules[0].approval.budget = Some(100);
+        let expectation = suite(vec![case(
+            "budget",
+            "read",
+            json!({
+                "decision":"human_gated","approval_requirement":"first_use",
+                "required_factors":["local_bio"],"budget":5
+            }),
+        )]);
+        let report = compare(&baseline, &candidate, &expectation, false).unwrap();
+        assert!(!report.passed);
+        assert_eq!(report.cases[0].changes, [DecisionChange::ApprovalChanged]);
+        for invalid in [
+            json!({"require":"first_use","budget":0}),
+            json!({"require":"never","budget":5}),
+        ] {
+            let invalid =
+                policy(json!([{"name":"invalid","operation_pattern":"*","approval":invalid}]));
+            let expected = suite(vec![case("invalid", "read", json!({"decision":"deny"}))]);
+            assert!(
+                compare(&invalid, &invalid, &expected, false)
+                    .unwrap()
+                    .passed
+            );
+        }
     }
 
     #[test]

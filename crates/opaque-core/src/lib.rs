@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 pub mod approval_gate;
 pub mod attest;
 pub mod audit;

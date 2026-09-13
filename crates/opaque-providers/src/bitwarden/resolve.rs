@@ -1,7 +1,7 @@
 //! Bitwarden Secrets Manager secret resolver.
 //!
 //! Resolves `bitwarden:<secret-id>` or `bitwarden:<project>/<secret-key>`
-//! references using the Bitwarden Secrets Manager REST API.
+//! references using the official Bitwarden Secrets Manager CLI.
 //!
 //! For `<secret-id>` format, the secret is fetched directly by UUID.
 //! For `<project>/<secret-key>` format, the project is resolved by name,
@@ -71,7 +71,11 @@ impl BitwardenResolver {
 
         if let Some((project, key)) = rest.split_once('/') {
             // project/key format
-            if project.is_empty() || key.is_empty() {
+            if project.is_empty()
+                || key.is_empty()
+                || project.chars().any(char::is_control)
+                || key.chars().any(char::is_control)
+            {
                 return Err(ResolveError::BitwardenError(
                     ref_str.to_owned(),
                     "project and key names must be non-empty".into(),
@@ -79,7 +83,8 @@ impl BitwardenResolver {
             }
             Ok(BitwardenRef::ProjectKey { project, key })
         } else {
-            // Direct secret ID
+            super::client::validate_id(rest)
+                .map_err(|e| ResolveError::BitwardenError(ref_str.into(), e.to_string()))?;
             Ok(BitwardenRef::SecretId(rest))
         }
     }
@@ -105,13 +110,24 @@ impl SecretResolver for BitwardenResolver {
             )
         })?;
 
-        // Use block_in_place + block_on to call async HTTP from sync trait.
-        let handle = tokio::runtime::Handle::current();
+        // Use block_in_place + block_on to await the CLI from the sync trait.
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+            ResolveError::BitwardenError(
+                ref_str.into(),
+                "Bitwarden resolution requires a multi-thread Tokio runtime".into(),
+            )
+        })?;
+        if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+            return Err(ResolveError::BitwardenError(
+                ref_str.into(),
+                "Bitwarden resolution requires a multi-thread Tokio runtime".into(),
+            ));
+        }
         let result = tokio::task::block_in_place(|| {
             handle.block_on(async {
                 match parsed {
                     BitwardenRef::SecretId(secret_id) => {
-                        let secret = self
+                        let mut secret = self
                             .client
                             .get_secret(token, secret_id)
                             .await
@@ -119,6 +135,7 @@ impl SecretResolver for BitwardenResolver {
 
                         secret
                             .value
+                            .take()
                             .ok_or_else(|| format!("secret '{secret_id}' has no value"))
                     }
                     BitwardenRef::ProjectKey { project, key } => {
@@ -134,13 +151,13 @@ impl SecretResolver for BitwardenResolver {
                             .await
                             .map_err(|e| format!("secret lookup failed: {e}"))?;
 
-                        let secret = self
+                        let mut secret = self
                             .client
                             .get_secret(token, &secret_id)
                             .await
                             .map_err(|e| format!("secret fetch failed: {e}"))?;
 
-                        secret.value.ok_or_else(|| {
+                        secret.value.take().ok_or_else(|| {
                             format!("secret '{key}' in project '{project}' has no value")
                         })
                     }
@@ -225,10 +242,11 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolver_debug() {
-        let client = BitwardenClient::new("http://localhost:8080").unwrap();
-        let resolver = BitwardenResolver::new(client);
+        let fixture = crate::bitwarden::test_support::Fixture::new();
+        let resolver = BitwardenResolver::new(fixture.client.clone());
         let debug = format!("{resolver:?}");
         assert!(debug.contains("BitwardenResolver"));
     }

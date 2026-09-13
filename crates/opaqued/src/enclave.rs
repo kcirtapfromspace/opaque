@@ -305,6 +305,12 @@ impl LeaseKey {
         if let Some(ref t) = request.client_identity.codesign_team_id {
             hasher.update(t.as_bytes());
         }
+        if let Some(workload) = &request.client_identity.workload {
+            // Listener-established observations only. Source, strength and the
+            // ordered selector set all partition approval authority.
+            hasher.update(b"\0opaque.workload-lease.v1\0");
+            hasher.update(serde_json::to_vec(workload).expect("workload identity serializes"));
+        }
         let client_fingerprint = format!("{:x}", hasher.finalize());
 
         // Sorted target entries.
@@ -346,6 +352,15 @@ struct LeaseEntry {
     granted_at: tokio::time::Instant,
     ttl: Duration,
     one_time: bool,
+    budget: Option<u32>,
+    spent: u32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LeaseUse {
+    Missing,
+    Used,
+    Exhausted,
 }
 
 /// In-memory cache of approval leases. Cleared on daemon restart (fail closed).
@@ -365,28 +380,29 @@ impl LeaseCache {
 
     /// Check if a valid lease exists for the given key.
     ///
-    /// Returns `true` if a valid (non-expired) lease exists. Lazily removes
-    /// expired entries. Consumes one-time leases on hit.
-    fn check(&self, key: &LeaseKey) -> bool {
+    /// Reserve one attempt before dispatch. Exhausted entries remain until TTL
+    /// expiry: a concurrent request cannot turn exhaustion into a new approval.
+    /// Failed or ambiguous attempts are never refunded.
+    fn take(&self, key: &LeaseKey) -> LeaseUse {
         let mut leases = self.leases.lock().expect("lease cache mutex poisoned");
         let now = tokio::time::Instant::now();
 
-        if let Some(entry) = leases.get(key) {
+        if let Some(entry) = leases.get_mut(key) {
             if now.duration_since(entry.granted_at) < entry.ttl {
-                if entry.one_time {
-                    // Consume the one-time lease.
-                    leases.remove(key);
+                if entry.budget.is_some_and(|budget| entry.spent >= budget) {
+                    return LeaseUse::Exhausted;
                 }
-                return true;
+                entry.spent = entry.spent.saturating_add(1);
+                return LeaseUse::Used;
             }
             // Expired — remove lazily.
             leases.remove(key);
         }
-        false
+        LeaseUse::Missing
     }
 
-    /// Grant a new lease. TTL is capped at `max_ttl`.
-    fn grant(&self, key: LeaseKey, ttl: Duration, one_time: bool) {
+    /// Install the approved allowance, counting the approving attempt itself.
+    fn grant(&self, key: LeaseKey, ttl: Duration, one_time: bool, budget: Option<u32>) {
         let capped_ttl = ttl.min(self.max_ttl);
         let mut leases = self.leases.lock().expect("lease cache mutex poisoned");
         leases.insert(
@@ -395,6 +411,8 @@ impl LeaseCache {
                 granted_at: tokio::time::Instant::now(),
                 ttl: capped_ttl,
                 one_time,
+                budget: if one_time { Some(1) } else { budget },
+                spent: 1,
             },
         );
     }
@@ -424,6 +442,11 @@ impl LeaseCache {
                     client_fingerprint: key.client_fingerprint[..12].to_string(),
                     ttl_remaining_secs: (entry.ttl - elapsed).as_secs(),
                     one_time: entry.one_time,
+                    budget: entry.budget,
+                    spent: entry.spent,
+                    remaining_uses: entry
+                        .budget
+                        .map(|budget| budget.saturating_sub(entry.spent)),
                 })
             })
             .collect()
@@ -438,6 +461,9 @@ pub struct LeaseInfo {
     pub client_fingerprint: String,
     pub ttl_remaining_secs: u64,
     pub one_time: bool,
+    pub budget: Option<u32>,
+    pub spent: u32,
+    pub remaining_uses: Option<u32>,
 }
 
 impl fmt::Debug for LeaseCache {
@@ -1197,23 +1223,59 @@ impl Enclave {
         target_summary: &TargetSummary,
         expected_policy_generation: u64,
     ) -> Result<Option<opaque_core::workstation::SignedWorkstationReceipt>, EnclaveError> {
+        if request
+            .client_identity
+            .workload
+            .as_ref()
+            .is_some_and(|identity| !identity.is_attested())
+        {
+            return Err(EnclaveError::IdentityVerification(
+                "workload attestation unavailable".into(),
+            ));
+        }
+        // Serialize the initial allowance lookup with approval/issuance. A
+        // queued first-use request must observe the allowance just granted,
+        // instead of approving again and resetting its budget.
+        let _permit =
+            if decision.approval_requirement != ApprovalRequirement::Never {
+                Some(self.approval_semaphore.acquire().await.map_err(|_| {
+                    EnclaveError::ApprovalUnavailable("approval gate closed".into())
+                })?)
+            } else {
+                None
+            };
+        if self
+            .policy_generation
+            .load(std::sync::atomic::Ordering::SeqCst)
+            != expected_policy_generation
+        {
+            return Err(EnclaveError::ApprovalNotGranted(
+                "policy changed before review; a fresh request is required".into(),
+            ));
+        }
         let needs_approval = match decision.approval_requirement {
             ApprovalRequirement::Always => true,
             ApprovalRequirement::FirstUse => {
                 let lease_key = LeaseKey::from_request(request);
-                if self.lease_cache.check(&lease_key) {
-                    // Lease hit — emit audit event, skip approval.
-                    self.audit.emit(
-                        AuditEvent::new(AuditEventKind::LeaseHit)
-                            .with_request_id(request.request_id)
-                            .with_client(client_summary.clone())
-                            .with_operation(&request.operation)
-                            .with_target(target_summary.clone())
-                            .with_outcome("lease_used"),
-                    );
-                    false
-                } else {
-                    true
+                match self.lease_cache.take(&lease_key) {
+                    LeaseUse::Used => {
+                        // Lease hit — emit audit event, skip approval.
+                        self.audit.emit(
+                            AuditEvent::new(AuditEventKind::LeaseHit)
+                                .with_request_id(request.request_id)
+                                .with_client(client_summary.clone())
+                                .with_operation(&request.operation)
+                                .with_target(target_summary.clone())
+                                .with_outcome("lease_used"),
+                        );
+                        false
+                    }
+                    LeaseUse::Missing => true,
+                    LeaseUse::Exhausted => {
+                        return Err(EnclaveError::ApprovalNotGranted(
+                            "first-use approval budget exhausted; wait for expiry before requesting fresh approval".into(),
+                        ));
+                    }
                 }
             }
             ApprovalRequirement::Never => false,
@@ -1290,6 +1352,22 @@ impl Enclave {
         // rendering into the approval prompt. This is defense-in-depth: even
         // if upstream validation is bypassed, the prompt cannot be spoofed.
         let mut description = format!("Operation: {}", op_def.description);
+        if decision.approval_requirement == ApprovalRequirement::FirstUse {
+            let ttl = decision
+                .lease_ttl
+                .unwrap_or(DEFAULT_LEASE_TTL)
+                .min(MAX_LEASE_TTL);
+            let budget = if decision.one_time {
+                Some(1)
+            } else {
+                decision.budget
+            };
+            description.push_str(&format!(
+                "\nApproval allowance: {} attempts total (including this request), expires in {} seconds. Failed or uncertain attempts count.",
+                budget.map_or_else(|| "unlimited".into(), |count| count.to_string()),
+                ttl.as_secs(),
+            ));
+        }
         if matches!(
             request.operation.as_str(),
             "github.publish_manifest"
@@ -1318,13 +1396,6 @@ impl Enclave {
         }
         // Display the complete action fingerprint.
         description.push_str(&format!("\nRequest Hash: {content_hash}"));
-
-        // Serialize approval prompts to avoid races.
-        let _permit = self
-            .approval_semaphore
-            .acquire()
-            .await
-            .map_err(|_| EnclaveError::ApprovalUnavailable("approval gate closed".into()))?;
 
         // Emit approval presented event.
         self.audit.emit(
@@ -1454,7 +1525,8 @@ impl Enclave {
                 if decision.approval_requirement == ApprovalRequirement::FirstUse {
                     let ttl = decision.lease_ttl.unwrap_or(DEFAULT_LEASE_TTL);
                     let lease_key = LeaseKey::from_request(request);
-                    self.lease_cache.grant(lease_key, ttl, decision.one_time);
+                    self.lease_cache
+                        .grant(lease_key, ttl, decision.one_time, decision.budget);
                 }
 
                 Ok(outcome.workstation_receipt)
@@ -1953,6 +2025,7 @@ mod tests {
             exe_path: Some("/usr/bin/claude-code".into()),
             exe_sha256: Some("aabbccdd".into()),
             codesign_team_id: None,
+            workload: None,
         }
     }
 
@@ -2089,6 +2162,7 @@ mod tests {
                 factors: vec![ApprovalFactor::LocalBio],
                 lease_ttl: None,
                 one_time: false,
+                budget: None,
                 require_distinct_approver: true,
             },
         });
@@ -2240,6 +2314,7 @@ mod tests {
                 factors: vec![],
                 lease_ttl: None,
                 one_time: false,
+                budget: None,
                 require_distinct_approver: true,
             },
         });
@@ -2317,6 +2392,7 @@ mod tests {
                 factors: vec![ApprovalFactor::LocalBio],
                 lease_ttl: None,
                 one_time: true,
+                budget: None,
                 require_distinct_approver: false,
             },
         }])
@@ -2391,6 +2467,7 @@ mod tests {
                 factors: vec![ApprovalFactor::Fido2],
                 lease_ttl: None,
                 one_time: true,
+                budget: None,
                 require_distinct_approver: false,
             },
         });
@@ -2443,6 +2520,7 @@ mod tests {
                 factors: vec![ApprovalFactor::LocalBio],
                 lease_ttl: None,
                 one_time: true,
+                budget: None,
                 require_distinct_approver: false,
             },
         });
@@ -2706,6 +2784,34 @@ mod tests {
     }
 
     #[test]
+    fn lease_key_binds_trusted_workload_selectors_and_strength() {
+        use opaque_core::workload::{AttestationStrength, Selector, WorkloadIdentity};
+        let mut request = test_request("github.set_actions_secret", ClientType::Agent);
+        request.client_identity.workload = Some(WorkloadIdentity {
+            source: "peercred".to_owned().try_into().unwrap(),
+            strength: AttestationStrength::Weak,
+            selectors: [Selector::new("peercred", "uid", "501").unwrap()]
+                .into_iter()
+                .collect(),
+        });
+        let original = LeaseKey::from_request(&request);
+        let mut other = request.clone();
+        other.client_identity.workload.as_mut().unwrap().strength = AttestationStrength::Medium;
+        assert_ne!(original, LeaseKey::from_request(&other));
+        let mut other = request.clone();
+        other
+            .client_identity
+            .workload
+            .as_mut()
+            .unwrap()
+            .selectors
+            .insert(Selector::new("codesign", "team_id", "OTHERTEAM").unwrap());
+        assert_ne!(original, LeaseKey::from_request(&other));
+        request.client_identity.workload = None;
+        assert_ne!(original, LeaseKey::from_request(&request));
+    }
+
+    #[test]
     fn lease_key_differs_on_target() {
         let req1 = test_request("github.set_actions_secret", ClientType::Agent);
         let mut req2 = req1.clone();
@@ -2754,8 +2860,8 @@ mod tests {
         let cache = LeaseCache::new();
         let req = test_request("github.set_actions_secret", ClientType::Agent);
         let key = LeaseKey::from_request(&req);
-        cache.grant(key.clone(), Duration::from_secs(60), false);
-        assert!(cache.check(&key));
+        cache.grant(key.clone(), Duration::from_secs(60), false, None);
+        assert_eq!(cache.take(&key), LeaseUse::Used);
     }
 
     #[tokio::test]
@@ -2763,9 +2869,9 @@ mod tests {
         let cache = LeaseCache::new();
         let req = test_request("github.set_actions_secret", ClientType::Agent);
         let key = LeaseKey::from_request(&req);
-        cache.grant(key.clone(), Duration::from_millis(1), false);
+        cache.grant(key.clone(), Duration::from_millis(1), false, None);
         tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(!cache.check(&key));
+        assert_eq!(cache.take(&key), LeaseUse::Missing);
     }
 
     #[test]
@@ -2773,9 +2879,9 @@ mod tests {
         let cache = LeaseCache::new();
         let req = test_request("github.set_actions_secret", ClientType::Agent);
         let key = LeaseKey::from_request(&req);
-        cache.grant(key.clone(), Duration::from_secs(60), true);
-        assert!(cache.check(&key)); // first check consumes
-        assert!(!cache.check(&key)); // second check → gone
+        cache.grant(key.clone(), Duration::from_secs(60), true, None);
+        assert_eq!(cache.take(&key), LeaseUse::Exhausted); // approving call already consumed it
+        assert_eq!(cache.take(&key), LeaseUse::Exhausted); // exhaustion cannot reset the budget
     }
 
     #[test]
@@ -2783,9 +2889,9 @@ mod tests {
         let cache = LeaseCache::new();
         let req = test_request("github.set_actions_secret", ClientType::Agent);
         let key = LeaseKey::from_request(&req);
-        cache.grant(key.clone(), Duration::from_secs(60), false);
+        cache.grant(key.clone(), Duration::from_secs(60), false, None);
         cache.clear();
-        assert!(!cache.check(&key));
+        assert_eq!(cache.take(&key), LeaseUse::Missing);
     }
 
     #[test]
@@ -2796,9 +2902,9 @@ mod tests {
         req2.target.insert("repo".into(), "other/repo".into());
         let key1 = LeaseKey::from_request(&req1);
         let key2 = LeaseKey::from_request(&req2);
-        cache.grant(key1.clone(), Duration::from_secs(60), false);
-        assert!(cache.check(&key1));
-        assert!(!cache.check(&key2));
+        cache.grant(key1.clone(), Duration::from_secs(60), false, None);
+        assert_eq!(cache.take(&key1), LeaseUse::Used);
+        assert_eq!(cache.take(&key2), LeaseUse::Missing);
     }
 
     // -- Lease integration tests --
@@ -2830,6 +2936,7 @@ mod tests {
                 factors: vec![ApprovalFactor::LocalBio],
                 lease_ttl,
                 one_time,
+                budget: None,
                 require_distinct_approver: false,
             },
         }])
@@ -2853,6 +2960,119 @@ mod tests {
             .audit(audit)
             .build()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn counted_allowance_serializes_first_approval_and_admits_exactly_100_attempts() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let (gate, approvals) = CountingApproveGate::new();
+        let mut rules = serde_json::to_value(
+            // Use the same public configuration parser as an operator policy.
+            ApprovalConfig {
+                require: ApprovalRequirement::FirstUse,
+                factors: vec![ApprovalFactor::LocalBio],
+                lease_ttl: Some(Duration::from_secs(300)),
+                budget: Some(100),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(rules["budget"], 100);
+        let mut policy_rules: Vec<PolicyRule> = serde_json::from_value(serde_json::json!([{
+            "name": "counted",
+            "operation_pattern": "github.*",
+            "allow": true,
+            "approval": rules.take()
+        }]))
+        .unwrap();
+        // Explicitly admit the same caller class as the existing first-use rule.
+        policy_rules[0].client_types = vec![ClientType::Agent, ClientType::Human];
+        let enclave = Arc::new(build_lease_enclave(
+            Box::new(gate),
+            audit.clone(),
+            PolicyEngine::with_rules(policy_rules),
+        ));
+        let mut tasks = tokio::task::JoinSet::new();
+        let start = Arc::new(tokio::sync::Barrier::new(101));
+        for _ in 0..101 {
+            let enclave = enclave.clone();
+            let start = start.clone();
+            tasks.spawn(async move {
+                start.wait().await;
+                enclave
+                    .execute(test_request("github.set_actions_secret", ClientType::Agent))
+                    .await
+            });
+        }
+        let mut successes = 0;
+        let mut refusals = 0;
+        while let Some(result) = tasks.join_next().await {
+            match result.unwrap().error_code() {
+                None => successes += 1,
+                Some("approval_not_granted") => refusals += 1,
+                other => panic!("unexpected outcome: {other:?}"),
+            }
+        }
+        assert_eq!((successes, refusals), (100, 1));
+        assert_eq!(approvals.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            audit
+                .events_of_kind(AuditEventKind::OperationSucceeded)
+                .len(),
+            100
+        );
+        let leases = enclave.active_leases();
+        assert_eq!(leases[0].spent, 100);
+        assert_eq!(leases[0].remaining_uses, Some(0));
+    }
+
+    #[test]
+    fn counted_allowance_cache_drawdown_is_atomic_and_restart_requires_approval() {
+        let cache = Arc::new(LeaseCache::new());
+        let key = LeaseKey::from_request(&test_request(
+            "github.set_actions_secret",
+            ClientType::Agent,
+        ));
+        cache.grant(key.clone(), Duration::from_secs(60), false, Some(100));
+        let results = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..100)
+                .map(|_| {
+                    let cache = cache.clone();
+                    let key = key.clone();
+                    scope.spawn(move || cache.take(&key))
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        // The grant reserved the approving attempt; exactly 99 reuses remain.
+        assert_eq!(
+            results
+                .iter()
+                .filter(|outcome| **outcome == LeaseUse::Used)
+                .count(),
+            99
+        );
+        assert_eq!(cache.take(&key), LeaseUse::Exhausted);
+        assert_eq!(LeaseCache::new().take(&key), LeaseUse::Missing);
+        cache.clear();
+        assert_eq!(cache.take(&key), LeaseUse::Missing);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn counted_allowance_expiry_does_not_restore_spent_units() {
+        let cache = LeaseCache::new();
+        let key = LeaseKey::from_request(&test_request(
+            "github.set_actions_secret",
+            ClientType::Agent,
+        ));
+        cache.grant(key.clone(), Duration::from_secs(60), false, Some(2));
+        assert_eq!(cache.take(&key), LeaseUse::Used);
+        assert_eq!(cache.take(&key), LeaseUse::Exhausted);
+        tokio::time::advance(Duration::from_secs(61)).await;
+        assert_eq!(cache.take(&key), LeaseUse::Missing);
     }
 
     #[tokio::test]
@@ -2999,6 +3219,7 @@ mod tests {
                 factors: vec![ApprovalFactor::LocalBio],
                 lease_ttl: Some(Duration::from_secs(300)),
                 one_time: false,
+                budget: None,
                 require_distinct_approver: false,
             },
         });
@@ -3029,15 +3250,18 @@ mod tests {
         let _ = enclave.execute(req).await;
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-        // 2nd execution: lease hit (consumed).
+        // The approving attempt consumed the one-time allowance.
         let req = test_request("github.set_actions_secret", ClientType::Agent);
         let _ = enclave.execute(req).await;
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-        // 3rd execution: lease gone, approval again.
+        // Further requests cannot implicitly reset the exhausted allowance.
         let req = test_request("github.set_actions_secret", ClientType::Agent);
-        let _ = enclave.execute(req).await;
-        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            enclave.execute(req).await.error_code(),
+            Some("approval_not_granted")
+        );
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -3542,6 +3766,7 @@ mod tests {
                 factors: vec![],
                 lease_ttl: None,
                 one_time: false,
+                budget: None,
                 require_distinct_approver: false,
             },
         }]);
@@ -3621,6 +3846,7 @@ mod tests {
                 factors: vec![ApprovalFactor::LocalBio],
                 lease_ttl: None,
                 one_time: false,
+                budget: None,
                 require_distinct_approver: false,
             },
         });
@@ -3702,6 +3928,7 @@ mod tests {
                 factors: vec![],
                 lease_ttl: None,
                 one_time: false,
+                budget: None,
                 require_distinct_approver: false,
             },
         }]);
@@ -3778,6 +4005,7 @@ mod tests {
                 factors: vec![],
                 lease_ttl: None,
                 one_time: false,
+                budget: None,
                 require_distinct_approver: false,
             },
         }]);
@@ -3850,6 +4078,7 @@ mod tests {
                 factors: vec![ApprovalFactor::LocalBio],
                 lease_ttl: None,
                 one_time: false,
+                budget: None,
                 require_distinct_approver: false,
             },
         }]);
@@ -3933,6 +4162,7 @@ mod tests {
                 factors: vec![ApprovalFactor::LocalBio],
                 lease_ttl: None,
                 one_time: false,
+                budget: None,
                 require_distinct_approver: false,
             },
         }]);
@@ -4224,6 +4454,7 @@ mod tests {
                     factors: vec![],
                     lease_ttl: None,
                     one_time: false,
+                    budget: None,
                     require_distinct_approver: false,
                 },
             },
@@ -4253,6 +4484,7 @@ mod tests {
                     factors: vec![ApprovalFactor::LocalBio],
                     lease_ttl: None,
                     one_time: false,
+                    budget: None,
                     require_distinct_approver: false,
                 },
             },
@@ -4529,6 +4761,7 @@ mod tests {
                 factors: vec![],
                 lease_ttl: None,
                 one_time: false,
+                budget: None,
                 require_distinct_approver: false,
             },
         }]);
@@ -4658,6 +4891,7 @@ mod tests {
                 factors: vec![ApprovalFactor::LocalBio],
                 lease_ttl: None,
                 one_time: true,
+                budget: None,
                 require_distinct_approver: false,
             },
         }]);
@@ -4865,6 +5099,7 @@ mod operation_catalog_tests {
             server_build: "catalog-fixture-v1".into(),
             service_uid: Uuid::new_v4(),
             source_id: opaque_bounded_work::inference::DEMO_SOURCE_ID.into(),
+            github_ci: None,
             source_snapshot_sha256: opaque_bounded_work::inference::demo_source_snapshot_sha256(),
             credential_ref: None,
             allow_loopback_http: false,
@@ -4972,6 +5207,32 @@ mod operation_catalog_tests {
     }
 
     #[test]
+    fn catalog_preserves_explicit_fixture_availability() {
+        #[derive(Debug)]
+        struct FixtureCatalogHandler;
+        impl opaque_core::operation_handler::OperationHandler for FixtureCatalogHandler {
+            fn fixture_only(&self) -> bool {
+                true
+            }
+        }
+        let mut registry = OperationRegistry::new();
+        let mut operation = task_operation();
+        operation.name = "test.fixture".into();
+        registry.register(operation).unwrap();
+        let enclave = Enclave::builder()
+            .registry(registry)
+            .handler("test.fixture", Box::new(FixtureCatalogHandler))
+            .approval_gate(Box::new(AlwaysDenyGate))
+            .audit(Arc::new(InMemoryAuditEmitter::new()))
+            .build()
+            .unwrap();
+        let rows = enclave.operation_catalog();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["availability"], "fixture_only");
+        assert_eq!(rows[0]["policy_status"], "evaluated_per_request");
+    }
+
+    #[test]
     fn catalog_reports_registered_handlers_without_claiming_policy_permission() {
         let mut registry = OperationRegistry::new();
         for name in [
@@ -5008,12 +5269,8 @@ mod operation_catalog_tests {
                 "aws.create_secret",
                 Box::new(opaque_providers::aws::AwsHandler::new(
                     Arc::new(InMemoryAuditEmitter::new()),
-                    opaque_providers::aws::client::AwsClient::new(
-                        "http://127.0.0.1:1",
-                        "http://127.0.0.1:1",
-                        "http://127.0.0.1:1",
-                    )
-                    .expect("loopback fixture URLs are valid"),
+                    opaque_providers::aws::client::AwsClient::for_region("us-east-1")
+                        .expect("canonical production region is valid without credential access"),
                 )),
             )
             .handler("github.set_actions_secret", handler())
@@ -5038,7 +5295,7 @@ mod operation_catalog_tests {
                 "test.disabled"
             ]
         );
-        assert_eq!(rows[0]["availability"], "fixture_only");
+        assert_eq!(rows[0]["availability"], "enabled");
         assert_eq!(rows[1]["availability"], "enabled");
         assert_eq!(rows[3]["availability"], "disabled");
         assert_eq!(rows[1]["mcp_exposed"], true);

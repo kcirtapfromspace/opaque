@@ -9,6 +9,13 @@
 //! are mapped to sanitized [`GitHubApiError`] variants.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+
+const INVENTORY_PAGE_SIZE: usize = 100;
+const MAX_INVENTORY_PAGES: usize = 100;
+const MAX_INVENTORY_PAGE_BYTES: usize = 512 * 1024;
+const MAX_INVENTORY_BYTES: usize = 8 * 1024 * 1024;
+const INVENTORY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// GitHub API version header value.
 /// See: https://docs.github.com/en/rest/about-the-rest-api/api-versions
@@ -50,6 +57,15 @@ pub enum GitHubApiError {
 
     #[error("GitHub returned invalid repository identity metadata")]
     InvalidRepositoryIdentity,
+
+    #[error("GitHub secret inventory is inconsistent or invalid; no partial inventory returned")]
+    InvalidInventory,
+
+    #[error("GitHub secret inventory exceeds supported bounds; no partial inventory returned")]
+    InventoryLimitExceeded,
+
+    #[error("GitHub secret inventory timed out; no partial inventory returned")]
+    InventoryTimeout,
 }
 
 impl GitHubApiError {
@@ -436,35 +452,99 @@ impl GitHubClient {
         }
     }
 
-    /// List secrets for a given scope (names and timestamps only, never values).
+    /// List all secrets for a scope (names and timestamps only, never values).
+    ///
+    /// Fetch at most 100 pages of 100 entries within 60 seconds. Inconsistent
+    /// counts, duplicate names, incomplete pages and exceeded bounds fail closed.
+    /// GitHub does not provide snapshot isolation: concurrent changes with an
+    /// unchanged total count cannot always be detected.
     pub async fn list_secrets_scoped(
         &self,
         token: &str,
         scope: &SecretScope<'_>,
     ) -> Result<ListSecretsResponse, GitHubApiError> {
-        let url = format!("{}{}", self.base_url, scope.list_secrets_path());
-
-        let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(token)
-            .header("Accept", GITHUB_ACCEPT)
-            .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
-            .send()
+        tokio::time::timeout(INVENTORY_TIMEOUT, self.list_inventory(token, scope))
             .await
-            .map_err(GitHubApiError::Network)?;
+            .map_err(|_| GitHubApiError::InventoryTimeout)?
+    }
 
-        match resp.status().as_u16() {
-            200 => resp
-                .json::<ListSecretsResponse>()
+    async fn list_inventory(
+        &self,
+        token: &str,
+        scope: &SecretScope<'_>,
+    ) -> Result<ListSecretsResponse, GitHubApiError> {
+        let url = format!("{}{}", self.base_url, scope.list_secrets_path());
+        let mut secrets = Vec::new();
+        let mut names = HashSet::new();
+        let mut expected_count = None;
+        let mut total_bytes = 0;
+        for page in 1..=MAX_INVENTORY_PAGES {
+            // All supported secret scopes use numbered pagination. Construct
+            // every page locally from the pinned endpoint: response Link URLs
+            // can never redirect this bearer token to another origin or scope.
+            let mut resp = self
+                .http
+                .get(&url)
+                .query(&[("per_page", INVENTORY_PAGE_SIZE), ("page", page)])
+                .bearer_auth(token)
+                .header("Accept", GITHUB_ACCEPT)
+                .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
+                .send()
                 .await
-                .map_err(GitHubApiError::Network),
-            401 | 403 => Err(GitHubApiError::Unauthorized),
-            404 => Err(GitHubApiError::NotFound(scope.not_found_context())),
-            429 => Err(GitHubApiError::RateLimited),
-            500..=599 => Err(GitHubApiError::ServerError),
-            other => Err(GitHubApiError::UnexpectedStatus(other)),
+                .map_err(GitHubApiError::Network)?;
+            match resp.status().as_u16() {
+                200 => {}
+                401 | 403 => return Err(GitHubApiError::Unauthorized),
+                404 => return Err(GitHubApiError::NotFound(scope.not_found_context())),
+                429 => return Err(GitHubApiError::RateLimited),
+                500..=599 => return Err(GitHubApiError::ServerError),
+                other => return Err(GitHubApiError::UnexpectedStatus(other)),
+            }
+            if resp.content_length().is_some_and(|length| {
+                length > MAX_INVENTORY_PAGE_BYTES as u64
+                    || length > (MAX_INVENTORY_BYTES - total_bytes) as u64
+            }) {
+                return Err(GitHubApiError::InventoryLimitExceeded);
+            }
+            let mut bytes = Vec::new();
+            while let Some(chunk) = resp.chunk().await.map_err(GitHubApiError::Network)? {
+                if chunk.len() > MAX_INVENTORY_PAGE_BYTES - bytes.len()
+                    || chunk.len() > MAX_INVENTORY_BYTES - total_bytes
+                {
+                    return Err(GitHubApiError::InventoryLimitExceeded);
+                }
+                total_bytes += chunk.len();
+                bytes.extend_from_slice(&chunk);
+            }
+            let response: ListSecretsResponse =
+                serde_json::from_slice(&bytes).map_err(|_| GitHubApiError::InvalidInventory)?;
+            let count = usize::try_from(response.total_count)
+                .map_err(|_| GitHubApiError::InvalidInventory)?;
+            if count > INVENTORY_PAGE_SIZE * MAX_INVENTORY_PAGES {
+                return Err(GitHubApiError::InventoryLimitExceeded);
+            }
+            if expected_count.is_some_and(|expected| expected != count)
+                || response.secrets.len() != (count - secrets.len()).min(INVENTORY_PAGE_SIZE)
+            {
+                return Err(GitHubApiError::InvalidInventory);
+            }
+            expected_count = Some(count);
+            for secret in response.secrets {
+                if super::validate_secret_name(&secret.name).is_err()
+                    || !names.insert(secret.name.to_ascii_uppercase())
+                {
+                    return Err(GitHubApiError::InvalidInventory);
+                }
+                secrets.push(secret);
+            }
+            if secrets.len() == count {
+                return Ok(ListSecretsResponse {
+                    total_count: response.total_count,
+                    secrets,
+                });
+            }
         }
+        Err(GitHubApiError::InventoryLimitExceeded)
     }
 
     /// Delete a secret for a given scope.
@@ -538,6 +618,10 @@ impl GitHubClient {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "inventory_tests.rs"]
+mod inventory_tests;
 
 #[cfg(test)]
 mod tests {

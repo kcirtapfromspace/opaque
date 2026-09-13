@@ -290,6 +290,11 @@ pub struct ClientIdentity {
 
     /// macOS code signature Team ID, if available.
     pub codesign_team_id: Option<String>,
+
+    /// Trusted listener observations. Deserialization never grants workload
+    /// authority; the daemon must attach this context after attestation.
+    #[serde(skip)]
+    pub workload: Option<crate::workload::WorkloadIdentity>,
 }
 
 // Custom Debug that never leaks anything unexpected.
@@ -311,6 +316,7 @@ impl fmt::Debug for ClientIdentity {
                 }),
             )
             .field("codesign_team_id", &self.codesign_team_id)
+            .field("workload", &self.workload)
             .finish()
     }
 }
@@ -479,6 +485,14 @@ impl OperationRequest {
         }
         hasher.update(b"\0");
 
+        // Canonical trusted observations bind approvals to the achieved
+        // strength and selectors. Absence preserves historical fixture hashes.
+        if let Some(workload) = &self.client_identity.workload {
+            hasher.update(b"workload-v1\0");
+            hasher.update(serde_json::to_vec(workload).expect("workload identity serialization"));
+            hasher.update(b"\0");
+        }
+
         // Workspace remote_url + branch
         if let Some(ref ws) = self.workspace {
             if let Some(ref url) = ws.remote_url {
@@ -533,6 +547,7 @@ impl fmt::Debug for OperationRequest {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
@@ -637,6 +652,7 @@ mod tests {
                 "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".into(),
             ),
             codesign_team_id: None,
+            workload: None,
         };
         let dbg = format!("{id:?}");
         // The full hash should NOT appear in debug output.
@@ -699,6 +715,7 @@ mod tests {
             exe_path: Some("/usr/bin/claude-code".into()),
             exe_sha256: Some("aabb".into()),
             codesign_team_id: Some("TEAM123".into()),
+            workload: None,
         };
         let display = format!("{id}");
         assert!(display.contains("uid=501"));
@@ -717,6 +734,7 @@ mod tests {
             exe_path: None,
             exe_sha256: None,
             codesign_team_id: None,
+            workload: None,
         };
         let display = format!("{id}");
         assert!(display.contains("uid=0"));
@@ -735,6 +753,7 @@ mod tests {
             exe_path: None,
             exe_sha256: Some("abcdef01".into()),
             codesign_team_id: None,
+            workload: None,
         };
         let dbg = format!("{id:?}");
         assert!(dbg.contains("abcdef01"));
@@ -750,6 +769,7 @@ mod tests {
             exe_path: None,
             exe_sha256: None,
             codesign_team_id: None,
+            workload: None,
         };
         let dbg = format!("{id:?}");
         assert!(dbg.contains("exe_sha256: None"));
@@ -794,6 +814,7 @@ mod tests {
                 exe_path: Some("/usr/bin/test".into()),
                 exe_sha256: Some("aabb".into()),
                 codesign_team_id: None,
+                workload: None,
             },
             client_type: ClientType::Agent,
             operation: "test.op".into(),
@@ -898,6 +919,7 @@ mod tests {
                 exe_path: None,
                 exe_sha256: None,
                 codesign_team_id: None,
+                workload: None,
             },
             client_type: ClientType::Agent,
             operation: "test.op".into(),
@@ -946,6 +968,7 @@ mod tests {
                 exe_path: None,
                 exe_sha256: None,
                 codesign_team_id: None,
+                workload: None,
             },
             client_type: ClientType::Agent,
             operation: "test.op".into(),
@@ -992,6 +1015,7 @@ mod tests {
                 exe_path: None,
                 exe_sha256: None,
                 codesign_team_id: None,
+                workload: None,
             },
             client_type: ClientType::Agent,
             operation: "op.a".into(),
@@ -1021,6 +1045,7 @@ mod tests {
                 exe_path: None,
                 exe_sha256: None,
                 codesign_team_id: None,
+                workload: None,
             },
             client_type: ClientType::Agent,
             operation: "test.op".into(),
@@ -1054,6 +1079,7 @@ mod tests {
                 exe_path: None,
                 exe_sha256: None,
                 codesign_team_id: None,
+                workload: None,
             },
             client_type: ClientType::Agent,
             operation: "test.op".into(),
@@ -1081,6 +1107,7 @@ mod tests {
                 exe_path: None,
                 exe_sha256: None,
                 codesign_team_id: None,
+                workload: None,
             },
             client_type: ClientType::Agent,
             operation: "test.op".into(),
@@ -1119,6 +1146,7 @@ mod tests {
                 exe_path: None,
                 exe_sha256: None,
                 codesign_team_id: None,
+                workload: None,
             },
             client_type: ClientType::Agent,
             operation: "test.op".into(),
@@ -1203,6 +1231,7 @@ mod tests {
                 exe_path: None,
                 exe_sha256: None,
                 codesign_team_id: None,
+                workload: None,
             },
             client_type: ClientType::Agent,
             operation: "test.op".into(),

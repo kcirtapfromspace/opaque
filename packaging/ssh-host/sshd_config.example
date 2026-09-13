@@ -1,0 +1,33 @@
+# Dedicated bounded-health sshd instance. Replace IP, port and account before use.
+Port 2222
+ListenAddress 192.0.2.10
+HostKey /etc/opaque-ssh/host_key
+PidFile /run/opaque-ssh/sshd.pid
+TrustedUserCAKeys /etc/opaque-ssh/ca.pub
+AuthorizedPrincipalsFile none
+AuthorizedPrincipalsCommand /usr/bin/python3 -I /opt/opaque-ssh/principal_hook.py %i
+AuthorizedPrincipalsCommandUser nobody
+AuthorizedKeysFile none
+AuthenticationMethods publickey
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+UsePAM no
+AllowUsers opaque
+StrictModes yes
+DisableForwarding yes
+PermitTTY no
+PermitTunnel no
+PermitUserRC no
+PermitUserEnvironment no
+MaxSessions 1
+MaxAuthTries 2
+MaxStartups 20
+LoginGraceTime 10
+ClientAliveInterval 2
+ClientAliveCountMax 2
+UnusedConnectionTimeout 3s
+ChannelTimeout session=35s
+UseDNS no
+LogLevel ERROR

@@ -9,6 +9,9 @@ pub(super) struct BoundAction {
     #[serde(flatten)]
     pub action: BitwardenAction,
     pub api_url: String,
+    pub identity_url: String,
+    pub executable: String,
+    pub executable_sha256: String,
 }
 
 #[derive(Serialize)]
@@ -46,14 +49,10 @@ impl BitwardenAction {
             },
             _ => {
                 let secret_id = selector(params, "secret_id")?;
-                // Secret IDs are single path segments. Prevent URL parsing
-                // from turning an approved ID into a different API request.
-                if !secret_id
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
-                {
-                    return Err("invalid 'secret_id' selector".into());
-                }
+                super::client::validate_id(&secret_id).map_err(|e| e.to_string())?;
+                let secret_id = uuid::Uuid::parse_str(&secret_id)
+                    .map_err(|_| "invalid Bitwarden UUID")?
+                    .to_string();
                 Self::ReadSecret { secret_id }
             }
         })
