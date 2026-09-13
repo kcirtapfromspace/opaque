@@ -190,7 +190,7 @@ class CollectionContracts(unittest.TestCase):
 
     def test_test_process_profile_alone_never_qualifies_daemon_collection(self):
         self.profile("test")
-        for target in ("task_api_e2e", "resource_authority_e2e", "mcp_gateway_e2e", "synthesized_review_e2e"):
+        for target in ("task_api_e2e", "resource_authority_e2e", "mcp_gateway_e2e"):
             with self.assertRaisesRegex(suite.Invalid, "missing_required_child_profiles"):
                 collector.profile_inventory(self.root, target)
 
@@ -207,16 +207,41 @@ class CollectionContracts(unittest.TestCase):
         self.assertEqual(len(collector.profile_inventory(self.root, "mcp_gateway_e2e", cases[0])[0]), 3)
 
     def test_split_uid_caller_profiles_require_retained_mapping_objects(self):
+        case = collector.CASES["synthesized_review_e2e"][0]
         for role in ("test", "daemon", "peer"):
             self.profile(role)
         with self.assertRaisesRegex(suite.Invalid, "missing_instrumented_peer_object"):
-            collector.profile_inventory(self.root, "synthesized_review_e2e")
+            collector.profile_inventory(self.root, "synthesized_review_e2e", case)
         peer = self.root / "peer-binary-fixture"
         peer.write_bytes(b"retained caller mapping")
-        profiles, objects = collector.profile_inventory(self.root, "synthesized_review_e2e")
+        profiles, objects = collector.profile_inventory(self.root, "synthesized_review_e2e", case)
         self.assertEqual(objects, [peer])
         self.assertEqual(len(profiles), 3)
         self.assertTrue(all(len(item["sha256"]) == 64 for item in profiles))
+
+    def test_ordinary_oidc_baselines_do_not_claim_ignored_daemon_peer_ceremonies(self):
+        self.profile("test")
+        targets = {"synthesized_review_e2e": collector.CASES["synthesized_review_e2e"],
+                   collector.CONTAINED_TARGET: (*collector.CONTAINED_CASES,
+                       "contained_real_model_completions_require_signed_review_and_survive_restart")}
+        for target, cases in targets.items():
+            profiles, objects = collector.profile_inventory(self.root, target)
+            self.assertEqual({entry["role"] for entry in profiles}, {"test"})
+            self.assertEqual(objects, [])
+            for case in cases:
+                with self.subTest(target=target, case=case), self.assertRaisesRegex(suite.Invalid, "missing_required_child_profiles"):
+                    collector.profile_inventory(self.root, target, case)
+        self.profile("daemon")
+        self.profile("peer")
+        for target, cases in targets.items():
+            with self.assertRaisesRegex(suite.Invalid, "missing_instrumented_peer_object"):
+                collector.profile_inventory(self.root, target, cases[0])
+        (self.root / "peer-binary-fixture").write_bytes(b"retained caller mapping")
+        for target, cases in targets.items():
+            for case in cases:
+                profiles, objects = collector.profile_inventory(self.root, target, case)
+                self.assertEqual({entry["role"] for entry in profiles}, {"test", "daemon", "peer"})
+                self.assertEqual(len(objects), 1)
 
     def test_workspace_rpc_requires_actual_peer_profile_and_mapping_on_each_platform(self):
         name = "task_rpc_rechecks_changed_workspace_after_source_read_without_publishing"

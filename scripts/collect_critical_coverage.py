@@ -384,7 +384,9 @@ def role_requirements(target, name):
     if target == "task_api_e2e" and name == "task_rpc_rechecks_changed_workspace_after_source_read_without_publishing":
         return {"test", "daemon", "peer"}
     if target in ("synthesized_review_e2e", CONTAINED_TARGET):
-        return {"test", "daemon", "peer"}
+        # Ordinary baseline execution runs only the shared OIDC helper tests;
+        # the daemon/peer ceremonies are ignored until selected by exact name.
+        return {"test"} if name is None else {"test", "daemon", "peer"}
     if target == "mcp_gateway_e2e":
         roles = {"test", "daemon"}
         if name in (CASES[target][0], CASES[target][5]):
