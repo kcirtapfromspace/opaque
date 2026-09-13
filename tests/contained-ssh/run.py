@@ -100,6 +100,7 @@ def main():
     # Mount this child directly: fixture UIDs may traverse it inside the
     # container, while the host's outer 0700 output keeps artifacts private.
     artifacts.mkdir(mode=0o711)
+    artifacts.chmod(0o711)  # Restore traversal bits removed by the private umask.
     run_id = str(uuid.uuid4())
     name = "opaque-contained-" + run_id
     record = {"schema": "opaque.contained-run.v1", "run_id": run_id,

@@ -1,6 +1,7 @@
 """Safety regressions for owned-resource cleanup, separate from service proof."""
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -17,6 +18,20 @@ def result(code=0, stdout=b""):
 
 
 class CleanupTests(unittest.TestCase):
+    def test_restrictive_umask_keeps_outer_private_and_mount_traversable(self):
+        previous_umask = os.umask(0o077)
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "new"
+                with patch.object(RUNNER.sys, "argv", ["run.py", "--output", str(output)]), \
+                     patch.object(RUNNER, "command", side_effect=RuntimeError("stop before Docker")):
+                    with self.assertRaisesRegex(RuntimeError, "stop before Docker"):
+                        RUNNER.main()
+                self.assertEqual(output.stat().st_mode & 0o777, 0o700)
+                self.assertEqual((output / "container").stat().st_mode & 0o777, 0o711)
+        finally:
+            os.umask(previous_umask)
+
     def test_artifact_handoff_has_fixed_mount_and_does_not_follow_symlinks(self):
         with patch.object(RUNNER.os, "getuid", return_value=1001), \
              patch.object(RUNNER.os, "getgid", return_value=1002), \
