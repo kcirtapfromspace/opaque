@@ -10,7 +10,7 @@ opaque task show TASK_ID_FROM_PLAN
 ```
 
 This source implementation requires a release containing the configurable SSH
-health contract and the [Linux host package](../packaging/ssh-host/README.md).
+health contract and the [Linux host package](https://github.com/kcirtapfromspace/opaque/tree/main/packaging/ssh-host).
 The broker and host require separate deployment. Local tests establish protocol
 behavior; they do not establish qualification on your Vault/OpenSSH deployment.
 
@@ -54,7 +54,7 @@ Both digest fields are lowercase SHA-256 of the decoded OpenSSH wire blob,
 not the printed `SHA256:` fingerprint. Grant and receipt keys are separate
 Ed25519 keys; seed files contain exactly 32 raw bytes with mode 0600.
 
-For a headless broker, enroll a [trusted workstation reviewer](../crates/opaque-approver/README.md)
+For a headless broker, enroll a [trusted workstation reviewer](remote-approvals.md)
 and require `factors = ["paired_workstation"]` for both `ssh.health_manifest`
 and `ssh.service_health`. The broker and reviewer must both include SSH task
 support in their workstation protocol. The workstation displays the complete

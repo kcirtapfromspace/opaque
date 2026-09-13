@@ -131,6 +131,10 @@ jobs:
     name: Critical production source line and branch coverage
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    env:
+      # The repository's stable pin overrides rustup's default toolchain.
+      # Select nightly explicitly for every coverage subprocess.
+      RUSTUP_TOOLCHAIN: nightly-2026-09-13
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
