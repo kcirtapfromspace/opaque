@@ -20,6 +20,10 @@
 //! `EnclaveFacade::verify_workspace` addition through a real `execute_task`
 //! dispatch, not just a build check.
 
+#[cfg(coverage)]
+#[path = "support/coverage.rs"]
+mod coverage;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -141,6 +145,8 @@ factors = ["local_bio"]
             .env_remove("OPAQUE_SOCK")
             .stdout(Stdio::from(log_stdout))
             .stderr(log_file);
+        #[cfg(coverage)]
+        coverage::subprocess(&mut cmd, "daemon");
         let child = cmd.spawn().expect("spawn opaqued");
 
         let mut daemon = Daemon {

@@ -856,4 +856,212 @@ mod tests {
         assert!(!waiting.await.unwrap().unwrap().approve);
         server_task.abort();
     }
+
+    #[tokio::test]
+    async fn workstation_tls_authenticated_device_mismatch_preserves_signed_round() {
+        let rig = rig();
+        let handle = rig.server.handle();
+        let document = document();
+        let waiting = issue(&handle, &document).await;
+        let second_key = SigningKey::from_bytes(&[59; 32]);
+        let second_public_key = hex(second_key.verifying_key().as_bytes());
+        rig.manager
+            .enroll_workstation(&WorkstationApproverConfig {
+                public_key_hex: second_public_key.clone(),
+                name: "Second isolated signer".into(),
+                principal_id: Some("other-test-human".into()),
+            })
+            .unwrap();
+        let enrollment = rig
+            .manager
+            .begin_workstation_enrollment(&second_public_key)
+            .unwrap();
+        let second_device = rig
+            .manager
+            .complete_workstation_enrollment(&EnrollmentRequest {
+                public_key_hex: second_public_key,
+                nonce: enrollment.nonce.clone(),
+                signature: hex(&second_key.sign(&enrollment_bytes(&enrollment)).to_bytes()),
+            })
+            .unwrap();
+        let mismatched = WorkstationResponse {
+            device_id: second_device.device_id.clone(),
+            decision: WorkstationDecision::Approve,
+            signature: hex(&second_key
+                .sign(&workstation_decision_bytes(&document.challenge, true))
+                .to_bytes()),
+        };
+        // The body is independently valid for another enrolled signer. This
+        // reaches the authenticated-device binding guard, not signature failure.
+        rig.manager
+            .verify_workstation_decision(
+                &document.challenge,
+                &mismatched.signature,
+                &mismatched.device_id,
+                true,
+            )
+            .unwrap();
+        let rejection = signature(&rig, &document, false);
+        let expected_pending = {
+            let pending = handle.state.workstation_pending.lock().unwrap();
+            let entry = pending.get(&document.challenge.approval_id).unwrap();
+            (entry.review.clone(), entry.created_at, entry.timeout)
+        };
+        let Rig {
+            server,
+            certificate,
+            device,
+            _directory,
+            ..
+        } = rig;
+        let (server_task, address) = server.start().await.unwrap();
+        let client = BrokerClient::new(
+            &format!("https://{address}"),
+            &certificate_fingerprint(&certificate),
+        )
+        .unwrap();
+        let credentials = Some((device.device_id.as_str(), device.token.as_str()));
+        let route = format!("/workstation/approvals/{}", document.challenge.approval_id);
+        let fetched: WorkstationReview = client
+            .request(reqwest::Method::GET, &route, None, credentials)
+            .await
+            .unwrap();
+        assert_eq!(fetched, document);
+        let error = client
+            .request::<serde_json::Value>(
+                reqwest::Method::POST,
+                &format!("{route}/respond"),
+                Some(serde_json::to_value(mismatched).unwrap()),
+                credentials,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error, "broker rejected workstation request (HTTP 403)");
+        assert!(!waiting.is_finished());
+        {
+            let pending = handle.state.workstation_pending.lock().unwrap();
+            assert_eq!(pending.len(), 1);
+            let entry = pending.get(&document.challenge.approval_id).unwrap();
+            assert_eq!(
+                (entry.review.clone(), entry.created_at, entry.timeout),
+                expected_pending
+            );
+            assert!(!entry.response_tx.is_closed());
+        }
+        let _: serde_json::Value = client
+            .request(
+                reqwest::Method::POST,
+                &format!("{route}/respond"),
+                Some(serde_json::to_value(&rejection).unwrap()),
+                credentials,
+            )
+            .await
+            .unwrap();
+        let decision = waiting.await.unwrap().unwrap();
+        assert!(!decision.approve);
+        assert_eq!(decision.device.device_id, device.device_id);
+        assert!(handle.state.workstation_pending.lock().unwrap().is_empty());
+        let error = client
+            .request::<serde_json::Value>(
+                reqwest::Method::POST,
+                &format!("{route}/respond"),
+                Some(serde_json::to_value(rejection).unwrap()),
+                credentials,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error, "broker rejected workstation request (HTTP 404)");
+        drop(client);
+        server_task.abort();
+        assert!(server_task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn workstation_tls_expired_fetch_and_signed_response_never_decide() {
+        let rig = rig();
+        let handle = rig.server.handle();
+        let Rig {
+            server,
+            certificate,
+            device,
+            key,
+            _directory,
+            ..
+        } = rig;
+        let (server_task, address) = server.start().await.unwrap();
+        let client = BrokerClient::new(
+            &format!("https://{address}"),
+            &certificate_fingerprint(&certificate),
+        )
+        .unwrap();
+        let credentials = Some((device.device_id.as_str(), device.token.as_str()));
+        for local_elapsed_timeout in [false, true] {
+            let document = document();
+            let waiting = issue(&handle, &document).await;
+            let route = format!("/workstation/approvals/{}", document.challenge.approval_id);
+            let fetched: WorkstationReview = client
+                .request(reqwest::Method::GET, &route, None, credentials)
+                .await
+                .unwrap();
+            assert_eq!(fetched, document);
+            let expired = {
+                let mut pending = handle.state.workstation_pending.lock().unwrap();
+                let entry = pending.get_mut(&document.challenge.approval_id).unwrap();
+                if local_elapsed_timeout {
+                    entry.created_at = Instant::now()
+                        .checked_sub(entry.timeout + Duration::from_secs(1))
+                        .unwrap();
+                    assert!(entry.review.challenge.expires_at > now());
+                } else {
+                    entry.review.challenge.created_at = now() - 60;
+                    entry.review.challenge.expires_at = now();
+                    assert!(entry.created_at.elapsed() < entry.timeout);
+                }
+                entry.review.clone()
+            };
+            // Sign the current pending challenge, including the changed wall
+            // deadline, so an obsolete signature cannot explain the rejection.
+            let response = WorkstationResponse {
+                device_id: device.device_id.clone(),
+                decision: WorkstationDecision::Approve,
+                signature: hex(&key
+                    .sign(&workstation_decision_bytes(&expired.challenge, true))
+                    .to_bytes()),
+            };
+            opaque_core::workstation::verify_signature(
+                &hex(key.verifying_key().as_bytes()),
+                &response.signature,
+                &workstation_decision_bytes(&expired.challenge, true),
+            )
+            .unwrap();
+            let error = client
+                .request::<WorkstationReview>(reqwest::Method::GET, &route, None, credentials)
+                .await
+                .unwrap_err();
+            assert_eq!(error, "broker rejected workstation request (HTTP 410)");
+            let error = client
+                .request::<serde_json::Value>(
+                    reqwest::Method::POST,
+                    &format!("{route}/respond"),
+                    Some(serde_json::to_value(response).unwrap()),
+                    credentials,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error, "broker rejected workstation request (HTTP 410)");
+            assert!(!waiting.is_finished());
+            {
+                let pending = handle.state.workstation_pending.lock().unwrap();
+                let entry = pending.get(&document.challenge.approval_id).unwrap();
+                assert_eq!(entry.review, expired);
+                assert!(!entry.response_tx.is_closed());
+            }
+            waiting.abort();
+            assert!(waiting.await.unwrap_err().is_cancelled());
+            assert!(handle.state.workstation_pending.lock().unwrap().is_empty());
+        }
+        drop(client);
+        server_task.abort();
+        assert!(server_task.await.unwrap_err().is_cancelled());
+    }
 }

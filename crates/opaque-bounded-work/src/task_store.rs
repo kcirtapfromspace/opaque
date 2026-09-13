@@ -2374,4 +2374,347 @@ mod tests {
             Some(TaskApprovalMode::PairedWorkstation)
         );
     }
+
+    #[test]
+    fn rollback_cannot_approve_reserve_finalize_or_authorize_a_charged_slot() {
+        let (directory, store) = fixture();
+        let task = store.create(OWNER, manifest(1), NOW).unwrap();
+        let claimed = store.claim(&task.id, OWNER, NOW).unwrap();
+        assert!(matches!(
+            store.approve(
+                &task.id,
+                OWNER,
+                &task.manifest_digest,
+                TaskApprovalMode::Native,
+                NOW - 1
+            ),
+            Err(TaskStoreError::InvalidInput)
+        ));
+        assert_eq!(store.get(&task.id, OWNER, NOW).unwrap(), claimed);
+        let approved = store
+            .approve(
+                &task.id,
+                OWNER,
+                &task.manifest_digest,
+                TaskApprovalMode::Native,
+                NOW + 2,
+            )
+            .unwrap();
+        let slot = &task.slots[0].id;
+        assert!(matches!(
+            store.reserve_slot(&task.id, OWNER, slot, "attempt", NOW + 1),
+            Err(TaskStoreError::InvalidInput)
+        ));
+        assert_eq!(store.get(&task.id, OWNER, NOW + 2).unwrap(), approved);
+        store
+            .reserve_slot(&task.id, OWNER, slot, "attempt", NOW + 3)
+            .unwrap();
+        let charged = store.get(&task.id, OWNER, NOW + 3).unwrap();
+        assert!(matches!(
+            store.finalize_slot(&task.id, OWNER, slot, "attempt", accepted(), NOW + 2),
+            Err(TaskStoreError::InvalidInput)
+        ));
+        assert!(matches!(
+            store.authorize_dispatch(&task.id, OWNER, slot, "attempt", NOW + 2),
+            Err(TaskStoreError::InvalidInput)
+        ));
+        assert_eq!(store.get(&task.id, OWNER, NOW + 3).unwrap(), charged);
+        drop(store);
+        let restarted = TaskStore::open(&directory.path().join("tasks.sqlite3")).unwrap();
+        let recovered = restarted.get(&task.id, OWNER, NOW + 4).unwrap();
+        assert_eq!(recovered.slots[0].state, SlotState::Unknown);
+        assert_eq!(recovered.slots[0].reserved_at, Some(NOW + 3));
+        assert_eq!(recovered.slots[0].request_id.as_deref(), Some("attempt"));
+        assert!(
+            restarted
+                .reserve_slot(&task.id, OWNER, slot, "retry", NOW + 4)
+                .is_err()
+        );
+    }
+
+    fn signed_bound_receipt(
+        task: &TaskRecord,
+    ) -> (
+        ed25519_dalek::SigningKey,
+        opaque_core::workstation::SignedWorkstationReceipt,
+    ) {
+        use ed25519_dalek::{Signer, SigningKey};
+        use opaque_core::workstation::*;
+        let key = SigningKey::from_bytes(&[59; 32]);
+        let review = WorkstationReview {
+            challenge: WorkstationChallenge {
+                schema_version: 2,
+                broker_id: "opq-bound-receipt-fixture".into(),
+                authority: Some(WorkstationAuthority {
+                    binding: ApprovalBinding {
+                        tenant: task.tenant.clone().unwrap(),
+                        task_id: task.id.clone(),
+                        manifest_digest: task.manifest_digest.clone(),
+                        request_hash: "a".repeat(64),
+                        policy_digest: "b".repeat(64),
+                        requester: "fixture-requester".into(),
+                    },
+                    principal_id: "fixture-reviewer".into(),
+                    public_key_hex: hex(key.verifying_key().as_bytes()),
+                    required_role: "operator".into(),
+                    authority_epoch: 1,
+                }),
+                approval_id: uuid::Uuid::new_v4().to_string(),
+                request_id: uuid::Uuid::new_v4().to_string(),
+                operation: "inference.fixed_manifest".into(),
+                content_hash: review_hash("Exactly the bound fixture task"),
+                nonce: "c".repeat(64),
+                created_at: NOW,
+                expires_at: NOW + 120,
+            },
+            review_text: "Exactly the bound fixture task".into(),
+        };
+        let response = WorkstationResponse {
+            device_id: uuid::Uuid::new_v4().to_string(),
+            decision: WorkstationDecision::Approve,
+            signature: hex(&key
+                .sign(&workstation_decision_bytes(&review.challenge, true))
+                .to_bytes()),
+        };
+        (
+            key,
+            SignedWorkstationReceipt {
+                schema_version: 1,
+                review,
+                response,
+                accepted_at: NOW,
+            },
+        )
+    }
+
+    #[test]
+    fn otherwise_valid_signed_receipts_cannot_change_digest_tenant_decision_or_time() {
+        use ed25519_dalek::Signer;
+        use opaque_core::workstation::{WorkstationDecision, hex, workstation_decision_bytes};
+        for mutation in ["digest", "tenant", "rejection", "future_acceptance"] {
+            let directory = tempfile::tempdir().unwrap();
+            let binding = tenant("binding-guards");
+            let owner = binding.owner_key(501, None);
+            let path = directory.path().join("tasks.db");
+            let store = TaskStore::open_for_tenant(&path, Some(binding.clone())).unwrap();
+            let task = store
+                .create(&owner, inference_manifest(&binding), NOW)
+                .unwrap();
+            let claimed = store.claim(&task.id, &owner, NOW).unwrap();
+            let (key, mut receipt) = signed_bound_receipt(&task);
+            match mutation {
+                "digest" => {
+                    receipt
+                        .review
+                        .challenge
+                        .authority
+                        .as_mut()
+                        .unwrap()
+                        .binding
+                        .manifest_digest = "e".repeat(64)
+                }
+                "tenant" => {
+                    receipt
+                        .review
+                        .challenge
+                        .authority
+                        .as_mut()
+                        .unwrap()
+                        .binding
+                        .tenant = tenant("other-tenant")
+                }
+                "rejection" => receipt.response.decision = WorkstationDecision::Reject,
+                "future_acceptance" => receipt.accepted_at = NOW + 1,
+                _ => unreachable!(),
+            }
+            receipt.response.signature = hex(&key
+                .sign(&workstation_decision_bytes(
+                    &receipt.review.challenge,
+                    receipt.response.decision == WorkstationDecision::Approve,
+                ))
+                .to_bytes());
+            receipt.verify().unwrap();
+            assert!(
+                matches!(
+                    store.approve_with_receipt(
+                        &task.id,
+                        &owner,
+                        &task.manifest_digest,
+                        TaskApprovalMode::PairedWorkstation,
+                        NOW,
+                        Some(&receipt)
+                    ),
+                    Err(TaskStoreError::InvalidInput)
+                ),
+                "{mutation}"
+            );
+            assert_eq!(
+                store.get(&task.id, &owner, NOW).unwrap(),
+                claimed,
+                "{mutation}"
+            );
+            assert!(
+                matches!(
+                    store.reserve_slot(&task.id, &owner, &task.slots[0].id, "denied", NOW),
+                    Err(TaskStoreError::NotApproved)
+                ),
+                "{mutation}"
+            );
+            drop(store);
+            let restarted = TaskStore::open_for_tenant(&path, Some(binding)).unwrap();
+            let recovered = restarted.get(&task.id, &owner, NOW + 2).unwrap();
+            assert!(
+                recovered.approved_at.is_none() && recovered.workstation_receipt.is_none(),
+                "{mutation}"
+            );
+            assert!(
+                recovered
+                    .slots
+                    .iter()
+                    .all(|slot| slot.state == SlotState::Pending && slot.request_id.is_none()),
+                "{mutation}"
+            );
+            assert!(
+                restarted.claim(&task.id, &owner, NOW + 2).is_err(),
+                "{mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn persisted_slot_corruption_refuses_reopen_without_repair_or_refund() {
+        type Mutation = (&'static str, u8, fn(&mut TaskRecord));
+        let mutations: &[Mutation] = &[
+            ("pending_request", 0, |r| {
+                r.slots[0].request_id = Some("unearned".into())
+            }),
+            ("pending_reservation", 0, |r| {
+                r.slots[0].reserved_at = Some(NOW)
+            }),
+            ("pending_finish", 0, |r| r.slots[0].finished_at = Some(NOW)),
+            ("pending_outcome", 0, |r| {
+                r.slots[0].outcome = Some(accepted())
+            }),
+            ("approved_before_creation", 0, |r| {
+                r.approved_at = Some(NOW - 1)
+            }),
+            ("approved_at_expiry", 0, |r| {
+                r.approved_at = Some(r.expires_at)
+            }),
+            ("reserved_without_approval", 1, |r| {
+                r.approved_at = None;
+                r.approval_mode = None;
+            }),
+            ("reserved_without_timestamp", 1, |r| {
+                r.slots[0].reserved_at = None
+            }),
+            ("reserved_before_approval", 1, |r| {
+                r.slots[0].reserved_at = Some(NOW - 1)
+            }),
+            ("reserved_at_expiry", 1, |r| {
+                r.slots[0].reserved_at = Some(r.expires_at)
+            }),
+            ("reserved_without_request", 1, |r| {
+                r.slots[0].request_id = None
+            }),
+            ("reserved_invalid_request", 1, |r| {
+                r.slots[0].request_id = Some(" ".into())
+            }),
+            ("reserved_finish_before_reservation", 1, |r| {
+                r.slots[0].finished_at = Some(NOW)
+            }),
+            ("reserved_with_outcome", 1, |r| {
+                r.slots[0].outcome = Some(accepted())
+            }),
+            ("reserved_with_finish", 1, |r| {
+                r.slots[0].finished_at = Some(NOW + 2)
+            }),
+            ("terminal_without_outcome", 2, |r| r.slots[0].outcome = None),
+            ("terminal_outcome_state_mismatch", 2, |r| {
+                r.slots[0].state = SlotState::Rejected;
+                r.state = TaskState::Partial;
+            }),
+            ("terminal_without_finish", 2, |r| {
+                r.slots[0].finished_at = None
+            }),
+            ("terminal_finish_before_reservation", 2, |r| {
+                r.slots[0].finished_at = Some(NOW)
+            }),
+        ];
+        for &(name, phase, mutation) in mutations {
+            let (directory, store) = fixture();
+            let task = approved(&store, 1);
+            if phase > 0 {
+                store
+                    .reserve_slot(&task.id, OWNER, &task.slots[0].id, "charged", NOW + 1)
+                    .unwrap();
+            }
+            if phase > 1 {
+                store
+                    .finalize_slot(
+                        &task.id,
+                        OWNER,
+                        &task.slots[0].id,
+                        "charged",
+                        accepted(),
+                        NOW + 2,
+                    )
+                    .unwrap();
+            }
+            let mut corrupted = store.get(&task.id, OWNER, NOW + 2).unwrap();
+            // A second valid charged row must not be recovered if any row is corrupt.
+            let witness = approved(&store, 1);
+            store
+                .reserve_slot(&witness.id, OWNER, &witness.slots[0].id, "witness", NOW + 1)
+                .unwrap();
+            drop(store);
+            mutation(&mut corrupted);
+            let path = directory.path().join("tasks.sqlite3");
+            let database = Connection::open(&path).unwrap();
+            let encoded = serde_json::to_string(&corrupted).unwrap();
+            assert_eq!(
+                database
+                    .execute(
+                        "UPDATE bounded_tasks SET record=?1 WHERE id=?2",
+                        params![encoded, task.id]
+                    )
+                    .unwrap(),
+                1
+            );
+            let witness_before: String = database
+                .query_row(
+                    "SELECT record FROM bounded_tasks WHERE id=?1",
+                    [&witness.id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            drop(database);
+            assert!(
+                matches!(TaskStore::open(&path), Err(TaskStoreError::Corrupt)),
+                "{name}"
+            );
+            // SQLite may update container header counters when opening. The exact
+            // serialized authority rows, including another charged slot, must not change.
+            let database = Connection::open(&path).unwrap();
+            let actual: String = database
+                .query_row(
+                    "SELECT record FROM bounded_tasks WHERE id=?1",
+                    [&task.id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let witness_after: String = database
+                .query_row(
+                    "SELECT record FROM bounded_tasks WHERE id=?1",
+                    [&witness.id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(actual, encoded, "corrupt row was repaired: {name}");
+            assert_eq!(
+                witness_after, witness_before,
+                "another charged row was recovered: {name}"
+            );
+        }
+    }
 }

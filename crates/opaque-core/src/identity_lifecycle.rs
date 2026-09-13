@@ -202,7 +202,223 @@ async fn exchange(
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod transport_tests {
     use super::*;
-    use tokio::io::AsyncReadExt;
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn batch() -> LifecycleBatch {
+        LifecycleBatch {
+            schema_version: 1,
+            binding: TenantBinding::new(
+                crate::tenant::TenantId::parse("transport-fixture").unwrap(),
+                uuid::Uuid::new_v4(),
+            )
+            .unwrap(),
+            issuer: "https://idp.example".into(),
+            revision: 2,
+            updates: vec![SubjectUpdate {
+                subject: "reviewer".into(),
+                active: false,
+                deleted: false,
+                groups: vec![],
+            }],
+            suspend: false,
+        }
+    }
+
+    fn receipt(batch: &LifecycleBatch) -> LifecycleReceipt {
+        use sha2::{Digest, Sha256};
+        LifecycleReceipt {
+            schema_version: 1,
+            binding: batch.binding.clone(),
+            issuer: batch.issuer.clone(),
+            revision: batch.revision,
+            digest: format!("{:x}", Sha256::digest(serde_json::to_vec(batch).unwrap())),
+        }
+    }
+
+    fn frame(bytes: &[u8]) -> Vec<u8> {
+        let mut result = (bytes.len() as u32).to_be_bytes().to_vec();
+        result.extend_from_slice(bytes);
+        result
+    }
+
+    // A real, custody-checked Unix listener receives exactly one scoped
+    // mutation. The responder is synthetic; broker state is tested separately.
+    async fn response_over_socket(
+        batch: &LifecycleBatch,
+        response: Vec<u8>,
+    ) -> Result<LifecycleReceipt, String> {
+        let dir = tempfile::Builder::new()
+            .prefix("oq-lifecycle-")
+            .tempdir_in(std::fs::canonicalize("/tmp").unwrap())
+            .unwrap();
+        let socket = dir.path().join("lifecycle.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let client = deliver(
+            &socket,
+            unsafe { libc::geteuid() },
+            "scoped-fixture-token",
+            batch,
+        );
+        let server = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let length = stream.read_u32().await.unwrap() as usize;
+            assert!(length > 0 && length <= MAX_REQUEST_BYTES);
+            let mut bytes = vec![0; length];
+            stream.read_exact(&mut bytes).await.unwrap();
+            let request: LifecycleRequest = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(request.credential, "scoped-fixture-token");
+            assert_eq!(&request.batch, batch);
+            for chunk in response.chunks(3) {
+                stream.write_all(chunk).await.unwrap();
+            }
+            stream.shutdown().await.unwrap();
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (result, ()) = tokio::join!(client, server);
+            result
+        })
+        .await
+        .expect("one exchange must terminate without retry")
+    }
+
+    #[tokio::test]
+    async fn framed_delivery_requires_every_pending_mutation_receipt_binding() {
+        let batch = batch();
+        let valid = receipt(&batch);
+        for case in 0..8 {
+            let mut offered = valid.clone();
+            match case {
+                0 => {}
+                1 => offered.schema_version = 2,
+                2 => offered.binding.tenant_id = crate::tenant::TenantId::parse("other").unwrap(),
+                3 => offered.binding.broker_id = uuid::Uuid::new_v4(),
+                4 => offered.issuer = "https://different.example".into(),
+                5 => offered.revision += 1,
+                6 => offered.digest = "0".repeat(64),
+                7 => offered.binding.schema_version = 2,
+                _ => unreachable!(),
+            }
+            let response =
+                serde_json::to_vec(&LifecycleResponse::Applied { receipt: offered }).unwrap();
+            let result = response_over_socket(&batch, frame(&response)).await;
+            if case == 0 {
+                assert_eq!(result.unwrap(), valid);
+            } else {
+                assert_eq!(
+                    result.unwrap_err(),
+                    "lifecycle receipt does not match pending mutation",
+                    "case {case}"
+                );
+            }
+        }
+        let rejected = serde_json::to_vec(&LifecycleResponse::Rejected {
+            error: "revision denied".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            response_over_socket(&batch, frame(&rejected))
+                .await
+                .unwrap_err(),
+            "revision denied"
+        );
+    }
+
+    #[tokio::test]
+    async fn framed_delivery_rejects_zero_oversized_malformed_and_truncated_responses() {
+        let batch = batch();
+        let cases = [
+            (vec![0, 0, 0, 0], "lifecycle response exceeds bound"),
+            (
+                ((MAX_RESPONSE_BYTES + 1) as u32).to_be_bytes().to_vec(),
+                "lifecycle response exceeds bound",
+            ),
+            (frame(b"{"), "invalid lifecycle response"),
+            (
+                frame(br#"{"status":"applied","receipt":null}"#),
+                "invalid lifecycle response",
+            ),
+            (vec![0, 0], "lifecycle response unavailable"),
+            (vec![0, 0, 0, 3, b'{'], "lifecycle response unavailable"),
+        ];
+        for (response, expected) in cases {
+            assert_eq!(
+                response_over_socket(&batch, response).await.unwrap_err(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_mutations_and_credentials_send_no_frame_bytes() {
+        for oversized_batch in [true, false] {
+            let (mut client, mut server) = tokio::net::UnixStream::pair().unwrap();
+            let mut batch = batch();
+            let credential = if oversized_batch {
+                batch.updates[0].subject = "x".repeat(MAX_BATCH_BYTES);
+                "scoped-fixture-token".into()
+            } else {
+                "x".repeat(MAX_REQUEST_BYTES)
+            };
+            let result =
+                exchange(&mut client, unsafe { libc::geteuid() }, &credential, &batch).await;
+            assert_eq!(
+                result.unwrap_err(),
+                if oversized_batch {
+                    "lifecycle batch exceeds bound"
+                } else {
+                    "lifecycle request exceeds bound"
+                }
+            );
+            drop(client);
+            let mut bytes = Vec::new();
+            server.read_to_end(&mut bytes).await.unwrap();
+            assert!(bytes.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn unsafe_socket_custody_denies_delivery_before_credentials_leave() {
+        let uid = unsafe { libc::geteuid() };
+        assert_eq!(
+            validate_socket_path(std::path::Path::new("relative.sock"), uid).unwrap_err(),
+            "lifecycle socket path must be absolute"
+        );
+        let dir = tempfile::Builder::new()
+            .prefix("oq-custody-")
+            .tempdir_in(std::fs::canonicalize("/tmp").unwrap())
+            .unwrap();
+        let socket = dir.path().join("lifecycle.sock");
+        std::fs::write(&socket, b"preserve this file").unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            deliver(&socket, uid, "secret", &batch()).await.unwrap_err(),
+            "lifecycle endpoint custody mismatch"
+        );
+        assert_eq!(std::fs::read(&socket).unwrap(), b"preserve this file");
+        std::fs::remove_file(&socket).unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o606)).unwrap();
+        assert_eq!(
+            deliver(&socket, uid, "secret", &batch()).await.unwrap_err(),
+            "lifecycle endpoint custody mismatch"
+        );
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(
+            deliver(&socket, uid, "secret", &batch())
+                .await
+                .unwrap_err()
+                .contains("unsafe lifecycle")
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     #[tokio::test]
     async fn wrong_peer_uid_receives_no_credential_or_mutation_bytes() {
         let (mut client, mut server) = tokio::net::UnixStream::pair().unwrap();

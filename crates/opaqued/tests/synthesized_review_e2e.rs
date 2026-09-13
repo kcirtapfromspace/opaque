@@ -7,6 +7,8 @@
 #![cfg(target_os = "linux")]
 #[path = "support/oidc.rs"]
 mod oidc;
+#[path = "support/preparation_fence.rs"]
+mod preparation_fence;
 #[path = "support/split_daemon.rs"]
 mod split_daemon;
 #[path = "support/workstation.rs"]
@@ -28,6 +30,7 @@ const PAT: &str = "ghp_synthetic_review_fixture_only";
 const VAULT_TOKEN: &str = "synthetic-review-vault-token";
 const SECRET: &str = "synthetic-secret-custody-sentinel";
 const CLIENT: &str = "opaque-synthesized-review";
+const LIFECYCLE_TOKEN: &str = "synthetic-lifecycle-transport-credential-for-disposable-ci-only";
 
 struct Providers {
     github: MockServer,
@@ -230,6 +233,105 @@ struct Fixture {
     session: String,
 }
 impl Fixture {
+    async fn enable_lifecycle(&mut self, github: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        self.daemon.stop();
+        let token = self.layout.state.join("identity-lifecycle.token");
+        std::fs::write(&token, LIFECYCLE_TOKEN).unwrap();
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let name = std::ffi::CString::new(token.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(
+            unsafe {
+                libc::chown(
+                    name.as_ptr(),
+                    split_daemon::BROKER_UID,
+                    split_daemon::BROKER_UID,
+                )
+            },
+            0
+        );
+        let endpoint = &self.workstation.state.enrollment.as_ref().unwrap().endpoint;
+        let port = reqwest::Url::parse(endpoint).unwrap().port().unwrap();
+        let mut document = config(
+            &self.layout,
+            &self.idp.uri(),
+            port,
+            Some((&self.reviewer, &self.workstation.state.public_key_hex)),
+        );
+        document += &format!(
+            "\n[lifecycle]\nsocket_path = {:?}\nallowed_adapter_uids = [0]\ntoken_file = {:?}\n[lifecycle.group_roles]\nreviewers = [\"approver\"]\noperators = [\"operator\"]\n",
+            self.layout.state.join("lifecycle.sock"),
+            token
+        );
+        self.layout.seal(&document);
+        self.daemon = self.layout.start(&env(github, &self.providers.vault.uri()));
+        // The ordinary socket/token appear before optional ingress startup.
+        // Complete an RPC before attempting the separate listener readiness check.
+        self.daemon.human().ok("version", Value::Null, None).await;
+        self.workstation
+            .reconnect(&std::fs::read(self.layout.state.join("approval_server.cert")).unwrap());
+        let initial = self.lifecycle_batch(1, true);
+        self.deliver_lifecycle(&initial).await;
+        let requester = login(&self.daemon.human(), &self.idp, "requester").await;
+        assert_eq!(requester["principal_id"], self.requester);
+        self.session = self.delegate().await;
+    }
+
+    fn lifecycle_batch(
+        &self,
+        revision: u64,
+        active: bool,
+    ) -> opaque_core::identity_lifecycle::LifecycleBatch {
+        use opaque_core::identity_lifecycle::{LifecycleBatch, SubjectUpdate};
+        LifecycleBatch {
+            schema_version: 1,
+            binding: serde_json::from_slice(
+                &std::fs::read(self.layout.state.join("tenant.binding.json")).unwrap(),
+            )
+            .unwrap(),
+            issuer: self.idp.uri(),
+            revision,
+            updates: [("reviewer", "reviewers"), ("requester", "operators")]
+                .into_iter()
+                .map(|(subject, group)| SubjectUpdate {
+                    subject: subject.into(),
+                    active,
+                    deleted: false,
+                    groups: if active { vec![group.into()] } else { vec![] },
+                })
+                .collect(),
+            suspend: false,
+        }
+    }
+
+    async fn deliver_lifecycle(
+        &self,
+        batch: &opaque_core::identity_lifecycle::LifecycleBatch,
+    ) -> opaque_core::identity_lifecycle::LifecycleReceipt {
+        let socket = self.layout.state.join("lifecycle.sock");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                use std::os::unix::fs::FileTypeExt;
+                if std::fs::symlink_metadata(&socket)
+                    .is_ok_and(|metadata| metadata.file_type().is_socket())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("sealed fixture lifecycle listener did not become ready after daemon startup");
+        opaque_core::identity_lifecycle::deliver(
+            &socket,
+            split_daemon::BROKER_UID,
+            LIFECYCLE_TOKEN,
+            batch,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("lifecycle revision {} failed: {error}", batch.revision))
+    }
+
     async fn new() -> Self {
         let layout = Layout::new();
         let idp = oidc::MockOidc::start(CLIENT).await;
@@ -613,4 +715,125 @@ async fn synthesized_review_timeout_rejects_late_signature_without_effects() {
     );
     assert!(f.workstation.pending().await.is_empty());
     assert_eq!(f.providers.effects().await, (0, 0));
+}
+
+#[tokio::test]
+#[ignore = "requires Linux root; mandatory synthesized contained profile"]
+#[allow(clippy::await_holding_lock)]
+async fn synthesized_lifecycle_regrant_during_preparation_keeps_signed_task_charged_and_denied() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut f = Fixture::new().await;
+    let fence = preparation_fence::PreparationFence::new(&f.providers.github.uri()).await;
+    f.enable_lifecycle(fence.uri()).await;
+    let task = f.plan().await;
+    let old_session = f.session.clone();
+    let request = f.start_task(&task);
+    let review = f.workstation.wait_review("github.publish_manifest").await;
+    f.assert_bound_review(&review, &task);
+    assert_eq!(f.providers.effects().await, (0, 0));
+    f.workstation.respond(&review, true).await.unwrap();
+    fence.wait_for_preparation().await;
+    let charged = f.get(&task).await;
+    assert_eq!(charged["slots"][0]["state"], "reserved");
+    assert!(charged["approved_at"].is_number());
+    let receipt = f.verify_receipt(&charged).await;
+    // Provider preparation reads the pinned source before the final write
+    // authorization fence. This scenario proves zero GitHub writes, not zero reads.
+    assert_eq!(f.providers.effects().await, (1, 0));
+    let removed = f.lifecycle_batch(2, false);
+    f.deliver_lifecycle(&removed).await;
+    let restored = f.lifecycle_batch(3, true);
+    let restoration = f.deliver_lifecycle(&restored).await;
+    let old_access = f
+        .daemon
+        .agent()
+        .call(
+            "task_get",
+            json!({"task_id":task["id"]}),
+            Some(&old_session),
+        )
+        .await
+        .expect("live broker transport should return a structured authorization denial");
+    assert_eq!(old_access["error"]["code"], "delegation_invalid");
+    assert!(old_access["result"].is_null());
+    for secret in [PAT, VAULT_TOKEN, SECRET, LIFECYCLE_TOKEN] {
+        assert!(!old_access.to_string().contains(secret));
+    }
+    assert_eq!(
+        login(&f.daemon.human(), &f.idp, "requester").await["principal_id"],
+        f.requester
+    );
+    f.session = f.delegate().await;
+    fence.release();
+    let response = request.await.unwrap().unwrap();
+    assert!(response["error"].is_null());
+    let denied = response["result"]["task"].clone();
+    assert_eq!(denied["state"], "partial");
+    assert_eq!(denied["slots"][0]["state"], "rejected");
+    assert_eq!(
+        denied["slots"][0]["request_id"],
+        charged["slots"][0]["request_id"]
+    );
+    assert_eq!(
+        denied["slots"][0]["reserved_at"],
+        charged["slots"][0]["reserved_at"]
+    );
+    assert_eq!(
+        denied["workstation_receipt"],
+        charged["workstation_receipt"]
+    );
+    assert_eq!(f.providers.effects().await, (1, 0));
+
+    let before_restart = f.session.clone();
+    f.daemon.stop();
+    f.daemon = f.layout.start(&env(fence.uri(), &f.providers.vault.uri()));
+    f.workstation
+        .reconnect(&std::fs::read(f.layout.state.join("approval_server.cert")).unwrap());
+    assert!(
+        f.daemon
+            .agent()
+            .call(
+                "task_get",
+                json!({"task_id":task["id"]}),
+                Some(&before_restart)
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        f.daemon
+            .agent()
+            .call(
+                "task_get",
+                json!({"task_id":task["id"]}),
+                Some(&old_session)
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(f.deliver_lifecycle(&restored).await, restoration);
+    assert!(
+        opaque_core::identity_lifecycle::deliver(
+            &f.layout.state.join("lifecycle.sock"),
+            split_daemon::BROKER_UID,
+            LIFECYCLE_TOKEN,
+            &removed
+        )
+        .await
+        .is_err()
+    );
+    f.session = f.delegate().await;
+    let recovered = f.get(&task).await;
+    assert_eq!(recovered, denied);
+    assert_eq!(f.verify_receipt(&recovered).await, receipt);
+    assert!(
+        f.daemon
+            .agent()
+            .call("task_run", json!({"task_id":task["id"]}), Some(&f.session))
+            .await
+            .unwrap()["error"]
+            .is_object()
+    );
+    assert!(f.workstation.pending().await.is_empty());
+    assert_eq!(f.providers.effects().await, (1, 0));
 }

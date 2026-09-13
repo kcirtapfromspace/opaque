@@ -1036,6 +1036,76 @@ mod tests {
         assert_eq!(stored[0].credential_id, credential.credential_id);
     }
 
+    #[test]
+    fn registration_wrong_rp_preserves_existing_credentials() {
+        let (manager, _dir) = test_manager(MockTransport::new("opaque.local"));
+        let existing = manager.register("reviewer", "existing key").unwrap();
+        let before = std::fs::read(&manager.store.path).unwrap();
+        let foreign_transport = MockTransport::new("different.local");
+        let (foreign_manager, _foreign_dir) = test_manager(foreign_transport.clone());
+        let response = foreign_transport
+            .register(&manager.registration_challenge().unwrap(), "reviewer")
+            .unwrap();
+
+        // The exact response has a valid key and user-presence flag and can
+        // register at its own RP. Only the receiving RP differs here.
+        foreign_manager
+            .validate_and_store_registration(&response, "foreign key")
+            .unwrap();
+        assert!(matches!(
+            manager.validate_and_store_registration(&response, "foreign key"),
+            Err(Fido2Error::InvalidAuthData(reason)) if reason == "RP ID hash mismatch"
+        ));
+        assert_eq!(std::fs::read(&manager.store.path).unwrap(), before);
+        let reopened = Fido2CredentialStore::new(manager.store.path.clone(), vec![0x5a; 32]);
+        let credentials = reopened.load().unwrap();
+        assert_eq!(credentials.len(), 1);
+        assert_eq!(credentials[0].credential_id, existing.credential_id);
+        assert!(matches!(
+            reopened.find(&response.credential_id),
+            Err(Fido2Error::CredentialNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn signed_assertion_wrong_rp_preserves_counter_and_principal_binding() {
+        let (manager, _dir) = test_manager(MockTransport::new("opaque.local"));
+        let (assertion, mut credential) =
+            make_signed_assertion("different.local", true, 8, "bound-credential");
+        credential.counter = 7;
+        credential.principal_binding = Some(Fido2PrincipalBinding {
+            principal_id: PrincipalId::parse("hum_00000000000000000000000000000001").unwrap(),
+            issuer: "https://issuer.example".into(),
+            subject: "reviewer".into(),
+            tenant_id: "tenant-a".into(),
+            broker_id: uuid::Uuid::new_v4().to_string(),
+        });
+        credential
+            .principal_binding
+            .as_ref()
+            .unwrap()
+            .validate()
+            .unwrap();
+        manager.store.add(credential.clone()).unwrap();
+        let before = std::fs::read(&manager.store.path).unwrap();
+
+        // This is a fresh, correctly signed assertion for the same stored
+        // key and challenge, with a higher counter, but for a different RP.
+        let (foreign_manager, _foreign_dir) = test_manager(MockTransport::new("different.local"));
+        foreign_manager
+            .verify_assertion(&assertion, &credential, "test-challenge")
+            .unwrap();
+        assert!(matches!(
+            manager.verify_and_record_assertion(&assertion, "test-challenge"),
+            Err(Fido2Error::InvalidAuthData(reason)) if reason == "RP ID hash mismatch"
+        ));
+        assert_eq!(std::fs::read(&manager.store.path).unwrap(), before);
+        let reopened = Fido2CredentialStore::new(manager.store.path.clone(), vec![0x5a; 32]);
+        let retained = reopened.find(&credential.credential_id).unwrap();
+        assert_eq!(retained.counter, 7);
+        assert_eq!(retained.principal_binding, credential.principal_binding);
+    }
+
     // -----------------------------------------------------------------------
     // Authentication tests
     // -----------------------------------------------------------------------

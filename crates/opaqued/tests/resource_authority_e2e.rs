@@ -1,6 +1,10 @@
 //! Disposable real-daemon + real HTTP gateway integration. The test alone may
 //! mutate its private fixture identity DB; the gateway receives neither that
 //! database path nor the broad daemon token.
+#[cfg(coverage)]
+#[path = "support/coverage.rs"]
+mod coverage;
+
 use opaque_core::{
     resource_auth::{AuthError, BrokerClient, BrokerClientConfig},
     tenant::{TenantBinding, TenantId},
@@ -40,16 +44,18 @@ impl Drop for Daemon {
 impl Daemon {
     async fn start(root: &Path) -> Self {
         let _ = std::fs::remove_file(root.join("resource.sock")); // Our killed fixture's path only.
-        let mut child = Command::new(env!("CARGO_BIN_EXE_opaqued"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_opaqued"));
+        command
             .env("HOME", root)
             .env("XDG_RUNTIME_DIR", root.join("run"))
             .env("OPAQUE_CONFIG", root.join("config.toml"))
             .env("OPAQUE_RESOURCE_AUTHORITY_FIXTURE", "1")
             .env_remove("OPAQUE_SOCK")
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::piped());
+        #[cfg(coverage)]
+        coverage::subprocess(&mut command, "daemon");
+        let mut child = command.spawn().unwrap();
         for _ in 0..200 {
             if root.join("resource.sock").exists() {
                 return Self {

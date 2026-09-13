@@ -128,54 +128,109 @@ jobs:
           if-no-files-found: error
 
   measured-code-coverage:
-    name: Critical production source line and branch coverage
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    name: Critical production coverage (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            runner: ubuntu-24.04
+          - platform: darwin
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
     env:
-      # The repository's stable pin overrides rustup's default toolchain.
-      # Select nightly explicitly for every coverage subprocess.
+      # This explicit selection outranks the repository's stable product pin.
       RUSTUP_TOOLCHAIN: nightly-2026-09-13
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+      - if: matrix.platform == 'darwin'
+        uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
         with:
           toolchain: nightly-2026-09-13
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
+      - if: matrix.platform == 'darwin'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> ${{ runner.temp }}/critical-coverage-target"
+          key: critical-coverage-${{ matrix.platform }}
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12.11"
-      - name: Verify strict measured-coverage regressions
-        run: python3 -B -m unittest discover -s scripts -p test_check_llvm_coverage.py -v
+      - name: Verify collector and measured-coverage regressions
+        run: python3 -B -m unittest discover -s scripts -p 'test_*coverage*.py' -v
       - name: Install pinned coverage collector
+        if: matrix.platform == 'darwin'
         run: cargo install cargo-llvm-cov --version 0.9.1 --locked
-      - name: Instrument critical production source lines and branches
-        # Pinned nightly measures branches without changing the product's stable
-        # toolchain. Test-only modules use coverage(off) under coverage_nightly;
-        # standalone integration-test sources are excluded by the path filter.
+      - name: Verify disposable host runner regressions
+        if: matrix.platform == 'linux'
+        run: python3 -B -m unittest discover -s tests/contained-ssh -p 'test_*.py' -v
+      - name: Collect existing library and daemon scenarios on this platform
+        # A killed-child preflight verifies continuous branch profiles before
+        # any measurements. The same instrumentation builds test, daemon and
+        # adapter binaries; split-UID peer objects/profiles are retained too.
+        # Linux runs real SSH and controlled inference RPC scenarios inside a
+        # disposable systemd/Vault/OpenSSH host. Only the three declared libraries' source is reported.
         run: |
-          cargo llvm-cov --locked \
-            -p opaque-core -p opaque-bounded-work -p opaque-approval \
-            --tests --all-features --branch --json \
-            --ignore-filename-regex '(^|/)tests/' \
-            --output-path "$RUNNER_TEMP/critical-branch-llvm-coverage.json"
-      - name: Require the declared 100 percent line and branch targets
-        # Both measured targets deliberately fail until uncovered code closes.
+          if [ "${{ matrix.platform }}" = linux ]; then
+            coverage_status=0
+            python3 -B tests/contained-ssh/run.py --coverage \
+              --output "$RUNNER_TEMP/critical-contained" || coverage_status=$?
+            if [ -d "$RUNNER_TEMP/critical-contained/container/coverage" ]; then
+              sudo -n chown -R --no-dereference "$(id -u):$(id -g)" \
+                "$RUNNER_TEMP/critical-contained/container/coverage"
+              mv "$RUNNER_TEMP/critical-contained/container/coverage" \
+                "$RUNNER_TEMP/critical-coverage"
+            fi
+            exit "$coverage_status"
+          else
+            python3 -B scripts/collect_critical_coverage.py \
+              --source-root "$GITHUB_WORKSPACE" \
+              --target-dir "$RUNNER_TEMP/critical-coverage-target" \
+              --reuse-target-dir \
+              --output "$RUNNER_TEMP/critical-coverage"
+          fi
+      - name: Require 100 percent production lines and branches on this platform
+        # An independently passing platform cannot cover code compiled out here.
+        # Both targets remain exactly 100; uncovered production code fails.
         run: |
           python3 -B scripts/check_llvm_coverage.py \
-            --report "$RUNNER_TEMP/critical-branch-llvm-coverage.json" \
+            --report "$RUNNER_TEMP/critical-coverage/llvm-coverage.json" \
             --source-root "$GITHUB_WORKSPACE" \
             --require-file crates/opaque-bounded-work/src/task_store.rs \
+            --require-file crates/opaque-bounded-work/src/task_api.rs \
+            --require-file crates/opaque-bounded-work/src/resource_authority.rs \
             --require-file crates/opaque-core/src/task.rs \
+            --require-file crates/opaque-core/src/identity_lifecycle.rs \
             --require-file crates/opaque-approval/src/approval_server/workstation.rs \
             --require-branches \
-            --output "$RUNNER_TEMP/critical-branch-coverage-summary.json"
-      - name: Retain measured line and branch coverage summary
+            --output "$RUNNER_TEMP/critical-coverage/gate.json"
+      - name: Restore generated artifact and cache ownership
+        if: always() && matrix.platform == 'linux'
+        run: |
+          for generated_path in \
+            "$RUNNER_TEMP/critical-coverage" \
+            "$RUNNER_TEMP/critical-contained" \
+            "$RUNNER_TEMP/critical-coverage-target" \
+            "$HOME/.cargo/registry" \
+            "$HOME/.cargo/git"; do
+            if [ -d "$generated_path" ]; then
+              sudo -n chown -R --no-dereference "$(id -u):$(id -g)" "$generated_path"
+            fi
+          done
+      - name: Retain platform-specific collection inventory and coverage
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: critical-production-line-and-branch-coverage
-          path: ${{ runner.temp }}/critical-branch-coverage-summary.json
+          name: critical-production-coverage-${{ matrix.platform }}
+          path: |
+            ${{ runner.temp }}/critical-contained/run.json
+            ${{ runner.temp }}/critical-coverage/collection.json
+            ${{ runner.temp }}/critical-coverage/coverage-summary.json
+            ${{ runner.temp }}/critical-coverage/baseline-summary.json
+            ${{ runner.temp }}/critical-coverage/baseline-llvm-coverage.json
+            ${{ runner.temp }}/critical-coverage/gate.json
+            ${{ runner.temp }}/critical-coverage/llvm-coverage.json
           if-no-files-found: error
 
   test-macos:

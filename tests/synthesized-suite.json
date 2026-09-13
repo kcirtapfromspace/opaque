@@ -99,6 +99,32 @@
       "root": false,
       "tools": [],
       "build_timeout_seconds": 1800
+    },
+    {
+      "id": "contained-ssh",
+      "package": "opaqued",
+      "kind": "test",
+      "name": "contained_ssh_e2e",
+      "features": [],
+      "platforms": [
+        "linux"
+      ],
+      "root": true,
+      "tools": [
+        "rustc",
+        "setpriv",
+        "getent",
+        "useradd",
+        "userdel",
+        "groupadd",
+        "groupdel",
+        "vault",
+        "systemctl",
+        "ssh-keygen",
+        "python3"
+      ],
+      "build_timeout_seconds": 1800,
+      "requires_sys_ptrace": true
     }
   ],
   "tests": [
@@ -277,6 +303,48 @@
       "name": "task_store::tests::malformed_or_semantically_corrupt_ledgers_fail_closed",
       "timeout_seconds": 120,
       "include_ignored": false
+    },
+    {
+      "id": "contained-ssh-once",
+      "target": "contained-ssh",
+      "name": "contained_signed_ssh_runs_one_probe_and_rejects_replay_after_restart",
+      "timeout_seconds": 120,
+      "include_ignored": true
+    },
+    {
+      "id": "contained-ssh-unknown",
+      "target": "contained-ssh",
+      "name": "contained_guard_crash_preserves_unknown_and_kills_probe_without_replay",
+      "timeout_seconds": 120,
+      "include_ignored": true
+    },
+    {
+      "id": "contained-inference-authority",
+      "target": "contained-ssh",
+      "name": "contained_inference_rpc_rechecks_authority_after_metadata_without_refunding",
+      "timeout_seconds": 120,
+      "include_ignored": true
+    },
+    {
+      "id": "composed-lifecycle-regrant",
+      "target": "composed-review",
+      "name": "synthesized_lifecycle_regrant_during_preparation_keeps_signed_task_charged_and_denied",
+      "timeout_seconds": 120,
+      "include_ignored": true
+    },
+    {
+      "id": "workstation-device-body-binding",
+      "target": "workstation",
+      "name": "approval_server::workstation::tests::workstation_tls_authenticated_device_mismatch_preserves_signed_round",
+      "timeout_seconds": 120,
+      "include_ignored": false
+    },
+    {
+      "id": "workstation-expired-fetch-response",
+      "target": "workstation",
+      "name": "approval_server::workstation::tests::workstation_tls_expired_fetch_and_signed_response_never_decide",
+      "timeout_seconds": 120,
+      "include_ignored": false
     }
   ],
   "requirements": [
@@ -389,9 +457,12 @@
     {
       "id": "contained.vault-openssh-systemd",
       "profile": "contained",
-      "status": "missing",
-      "tests": [],
-      "description": "Unattended real Vault, OpenSSH, systemd guard, distinct UIDs and signed health task have not yet been composed in public core."
+      "status": "implemented",
+      "tests": [
+        "contained-ssh-once",
+        "contained-ssh-unknown"
+      ],
+      "description": "Unattended real Vault/OpenSSH/systemd host with distinct NSS UIDs, exact scripted signed review, one audited certificate and health probe, signed host replay denial, guard-crash uncertainty and durable broker restart."
     },
     {
       "id": "model.pinned-actual-completions",
@@ -450,6 +521,34 @@
         "ledger-corruption"
       ],
       "description": "Foreign tenant bindings, fabricated completion, multiple writers and corrupt durable state fail closed."
+    },
+    {
+      "id": "contained.inference-rpc-authority",
+      "profile": "contained",
+      "status": "implemented",
+      "tests": [
+        "contained-inference-authority"
+      ],
+      "description": "Real daemon inference planning/execution against controlled HTTP metadata/completions: revoked planning delegation creates no task, three typed protocol completions succeed, and revocation during execution metadata preserves charge while preventing further completion. Not actual-model evidence."
+    },
+    {
+      "id": "protocol.lifecycle_signed_review_revocation",
+      "profile": "protocol",
+      "status": "implemented",
+      "tests": [
+        "composed-lifecycle-regrant"
+      ],
+      "description": "Signed controlled OIDC and accepted pinned-TLS review survive framed split-UID lifecycle offboard/regrant during preparation as a charged denied task with retained receipt and no effective GitHub write; one preparatory Vault read precedes the final write gate and old delegation remains denied after restart."
+    },
+    {
+      "id": "workstation-tls-binding-and-expiry",
+      "profile": "protocol",
+      "status": "implemented",
+      "tests": [
+        "workstation-device-body-binding",
+        "workstation-expired-fetch-response"
+      ],
+      "description": "Pinned TLS rejects a different enrolled signer under another authenticated device without consuming the pending round; a correctly signed Reject consumes once. Expired fetch and correctly signed response return 410 after wall or local elapsed deadlines without a decision. No native human claim."
     }
   ]
 }

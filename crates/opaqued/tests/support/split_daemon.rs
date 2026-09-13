@@ -1,4 +1,8 @@
 //! Linux-root, sealed split-UID fixture. No same-UID enforcement exception.
+#[cfg(coverage)]
+#[path = "coverage.rs"]
+mod coverage;
+
 use serde_json::{Value, json};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -148,14 +152,19 @@ impl Layout {
         std::fs::write(&source, include_str!("rpc_peer.rs")).unwrap();
         let human_binary = base.path().join("human-peer");
         let agent_binary = base.path().join("agent-peer");
-        let compile = Command::new("rustc")
-            .args(["--edition=2024"])
-            .arg(&source)
-            .arg("-o")
-            .arg(&human_binary)
-            .output()
-            .unwrap();
-        assert!(compile.status.success(), "std-only peer compilation failed");
+        #[cfg(coverage)]
+        coverage::compile_peer(&source, &human_binary);
+        #[cfg(not(coverage))]
+        {
+            let compile = Command::new("rustc")
+                .args(["--edition=2024"])
+                .arg(&source)
+                .arg("-o")
+                .arg(&human_binary)
+                .output()
+                .unwrap();
+            assert!(compile.status.success(), "std-only peer compilation failed");
+        }
         std::fs::copy(&human_binary, &agent_binary).unwrap();
         let daemon_binary = base.path().join("opaqued");
         std::fs::copy(env!("CARGO_BIN_EXE_opaqued"), &daemon_binary).unwrap();
@@ -223,6 +232,8 @@ impl Layout {
         for (key, value) in env {
             cmd.env(key, value);
         }
+        #[cfg(coverage)]
+        coverage::subprocess(&mut cmd, "daemon");
         let mut daemon = Daemon {
             child: cmd.spawn().unwrap(),
             log,
@@ -320,7 +331,8 @@ impl Peer {
             bytes.extend_from_slice(&(frame.len() as u32).to_be_bytes());
             bytes.extend(frame);
         }
-        let mut child = tokio::process::Command::new("setpriv")
+        let mut command = tokio::process::Command::new("setpriv");
+        command
             .args([
                 format!("--reuid={CLIENT_UID}"),
                 format!("--regid={CLIENT_UID}"),
@@ -334,9 +346,10 @@ impl Peer {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|_| "peer spawn failed")?;
+            .kill_on_drop(true);
+        #[cfg(coverage)]
+        coverage::subprocess(command.as_std_mut(), "peer");
+        let mut child = command.spawn().map_err(|_| "peer spawn failed")?;
         let mut input = child.stdin.take().unwrap();
         input
             .write_all(&bytes)

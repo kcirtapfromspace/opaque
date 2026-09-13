@@ -1,6 +1,10 @@
 //! Real stdio adapter -> authenticated daemon -> signed registry -> approval ->
 //! durable reservation -> synthetic MCP HTTP effect -> metadata-only receipt.
 //! No external server or real service credential is used by this suite.
+#[cfg(coverage)]
+#[path = "support/coverage.rs"]
+mod coverage;
+
 use axum::{
     Json, Router,
     extract::{Request, State},
@@ -157,7 +161,8 @@ factors = ["local_bio"]
         let _ = std::fs::remove_file(&token_path);
         let log = self.home.path().join("daemon.log");
         let output = std::fs::File::create(&log).unwrap();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_opaqued"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_opaqued"));
+        command
             .env_clear()
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
             .env("HOME", self.home.path())
@@ -169,9 +174,10 @@ factors = ["local_bio"]
             .env("ALL_PROXY", "http://127.0.0.1:9")
             .env("NO_PROXY", "")
             .stdout(output.try_clone().unwrap())
-            .stderr(output)
-            .spawn()
-            .unwrap();
+            .stderr(output);
+        #[cfg(coverage)]
+        coverage::subprocess(&mut command, "daemon");
+        let mut child = command.spawn().unwrap();
         let deadline = Instant::now() + Duration::from_secs(20);
         while (!sock.exists() || !token_path.exists()) && Instant::now() < deadline {
             if let Some(status) = child.try_wait().unwrap() {
@@ -208,7 +214,8 @@ factors = ["local_bio"]
             binary.exists(),
             "build adapter first: cargo build --locked -p opaque-mcp --bin opaque-mcp"
         );
-        let mut child = tokio::process::Command::new(binary)
+        let mut command = tokio::process::Command::new(binary);
+        command
             .current_dir(self.home.path())
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
@@ -217,9 +224,10 @@ factors = ["local_bio"]
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
+            .kill_on_drop(true);
+        #[cfg(coverage)]
+        coverage::subprocess(command.as_std_mut(), "adapter");
+        let mut child = command.spawn().unwrap();
         let input = child.stdin.take().unwrap();
         let output = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
         Adapter {
