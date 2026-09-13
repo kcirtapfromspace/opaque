@@ -17,7 +17,7 @@ chrono = { workspace = true }
 crypto_box = { workspace = true }
 jsonwebtoken = { workspace = true }
 libc = { workspace = true }
-quick-xml = { version = "0.39", features = ["serialize"], optional = true }
+quick-xml = { version = "0.41", features = ["serialize"], optional = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
