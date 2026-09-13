@@ -16,6 +16,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+from rust_coverage_scope import ScopeError, runtime_sources
+
 
 class CoverageError(ValueError):
     pass
@@ -110,13 +112,19 @@ def workspace_scope(metadata, source_root):
                 roots.add(source.parent.relative_to(source_root).as_posix())
         if not entries:
             raise CoverageError("workspace package has no qualified runtime targets")
+        try:
+            graph = runtime_sources(source_root, entries)
+        except ScopeError as error:
+            raise CoverageError("invalid workspace runtime source graph: " + str(error)) from error
+        shared = {name for name in graph["sources"] if not (source_root / name).is_relative_to(manifest.parent)}
         result.append({"package": name, "manifest": manifest.relative_to(source_root).as_posix(),
-                       "source_roots": sorted(roots), "entry_sources": sorted(entries)})
+                       "source_roots": sorted(roots), "entry_sources": sorted(entries),
+                       "shared_sources": sorted(shared), "required_shared_sources": sorted(shared & graph["required"])})
     return sorted(result, key=lambda item: item["package"])
 
 
 def _owned_source(name, package):
-    return name in package["entry_sources"] or any(
+    return name in package["entry_sources"] or name in package["shared_sources"] or any(
         Path(name).is_relative_to(root) for root in package["source_roots"])
 
 
@@ -140,6 +148,7 @@ def evaluate(report, *, source_root, required_files, minimum_lines=100.0,
     source_root = Path(source_root).resolve(strict=True)
     scope = workspace_scope(workspace_metadata, source_root) if workspace_metadata is not None else []
     required = {_relative(name, source_root) for name in required_files}
+    required.update(name for package in scope for name in package["required_shared_sources"])
     if not required and not scope:
         raise CoverageError("at least one required source file must be declared")
     if any(not (source_root / name).is_file() for name in required):
@@ -198,7 +207,15 @@ def evaluate(report, *, source_root, required_files, minimum_lines=100.0,
     missing_packages = [item["package"] for item in workspace if item["status"] != "measured"]
     if missing_packages:
         failures.append("workspace_package_has_no_instrumented_production_lines")
-    unowned = sorted(name for name in measured if scope and sum(_owned_source(name, item) for item in scope) != 1)
+    # A literal shared module can belong to multiple packages. Each must prove
+    # its exact edge; a broad directory root cannot invent shared ownership.
+    unowned = []
+    for name in measured:
+        owners = [item for item in scope if _owned_source(name, item)]
+        if scope and (not owners or (len(owners) > 1 and sum(name not in item["shared_sources"] for item in owners) > 1)):
+            unowned.append(name)
+    unowned.sort()
+    shared_sources = {name for item in scope for name in item["shared_sources"]}
     if unowned:
         failures.append("reported_source_has_no_unique_workspace_runtime_owner")
     return {
@@ -211,6 +228,8 @@ def evaluate(report, *, source_root, required_files, minimum_lines=100.0,
         "workspace_packages": workspace,
         "unmeasured_workspace_packages": missing_packages,
         "sources_without_unique_workspace_owner": unowned,
+        "unmapped_shared_runtime_sources": sorted(shared_sources - measured.keys()),
+        "shared_source_scope": "Exact source edges may share counters across package rows; global totals count each file once. Unmapped native sources are not qualified.",
         "missing_required_source_files": missing,
         "unmeasured_required_source_files": unmeasured_required,
         "thresholds": {"lines": minimum_lines,

@@ -26,6 +26,7 @@ import time
 import tomllib
 
 import check_llvm_coverage as gate
+from rust_coverage_scope import ScopeError, runtime_sources
 import synthesized_suite as suite
 
 TOOLCHAIN = "nightly-2026-09-13"
@@ -456,11 +457,56 @@ def source_inventory(root, workspace):
             require(path not in seen, "overlapping_workspace_production_source")
             seen.add(path)
             inventory.append({"package": package["name"], "path": str(path.relative_to(root)), "sha256": sha(path)})
+    by_path = {item["path"]: item for item in inventory}
+    for package in workspace:
+        entries = [t["source"] for t in package["targets"] if t["kind"] in ("lib", "bin") and t["eligible"]]
+        try:
+            graph = runtime_sources(root, entries)
+        except ScopeError as error:
+            raise suite.Invalid("invalid_workspace_runtime_source_graph:" + str(error)) from error
+        for name in sorted(graph["sources"]):
+            entry = by_path.setdefault(name, {"package": package["name"], "path": name, "sha256": sha(root / name)})
+            owners = set(entry.get("packages", [entry["package"]])) | {package["name"]}
+            entry["packages"] = sorted(owners)
+            if not (root / name).is_relative_to((root / package["manifest"]).parent):
+                entry["shared_runtime_source"] = True
+                if name in graph["required"]:
+                    entry["required_native_mapping"] = True
+    inventory = sorted(by_path.values(), key=lambda item: item["path"])
     require(set(REQUIRED_FILES) <= {item["path"] for item in inventory}, "required_source_not_in_inventory")
     return inventory
 
 
-def validate_report_scope(report, sources, root):
+def unfiltered_runtime_mappings(report, sources, workspace, root, target):
+    """Audit native mappings before filename filtering can hide a source."""
+    declared = {item["path"] for item in sources}
+    measured, seen = {}, {}
+    harness_roots = {(root / p["manifest"]).parent / kind for p in workspace for kind in ("tests", "examples", "benches")}
+    harness_entries = {root / t["source"] for p in workspace for t in p["targets"] if t["kind"] not in ("lib", "bin")}
+    for item in report.get("data", [{}])[0].get("files", []):
+        path = Path(item["filename"])
+        path = (path if path.is_absolute() else root / path).resolve()
+        require(path not in seen or seen[path] == item["filename"], "unsupported_compiler_source_alias:" + str(path))
+        require(path not in seen, "duplicate_unfiltered_mapping_source")
+        seen[path] = item["filename"]
+        if not path.is_relative_to(root):
+            continue  # Registry, toolchain and temporary test-peer source.
+        name = path.relative_to(root).as_posix()
+        if name in declared:
+            # LLVM can retain a literal #[path] spelling with ../ segments.
+            # Canonical paths identify ownership, but do not necessarily match
+            # LLVM's --sources selector. Retain its exact emitted spelling
+            # for an anchored include-filename-regex, which does not realpath it.
+            measured[name] = item["filename"]
+        elif path.is_relative_to(target) or path in harness_entries or any(path.is_relative_to(p) for p in harness_roots):
+            continue  # Exact Cargo harness scope; never included in production totals.
+        else:
+            raise suite.Invalid("uninventoried_workspace_runtime_mapping:" + name)
+    require(bool(measured), "no_unfiltered_workspace_runtime_mappings")
+    return measured
+
+
+def validate_report_scope(report, sources, root, expected_mappings=None):
     files = report.get("data", [{}])[0].get("files", [])
     declared = {item["path"] for item in sources}
     measured = set()
@@ -469,6 +515,9 @@ def validate_report_scope(report, sources, root):
         require(path in declared and path not in measured, "undeclared_or_duplicate_report_source")
         measured.add(path)
     require(set(REQUIRED_FILES) <= measured, "required_source_missing_from_collection")
+    require({item["path"] for item in sources if item.get("required_native_mapping")} <= measured,
+            "required_shared_runtime_source_missing_from_collection")
+    require(expected_mappings is None or measured == set(expected_mappings), "filtered_report_dropped_native_runtime_mapping")
     return sorted(declared - measured)
 
 
@@ -492,12 +541,13 @@ def package_report_subset(report, packages, root):
 
 
 def workspace_package_coverage(report, sources, workspace, root):
-    owners = {item["path"]: item["package"] for item in sources}
+    owners = {item["path"]: item.get("packages", [item["package"]]) for item in sources}
     measured = {p["name"]: [] for p in workspace}
     for item in report["data"][0]["files"]:
         name = Path(item["filename"]).resolve().relative_to(root).as_posix()
         require(name in owners, "undeclared_report_source")
-        measured[owners[name]].append(item)
+        for owner in owners[name]:
+            measured[owner].append(item)
     rows = []
     for package in workspace:
         files = measured[package["name"]]
@@ -507,6 +557,7 @@ def workspace_package_coverage(report, sources, workspace, root):
         status = "measured" if counts["lines"]["count"] > 0 else "unqualified_zero_native_mapping" if production else "no_runtime_targets"
         rows.append({"package": package["name"], "manifest": package["manifest"], "status": status,
                      "mapped_files": len(files), "measured": counts,
+                     "shared_source_files": sorted(name for name, names in owners.items() if len(names) > 1 and package["name"] in names),
                      "reason": ("No executable mapping was emitted for this package on this native target; "
                                 "compiled-out or zero-line code is not qualified by another platform.")
                                if status == "unqualified_zero_native_mapping" else None})
@@ -788,11 +839,16 @@ class Collector:
         argv = [self.llvm_cov, "export", str(objects[0]), "-instr-profile=" + str(merged)]
         for binary in objects[1:]:
             argv += ["--object", str(binary)]
-        argv += ["--sources", *[str(self.root / item["path"]) for item in self.result["source_inventory"]]]
+        unfiltered_raw = self.command("mapping-inventory-" + label, [*argv, "--summary-only"],
+                                      export=self.output / f"{label}-unfiltered-mappings.json")
+        native_mappings = unfiltered_runtime_mappings(json.loads(unfiltered_raw), self.result["source_inventory"],
+                                                      self.workspace, self.root, self.target)
+        argv += ["--include-filename-regex=^(" + "|".join(re.escape(native_mappings[name])
+                                                         for name in sorted(native_mappings)) + ")$"]
         report_path = self.output / ("llvm-coverage.json" if label == "critical" else f"{label}-llvm-coverage.json")
         raw = self.command("export-" + label, argv, export=report_path)
         report = json.loads(raw)
-        missing = validate_report_scope(report, self.result["source_inventory"], self.root)
+        missing = validate_report_scope(report, self.result["source_inventory"], self.root, native_mappings)
         package_rows = workspace_package_coverage(report, self.result["source_inventory"], self.workspace, self.root)
         if label == "critical":
             self.result["workspace_package_coverage"] = package_rows
@@ -814,6 +870,8 @@ class Collector:
                                      "scope": "historical three-package comparison only; never whole-workspace qualification"})
             save(self.output / "original-scope-summary.json", original_summary)
         return {"coverage_gate": summary["status"], "coverage_report_sha256": summary["input_sha256"],
+                "unfiltered_mapping_inventory_sha256": hashlib.sha256(unfiltered_raw).hexdigest(),
+                "native_mapped_source_files": sorted(native_mappings),
                 "merged_profile_sha256": sha(merged), "sources_without_mapping": missing,
                 "unmapped_source_scope": "no mapping emitted on this native target; may be test-only coverage(off), compiled-out, or uninstantiated code; not qualification from another OS",
                 "measured": summary["measured"], "binary_count": len(objects), "profile_count": len(profiles)}

@@ -2,6 +2,7 @@
 import copy
 import json
 import os
+import re
 import signal
 from pathlib import Path
 import sys
@@ -543,7 +544,16 @@ class CollectionContracts(unittest.TestCase):
                     if label == "merge-critical":
                         Path(argv[-1]).write_bytes(b"merged fixture profile")
                         return b""
-                    self.assertEqual(label, "export-critical")
+                    self.assertIn(label, {"mapping-inventory-critical", "export-critical"})
+                    if label == "mapping-inventory-critical":
+                        self.assertNotIn("--sources", argv)
+                        self.assertIn("--summary-only", argv)
+                        self.assertFalse(any(arg.startswith("--include-filename-regex") for arg in argv))
+                    else:
+                        self.assertNotIn("--sources", argv)
+                        pattern = next(arg.split("=", 1)[1] for arg in argv if arg.startswith("--include-filename-regex="))
+                        self.assertTrue(all(re.fullmatch(pattern, item["filename"]) for item in report["data"][0]["files"]))
+                        self.assertIsNone(re.fullmatch(pattern, str(self.root / "uninventoried.rs")))
                     options["export"].write_bytes(raw)
                     return raw
                 with patch.object(run, "command", side_effect=command):
@@ -617,6 +627,74 @@ class CollectionContracts(unittest.TestCase):
         report["data"][0]["files"].pop()
         with self.assertRaisesRegex(suite.Invalid, "required_source_missing_from_collection"):
             collector.validate_report_scope(report, sources, self.root)
+
+    def test_shared_runtime_module_tracks_all_packages_without_directory_broadening(self):
+        metadata, workspace = self.workspace((("new-first", "lib"), ("new-second", "bin")))
+        shared = self.root / "assets" / "shared.rs"
+        shared.parent.mkdir()
+        shared.write_text("pub fn shared() {}")
+        shared.with_name("unrelated.rs").write_text("pub fn unrelated() {}")
+        for package in metadata["packages"]:
+            if package["name"].startswith("new-"):
+                Path(package["targets"][0]["src_path"]).write_text(
+                    '#[path="../../../assets/shared.rs"] mod shared;')
+        inventory = collector.source_inventory(self.root, workspace)
+        row = next(item for item in inventory if item["path"] == "assets/shared.rs")
+        self.assertEqual(row["packages"], ["new-first", "new-second"])
+        self.assertTrue(row["required_native_mapping"])
+        self.assertNotIn("assets/unrelated.rs", {item["path"] for item in inventory})
+        report = {"data": [{"files": [{"filename": str(shared), "summary": {
+            metric: {"count": 1, "covered": 1} for metric in ("lines", "branches")}}]}]}
+        counts = collector.workspace_package_coverage(report, inventory, workspace, self.root)
+        for name in ("new-first", "new-second"):
+            package = next(item for item in counts if item["package"] == name)
+            self.assertEqual(package["measured"]["lines"], {"count": 1, "covered": 1})
+            self.assertEqual(package["shared_source_files"], ["assets/shared.rs"])
+        self.assertEqual(len(report["data"][0]["files"]), 1)
+
+    def test_unknown_compiler_mapping_is_rejected_before_filtering_sources(self):
+        report = self.coverage_report(True)
+        inventory = collector.source_inventory(self.root, self.coverage_workspace)
+        unknown = self.root / "assets" / "unfollowed.rs"
+        unknown.parent.mkdir()
+        unknown.write_text("pub fn runtime() {}")
+        report["data"][0]["files"].append({"filename": str(unknown)})
+        with self.assertRaisesRegex(suite.Invalid, "uninventoried_workspace_runtime_mapping:assets/unfollowed.rs"):
+            collector.unfiltered_runtime_mappings(report, inventory, self.coverage_workspace, self.root, self.target)
+        # Harness mappings may exist in test objects, but never join production.
+        report["data"][0]["files"][-1]["filename"] = str(self.root / "crates/opaque-web/tests/fixture.rs")
+        actual = collector.unfiltered_runtime_mappings(report, inventory, self.coverage_workspace, self.root, self.target)
+        self.assertEqual(set(actual), set(collector.REQUIRED_FILES))
+
+    def test_compiler_literal_parent_path_is_retained_for_llvm_source_selection(self):
+        report = self.coverage_report(True)
+        inventory = collector.source_inventory(self.root, self.coverage_workspace)
+        literal = str(self.root / "crates/opaque-web/src/routes/../../../../assets/brand/embedded.rs")
+        report["data"][0]["files"].append({"filename": literal})
+        inventory.append({"path": "assets/brand/embedded.rs"})
+        mappings = collector.unfiltered_runtime_mappings(report, inventory, self.coverage_workspace, self.root, self.target)
+        self.assertEqual(mappings["assets/brand/embedded.rs"], literal)
+
+    def test_distinct_compiler_aliases_of_one_physical_source_fail_instead_of_double_counting(self):
+        report = self.coverage_report(True)
+        inventory = collector.source_inventory(self.root, self.coverage_workspace)
+        first = str(self.root / "crates/opaque-web/src/routes/../../../../assets/shared.rs")
+        second = str(self.root / "assets/shared.rs")
+        report["data"][0]["files"].extend({"filename": name} for name in (first, second))
+        inventory.append({"path": "assets/shared.rs", "packages": ["opaque-web", "opaque-core"]})
+        with self.assertRaisesRegex(suite.Invalid, "unsupported_compiler_source_alias"):
+            collector.unfiltered_runtime_mappings(report, inventory, self.coverage_workspace, self.root, self.target)
+
+    def test_filter_cannot_drop_observed_native_mapping_or_required_shared_source(self):
+        report = self.coverage_report(True)
+        inventory = collector.source_inventory(self.root, self.coverage_workspace)
+        name = "assets/shared.rs"
+        native = {*collector.REQUIRED_FILES, name}
+        conditional = {"path": name, "shared_runtime_source": True}
+        with self.assertRaisesRegex(suite.Invalid, "filtered_report_dropped_native_runtime_mapping"):
+            collector.validate_report_scope(report, [*inventory, conditional], self.root, native)
+        with self.assertRaisesRegex(suite.Invalid, "required_shared_runtime_source_missing_from_collection"):
+            collector.validate_report_scope(report, [*inventory, {**conditional, "required_native_mapping": True}], self.root)
 
     def test_fresh_output_refuses_stale_or_existing_directory(self):
         with self.assertRaises(FileExistsError):

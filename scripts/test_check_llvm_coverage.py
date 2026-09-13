@@ -171,6 +171,51 @@ class MeasuredCoverageTests(unittest.TestCase):
             self.assertEqual(result["status"], "failed")
             self.assertEqual(result["unmeasured_workspace_packages"], ["excluded-cli"])
 
+    def test_shared_module_requires_mapping_and_preserves_all_exact_package_owners(self):
+        metadata = self.workspace()
+        shared = self.root / "assets" / "brand.rs"
+        shared.parent.mkdir()
+        shared.write_text("pub fn get(value: [u8; 4]) -> [u8; 4] { value }")
+        for package in metadata["packages"]:
+            Path(package["targets"][0]["src_path"]).write_text(
+                '#[path="../../assets/brand.rs"] mod shared; pub fn run() { shared::get(); }')
+        report = self.workspace_report(metadata)
+        missing = self.check(report, required_files=[], workspace_metadata=metadata)
+        self.assertEqual(missing["missing_required_source_files"], ["assets/brand.rs"])
+        self.assertEqual(missing["status"], "failed")
+        summary = copy.deepcopy(report["data"][0]["files"][0]["summary"])
+        report["data"][0]["files"].append({"filename": str(shared), "summary": summary})
+        for metric in ("lines", "branches"):
+            for key in ("count", "covered"):
+                report["data"][0]["totals"][metric][key] += summary[metric][key]
+        complete = self.check(report, required_files=[], workspace_metadata=metadata)
+        self.assertEqual(complete["status"], "passed")
+        self.assertEqual(complete["measured"]["lines"]["count"], 30)
+        self.assertEqual(complete["sources_without_unique_workspace_owner"], [])
+        self.assertTrue(all(row["shared_sources"] == ["assets/brand.rs"] for row in complete["workspace_packages"]))
+        # Exact source edges confer no ownership of neighboring assets.
+        unrelated = shared.with_name("unrelated.rs")
+        unrelated.write_text("pub fn unrelated() {}")
+        report["data"][0]["files"][-1]["filename"] = str(unrelated)
+        result = self.check(report, required_files=[], workspace_metadata=metadata)
+        self.assertIn("assets/unrelated.rs", result["sources_without_unique_workspace_owner"])
+        self.assertEqual(result["status"], "failed")
+
+    def test_shared_native_cfg_is_declared_without_qualifying_compiled_out_code(self):
+        metadata = self.workspace()
+        shared = self.root / "assets" / "native.rs"
+        shared.parent.mkdir()
+        shared.write_text("pub fn native() {}")
+        Path(metadata["packages"][0]["targets"][0]["src_path"]).write_text(
+            '#[cfg(target_os="linux")] #[path="../../assets/native.rs"] mod native; pub fn run() {}')
+        scope = GATE.workspace_scope(metadata, self.root)
+        package = next(item for item in scope if item["package"] == "library")
+        self.assertEqual(package["shared_sources"], ["assets/native.rs"])
+        self.assertEqual(package["required_shared_sources"], [])
+        result = self.check(self.workspace_report(metadata), required_files=[], workspace_metadata=metadata)
+        self.assertEqual(result["measured"]["lines"]["count"], 20)
+        self.assertNotIn("assets/native.rs", result["required_source_files"])
+
     def test_invalid_or_missing_workspace_members_fail_closed(self):
         metadata = self.workspace()
         variants = [None, {}, {**metadata, "workspace_members": []},
