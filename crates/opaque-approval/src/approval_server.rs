@@ -221,6 +221,7 @@ impl ApprovalServerHandle {
 /// Test hook: pop one pending approval, handing back its signable challenge
 /// and response sender — what the HTTP respond path does, minus HTTP.
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn test_take_pending(
     handle: &ApprovalServerHandle,
 ) -> Option<(
@@ -719,6 +720,7 @@ pub fn advertise_mdns(port: u16, fingerprint: &str) -> Result<mdns_sd::ServiceDa
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::pairing::challenge::decision_bytes;

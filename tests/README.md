@@ -1,0 +1,87 @@
+# Automated acceptance and coverage
+
+Run the declared protocol scenarios without a person at the keyboard:
+
+```sh
+python3 -B scripts/synthesized_suite.py --profile protocol \
+  --target-dir /tmp/opaque-protocol-target --output /tmp/opaque-protocol-run
+```
+
+Output directories must be new and outside the checkout. The manifest in
+`tests/synthesized-suite.json` names the exact tests and prerequisites. A missing
+test, unavailable prerequisite, unexpected ignore, timeout or changed source
+tree fails the run. The Linux composed-review cases require root and
+`CAP_SYS_PTRACE`; use an isolated Linux runner for those cases.
+
+The contained profile runs real Vault, OpenSSH and systemd in one disposable
+Linux Docker host, with separate broker and caller UIDs. It generates temporary
+keys, signs one-use SSH certificates, checks host receipts and replay denial,
+and exercises crash recovery. The wrapper builds its image, starts only its
+owned container and removes it after the run:
+
+```sh
+python3 -B tests/contained-ssh/run.py --output /tmp/opaque-contained-run
+```
+
+Docker must support privileged systemd containers. Services use literal
+loopback addresses inside that host; the profile does not test inter-host
+network isolation. The signed OIDC issuer, scripted reviewer and HTTP inference
+responses are explicit test implementations. They test the production protocols;
+actual model completions and native human approval remain separate qualifications.
+
+## Collect production coverage
+
+The collector executes existing library tests and selected daemon task,
+resource-authority, provisioning, MCP and composed-review scenarios. It builds
+the daemon, adapter and bare-rustc peer with the same pinned instrumentation,
+requires fresh child profiles, and verifies that branch counters survive a real
+SIGKILL before collecting any results. It preserves crash behavior in the tests.
+
+On macOS, install the pinned tools and run the native collector:
+
+```sh
+rustup toolchain install nightly-2026-09-13 --profile minimal --component llvm-tools-preview
+cargo +1.95.0 install cargo-llvm-cov --version 0.9.1 --locked
+python3 -B scripts/collect_critical_coverage.py \
+  --target-dir /tmp/opaque-coverage-target --output /tmp/opaque-coverage-run
+```
+
+On Linux, the contained wrapper installs the same tools and collects both the
+existing scenarios and contained cases:
+
+```sh
+python3 -B tests/contained-ssh/run.py --coverage --output /tmp/opaque-contained-coverage
+```
+
+An optional existing `--registry-cache` or `--target-cache` Docker volume can
+reduce repeated build time. Do not share a target cache with an active build.
+The native collector accepts `--reuse-target-dir` for the same purpose. Neither
+option reuses coverage profiles.
+
+The measured production source scope is `opaque-core`, `opaque-bounded-work`
+and `opaque-approval`, with an explicit file inventory. Test-only modules remain
+excluded through compiler coverage annotations; production functions they call
+remain instrumented. Unmapped source files are listed explicitly. Library-only
+and expanded exports retain separate denominators because additional daemon
+objects can introduce additional production generic instantiations.
+
+Each `collection.json` records the source revision and content fingerprint,
+compiler target, exact test inventory, binary/profile hashes, measured counts
+and collection failures. `status: collected` means the collection completed;
+it does **not** mean the coverage target passed. The separate
+`coverage-summary.json` records the unchanged 100% line and branch gate.
+CI enforces that gate independently on Linux and macOS. Reports must not be
+averaged: one target cannot cover code compiled out on the other target.
+
+Raw command logs and runtime artifacts stay in local output. CI publishes only
+the collection inventory and sanitized coverage reports, never generated keys,
+credentials or raw service logs.
+
+## State evidence
+
+The suite checks durable single-use consumption, retained charges after unknown
+outcomes, replay denial after restart, authority changes before dispatch, and
+corrupt-row rejection. The finite TaskStore model explores its declared bounded
+state space; explicit concurrency and fault scenarios cover other cases.
+Neither a bounded model nor 100% source coverage proves every possible
+execution, deployment, provider account or human ceremony.

@@ -88,12 +88,14 @@ nav:
   - Start Here:
       - First Operation: tutorial.md
       - Install and Commands: getting-started.md
+      - Installable Releases: installable-releases.md
       - Hosted Demo: hosted-demo.md
   - Architecture:
       - Boundaries and Evidence: architecture.md
       - Deployment: deployment.md
       - Evidence Verification: evidence-checkpoints.md
       - Bounded Tasks: bounded-work.md
+      - Workload Attestation: workload-attestation.md
   - Reference:
       - Configuration:
           - Policy: policy.md
@@ -102,6 +104,12 @@ nav:
           - Storage: storage.md
           - Federation: federation.md
       - Integrations:
+          - AWS: aws.md
+          - Azure: azure.md
+          - Google Cloud: gcp.md
+          - GitHub Secret Inventory: github-secret-inventory.md
+          - GitHub and CI Inference: github-ci-inference.md
+          - SSH Service Health: ssh-health.md
           - MCP: mcp-integration.md
           - Qualifying MCP Tools: mcp-qualified-tools.md
           - Bitwarden: bitwarden.md

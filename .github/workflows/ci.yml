@@ -74,6 +74,167 @@ jobs:
           cargo test --locked -p opaqued tests::enforce_agent_sessions_rejects_unwrapped_and_allows_session_token -- --exact 2>&1 | tee /tmp/wrapper-test.out
           grep -q "test result: ok. 1 passed" /tmp/wrapper-test.out
 
+  unattended-acceptance:
+    name: Declared unattended protocol acceptance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12.11"
+      - name: Verify strict runner regressions
+        run: python3 -B -m unittest discover -s scripts -p test_synthesized_suite.py -v
+      - name: Run exact declared tests with real split-UID prerequisites
+        # The three composed tests are ignored in ordinary nonroot workspace
+        # runs. The manifest explicitly executes them with zero ignored tests.
+        # It never invokes the native approval UI.
+        run: |
+          sudo -n env \
+            PATH="$PATH" \
+            CARGO_HOME="$HOME/.cargo" \
+            RUSTUP_HOME="$HOME/.rustup" \
+            RUSTUP_TOOLCHAIN=1.95.0 \
+            python3 -B scripts/synthesized_suite.py \
+              --profile protocol \
+              --target-dir "$GITHUB_WORKSPACE/target" \
+              --output "$RUNNER_TEMP/synthesized-protocol"
+      - name: Restore report and build-cache ownership
+        if: always()
+        run: |
+          # Root compiles the split-UID fixtures. Return generated directories
+          # to the runner before artifact upload and rust-cache's post step.
+          for generated_path in \
+            "$RUNNER_TEMP/synthesized-protocol" \
+            "$GITHUB_WORKSPACE/target" \
+            "$HOME/.cargo/registry" \
+            "$HOME/.cargo/git"; do
+            if [ -d "$generated_path" ]; then
+              sudo -n chown -R --no-dereference "$(id -u):$(id -g)" "$generated_path"
+            fi
+          done
+      - name: Retain scoped acceptance results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: declared-protocol-acceptance
+          path: |
+            ${{ runner.temp }}/synthesized-protocol/report.json
+            ${{ runner.temp }}/synthesized-protocol/junit.xml
+          if-no-files-found: error
+
+  measured-code-coverage:
+    name: Critical production coverage (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            runner: ubuntu-24.04
+            python-version: "3.12.11"
+          - platform: darwin
+            runner: macos-15
+            python-version: "3.12.10"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      # This explicit selection outranks the repository's stable product pin.
+      RUSTUP_TOOLCHAIN: nightly-2026-09-13
+    steps:
+      - uses: actions/checkout@v6
+      - if: matrix.platform == 'darwin'
+        uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+        with:
+          toolchain: nightly-2026-09-13
+          components: llvm-tools-preview
+      - if: matrix.platform == 'darwin'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> ${{ runner.temp }}/critical-coverage-target"
+          key: critical-coverage-${{ matrix.platform }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Verify collector and measured-coverage regressions
+        run: python3 -B -m unittest discover -s scripts -p 'test_*coverage*.py' -v
+      - name: Install pinned coverage collector
+        if: matrix.platform == 'darwin'
+        run: cargo install cargo-llvm-cov --version 0.9.1 --locked
+      - name: Verify disposable host runner regressions
+        if: matrix.platform == 'linux'
+        run: python3 -B -m unittest discover -s tests/contained-ssh -p 'test_*.py' -v
+      - name: Collect existing library and daemon scenarios on this platform
+        # A killed-child preflight verifies continuous branch profiles before
+        # any measurements. The same instrumentation builds test, daemon and
+        # adapter binaries; split-UID peer objects/profiles are retained too.
+        # Linux runs real SSH and controlled inference RPC scenarios inside a
+        # disposable systemd/Vault/OpenSSH host. Only the three declared libraries' source is reported.
+        run: |
+          if [ "${{ matrix.platform }}" = linux ]; then
+            coverage_status=0
+            python3 -B tests/contained-ssh/run.py --coverage \
+              --output "$RUNNER_TEMP/critical-contained" || coverage_status=$?
+            if [ -d "$RUNNER_TEMP/critical-contained/container/coverage" ]; then
+              sudo -n chown -R --no-dereference "$(id -u):$(id -g)" \
+                "$RUNNER_TEMP/critical-contained/container/coverage"
+              mv "$RUNNER_TEMP/critical-contained/container/coverage" \
+                "$RUNNER_TEMP/critical-coverage"
+            fi
+            exit "$coverage_status"
+          else
+            python3 -B scripts/collect_critical_coverage.py \
+              --source-root "$GITHUB_WORKSPACE" \
+              --target-dir "$RUNNER_TEMP/critical-coverage-target" \
+              --reuse-target-dir \
+              --output "$RUNNER_TEMP/critical-coverage"
+          fi
+      - name: Require 100 percent production lines and branches on this platform
+        # An independently passing platform cannot cover code compiled out here.
+        # Both targets remain exactly 100; uncovered production code fails.
+        run: |
+          python3 -B scripts/check_llvm_coverage.py \
+            --report "$RUNNER_TEMP/critical-coverage/llvm-coverage.json" \
+            --source-root "$GITHUB_WORKSPACE" \
+            --require-file crates/opaque-bounded-work/src/task_store.rs \
+            --require-file crates/opaque-bounded-work/src/task_api.rs \
+            --require-file crates/opaque-bounded-work/src/resource_authority.rs \
+            --require-file crates/opaque-core/src/task.rs \
+            --require-file crates/opaque-core/src/identity_lifecycle.rs \
+            --require-file crates/opaque-approval/src/approval_server/workstation.rs \
+            --require-branches \
+            --output "$RUNNER_TEMP/critical-coverage/gate.json"
+      - name: Restore generated artifact and cache ownership
+        if: always() && matrix.platform == 'linux'
+        run: |
+          for generated_path in \
+            "$RUNNER_TEMP/critical-coverage" \
+            "$RUNNER_TEMP/critical-contained" \
+            "$RUNNER_TEMP/critical-coverage-target" \
+            "$HOME/.cargo/registry" \
+            "$HOME/.cargo/git"; do
+            if [ -d "$generated_path" ]; then
+              sudo -n chown -R --no-dereference "$(id -u):$(id -g)" "$generated_path"
+            fi
+          done
+      - name: Retain platform-specific collection inventory and coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: critical-production-coverage-${{ matrix.platform }}
+          path: |
+            ${{ runner.temp }}/critical-contained/run.json
+            ${{ runner.temp }}/critical-coverage/collection.json
+            ${{ runner.temp }}/critical-coverage/coverage-summary.json
+            ${{ runner.temp }}/critical-coverage/baseline-summary.json
+            ${{ runner.temp }}/critical-coverage/baseline-llvm-coverage.json
+            ${{ runner.temp }}/critical-coverage/gate.json
+            ${{ runner.temp }}/critical-coverage/llvm-coverage.json
+          if-no-files-found: error
+
   test-macos:
     name: Native macOS tests
     runs-on: macos-15
@@ -113,11 +274,13 @@ jobs:
       - name: Run every Python regression without skips
         # Linux runs the real peer-credential/parent-death cases. Installing the
         # pinned FIDO2 library makes its API-contract cases mandatory as well.
+        # The packaged SSH host's signed-control and health-contract tests are
+        # a separate discovery root and must also run without skips.
         run: |
           python -B - <<'PYTEST'
           import sys
           import unittest
-          for directory in ("scripts",):
+          for directory in ("scripts", "packaging/ssh-host/tests"):
               suite = unittest.TestLoader().discover(directory, pattern="test_*.py")
               result = unittest.TextTestRunner(verbosity=2).run(suite)
               if not result.wasSuccessful() or not result.testsRun or result.skipped:

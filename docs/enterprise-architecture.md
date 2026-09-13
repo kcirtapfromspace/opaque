@@ -254,6 +254,9 @@ scoped to your issuer.
 
 ## Open work
 
-Hardware attestation, IdP/tenant-source wiring, the inert `codesign_team_id`
-field, and the provider feature-gate gap above are the open items; see
+Hardware attestation, deployment-specific IdP/tenant-source qualification and
+the remaining provider feature-gate gaps are open. The listener now validates
+macOS signing teams and carries trusted selector/strength observations into
+policy and approval leases; see [workload attestation](workload-attestation.md).
+See
 [deferred roadmap](roadmap-deferred.md) for the rest.

@@ -1,584 +1,242 @@
-//! Azure Key Vault integration.
-//!
-//! Provides two capabilities:
-//! - **Secret resolution** via `azure:<vault>/<secret>` or `azure:<vault>/<secret>/<version>` refs
-//! - **CLI browsing** via `azure.list_secrets`, `azure.list_keys`, and `azure.list_certificates`
-//! - **Write-only** via `azure.set_secret` (never returns secret values)
-//!
-//! Uses the Azure Key Vault REST API with Azure AD client credentials flow.
-//!
-//! Backend selection:
-//! 1. If `OPAQUE_AZURE_VAULT_URL` is set -> use that URL directly
-//! 2. Otherwise -> construct from vault name: `https://{vault-name}.vault.azure.net`
-//! 3. If no Azure AD credentials configured -> disabled
-
+//! Prepared Azure Key Vault metadata and write operations; raw values stay in resolvers.
 pub mod client;
+#[cfg(test)]
+mod prepared_tests;
 pub mod resolve;
-
-use std::fmt;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
-
-use opaque_core::audit::{AuditEvent, AuditEventKind, AuditSink};
-use opaque_core::operation::OperationRequest;
-
-use opaque_core::operation_handler::OperationHandler;
-use opaque_core::resolver::SecretResolver;
-
 use client::AzureKeyVaultClient;
-
-/// The Azure Key Vault operation handler.
-///
-/// Handles secret/key/certificate browsing and write-only secret operations.
-/// A single `AzureHandler` instance is registered for each Azure operation
-/// name; it dispatches by `request.operation`.
+use opaque_core::{
+    audit::{AuditEvent, AuditEventKind, AuditSink},
+    operation::OperationRequest,
+    operation_handler::{OperationHandler, PreparedOperation},
+    resolver::{BaseResolver, SecretResolver},
+};
+use serde::Serialize;
+use std::{collections::HashMap, sync::Arc};
 pub struct AzureHandler {
     audit: Arc<dyn AuditSink>,
     client: AzureKeyVaultClient,
 }
-
-impl fmt::Debug for AzureHandler {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AzureHandler").finish()
+impl std::fmt::Debug for AzureHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AzureHandler").finish_non_exhaustive()
     }
 }
-
 impl AzureHandler {
-    /// Create a handler for the Azure Key Vault API.
+    /// The final argument is a broker-owned credential ref, never a raw secret.
     pub fn new(
         audit: Arc<dyn AuditSink>,
-        base_url: &str,
-        tenant_id: String,
-        client_id: String,
-        client_secret: String,
+        base: &str,
+        tenant: String,
+        application: String,
+        credential_ref: String,
     ) -> Result<Self, client::AzureApiError> {
-        Ok(Self {
+        Ok(Self::from_client(
             audit,
-            client: AzureKeyVaultClient::new(base_url, tenant_id, client_id, client_secret)?,
-        })
+            AzureKeyVaultClient::new(base, tenant, application, credential_ref)?,
+        ))
     }
-
-    /// Extract the secret name from a Key Vault URL id.
-    ///
-    /// Azure Key Vault returns IDs like `https://myvault.vault.azure.net/secrets/my-secret`.
-    /// We extract just the name portion for sanitized responses.
-    fn extract_name_from_id(id: &str) -> &str {
-        id.rsplit('/').next().unwrap_or(id)
+    pub fn from_client(audit: Arc<dyn AuditSink>, client: AzureKeyVaultClient) -> Self {
+        Self { audit, client }
     }
 }
-
+#[derive(Serialize)]
+struct Action {
+    operation: String,
+    name: Option<String>,
+    version: Option<String>,
+    value_ref: Option<String>,
+    vault_url: String,
+    auth: client::AuthBinding,
+}
+fn parse(request: &OperationRequest, client: &AzureKeyVaultClient) -> Result<Action, String> {
+    let (required, optional): (&[&str], &[&str]) =
+        match request.operation.as_str() {
+            "azure.list_secrets" | "azure.list_keys" | "azure.list_certificates" => (&[], &[]),
+            "azure.get_secret" => (&["name"], &["version"]),
+            "azure.set_secret" => (&["name", "value_ref"], &[]),
+            "azure.read_secret" | "azure.reveal_secret" => return Err(
+                "raw secret reveal is disabled; use an azure: reference in an authorized consumer"
+                    .into(),
+            ),
+            _ => return Err("unknown Azure operation".into()),
+        };
+    let params = request
+        .params
+        .as_object()
+        .ok_or("parameters must be an object")?;
+    if required
+        .iter()
+        .any(|key| !params.get(*key).is_some_and(serde_json::Value::is_string))
+        || params.iter().any(|(key, value)| {
+            (!required.contains(&key.as_str()) && !optional.contains(&key.as_str()))
+                || !value.is_string()
+        })
+    {
+        return Err("exact Azure operation parameters required".into());
+    }
+    let name = params
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    if let Some(n) = &name {
+        client::validate_name(n).map_err(|e| e.to_string())?;
+    }
+    let version = params
+        .get("version")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    if let Some(v) = &version {
+        client::validate_version(v).map_err(|e| e.to_string())?;
+    }
+    let value_ref = params
+        .get("value_ref")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    if let Some(v) = &value_ref {
+        client::validate_ref(v)?;
+    }
+    Ok(Action {
+        operation: request.operation.clone(),
+        name,
+        version,
+        value_ref,
+        vault_url: client.base_url().into(),
+        auth: client.auth_binding().clone(),
+    })
+}
 impl OperationHandler for AzureHandler {
-    fn execute(
-        &self,
-        request: &OperationRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send + '_>> {
+    fn prepare<'a>(&'a self, request: &OperationRequest) -> Result<PreparedOperation<'a>, String> {
+        let action = parse(request, &self.client)?;
+        let mut refs = action.auth.refs();
+        if let Some(value) = &action.value_ref {
+            refs.push(value.clone());
+        }
+        let mut target = HashMap::from([
+            ("azure_vault_url".into(), action.vault_url.clone()),
+            ("azure_tenant_id".into(), action.auth.tenant_id.clone()),
+            ("azure_client_id".into(), action.auth.client_id.clone()),
+        ]);
+        if let Some(name) = &action.name {
+            target.insert("name".into(), name.clone());
+        }
+        if let Some(version) = &action.version {
+            target.insert("version".into(), version.clone());
+        }
+        if let Some(vault) = self.client.vault_name() {
+            target.insert("vault".into(), vault.into());
+        }
         let request_id = request.request_id;
-        let params = request.params.clone();
-        let operation = request.operation.clone();
-        let audit = self.audit.clone();
-
-        Box::pin(async move {
-            match operation.as_str() {
+        PreparedOperation::new(action, target, refs, move |action| async move {
+            self.audit.emit(
+                AuditEvent::new(AuditEventKind::ProviderFetchStarted)
+                    .with_request_id(request_id)
+                    .with_operation(&action.operation),
+            );
+            let result = match action.operation.as_str() {
                 "azure.list_secrets" => {
-                    audit.emit(
-                        AuditEvent::new(AuditEventKind::ProviderFetchStarted)
-                            .with_request_id(request_id)
-                            .with_operation(&operation)
-                            .with_detail("endpoint=list_secrets"),
-                    );
-
-                    let secrets = self
+                    let rows = self
                         .client
                         .list_secrets()
                         .await
-                        .map_err(|e| format!("failed to list secrets: {e}"))?;
-
-                    audit.emit(
-                        AuditEvent::new(AuditEventKind::ProviderFetchFinished)
-                            .with_request_id(request_id)
-                            .with_operation(&operation)
-                            .with_outcome("ok")
-                            .with_detail(format!("secrets_count={}", secrets.len())),
-                    );
-
-                    // Return sanitized response: names only (no values, no full URLs).
-                    let sanitized: Vec<serde_json::Value> = secrets
-                        .into_iter()
-                        .map(|s| {
-                            serde_json::json!({
-                                "name": Self::extract_name_from_id(&s.id),
-                                "enabled": s.attributes.as_ref().and_then(|a| a.enabled),
-                            })
-                        })
-                        .collect();
-
-                    Ok(serde_json::json!({ "secrets": sanitized }))
+                        .map_err(|e| e.to_string())?;
+                    let mut output = Vec::new();
+                    for row in rows {
+                        let name = self
+                            .client
+                            .resource_name(&row.id, "secrets")
+                            .map_err(|e| e.to_string())?;
+                        output.push(serde_json::json!({"name":name,"enabled":row.attributes.and_then(|a|a.enabled)}));
+                    }
+                    serde_json::json!({"secrets":output})
                 }
                 "azure.list_keys" => {
-                    audit.emit(
-                        AuditEvent::new(AuditEventKind::ProviderFetchStarted)
-                            .with_request_id(request_id)
-                            .with_operation(&operation)
-                            .with_detail("endpoint=list_keys"),
-                    );
-
-                    let keys = self
-                        .client
-                        .list_keys()
-                        .await
-                        .map_err(|e| format!("failed to list keys: {e}"))?;
-
-                    audit.emit(
-                        AuditEvent::new(AuditEventKind::ProviderFetchFinished)
-                            .with_request_id(request_id)
-                            .with_operation(&operation)
-                            .with_outcome("ok")
-                            .with_detail(format!("keys_count={}", keys.len())),
-                    );
-
-                    let sanitized: Vec<serde_json::Value> = keys
-                        .into_iter()
-                        .map(|k| {
-                            serde_json::json!({
-                                "name": Self::extract_name_from_id(&k.kid),
-                                "enabled": k.attributes.as_ref().and_then(|a| a.enabled),
-                            })
-                        })
-                        .collect();
-
-                    Ok(serde_json::json!({ "keys": sanitized }))
+                    let rows = self.client.list_keys().await.map_err(|e| e.to_string())?;
+                    let mut output = Vec::new();
+                    for row in rows {
+                        let name = self
+                            .client
+                            .resource_name(&row.kid, "keys")
+                            .map_err(|e| e.to_string())?;
+                        output.push(serde_json::json!({"name":name,"enabled":row.attributes.and_then(|a|a.enabled)}));
+                    }
+                    serde_json::json!({"keys":output})
                 }
                 "azure.list_certificates" => {
-                    audit.emit(
-                        AuditEvent::new(AuditEventKind::ProviderFetchStarted)
-                            .with_request_id(request_id)
-                            .with_operation(&operation)
-                            .with_detail("endpoint=list_certificates"),
-                    );
-
-                    let certs = self
+                    let rows = self
                         .client
                         .list_certificates()
                         .await
-                        .map_err(|e| format!("failed to list certificates: {e}"))?;
-
-                    audit.emit(
-                        AuditEvent::new(AuditEventKind::ProviderFetchFinished)
-                            .with_request_id(request_id)
-                            .with_operation(&operation)
-                            .with_outcome("ok")
-                            .with_detail(format!("certs_count={}", certs.len())),
-                    );
-
-                    let sanitized: Vec<serde_json::Value> = certs
-                        .into_iter()
-                        .map(|c| {
-                            serde_json::json!({
-                                "name": Self::extract_name_from_id(&c.id),
-                                "enabled": c.attributes.as_ref().and_then(|a| a.enabled),
-                            })
-                        })
-                        .collect();
-
-                    Ok(serde_json::json!({ "certificates": sanitized }))
+                        .map_err(|e| e.to_string())?;
+                    let mut output = Vec::new();
+                    for row in rows {
+                        let name = self
+                            .client
+                            .resource_name(&row.id, "certificates")
+                            .map_err(|e| e.to_string())?;
+                        output.push(serde_json::json!({"name":name,"enabled":row.attributes.and_then(|a|a.enabled)}));
+                    }
+                    serde_json::json!({"certificates":output})
                 }
                 "azure.get_secret" => {
-                    let secret_name = params
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| "missing 'name' parameter".to_string())?;
-                    let version = params.get("version").and_then(|v| v.as_str());
-
-                    audit.emit(
-                        AuditEvent::new(AuditEventKind::ProviderFetchStarted)
-                            .with_request_id(request_id)
-                            .with_operation(&operation)
-                            .with_detail(format!(
-                                "endpoint=get_secret name={secret_name} version={}",
-                                version.unwrap_or("(latest)")
-                            )),
-                    );
-
                     let secret = self
                         .client
-                        .get_secret(secret_name, version)
+                        .get_secret(action.name.as_deref().unwrap(), action.version.as_deref())
                         .await
-                        .map_err(|e| format!("failed to get secret: {e}"))?;
-
-                    let value = secret
-                        .value
-                        .ok_or_else(|| format!("secret '{secret_name}' has no value"))?;
-
-                    audit.emit(
-                        AuditEvent::new(AuditEventKind::ProviderFetchFinished)
-                            .with_request_id(request_id)
-                            .with_operation(&operation)
-                            .with_outcome("ok")
-                            .with_detail(format!("name={secret_name} value_len={}", value.len())),
-                    );
-
-                    Ok(serde_json::json!({
-                        "name": secret_name,
-                        "value": value,
-                    }))
+                        .map_err(|e| e.to_string())?;
+                    let name = self
+                        .client
+                        .resource_name(&secret.id, "secrets")
+                        .map_err(|e| e.to_string())?;
+                    if Some(name.as_str()) != action.name.as_deref() {
+                        return Err("Azure returned a different secret".into());
+                    }
+                    serde_json::json!({"name":name,"enabled":secret.attributes.as_ref().and_then(|a|a.enabled),"metadata_only":true})
                 }
                 "azure.set_secret" => {
-                    let secret_name = params
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| "missing 'name' parameter".to_string())?;
-                    let value_ref = params
-                        .get("value_ref")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| "missing 'value_ref' parameter".to_string())?;
-
-                    audit.emit(
-                        AuditEvent::new(AuditEventKind::ProviderFetchStarted)
-                            .with_request_id(request_id)
-                            .with_operation(&operation)
-                            .with_detail(format!("endpoint=set_secret name={secret_name}")),
-                    );
-
-                    // Resolve the secret value from the ref.
-                    let base = opaque_core::resolver::BaseResolver::new();
-                    let secret_value = base
-                        .resolve(value_ref)
-                        .map_err(|e| format!("failed to resolve value_ref '{value_ref}': {e}"))?;
-                    let value_str = secret_value
-                        .as_str()
-                        .ok_or_else(|| "resolved value is not valid UTF-8".to_string())?;
-
-                    let _result = self
+                    let value = BaseResolver::new()
+                        .resolve(action.value_ref.as_deref().unwrap())
+                        .map_err(|_| "Azure value reference unavailable")?;
+                    let value = value.as_str().ok_or("Azure secret value must be UTF-8")?;
+                    let secret = self
                         .client
-                        .set_secret(secret_name, value_str)
+                        .set_secret(action.name.as_deref().unwrap(), value)
                         .await
-                        .map_err(|e| format!("failed to set secret: {e}"))?;
-
-                    audit.emit(
-                        AuditEvent::new(AuditEventKind::ProviderFetchFinished)
-                            .with_request_id(request_id)
-                            .with_operation(&operation)
-                            .with_outcome("ok")
-                            .with_detail(format!("name={secret_name}")),
-                    );
-
-                    // Write-only: never return the secret value.
-                    Ok(serde_json::json!({
-                        "name": secret_name,
-                        "status": "ok",
-                    }))
+                        .map_err(|e| e.to_string())?;
+                    let name = self
+                        .client
+                        .resource_name(&secret.id, "secrets")
+                        .map_err(|e| e.to_string())?;
+                    if Some(name.as_str()) != action.name.as_deref() {
+                        return Err("Azure returned a different secret".into());
+                    }
+                    serde_json::json!({"name":name,"status":"written"})
                 }
-                other => Err(format!("unknown Azure operation: {other}")),
-            }
+                _ => unreachable!("validated operation"),
+            };
+            self.audit.emit(
+                AuditEvent::new(AuditEventKind::ProviderFetchFinished)
+                    .with_request_id(request_id)
+                    .with_operation(&action.operation)
+                    .with_outcome("ok"),
+            );
+            Ok(result)
         })
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use opaque_core::audit::InMemoryAuditEmitter;
-    use opaque_core::operation::{ClientIdentity, ClientType};
-
-    fn make_request(operation: &str, params: serde_json::Value) -> OperationRequest {
-        OperationRequest {
-            principal: None,
-            request_id: uuid::Uuid::new_v4(),
-            client_identity: ClientIdentity {
-                uid: 501,
-                gid: 20,
-                pid: Some(1234),
-                exe_path: None,
-                exe_sha256: None,
-                codesign_team_id: None,
-            },
-            client_type: ClientType::Human,
-            operation: operation.into(),
-            target: std::collections::HashMap::new(),
-            secret_ref_names: vec![],
-            created_at: std::time::SystemTime::now(),
-            expires_at: None,
-            params,
-            workspace: None,
-        }
-    }
-
-    #[test]
-    fn handler_debug() {
-        let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = AzureHandler::new(
-            audit,
-            "http://localhost:8080",
-            "t".into(),
-            "c".into(),
-            "s".into(),
-        )
-        .unwrap();
-        let debug = format!("{handler:?}");
-        assert!(debug.contains("AzureHandler"));
-    }
-
-    #[tokio::test]
-    async fn unknown_operation_rejected() {
-        let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = AzureHandler::new(
-            audit,
-            "http://localhost:8080",
-            "t".into(),
-            "c".into(),
-            "s".into(),
-        )
-        .unwrap();
-        let request = make_request("azure.unknown", serde_json::json!({}));
-        let result = handler.execute(&request).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("unknown Azure operation"));
-    }
-
-    #[tokio::test]
-    async fn get_secret_missing_name_rejected() {
-        let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = AzureHandler::new(
-            audit,
-            "http://localhost:8080",
-            "t".into(),
-            "c".into(),
-            "s".into(),
-        )
-        .unwrap();
-        let request = make_request("azure.get_secret", serde_json::json!({}));
-        let result = handler.execute(&request).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("missing 'name'"));
-    }
-
-    #[tokio::test]
-    async fn set_secret_missing_name_rejected() {
-        let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = AzureHandler::new(
-            audit,
-            "http://localhost:8080",
-            "t".into(),
-            "c".into(),
-            "s".into(),
-        )
-        .unwrap();
-        let request = make_request(
-            "azure.set_secret",
-            serde_json::json!({"value_ref": "env:X"}),
-        );
-        let result = handler.execute(&request).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("missing 'name'"));
-    }
-
-    #[tokio::test]
-    async fn set_secret_missing_value_ref_rejected() {
-        let audit = Arc::new(InMemoryAuditEmitter::new());
-        let handler = AzureHandler::new(
-            audit,
-            "http://localhost:8080",
-            "t".into(),
-            "c".into(),
-            "s".into(),
-        )
-        .unwrap();
-        let request = make_request("azure.set_secret", serde_json::json!({"name": "test"}));
-        let result = handler.execute(&request).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("missing 'value_ref'"));
-    }
-
-    #[test]
-    fn extract_name_from_id_full_url() {
-        assert_eq!(
-            AzureHandler::extract_name_from_id("https://myvault.vault.azure.net/secrets/my-secret"),
-            "my-secret"
-        );
-    }
-
-    #[test]
-    fn extract_name_from_id_with_version() {
-        assert_eq!(
-            AzureHandler::extract_name_from_id(
-                "https://myvault.vault.azure.net/secrets/my-secret/abc123"
-            ),
-            "abc123"
-        );
-    }
-
-    #[test]
-    fn extract_name_from_id_bare() {
-        assert_eq!(
-            AzureHandler::extract_name_from_id("just-a-name"),
-            "just-a-name"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Integration tests using wiremock
-    // -----------------------------------------------------------------------
-
-    use wiremock::matchers::{body_string_contains, header, method, path, query_param};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    /// Set up a handler pointing at a mock server with OAuth mocked.
-    async fn setup_handler_with_mock() -> (AzureHandler, MockServer, Arc<InMemoryAuditEmitter>) {
-        let mock_server = MockServer::start().await;
-        let audit = Arc::new(InMemoryAuditEmitter::new());
-
-        // Mock OAuth2 token endpoint.
-        Mock::given(method("POST"))
-            .and(path("/oauth2/v2.0/token"))
-            .and(body_string_contains("grant_type=client_credentials"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "test-azure-token",
-                "expires_in": 3600,
-                "token_type": "Bearer"
-            })))
-            .mount(&mock_server)
-            .await;
-
-        let mut client = AzureKeyVaultClient::new(
-            &mock_server.uri(),
-            "test-tenant".into(),
-            "test-client".into(),
-            "test-secret".into(),
-        )
-        .unwrap();
-        client.token_endpoint_override = Some(format!("{}/oauth2/v2.0/token", mock_server.uri()));
-
-        let handler = AzureHandler {
-            audit: audit.clone(),
-            client,
-        };
-        (handler, mock_server, audit)
-    }
-
-    #[tokio::test]
-    async fn list_secrets_via_handler() {
-        let (handler, mock_server, audit) = setup_handler_with_mock().await;
-
-        Mock::given(method("GET"))
-            .and(path("/secrets"))
-            .and(query_param("api-version", "7.4"))
-            .and(header("Authorization", "Bearer test-azure-token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "value": [
-                    {"id": "https://vault/secrets/db-password", "attributes": {"enabled": true}},
-                    {"id": "https://vault/secrets/api-key", "attributes": {"enabled": false}}
-                ]
-            })))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let request = make_request("azure.list_secrets", serde_json::json!({}));
-        let result = handler.execute(&request).await.unwrap();
-
-        let secrets = result["secrets"].as_array().unwrap();
-        assert_eq!(secrets.len(), 2);
-        assert_eq!(secrets[0]["name"], "db-password");
-        assert_eq!(secrets[0]["enabled"], true);
-        assert_eq!(secrets[1]["name"], "api-key");
-        assert_eq!(secrets[1]["enabled"], false);
-
-        // No full URLs should leak.
-        assert!(secrets[0].get("id").is_none());
-
-        // Verify audit events were emitted.
-        let events = audit.events();
-        assert!(events.len() >= 2);
-    }
-
-    #[tokio::test]
-    async fn list_keys_via_handler() {
-        let (handler, mock_server, _audit) = setup_handler_with_mock().await;
-
-        Mock::given(method("GET"))
-            .and(path("/keys"))
-            .and(query_param("api-version", "7.4"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "value": [
-                    {"kid": "https://vault/keys/signing-key", "attributes": {"enabled": true}}
-                ]
-            })))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let request = make_request("azure.list_keys", serde_json::json!({}));
-        let result = handler.execute(&request).await.unwrap();
-
-        let keys = result["keys"].as_array().unwrap();
-        assert_eq!(keys.len(), 1);
-        assert_eq!(keys[0]["name"], "signing-key");
-    }
-
-    #[tokio::test]
-    async fn list_certificates_via_handler() {
-        let (handler, mock_server, _audit) = setup_handler_with_mock().await;
-
-        Mock::given(method("GET"))
-            .and(path("/certificates"))
-            .and(query_param("api-version", "7.4"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "value": [
-                    {"id": "https://vault/certificates/tls-cert", "attributes": {"enabled": true}}
-                ]
-            })))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let request = make_request("azure.list_certificates", serde_json::json!({}));
-        let result = handler.execute(&request).await.unwrap();
-
-        let certs = result["certificates"].as_array().unwrap();
-        assert_eq!(certs.len(), 1);
-        assert_eq!(certs[0]["name"], "tls-cert");
-    }
-
-    #[tokio::test]
-    async fn list_secrets_auth_failure() {
-        let (handler, mock_server, _audit) = setup_handler_with_mock().await;
-
-        Mock::given(method("GET"))
-            .and(path("/secrets"))
-            .and(query_param("api-version", "7.4"))
-            .respond_with(ResponseTemplate::new(401))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let request = make_request("azure.list_secrets", serde_json::json!({}));
-        let result = handler.execute(&request).await;
-
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("authentication failed"));
-    }
-
-    #[tokio::test]
-    async fn list_secrets_forbidden() {
-        let (handler, mock_server, _audit) = setup_handler_with_mock().await;
-
-        Mock::given(method("GET"))
-            .and(path("/secrets"))
-            .and(query_param("api-version", "7.4"))
-            .respond_with(ResponseTemplate::new(403))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let request = make_request("azure.list_secrets", serde_json::json!({}));
-        let result = handler.execute(&request).await;
-
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("forbidden"));
-    }
+/// Definitions for the supported, non-revealing broker operations.
+pub fn operations() -> Vec<opaque_core::operation::OperationDef> {
+    use opaque_core::operation::{
+        ApprovalFactor, ApprovalRequirement, OperationDef, OperationSafety,
+    };
+    [("azure.list_secrets",vec![],"List Azure Key Vault secret metadata",false),
+     ("azure.list_keys",vec![],"List Azure Key Vault key metadata",false),
+     ("azure.list_certificates",vec![],"List Azure Key Vault certificate metadata",false),
+     ("azure.get_secret",vec!["name"],"Read Azure secret metadata without disclosing its value",false),
+     ("azure.set_secret",vec!["name","value_ref"],"Write a resolved value to Azure Key Vault",true)]
+    .into_iter().map(|(name,required,description,write)|{
+        let mut properties:serde_json::Map<String,serde_json::Value>=required.iter().map(|key|(key.to_string(),serde_json::json!({"type":"string","minLength":1,"maxLength":512}))).collect();
+        if name=="azure.get_secret"{properties.insert("version".into(),serde_json::json!({"type":"string","minLength":1,"maxLength":128}));}
+        OperationDef{name:name.into(),safety:OperationSafety::Safe,default_approval:if write{ApprovalRequirement::Always}else{ApprovalRequirement::FirstUse},default_factors:vec![ApprovalFactor::LocalBio],description:description.into(),params_schema:Some(serde_json::json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})),allowed_target_keys:vec!["name","version","vault","azure_vault_url","azure_tenant_id","azure_client_id"].into_iter().map(str::to_owned).collect(),secret_ref_param_keys:if write{vec!["value_ref".into()]}else{vec![]}}
+    }).collect()
 }

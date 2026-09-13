@@ -432,4 +432,5 @@ fn private_read(path: &Path, limit: usize, secret: bool) -> Result<Zeroizing<Vec
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests;

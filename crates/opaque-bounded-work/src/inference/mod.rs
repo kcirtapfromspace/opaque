@@ -2,7 +2,10 @@
 //! The caller owns policy, trusted approval, reservation, and slot consumption.
 
 mod client;
+mod github_source;
+pub use github_source::capture_public_github_ci;
 
+use opaque_core::inference::github::{GithubCiSource, SOURCE_ID as GITHUB_SOURCE_ID};
 use opaque_core::inference::{
     INFERENCE_OUTPUT_TOKENS, InferenceAction, InferenceReceipt, InferenceReceiptCode, fixed_prompt,
     prompt_sha256, sha256, valid_label, valid_model_id, valid_output_text, valid_sha256,
@@ -57,7 +60,10 @@ pub struct InferenceProfileConfig {
     pub server_build: String,
     pub service_uid: uuid::Uuid,
     pub source_id: String,
+    #[serde(default)]
     pub source_snapshot_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_ci: Option<GithubCiSource>,
     #[serde(default)]
     pub credential_ref: Option<String>,
     #[serde(default)]
@@ -115,8 +121,17 @@ impl TrustedInferenceProfile {
             || !valid_sha256(&self.model_artifact_sha256)
             || self.model_artifact_sha256 == "0".repeat(64)
             || !valid_sha256(&self.chat_template_sha256)
-            || self.source_id != DEMO_SOURCE_ID
-            || self.source_snapshot_sha256 != demo_source_snapshot_sha256()
+            || match &self.github_ci {
+                Some(source) => {
+                    source.validate().is_err()
+                        || self.source_id != GITHUB_SOURCE_ID
+                        || !self.source_snapshot_sha256.is_empty()
+                }
+                None => {
+                    self.source_id != DEMO_SOURCE_ID
+                        || self.source_snapshot_sha256 != demo_source_snapshot_sha256()
+                }
+            }
         {
             return Err(unavailable());
         }
@@ -161,11 +176,42 @@ impl TrustedInferenceProfile {
             && action.model_artifact_sha256 == self.model_artifact_sha256
             && action.credential_ref == self.credential_ref
             && action.source_id == self.source_id
-            && action.source_snapshot_sha256 == self.source_snapshot_sha256
-            && demo_prompt_id(action.ordinal)
-                .and_then(prompt_sha256)
-                .as_deref()
-                == Some(action.prompt_sha256.as_str())
+            && match (&self.github_ci, &action.github_ci_snapshot) {
+                (Some(source), Some(snapshot)) => snapshot.source == *source,
+                // This seed is used only for policy preflight before capture.
+                // It is never persisted or accepted by the execution path.
+                (Some(source), None) => {
+                    action.source_snapshot_sha256 == source.digest()
+                        && demo_prompt_id(action.ordinal)
+                            .and_then(prompt_sha256)
+                            .as_deref()
+                            == Some(action.prompt_sha256.as_str())
+                }
+                (None, None) => {
+                    action.source_snapshot_sha256 == self.source_snapshot_sha256
+                        && demo_prompt_id(action.ordinal)
+                            .and_then(prompt_sha256)
+                            .as_deref()
+                            == Some(action.prompt_sha256.as_str())
+                }
+                (None, Some(_)) => false,
+            }
+    }
+}
+
+/// Complete reviewed prompt. GitHub source records contain only bounded typed
+/// public observations and never arbitrary repository text, logs or instructions.
+pub fn action_prompt(
+    profile: &TrustedInferenceProfile,
+    action: &InferenceAction,
+) -> Option<String> {
+    if !profile.matches(action) {
+        return None;
+    }
+    match (&profile.github_ci, &action.github_ci_snapshot) {
+        (Some(_), Some(snapshot)) => snapshot.prompt(action.ordinal),
+        (None, None) => demo_prompt(action.ordinal).map(str::to_owned),
+        _ => None,
     }
 }
 
@@ -189,7 +235,8 @@ pub fn prepare_inference_manifest(
 }
 
 /// The bootstrap RPC accepts only a title and expiry. All authority is made
-/// here from the server-selected profile and compiled public fixture source.
+/// here from the server-selected profile. A GitHub seed needs broker capture
+/// before it can be persisted or executed.
 pub fn public_demo_manifest(
     profile: &TrustedInferenceProfile,
     title: String,
@@ -208,7 +255,11 @@ pub fn public_demo_manifest(
                 model_id: profile.model_id.clone(),
                 model_artifact_sha256: profile.model_artifact_sha256.clone(),
                 source_id: profile.source_id.clone(),
-                source_snapshot_sha256: profile.source_snapshot_sha256.clone(),
+                source_snapshot_sha256: profile.github_ci.as_ref().map_or_else(
+                    || profile.source_snapshot_sha256.clone(),
+                    GithubCiSource::digest,
+                ),
+                github_ci_snapshot: None,
                 prompt_sha256: demo_prompt_id(ordinal)
                     .and_then(prompt_sha256)
                     .expect("fixed public prompt"),
@@ -248,13 +299,24 @@ fn credential(
         .transpose()
 }
 
-/// Planning sends only provider metadata reads and the compiled public demo
-/// prompts. Future private-source preprocessing must occur after approval.
+/// Planning captures the configured public source and checks model identity
+/// and prompt tokens. Private-source preprocessing is not supported.
 pub async fn plan_inference_manifest(
     mut manifest: TaskManifest,
     profile: &TrustedInferenceProfile,
 ) -> Result<TaskManifest, String> {
     prepare_inference_manifest(&mut manifest, profile)?;
+    if let Some(source) = &profile.github_ci {
+        if manifest.actions.iter().any(|action| {
+            action
+                .as_inference()
+                .is_some_and(|a| a.github_ci_snapshot.is_some())
+        }) {
+            return Err("GitHub snapshots must be captured by the broker".into());
+        }
+        let snapshot = capture_public_github_ci(source).await?;
+        attach_github_snapshot(&mut manifest, profile, snapshot)?;
+    }
     let client = InferenceClient::new(profile)?;
     let credential = credential(profile)?;
     let token = credential.as_ref().and_then(|secret| secret.as_str());
@@ -262,10 +324,38 @@ pub async fn plan_inference_manifest(
     for action in &manifest.actions {
         let action = action.as_inference().ok_or_else(unavailable)?;
         client
-            .tokenize_prompt(demo_prompt(action.ordinal).ok_or_else(unavailable)?, token)
+            .tokenize_prompt(
+                &action_prompt(profile, action).ok_or_else(unavailable)?,
+                token,
+            )
             .await?;
     }
     Ok(manifest)
+}
+
+fn attach_github_snapshot(
+    manifest: &mut TaskManifest,
+    profile: &TrustedInferenceProfile,
+    snapshot: opaque_core::inference::github::GithubCiSnapshot,
+) -> Result<(), String> {
+    snapshot.validate().map_err(|_| unavailable())?;
+    if profile.github_ci.as_ref() != Some(&snapshot.source) {
+        return Err(unavailable());
+    }
+    for action in &mut manifest.actions {
+        let opaque_core::task::TaskAction::Inference(action) = action else {
+            return Err(unavailable());
+        };
+        action.source_snapshot_sha256 = snapshot.digest();
+        action.prompt_sha256 = sha256(
+            snapshot
+                .prompt(action.ordinal)
+                .ok_or_else(unavailable)?
+                .as_bytes(),
+        );
+        action.github_ci_snapshot = Some(snapshot.clone());
+    }
+    prepare_inference_manifest(manifest, profile)
 }
 
 pub struct InferenceExecution {
@@ -333,6 +423,9 @@ where
     {
         return rejected();
     }
+    let Some(prompt) = action_prompt(profile, action) else {
+        return rejected();
+    };
     let _serial = INFERENCE_SERIAL.lock().await;
     let Ok(client) = InferenceClient::new(profile) else {
         return rejected();
@@ -344,10 +437,7 @@ where
     if client.verify_identity(profile, token).await.is_err() {
         return rejected();
     }
-    let Some(prompt) = demo_prompt(action.ordinal) else {
-        return rejected();
-    };
-    let Ok(tokens) = client.tokenize_prompt(prompt, token).await else {
+    let Ok(tokens) = client.tokenize_prompt(&prompt, token).await else {
         return rejected();
     };
     // Recheck identity after asynchronous template/tokenizer work. This is
@@ -421,4 +511,5 @@ where
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests;

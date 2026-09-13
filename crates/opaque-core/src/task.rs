@@ -845,6 +845,7 @@ pub fn parse_pinned_vault_ref(reference: &str) -> Result<PinnedVaultRef<'_>, Tas
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
@@ -1136,11 +1137,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn typed_receipt_sanitizer_preserves_verified_authority_and_scrubs_free_metadata() {
+    fn sanitizer_record() -> TaskRecord {
         let manifest = manifest();
         let action = manifest.actions[0].clone();
-        let record = TaskRecord {
+        TaskRecord {
             id: "550e8400-e29b-41d4-a716-446655440000".into(),
             manifest_digest: manifest.digest().unwrap(),
             manifest,
@@ -1162,7 +1162,63 @@ mod tests {
                 finished_at: None,
                 outcome: None,
             }],
-        };
+        }
+    }
+
+    #[test]
+    fn typed_receipt_sanitizer_preserves_workstation_reference_on_single_and_list_responses() {
+        let sanitizer = crate::sanitize::Sanitizer::new();
+        let mut record = sanitizer_record();
+        record.approved_at = Some(101);
+        record.approval_mode = Some(TaskApprovalMode::PairedWorkstation);
+        record.workstation_receipt = Some(WorkstationReceiptRef {
+            approval_id: "550e8400-e29b-41d4-a716-446655440001".into(),
+            sha256: "a".repeat(64),
+        });
+        let reference = serde_json::to_value(&record.workstation_receipt).unwrap();
+        // Generic provider data must retain the existing secret-shaped hash
+        // redaction. Only the validated typed task reference is exempt.
+        assert_eq!(sanitizer.sanitize_value(&reference)["sha256"], "[REDACTED]");
+        for (payload, key, listed) in [
+            (serde_json::json!({"task": record}), "task", false),
+            (serde_json::json!({"tasks": [record]}), "tasks", true),
+        ] {
+            let response = sanitizer.sanitize_task_response(payload).unwrap();
+            let public = if listed {
+                &response.payload()[key][0]
+            } else {
+                &response.payload()[key]
+            };
+            assert_eq!(public["workstation_receipt"], reference);
+            assert_eq!(public["owner_key"], "[REDACTED]");
+        }
+        let invalid_references: [fn(&mut TaskRecord); 5] = [
+            |r: &mut TaskRecord| {
+                r.workstation_receipt.as_mut().unwrap().approval_id = "not-a-uuid".into()
+            },
+            |r: &mut TaskRecord| r.workstation_receipt.as_mut().unwrap().sha256 = "a".repeat(63),
+            |r: &mut TaskRecord| {
+                r.workstation_receipt.as_mut().unwrap().sha256 =
+                    "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij".into()
+            },
+            |r: &mut TaskRecord| r.approved_at = None,
+            |r: &mut TaskRecord| r.approval_mode = None,
+        ];
+        for mutate in invalid_references {
+            let mut invalid = record.clone();
+            mutate(&mut invalid);
+            assert!(sanitizer.sanitize_task_record(&invalid).is_err());
+            assert!(
+                sanitizer
+                    .sanitize_task_response(serde_json::json!({"tasks": [invalid]}))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn typed_receipt_sanitizer_preserves_verified_authority_and_scrubs_free_metadata() {
+        let record = sanitizer_record();
         let sanitizer = crate::sanitize::Sanitizer::new();
         let public = sanitizer.sanitize_task_record(&record).unwrap();
         assert_eq!(public["manifest_digest"], record.manifest_digest);

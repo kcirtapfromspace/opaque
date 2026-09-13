@@ -429,6 +429,7 @@ pub fn tighten_modes(items: &[CustodyPath], daemon_uid: u32) -> Vec<(PathBuf, u3
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use std::collections::HashMap;

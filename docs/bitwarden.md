@@ -1,121 +1,6 @@
 # Bitwarden Secrets Manager
 
-Opaque integrates with [Bitwarden Secrets Manager](https://bitwarden.com/products/secrets-manager/) for secret storage and retrieval. The integration follows the same pattern as 1Password: browsing operations are `SAFE`, reading secret values is `REVEAL` (hard-blocked in v1).
-
-## Setup
-
-### 1. Create a Bitwarden service account
-
-In the Bitwarden web vault:
-
-1. Go to **Organizations** → your org → **Secrets Manager**
-2. Create a **Service Account** with access to the projects you need
-3. Copy the service account **access token**
-
-### 2. Store the access token
-
-Store the Bitwarden access token in your macOS Keychain (or another ref-compatible store):
-
-```bash
-security add-generic-password -a opaque -s opaque/bitwarden-token -w '<access-token>'
-```
-
-### 3. Configure Opaque
-
-Your `config.toml` policy rules control which Bitwarden operations are allowed. See the example rules below or use a preset:
-
-```bash
-opaque init --preset github-secrets   # includes test.noop for onboarding
-```
-
-## Secret Reference Format
-
-Bitwarden secrets are referenced using the `bitwarden:` scheme:
-
-| Format | Example | Resolution |
-|--------|---------|------------|
-| `bitwarden:<secret-id>` | `bitwarden:a1b2c3d4-e5f6-7890-abcd-ef1234567890` | Fetch by UUID |
-| `bitwarden:<project>/<secret-key>` | `bitwarden:production/DATABASE_URL` | Fetch by project name + secret key |
-
-These refs are used in execution profiles and as `value_ref` arguments to operations like `github.set_actions_secret`.
-
-### Profile example
-
-```toml
-# ~/.opaque/profiles/prod.toml
-[secrets]
-DATABASE_URL = "bitwarden:production/DATABASE_URL"
-API_KEY = "bitwarden:production/API_KEY"
-GITHUB_TOKEN = "keychain:opaque/github-pat"
-```
-
-## Operations
-
-### `bitwarden.list_projects` (`SAFE`)
-
-Lists accessible Bitwarden projects (names only).
-
-- **Approval**: `first_use` (recommended)
-- **Result**: `{ "projects": [{ "name": "...", "id": "..." }] }`
-
-### `bitwarden.list_secrets` (`SAFE`)
-
-Lists secret names in a project (no values).
-
-- **Params**: `project` (optional; filter by project name)
-- **Approval**: `first_use` (recommended)
-- **Result**: `{ "secrets": [{ "key": "...", "id": "...", "project": "..." }] }`
-
-### `bitwarden.read_secret` (`REVEAL`)
-
-Reads a secret value. **Hard-blocked in v1**: this operation returns plaintext and is never allowed for agent clients.
-
-- Human-only interactive use is possible if explicitly enabled in policy with `client_types = ["human"]`.
-
-## Policy Examples
-
-### Allow agents to browse Bitwarden (read-only metadata)
-
-```toml
-[[rules]]
-name = "allow-bitwarden-list-projects"
-operation_pattern = "bitwarden.list_projects"
-allow = true
-client_types = ["agent", "human"]
-
-[rules.approval]
-require = "first_use"
-factors = ["local_bio"]
-lease_ttl = 300
-
-[[rules]]
-name = "allow-bitwarden-list-secrets"
-operation_pattern = "bitwarden.list_secrets"
-allow = true
-client_types = ["agent", "human"]
-
-[rules.approval]
-require = "first_use"
-factors = ["local_bio"]
-lease_ttl = 300
-```
-
-### Use Bitwarden refs with GitHub secrets
-
-```toml
-[[rules]]
-name = "allow-github-actions-secret"
-operation_pattern = "github.set_actions_secret"
-allow = true
-client_types = ["agent", "human"]
-
-[rules.approval]
-require = "always"
-factors = ["local_bio"]
-lease_ttl = 300
-```
-
-Then reference Bitwarden secrets in your commands:
+Use a Bitwarden Secrets Manager secret in an approved operation without returning its value to the agent:
 
 ```bash
 opaque github set-secret \
@@ -124,25 +9,81 @@ opaque github set-secret \
   --value-ref bitwarden:production/DATABASE_URL
 ```
 
-## Environment Variables
+Opaque invokes the official [`bws` CLI](https://bitwarden.com/help/secrets-manager-cli/) for machine-account authentication and secret decryption. Install a trusted official `bws` executable on the broker host before starting `opaqued`. This integration is for Secrets Manager machine accounts, not the separate Password Manager `bw` CLI. A missing executable leaves Bitwarden unavailable; other configured providers can still start.
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `OPAQUE_BITWARDEN_URL` | Bitwarden API base URL | `https://api.bitwarden.com` |
+## Configure the broker
 
-The Bitwarden access token is resolved via secret refs (e.g., `keychain:opaque/bitwarden-token`), not environment variables, to avoid credential cycles.
+Create a machine account with read access to the required projects and generate an access token in Bitwarden Secrets Manager. Store the token in a base secret store, such as the macOS Keychain item `opaque/bitwarden-token`, using your normal secure credential-entry workflow.
 
-## End-to-End Workflow
+| Variable | Meaning | Default |
+|----------|---------|---------|
+| `OPAQUE_BITWARDEN_CLI_PATH` | Path to the installed official `bws` executable | Resolve `bws` from broker `PATH` at startup |
+| `OPAQUE_BITWARDEN_TOKEN_REF` | Machine access token ref; `keychain:` and `env:` supported | `keychain:opaque/bitwarden-token` |
+| `OPAQUE_BITWARDEN_URL` | Secrets Manager API endpoint | `https://api.bitwarden.com` |
+| `OPAQUE_BITWARDEN_IDENTITY_URL` | Machine authentication endpoint | Derived for US, EU, or a self-hosted API URL ending in `/api` |
 
-1. Store your Bitwarden service account token in the macOS Keychain
-2. Initialize Opaque with a policy that allows the operations you need
-3. Start `opaqued`
-4. Browse your secrets: `opaque execute bitwarden.list_projects`
-5. Use Bitwarden refs in GitHub secret sync:
-   ```bash
-   opaque github set-secret \
-     --repo myorg/myrepo \
-     --secret-name API_KEY \
-     --value-ref bitwarden:production/API_KEY
-   ```
-6. Review the audit log: `opaque audit tail --limit 10`
+For EU hosting, set `OPAQUE_BITWARDEN_URL=https://api.bitwarden.eu`; the identity endpoint becomes `https://identity.bitwarden.eu`. For self-hosting, `https://secrets.example.com/api` derives `https://secrets.example.com/identity`. Other custom API endpoints require an explicit identity URL. HTTPS is required, including on loopback, to match the official CLI. Endpoint credentials, query strings and fragments are rejected.
+
+Each invocation receives a private temporary configuration with explicit API and identity endpoints and `state_opt_out="true"`. Opaque clears inherited CLI configuration and passes the machine token only through the child's `BWS_ACCESS_TOKEN` environment. The token is absent from command arguments and the configuration file. Shared `bws` profiles, persistent login state and inherited proxy or custom CA environment variables are not used. Custom TLS trust must be installed in the host trust store supported by `bws`.
+
+The broker pins the executable's resolved path and SHA-256 digest. Bitwarden browsing approvals bind that identity and both endpoints. Replacing the executable requires restarting the broker and reviewing the new prepared action. Commands time out after 30 seconds; output exceeding 16 MiB fails with a sanitized error. These bounds also apply to large project listings.
+
+## Secret references
+
+| Reference | Resolution |
+|-----------|------------|
+| `bitwarden:<secret-uuid>` | Read one non-nil UUID |
+| `bitwarden:<project-name>/<secret-key>` | Find an exact project name and exact key, then read its UUID |
+
+Duplicate matching project names or keys are rejected. Use UUID references when names are ambiguous. Secret whitespace is preserved.
+
+Execution profile example:
+
+```toml
+[secrets]
+DATABASE_URL = "bitwarden:production/DATABASE_URL"
+API_KEY = "bitwarden:production/API_KEY"
+```
+
+## Browsing and policy
+
+`bitwarden.list_projects` returns `{"projects":[{"name":"production"}]}`. `bitwarden.list_secrets` accepts an optional `project` name and returns `{"secrets":[{"key":"DATABASE_URL"}]}`. Both are `SAFE` metadata operations; IDs, notes and secret values are omitted from their results.
+
+The official `bws secret list` response includes decrypted values. Opaque discards those fields inside the broker, zeroizes the captured response buffer, and returns only keys. Browsing therefore still requires trusting the broker host and installed executable with project contents.
+
+`bitwarden.read_secret` is `REVEAL`: agent clients are always denied. Human use requires an explicit allow rule. Prefer refs in approved operations or execution profiles when plaintext output is unnecessary.
+
+```toml
+[[rules]]
+name = "browse-bitwarden-projects"
+operation_pattern = "bitwarden.list_projects"
+allow = true
+client_types = ["agent", "human"]
+
+[rules.approval]
+require = "first_use"
+factors = ["local_bio"]
+lease_ttl = 300
+```
+
+Add a separate rule for `bitwarden.list_secrets` if needed. Provider writes such as `github.set_actions_secret` also require their own policy and approval.
+
+## Validation
+
+The regular tests use an explicitly created fake executable to check command arguments, configuration isolation, output limits, timeout handling, prepared-action binding, metadata sanitization and value transfer through the daemon. They do not prove successful authentication to a live Bitwarden account.
+
+For opt-in live acceptance, install official `bws` and provision a disposable secret with a known SHA-256 digest. Supply these variables through a secure test environment:
+
+- `OPAQUE_BITWARDEN_LIVE_ACCEPTANCE=1`
+- `OPAQUE_BITWARDEN_LIVE_TOKEN`: dedicated machine access token
+- `OPAQUE_BITWARDEN_LIVE_SECRET_ID`: disposable secret UUID
+- `OPAQUE_BITWARDEN_LIVE_VALUE_SHA256`: lowercase SHA-256 of the exact value bytes
+- The broker endpoint and executable variables above, if defaults do not apply
+
+```bash
+cargo test --locked -p opaque-providers --no-default-features --features bitwarden \
+  bitwarden::client::tests::live_machine_authentication_and_secret_decryption \
+  -- --ignored --exact
+```
+
+This test lists projects and reads the selected secret, verifies the decrypted value by digest, and prints neither the value nor token. It performs no provider writes. A passing fixture suite is not a recorded live acceptance run.

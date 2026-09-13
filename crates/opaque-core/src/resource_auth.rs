@@ -503,6 +503,7 @@ fn validate_url(value: &str, allow_loopback: bool) -> Result<(), AuthError> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use jsonwebtoken::{EncodingKey, Header, encode};
@@ -1301,6 +1302,7 @@ impl BrokerClient {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod transport_tests {
     use super::*;
     fn request() -> ResourceRequest {

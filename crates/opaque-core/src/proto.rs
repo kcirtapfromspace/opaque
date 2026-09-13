@@ -124,6 +124,7 @@ impl std::fmt::Display for ExecStream {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

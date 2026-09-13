@@ -1,0 +1,21 @@
+[Unit]
+Description=Opaque dedicated bounded-health SSH listener
+After=network.target opaque-ssh-guard.service
+Requires=opaque-ssh-guard.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/sbin/sshd -t -f /etc/opaque-ssh/sshd_config
+ExecStart=/usr/sbin/sshd -D -e -f /etc/opaque-ssh/sshd_config
+User=root
+Group=root
+RuntimeDirectory=sshd
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+Restart=on-failure
+RestartSec=2
+KillMode=control-group
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target

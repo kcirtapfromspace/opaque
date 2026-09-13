@@ -351,6 +351,7 @@ mod tests {
                 exe_path: None,
                 exe_sha256: None,
                 codesign_team_id: None,
+                workload: None,
             },
             client_type: ClientType::Human,
             operation: operation.into(),

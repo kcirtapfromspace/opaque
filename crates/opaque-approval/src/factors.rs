@@ -831,6 +831,7 @@ impl FactorVerifier for Fido2Verifier {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use opaque_core::audit::ApproverSource;

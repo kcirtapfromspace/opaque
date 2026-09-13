@@ -1437,7 +1437,11 @@ fn operation_registry() -> std::io::Result<OperationRegistry> {
             default_factors: vec![ApprovalFactor::LocalBio],
             description: "List available Bitwarden Secrets Manager projects".into(),
             params_schema: None,
-            allowed_target_keys: vec!["bitwarden_api_url".into()],
+            allowed_target_keys: vec![
+                "bitwarden_api_url".into(),
+                "bitwarden_identity_url".into(),
+                "bitwarden_cli_sha256".into(),
+            ],
             secret_ref_param_keys: vec![],
         })
         .map_err(std::io::Error::other)?;
@@ -1453,7 +1457,12 @@ fn operation_registry() -> std::io::Result<OperationRegistry> {
                 "type": "object",
                 "properties": { "project": {"type": "string"} }
             })),
-            allowed_target_keys: vec!["project".into(), "bitwarden_api_url".into()],
+            allowed_target_keys: vec![
+                "project".into(),
+                "bitwarden_api_url".into(),
+                "bitwarden_identity_url".into(),
+                "bitwarden_cli_sha256".into(),
+            ],
             secret_ref_param_keys: vec![],
         })
         .map_err(std::io::Error::other)?;
@@ -1470,10 +1479,24 @@ fn operation_registry() -> std::io::Result<OperationRegistry> {
                 "required": ["secret_id"],
                 "properties": { "secret_id": {"type": "string"} }
             })),
-            allowed_target_keys: vec!["secret_id".into(), "bitwarden_api_url".into()],
+            allowed_target_keys: vec![
+                "secret_id".into(),
+                "bitwarden_api_url".into(),
+                "bitwarden_identity_url".into(),
+                "bitwarden_cli_sha256".into(),
+            ],
             secret_ref_param_keys: vec!["secret_id".into()],
         })
         .map_err(std::io::Error::other)?;
+
+    for operation in opaque_providers::gcp::operations()
+        .into_iter()
+        .chain(opaque_providers::azure::operations())
+    {
+        registry
+            .register(operation)
+            .map_err(std::io::Error::other)?;
+    }
 
     // AWS STS operations
     registry
@@ -1484,7 +1507,11 @@ fn operation_registry() -> std::io::Result<OperationRegistry> {
             default_factors: vec![ApprovalFactor::LocalBio],
             description: "Get the AWS caller identity (account, ARN, user ID)".into(),
             params_schema: None,
-            allowed_target_keys: vec!["aws_backend".into(), "aws_api_url".into()],
+            allowed_target_keys: vec![
+                "aws_region".into(),
+                "aws_backend".into(),
+                "aws_api_url".into(),
+            ],
             secret_ref_param_keys: vec![],
         })
         .map_err(std::io::Error::other)?;
@@ -1507,6 +1534,7 @@ fn operation_registry() -> std::io::Result<OperationRegistry> {
             allowed_target_keys: vec![
                 "role_arn".into(),
                 "session_name".into(),
+                "aws_region".into(),
                 "aws_backend".into(),
                 "aws_api_url".into(),
             ],
@@ -1523,7 +1551,11 @@ fn operation_registry() -> std::io::Result<OperationRegistry> {
             default_factors: vec![ApprovalFactor::LocalBio],
             description: "List AWS Secrets Manager secret names".into(),
             params_schema: None,
-            allowed_target_keys: vec!["aws_backend".into(), "aws_api_url".into()],
+            allowed_target_keys: vec![
+                "aws_region".into(),
+                "aws_backend".into(),
+                "aws_api_url".into(),
+            ],
             secret_ref_param_keys: vec![],
         })
         .map_err(std::io::Error::other)?;
@@ -1542,6 +1574,7 @@ fn operation_registry() -> std::io::Result<OperationRegistry> {
             })),
             allowed_target_keys: vec![
                 "secret_id".into(),
+                "aws_region".into(),
                 "aws_backend".into(),
                 "aws_api_url".into(),
             ],
@@ -1565,7 +1598,12 @@ fn operation_registry() -> std::io::Result<OperationRegistry> {
                     "description": {"type": "string"}
                 }
             })),
-            allowed_target_keys: vec!["name".into(), "aws_backend".into(), "aws_api_url".into()],
+            allowed_target_keys: vec![
+                "name".into(),
+                "aws_region".into(),
+                "aws_backend".into(),
+                "aws_api_url".into(),
+            ],
             secret_ref_param_keys: vec![],
         })
         .map_err(std::io::Error::other)?;
@@ -1587,6 +1625,7 @@ fn operation_registry() -> std::io::Result<OperationRegistry> {
             })),
             allowed_target_keys: vec![
                 "secret_id".into(),
+                "aws_region".into(),
                 "aws_backend".into(),
                 "aws_api_url".into(),
             ],
@@ -1609,6 +1648,7 @@ fn operation_registry() -> std::io::Result<OperationRegistry> {
             allowed_target_keys: vec![
                 "secret_id".into(),
                 "force_delete_without_recovery".into(),
+                "aws_region".into(),
                 "aws_backend".into(),
                 "aws_api_url".into(),
             ],
@@ -1632,6 +1672,7 @@ fn operation_registry() -> std::io::Result<OperationRegistry> {
             allowed_target_keys: vec![
                 "name".into(),
                 "with_decryption".into(),
+                "aws_region".into(),
                 "aws_backend".into(),
                 "aws_api_url".into(),
             ],
@@ -1660,6 +1701,7 @@ fn operation_registry() -> std::io::Result<OperationRegistry> {
                 "name".into(),
                 "type".into(),
                 "overwrite".into(),
+                "aws_region".into(),
                 "aws_backend".into(),
                 "aws_api_url".into(),
             ],
@@ -1686,6 +1728,7 @@ fn operation_registry() -> std::io::Result<OperationRegistry> {
                 "path".into(),
                 "with_decryption".into(),
                 "recursive".into(),
+                "aws_region".into(),
                 "aws_backend".into(),
                 "aws_api_url".into(),
             ],
@@ -1705,7 +1748,12 @@ fn operation_registry() -> std::io::Result<OperationRegistry> {
                 "required": ["name"],
                 "properties": { "name": {"type": "string"} }
             })),
-            allowed_target_keys: vec!["name".into(), "aws_backend".into(), "aws_api_url".into()],
+            allowed_target_keys: vec![
+                "name".into(),
+                "aws_region".into(),
+                "aws_backend".into(),
+                "aws_api_url".into(),
+            ],
             secret_ref_param_keys: vec![],
         })
         .map_err(std::io::Error::other)?;
@@ -2270,37 +2318,25 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         info!("1Password handler disabled (no Connect URL or op CLI found)");
     }
 
-    // Bitwarden handler: use configured URL or default.
+    // The official bws CLI performs authentication and secret decryption.
     let bitwarden_url = std::env::var(opaque_providers::bitwarden::client::BITWARDEN_URL_ENV)
         .unwrap_or_else(|_| opaque_providers::bitwarden::client::DEFAULT_BASE_URL.to_owned());
-    {
-        let bw_list_projects_handler =
-            opaque_providers::bitwarden::BitwardenHandler::new(audit.clone(), &bitwarden_url)
-                .map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
-                })?;
-        let bw_list_secrets_handler =
-            opaque_providers::bitwarden::BitwardenHandler::new(audit.clone(), &bitwarden_url)
-                .map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
-                })?;
-        let bw_read_secret_handler =
-            opaque_providers::bitwarden::BitwardenHandler::new(audit.clone(), &bitwarden_url)
-                .map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
-                })?;
-        enclave_builder = enclave_builder
-            .handler(
-                "bitwarden.list_projects",
-                Box::new(bw_list_projects_handler),
-            )
-            .handler("bitwarden.list_secrets", Box::new(bw_list_secrets_handler))
-            .handler("bitwarden.read_secret", Box::new(bw_read_secret_handler));
-        info!("Bitwarden handler enabled ({})", bitwarden_url);
+    for operation in [
+        "bitwarden.list_projects",
+        "bitwarden.list_secrets",
+        "bitwarden.read_secret",
+    ] {
+        match opaque_providers::bitwarden::BitwardenHandler::new(audit.clone(), &bitwarden_url) {
+            Ok(handler) => enclave_builder = enclave_builder.handler(operation, Box::new(handler)),
+            Err(error) => {
+                info!("Bitwarden handler disabled: {error}");
+                break;
+            }
+        }
     }
 
-    // The unsigned AWS transport is quarantined to explicitly enabled loopback mocks.
-    match opaque_providers::aws::client::AwsClient::from_mock_env() {
+    // Production AWS uses official SigV4 and service wire protocols.
+    match opaque_providers::aws::client::AwsClient::from_env() {
         Ok(Some(aws_client)) => {
             for op in [
                 "aws.get_caller_identity",
@@ -2323,10 +2359,55 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
                     )),
                 );
             }
-            warn!("AWS loopback mock handler enabled; real AWS signing is not implemented");
+            info!("AWS handler enabled ({})", aws_client.backend());
         }
-        Ok(None) => info!("AWS handler disabled; signed production transport is not implemented"),
-        Err(_) => return Err(std::io::Error::other("invalid AWS mock configuration")),
+        Ok(None) => info!("AWS handler disabled (set OPAQUE_AWS_REGION)"),
+        Err(error) => {
+            return Err(std::io::Error::other(format!(
+                "invalid AWS configuration: {error}"
+            )));
+        }
+    }
+
+    match opaque_providers::gcp::client::GcpSecretManagerClient::from_env() {
+        Ok(Some(client)) => {
+            for operation in opaque_providers::gcp::operations() {
+                enclave_builder = enclave_builder.handler(
+                    &operation.name,
+                    Box::new(opaque_providers::gcp::GcpHandler::from_client(
+                        audit.clone(),
+                        client.clone(),
+                    )),
+                );
+            }
+            info!("GCP Secret Manager handler enabled");
+        }
+        Ok(None) => info!("GCP Secret Manager handler disabled (see docs/gcp.md)"),
+        Err(error) => {
+            return Err(std::io::Error::other(format!(
+                "invalid GCP configuration: {error}"
+            )));
+        }
+    }
+    match opaque_providers::azure::client::AzureKeyVaultClient::from_env() {
+        Ok(Some(client)) => {
+            for operation in opaque_providers::azure::operations() {
+                enclave_builder = enclave_builder.handler(
+                    &operation.name,
+                    Box::new(opaque_providers::azure::AzureHandler::from_client(
+                        audit.clone(),
+                        client.clone(),
+                    )),
+                );
+            }
+            info!("Azure Key Vault handler enabled");
+        }
+        Ok(None) => info!("Azure Key Vault handler disabled (see docs/azure.md)"),
+        Err(error) => {
+            return Err(std::io::Error::other(format!(
+                "invalid Azure configuration: {error}"
+            )));
+        }
     }
 
     // Approval backend selection. The insecure auto-approve backend exists
@@ -5402,6 +5483,25 @@ mod tests {
             ("gitlab", &["set_ci_variable"]),
             ("onepassword", &["list_vaults", "list_items", "read_field"]),
             (
+                "gcp",
+                &[
+                    "get_secret",
+                    "list_secrets",
+                    "create_secret",
+                    "add_secret_version",
+                ],
+            ),
+            (
+                "azure",
+                &[
+                    "get_secret",
+                    "list_secrets",
+                    "set_secret",
+                    "list_keys",
+                    "list_certificates",
+                ],
+            ),
+            (
                 "bitwarden",
                 &["list_projects", "list_secrets", "read_secret"],
             ),
@@ -5432,7 +5532,7 @@ mod tests {
                     .map(move |action| format!("{family}.{action}"))
             })
             .collect();
-        assert_eq!(expected.len(), 28);
+        assert_eq!(expected.len(), 37);
         expected.extend(
             [enclave::task_operation()]
                 .into_iter()
@@ -5453,7 +5553,7 @@ mod tests {
         let actual: std::collections::BTreeSet<_> =
             registry.iter().map(|def| def.name.clone()).collect();
         assert_eq!(actual, expected);
-        assert_eq!(actual.len(), 37);
+        assert_eq!(actual.len(), 46);
         // Raw secret bytes must never be cataloged as reference names.
         assert!(
             registry
@@ -5470,6 +5570,7 @@ mod tests {
             exe_path: Some("/usr/bin/claude-code".into()),
             exe_sha256: Some("aabbccdd".into()),
             codesign_team_id: None,
+            workload: None,
         }
     }
 
@@ -7382,6 +7483,7 @@ exe_sha256 = "deadbeef"
             exe_path: None,
             exe_sha256: None,
             codesign_team_id: None,
+            workload: None,
         };
         assert_eq!(derive_agent_tool_name(None, &bare), "agent");
         // Pure punctuation label collapses to "agent", never empty.

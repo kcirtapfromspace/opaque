@@ -1,4 +1,4 @@
-//! Canonical AWS fixture actions. Preparation never resolves credentials.
+//! Canonical AWS actions. Preparation never resolves credentials.
 use std::collections::HashMap;
 
 use serde::{Serialize, Serializer};
@@ -11,11 +11,18 @@ pub(super) struct BoundAction {
     pub action: AwsAction,
     pub backend: &'static str,
     pub api_url: String,
+    pub region: String,
 }
 
 // The immutable action owns the exact bytes sent to AWS. Its serialized
 // authorization payload binds a digest, keeping secret bytes out of review.
 pub(super) struct ConfidentialValue(String);
+
+impl Drop for ConfidentialValue {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
 
 impl ConfidentialValue {
     pub(super) fn expose(&self) -> &str {

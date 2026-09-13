@@ -62,3 +62,6 @@ reqwest = { workspace = true, features = ["rustls-tls"] }
 # only place in the workspace that still uses them directly.
 
 # Linux approval is handled by the opaque-approve-helper binary (subprocess).
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)"] }

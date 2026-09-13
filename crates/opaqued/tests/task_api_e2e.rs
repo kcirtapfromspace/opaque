@@ -20,6 +20,10 @@
 //! `EnclaveFacade::verify_workspace` addition through a real `execute_task`
 //! dispatch, not just a build check.
 
+#[cfg(coverage)]
+#[path = "support/coverage.rs"]
+mod coverage;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -141,6 +145,8 @@ factors = ["local_bio"]
             .env_remove("OPAQUE_SOCK")
             .stdout(Stdio::from(log_stdout))
             .stderr(log_file);
+        #[cfg(coverage)]
+        coverage::subprocess(&mut cmd, "daemon");
         let child = cmd.spawn().expect("spawn opaqued");
 
         let mut daemon = Daemon {
@@ -185,6 +191,17 @@ struct Daemon {
     sock: PathBuf,
     token: String,
     log: PathBuf,
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        // std::process::Child does not stop or reap a process on drop. Preserve
+        // fixture cleanup when an assertion or readiness check unwinds.
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
 }
 
 impl Daemon {
@@ -335,6 +352,38 @@ fn ok(resp: &Value, context: &str) {
         resp.get("error").is_none_or(Value::is_null),
         "{context} returned an error: {resp}"
     );
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn ssh_planning_without_tenant_is_denied_before_provider_io() {
+    let _serial = serial_guard();
+    let github = MockServer::start().await;
+    let vault = MockServer::start().await;
+    // A daemon that permits plain tasks must still reject tenant-only SSH
+    // planning. Tenant-enabled scenarios use the isolated broker fixture;
+    // startup deliberately rejects tenant mode in this same-UID fixture.
+    let fixture = Fixture::new();
+    let config_path = fixture.write_config();
+    let daemon = fixture.spawn(&config_path, &github.uri(), &vault.uri());
+    let denied = daemon
+        .call(
+            "task_plan_ssh",
+            json!({"title":"unauthenticated SSH plan","expires_in_secs":60}),
+        )
+        .await;
+    assert_eq!(denied["error"]["code"], "task_unavailable");
+    assert_eq!(
+        denied["error"]["message"],
+        "tenant tasks require an authenticated tenant principal and live delegation"
+    );
+    assert!(denied["result"].is_null());
+    let listed = daemon.call("task_list", json!({})).await;
+    ok(&listed, "list after denied SSH plan");
+    assert_eq!(listed["result"]["tasks"], json!([]));
+    assert!(github.received_requests().await.unwrap().is_empty());
+    assert!(vault.received_requests().await.unwrap().is_empty());
+    daemon.shutdown();
 }
 
 /// Full lifecycle: plan two tasks, list and fetch the first, run it to

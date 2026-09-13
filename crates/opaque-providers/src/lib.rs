@@ -10,15 +10,12 @@
 //! nameable from anywhere else) so providers can be built, tested, and
 //! feature-gated independently of the daemon's kernel.
 //!
-//! Each provider is behind a Cargo feature of the same name (see this
-//! crate's `Cargo.toml`). `github`, `gitlab`, `onepassword`, `bitwarden`,
-//! `vault`, and `aws` are in `default` (the six wired into the daemon's
-//! `default_secret_resolvers()` / operation registry today); `azure`,
-//! `doppler`, `gcp`, and `infisical` are not (dormant, compiled-but-unused,
-//! same as before this extraction — `#[allow(dead_code)]` mirrors the
-//! attribute `opaqued`'s `main.rs` used to carry on their `mod`
-//! declarations). `opaqued` enables all ten explicitly so turning this
-//! feature system on does not change its shipped behavior.
+//! Providers have independent Cargo features. The default set is `github`,
+//! `gitlab`, `onepassword`, `bitwarden`, `vault`, and `aws`. The daemon also
+//! enables `gcp` and `azure`, registering their configured handlers and secret
+//! resolvers. `doppler` and `infisical` remain compiled but unwired in the daemon.
+//! Availability follows explicit configuration; registry membership alone does
+//! not enable an operation or grant policy permission.
 
 #[cfg(any(
     feature = "aws",
@@ -32,7 +29,6 @@ mod endpoint;
 #[cfg(feature = "aws")]
 pub mod aws;
 #[cfg(feature = "azure")]
-#[allow(dead_code)]
 pub mod azure;
 #[cfg(feature = "bitwarden")]
 pub mod bitwarden;
@@ -40,7 +36,6 @@ pub mod bitwarden;
 #[allow(dead_code)]
 pub mod doppler;
 #[cfg(feature = "gcp")]
-#[allow(dead_code)]
 pub mod gcp;
 #[cfg(feature = "github")]
 pub mod github;

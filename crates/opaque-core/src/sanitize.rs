@@ -327,11 +327,31 @@ impl Sanitizer {
                     .map_err(|_| "invalid task receipt outcome")?;
             }
         }
+        if let Some(receipt) = &record.workstation_receipt
+            && (record.approved_at.is_none()
+                || !matches!(
+                    record.approval_mode,
+                    Some(
+                        crate::task::TaskApprovalMode::PairedWorkstation
+                            | crate::task::TaskApprovalMode::InsecureTest
+                    )
+                )
+                || uuid::Uuid::parse_str(&receipt.approval_id).is_err()
+                || crate::workstation::decode_hex::<32>(&receipt.sha256).is_err())
+        {
+            return Err("invalid workstation receipt reference".into());
+        }
         let source = serde_json::to_value(record).map_err(|_| "invalid task receipt")?;
         let mut output = self.sanitize_value(&source);
         output["manifest_digest"] = source["manifest_digest"].clone();
         if record.tenant.is_some() {
             output["tenant"] = source["tenant"].clone();
+        }
+        if record.workstation_receipt.is_some() {
+            // A strictly shaped public lookup/digest binds the separately
+            // retained signed decision. Generic hash heuristics must not
+            // destroy this binding; unrelated provider hashes remain scrubbed.
+            output["workstation_receipt"] = source["workstation_receipt"].clone();
         }
         if record.release_observation.is_some() {
             output["release_observation"] = source["release_observation"].clone();
@@ -588,6 +608,7 @@ fn is_secret_field_name(name: &str) -> bool {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

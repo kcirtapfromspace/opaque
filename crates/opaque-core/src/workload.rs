@@ -2,8 +2,9 @@
 //!
 //! These types are not proof by themselves. The daemon must select an attestor
 //! from its listener, never deserialize caller-provided values as authority.
-//! Legacy client matching and approval fingerprints remain unchanged while
-//! the workload context is introduced alongside them.
+//! Trusted listener observations feed client policy selectors and approval
+//! fingerprints. The transport's authority boundary is the connecting process,
+//! not an independently identified script or agent running inside that process.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -158,6 +159,7 @@ impl WorkloadIdentity {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};

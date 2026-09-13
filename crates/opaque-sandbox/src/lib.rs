@@ -247,15 +247,16 @@ impl SandboxExecutor {
             // Build combined environment.
             let env = Self::build_env(&profile, &resolved_secrets);
 
-            // Emit SandboxCreated audit event.
+            // Arbitrary argv and working paths can contain secret bytes that
+            // pattern redaction cannot recognize. Record only bounded metadata;
+            // the canonical approval still binds the complete requested action.
             let sandbox_event = AuditEvent::new(AuditEventKind::SandboxCreated)
                 .with_request_id(request_id)
                 .with_operation("sandbox.exec")
                 .with_outcome("created")
                 .with_detail(format!(
-                    "profile={profile_name} command={:?} project_dir={}",
-                    command,
-                    profile.project_dir.display()
+                    "profile={profile_name} argument_count={}",
+                    command.len(),
                 ));
             audit.emit(sandbox_event);
 
@@ -670,6 +671,7 @@ mod tests {
                 exe_path: None,
                 exe_sha256: None,
                 codesign_team_id: None,
+                workload: None,
             },
             client_type: ClientType::Human,
             operation: "sandbox.exec".into(),
@@ -701,6 +703,7 @@ mod tests {
                 exe_path: None,
                 exe_sha256: None,
                 codesign_team_id: None,
+                workload: None,
             },
             client_type: ClientType::Human,
             operation: "sandbox.exec".into(),
@@ -732,6 +735,7 @@ mod tests {
                 exe_path: None,
                 exe_sha256: None,
                 codesign_team_id: None,
+                workload: None,
             },
             client_type: ClientType::Human,
             operation: "sandbox.exec".into(),
@@ -789,6 +793,7 @@ mod tests {
                 exe_path: None,
                 exe_sha256: None,
                 codesign_team_id: None,
+                workload: None,
             },
             client_type: ClientType::Human,
             operation: "sandbox.exec".into(),

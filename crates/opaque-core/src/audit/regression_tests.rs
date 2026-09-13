@@ -641,6 +641,7 @@ fn client_hash_summary_never_splits_a_non_ascii_caller_value() {
         exe_path: None,
         exe_sha256: Some(format!("{}é", "a".repeat(15))),
         codesign_team_id: None,
+        workload: None,
     };
     let summary = ClientSummary::from((&identity, ClientType::Agent));
     assert_eq!(summary.exe_sha256_prefix, Some("a".repeat(15)));

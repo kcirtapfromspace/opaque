@@ -13,6 +13,45 @@ pub const SSH_FIXED_COMMAND: &str = "opaque-service-health";
 pub const MAX_SSH_TASK_DURATION_SECS: u64 = 300;
 pub const MAX_SSH_SESSION_SECS: u32 = 30;
 
+/// One bounded local HTTP GET, approved together with the SSH destination.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SshHealthContract {
+    pub service: String,
+    pub version: String,
+    pub host: String,
+    pub port: u16,
+    pub path: String,
+}
+
+impl SshHealthContract {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !valid_ssh_label(&self.service)
+            || !valid_ssh_label(&self.version)
+            || !matches!(self.host.as_str(), "127.0.0.1" | "::1")
+            || self.port == 0
+            || self.path.len() > 256
+            || !self.path.starts_with('/')
+            || !self
+                .path
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"/_.-".contains(&b))
+            || self
+                .path
+                .split('/')
+                .skip(1)
+                .any(|segment| segment == "." || segment == ".." || segment.is_empty())
+        {
+            return Err("invalid SSH health contract");
+        }
+        Ok(())
+    }
+
+    pub fn expected_response(&self) -> serde_json::Value {
+        serde_json::json!({"service":self.service, "status":"ok", "version":self.version})
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SshHealthAction {
@@ -37,6 +76,9 @@ pub struct SshHealthAction {
     pub login_user: String,
     pub source_address: String,
     pub command: String,
+    /// Omission preserves the original schema-4 fixture contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_contract: Option<SshHealthContract>,
     pub max_session_secs: u32,
     pub grant_id: String,
 }
@@ -93,6 +135,9 @@ impl SshHealthAction {
                 .all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))
         {
             return Err("invalid fixed SSH authority");
+        }
+        if let Some(contract) = &self.health_contract {
+            contract.validate()?;
         }
         Ok(())
     }
@@ -155,6 +200,15 @@ impl SshReceipt {
             {
                 return Err("invalid SSH health evidence");
             }
+            if let Some(contract) = &action.health_contract {
+                let response: serde_json::Value = serde_json::from_str(
+                    self.output_text.as_deref().ok_or("missing health output")?,
+                )
+                .map_err(|_| "invalid SSH health response")?;
+                if response != contract.expected_response() {
+                    return Err("SSH health response differs from approved contract");
+                }
+            }
         } else if self.output_text.is_some() || self.output_sha256.is_some() {
             return Err("incomplete SSH operation cannot claim health evidence");
         }
@@ -163,6 +217,7 @@ impl SshReceipt {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::task::{TaskAction, TaskManifest};
@@ -175,7 +230,7 @@ mod tests {
             profile_id: "fixture-health".into(), profile_sha256: "a".repeat(64),
             destination_host: "192.0.2.1".into(), destination_port: 22,
             host_key_sha256: "b".repeat(64), vault_role: "fixture-health".into(), vault_ca_sha256: "e".repeat(64), vault_token_ref: "env:VAULT_SIGNER_TOKEN".into(), principal: "fixture-health".into(), login_user: "opaque".into(),
-            source_address: "192.0.2.2".into(), command: SSH_FIXED_COMMAND.into(), max_session_secs: 30,
+            source_address: "192.0.2.2".into(), command: SSH_FIXED_COMMAND.into(), health_contract: None, max_session_secs: 30,
             grant_id: "00000000-0000-4000-8000-000000000002".into(),
         }
     }
@@ -188,6 +243,68 @@ mod tests {
             github_api_url: String::new(),
             vault_api_url: String::new(),
             actions: vec![action().into()],
+        }
+    }
+
+    #[test]
+    fn health_contract_rejects_unbounded_endpoints_and_preserves_legacy_serialization() {
+        let legacy = action();
+        let encoded = serde_json::to_value(&legacy).unwrap();
+        assert!(encoded.get("health_contract").is_none());
+        assert_eq!(
+            serde_json::from_value::<SshHealthAction>(encoded.clone()).unwrap(),
+            legacy
+        );
+        let contract = SshHealthContract {
+            service: "payments-api".into(),
+            version: "2026.09.1".into(),
+            host: "127.0.0.1".into(),
+            port: 9000,
+            path: "/ready/health".into(),
+        };
+        contract.validate().unwrap();
+        let mut approved = manifest();
+        let mut data = serde_json::to_value(&approved).unwrap();
+        data["actions"][0]["health_contract"] = serde_json::to_value(&contract).unwrap();
+        approved = serde_json::from_value(data.clone()).unwrap();
+        approved.validate().unwrap();
+        assert_ne!(manifest().digest().unwrap(), approved.digest().unwrap());
+        for (field, value) in [
+            ("service", serde_json::json!("billing-api")),
+            ("version", serde_json::json!("2026.09.2")),
+            ("host", serde_json::json!("::1")),
+            ("port", serde_json::json!(9001)),
+            ("path", serde_json::json!("/health")),
+        ] {
+            let mut changed = data.clone();
+            changed["actions"][0]["health_contract"][field] = value;
+            let changed: TaskManifest = serde_json::from_value(changed).unwrap();
+            assert_ne!(
+                approved.digest().unwrap(),
+                changed.digest().unwrap(),
+                "unbound {field}"
+            );
+        }
+        for (field, value) in [
+            ("host", serde_json::json!("localhost")),
+            ("host", serde_json::json!("169.254.169.254")),
+            ("host", serde_json::json!("127.0.0.2")),
+            ("port", serde_json::json!(0)),
+            ("path", serde_json::json!("//metadata")),
+            ("path", serde_json::json!("/a/../health")),
+            ("path", serde_json::json!("/health?token=x")),
+            ("path", serde_json::json!("/%68ealth")),
+            ("service", serde_json::json!("api;id")),
+        ] {
+            let mut changed = serde_json::to_value(&contract).unwrap();
+            changed[field] = value;
+            assert!(
+                serde_json::from_value::<SshHealthContract>(changed)
+                    .unwrap()
+                    .validate()
+                    .is_err(),
+                "accepted {field}"
+            );
         }
     }
 

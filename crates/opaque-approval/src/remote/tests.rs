@@ -506,3 +506,206 @@ fn historical_notice_columns_do_not_resume_delivery_or_pending_authority() {
     assert_eq!(state, "cancelled_restart");
     assert_eq!(notice, "cancelled");
 }
+
+fn reviewed_requester() -> opaque_core::identity::PrincipalContext {
+    use opaque_core::identity::{AccessMode, PrincipalContext, PrincipalId};
+    PrincipalContext {
+        sub: PrincipalId::parse("svc_22222222222222222222222222222222").unwrap(),
+        sub_label: "fixture requester".into(),
+        sub_roles: Default::default(),
+        sub_teams: vec![],
+        act: PrincipalId::parse("agt_33333333333333333333333333333333").unwrap(),
+        act_label: "fixture agent".into(),
+        mode: AccessMode::Autonomous,
+        jti: "fixture-delegation".into(),
+        human_session_id: None,
+    }
+}
+
+#[test]
+fn durable_receipt_requires_the_reviewed_requester_before_and_after_restart() {
+    let rig = Rig::new();
+    let remote = rig.open();
+    let review = rig.review(&remote);
+    remote.enqueue(&review).unwrap();
+    let receipt = remote
+        .accept(&review, rig.response(&review, true), &rig.device)
+        .unwrap();
+    receipt.verify().unwrap();
+    let requester = reviewed_requester();
+    let mut other = requester.clone();
+    other.sub =
+        opaque_core::identity::PrincipalId::parse("svc_44444444444444444444444444444444").unwrap();
+    let mut current = remote;
+    for restart in [false, true] {
+        if restart {
+            drop(current);
+            current = rig.open();
+        }
+        for context in [None, Some(&other)] {
+            let mut effects = 0;
+            assert_eq!(
+                current
+                    .authorize(context, &receipt, &mut || {
+                        effects += 1;
+                        Ok(())
+                    })
+                    .unwrap_err(),
+                "remote dispatch requires the reviewed requester"
+            );
+            assert_eq!(effects, 0);
+            assert_eq!(
+                current
+                    .store
+                    .receipt(&review.challenge.approval_id)
+                    .unwrap(),
+                Some(receipt.clone())
+            );
+        }
+        let mut effects = 0;
+        current
+            .authorize(Some(&requester), &receipt, &mut || {
+                effects += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            effects, 1,
+            "the matching receipt remains usable by the caller's ledger gate"
+        );
+    }
+}
+
+#[test]
+fn independently_signed_reviewer_bindings_fail_current_and_locked_authority_checks() {
+    let rig = Rig::new();
+    let remote = rig.open();
+    let review = rig.review(&remote);
+    remote.enqueue(&review).unwrap();
+    for mutation in ["key", "principal", "role"] {
+        let mut changed = review.clone();
+        let mut key = rig.key.clone();
+        let authority = changed.challenge.authority.as_mut().unwrap();
+        match mutation {
+            "key" => {
+                key = SigningKey::from_bytes(&[57; 32]);
+                authority.public_key_hex = hex(key.verifying_key().as_bytes());
+            }
+            "principal" => authority.principal_id = "hum_55555555555555555555555555555555".into(),
+            "role" => authority.required_role = "approver".into(),
+            _ => unreachable!(),
+        }
+        let response = WorkstationResponse {
+            device_id: rig.device.device_id.clone(),
+            decision: WorkstationDecision::Approve,
+            signature: hex(&key
+                .sign(&workstation_decision_bytes(&changed.challenge, true))
+                .to_bytes()),
+        };
+        let candidate = SignedWorkstationReceipt {
+            schema_version: 1,
+            review: changed.clone(),
+            response: response.clone(),
+            accepted_at: now(),
+        };
+        candidate.verify().unwrap();
+        assert_eq!(
+            remote.accept(&changed, response, &rig.device).unwrap_err(),
+            "remote reviewer authority changed",
+            "{mutation}"
+        );
+        let mut effects = 0;
+        assert_eq!(
+            remote
+                .with_authority(Some(&reviewed_requester()), &candidate, &mut || {
+                    effects += 1;
+                    Ok(())
+                })
+                .unwrap_err(),
+            "remote reviewer enrollment changed",
+            "{mutation}"
+        );
+        assert_eq!(effects, 0, "{mutation}");
+        assert_eq!(
+            remote
+                .can_read_receipt(&candidate, &rig.device.device_id)
+                .unwrap_err(),
+            "receipt belongs to another reviewer",
+            "{mutation}"
+        );
+        assert!(
+            remote
+                .store
+                .receipt(&review.challenge.approval_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+    let receipt = remote
+        .accept(&review, rig.response(&review, true), &rig.device)
+        .unwrap();
+    remote.revalidate(&receipt).unwrap();
+}
+
+#[test]
+fn valid_signatures_do_not_replace_authenticated_device_or_durable_acceptance() {
+    let rig = Rig::new();
+    let remote = rig.open();
+    let review = rig.review(&remote);
+    remote.enqueue(&review).unwrap();
+    let mut candidate = SignedWorkstationReceipt {
+        schema_version: 1,
+        review: review.clone(),
+        response: rig.response(&review, true),
+        accepted_at: now(),
+    };
+    candidate.verify().unwrap();
+    assert_eq!(
+        remote.revalidate(&candidate).unwrap_err(),
+        "remote decision is not durably accepted"
+    );
+    candidate.response.device_id = uuid::Uuid::new_v4().to_string();
+    candidate.verify().unwrap();
+    assert_eq!(
+        remote
+            .accept(&review, candidate.response.clone(), &rig.device)
+            .unwrap_err(),
+        "wrong reviewer device"
+    );
+    assert_eq!(
+        remote
+            .can_read_receipt(&candidate, &rig.device.device_id)
+            .unwrap_err(),
+        "receipt belongs to another reviewer"
+    );
+    assert!(
+        remote
+            .store
+            .receipt(&review.challenge.approval_id)
+            .unwrap()
+            .is_none()
+    );
+    let other_key = SigningKey::from_bytes(&[58; 32]);
+    let other = rig
+        .pairing
+        .enroll_workstation(&WorkstationApproverConfig {
+            public_key_hex: hex(other_key.verifying_key().as_bytes()),
+            name: "Other enrolled reviewer".into(),
+            principal_id: Some("hum_66666666666666666666666666666666".into()),
+        })
+        .unwrap();
+    assert_eq!(
+        remote.check_current(&review, Some(&other)).unwrap_err(),
+        "remote reviewer authority changed"
+    );
+    let accepted = remote
+        .accept(&review, rig.response(&review, true), &rig.device)
+        .unwrap();
+    assert_eq!(
+        remote
+            .can_read_receipt(&accepted, &other.device_id)
+            .unwrap_err(),
+        "receipt belongs to another reviewer"
+    );
+    remote.revalidate(&accepted).unwrap();
+}

@@ -4,6 +4,8 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub mod github;
+
 pub const INFERENCE_OPERATION: &str = "inference.fixed_completion";
 pub const INFERENCE_TASK_OPERATION: &str = "inference.fixed_manifest";
 pub const INFERENCE_INPUT_TOKENS: u32 = 512;
@@ -85,6 +87,9 @@ pub struct InferenceAction {
     pub model_artifact_sha256: String,
     pub source_id: String,
     pub source_snapshot_sha256: String,
+    /// Captured by the broker from its fixed public GitHub source during planning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_ci_snapshot: Option<github::GithubCiSnapshot>,
     #[serde(default)]
     pub prompt_sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,6 +129,19 @@ impl InferenceAction {
             crate::task::validate_github_token_ref(reference)
                 .map_err(|_| "invalid inference credential reference")?;
         }
+        if let Some(snapshot) = &self.github_ci_snapshot {
+            snapshot.validate()?;
+            if self.source_id != github::SOURCE_ID
+                || self.source_snapshot_sha256 != snapshot.digest()
+                || snapshot
+                    .prompt(self.ordinal)
+                    .map(|prompt| sha256(prompt.as_bytes()))
+                    .as_deref()
+                    != Some(self.prompt_sha256.as_str())
+            {
+                return Err("invalid GitHub inference source binding");
+            }
+        }
         if self.operation != INFERENCE_OPERATION
             || !(1..=3).contains(&self.ordinal)
             || !valid_label(&self.source_id)
@@ -159,6 +177,7 @@ pub fn validate_inference_actions(actions: &[&InferenceAction]) -> Result<(), &'
             || action.credential_ref != first.credential_ref
             || action.source_id != first.source_id
             || action.source_snapshot_sha256 != first.source_snapshot_sha256
+            || action.github_ci_snapshot != first.github_ci_snapshot
         {
             return Err("inference slots must share one trusted profile");
         }
@@ -244,6 +263,7 @@ impl InferenceReceipt {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
@@ -256,6 +276,7 @@ mod tests {
             model_id: "fixed-model".into(), model_artifact_sha256: "b".repeat(64),
             source_id: "public-demo".into(), source_snapshot_sha256: "c".repeat(64), prompt_sha256: prompt_sha256(prompt_id).unwrap(),
             credential_ref: None, options: InferenceOptions::default(),
+            github_ci_snapshot: None,
         }
     }
 

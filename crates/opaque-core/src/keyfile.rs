@@ -72,6 +72,7 @@ fn write_key_file(path: &Path, key: &[u8; 32]) -> io::Result<()> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

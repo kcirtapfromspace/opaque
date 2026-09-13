@@ -546,19 +546,24 @@ mod tests {
     async fn review_timeout_reports_last_stage_and_reaps_helper() {
         // Model a helper that has received the complete review and then stalls
         // at the window stage. The separate unread-input test covers a helper
-        // that never consumes its stdin.
+        // that never consumes its stdin. Use shell built-ins for this one-line
+        // fixture so a second process need not start before the stage marker.
+        // Leave startup headroom when other workspace tests compile/link; the
+        // helper's stall still greatly exceeds this test's explicit deadline.
         let (_directory, helper) = review_test_helper(
-            "cat > \"$0.review\" || exit 2\nprintf '%s\\n' $$ > \"$0.pid\"\nprintf '%s\\n' 'opaque-review-stage: window-ordered'\nexec /bin/sleep 5",
+            "IFS= read -r review\nprintf '%s' \"$review\" > \"$0.review\" || exit 2\nprintf '%s\\n' $$ > \"$0.pid\"\nprintf '%s\\n' 'opaque-review-stage: window-ordered'\nexec /bin/sleep 30",
         );
         let review = "complete task";
+        let deadline = std::time::Duration::from_secs(5);
         let started = std::time::Instant::now();
-        let error = run_task_review(&helper, review, std::time::Duration::from_secs(1))
+        let error = run_task_review(&helper, review, deadline)
             .await
             .unwrap_err()
             .to_string();
         assert!(error.contains("task review timed out"), "{error}");
         assert!(error.contains("last stage: window-ordered"), "{error}");
-        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        assert!(started.elapsed() >= deadline);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
         assert_eq!(
             std::fs::read_to_string(helper.with_extension("review")).unwrap(),
             review

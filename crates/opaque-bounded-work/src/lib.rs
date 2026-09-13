@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 //! Opaque's bounded agent work surface: the fixed-manifest task ledger
 //! (`task_api`/`task_store`), Vault-signed SSH certificate execution
 //! (`ssh`), inference brokering (`inference`), and the delegated metrics

@@ -10,7 +10,28 @@ permissions:
   id-token: write
 
 jobs:
+  qualify:
+    if: ${{ github.repository == 'kcirtapfromspace/opaque' && github.event.repository.private == false }}
+    name: Qualify tagged source (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --workspace --all-features
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12.11"
+      - run: python3 -B -m unittest discover -s scripts -p 'test_release_artifacts.py' -v
+      - run: python3 -B -m unittest discover -s scripts -p 'test_install_delivery.py' -v
+
   build:
+    needs: qualify
     # Release/signing automation belongs to the public product repository only.
     if: ${{ github.repository == 'kcirtapfromspace/opaque' && github.event.repository.private == false }}
     name: Build ${{ matrix.target }}
@@ -40,6 +61,10 @@ jobs:
           toolchain: "1.95.0"
           targets: ${{ matrix.target }}
 
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12.11"
+
       - name: Install cross-compilation tools
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
@@ -58,7 +83,7 @@ jobs:
 
       - name: Strip binaries
         run: |
-          for bin in opaqued opaque opaque-mcp opaque-approve-helper opaque-approver opaque-evidence opaque-web; do
+          for bin in opaqued opaque opaque-mcp opaque-mcp-contract opaque-approve-helper opaque-approver opaque-evidence opaque-web; do
             strip "target/${{ matrix.target }}/release/$bin" 2>/dev/null || true
           done
 
@@ -82,7 +107,7 @@ jobs:
           security list-keychain -d user -s "$KEYCHAIN_PATH"
 
           # Sign each binary
-          for bin in opaqued opaque opaque-mcp opaque-approve-helper opaque-approver opaque-evidence opaque-web; do
+          for bin in opaqued opaque opaque-mcp opaque-mcp-contract opaque-approve-helper opaque-approver opaque-evidence opaque-web; do
             codesign --force --options runtime --sign "$APPLE_SIGNING_IDENTITY" \
               "target/${{ matrix.target }}/release/$bin"
           done
@@ -120,6 +145,7 @@ jobs:
             target/${{ matrix.target }}/release/opaqued \
             target/${{ matrix.target }}/release/opaque \
             target/${{ matrix.target }}/release/opaque-mcp \
+            target/${{ matrix.target }}/release/opaque-mcp-contract \
             target/${{ matrix.target }}/release/opaque-approve-helper \
             target/${{ matrix.target }}/release/opaque-approver \
             target/${{ matrix.target }}/release/opaque-evidence \
@@ -133,6 +159,13 @@ jobs:
           xcrun stapler validate "target/${{ matrix.target }}/release/Opaque Reviewer.app"
           rm -f "$NOTARIZE_ZIP"
 
+      - name: Bind complete payload to tagged source
+        run: |
+          python3 scripts/release_artifacts.py manifest \
+            --binary-dir "target/${{ matrix.target }}/release" \
+            --target "${{ matrix.target }}" --version "${GITHUB_REF_NAME#v}" \
+            --revision "$GITHUB_SHA"
+
       - name: Create tarball
         id: tarball
         run: |
@@ -140,10 +173,28 @@ jobs:
           ARCHIVE="opaque-${TAG#v}-${{ matrix.target }}.tar.gz"
           EXTRAS=()
           if [[ "${{ matrix.target }}" == *apple-darwin ]]; then EXTRAS+=("Opaque Reviewer.app"); fi
-          tar czf "$ARCHIVE" \
+          # BSD tar otherwise adds unmanifested AppleDouble metadata files.
+          COPYFILE_DISABLE=1 tar czf "$ARCHIVE" \
             -C "target/${{ matrix.target }}/release" \
-            opaqued opaque opaque-mcp opaque-approve-helper opaque-approver opaque-evidence opaque-web "${EXTRAS[@]}"
+            opaqued opaque opaque-mcp opaque-mcp-contract opaque-approve-helper opaque-approver opaque-evidence opaque-web opaque-release.json "${EXTRAS[@]}"
           echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+
+      - name: Verify complete archive and smoke native binaries
+        run: |
+          SMOKE=()
+          HOST=$(rustc -vV | sed -n 's/^host: //p')
+          if [[ "$HOST" == "${{ matrix.target }}" ]]; then SMOKE+=(--smoke); fi
+          python3 scripts/release_artifacts.py verify \
+            --archive "${{ steps.tarball.outputs.archive }}" \
+            --target "${{ matrix.target }}" --version "${GITHUB_REF_NAME#v}" \
+            --revision "$GITHUB_SHA" "${SMOKE[@]}"
+          if [[ "${{ matrix.target }}" == *apple-darwin ]]; then
+            RELEASE_UNPACKED=$(mktemp -d)
+            trap 'rm -rf "$RELEASE_UNPACKED"' EXIT
+            tar xzf "${{ steps.tarball.outputs.archive }}" -C "$RELEASE_UNPACKED"
+            codesign --verify --deep --strict "$RELEASE_UNPACKED/Opaque Reviewer.app"
+            xcrun stapler validate "$RELEASE_UNPACKED/Opaque Reviewer.app"
+          fi
 
       - name: Generate SHA256 checksum
         run: shasum -a 256 "${{ steps.tarball.outputs.archive }}" > "${{ steps.tarball.outputs.archive }}.sha256"

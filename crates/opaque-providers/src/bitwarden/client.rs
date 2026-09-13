@@ -1,57 +1,74 @@
-//! Bitwarden Secrets Manager API client.
+//! Bitwarden Secrets Manager through the official `bws` CLI.
 //!
-//! Wraps the REST endpoints needed to browse projects/secrets and resolve
-//! secret values via the Bitwarden Secrets Manager API.
-//!
-//! **Never** leaks raw API error bodies to callers — all errors are
-//! mapped to sanitized strings.
+//! `bws` owns machine-token login, organization-key decryption and secret
+//! decryption. Opaque invokes only fixed read commands, with a pinned executable,
+//! isolated configuration, no persistent login state and bounded output.
 
-use serde::{Deserialize, Serialize};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
 
-/// Environment variable to override the default Bitwarden Secrets Manager base URL.
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncReadExt;
+use zeroize::{Zeroize, Zeroizing};
+
 pub const BITWARDEN_URL_ENV: &str = "OPAQUE_BITWARDEN_URL";
-
-/// Default Bitwarden Secrets Manager API base URL.
+pub const BITWARDEN_IDENTITY_URL_ENV: &str = "OPAQUE_BITWARDEN_IDENTITY_URL";
+pub const BITWARDEN_CLI_PATH_ENV: &str = "OPAQUE_BITWARDEN_CLI_PATH";
 pub const DEFAULT_BASE_URL: &str = "https://api.bitwarden.com";
+const MAX_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Bitwarden Secrets Manager API error types. Raw API error messages are never exposed.
+/// Errors never include child output, tokens, secret values or rejected URLs.
 #[derive(Debug, thiserror::Error)]
 pub enum BitwardenApiError {
-    #[error("network error communicating with Bitwarden Secrets Manager")]
-    Network(#[source] reqwest::Error),
-
-    #[error("Bitwarden Secrets Manager authentication failed (check access token)")]
-    Unauthorized,
-
-    #[error("resource not found: {0}")]
-    NotFound(String),
-
-    #[error("Bitwarden Secrets Manager server error")]
-    ServerError,
-
-    #[error("unexpected Bitwarden Secrets Manager response: status {0}")]
-    UnexpectedStatus(u16),
-
-    #[error("{0}")]
-    InvalidUrlScheme(String),
+    #[error("Bitwarden requires the official bws CLI; install it or set OPAQUE_BITWARDEN_CLI_PATH")]
+    CliUnavailable,
+    #[error("Bitwarden bws executable changed; restart the broker and review the new executable")]
+    ExecutableChanged,
+    #[error(
+        "invalid Bitwarden endpoint configuration (HTTPS required; no credentials, query or fragment)"
+    )]
+    InvalidEndpoint,
+    #[error(
+        "custom Bitwarden API URL requires OPAQUE_BITWARDEN_IDENTITY_URL (or a self-hosted URL ending in /api)"
+    )]
+    MissingIdentityEndpoint,
+    #[error("failed to create isolated Bitwarden CLI configuration")]
+    Configuration,
+    #[error(
+        "Bitwarden bws command failed (check machine access token, permissions and server configuration)"
+    )]
+    CommandFailed,
+    #[error("Bitwarden bws command timed out")]
+    Timeout,
+    #[error("Bitwarden bws response exceeds the output limit")]
+    OutputLimit,
+    #[error("Bitwarden bws returned an invalid response")]
+    InvalidResponse,
+    #[error("invalid Bitwarden UUID selector")]
+    InvalidSelector,
+    #[error("Bitwarden resource not found")]
+    NotFound,
+    #[error("Bitwarden name is ambiguous; use a unique project/key or secret UUID")]
+    AmbiguousName,
 }
 
-/// A Bitwarden Secrets Manager project.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BitwardenProject {
     pub id: String,
     pub name: String,
 }
 
-/// A Bitwarden secret summary (returned by list endpoints, no value).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BitwardenSecretSummary {
     pub id: String,
     pub key: String,
 }
 
-/// A Bitwarden secret with its value.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct BitwardenSecret {
     pub id: String,
     pub key: String,
@@ -63,152 +80,278 @@ pub struct BitwardenSecret {
     pub project_id: Option<String>,
 }
 
-/// Validate that a URL uses `https://`, allowing `http://` only for localhost.
-fn validate_url_scheme(url: &str) -> Result<(), BitwardenApiError> {
-    crate::endpoint::validate_http_endpoint(url)
-        .map_err(|message| BitwardenApiError::InvalidUrlScheme(message.into()))
+impl std::fmt::Debug for BitwardenSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BitwardenSecret")
+            .field("id", &self.id)
+            .field("key", &self.key)
+            .field("value", &"[REDACTED]")
+            .finish()
+    }
 }
 
-/// Bitwarden Secrets Manager REST API client.
-///
-/// Follows the same pattern as `OnePasswordClient`: no stored token (passed
-/// per-call), timeouts, and a user-agent header.
+impl Drop for BitwardenSecret {
+    fn drop(&mut self) {
+        self.value.zeroize();
+        self.note.zeroize();
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BitwardenClient {
-    http: reqwest::Client,
     base_url: String,
+    identity_url: String,
+    executable: PathBuf,
+    executable_sha256: String,
+    timeout: Duration,
+}
+
+fn validate_endpoint(url: &str) -> Result<String, BitwardenApiError> {
+    crate::endpoint::validate_http_endpoint(url).map_err(|_| BitwardenApiError::InvalidEndpoint)?;
+    // Official bws enforces HTTPS, including for loopback destinations.
+    if !url.starts_with("https://") {
+        return Err(BitwardenApiError::InvalidEndpoint);
+    }
+    Ok(url.trim_end_matches('/').to_owned())
+}
+
+fn identity_url(api_url: &str, explicit: Option<&str>) -> Result<String, BitwardenApiError> {
+    if let Some(explicit) = explicit {
+        return validate_endpoint(explicit);
+    }
+    match api_url {
+        "https://api.bitwarden.com" => Ok("https://identity.bitwarden.com".into()),
+        "https://api.bitwarden.eu" => Ok("https://identity.bitwarden.eu".into()),
+        _ => api_url
+            .strip_suffix("/api")
+            .map(|base| format!("{base}/identity"))
+            .ok_or(BitwardenApiError::MissingIdentityEndpoint),
+    }
+}
+
+fn executable_digest(path: &Path) -> Result<String, BitwardenApiError> {
+    let mut file = std::fs::File::open(path).map_err(|_| BitwardenApiError::CliUnavailable)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| BitwardenApiError::CliUnavailable)?;
+    if !metadata.is_file() {
+        return Err(BitwardenApiError::CliUnavailable);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err(BitwardenApiError::CliUnavailable);
+        }
+    }
+    let mut hash = Sha256::new();
+    let mut buffer = [0; 65536];
+    loop {
+        let n = file
+            .read(&mut buffer)
+            .map_err(|_| BitwardenApiError::CliUnavailable)?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buffer[..n]);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+pub(super) fn validate_id(id: &str) -> Result<(), BitwardenApiError> {
+    uuid::Uuid::parse_str(id)
+        .ok()
+        .filter(|id| !id.is_nil())
+        .map(|_| ())
+        .ok_or(BitwardenApiError::InvalidSelector)
 }
 
 impl BitwardenClient {
-    /// Credential-free endpoint frozen when the client was constructed.
     pub(super) fn base_url(&self) -> &str {
         &self.base_url
     }
-
-    /// Build the user-agent string from the crate version.
-    fn user_agent() -> String {
-        format!("opaqued/{}", env!("CARGO_PKG_VERSION"))
+    pub(super) fn identity_url(&self) -> &str {
+        &self.identity_url
+    }
+    pub(super) fn executable_path(&self) -> &Path {
+        &self.executable
+    }
+    pub(super) fn executable_sha256(&self) -> &str {
+        &self.executable_sha256
     }
 
-    /// Create a new client pointing at the given Bitwarden Secrets Manager URL.
+    /// Construct without reading a token or starting the CLI. API and identity
+    /// endpoints plus executable identity are frozen before approval.
     pub fn new(base_url: &str) -> Result<Self, BitwardenApiError> {
-        validate_url_scheme(base_url)?;
+        let api = validate_endpoint(base_url)?;
+        let identity = identity_url(
+            &api,
+            std::env::var(BITWARDEN_IDENTITY_URL_ENV).ok().as_deref(),
+        )?;
+        let executable = if let Some(path) = std::env::var_os(BITWARDEN_CLI_PATH_ENV) {
+            PathBuf::from(path)
+        } else {
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                .map(|dir| dir.join(if cfg!(windows) { "bws.exe" } else { "bws" }))
+                .find(|path| executable_digest(path).is_ok())
+                .ok_or(BitwardenApiError::CliUnavailable)?
+        };
+        Self::with_executable(&api, &identity, &executable)
+    }
 
-        let http = reqwest::Client::builder()
-            .user_agent(Self::user_agent())
-            .timeout(std::time::Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .build()
-            .map_err(BitwardenApiError::Network)?;
-
+    pub(super) fn with_executable(
+        api: &str,
+        identity: &str,
+        executable: &Path,
+    ) -> Result<Self, BitwardenApiError> {
+        let executable = executable
+            .canonicalize()
+            .map_err(|_| BitwardenApiError::CliUnavailable)?;
+        let executable_sha256 = executable_digest(&executable)?;
         Ok(Self {
-            http,
-            base_url: base_url.trim_end_matches('/').to_owned(),
+            base_url: validate_endpoint(api)?,
+            identity_url: validate_endpoint(identity)?,
+            executable,
+            executable_sha256,
+            timeout: COMMAND_TIMEOUT,
         })
     }
 
-    /// List all projects accessible with the given token.
+    async fn run<T: DeserializeOwned>(
+        &self,
+        token: &str,
+        args: &[&str],
+    ) -> Result<T, BitwardenApiError> {
+        if token.is_empty() || token.contains('\0') {
+            return Err(BitwardenApiError::CommandFailed);
+        }
+        if executable_digest(&self.executable).map_err(|_| BitwardenApiError::ExecutableChanged)?
+            != self.executable_sha256
+        {
+            return Err(BitwardenApiError::ExecutableChanged);
+        }
+        // The official CLI reads this TOML schema. Explicit API/identity values
+        // prevent ambient bws profiles or BWS_SERVER_URL changing destinations.
+        // Quoted booleans support released bws 2.1.0 and newer parsers.
+        let mut config =
+            tempfile::NamedTempFile::new().map_err(|_| BitwardenApiError::Configuration)?;
+        let config_text = format!(
+            "[profiles.opaque]\nserver_api = {}\nserver_identity = {}\nstate_opt_out = \"true\"\n",
+            serde_json::to_string(&self.base_url).map_err(|_| BitwardenApiError::Configuration)?,
+            serde_json::to_string(&self.identity_url)
+                .map_err(|_| BitwardenApiError::Configuration)?
+        );
+        config
+            .write_all(config_text.as_bytes())
+            .map_err(|_| BitwardenApiError::Configuration)?;
+        config
+            .flush()
+            .map_err(|_| BitwardenApiError::Configuration)?;
+        let mut command = tokio::process::Command::new(&self.executable);
+        command
+            .env_clear()
+            .env("BWS_ACCESS_TOKEN", token)
+            .arg("--config-file")
+            .arg(config.path())
+            .args(["--profile", "opaque", "--output", "json", "--color", "no"])
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        if let Some(root) = std::env::var_os("SystemRoot") {
+            command.env("SystemRoot", root);
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|_| BitwardenApiError::CliUnavailable)?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or(BitwardenApiError::CommandFailed)?;
+        let mut output = Zeroizing::new(Vec::new());
+        let result = tokio::time::timeout(self.timeout, async {
+            stdout
+                .take(MAX_OUTPUT_BYTES + 1)
+                .read_to_end(&mut output)
+                .await
+                .map_err(|_| BitwardenApiError::CommandFailed)?;
+            if output.len() as u64 > MAX_OUTPUT_BYTES {
+                return Err(BitwardenApiError::OutputLimit);
+            }
+            let status = child
+                .wait()
+                .await
+                .map_err(|_| BitwardenApiError::CommandFailed)?;
+            if !status.success() {
+                return Err(BitwardenApiError::CommandFailed);
+            }
+            serde_json::from_slice(&output).map_err(|_| BitwardenApiError::InvalidResponse)
+        })
+        .await;
+        match result {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => {
+                let _ = child.kill().await;
+                Err(error)
+            }
+            Err(_) => {
+                let _ = child.kill().await;
+                Err(BitwardenApiError::Timeout)
+            }
+        }
+    }
+
     pub async fn list_projects(
         &self,
         token: &str,
     ) -> Result<Vec<BitwardenProject>, BitwardenApiError> {
-        let url = format!("{}/api/projects", self.base_url);
-
-        let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(token)
-            .send()
-            .await
-            .map_err(BitwardenApiError::Network)?;
-
-        match resp.status().as_u16() {
-            200 => resp
-                .json::<Vec<BitwardenProject>>()
-                .await
-                .map_err(BitwardenApiError::Network),
-            401 | 403 => Err(BitwardenApiError::Unauthorized),
-            404 => Err(BitwardenApiError::NotFound("projects endpoint".into())),
-            500..=599 => Err(BitwardenApiError::ServerError),
-            other => Err(BitwardenApiError::UnexpectedStatus(other)),
-        }
+        self.run(token, &["project", "list"]).await
     }
 
-    /// List secrets, optionally filtered by project ID.
     pub async fn list_secrets(
         &self,
         token: &str,
         project_id: Option<&str>,
     ) -> Result<Vec<BitwardenSecretSummary>, BitwardenApiError> {
-        let mut url = format!("{}/api/secrets", self.base_url);
-        if let Some(pid) = project_id {
-            url = format!("{url}?projectId={pid}");
+        let mut args = vec!["secret", "list"];
+        if let Some(id) = project_id {
+            validate_id(id)?;
+            args.push(id);
         }
-
-        let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(token)
-            .send()
-            .await
-            .map_err(BitwardenApiError::Network)?;
-
-        match resp.status().as_u16() {
-            200 => resp
-                .json::<Vec<BitwardenSecretSummary>>()
-                .await
-                .map_err(BitwardenApiError::Network),
-            401 | 403 => Err(BitwardenApiError::Unauthorized),
-            404 => Err(BitwardenApiError::NotFound("secrets endpoint".into())),
-            500..=599 => Err(BitwardenApiError::ServerError),
-            other => Err(BitwardenApiError::UnexpectedStatus(other)),
-        }
+        // Deserialize metadata only; returned plaintext values/notes are skipped
+        // by serde and the complete raw stdout buffer is zeroized on drop.
+        self.run(token, &args).await
     }
 
-    /// Get a single secret with its value.
     pub async fn get_secret(
         &self,
         token: &str,
         secret_id: &str,
     ) -> Result<BitwardenSecret, BitwardenApiError> {
-        let url = format!("{}/api/secrets/{}", self.base_url, secret_id);
-
-        let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(token)
-            .send()
-            .await
-            .map_err(BitwardenApiError::Network)?;
-
-        match resp.status().as_u16() {
-            200 => resp
-                .json::<BitwardenSecret>()
-                .await
-                .map_err(BitwardenApiError::Network),
-            401 | 403 => Err(BitwardenApiError::Unauthorized),
-            404 => Err(BitwardenApiError::NotFound(format!("secret {secret_id}"))),
-            500..=599 => Err(BitwardenApiError::ServerError),
-            other => Err(BitwardenApiError::UnexpectedStatus(other)),
+        validate_id(secret_id)?;
+        let secret: BitwardenSecret = self.run(token, &["secret", "get", secret_id]).await?;
+        if uuid::Uuid::parse_str(&secret.id).ok() != uuid::Uuid::parse_str(secret_id).ok() {
+            return Err(BitwardenApiError::InvalidResponse);
         }
+        Ok(secret)
     }
 
-    /// Resolve a project name to its ID by listing all projects and matching by name.
     pub async fn find_project_by_name(
         &self,
         token: &str,
         name: &str,
     ) -> Result<String, BitwardenApiError> {
         let projects = self.list_projects(token).await?;
-        projects
-            .into_iter()
-            .find(|p| p.name == name)
-            .map(|p| p.id)
-            .ok_or_else(|| BitwardenApiError::NotFound(format!("project '{name}'")))
+        unique_id(
+            projects
+                .into_iter()
+                .filter(|p| p.name == name)
+                .map(|p| p.id),
+        )
     }
 
-    /// Resolve a secret key to its ID within a project.
     pub async fn find_secret_by_key(
         &self,
         token: &str,
@@ -216,542 +359,19 @@ impl BitwardenClient {
         key: &str,
     ) -> Result<String, BitwardenApiError> {
         let secrets = self.list_secrets(token, Some(project_id)).await?;
-        secrets
-            .into_iter()
-            .find(|s| s.key == key)
-            .map(|s| s.id)
-            .ok_or_else(|| BitwardenApiError::NotFound(format!("secret '{key}' in project")))
+        unique_id(secrets.into_iter().filter(|s| s.key == key).map(|s| s.id))
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+fn unique_id(mut ids: impl Iterator<Item = String>) -> Result<String, BitwardenApiError> {
+    let id = ids.next().ok_or(BitwardenApiError::NotFound)?;
+    if ids.next().is_some() {
+        return Err(BitwardenApiError::AmbiguousName);
+    }
+    validate_id(&id)?;
+    Ok(id)
+}
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn constructor_rejects_sensitive_endpoint_without_echoing_it() {
-        for endpoint in [
-            "https://endpoint-secret@example.test",
-            "https://user:endpoint-secret@example.test",
-            "https://example.test?token=endpoint-secret",
-            "https://example.test#endpoint-secret",
-            "https://@example.test",
-            "https://example.test?",
-            "https://example.test#",
-            "https:///example.test",
-            "https://example.test/\nendpoint-secret",
-        ] {
-            let error = BitwardenClient::new(endpoint).unwrap_err().to_string();
-            assert!(!error.contains("endpoint-secret"));
-            assert!(!error.contains(endpoint));
-        }
-    }
-
-    #[tokio::test]
-    async fn request_does_not_follow_redirect_or_repeat_failure() {
-        for status in [302, 307, 503] {
-            let server = MockServer::start().await;
-            Mock::given(method("GET"))
-                .and(path("/api/projects"))
-                .and(header("Authorization", "Bearer fixture-token"))
-                .respond_with(
-                    ResponseTemplate::new(status)
-                        .insert_header("Location", format!("{}/forbidden-follow", server.uri())),
-                )
-                .expect(1)
-                .mount(&server)
-                .await;
-            Mock::given(path("/forbidden-follow"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
-                .expect(0)
-                .mount(&server)
-                .await;
-            let client = BitwardenClient::new(&server.uri()).unwrap();
-            let error = client.list_projects("fixture-token").await.unwrap_err();
-            if status == 503 {
-                assert!(matches!(error, BitwardenApiError::ServerError));
-            } else {
-                assert!(
-                    matches!(error, BitwardenApiError::UnexpectedStatus(code) if code == status)
-                );
-            }
-            assert_eq!(server.received_requests().await.unwrap().len(), 1);
-        }
-    }
-
-    #[test]
-    fn client_stores_base_url_trimmed() {
-        let client = BitwardenClient::new("http://localhost:8080/").unwrap();
-        assert_eq!(client.base_url, "http://localhost:8080");
-    }
-
-    #[test]
-    fn client_base_url_no_trailing_slash() {
-        let client = BitwardenClient::new("http://localhost:8080").unwrap();
-        assert_eq!(client.base_url, "http://localhost:8080");
-    }
-
-    #[test]
-    fn user_agent_contains_version() {
-        let ua = BitwardenClient::user_agent();
-        assert!(ua.starts_with("opaqued/"));
-    }
-
-    #[test]
-    fn project_deserialize() {
-        let json = r#"{"id":"proj-123","name":"My Project"}"#;
-        let project: BitwardenProject = serde_json::from_str(json).unwrap();
-        assert_eq!(project.id, "proj-123");
-        assert_eq!(project.name, "My Project");
-    }
-
-    #[test]
-    fn secret_summary_deserialize() {
-        let json = r#"{"id":"sec-456","key":"DB_PASSWORD"}"#;
-        let secret: BitwardenSecretSummary = serde_json::from_str(json).unwrap();
-        assert_eq!(secret.id, "sec-456");
-        assert_eq!(secret.key, "DB_PASSWORD");
-    }
-
-    #[test]
-    fn secret_deserialize_with_value() {
-        let json = r#"{
-            "id": "sec-456",
-            "key": "DB_PASSWORD",
-            "value": "supersecret",
-            "note": "Production database password",
-            "projectId": "proj-123"
-        }"#;
-        let secret: BitwardenSecret = serde_json::from_str(json).unwrap();
-        assert_eq!(secret.id, "sec-456");
-        assert_eq!(secret.key, "DB_PASSWORD");
-        assert_eq!(secret.value.as_deref(), Some("supersecret"));
-        assert_eq!(secret.note.as_deref(), Some("Production database password"));
-        assert_eq!(secret.project_id.as_deref(), Some("proj-123"));
-    }
-
-    #[test]
-    fn secret_deserialize_minimal() {
-        let json = r#"{"id": "sec-456", "key": "TOKEN"}"#;
-        let secret: BitwardenSecret = serde_json::from_str(json).unwrap();
-        assert_eq!(secret.id, "sec-456");
-        assert!(secret.value.is_none());
-        assert!(secret.note.is_none());
-        assert!(secret.project_id.is_none());
-    }
-
-    #[test]
-    fn bitwarden_api_error_display() {
-        let err = BitwardenApiError::Unauthorized;
-        assert!(format!("{err}").contains("authentication failed"));
-
-        let err = BitwardenApiError::NotFound("secret 'test'".into());
-        assert!(format!("{err}").contains("not found"));
-
-        let err = BitwardenApiError::ServerError;
-        assert!(format!("{err}").contains("server error"));
-
-        let err = BitwardenApiError::UnexpectedStatus(418);
-        assert!(format!("{err}").contains("418"));
-    }
-
-    #[test]
-    fn projects_list_deserialize() {
-        let json = r#"[
-            {"id":"p1","name":"Production"},
-            {"id":"p2","name":"Staging"}
-        ]"#;
-        let projects: Vec<BitwardenProject> = serde_json::from_str(json).unwrap();
-        assert_eq!(projects.len(), 2);
-        assert_eq!(projects[0].name, "Production");
-        assert_eq!(projects[1].name, "Staging");
-    }
-
-    #[test]
-    fn secrets_list_deserialize() {
-        let json = r#"[
-            {"id":"s1","key":"DB_PASSWORD"},
-            {"id":"s2","key":"API_KEY"}
-        ]"#;
-        let secrets: Vec<BitwardenSecretSummary> = serde_json::from_str(json).unwrap();
-        assert_eq!(secrets.len(), 2);
-        assert_eq!(secrets[0].key, "DB_PASSWORD");
-        assert_eq!(secrets[1].key, "API_KEY");
-    }
-
-    // -----------------------------------------------------------------------
-    // Integration tests using wiremock
-    // -----------------------------------------------------------------------
-
-    use wiremock::matchers::{header, method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    #[tokio::test]
-    async fn list_projects_success() {
-        let mock_server = MockServer::start().await;
-
-        Mock::given(method("GET"))
-            .and(path("/api/projects"))
-            .and(header("Authorization", "Bearer test-token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"id": "p1", "name": "Production"},
-                {"id": "p2", "name": "Staging"}
-            ])))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let client = BitwardenClient::new(&mock_server.uri()).unwrap();
-        let projects = client.list_projects("test-token").await.unwrap();
-
-        assert_eq!(projects.len(), 2);
-        assert_eq!(projects[0].id, "p1");
-        assert_eq!(projects[0].name, "Production");
-        assert_eq!(projects[1].id, "p2");
-        assert_eq!(projects[1].name, "Staging");
-    }
-
-    #[tokio::test]
-    async fn list_projects_unauthorized() {
-        let mock_server = MockServer::start().await;
-
-        Mock::given(method("GET"))
-            .and(path("/api/projects"))
-            .respond_with(ResponseTemplate::new(401))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let client = BitwardenClient::new(&mock_server.uri()).unwrap();
-        let result = client.list_projects("bad-token").await;
-
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            BitwardenApiError::Unauthorized
-        ));
-    }
-
-    #[tokio::test]
-    async fn list_projects_server_error() {
-        let mock_server = MockServer::start().await;
-
-        Mock::given(method("GET"))
-            .and(path("/api/projects"))
-            .respond_with(ResponseTemplate::new(500))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let client = BitwardenClient::new(&mock_server.uri()).unwrap();
-        let result = client.list_projects("token").await;
-
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            BitwardenApiError::ServerError
-        ));
-    }
-
-    #[tokio::test]
-    async fn list_secrets_success() {
-        let mock_server = MockServer::start().await;
-
-        Mock::given(method("GET"))
-            .and(path("/api/secrets"))
-            .and(header("Authorization", "Bearer test-token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"id": "s1", "key": "DB_PASSWORD"},
-                {"id": "s2", "key": "API_KEY"}
-            ])))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let client = BitwardenClient::new(&mock_server.uri()).unwrap();
-        let secrets = client.list_secrets("test-token", None).await.unwrap();
-
-        assert_eq!(secrets.len(), 2);
-        assert_eq!(secrets[0].key, "DB_PASSWORD");
-        assert_eq!(secrets[1].key, "API_KEY");
-    }
-
-    #[tokio::test]
-    async fn get_secret_success() {
-        let mock_server = MockServer::start().await;
-
-        Mock::given(method("GET"))
-            .and(path("/api/secrets/sec-123"))
-            .and(header("Authorization", "Bearer test-token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "sec-123",
-                "key": "DB_PASSWORD",
-                "value": "supersecret",
-                "note": "Production DB",
-                "projectId": "proj-1"
-            })))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let client = BitwardenClient::new(&mock_server.uri()).unwrap();
-        let secret = client.get_secret("test-token", "sec-123").await.unwrap();
-
-        assert_eq!(secret.id, "sec-123");
-        assert_eq!(secret.key, "DB_PASSWORD");
-        assert_eq!(secret.value.as_deref(), Some("supersecret"));
-        assert_eq!(secret.note.as_deref(), Some("Production DB"));
-        assert_eq!(secret.project_id.as_deref(), Some("proj-1"));
-    }
-
-    #[tokio::test]
-    async fn get_secret_not_found() {
-        let mock_server = MockServer::start().await;
-
-        Mock::given(method("GET"))
-            .and(path("/api/secrets/missing"))
-            .respond_with(ResponseTemplate::new(404))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let client = BitwardenClient::new(&mock_server.uri()).unwrap();
-        let result = client.get_secret("token", "missing").await;
-
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            BitwardenApiError::NotFound(_)
-        ));
-    }
-
-    #[tokio::test]
-    async fn find_project_by_name_success() {
-        let mock_server = MockServer::start().await;
-
-        Mock::given(method("GET"))
-            .and(path("/api/projects"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"id": "p1", "name": "Production"},
-                {"id": "p2", "name": "Staging"}
-            ])))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let client = BitwardenClient::new(&mock_server.uri()).unwrap();
-        let project_id = client
-            .find_project_by_name("token", "Staging")
-            .await
-            .unwrap();
-        assert_eq!(project_id, "p2");
-    }
-
-    #[tokio::test]
-    async fn find_project_by_name_not_found() {
-        let mock_server = MockServer::start().await;
-
-        Mock::given(method("GET"))
-            .and(path("/api/projects"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"id": "p1", "name": "Production"}
-            ])))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let client = BitwardenClient::new(&mock_server.uri()).unwrap();
-        let result = client.find_project_by_name("token", "Nonexistent").await;
-
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            BitwardenApiError::NotFound(_)
-        ));
-    }
-
-    #[tokio::test]
-    async fn find_secret_by_key_success() {
-        let mock_server = MockServer::start().await;
-
-        Mock::given(method("GET"))
-            .and(path("/api/secrets"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"id": "s1", "key": "DB_PASSWORD"},
-                {"id": "s2", "key": "API_KEY"}
-            ])))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let client = BitwardenClient::new(&mock_server.uri()).unwrap();
-        let secret_id = client
-            .find_secret_by_key("token", "p1", "API_KEY")
-            .await
-            .unwrap();
-        assert_eq!(secret_id, "s2");
-    }
-
-    /// Full end-to-end resolution chain:
-    /// find_project_by_name → find_secret_by_key → get_secret → extract value
-    #[tokio::test]
-    async fn full_resolution_chain() {
-        let mock_server = MockServer::start().await;
-
-        // Step 1: list projects → find "Production" → project_id="p1"
-        Mock::given(method("GET"))
-            .and(path("/api/projects"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"id": "p1", "name": "Production"}
-            ])))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        // Step 2: list secrets in project → find "DB_PASSWORD" → secret_id="s1"
-        Mock::given(method("GET"))
-            .and(path("/api/secrets"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"id": "s1", "key": "DB_PASSWORD"}
-            ])))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        // Step 3: get secret s1 → extract value
-        Mock::given(method("GET"))
-            .and(path("/api/secrets/s1"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "s1",
-                "key": "DB_PASSWORD",
-                "value": "realpassword123",
-                "projectId": "p1"
-            })))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let client = BitwardenClient::new(&mock_server.uri()).unwrap();
-        let token = "test-token";
-
-        let project_id = client
-            .find_project_by_name(token, "Production")
-            .await
-            .unwrap();
-        assert_eq!(project_id, "p1");
-
-        let secret_id = client
-            .find_secret_by_key(token, &project_id, "DB_PASSWORD")
-            .await
-            .unwrap();
-        assert_eq!(secret_id, "s1");
-
-        let secret = client.get_secret(token, &secret_id).await.unwrap();
-        assert_eq!(secret.value.as_deref(), Some("realpassword123"));
-    }
-
-    /// Verify bearer token is sent correctly in the Authorization header.
-    #[tokio::test]
-    async fn bearer_auth_header_sent() {
-        let mock_server = MockServer::start().await;
-
-        Mock::given(method("GET"))
-            .and(path("/api/projects"))
-            .and(header("Authorization", "Bearer my-secret-token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let client = BitwardenClient::new(&mock_server.uri()).unwrap();
-        let projects = client.list_projects("my-secret-token").await.unwrap();
-        assert!(projects.is_empty());
-    }
-
-    /// Verify the user-agent header is sent.
-    #[tokio::test]
-    async fn user_agent_header_sent() {
-        let mock_server = MockServer::start().await;
-
-        Mock::given(method("GET"))
-            .and(path("/api/projects"))
-            .and(header(
-                "user-agent",
-                &format!("opaqued/{}", env!("CARGO_PKG_VERSION")),
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let client = BitwardenClient::new(&mock_server.uri()).unwrap();
-        client.list_projects("token").await.unwrap();
-    }
-
-    /// Verify unexpected status codes are handled.
-    #[tokio::test]
-    async fn unexpected_status_code() {
-        let mock_server = MockServer::start().await;
-
-        Mock::given(method("GET"))
-            .and(path("/api/projects"))
-            .respond_with(ResponseTemplate::new(418)) // I'm a teapot
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let client = BitwardenClient::new(&mock_server.uri()).unwrap();
-        let result = client.list_projects("token").await;
-        assert!(matches!(
-            result.unwrap_err(),
-            BitwardenApiError::UnexpectedStatus(418)
-        ));
-    }
-
-    /// Verify 403 is treated as unauthorized (same as 401).
-    #[tokio::test]
-    async fn forbidden_treated_as_unauthorized() {
-        let mock_server = MockServer::start().await;
-
-        Mock::given(method("GET"))
-            .and(path("/api/projects"))
-            .respond_with(ResponseTemplate::new(403))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let client = BitwardenClient::new(&mock_server.uri()).unwrap();
-        let result = client.list_projects("token").await;
-        assert!(matches!(
-            result.unwrap_err(),
-            BitwardenApiError::Unauthorized
-        ));
-    }
-
-    #[test]
-    fn validate_url_scheme_accepts_https() {
-        validate_url_scheme("https://api.bitwarden.com").unwrap();
-    }
-
-    #[test]
-    fn validate_url_scheme_accepts_localhost_http() {
-        validate_url_scheme("http://localhost:8080").unwrap();
-        validate_url_scheme("http://127.0.0.1:9000/api").unwrap();
-    }
-
-    #[test]
-    fn validate_url_scheme_rejects_remote_http() {
-        let err = validate_url_scheme("http://api.bitwarden.com").unwrap_err();
-        assert!(err.to_string().contains("insecure HTTP URL rejected"));
-    }
-
-    #[test]
-    fn validate_url_scheme_rejects_ftp() {
-        let err = validate_url_scheme("ftp://example.com/file").unwrap_err();
-        assert!(err.to_string().contains("unsupported URL scheme"));
-    }
-}
+#[path = "client_tests.rs"]
+mod tests;

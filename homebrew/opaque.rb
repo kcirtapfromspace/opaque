@@ -39,6 +39,7 @@ class Opaque < Formula
     bin.install "opaque-web"
     # Older tagged archives predate these tools. A release containing them must
     # make them available without breaking installation of the existing tags.
+    bin.install "opaque-mcp-contract" if File.file?("opaque-mcp-contract")
     bin.install "opaque-approver" if File.file?("opaque-approver")
     bin.install "opaque-evidence" if File.file?("opaque-evidence")
     prefix.install "Opaque Reviewer.app" if OS.mac? && File.directory?("Opaque Reviewer.app")

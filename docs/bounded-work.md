@@ -129,11 +129,13 @@ bindings; the opt-in live Vault/SSH test needs separately provisioned disposable
 services. `opaque task plan-ssh` does not provision a host, configure its guard,
 install Vault or establish a successful native review ceremony.
 
-Application-evidence (`Inference`) currently uses three fixed synthetic public
-source prompts, with an explicitly configured tenant/model profile. It is not a
-general query connector or proof of tenant-aware private data access. Real private
-sources require a separately qualified source adapter, identity/resource-token
-contract and disclosure policy; see [enterprise architecture](enterprise-architecture.md).
+Application-evidence (`Inference`) supports a broker-captured sample of public
+GitHub workflow results, or the legacy explicit synthetic source. The configured
+repository, workflow and branch select up to three typed observations; the exact
+snapshot and three prompts are bound to the reviewed manifest. See
+[GitHub CI inference](github-ci-inference.md) for configuration and evidence limits.
+Private repositories, arbitrary queries, repository text and CI logs are not
+accepted by this source adapter.
 
 [Signed evidence checkpoints](evidence-checkpoints.md) let another recipient verify
 the producer and exact exported audit range without the audit HMAC key. They do not

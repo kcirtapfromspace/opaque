@@ -441,6 +441,7 @@ mod tests {
                 exe_path: None,
                 exe_sha256: None,
                 codesign_team_id: None,
+                workload: None,
             },
             client_type: opaque_core::operation::ClientType::Agent,
             principal: None,

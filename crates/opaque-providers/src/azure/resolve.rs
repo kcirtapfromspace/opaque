@@ -1,288 +1,125 @@
-//! Azure Key Vault secret resolver.
-//!
-//! Resolves `azure:<vault-name>/<secret-name>` or
-//! `azure:<vault-name>/<secret-name>/<version>` references using the
-//! Azure Key Vault REST API.
-//!
-//! The Azure AD credentials (tenant ID, client ID, client secret) are
-//! resolved via environment variables. The vault URL is constructed from
-//! the vault name or overridden via `OPAQUE_AZURE_VAULT_URL`.
-
-use opaque_core::resolver::{ResolveError, SecretResolver};
-use opaque_core::secret::SecretValue;
-
-use super::client::{
-    AZURE_CLIENT_ID_ENV, AZURE_CLIENT_SECRET_ENV, AZURE_TENANT_ID_ENV, AZURE_VAULT_URL_ENV,
-    AzureKeyVaultClient,
+//! Resolve only the configured Azure vault into a zeroizing consumer value.
+use super::client::{AzureKeyVaultClient, validate_name, validate_vault, validate_version};
+use opaque_core::{
+    resolver::{ResolveError, SecretResolver},
+    secret::SecretValue,
 };
-
-/// Resolves `azure:<vault>/<secret>` or `azure:<vault>/<secret>/<version>` secret references.
-pub struct AzureResolver;
-
+pub struct AzureResolver {
+    client: AzureKeyVaultClient,
+}
 impl std::fmt::Debug for AzureResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AzureResolver").finish()
+        f.debug_struct("AzureResolver").finish_non_exhaustive()
     }
 }
-
-/// Parsed Azure Key Vault ref.
-#[derive(Debug, PartialEq)]
-enum AzureRef<'a> {
-    /// `azure:<vault>/<secret>` — latest version.
-    Latest {
-        vault_name: &'a str,
-        secret_name: &'a str,
-    },
-    /// `azure:<vault>/<secret>/<version>` — specific version.
-    Versioned {
-        vault_name: &'a str,
-        secret_name: &'a str,
-        version: &'a str,
-    },
-}
-
 impl AzureResolver {
-    /// Parse an `azure:` ref into its components.
-    ///
-    /// Formats:
-    /// - `azure:<vault-name>/<secret-name>` — latest version
-    /// - `azure:<vault-name>/<secret-name>/<version>` — specific version
-    fn parse_ref(ref_str: &str) -> Result<AzureRef<'_>, ResolveError> {
-        let rest = ref_str
+    pub fn new(client: AzureKeyVaultClient) -> Self {
+        Self { client }
+    }
+    fn parse_ref(value: &str) -> Result<(&str, &str, Option<&str>), ResolveError> {
+        let rest = value
             .strip_prefix("azure:")
-            .ok_or_else(|| ResolveError::UnknownScheme(ref_str.to_owned()))?;
-
-        if rest.is_empty() {
+            .ok_or_else(|| ResolveError::UnknownScheme(value.into()))?;
+        let parts: Vec<_> = rest.split('/').collect();
+        if !(2..=3).contains(&parts.len())
+            || validate_vault(parts[0]).is_err()
+            || validate_name(parts[1]).is_err()
+            || parts.get(2).is_some_and(|v| validate_version(v).is_err())
+        {
             return Err(ResolveError::AzureError(
-                ref_str.to_owned(),
-                "empty ref after 'azure:' prefix".into(),
+                "azure:".into(),
+                "expected azure:vault/secret[/version] with valid resource IDs".into(),
             ));
         }
-
-        let parts: Vec<&str> = rest.splitn(3, '/').collect();
-        match parts.len() {
-            1 => {
-                // No slash at all — missing secret name.
-                Err(ResolveError::AzureError(
-                    ref_str.to_owned(),
-                    "expected format azure:<vault>/<secret> or azure:<vault>/<secret>/<version>"
-                        .into(),
-                ))
-            }
-            2 => {
-                let vault_name = parts[0];
-                let secret_name = parts[1];
-
-                if vault_name.is_empty() || secret_name.is_empty() {
-                    return Err(ResolveError::AzureError(
-                        ref_str.to_owned(),
-                        "vault name and secret name must be non-empty".into(),
-                    ));
-                }
-
-                Ok(AzureRef::Latest {
-                    vault_name,
-                    secret_name,
-                })
-            }
-            3 => {
-                let vault_name = parts[0];
-                let secret_name = parts[1];
-                let version = parts[2];
-
-                if vault_name.is_empty() || secret_name.is_empty() || version.is_empty() {
-                    return Err(ResolveError::AzureError(
-                        ref_str.to_owned(),
-                        "vault name, secret name, and version must be non-empty".into(),
-                    ));
-                }
-
-                Ok(AzureRef::Versioned {
-                    vault_name,
-                    secret_name,
-                    version,
-                })
-            }
-            _ => unreachable!("splitn(3) can return at most 3 parts"),
-        }
-    }
-
-    /// Construct the vault base URL from a vault name.
-    fn vault_url(vault_name: &str) -> String {
-        // Check for explicit override first.
-        if let Ok(url) = std::env::var(AZURE_VAULT_URL_ENV) {
-            return url;
-        }
-        format!("https://{vault_name}.vault.azure.net")
+        Ok((parts[0], parts[1], parts.get(2).copied()))
     }
 }
-
 impl SecretResolver for AzureResolver {
-    fn resolve(&self, ref_str: &str) -> Result<SecretValue, ResolveError> {
-        let parsed = Self::parse_ref(ref_str)?;
-
-        let (vault_name, secret_name, version) = match &parsed {
-            AzureRef::Latest {
-                vault_name,
-                secret_name,
-            } => (*vault_name, *secret_name, None),
-            AzureRef::Versioned {
-                vault_name,
-                secret_name,
-                version,
-            } => (*vault_name, *secret_name, Some(*version)),
-        };
-
-        // Read Azure AD credentials from environment.
-        let tenant_id = std::env::var(AZURE_TENANT_ID_ENV).map_err(|_| {
-            ResolveError::AzureError(ref_str.to_owned(), format!("{AZURE_TENANT_ID_ENV} not set"))
-        })?;
-        let client_id = std::env::var(AZURE_CLIENT_ID_ENV).map_err(|_| {
-            ResolveError::AzureError(ref_str.to_owned(), format!("{AZURE_CLIENT_ID_ENV} not set"))
-        })?;
-        let client_secret = std::env::var(AZURE_CLIENT_SECRET_ENV).map_err(|_| {
-            ResolveError::AzureError(
-                ref_str.to_owned(),
-                format!("{AZURE_CLIENT_SECRET_ENV} not set"),
-            )
-        })?;
-
-        let base_url = Self::vault_url(vault_name);
-        let client = AzureKeyVaultClient::new(&base_url, tenant_id, client_id, client_secret)
-            .map_err(|e| {
-                ResolveError::AzureError(ref_str.to_owned(), format!("client init failed: {e}"))
-            })?;
-
-        // Use block_in_place + block_on to call async HTTP from sync trait.
-        let handle = tokio::runtime::Handle::current();
-        let result = tokio::task::block_in_place(|| {
-            handle.block_on(async {
-                let secret = client
-                    .get_secret(secret_name, version)
-                    .await
-                    .map_err(|e| format!("secret fetch failed: {e}"))?;
-
-                secret
-                    .value
-                    .ok_or_else(|| format!("secret '{secret_name}' has no value"))
-            })
-        });
-
-        match result {
-            Ok(value) => Ok(SecretValue::from_string(value)),
-            Err(msg) => Err(ResolveError::AzureError(ref_str.to_owned(), msg)),
+    fn resolve(&self, value: &str) -> Result<SecretValue, ResolveError> {
+        let (vault, secret, version) = Self::parse_ref(value)?;
+        if self.client.vault_name() != Some(vault) {
+            return Err(ResolveError::AzureError(
+                "azure:".into(),
+                "reference does not match the configured vault".into(),
+            ));
         }
+        let run = async {
+            let mut result = self
+                .client
+                .get_secret(secret, version)
+                .await
+                .map_err(|e| e.to_string())?;
+            if self
+                .client
+                .resource_name(&result.id, "secrets")
+                .map_err(|e| e.to_string())?
+                != secret
+            {
+                return Err("Azure returned a different secret".into());
+            }
+            let bytes = result.value.take().ok_or("Azure secret has no value")?;
+            Ok(SecretValue::from_string(bytes))
+        };
+        let result = match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| handle.block_on(run))
+            }
+            Ok(_) => Err("Azure resolver requires a broker worker or multi-thread runtime".into()),
+            Err(_) => tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| "Azure runtime unavailable".to_owned())
+                .and_then(|runtime| runtime.block_on(run)),
+        };
+        result.map_err(|message| ResolveError::AzureError("azure:".into(), message))
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn parse_ref_vault_and_secret() {
-        let result = AzureResolver::parse_ref("azure:my-vault/my-secret").unwrap();
+    fn refs_are_exact_and_safe() {
         assert_eq!(
-            result,
-            AzureRef::Latest {
-                vault_name: "my-vault",
-                secret_name: "my-secret"
-            }
+            AzureResolver::parse_ref("azure:myvault/my-secret").unwrap(),
+            ("myvault", "my-secret", None)
         );
-    }
-
-    #[test]
-    fn parse_ref_with_version() {
-        let result = AzureResolver::parse_ref("azure:my-vault/my-secret/abc123def").unwrap();
         assert_eq!(
-            result,
-            AzureRef::Versioned {
-                vault_name: "my-vault",
-                secret_name: "my-secret",
-                version: "abc123def"
-            }
+            AzureResolver::parse_ref("azure:myvault/my-secret/abc123")
+                .unwrap()
+                .2,
+            Some("abc123")
         );
-    }
-
-    #[test]
-    fn parse_ref_wrong_scheme() {
-        let result = AzureResolver::parse_ref("env:FOO");
-        assert!(result.is_err());
+        for value in [
+            "azure:",
+            "azure:vault",
+            "azure:vault/",
+            "azure:vault/../x",
+            "azure:vault/secret/%2f",
+            "azure:vault/secret/1/x",
+            "azure:vault/secret/1?x",
+            "azure:vault#evil/secret",
+            "azure:../secret",
+        ] {
+            assert!(AzureResolver::parse_ref(value).is_err(), "{value}");
+        }
         assert!(matches!(
-            result.unwrap_err(),
-            ResolveError::UnknownScheme(_)
+            AzureResolver::parse_ref("env:X"),
+            Err(ResolveError::UnknownScheme(_))
         ));
     }
-
     #[test]
-    fn parse_ref_empty_after_prefix() {
-        let result = AzureResolver::parse_ref("azure:");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn parse_ref_missing_secret_name() {
-        let result = AzureResolver::parse_ref("azure:my-vault");
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(matches!(err, ResolveError::AzureError(..)));
-        assert!(format!("{err}").contains("expected format"));
-    }
-
-    #[test]
-    fn parse_ref_empty_vault() {
-        let result = AzureResolver::parse_ref("azure:/secret");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn parse_ref_empty_secret() {
-        let result = AzureResolver::parse_ref("azure:vault/");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn parse_ref_empty_version() {
-        let result = AzureResolver::parse_ref("azure:vault/secret/");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn parse_ref_with_hyphens_and_numbers() {
-        let result = AzureResolver::parse_ref("azure:my-vault-01/db-password-2").unwrap();
-        assert_eq!(
-            result,
-            AzureRef::Latest {
-                vault_name: "my-vault-01",
-                secret_name: "db-password-2"
-            }
-        );
-    }
-
-    #[test]
-    fn vault_url_default() {
-        // Remove override if set.
-        unsafe { std::env::remove_var(AZURE_VAULT_URL_ENV) };
-        let url = AzureResolver::vault_url("my-vault");
-        assert_eq!(url, "https://my-vault.vault.azure.net");
-    }
-
-    #[test]
-    fn vault_url_override() {
-        unsafe { std::env::set_var(AZURE_VAULT_URL_ENV, "http://localhost:8080") };
-        let url = AzureResolver::vault_url("ignored");
-        assert_eq!(url, "http://localhost:8080");
-        unsafe { std::env::remove_var(AZURE_VAULT_URL_ENV) };
-    }
-
-    #[test]
-    fn resolver_debug() {
-        let resolver = AzureResolver;
-        let debug = format!("{resolver:?}");
-        assert!(debug.contains("AzureResolver"));
+    fn mismatched_vault_rejected_without_runtime_or_credentials() {
+        let client = AzureKeyVaultClient::new(
+            "https://configured.vault.azure.net",
+            "tenant".into(),
+            "client".into(),
+            "env:MISSING_CLOUD_TEST_SECRET".into(),
+        )
+        .unwrap();
+        let error = AzureResolver::new(client)
+            .resolve("azure:foreign/test")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("configured vault"));
     }
 }

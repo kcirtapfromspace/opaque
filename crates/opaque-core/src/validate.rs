@@ -186,7 +186,14 @@ impl InputValidator {
             if name.trim().is_empty() || name.chars().any(|ch| ch.is_control() || matches!(ch as u32, 0x061c | 0x200e..=0x200f | 0x202a..=0x202e | 0x2066..=0x2069)) {
                 return Err(ValidationError::InvalidCharset { field, value: String::new() });
             }
-            if patterns.contains_secret(name) {
+            // Match the reference body, as in validate_secret_ref_names. The
+            // known onepassword: scheme otherwise resembles password:<value>.
+            // Do not suppress detection of a secret embedded in the body.
+            let body = crate::profile::ALLOWED_REF_SCHEMES
+                .iter()
+                .find_map(|scheme| name.strip_prefix(scheme))
+                .unwrap_or(name.as_str());
+            if patterns.contains_secret(body) {
                 return Err(ValidationError::SecretDetected { field });
             }
         }
@@ -296,8 +303,30 @@ impl InputValidator {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_onepassword_refs_preserve_names_without_hiding_secret_bodies() {
+        assert!(
+            InputValidator::validate_prepared_refs(&[
+                "onepassword:Synthetic Vault/Synthetic Item/password".into(),
+                "onepassword:Engineering/CI credential/notes".into(),
+            ])
+            .is_ok()
+        );
+        for value in [
+            "onepassword:password=actual-secret-bytes",
+            "onepassword:Vault/Item/field\nforged",
+            "onepassword:Vault/Item/\u{202e}field",
+        ] {
+            assert!(
+                InputValidator::validate_prepared_refs(&[value.into()]).is_err(),
+                "{value:?}"
+            );
+        }
+    }
 
     #[test]
     fn validate_field_accepts_normal() {

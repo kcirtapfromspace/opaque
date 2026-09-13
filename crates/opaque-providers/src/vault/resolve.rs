@@ -4,14 +4,14 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroU64;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use opaque_core::resolver::{BaseResolver, ResolveError, SecretResolver};
 use opaque_core::secret::SecretValue;
 use sha2::{Digest, Sha256};
 
-use super::client::{VaultClient, VaultLease};
+use super::client::{VaultApiError, VaultClient, VaultLease, VaultSecret};
 
 /// Default keychain ref for the Vault token.
 const DEFAULT_TOKEN_REF: &str = "keychain:opaque/vault-token";
@@ -25,12 +25,11 @@ const LEASE_RENEW_WINDOW_SECS_ENV: &str = "OPAQUE_VAULT_LEASE_RENEW_WINDOW_SECS"
 /// Default proactive lease renewal window.
 const DEFAULT_LEASE_RENEW_WINDOW_SECS: u64 = 30;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct LeaseCacheEntry {
-    value: String,
+    snapshot: Arc<VaultSecret>,
     expires_at: Instant,
-    lease_id: Option<String>,
-    renewable: bool,
+    lease: VaultLease,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -38,25 +37,21 @@ struct LeaseCacheKey {
     base_url: String,
     token_fingerprint: [u8; 32],
     path: String,
-    field: String,
     version: Option<NonZeroU64>,
 }
 
-static LEASE_CACHE: LazyLock<Mutex<HashMap<LeaseCacheKey, LeaseCacheEntry>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-#[derive(Debug, Clone)]
-enum CacheState {
-    Miss,
-    Hit {
-        value: String,
-        lease_id: Option<String>,
-        needs_renewal: bool,
-    },
-    Expired {
-        lease_id: Option<String>,
-    },
+#[derive(Clone)]
+struct ResolutionSnapshot {
+    secret: Arc<VaultSecret>,
+    expires_at: Option<Instant>,
 }
+
+type CacheSlot = Arc<tokio::sync::Mutex<Option<LeaseCacheEntry>>>;
+// The global map only protects slot lookup. Network I/O holds the individual
+// slot's async mutex, making issuance/renewal/refresh singleflight per identity.
+static LEASE_CACHE: LazyLock<Mutex<HashMap<LeaseCacheKey, CacheSlot>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+const MAX_CACHED_PATHS: usize = 4096;
 
 /// Parsed vault secret ref.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,13 +187,37 @@ impl VaultResolver {
             base_url: self.client.base_url().to_owned(),
             token_fingerprint: Sha256::digest(token.as_bytes()).into(),
             path: parsed.path.to_owned(),
-            field: parsed.field.to_owned(),
             version: parsed.version,
         }
     }
 
-    fn lock_cache() -> std::sync::MutexGuard<'static, HashMap<LeaseCacheKey, LeaseCacheEntry>> {
+    fn lock_cache() -> std::sync::MutexGuard<'static, HashMap<LeaseCacheKey, CacheSlot>> {
         LEASE_CACHE.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn cache_slot(key: &LeaseCacheKey) -> Result<CacheSlot, String> {
+        let mut cache = Self::lock_cache();
+        if let Some(slot) = cache.get(key) {
+            return Ok(slot.clone());
+        }
+        // Retire unused expired snapshots without dropping an in-flight slot.
+        cache.retain(|_, slot| {
+            if Arc::strong_count(slot) != 1 {
+                return true;
+            }
+            match slot.try_lock() {
+                Ok(entry) => entry
+                    .as_ref()
+                    .is_some_and(|entry| entry.expires_at > Instant::now()),
+                Err(_) => true,
+            }
+        });
+        if cache.len() >= MAX_CACHED_PATHS {
+            return Err("Vault dynamic credential cache capacity reached".into());
+        }
+        let slot = Arc::new(tokio::sync::Mutex::new(None));
+        cache.insert(key.clone(), slot.clone());
+        Ok(slot)
     }
 
     fn lease_renew_window_secs() -> u64 {
@@ -220,183 +239,170 @@ impl VaultResolver {
         }
     }
 
-    fn cache_state(key: &LeaseCacheKey, renew_window_secs: u64) -> CacheState {
-        let now = Instant::now();
-        let mut cache = Self::lock_cache();
-        let Some(entry) = cache.get(key).cloned() else {
-            return CacheState::Miss;
-        };
-
-        if entry.expires_at <= now {
-            cache.remove(key);
-            return CacheState::Expired {
-                lease_id: entry.lease_id,
-            };
+    async fn read_snapshot(
+        &self,
+        token: &str,
+        parsed: &VaultRef<'_>,
+    ) -> Result<ResolutionSnapshot, String> {
+        // Pinned KV reads revalidate deletion/destruction on every batch. They
+        // never reuse plaintext from the cross-execution dynamic cache.
+        if parsed.version.is_some() {
+            return self
+                .client
+                .read_secret_at_version(token, parsed.path, parsed.version)
+                .await
+                .map(|secret| ResolutionSnapshot {
+                    secret: Arc::new(secret),
+                    expires_at: None,
+                })
+                .map_err(|e| e.to_string());
         }
-
-        let needs_renewal = renew_window_secs > 0
-            && entry.renewable
-            && entry.lease_id.is_some()
-            && entry.expires_at.saturating_duration_since(now)
-                <= Duration::from_secs(renew_window_secs);
-
-        CacheState::Hit {
-            value: entry.value,
-            lease_id: entry.lease_id,
-            needs_renewal,
+        let key = self.lease_cache_key(token, parsed);
+        let slot = Self::cache_slot(&key)?;
+        let mut entry = slot.lock().await;
+        if let Some(cached) = entry.as_mut() {
+            let renew_window = Duration::from_secs(Self::lease_renew_window_secs());
+            if cached.expires_at > Instant::now()
+                && cached.lease.renewable
+                && !renew_window.is_zero()
+                && cached.expires_at.saturating_duration_since(Instant::now()) <= renew_window
+            {
+                let started = Instant::now();
+                match self.client.renew_lease(token, &cached.lease.lease_id).await {
+                    Ok(lease) => {
+                        cached.expires_at = started
+                            .checked_add(Duration::from_secs(lease.lease_duration_secs))
+                            .ok_or("Vault lease duration exceeds supported expiry")?;
+                        cached.lease = lease;
+                    }
+                    Err(
+                        err @ (VaultApiError::Unauthorized
+                        | VaultApiError::NotFound(_)
+                        | VaultApiError::BadRequest
+                        | VaultApiError::InvalidLease),
+                    ) => {
+                        // Revoked/invalid authority is not an availability failure.
+                        // Never return a cached credential after this rejection.
+                        *entry = None;
+                        return Err(err.to_string());
+                    }
+                    Err(err) => tracing::warn!("best-effort Vault lease renewal failed: {err}"),
+                }
+            }
+            // Recheck after network latency, including a failed renewal.
+            if cached.expires_at > Instant::now() {
+                return Ok(ResolutionSnapshot {
+                    secret: cached.snapshot.clone(),
+                    expires_at: Some(cached.expires_at),
+                });
+            }
         }
-    }
-
-    fn store_cached_value(
-        key: LeaseCacheKey,
-        value: String,
-        lease_duration_secs: u64,
-        lease_id: Option<String>,
-        renewable: bool,
-    ) {
-        if lease_duration_secs == 0 {
-            return;
+        if let Some(expired) = entry.take()
+            && let Err(err) = self
+                .client
+                .revoke_lease(token, &expired.lease.lease_id)
+                .await
+        {
+            tracing::warn!("best-effort Vault lease revoke failed: {err}");
         }
-        let ttl = lease_duration_secs.max(1);
-        let expires_at = Instant::now() + Duration::from_secs(ttl);
-        let mut cache = Self::lock_cache();
-        cache.insert(
-            key,
-            LeaseCacheEntry {
-                value,
-                expires_at,
-                lease_id,
-                renewable,
-            },
+        let started = Instant::now();
+        let snapshot = Arc::new(
+            self.client
+                .read_secret_at_version(token, parsed.path, None)
+                .await
+                .map_err(|e| e.to_string())?,
         );
+        if let Some(lease) = &snapshot.lease {
+            let expires_at = started
+                .checked_add(Duration::from_secs(lease.lease_duration_secs))
+                .ok_or("Vault lease duration exceeds supported expiry")?;
+            if expires_at <= Instant::now() {
+                return Err("Vault credential lease expired during issuance".into());
+            }
+            *entry = Some(LeaseCacheEntry {
+                snapshot: snapshot.clone(),
+                expires_at,
+                lease: lease.clone(),
+            });
+        }
+        let expires_at = entry.as_ref().map(|entry| entry.expires_at);
+        Ok(ResolutionSnapshot {
+            secret: snapshot,
+            expires_at,
+        })
     }
 
-    fn update_cached_lease_after_renewal(
-        key: &LeaseCacheKey,
-        prior_lease_id: &str,
-        lease: &VaultLease,
-    ) {
-        if lease.lease_duration_secs == 0 {
-            return;
+    fn resolve_references(&self, refs: &[&str]) -> Result<Vec<SecretValue>, ResolveError> {
+        if refs.is_empty() {
+            return Ok(Vec::new());
         }
-
-        let mut cache = Self::lock_cache();
-        let Some(entry) = cache.get_mut(key) else {
-            return;
-        };
-        if entry.lease_id.as_deref() != Some(prior_lease_id) {
-            return;
+        // Validate the entire batch before resolving any credential or issuing
+        // any dynamic secret. Capture one token identity for the full batch.
+        let parsed = refs
+            .iter()
+            .map(|reference| Self::parse_ref(reference))
+            .collect::<Result<Vec<_>, _>>()?;
+        let token_value = BaseResolver::new().resolve(&self.token_ref).map_err(|e| {
+            ResolveError::VaultError(
+                refs[0].into(),
+                format!("failed to resolve access token: {e}"),
+            )
+        })?;
+        let token = token_value.as_str().ok_or_else(|| {
+            ResolveError::VaultError(refs[0].into(), "access token is not valid UTF-8".into())
+        })?;
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+            ResolveError::VaultError(
+                refs[0].into(),
+                "Vault resolution requires a multi-thread Tokio runtime".into(),
+            )
+        })?;
+        if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+            return Err(ResolveError::VaultError(
+                refs[0].into(),
+                "Vault resolution requires a multi-thread Tokio runtime".into(),
+            ));
         }
-
-        entry.expires_at = Instant::now() + Duration::from_secs(lease.lease_duration_secs.max(1));
-        entry.lease_id = Some(lease.lease_id.clone());
-        entry.renewable = lease.renewable;
+        tokio::task::block_in_place(|| {
+            handle.block_on(async {
+            // Execution-local snapshots keep related fields coherent even if
+            // the global lease expires or another execution refreshes it.
+            let mut snapshots: HashMap<LeaseCacheKey, ResolutionSnapshot> = HashMap::new();
+            let mut values = Vec::with_capacity(refs.len());
+            for (reference, parsed) in refs.iter().zip(&parsed) {
+                let key = self.lease_cache_key(token, parsed);
+                let snapshot = if let Some(snapshot) = snapshots.get(&key) {
+                    snapshot.clone()
+                } else {
+                    let snapshot = self.read_snapshot(token, parsed).await.map_err(|e| ResolveError::VaultError((*reference).into(), format!("secret read failed: {e}")))?;
+                    snapshots.insert(key, snapshot.clone());
+                    snapshot
+                };
+                let value = snapshot.secret.fields.get(parsed.field).ok_or_else(|| ResolveError::VaultError((*reference).into(), "requested field not found in secret snapshot".into()))?;
+                values.push(SecretValue::new(value.as_bytes().to_vec()));
+            }
+            if snapshots.values().any(|snapshot| snapshot.expires_at.is_some_and(|expiry| expiry <= Instant::now())) {
+                return Err(ResolveError::VaultError(refs[0].into(), "credential lease expired while resolving execution snapshot; retry the complete execution".into()));
+            }
+            Ok(values)
+        })
+        })
     }
 
     #[cfg(test)]
     fn clear_cache_for_tests() {
-        let mut cache = Self::lock_cache();
-        cache.clear();
+        Self::lock_cache().clear();
     }
 }
 
 impl SecretResolver for VaultResolver {
     fn resolve(&self, ref_str: &str) -> Result<SecretValue, ResolveError> {
-        let parsed = Self::parse_ref(ref_str)?;
+        self.resolve_references(&[ref_str])
+            .map(|mut values| values.remove(0))
+    }
 
-        // Resolve the Vault token via base resolvers only (env + keychain)
-        // to prevent cycles.
-        let base = BaseResolver::new();
-        let token_value = base.resolve(&self.token_ref).map_err(|e| {
-            ResolveError::VaultError(
-                ref_str.to_owned(),
-                format!("failed to resolve access token: {e}"),
-            )
-        })?;
-        let token = token_value.as_str().ok_or_else(|| {
-            ResolveError::VaultError(ref_str.to_owned(), "access token is not valid UTF-8".into())
-        })?;
-        let handle = tokio::runtime::Handle::current();
-        let cache_key = self.lease_cache_key(token, &parsed);
-        let renew_window_secs = Self::lease_renew_window_secs();
-        // Revalidate pinned KV versions on every execution so a deletion cannot
-        // be masked by a lease cache or a retained plaintext snapshot.
-        let cache_state = if parsed.version.is_some() {
-            CacheState::Miss
-        } else {
-            Self::cache_state(&cache_key, renew_window_secs)
-        };
-        match cache_state {
-            CacheState::Hit {
-                value,
-                lease_id,
-                needs_renewal,
-            } => {
-                if needs_renewal && let Some(lease_id) = lease_id {
-                    let renew_result = tokio::task::block_in_place(|| {
-                        handle.block_on(async { self.client.renew_lease(token, &lease_id).await })
-                    });
-                    match renew_result {
-                        Ok(lease) => {
-                            Self::update_cached_lease_after_renewal(&cache_key, &lease_id, &lease);
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                "best-effort Vault lease renewal failed for {}: {}",
-                                parsed.path,
-                                err
-                            );
-                        }
-                    }
-                }
-                return Ok(SecretValue::from_string(value));
-            }
-            CacheState::Expired { lease_id } => {
-                if let Some(expired_lease_id) = lease_id {
-                    let revoke_result = tokio::task::block_in_place(|| {
-                        handle.block_on(async {
-                            self.client.revoke_lease(token, &expired_lease_id).await
-                        })
-                    });
-                    if let Err(err) = revoke_result {
-                        tracing::warn!(
-                            "best-effort Vault lease revoke failed for {}: {}",
-                            parsed.path,
-                            err
-                        );
-                    }
-                }
-            }
-            CacheState::Miss => {}
-        }
-
-        // Use block_in_place + block_on to call async HTTP from sync trait.
-        let result = tokio::task::block_in_place(|| {
-            handle.block_on(async {
-                self.client
-                    .read_secret_field_at_version(token, parsed.path, parsed.field, parsed.version)
-                    .await
-                    .map_err(|e| format!("secret read failed: {e}"))
-            })
-        });
-
-        match result {
-            Ok(read) => {
-                if parsed.version.is_none()
-                    && let Some(lease) = read.lease
-                {
-                    Self::store_cached_value(
-                        cache_key,
-                        read.value.clone(),
-                        lease.lease_duration_secs,
-                        Some(lease.lease_id),
-                        lease.renewable,
-                    );
-                }
-                Ok(SecretValue::from_string(read.value))
-            }
-            Err(msg) => Err(ResolveError::VaultError(ref_str.to_owned(), msg)),
-        }
+    fn resolve_batch(&self, refs: &[&str]) -> Result<Vec<SecretValue>, ResolveError> {
+        self.resolve_references(refs)
     }
 }
 
@@ -408,7 +414,7 @@ mod tests {
     use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    async fn test_lock() -> tokio::sync::OwnedMutexGuard<()> {
+    pub(super) async fn test_lock() -> tokio::sync::OwnedMutexGuard<()> {
         static LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
         LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
@@ -461,7 +467,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_identity_binds_server_token_path_field_and_version() {
+    fn cache_identity_binds_server_token_path_and_version_but_groups_fields() {
         let resolver = VaultResolver::with_token_ref(
             VaultClient::with_base_url("http://127.0.0.1:8200".into()),
             "env:UNUSED".into(),
@@ -470,13 +476,14 @@ mod tests {
         let key = resolver.lease_cache_key("first-token", &reference);
         for different in [
             "vault:kv/data/other?version=7#FIELD",
-            "vault:kv/data/demo?version=7#OTHER",
             "vault:kv/data/demo?version=8#FIELD",
             "vault:kv/data/demo#FIELD",
         ] {
             let parsed = VaultResolver::parse_ref(different).unwrap();
             assert_ne!(key, resolver.lease_cache_key("first-token", &parsed));
         }
+        let other_field = VaultResolver::parse_ref("vault:kv/data/demo?version=7#OTHER").unwrap();
+        assert_eq!(key, resolver.lease_cache_key("first-token", &other_field));
         assert_ne!(key, resolver.lease_cache_key("second-token", &reference));
         let other_server = VaultResolver::with_token_ref(
             VaultClient::with_base_url("http://127.0.0.1:8201".into()),
@@ -726,7 +733,7 @@ mod tests {
                 "lease_id": "database/creds/readonly/a1"
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "lease_id": "database/creds/readonly/a2",
+                "lease_id": "database/creds/readonly/a1",
                 "lease_duration": 120,
                 "renewable": true
             })))
@@ -1080,3 +1087,7 @@ mod tests {
         unsafe { std::env::remove_var("OPAQUE_TEST_VAULT_TOKEN_REVOKE") };
     }
 }
+
+#[cfg(test)]
+#[path = "snapshot_tests.rs"]
+mod snapshot_tests;

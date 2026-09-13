@@ -130,7 +130,7 @@ pub fn safe_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "opaque_task_plan_inference",
-            description: "Plan three fixed synthetic public-source model completions in the authenticated tenant. The broker selects the source snapshot, model and exact prompts. No custom SQL, data source, endpoint, tenant or prompt is accepted. Planning is read-only and grants no authority. Human approval is required before execution; each attempt reserves 96 output units and uncertainty stops later requests.",
+            description: "Plan three bounded public-source model completions (configured GitHub CI observations or an explicit synthetic fixture) in the authenticated tenant. The broker selects the source snapshot, model and exact prompts. No custom SQL, data source, endpoint, tenant or prompt is accepted. Planning is read-only and grants no authority. Human approval is required before execution; each attempt reserves 96 output units and uncertainty stops later requests.",
             input_schema: json!({"type":"object","additionalProperties":false,"required":["title","expires_in_secs"],"properties":{"title":{"type":"string","minLength":1,"maxLength":160},"expires_in_secs":{"type":"integer","minimum":1,"maximum":600}}}),
             build_params: |args| json!({"title": args.get("title").cloned().unwrap_or(json!(null)), "expires_in_secs": args.get("expires_in_secs").cloned().unwrap_or(json!(null))}),
         },

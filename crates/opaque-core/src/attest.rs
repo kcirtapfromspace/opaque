@@ -233,6 +233,7 @@ fn payload_hex(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

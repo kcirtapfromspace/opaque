@@ -593,6 +593,7 @@ pub fn now_unix() -> i64 {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

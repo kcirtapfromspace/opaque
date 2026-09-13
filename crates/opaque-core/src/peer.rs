@@ -6,6 +6,9 @@ pub struct PeerInfo {
     pub pid: Option<i32>,
     pub uid: u32,
     pub gid: u32,
+    /// Kernel-issued macOS audit token, including the process incarnation.
+    /// Never constructed from a transport request or a PID lookup.
+    pub audit_token: Option<[u32; 8]>,
 }
 
 pub fn peer_info_from_fd(fd: RawFd) -> io::Result<PeerInfo> {
@@ -33,6 +36,7 @@ pub fn peer_info_from_fd(fd: RawFd) -> io::Result<PeerInfo> {
             pid: Some(ucred.pid),
             uid: ucred.uid,
             gid: ucred.gid,
+            audit_token: None,
         })
     }
 
@@ -53,6 +57,7 @@ pub fn peer_info_from_fd(fd: RawFd) -> io::Result<PeerInfo> {
             pid,
             uid: uid as u32,
             gid: gid as u32,
+            audit_token: local_peer_audit_token(fd).ok(),
         })
     }
 
@@ -64,6 +69,27 @@ pub fn peer_info_from_fd(fd: RawFd) -> io::Result<PeerInfo> {
             "peer credential lookup not supported on this platform",
         ))
     }
+}
+
+#[cfg(target_os = "macos")]
+fn local_peer_audit_token(fd: RawFd) -> io::Result<[u32; 8]> {
+    // sys/un.h: LOCAL_PEERTOKEN. The token binds code-signing lookup to the
+    // connected process incarnation; a later process reusing its PID cannot win.
+    const LOCAL_PEERTOKEN: libc::c_int = 0x006;
+    let mut token = [0u32; 8];
+    let mut len = std::mem::size_of_val(&token) as libc::socklen_t;
+    let rc =
+        unsafe { libc::getsockopt(fd, 0, LOCAL_PEERTOKEN, token.as_mut_ptr().cast(), &mut len) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if len as usize != std::mem::size_of_val(&token) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid peer audit token size",
+        ));
+    }
+    Ok(token)
 }
 
 #[cfg(target_os = "macos")]

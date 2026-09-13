@@ -1,84 +1,62 @@
-//! Azure Key Vault API client.
-//!
-//! Wraps the REST endpoints needed to browse secrets/keys/certificates and
-//! resolve secret values via the Azure Key Vault API.
-//!
-//! Authentication uses Azure AD OAuth2 client credentials flow with token
-//! caching. The access token is obtained from the Microsoft identity platform
-//! and cached until expiry.
-//!
-//! **Never** leaks raw API error bodies to callers --- all errors are
-//! mapped to sanitized strings.
-
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
-
-use serde::{Deserialize, Serialize};
-
-/// Environment variable to override the vault URL directly.
+//! Azure Key Vault data-plane client with fixed Entra authority and deferred secret refs.
+use opaque_core::resolver::{BaseResolver, SecretResolver};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::{
+    collections::HashSet,
+    time::{Duration, Instant},
+};
+use zeroize::{Zeroize, Zeroizing};
 pub const AZURE_VAULT_URL_ENV: &str = "OPAQUE_AZURE_VAULT_URL";
-
-/// Environment variable for the Azure AD tenant ID.
 pub const AZURE_TENANT_ID_ENV: &str = "OPAQUE_AZURE_TENANT_ID";
-
-/// Environment variable for the Azure AD client (application) ID.
 pub const AZURE_CLIENT_ID_ENV: &str = "OPAQUE_AZURE_CLIENT_ID";
-
-/// Environment variable for the Azure AD client secret.
 pub const AZURE_CLIENT_SECRET_ENV: &str = "OPAQUE_AZURE_CLIENT_SECRET";
-
-/// Default Azure Key Vault API version query parameter.
-const API_VERSION: &str = "7.4";
-
-/// Azure Key Vault API error types. Raw API error messages are never exposed.
+pub const AZURE_CLIENT_SECRET_REF_ENV: &str = "OPAQUE_AZURE_CLIENT_SECRET_REF";
+const API_VERSION: &str = "2025-07-01";
+const MAX_BODY: usize = 256 * 1024;
 #[derive(Debug, thiserror::Error)]
 pub enum AzureApiError {
-    #[error("invalid URL: {0}")]
+    #[error("invalid Azure endpoint or selector: {0}")]
     InvalidUrl(String),
-
     #[error("network error communicating with Azure Key Vault")]
     HttpError(#[source] reqwest::Error),
-
     #[error("Azure AD authentication failed (check tenant, client ID, and secret)")]
     AuthError,
-
     #[error("resource not found: {0}")]
     NotFound(String),
-
     #[error("access forbidden (check Key Vault access policies)")]
     Forbidden,
-
     #[error("Azure Key Vault server error")]
     ServerError,
-
     #[error("unexpected Azure Key Vault response: status {0}")]
     UnexpectedStatus(u16),
+    #[error("Azure returned invalid, oversized or incomplete data")]
+    InvalidResponse,
 }
-
-/// An Azure AD OAuth2 token response.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Deserialize, Zeroize)]
+#[zeroize(drop)]
 struct TokenResponse {
     access_token: String,
     expires_in: u64,
+    #[serde(default)]
+    token_type: Option<String>,
 }
-
-/// Cached access token with expiry tracking.
-#[derive(Debug, Clone)]
 struct CachedToken {
-    access_token: String,
+    access_token: Zeroizing<String>,
     expires_at: Instant,
+    credential_sha256: String,
 }
-
-/// An Azure Key Vault secret item (list endpoint, no value).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AzureAttributes {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AzureSecretItem {
     pub id: String,
     #[serde(default)]
     pub attributes: Option<AzureAttributes>,
 }
-
-/// An Azure Key Vault secret with its value.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct AzureSecret {
     pub id: String,
     #[serde(default)]
@@ -86,8 +64,16 @@ pub struct AzureSecret {
     #[serde(default)]
     pub attributes: Option<AzureAttributes>,
 }
-
-/// An Azure Key Vault key item (list endpoint).
+impl Drop for AzureSecret {
+    fn drop(&mut self) {
+        self.value.zeroize();
+    }
+}
+impl std::fmt::Debug for AzureSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AzureSecret").finish_non_exhaustive()
+    }
+}
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AzureKeyItem {
     #[serde(default)]
@@ -95,330 +81,503 @@ pub struct AzureKeyItem {
     #[serde(default)]
     pub attributes: Option<AzureAttributes>,
 }
-
-/// An Azure Key Vault certificate item (list endpoint).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AzureCertItem {
     pub id: String,
     #[serde(default)]
     pub attributes: Option<AzureAttributes>,
 }
-
-/// Common Key Vault resource attributes.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct AzureAttributes {
-    #[serde(default)]
-    pub enabled: Option<bool>,
-}
-
-/// Azure Key Vault list response envelope (paginated).
 #[derive(Debug, Deserialize)]
 struct ListResponse<T> {
     value: Vec<T>,
+    #[serde(default, rename = "nextLink")]
+    next_link: Option<String>,
 }
-
-/// Azure Key Vault set-secret request body.
-#[derive(Debug, Serialize)]
-struct SetSecretRequest<'a> {
-    value: &'a str,
+#[derive(Clone, Serialize)]
+pub struct AuthBinding {
+    pub tenant_id: String,
+    pub client_id: String,
+    pub credential_ref: String,
+    pub token_endpoint: String,
+    pub scope: String,
 }
-
-/// Validate that a URL uses `https://`, allowing `http://` only for localhost.
-fn validate_url_scheme(url: &str) -> Result<(), AzureApiError> {
-    if url.starts_with("https://") {
+impl AuthBinding {
+    pub fn refs(&self) -> Vec<String> {
+        vec![self.credential_ref.clone()]
+    }
+}
+pub fn validate_ref(value: &str) -> Result<(), String> {
+    if let Some(name) = value.strip_prefix("env:") {
+        if !name.is_empty()
+            && name.len() <= 256
+            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            return Ok(());
+        }
+    } else if let Some(path) = value.strip_prefix("keychain:")
+        && path.len() <= 512
+        && path
+            .split_once('/')
+            .is_some_and(|(a, b)| !a.is_empty() && !b.is_empty())
+        && path.bytes().all(|b| b.is_ascii_graphic())
+    {
         return Ok(());
     }
-    if url.starts_with("http://") {
-        if let Some(host_part) = url.strip_prefix("http://") {
-            let host = host_part.split('/').next().unwrap_or("");
-            let host_no_port = host.split(':').next().unwrap_or("");
-            if host_no_port == "localhost" || host_no_port == "127.0.0.1" {
-                return Ok(());
-            }
-        }
-        return Err(AzureApiError::InvalidUrl(format!(
-            "insecure HTTP URL rejected: {url}. \
-             Only https:// URLs are allowed (http:// is permitted for localhost/127.0.0.1 only)"
-        )));
-    }
-    Err(AzureApiError::InvalidUrl(format!(
-        "unsupported URL scheme: {url}. \
-         Only https:// URLs are allowed (http:// is permitted for localhost/127.0.0.1 only)"
-    )))
+    Err(
+        "credential/value reference must be an explicit env:NAME or keychain:service/account"
+            .into(),
+    )
 }
-
-/// Azure Key Vault REST API client.
-///
-/// Handles Azure AD OAuth2 client credentials flow for authentication,
-/// with token caching and automatic refresh on expiry.
+pub fn validate_name(value: &str) -> Result<(), AzureApiError> {
+    if value.is_empty()
+        || value.len() > 127
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err(AzureApiError::InvalidUrl("invalid resource name".into()));
+    }
+    Ok(())
+}
+pub fn validate_version(value: &str) -> Result<(), AzureApiError> {
+    if value.is_empty() || value.len() > 128 || !value.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err(AzureApiError::InvalidUrl("invalid version".into()));
+    }
+    Ok(())
+}
+pub fn validate_vault(value: &str) -> Result<(), AzureApiError> {
+    if !(3..=24).contains(&value.len())
+        || !value.as_bytes()[0].is_ascii_alphabetic()
+        || value.ends_with('-')
+        || value.contains("--")
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err(AzureApiError::InvalidUrl("invalid vault name".into()));
+    }
+    Ok(())
+}
+fn validate_url_scheme(value: &str) -> Result<(), AzureApiError> {
+    let u =
+        reqwest::Url::parse(value).map_err(|_| AzureApiError::InvalidUrl("invalid URL".into()))?;
+    if u.host_str().is_none()
+        || !u.username().is_empty()
+        || u.password().is_some()
+        || u.query().is_some()
+        || u.fragment().is_some()
+        || u.path() != "/"
+        || !(u.scheme() == "https"
+            || cfg!(test)
+                && u.scheme() == "http"
+                && matches!(u.host_str(), Some("localhost" | "127.0.0.1")))
+    {
+        return Err(AzureApiError::InvalidUrl(
+            "trusted HTTPS vault origin required".into(),
+        ));
+    }
+    Ok(())
+}
+fn validate_production_endpoint(url: &reqwest::Url) -> Result<(), AzureApiError> {
+    validate_url_scheme(url.as_str())?;
+    let vault = url
+        .host_str()
+        .and_then(|s| s.strip_suffix(".vault.azure.net"))
+        .ok_or_else(|| {
+            AzureApiError::InvalidUrl("only public Azure Key Vault origins are supported".into())
+        })?;
+    validate_vault(vault)?;
+    if url.scheme() != "https" || url.port().is_some() {
+        return Err(AzureApiError::InvalidUrl(
+            "unexpected vault transport".into(),
+        ));
+    }
+    Ok(())
+}
+#[derive(Clone)]
 pub struct AzureKeyVaultClient {
     http: reqwest::Client,
     base_url: String,
-    tenant_id: String,
-    client_id: String,
-    client_secret: String,
-    /// Override for the token endpoint (for testing).
+    auth: AuthBinding,
+    cached_token: std::sync::Arc<tokio::sync::Mutex<Option<CachedToken>>>,
+    #[cfg(test)]
     pub(crate) token_endpoint_override: Option<String>,
-    /// Cached access token.
-    cached_token: Mutex<Option<CachedToken>>,
+    #[cfg(test)]
+    test_secret: Option<Zeroizing<String>>,
 }
-
 impl std::fmt::Debug for AzureKeyVaultClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AzureKeyVaultClient")
-            .field("base_url", &self.base_url)
-            .field("tenant_id", &self.tenant_id)
-            .field("client_id", &self.client_id)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
-
 impl AzureKeyVaultClient {
-    /// Build the user-agent string from the crate version.
     fn user_agent() -> String {
         format!("opaqued/{}", env!("CARGO_PKG_VERSION"))
     }
-
-    /// Create a new Azure Key Vault client.
-    ///
-    /// Returns an error if the base URL uses an unsupported scheme.
+    pub fn from_env() -> Result<Option<Self>, AzureApiError> {
+        let Some(base) = std::env::var(AZURE_VAULT_URL_ENV)
+            .ok()
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(None);
+        };
+        let tenant = std::env::var(AZURE_TENANT_ID_ENV).map_err(|_| AzureApiError::AuthError)?;
+        let client = std::env::var(AZURE_CLIENT_ID_ENV).map_err(|_| AzureApiError::AuthError)?;
+        let credential_ref = std::env::var(AZURE_CLIENT_SECRET_REF_ENV)
+            .unwrap_or_else(|_| format!("env:{AZURE_CLIENT_SECRET_ENV}"));
+        Self::new(&base, tenant, client, credential_ref).map(Some)
+    }
+    /// The final argument is a credential reference, never the client secret.
     pub fn new(
         base_url: &str,
         tenant_id: String,
         client_id: String,
-        client_secret: String,
+        credential_ref: String,
     ) -> Result<Self, AzureApiError> {
         validate_url_scheme(base_url)?;
-
+        validate_ref(&credential_ref).map_err(|_| AzureApiError::AuthError)?;
+        for id in [&tenant_id, &client_id] {
+            if id.is_empty()
+                || id.len() > 255
+                || matches!(id.as_str(), "common" | "organizations" | "consumers")
+                || !id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+            {
+                return Err(AzureApiError::AuthError);
+            }
+        }
+        let url = reqwest::Url::parse(base_url)
+            .map_err(|_| AzureApiError::InvalidUrl("invalid vault".into()))?;
+        if !cfg!(test) {
+            validate_production_endpoint(&url)?;
+        }
         let http = reqwest::Client::builder()
             .user_agent(Self::user_agent())
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(5))
+            .retry(reqwest::retry::never())
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(AzureApiError::HttpError)?;
-
-        Ok(Self {
-            http,
-            base_url: base_url.trim_end_matches('/').to_owned(),
+        let auth = AuthBinding {
+            token_endpoint: format!(
+                "https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+            ),
+            scope: "https://vault.azure.net/.default".into(),
             tenant_id,
             client_id,
-            client_secret,
+            credential_ref,
+        };
+        Ok(Self {
+            http,
+            base_url: url.origin().ascii_serialization(),
+            auth,
+            cached_token: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            #[cfg(test)]
             token_endpoint_override: None,
-            cached_token: Mutex::new(None),
+            #[cfg(test)]
+            test_secret: None,
         })
     }
-
-    /// Override the token endpoint URL (for testing with wiremock).
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+    pub fn auth_binding(&self) -> &AuthBinding {
+        &self.auth
+    }
+    pub fn vault_name(&self) -> Option<&str> {
+        self.base_url
+            .strip_prefix("https://")
+            .and_then(|s| s.strip_suffix(".vault.azure.net"))
+    }
+    #[cfg(test)]
+    fn test_new(
+        base: &str,
+        tenant: String,
+        client: String,
+        secret: String,
+    ) -> Result<Self, AzureApiError> {
+        let mut c = Self::new(base, tenant, client, "env:OPAQUE_AZURE_TEST_SECRET".into())?;
+        c.test_secret = Some(Zeroizing::new(secret));
+        Ok(c)
+    }
     #[cfg(test)]
     fn with_token_endpoint(mut self, endpoint: String) -> Self {
         self.token_endpoint_override = Some(endpoint);
         self
     }
-
-    /// Get the token endpoint URL.
-    fn token_endpoint(&self) -> String {
-        if let Some(ref override_url) = self.token_endpoint_override {
-            return override_url.clone();
+    fn token_endpoint(&self) -> &str {
+        #[cfg(test)]
+        if let Some(url) = &self.token_endpoint_override {
+            return url;
         }
-        format!(
-            "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
-            self.tenant_id
-        )
+        &self.auth.token_endpoint
     }
-
-    /// Obtain an access token, using the cached one if still valid.
-    async fn get_access_token(&self) -> Result<String, AzureApiError> {
-        // Check cache first.
-        {
-            let cache = self.cached_token.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(ref cached) = *cache
-                && cached.expires_at > Instant::now()
-            {
-                return Ok(cached.access_token.clone());
-            }
+    fn credential(&self) -> Result<Zeroizing<String>, AzureApiError> {
+        #[cfg(test)]
+        if let Some(secret) = &self.test_secret {
+            return Ok(secret.clone());
         }
-
-        // Fetch a new token.
-        let token_url = self.token_endpoint();
-        let params = [
-            ("grant_type", "client_credentials"),
-            ("client_id", &self.client_id),
-            ("client_secret", &self.client_secret),
-            ("scope", "https://vault.azure.net/.default"),
-        ];
-
-        let resp = self
+        let value = BaseResolver::new()
+            .resolve(&self.auth.credential_ref)
+            .map_err(|_| AzureApiError::AuthError)?;
+        let value = value.as_str().ok_or(AzureApiError::AuthError)?;
+        if value.is_empty() || value.len() > 8192 {
+            return Err(AzureApiError::AuthError);
+        }
+        Ok(Zeroizing::new(value.into()))
+    }
+    async fn get_access_token(&self) -> Result<Zeroizing<String>, AzureApiError> {
+        use sha2::{Digest, Sha256};
+        let secret = self.credential()?;
+        let fingerprint = format!("{:x}", Sha256::digest(secret.as_bytes()));
+        let mut cache = self.cached_token.lock().await;
+        if let Some(cached) = cache.as_ref()
+            && cached.expires_at > Instant::now()
+            && cached.credential_sha256 == fingerprint
+        {
+            return Ok(cached.access_token.clone());
+        }
+        let response = self
             .http
-            .post(&token_url)
-            .form(&params)
+            .post(self.token_endpoint())
+            .form(&[
+                ("grant_type", "client_credentials"),
+                ("client_id", self.auth.client_id.as_str()),
+                ("client_secret", secret.as_str()),
+                ("scope", self.auth.scope.as_str()),
+            ])
             .send()
             .await
             .map_err(AzureApiError::HttpError)?;
-
-        if !resp.status().is_success() {
+        if response.status() != reqwest::StatusCode::OK {
             return Err(AzureApiError::AuthError);
         }
-
-        let token_resp: TokenResponse = resp.json().await.map_err(AzureApiError::HttpError)?;
-
-        let cached = CachedToken {
-            access_token: token_resp.access_token.clone(),
-            // Subtract 60 seconds for safety margin.
-            expires_at: Instant::now()
-                + Duration::from_secs(token_resp.expires_in.saturating_sub(60)),
-        };
-
+        let data: TokenResponse = read_json(response, 16 * 1024).await?;
+        if data.access_token.is_empty()
+            || data.access_token.len() > 8192
+            || !data.access_token.bytes().all(|b| b.is_ascii_graphic())
+            || !(1..=86400).contains(&data.expires_in)
+            || data
+                .token_type
+                .as_deref()
+                .is_some_and(|v| !v.eq_ignore_ascii_case("bearer"))
         {
-            let mut cache = self.cached_token.lock().unwrap_or_else(|p| p.into_inner());
-            *cache = Some(cached);
+            return Err(AzureApiError::AuthError);
         }
-
-        Ok(token_resp.access_token)
+        let token = Zeroizing::new(data.access_token.clone());
+        *cache = Some(CachedToken {
+            access_token: token.clone(),
+            expires_at: Instant::now() + Duration::from_secs(data.expires_in.saturating_sub(60)),
+            credential_sha256: fingerprint,
+        });
+        Ok(token)
     }
-
-    /// Build a URL with the api-version query parameter.
     fn api_url(&self, path: &str) -> String {
-        format!("{}{path}?api-version={API_VERSION}", self.base_url,)
+        format!("{}{path}?api-version={API_VERSION}", self.base_url)
     }
-
-    /// Map HTTP status codes to error types.
     fn map_status(status: u16, resource: &str) -> Result<(), AzureApiError> {
         match status {
             200..=299 => Ok(()),
             401 => Err(AzureApiError::AuthError),
             403 => Err(AzureApiError::Forbidden),
-            404 => Err(AzureApiError::NotFound(resource.to_owned())),
+            404 => Err(AzureApiError::NotFound(resource.into())),
             500..=599 => Err(AzureApiError::ServerError),
-            other => Err(AzureApiError::UnexpectedStatus(other)),
+            s => Err(AzureApiError::UnexpectedStatus(s)),
         }
     }
-
-    /// List all secrets in the vault.
-    pub async fn list_secrets(&self) -> Result<Vec<AzureSecretItem>, AzureApiError> {
+    async fn fetch<T: DeserializeOwned>(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<T, AzureApiError> {
+        let response = request.send().await.map_err(AzureApiError::HttpError)?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            *self.cached_token.lock().await = None;
+        }
+        Self::map_status(response.status().as_u16(), "requested resource")?;
+        read_json(response, MAX_BODY).await
+    }
+    fn next_page(&self, next: &str, path: &str) -> Result<reqwest::Url, AzureApiError> {
+        if next.len() > 8192 {
+            return Err(AzureApiError::InvalidResponse);
+        }
+        let url = reqwest::Url::parse(next).map_err(|_| AzureApiError::InvalidResponse)?;
+        let base =
+            reqwest::Url::parse(&self.base_url).map_err(|_| AzureApiError::InvalidResponse)?;
+        if url.origin() != base.origin()
+            || url.path() != path
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(AzureApiError::InvalidResponse);
+        }
+        let mut seen = HashSet::new();
+        let mut api = false;
+        for (key, value) in url.query_pairs() {
+            if !seen.insert(key.to_string())
+                || !matches!(
+                    key.as_ref(),
+                    "api-version" | "maxresults" | "skiptoken" | "$skiptoken"
+                )
+            {
+                return Err(AzureApiError::InvalidResponse);
+            }
+            if key == "api-version" {
+                if value != API_VERSION {
+                    return Err(AzureApiError::InvalidResponse);
+                }
+                api = true;
+            }
+        }
+        if !api {
+            return Err(AzureApiError::InvalidResponse);
+        }
+        Ok(url)
+    }
+    async fn list<T: DeserializeOwned>(&self, path: &str) -> Result<Vec<T>, AzureApiError> {
         let token = self.get_access_token().await?;
-        let url = self.api_url("/secrets");
-
-        let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(&token)
-            .send()
-            .await
-            .map_err(AzureApiError::HttpError)?;
-
-        let status = resp.status().as_u16();
-        if status != 200 {
-            return Err(Self::map_status(status, "secrets list").unwrap_err());
+        let mut url =
+            reqwest::Url::parse(&self.api_url(path)).map_err(|_| AzureApiError::InvalidResponse)?;
+        url.query_pairs_mut().append_pair("maxresults", "25");
+        let mut results = Vec::new();
+        let mut seen = HashSet::new();
+        for _ in 0..160 {
+            if !seen.insert(url.to_string()) {
+                return Err(AzureApiError::InvalidResponse);
+            }
+            let response: ListResponse<T> = self
+                .fetch(self.http.get(url).bearer_auth(token.as_str()))
+                .await?;
+            if response.value.len() > 25 || results.len() + response.value.len() > 4000 {
+                return Err(AzureApiError::InvalidResponse);
+            }
+            results.extend(response.value);
+            match response.next_link.filter(|v| !v.is_empty()) {
+                None => return Ok(results),
+                Some(next) => url = self.next_page(&next, path)?,
+            }
         }
-
-        let body: ListResponse<AzureSecretItem> =
-            resp.json().await.map_err(AzureApiError::HttpError)?;
-        Ok(body.value)
+        Err(AzureApiError::InvalidResponse)
     }
-
-    /// Get a secret by name, optionally at a specific version.
+    pub async fn list_secrets(&self) -> Result<Vec<AzureSecretItem>, AzureApiError> {
+        self.list("/secrets").await
+    }
+    pub async fn list_keys(&self) -> Result<Vec<AzureKeyItem>, AzureApiError> {
+        self.list("/keys").await
+    }
+    pub async fn list_certificates(&self) -> Result<Vec<AzureCertItem>, AzureApiError> {
+        self.list("/certificates").await
+    }
     pub async fn get_secret(
         &self,
         name: &str,
         version: Option<&str>,
     ) -> Result<AzureSecret, AzureApiError> {
-        let token = self.get_access_token().await?;
-        let path = match version {
-            Some(v) => format!("/secrets/{name}/{v}"),
-            None => format!("/secrets/{name}"),
-        };
-        let url = self.api_url(&path);
-
-        let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(&token)
-            .send()
-            .await
-            .map_err(AzureApiError::HttpError)?;
-
-        let status = resp.status().as_u16();
-        if status != 200 {
-            return Err(Self::map_status(status, &format!("secret '{name}'")).unwrap_err());
+        validate_name(name)?;
+        if let Some(v) = version {
+            validate_version(v)?;
         }
-
-        resp.json::<AzureSecret>()
-            .await
-            .map_err(AzureApiError::HttpError)
+        let url = self.api_url(&format!(
+            "/secrets/{name}{}",
+            version.map(|v| format!("/{v}")).unwrap_or_default()
+        ));
+        let token = self.get_access_token().await?;
+        let result: AzureSecret = self
+            .fetch(self.http.get(url).bearer_auth(token.as_str()))
+            .await?;
+        if result.value.as_ref().is_some_and(|s| s.len() > 25 * 1024) {
+            return Err(AzureApiError::InvalidResponse);
+        }
+        self.validate_secret_response(&result.id, name, version)?;
+        Ok(result)
     }
-
-    /// Set (create or update) a secret by name.
     pub async fn set_secret(&self, name: &str, value: &str) -> Result<AzureSecret, AzureApiError> {
-        let token = self.get_access_token().await?;
-        let url = self.api_url(&format!("/secrets/{name}"));
-
-        let body = SetSecretRequest { value };
-
-        let resp = self
-            .http
-            .put(&url)
-            .bearer_auth(&token)
-            .json(&body)
-            .send()
-            .await
-            .map_err(AzureApiError::HttpError)?;
-
-        let status = resp.status().as_u16();
-        if status != 200 {
-            return Err(Self::map_status(status, &format!("secret '{name}'")).unwrap_err());
+        validate_name(name)?;
+        if value.len() > 25 * 1024 {
+            return Err(AzureApiError::InvalidResponse);
         }
-
-        resp.json::<AzureSecret>()
-            .await
-            .map_err(AzureApiError::HttpError)
+        let token = self.get_access_token().await?;
+        let encoded = Zeroizing::new(
+            serde_json::to_string(value).map_err(|_| AzureApiError::InvalidResponse)?,
+        );
+        let body = Zeroizing::new(format!("{{\"value\":{}}}", encoded.as_str()));
+        let mut response: AzureSecret = self
+            .fetch(
+                self.http
+                    .put(self.api_url(&format!("/secrets/{name}")))
+                    .bearer_auth(token.as_str())
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(body.as_bytes().to_vec()),
+            )
+            .await?;
+        response.value.zeroize();
+        response.value = None;
+        self.validate_secret_response(&response.id, name, None)?;
+        Ok(response)
     }
-
-    /// List all keys in the vault.
-    pub async fn list_keys(&self) -> Result<Vec<AzureKeyItem>, AzureApiError> {
-        let token = self.get_access_token().await?;
-        let url = self.api_url("/keys");
-
-        let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(&token)
-            .send()
-            .await
-            .map_err(AzureApiError::HttpError)?;
-
-        let status = resp.status().as_u16();
-        if status != 200 {
-            return Err(Self::map_status(status, "keys list").unwrap_err());
+    fn validate_secret_response(
+        &self,
+        id: &str,
+        name: &str,
+        version: Option<&str>,
+    ) -> Result<(), AzureApiError> {
+        let url = reqwest::Url::parse(id).map_err(|_| AzureApiError::InvalidResponse)?;
+        if self.resource_name(id, "secrets")? != name
+            || url.path_segments().is_none_or(|parts| parts.count() != 3)
+            || version.is_some_and(|v| url.path().rsplit('/').next() != Some(v))
+        {
+            return Err(AzureApiError::InvalidResponse);
         }
-
-        let body: ListResponse<AzureKeyItem> =
-            resp.json().await.map_err(AzureApiError::HttpError)?;
-        Ok(body.value)
+        Ok(())
     }
-
-    /// List all certificates in the vault.
-    pub async fn list_certificates(&self) -> Result<Vec<AzureCertItem>, AzureApiError> {
-        let token = self.get_access_token().await?;
-        let url = self.api_url("/certificates");
-
-        let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(&token)
-            .send()
-            .await
-            .map_err(AzureApiError::HttpError)?;
-
-        let status = resp.status().as_u16();
-        if status != 200 {
-            return Err(Self::map_status(status, "certificates list").unwrap_err());
+    /// Validate server-returned identifiers before projecting them to callers.
+    pub fn resource_name(&self, id: &str, kind: &str) -> Result<String, AzureApiError> {
+        let url = reqwest::Url::parse(id).map_err(|_| AzureApiError::InvalidResponse)?;
+        let base =
+            reqwest::Url::parse(&self.base_url).map_err(|_| AzureApiError::InvalidResponse)?;
+        if url.origin() != base.origin()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(AzureApiError::InvalidResponse);
         }
-
-        let body: ListResponse<AzureCertItem> =
-            resp.json().await.map_err(AzureApiError::HttpError)?;
-        Ok(body.value)
+        let parts: Vec<_> = url.path().split('/').collect();
+        if !(3..=4).contains(&parts.len())
+            || !parts[0].is_empty()
+            || parts[1] != kind
+            || validate_name(parts[2]).is_err()
+            || parts.get(3).is_some_and(|v| validate_version(v).is_err())
+        {
+            return Err(AzureApiError::InvalidResponse);
+        }
+        Ok(parts[2].into())
     }
 }
-
+async fn read_json<T: DeserializeOwned>(
+    mut response: reqwest::Response,
+    max: usize,
+) -> Result<T, AzureApiError> {
+    if response
+        .content_length()
+        .is_some_and(|len| len > max as u64)
+    {
+        return Err(AzureApiError::InvalidResponse);
+    }
+    let mut data = Zeroizing::new(Vec::new());
+    while let Some(chunk) = response.chunk().await.map_err(AzureApiError::HttpError)? {
+        if chunk.len() > max.saturating_sub(data.len()) {
+            return Err(AzureApiError::InvalidResponse);
+        }
+        data.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&data).map_err(|_| AzureApiError::InvalidResponse)
+}
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -433,7 +592,7 @@ mod tests {
 
     #[test]
     fn client_stores_base_url_trimmed() {
-        let client = AzureKeyVaultClient::new(
+        let client = AzureKeyVaultClient::test_new(
             "http://localhost:8080/",
             "tenant".into(),
             "client".into(),
@@ -445,7 +604,7 @@ mod tests {
 
     #[test]
     fn client_base_url_no_trailing_slash() {
-        let client = AzureKeyVaultClient::new(
+        let client = AzureKeyVaultClient::test_new(
             "http://localhost:8080",
             "tenant".into(),
             "client".into(),
@@ -463,7 +622,7 @@ mod tests {
 
     #[test]
     fn client_debug_does_not_leak_secret() {
-        let client = AzureKeyVaultClient::new(
+        let client = AzureKeyVaultClient::test_new(
             "http://localhost:8080",
             "tenant-123".into(),
             "client-456".into(),
@@ -472,8 +631,8 @@ mod tests {
         .unwrap();
         let debug = format!("{client:?}");
         assert!(debug.contains("AzureKeyVaultClient"));
-        assert!(debug.contains("tenant-123"));
-        assert!(debug.contains("client-456"));
+        assert!(!debug.contains("tenant-123"));
+        assert!(!debug.contains("client-456"));
         assert!(!debug.contains("super-secret"));
     }
 
@@ -550,7 +709,7 @@ mod tests {
         assert!(format!("{err}").contains("418"));
 
         let err = AzureApiError::InvalidUrl("bad".into());
-        assert!(format!("{err}").contains("invalid URL"));
+        assert!(format!("{err}").contains("endpoint or selector"));
     }
 
     #[test]
@@ -561,30 +720,34 @@ mod tests {
     #[test]
     fn validate_url_scheme_accepts_localhost_http() {
         validate_url_scheme("http://localhost:8080").unwrap();
-        validate_url_scheme("http://127.0.0.1:9000/api").unwrap();
+        assert!(validate_url_scheme("http://127.0.0.1:9000/api").is_err());
     }
 
     #[test]
     fn validate_url_scheme_rejects_remote_http() {
         let err = validate_url_scheme("http://myvault.vault.azure.net").unwrap_err();
         assert!(matches!(err, AzureApiError::InvalidUrl(_)));
-        assert!(format!("{err}").contains("insecure HTTP URL rejected"));
+        assert!(format!("{err}").contains("HTTPS"));
     }
 
     #[test]
     fn validate_url_scheme_rejects_ftp() {
         let err = validate_url_scheme("ftp://example.com/file").unwrap_err();
         assert!(matches!(err, AzureApiError::InvalidUrl(_)));
-        assert!(format!("{err}").contains("unsupported URL scheme"));
+        assert!(format!("{err}").contains("HTTPS"));
     }
 
     #[test]
     fn api_url_includes_version() {
-        let client =
-            AzureKeyVaultClient::new("http://localhost:8080", "t".into(), "c".into(), "s".into())
-                .unwrap();
+        let client = AzureKeyVaultClient::test_new(
+            "http://localhost:8080",
+            "t".into(),
+            "c".into(),
+            "s".into(),
+        )
+        .unwrap();
         let url = client.api_url("/secrets");
-        assert_eq!(url, "http://localhost:8080/secrets?api-version=7.4");
+        assert_eq!(url, "http://localhost:8080/secrets?api-version=2025-07-01");
     }
 
     #[test]
@@ -640,7 +803,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = AzureKeyVaultClient::new(
+        let client = AzureKeyVaultClient::test_new(
             &mock_server.uri(),
             "test-tenant".into(),
             "test-client-id".into(),
@@ -667,7 +830,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = AzureKeyVaultClient::new(
+        let client = AzureKeyVaultClient::test_new(
             &mock_server.uri(),
             "tenant".into(),
             "client-id".into(),
@@ -677,11 +840,11 @@ mod tests {
         .with_token_endpoint(format!("{}/oauth2/v2.0/token", mock_server.uri()));
 
         let token = client.get_access_token().await.unwrap();
-        assert_eq!(token, "my-azure-token");
+        assert_eq!(token.as_str(), "my-azure-token");
 
         // Second call should use cache (mock expects only 1 call).
         let token2 = client.get_access_token().await.unwrap();
-        assert_eq!(token2, "my-azure-token");
+        assert_eq!(token2.as_str(), "my-azure-token");
     }
 
     #[tokio::test]
@@ -698,7 +861,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = AzureKeyVaultClient::new(
+        let client = AzureKeyVaultClient::test_new(
             &mock_server.uri(),
             "tenant".into(),
             "bad-client".into(),
@@ -718,7 +881,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/secrets"))
-            .and(query_param("api-version", "7.4"))
+            .and(query_param("api-version", "2025-07-01"))
             .and(header("Authorization", "Bearer mock-azure-token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "value": [
@@ -742,7 +905,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/secrets"))
-            .and(query_param("api-version", "7.4"))
+            .and(query_param("api-version", "2025-07-01"))
             .respond_with(ResponseTemplate::new(401))
             .expect(1)
             .mount(&mock_server)
@@ -759,7 +922,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/secrets"))
-            .and(query_param("api-version", "7.4"))
+            .and(query_param("api-version", "2025-07-01"))
             .respond_with(ResponseTemplate::new(403))
             .expect(1)
             .mount(&mock_server)
@@ -776,7 +939,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/secrets"))
-            .and(query_param("api-version", "7.4"))
+            .and(query_param("api-version", "2025-07-01"))
             .respond_with(ResponseTemplate::new(500))
             .expect(1)
             .mount(&mock_server)
@@ -793,10 +956,10 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/secrets/my-secret"))
-            .and(query_param("api-version", "7.4"))
+            .and(query_param("api-version", "2025-07-01"))
             .and(header("Authorization", "Bearer mock-azure-token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "https://vault/secrets/my-secret/version1",
+                "id": format!("{}/secrets/my-secret/version1", mock_server.uri()),
                 "value": "the-secret-value",
                 "attributes": {"enabled": true}
             })))
@@ -815,9 +978,9 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/secrets/my-secret/abc123"))
-            .and(query_param("api-version", "7.4"))
+            .and(query_param("api-version", "2025-07-01"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "https://vault/secrets/my-secret/abc123",
+                "id": format!("{}/secrets/my-secret/abc123", mock_server.uri()),
                 "value": "versioned-value"
             })))
             .expect(1)
@@ -837,7 +1000,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/secrets/missing"))
-            .and(query_param("api-version", "7.4"))
+            .and(query_param("api-version", "2025-07-01"))
             .respond_with(ResponseTemplate::new(404))
             .expect(1)
             .mount(&mock_server)
@@ -854,10 +1017,10 @@ mod tests {
 
         Mock::given(method("PUT"))
             .and(path("/secrets/new-secret"))
-            .and(query_param("api-version", "7.4"))
+            .and(query_param("api-version", "2025-07-01"))
             .and(header("Authorization", "Bearer mock-azure-token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "https://vault/secrets/new-secret/v1",
+                "id": format!("{}/secrets/new-secret/v1", mock_server.uri()),
                 "value": "new-value",
                 "attributes": {"enabled": true}
             })))
@@ -867,7 +1030,10 @@ mod tests {
 
         let secret = client.set_secret("new-secret", "new-value").await.unwrap();
         assert!(secret.id.contains("new-secret"));
-        assert_eq!(secret.value.as_deref(), Some("new-value"));
+        assert!(
+            secret.value.is_none(),
+            "write responses must discard echoed secrets"
+        );
     }
 
     #[tokio::test]
@@ -876,7 +1042,7 @@ mod tests {
 
         Mock::given(method("PUT"))
             .and(path("/secrets/restricted"))
-            .and(query_param("api-version", "7.4"))
+            .and(query_param("api-version", "2025-07-01"))
             .respond_with(ResponseTemplate::new(403))
             .expect(1)
             .mount(&mock_server)
@@ -893,7 +1059,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/keys"))
-            .and(query_param("api-version", "7.4"))
+            .and(query_param("api-version", "2025-07-01"))
             .and(header("Authorization", "Bearer mock-azure-token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "value": [
@@ -917,7 +1083,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/keys"))
-            .and(query_param("api-version", "7.4"))
+            .and(query_param("api-version", "2025-07-01"))
             .respond_with(ResponseTemplate::new(403))
             .expect(1)
             .mount(&mock_server)
@@ -934,7 +1100,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/certificates"))
-            .and(query_param("api-version", "7.4"))
+            .and(query_param("api-version", "2025-07-01"))
             .and(header("Authorization", "Bearer mock-azure-token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "value": [
@@ -956,7 +1122,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/certificates"))
-            .and(query_param("api-version", "7.4"))
+            .and(query_param("api-version", "2025-07-01"))
             .respond_with(ResponseTemplate::new(500))
             .expect(1)
             .mount(&mock_server)
@@ -973,7 +1139,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/secrets"))
-            .and(query_param("api-version", "7.4"))
+            .and(query_param("api-version", "2025-07-01"))
             .and(header("Authorization", "Bearer mock-azure-token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "value": []
@@ -992,7 +1158,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/secrets"))
-            .and(query_param("api-version", "7.4"))
+            .and(query_param("api-version", "2025-07-01"))
             .and(header(
                 "user-agent",
                 &format!("opaqued/{}", env!("CARGO_PKG_VERSION")),
@@ -1013,7 +1179,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/secrets"))
-            .and(query_param("api-version", "7.4"))
+            .and(query_param("api-version", "2025-07-01"))
             .respond_with(ResponseTemplate::new(418)) // I'm a teapot
             .expect(1)
             .mount(&mock_server)
@@ -1045,7 +1211,7 @@ mod tests {
         // Two API calls should both use the cached token.
         Mock::given(method("GET"))
             .and(path("/secrets"))
-            .and(query_param("api-version", "7.4"))
+            .and(query_param("api-version", "2025-07-01"))
             .and(header("Authorization", "Bearer cached-token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "value": []
@@ -1055,11 +1221,254 @@ mod tests {
             .await;
 
         let client =
-            AzureKeyVaultClient::new(&mock_server.uri(), "t".into(), "c".into(), "s".into())
+            AzureKeyVaultClient::test_new(&mock_server.uri(), "t".into(), "c".into(), "s".into())
                 .unwrap()
                 .with_token_endpoint(format!("{}/oauth2/v2.0/token", mock_server.uri()));
 
         client.list_secrets().await.unwrap();
         client.list_secrets().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    use serde_json::json;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path, query_param},
+    };
+    async fn client() -> (AzureKeyVaultClient, MockServer) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"access_token":"synthetic","expires_in":3600})),
+            )
+            .mount(&server)
+            .await;
+        let client = AzureKeyVaultClient::test_new(
+            &server.uri(),
+            "tenant".into(),
+            "client".into(),
+            "synthetic".into(),
+        )
+        .unwrap()
+        .with_token_endpoint(format!("{}/token", server.uri()));
+        (client, server)
+    }
+    #[tokio::test]
+    async fn follows_only_same_vault_same_collection_continuations() {
+        let (client, server) = client().await;
+        let trap = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/secrets")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"value":[{"id":"first"}],"nextLink":format!("{}/secrets?api-version={API_VERSION}&skiptoken=next",server.uri())}))).with_priority(2).mount(&server).await;
+        Mock::given(method("GET"))
+            .and(query_param("skiptoken", "next"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"value":[{"id":"second"}]})),
+            )
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        assert_eq!(client.list_secrets().await.unwrap().len(), 2);
+        for next in [
+            format!("{}/secrets?api-version={API_VERSION}", trap.uri()),
+            format!("{}/keys?api-version={API_VERSION}", server.uri()),
+            format!(
+                "{}/secrets?api-version={API_VERSION}&api-version=7.0",
+                server.uri()
+            ),
+            format!("{}/secrets?api-version={API_VERSION}#x", server.uri()),
+        ] {
+            assert!(client.next_page(&next, "/secrets").is_err());
+        }
+        assert!(trap.received_requests().await.unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn malicious_continuation_and_redirect_do_not_receive_bearer() {
+        let (client, server) = client().await;
+        let trap = MockServer::start().await;
+        Mock::given(method("GET")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"value":[],"nextLink":format!("{}/secrets?api-version={API_VERSION}",trap.uri())}))).mount(&server).await;
+        assert!(matches!(
+            client.list_secrets().await,
+            Err(AzureApiError::InvalidResponse)
+        ));
+        assert!(trap.received_requests().await.unwrap().is_empty());
+        server.reset().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("Location", format!("{}/stolen", trap.uri())),
+            )
+            .mount(&server)
+            .await;
+        assert!(client.get_secret("secret", None).await.is_err());
+        assert!(trap.received_requests().await.unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn expired_token_refreshes_and_auth_errors_never_echo_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"access_token":"synthetic","expires_in":30})),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = AzureKeyVaultClient::test_new(
+            &server.uri(),
+            "tenant".into(),
+            "client".into(),
+            "synthetic".into(),
+        )
+        .unwrap()
+        .with_token_endpoint(format!("{}/token", server.uri()));
+        client.get_access_token().await.unwrap();
+        client.get_access_token().await.unwrap();
+        server.reset().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_string("synthetic-secret-do-not-disclose"),
+            )
+            .mount(&server)
+            .await;
+        let err = client.get_access_token().await.unwrap_err();
+        assert!(!format!("{err:?} {err}").contains("do-not-disclose"));
+    }
+    #[tokio::test]
+    async fn invalid_ids_and_oversized_writes_fail_before_auth() {
+        let (client, server) = client().await;
+        assert!(client.get_secret("../other", None).await.is_err());
+        assert!(client.get_secret("secret", Some("x?alt=y")).await.is_err());
+        assert!(
+            client
+                .set_secret("secret", &"x".repeat(25 * 1024 + 1))
+                .await
+                .is_err()
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn oversized_json_and_repeated_pages_fail_instead_of_partial_success() {
+        let (client, server) = client().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("x".repeat(MAX_BODY + 1)))
+            .mount(&server)
+            .await;
+        assert!(matches!(
+            client.list_secrets().await,
+            Err(AzureApiError::InvalidResponse)
+        ));
+        server.reset().await;
+        Mock::given(method("GET")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"value":[],"nextLink":format!("{}/secrets?api-version={API_VERSION}&skiptoken=loop",server.uri())}))).mount(&server).await;
+        assert!(matches!(
+            client.list_secrets().await,
+            Err(AzureApiError::InvalidResponse)
+        ));
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+    #[tokio::test]
+    async fn response_resource_and_requested_version_must_match() {
+        let (client, server) = client().await;
+        client.get_access_token().await.unwrap();
+        for id in [
+            "https://other.vault.azure.net/secrets/secret/v1".to_owned(),
+            format!("{}/secrets/other/v1", server.uri()),
+            format!("{}/secrets/secret/v2", server.uri()),
+        ] {
+            server.reset().await;
+            Mock::given(method("GET"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"id":id,"value":"synthetic-do-not-disclose"})),
+                )
+                .mount(&server)
+                .await;
+            let err = client.get_secret("secret", Some("v1")).await.unwrap_err();
+            assert!(matches!(err, AzureApiError::InvalidResponse));
+            assert!(!format!("{err:?} {err}").contains("do-not-disclose"));
+        }
+    }
+    #[tokio::test]
+    async fn get_and_set_responses_require_provider_version() {
+        let (client, server) = client().await;
+        client.get_access_token().await.unwrap();
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"id":format!("{}/secrets/secret",server.uri()),"value":"synthetic"}),
+            ))
+            .mount(&server)
+            .await;
+        assert!(matches!(
+            client.get_secret("secret", None).await,
+            Err(AzureApiError::InvalidResponse)
+        ));
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"id":format!("{}/secrets/secret",server.uri()),"value":"synthetic"}),
+            ))
+            .mount(&server)
+            .await;
+        assert!(matches!(
+            client.set_secret("secret", "synthetic").await,
+            Err(AzureApiError::InvalidResponse)
+        ));
+    }
+    #[test]
+    fn tenant_and_url_injection_fail_at_construction() {
+        for tenant in [
+            "../other",
+            "tenant?x",
+            "tenant#x",
+            "common",
+            "organizations",
+        ] {
+            assert!(
+                AzureKeyVaultClient::new(
+                    "https://vault.vault.azure.net",
+                    tenant.into(),
+                    "client".into(),
+                    "env:UNREAD".into()
+                )
+                .is_err()
+            );
+        }
+        for url in [
+            "https://user:pass@vault.vault.azure.net",
+            "https://vault.vault.azure.net?x=y",
+            "https://vault.vault.azure.net/path",
+            "http://127.0.0.1.evil.invalid",
+        ] {
+            assert!(validate_url_scheme(url).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn production_vault_guard_is_independent_of_fixture_transport() {
+    assert!(
+        validate_production_endpoint(
+            &reqwest::Url::parse("https://my-vault.vault.azure.net").unwrap()
+        )
+        .is_ok()
+    );
+    for endpoint in [
+        "http://127.0.0.1:8000",
+        "https://my-vault.vault.azure.net.evil.invalid",
+        "https://evil.invalid",
+        "https://user@my-vault.vault.azure.net",
+        "https://my-vault.vault.azure.net:444",
+        "http://my-vault.vault.azure.net",
+        "https://my-vault.vault.azure.net/path",
+        "https://my-vault.vault.azure.net?x=y",
+    ] {
+        assert!(
+            validate_production_endpoint(&reqwest::Url::parse(endpoint).unwrap()).is_err(),
+            "{endpoint}"
+        );
     }
 }

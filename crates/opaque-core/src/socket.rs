@@ -234,6 +234,7 @@ pub fn validate_path_chain(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

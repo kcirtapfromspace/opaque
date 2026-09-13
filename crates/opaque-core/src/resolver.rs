@@ -21,13 +21,52 @@ pub trait SecretResolver: Send + Sync {
     ///
     /// Returns a [`SecretValue`] that is automatically zeroed on drop.
     fn resolve(&self, ref_str: &str) -> Result<SecretValue, ResolveError>;
+
+    /// Resolve references for one execution, preserving input order and length.
+    /// Providers issuing compound credentials override this method so fields
+    /// of the same secret come from one coherent issuance even across expiry.
+    fn resolve_batch(&self, refs: &[&str]) -> Result<Vec<SecretValue>, ResolveError> {
+        refs.iter()
+            .map(|reference| self.resolve(reference))
+            .collect()
+    }
+}
+
+/// Dispatch one execution's references in scheme batches without reordering
+/// the returned values. This keeps compound provider credentials coherent.
+pub fn resolve_batch_by_scheme(
+    refs: &[&str],
+    mut resolve: impl FnMut(&[&str]) -> Result<Vec<SecretValue>, ResolveError>,
+) -> Result<Vec<SecretValue>, ResolveError> {
+    let mut groups = std::collections::BTreeMap::<&str, Vec<(usize, &str)>>::new();
+    for (index, reference) in refs.iter().enumerate() {
+        let scheme = reference.split_once(':').map_or("", |(scheme, _)| scheme);
+        groups.entry(scheme).or_default().push((index, reference));
+    }
+    let mut result: Vec<Option<SecretValue>> = (0..refs.len()).map(|_| None).collect();
+    for group in groups.values() {
+        let references: Vec<&str> = group.iter().map(|(_, reference)| *reference).collect();
+        let values = resolve(&references)?;
+        if values.len() != group.len() {
+            return Err(ResolveError::InvalidBatch);
+        }
+        for ((index, _), value) in group.iter().zip(values) {
+            result[*index] = Some(value);
+        }
+    }
+    result
+        .into_iter()
+        .map(|value| value.ok_or(ResolveError::InvalidBatch))
+        .collect()
 }
 
 /// Errors from secret resolution.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ResolveError {
+    #[error("secret provider returned an invalid batch")]
+    InvalidBatch,
     #[error(
-        "unknown ref scheme in '{0}' (expected env:, keychain:, profile:, onepassword:, bitwarden:, aws:, or vault:)"
+        "unknown ref scheme in '{0}' (expected env:, keychain:, profile:, onepassword:, bitwarden:, aws:, gcp:, azure:, or vault:)"
     )]
     UnknownScheme(String),
 
@@ -294,6 +333,7 @@ impl SecretResolver for BaseResolver {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

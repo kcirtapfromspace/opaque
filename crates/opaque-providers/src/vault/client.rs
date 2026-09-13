@@ -2,7 +2,10 @@
 //!
 //! Supports extracting fields from both KV v1 and KV v2 style payloads.
 
+use std::collections::HashMap;
 use std::num::NonZeroU64;
+
+use opaque_core::secret::SecretValue;
 
 /// Environment variable to override the default Vault API base URL.
 pub const VAULT_URL_ENV: &str = "OPAQUE_VAULT_URL";
@@ -45,6 +48,9 @@ pub enum VaultApiError {
 
     #[error("Vault pinned version {0} is deleted, destroyed, or unavailable")]
     VersionUnavailable(u64),
+
+    #[error("Vault returned invalid lease metadata")]
+    InvalidLease,
 }
 
 /// Validate that a URL uses `https://`, allowing `http://` only for localhost.
@@ -116,6 +122,7 @@ fn scalar_field_value(value: &serde_json::Value) -> Option<String> {
 }
 
 /// Extract a string field from KV v1/v2 style response payloads.
+#[cfg(test)]
 fn extract_field_value(body: &serde_json::Value, field: &str) -> Option<String> {
     // KV v2 style: { "data": { "data": { <field>: <value> } } }
     if let Some(v2) = body
@@ -140,6 +147,14 @@ pub struct VaultLease {
     pub lease_id: String,
     pub lease_duration_secs: u64,
     pub renewable: bool,
+}
+
+/// One complete provider response. Related dynamic fields must be projected
+/// from this same issuance, never fetched independently.
+#[derive(Debug)]
+pub struct VaultSecret {
+    pub fields: HashMap<String, SecretValue>,
+    pub lease: Option<VaultLease>,
 }
 
 /// Secret read result with optional lease metadata.
@@ -178,6 +193,18 @@ fn extract_lease(body: &serde_json::Value) -> Option<VaultLease> {
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
     })
+}
+
+fn validated_lease(body: &serde_json::Value) -> Result<Option<VaultLease>, VaultApiError> {
+    let lease = extract_lease(body);
+    if body
+        .get("lease_id")
+        .is_some_and(|id| id.as_str() != Some(""))
+        && lease.is_none()
+    {
+        return Err(VaultApiError::InvalidLease);
+    }
+    Ok(lease)
 }
 
 /// Vault REST API client.
@@ -261,14 +288,33 @@ impl VaultClient {
         field: &str,
         version: Option<NonZeroU64>,
     ) -> Result<VaultSecretField, VaultApiError> {
+        if field.is_empty() {
+            return Err(VaultApiError::NotFound("empty secret field".into()));
+        }
+        let mut secret = self.read_secret_at_version(token, path, version).await?;
+        let value = secret
+            .fields
+            .remove(field)
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .ok_or_else(|| VaultApiError::NotFound(format!("field '{field}' at path '{path}'")))?;
+        Ok(VaultSecretField {
+            value,
+            lease: secret.lease,
+        })
+    }
+
+    /// Fetch one complete KV or dynamic issuance. Pinned versions are checked
+    /// before any field is made available to the resolver.
+    pub async fn read_secret_at_version(
+        &self,
+        token: &str,
+        path: &str,
+        version: Option<NonZeroU64>,
+    ) -> Result<VaultSecret, VaultApiError> {
         let path_trimmed = path.trim_matches('/');
         if path_trimmed.is_empty() {
             return Err(VaultApiError::NotFound("empty secret path".into()));
         }
-        if field.is_empty() {
-            return Err(VaultApiError::NotFound("empty secret field".into()));
-        }
-
         let encoded_path = encode_vault_path(path_trimmed);
         let url = format!("{}/v1/{encoded_path}", self.base_url);
         let mut request = self
@@ -287,7 +333,7 @@ impl VaultClient {
                     .json::<serde_json::Value>()
                     .await
                     .map_err(VaultApiError::Network)?;
-                let value = if let Some(version) = version {
+                let data = if let Some(version) = version {
                     let metadata = body
                         .get("data")
                         .and_then(|data| data.get("metadata"))
@@ -314,22 +360,35 @@ impl VaultClient {
                     if destroyed || !deletion_time.is_empty() {
                         return Err(VaultApiError::VersionUnavailable(version.get()));
                     }
-                    let data = body
-                        .get("data")
+                    body.get("data")
                         .and_then(|data| data.get("data"))
-                        .filter(|data| data.is_object())
-                        .ok_or(VaultApiError::VersionUnavailable(version.get()))?;
-                    // Only the KV v2 data object can supply a pinned field.
-                    data.get(field).and_then(scalar_field_value)
+                        .and_then(|data| data.as_object())
+                        .ok_or(VaultApiError::VersionUnavailable(version.get()))?
                 } else {
-                    extract_field_value(&body, field)
-                }
-                .ok_or_else(|| {
-                    VaultApiError::NotFound(format!("field '{field}' at path '{path_trimmed}'"))
-                })?;
-                Ok(VaultSecretField {
-                    value,
-                    lease: extract_lease(&body),
+                    body.get("data")
+                        .and_then(|v| v.as_object())
+                        .ok_or_else(|| VaultApiError::NotFound("secret data".into()))?
+                };
+                // Preserve unversioned KV v1 scalar siblings even when the
+                // document has its own object named `data`. Nested KV v2 fields
+                // take precedence, matching the existing unpinned field API.
+                // Pinned reads remain strictly inside their validated KV v2 data.
+                let nested = version
+                    .is_none()
+                    .then(|| data.get("data").and_then(|value| value.as_object()))
+                    .flatten();
+                let fields = data
+                    .iter()
+                    .filter(|(name, _)| nested.is_none_or(|nested| !nested.contains_key(*name)))
+                    .chain(nested.into_iter().flat_map(|nested| nested.iter()))
+                    .filter_map(|(name, value)| {
+                        scalar_field_value(value)
+                            .map(|value| (name.clone(), SecretValue::from_string(value)))
+                    })
+                    .collect();
+                Ok(VaultSecret {
+                    fields,
+                    lease: validated_lease(&body)?,
                 })
             }
             401 | 403 => Err(VaultApiError::Unauthorized),
@@ -402,7 +461,11 @@ impl VaultClient {
                     .json::<serde_json::Value>()
                     .await
                     .map_err(VaultApiError::Network)?;
-                extract_lease(&body).ok_or(VaultApiError::ServerError)
+                let lease = validated_lease(&body)?.ok_or(VaultApiError::InvalidLease)?;
+                if lease.lease_id != lease_id_trimmed {
+                    return Err(VaultApiError::InvalidLease);
+                }
+                Ok(lease)
             }
             400 => Err(VaultApiError::BadRequest),
             401 | 403 => Err(VaultApiError::Unauthorized),
@@ -794,7 +857,7 @@ mod tests {
                 "lease_id": "database/creds/readonly/a1"
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "lease_id": "database/creds/readonly/a2",
+                "lease_id": "database/creds/readonly/a1",
                 "lease_duration": 120,
                 "renewable": true
             })))
@@ -806,7 +869,7 @@ mod tests {
             .renew_lease("vault-token", "database/creds/readonly/a1")
             .await
             .unwrap();
-        assert_eq!(renewed.lease_id, "database/creds/readonly/a2");
+        assert_eq!(renewed.lease_id, "database/creds/readonly/a1");
         assert_eq!(renewed.lease_duration_secs, 120);
         assert!(renewed.renewable);
     }

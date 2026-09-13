@@ -72,7 +72,7 @@ impl AwsResolver {
             .strip_prefix("aws:")
             .ok_or_else(|| ResolveError::UnknownScheme(ref_str.to_owned()))?;
 
-        if rest.is_empty() {
+        if rest.is_empty() || rest.len() > 2048 || rest.chars().any(char::is_control) {
             return Err(ResolveError::AwsError(
                 ref_str.to_owned(),
                 "empty ref after 'aws:' prefix".into(),
@@ -98,9 +98,21 @@ impl SecretResolver for AwsResolver {
         let parsed = Self::parse_ref(ref_str)?;
 
         self.client
-            .ensure_mock_configuration()
+            .ensure_configuration()
             .map_err(|e| ResolveError::AwsError(ref_str.to_owned(), e.to_string()))?;
 
+        if !super::client::valid_credential_ref(&self.access_key_ref)
+            || !super::client::valid_credential_ref(&self.secret_key_ref)
+            || self.access_key_ref == self.secret_key_ref
+            || self.client.session_token_ref().is_some_and(|reference| {
+                reference == self.access_key_ref || reference == self.secret_key_ref
+            })
+        {
+            return Err(ResolveError::AwsError(
+                ref_str.into(),
+                "invalid AWS base credential references".into(),
+            ));
+        }
         // Resolve AWS credentials via base resolvers only (env + keychain).
         let base = BaseResolver::new();
         let access_key_value = base.resolve(&self.access_key_ref).map_err(|e| {
@@ -141,8 +153,7 @@ impl SecretResolver for AwsResolver {
                             .await
                             .map_err(|e| format!("secret fetch failed: {e}"))?;
 
-                        sv.secret_string
-                            .ok_or_else(|| format!("secret '{secret_name}' has no string value"))
+                        sv.into_secret_bytes().map_err(|e| e.to_string())
                     }
                     AwsRef::SsmParameter(param_name) => {
                         let param = self
@@ -153,14 +164,15 @@ impl SecretResolver for AwsResolver {
 
                         param
                             .value
-                            .ok_or_else(|| format!("parameter '{param_name}' has no value"))
+                            .map(String::into_bytes)
+                            .ok_or_else(|| "AWS parameter has no value".into())
                     }
                 }
             })
         });
 
         match result {
-            Ok(value) => Ok(SecretValue::from_string(value)),
+            Ok(value) => Ok(SecretValue::new(value)),
             Err(msg) => Err(ResolveError::AwsError(ref_str.to_owned(), msg)),
         }
     }
@@ -222,24 +234,79 @@ mod tests {
 
     #[test]
     fn resolver_debug() {
-        let client = AwsClient::new_single("http://localhost:8080");
+        let client = AwsClient::new_single("http://127.0.0.1:8080");
         let resolver = AwsResolver::new(client);
         let debug = format!("{resolver:?}");
         assert!(debug.contains("AwsResolver"));
     }
 
     #[test]
-    fn remote_resolution_fails_before_accessing_credentials() {
-        let client = AwsClient::new(
-            "https://sts.us-east-1.amazonaws.com",
-            "https://secretsmanager.us-east-1.amazonaws.com",
-            "https://ssm.us-east-1.amazonaws.com",
-        )
-        .unwrap();
-        let resolver = AwsResolver::new(client);
-        for reference in ["aws:prod/db-password", "aws:ssm:/prod/password"] {
-            let err = resolver.resolve(reference).unwrap_err();
-            assert!(err.to_string().contains("disabled pending SigV4"));
+    fn remote_override_is_rejected_before_accessing_credentials() {
+        assert!(
+            AwsClient::new(
+                "https://untrusted.example",
+                "https://untrusted.example",
+                "https://untrusted.example"
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolver_reads_binary_and_ssm_with_explicit_session_credentials() {
+        use super::super::client::{FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY, FIXTURE_SESSION_TOKEN};
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::*};
+        let server = MockServer::start().await;
+        Mock::given(header("x-amz-target", "secretsmanager.GetSecretValue"))
+            .and(body_json(serde_json::json!({"SecretId":"fixture-binary"})))
+            .and(header("x-amz-security-token", FIXTURE_SESSION_TOKEN))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"Name":"fixture-binary","SecretBinary":"AAEC/w=="}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(header("x-amz-target", "AmazonSSM.GetParameter"))
+            .and(body_json(serde_json::json!({"Name":"/fixture/parameter:2","WithDecryption":true})))
+            .and(header("x-amz-security-token", FIXTURE_SESSION_TOKEN))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"Parameter":{"Name":"/fixture/parameter","Value":"selected-value"}})))
+            .expect(1).mount(&server).await;
+        let names: Vec<String> = (0..3)
+            .map(|index| {
+                format!(
+                    "OPAQUE_AWS_RESOLVER_{}_{}",
+                    uuid::Uuid::new_v4().simple(),
+                    index
+                )
+            })
+            .collect();
+        for (name, value) in names.iter().zip([
+            FIXTURE_ACCESS_KEY,
+            FIXTURE_SECRET_KEY,
+            FIXTURE_SESSION_TOKEN,
+        ]) {
+            unsafe { std::env::set_var(name, value) };
+        }
+        let resolver = AwsResolver {
+            client: AwsClient::new_single(&server.uri())
+                .with_session_token_ref(&format!("env:{}", names[2]))
+                .unwrap(),
+            access_key_ref: format!("env:{}", names[0]),
+            secret_key_ref: format!("env:{}", names[1]),
+        };
+        assert_eq!(
+            resolver.resolve("aws:fixture-binary").unwrap().as_bytes(),
+            [0, 1, 2, 255]
+        );
+        assert_eq!(
+            resolver
+                .resolve("aws:ssm:/fixture/parameter:2")
+                .unwrap()
+                .as_str(),
+            Some("selected-value")
+        );
+        for name in names {
+            unsafe { std::env::remove_var(name) };
         }
     }
 }
