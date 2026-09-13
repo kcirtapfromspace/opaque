@@ -481,6 +481,7 @@ impl ApprovalServer {
 
     /// Get a reference to the shared state (for testing).
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(crate) fn state(&self) -> &Arc<ServerState> {
         &self.state
     }

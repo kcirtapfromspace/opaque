@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -17,6 +19,7 @@ use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod ipc_tests;
 mod policy_regression;
 mod service;
@@ -7432,6 +7435,7 @@ fn preset_checklist(preset_name: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use std::fs;

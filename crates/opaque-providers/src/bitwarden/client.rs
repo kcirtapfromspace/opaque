@@ -373,5 +373,6 @@ fn unique_id(mut ids: impl Iterator<Item = String>) -> Result<String, BitwardenA
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "client_tests.rs"]
 mod tests;

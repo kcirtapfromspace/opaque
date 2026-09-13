@@ -315,6 +315,7 @@ impl GitHubClient {
 
     /// Create a client pointing at a custom base URL (for testing with mock servers).
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     #[allow(dead_code)]
     pub fn with_base_url(base_url: String) -> Self {
         Self::from_base_url(&base_url).expect("invalid test GitHub API endpoint")
@@ -620,10 +621,12 @@ impl GitHubClient {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "inventory_tests.rs"]
 mod inventory_tests;
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

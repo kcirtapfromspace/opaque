@@ -1154,6 +1154,7 @@ fn check_existing_config(config_path: &Path, force: bool) -> Result<(), String> 
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use std::collections::HashMap;

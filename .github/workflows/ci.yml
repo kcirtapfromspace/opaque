@@ -90,7 +90,7 @@ jobs:
       - name: Verify strict runner regressions
         run: python3 -B -m unittest discover -s scripts -p test_synthesized_suite.py -v
       - name: Run exact declared tests with real split-UID prerequisites
-        # The three composed tests are ignored in ordinary nonroot workspace
+        # The composed tests are ignored in ordinary nonroot workspace
         # runs. The manifest explicitly executes them with zero ignored tests.
         # It never invokes the native approval UI.
         run: |
@@ -128,7 +128,7 @@ jobs:
           if-no-files-found: error
 
   measured-code-coverage:
-    name: Critical production coverage (${{ matrix.platform }})
+    name: Workspace production coverage (${{ matrix.platform }})
     strategy:
       fail-fast: false
       matrix:
@@ -146,8 +146,7 @@ jobs:
       RUSTUP_TOOLCHAIN: nightly-2026-09-13
     steps:
       - uses: actions/checkout@v6
-      - if: matrix.platform == 'darwin'
-        uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
         with:
           toolchain: nightly-2026-09-13
           components: llvm-tools-preview
@@ -167,12 +166,14 @@ jobs:
       - name: Verify disposable host runner regressions
         if: matrix.platform == 'linux'
         run: python3 -B -m unittest discover -s tests/contained-ssh -p 'test_*.py' -v
-      - name: Collect existing library and daemon scenarios on this platform
+      - name: Collect every workspace package and instrumented subprocess
         # A killed-child preflight verifies continuous branch profiles before
         # any measurements. The same instrumentation builds test, daemon and
         # adapter binaries; split-UID peer objects/profiles are retained too.
         # Linux runs real SSH and controlled inference RPC scenarios inside a
-        # disposable systemd/Vault/OpenSSH host. Only the three declared libraries' source is reported.
+        # disposable systemd/Vault/OpenSSH host. Cargo metadata defines the
+        # full workspace scope, including non-default members and binaries.
+        # The original three-package subset is only a historical comparison.
         run: |
           if [ "${{ matrix.platform }}" = linux ]; then
             coverage_status=0
@@ -199,6 +200,7 @@ jobs:
           python3 -B scripts/check_llvm_coverage.py \
             --report "$RUNNER_TEMP/critical-coverage/llvm-coverage.json" \
             --source-root "$GITHUB_WORKSPACE" \
+            --require-workspace \
             --require-file crates/opaque-bounded-work/src/task_store.rs \
             --require-file crates/opaque-bounded-work/src/task_api.rs \
             --require-file crates/opaque-bounded-work/src/resource_authority.rs \
@@ -224,11 +226,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: critical-production-coverage-${{ matrix.platform }}
+          name: workspace-production-coverage-${{ matrix.platform }}
           path: |
             ${{ runner.temp }}/critical-contained/run.json
             ${{ runner.temp }}/critical-coverage/collection.json
             ${{ runner.temp }}/critical-coverage/coverage-summary.json
+            ${{ runner.temp }}/critical-coverage/original-scope-summary.json
             ${{ runner.temp }}/critical-coverage/baseline-summary.json
             ${{ runner.temp }}/critical-coverage/baseline-llvm-coverage.json
             ${{ runner.temp }}/critical-coverage/gate.json
@@ -277,19 +280,22 @@ jobs:
         # The packaged SSH host's signed-control and health-contract tests are
         # a separate discovery root and must also run without skips.
         run: |
-          python -B - <<'PYTEST'
-          import sys
-          import unittest
-          for directory in ("scripts", "packaging/ssh-host/tests"):
-              suite = unittest.TestLoader().discover(directory, pattern="test_*.py")
-              result = unittest.TextTestRunner(verbosity=2).run(suite)
-              if not result.wasSuccessful() or not result.testsRun or result.skipped:
-                  print(f"Required suite {directory}: failures, missing tests, or skipped tests", file=sys.stderr)
-                  sys.exit(1)
+          # Independent processes prevent same-named test_runner modules in
+          # separate roots from shadowing one another in sys.modules.
+          for directory in scripts packaging/ssh-host/tests tests/contained-ssh tests/real-model tests/packaged; do
+            python -B - "$directory" <<'PYTEST'
+          import sys, unittest
+          directory = sys.argv[1]
+          suite = unittest.TestLoader().discover(directory, pattern="test_*.py")
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          if not result.wasSuccessful() or not result.testsRun or result.skipped:
+              print(f"Required suite {directory}: failures, missing tests, or skipped tests", file=sys.stderr)
+              sys.exit(1)
           PYTEST
+          done
 
   javascript:
-    name: JavaScript privacy and browser tests
+    name: JavaScript privacy and DOM regressions
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -306,6 +312,120 @@ jobs:
             deploy/cloudflare-docs-privacy/tests/*.test.mjs \
             crates/opaque-showcase/tests/*.test.cjs \
             crates/opaque-web/tests/*.test.cjs
+
+  browser-acceptance:
+    name: Real Chromium dashboard acceptance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "26.8.1"
+          cache: npm
+          cache-dependency-path: tests/browser/package-lock.json
+      - name: Build the real dashboard and daemon
+        run: cargo build --locked -p opaque-web -p opaqued
+      - name: Install pinned Chromium test runtime
+        working-directory: tests/browser
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npx playwright install --with-deps chromium
+      - name: Exercise owner authentication and real process boundaries
+        working-directory: tests/browser
+        run: npm test
+
+  real-model-acceptance:
+    name: Pinned model and signed review acceptance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12.11"
+      - name: Verify owned model harness regressions
+        run: python3 -B -m unittest discover -s tests/real-model -p 'test_*.py' -v
+      - name: Run actual pinned CPU generation through the broker
+        run: |
+          python3 -B tests/contained-ssh/run.py --real-model \
+            --image opaque-contained-model:ci --output "$RUNNER_TEMP/real-model"
+      - name: Retain source-bound model qualification
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-model-acceptance
+          path: |
+            ${{ runner.temp }}/real-model/run.json
+            ${{ runner.temp }}/real-model/container/model-service.json
+            ${{ runner.temp }}/real-model/container/suite/report.json
+            ${{ runner.temp }}/real-model/container/suite/junit.xml
+          if-no-files-found: error
+
+  packaged-acceptance:
+    name: Installed native artifacts (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            runner: ubuntu-24.04
+            python-version: "3.12.11"
+          - platform: darwin
+            runner: macos-15
+            python-version: "3.12.10"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Verify installed-artifact guard regressions
+        run: python3 -B -m unittest discover -s tests/packaged -p 'test_*.py' -v
+      - name: Build all real candidate tools
+        run: cargo build --locked --workspace --bins
+      - name: Package the exact native build
+        # Candidate build bytes; published signing/notarization stays separate.
+        run: |
+          python3 -B tests/packaged/build.py --binary-dir target/debug \
+            --output "$RUNNER_TEMP/packaged-candidate"
+      - name: Exercise the installed tools and actual account custody
+        run: |
+          if [ "${{ matrix.platform }}" = linux ]; then
+            sudo -n env PATH="$PATH" CARGO_HOME="$HOME/.cargo" RUSTUP_HOME="$HOME/.rustup" \
+              python3 -B scripts/synthesized_suite.py --profile packaged \
+                --packaged-archive "$RUNNER_TEMP/packaged-candidate/candidate.tar.gz" \
+                --packaged-owner-user "$(id -un)" --packaged-peer-user nobody \
+                --output "$RUNNER_TEMP/packaged-acceptance"
+          else
+            python3 -B scripts/synthesized_suite.py --profile packaged \
+              --packaged-archive "$RUNNER_TEMP/packaged-candidate/candidate.tar.gz" \
+              --output "$RUNNER_TEMP/packaged-acceptance"
+          fi
+      - name: Restore owned report access
+        if: always() && matrix.platform == 'linux'
+        run: |
+          if [ -d "$RUNNER_TEMP/packaged-acceptance" ]; then
+            sudo -n chown -R --no-dereference "$(id -u):$(id -g)" "$RUNNER_TEMP/packaged-acceptance"
+          fi
+      - name: Retain native installed-artifact qualification
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: installed-artifacts-${{ matrix.platform }}
+          path: |
+            ${{ runner.temp }}/packaged-acceptance/report.json
+            ${{ runner.temp }}/packaged-acceptance/junit.xml
+          if-no-files-found: error
 
   site-privacy:
     name: Generated visitor site privacy

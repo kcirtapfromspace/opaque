@@ -228,6 +228,7 @@ impl PasskeyApprover {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use webauthn_authenticator_rs::{WebauthnAuthenticator, softpasskey::SoftPasskey};

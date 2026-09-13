@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect critical production counters from library tests and real daemon tests.
+"""Collect production counters across every Cargo workspace package.
 
 Each invocation qualifies one native platform. Linux additionally requires root
 and CAP_SYS_PTRACE for the existing split-UID composed-review tests. This runs no
@@ -30,7 +30,7 @@ import synthesized_suite as suite
 
 TOOLCHAIN = "nightly-2026-09-13"
 COLLECTOR_VERSION = "0.9.1"
-PACKAGES = ("opaque-core", "opaque-bounded-work", "opaque-approval")
+ORIGINAL_PACKAGES = ("opaque-core", "opaque-bounded-work", "opaque-approval")
 BASE_FLAGS = ("-C", "instrument-coverage", "--cfg=coverage", "--cfg=coverage_nightly")
 
 
@@ -45,7 +45,7 @@ def instrumentation_flags(native_platform, page_size):
         for section in ("cnts", "data", "bits"):
             flags.append(f"-Clink-arg=-Wl,-sectalign,__DATA,__llvm_prf_{section},{page_size:x}")
     return flags
-REQUIRED_FILES = (
+ORIGINAL_REQUIRED_FILES = (
     "crates/opaque-bounded-work/src/task_store.rs",
     "crates/opaque-bounded-work/src/task_api.rs",
     "crates/opaque-bounded-work/src/resource_authority.rs",
@@ -53,10 +53,15 @@ REQUIRED_FILES = (
     "crates/opaque-core/src/identity_lifecycle.rs",
     "crates/opaque-approval/src/approval_server/workstation.rs",
 )
+REQUIRED_FILES = (*ORIGINAL_REQUIRED_FILES,
+                  "crates/opaque-providers/src/github/client.rs",
+                  "crates/opaque-native-approval/src/lib.rs",
+                  "crates/opaque-web/src/lib.rs")
 CASES = {
     "task_api_e2e": (
         "task_plan_run_get_list_revoke_end_to_end",
         "ssh_planning_without_tenant_is_denied_before_provider_io",
+        "task_rpc_rechecks_changed_workspace_after_source_read_without_publishing",
     ),
     "resource_authority_e2e": ("broker_identity_is_live_for_gateway_queries_disclosures_and_logout",),
     "mcp_gateway_e2e": (
@@ -94,11 +99,140 @@ CONTAINED_CASES = (
     "contained_signed_ssh_runs_one_probe_and_rejects_replay_after_restart",
     "contained_guard_crash_preserves_unknown_and_kills_probe_without_replay",
     "contained_inference_rpc_rechecks_authority_after_metadata_without_refunding",
+    "contained_ssh_rpc_rejects_absent_and_disabled_principals_without_effects",
+    "contained_ssh_rpc_rejects_foreign_tenant_and_broker_bindings_without_effects",
+    "contained_ssh_revoke_during_probe_preserves_charge_and_stops_observed_processes",
 )
 # These exclusions match existing explicitly ignored tests, not missing jobs.
 ROOT_CASE = "trust_domain::tests::root_multi_uid_custody_matrix"
-ALLOWED_IGNORED = {"ssh::tests::live_vault_host_execution", "task_store::tests::task_pagination_scales", ROOT_CASE}
-SCHEMA = "opaque.critical-coverage-collection.v1"
+DAEMON_ROOT_CASE = "trust_domain::tests::root_enforce_blocks_foreign_custody_then_privileges_drop"
+IGNORED_PREREQUISITES = {
+    ("opaque-core", "opaque_core", ROOT_CASE): "explicit Linux root custody matrix",
+    ("opaqued", "opaqued", DAEMON_ROOT_CASE): "explicit Linux root isolation with irreversible child UID drop",
+    ("opaque-bounded-work", "opaque_bounded_work", "ssh::tests::live_vault_host_execution"): "private disposable live Vault/SSH service; separate explicit opt-in",
+    ("opaque-bounded-work", "opaque_bounded_work", "task_store::tests::task_pagination_scales"): "explicit 1k/100k receipt scalability measurement",
+    ("opaque-web", "opaque_web", "sse::tests::audit_backlog_load_baseline"): "explicit long-running SSE load baseline",
+    ("opaque-federation-runtime", "opaque_federation_runtime", "workload_attest::tests::live_signed_and_adhoc_child_socket_attestation"): "explicit signed/unsigned Node binaries and expected macOS Team ID",
+    ("opaque-showcase", "gateway", "bounded_demo::browser_approval_fixture"): "explicit local browser service fixture; runs up to 20 minutes",
+}
+for _name in ("onepassword::op_cli::tests::live_list_vaults", "onepassword::op_cli::tests::live_list_items",
+              "onepassword::op_cli::tests::live_read_field"):
+    IGNORED_PREREQUISITES[("opaque-providers", "opaque_providers", _name)] = "authenticated 1Password desktop session; separate explicit opt-in"
+for _name, _reason in (
+    ("bitwarden::client::tests::live_machine_authentication_and_secret_decryption", "official bws and disposable live Bitwarden account"),
+    ("aws::client::tests::live_aws_read_only_identity_and_selected_resources", "explicit live AWS read opt-in, region, account and credential references"),
+    ("vault::resolve::snapshot_tests::live_dynamic_fields_share_one_real_lease", "explicit disposable live Vault database role"),
+):
+    IGNORED_PREREQUISITES[("opaque-providers", "opaque_providers", _name)] = _reason
+for _name in CASES["synthesized_review_e2e"]:
+    IGNORED_PREREQUISITES[("opaqued", "synthesized_review_e2e", _name)] = "explicit Linux root signed-review composition"
+for _name in CONTAINED_CASES:
+    IGNORED_PREREQUISITES[("opaqued", CONTAINED_TARGET, _name)] = "explicit marked Vault/OpenSSH/systemd host with Linux root and SYS_PTRACE"
+IGNORED_PREREQUISITES[("opaqued", CONTAINED_TARGET, "contained_real_model_completions_require_signed_review_and_survive_restart")] = "owned pinned real-model service profile; separate explicit opt-in"
+for _name in ("split_daemon_custody_and_signature_bound_approver", "split_daemon_refuses_stolen_custody"):
+    IGNORED_PREREQUISITES[("opaqued", "trust_domain_e2e", _name)] = "explicit marked Linux root host for split-UID daemon custody"
+ALLOWED_IGNORED = {name for _package, _target, name in IGNORED_PREREQUISITES}
+SCHEMA = "opaque.workspace-coverage-collection.v2"
+LIBRARY_KINDS = {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"}
+ZERO_COUNTER_DIAGNOSTIC = b"LLVM Profile Error: Neither __llvm_profile_counter_bias nor __llvm_profile_bitmap_bias is defined"
+
+
+def target_kind(kinds):
+    require(isinstance(kinds, list) and kinds, "invalid_cargo_target_kind")
+    if set(kinds) <= LIBRARY_KINDS:
+        return "lib"
+    require(len(kinds) == 1, "ambiguous_cargo_target_kind")
+    return kinds[0]
+
+
+def workspace_inventory(metadata, root):
+    """Cargo workspace_members is authoritative; default-members is not scope."""
+    require(Path(metadata.get("workspace_root", "")).resolve() == root, "metadata_workspace_root_mismatch")
+    members = metadata.get("workspace_members")
+    require(isinstance(members, list) and members and len(members) == len(set(members)), "invalid_workspace_members")
+    descriptions = metadata.get("packages")
+    require(isinstance(descriptions, list), "missing_workspace_package_metadata")
+    by_id = {item["id"]: item for item in descriptions}
+    require(len(by_id) == len(descriptions) and set(members) <= set(by_id), "missing_or_duplicate_workspace_package")
+    packages = []
+    for identity in members:
+        item = by_id[identity]
+        manifest = Path(item["manifest_path"])
+        require(manifest.is_absolute() and manifest.is_file() and not manifest.is_symlink()
+                and manifest.resolve().is_relative_to(root), "invalid_workspace_manifest")
+        name = tomllib.loads(manifest.read_text())["package"]["name"]
+        require(name == item["name"], "workspace_package_name_mismatch")
+        features = item.get("features")
+        require(isinstance(features, dict), "invalid_workspace_features")
+        targets = []
+        for target in item["targets"]:
+            kind = target_kind(target["kind"])
+            source = Path(target["src_path"])
+            require(source.is_absolute() and source.is_file() and not source.is_symlink()
+                    and source.resolve().is_relative_to(root), "invalid_workspace_target_source")
+            required = target.get("required-features", [])
+            require(isinstance(required, list) and set(required) <= set(features), "undeclared_required_target_features")
+            targets.append({"name": target["name"], "kind": kind, "source": source.relative_to(root).as_posix(),
+                            "test": bool(target.get("test", False)), "required_features": sorted(required),
+                            "eligible": kind in ("lib", "bin", "test"),
+                            "eligibility": "all_features_native_compiler" if kind in ("lib", "bin", "test")
+                                           else "not_a_runtime_library_binary_or_integration_test"})
+        require(targets and len({(t["name"], t["kind"]) for t in targets}) == len(targets), "duplicate_or_missing_workspace_target")
+        packages.append({"id": identity, "name": name, "manifest": manifest.relative_to(root).as_posix(),
+                         "features": sorted(features), "targets": targets})
+    require(len({p["name"] for p in packages}) == len(packages), "duplicate_workspace_package_name")
+    return sorted(packages, key=lambda p: p["name"])
+
+
+def expected_artifacts(workspace, *, tests):
+    return {(p["name"], t["name"], t["kind"], tests) for p in workspace for t in p["targets"]
+            if t["eligible"] and (t["test"] if tests else t["kind"] == "bin")}
+
+
+def validate_workspace_artifacts(workspace, selected, *, tests):
+    expected = expected_artifacts(workspace, tests=tests)
+    missing = expected - set(selected)
+    require(not missing, "missing_workspace_" + ("test" if tests else "binary") + "_artifacts:"
+            + ",".join(f"{p}/{name}/{kind}" for p, name, kind, _ in sorted(missing)))
+    require(bool(expected), "workspace_has_no_eligible_" + ("test_targets" if tests else "binaries"))
+    return sorted(expected)
+
+
+def test_inventory(raw):
+    """Zero tests are observed inventory, never a successful test execution."""
+    if raw.strip() in (b"0 tests, 0 benchmarks", ZERO_COUNTER_DIAGNOSTIC + b"\n0 tests, 0 benchmarks"):
+        return set()
+    counter_diagnostics(raw)
+    return suite.inventory(raw)
+
+
+def counter_diagnostics(raw, *, zero_tests=False):
+    errors = [line for line in raw.splitlines() if b"LLVM Profile Error:" in line]
+    require(not errors or (zero_tests and errors == [ZERO_COUNTER_DIAGNOSTIC]),
+            "unexpected_llvm_profile_error")
+    return ["no_continuous_counters_in_zero_test_harness"] if errors else []
+
+
+def reviewed_ignored_tests(package, target, ignored):
+    unknown = {name for name in ignored if (package, target, name) not in IGNORED_PREREQUISITES}
+    require(not unknown, "unreviewed_ignored_workspace_tests:" + package + "/" + target + ":" + ",".join(sorted(unknown)))
+    return {name: IGNORED_PREREQUISITES[(package, target, name)] for name in ignored}
+
+
+def test_execution_counts(executions, targets, skipped):
+    unique = set()
+    invocations = 0
+    for entry in executions:
+        require(len(entry["passed_test_names"]) == entry["passed"], "inconsistent_execution_test_count")
+        invocations += entry["passed"]
+        unique.update((entry["package"], entry["target"], entry["kind"], name) for name in entry["passed_test_names"])
+    return {"compiled_tests_on_native_target": sum(t["compiled_tests"] for t in targets),
+            "non_ignored_compiled_tests": sum(t["non_ignored_tests"] for t in targets),
+            "unique_passed_tests": len(unique), "passed_test_invocations": invocations,
+            "repeated_pass_invocations": invocations - len(unique), "test_process_invocations": len(executions),
+            "zero_test_process_invocations": sum(e["qualification"] == "no_tests_executed" for e in executions),
+            "ignored_tests_not_executed": sum(not s["executed_by_explicit_profile"] for s in skipped),
+            "scope": "unique identities include package, target kind, target name and test name; model transitions are not additional tests"}
 
 
 def require(condition, reason):
@@ -145,9 +279,12 @@ def selected_cases(native_platform, contained=False):
     require(native_platform in ("linux", "darwin"), "unsupported_native_platform")
     selected = {target: names for target, names in CASES.items()
                 if native_platform == "linux" or target != "synthesized_review_e2e"}
+    if native_platform == "linux":
+        selected["opaqued"] = (*selected["opaqued"], DAEMON_ROOT_CASE)
     if contained:
         require(native_platform == "linux", "contained_profile_requires_linux")
         selected[CONTAINED_TARGET] = CONTAINED_CASES
+        selected["trust_domain_e2e"] = ("split_daemon_custody_and_signature_bound_approver", "split_daemon_refuses_stolen_custody")
     return selected
 
 
@@ -164,7 +301,7 @@ def contained_prerequisites(native_platform, *, marker=Path("/etc/opaque-contain
             "scope": "disposable actual Vault/OpenSSH/systemd host with synthetic signed review; no native human claim"}
 
 
-def artifacts(raw, target_dir):
+def artifacts(raw, target_dir, *, qualified=False):
     result = {}
     for line in raw.splitlines():
         try:
@@ -177,16 +314,18 @@ def artifacts(raw, target_dir):
         require(path.is_absolute() and path.is_file() and not path.is_symlink()
                 and path.resolve().is_relative_to(target_dir), "invalid_compiler_artifact")
         target = event.get("target", {})
-        kind = target.get("kind")
-        require(isinstance(kind, list) and len(kind) == 1, "ambiguous_compiler_target")
-        key = (target.get("name"), kind[0], event.get("profile", {}).get("test"))
+        kind = target_kind(target.get("kind"))
+        key = (target.get("name"), kind, event.get("profile", {}).get("test"))
+        if qualified:
+            require(isinstance(event.get("package_id"), str) and event["package_id"], "missing_compiler_package_id")
+            key = (event["package_id"], *key)
         require(key not in result or result[key] == path, "duplicate_compiler_target")
         result[key] = path
     require(bool(result), "empty_compiler_artifacts")
     return result
 
 
-def artifact_packages(raw, selected, root):
+def artifact_packages(raw, selected, root, workspace=None):
     """Restore Cargo's runtime package name from each exact compiled manifest."""
     contexts = {}
     for line in raw.splitlines():
@@ -203,24 +342,30 @@ def artifact_packages(raw, selected, root):
         require(manifest.is_absolute() and manifest.is_file() and not manifest.is_symlink()
                 and manifest.resolve().is_relative_to(root), "invalid_artifact_package_manifest")
         package = tomllib.loads(manifest.read_text())["package"]["name"]
-        require(package in (*PACKAGES, "opaqued", "opaque-mcp"), "unexpected_artifact_package")
+        if workspace is not None:
+            registered = {p["id"]: p for p in workspace}
+            require(event.get("package_id") in registered, "artifact_not_a_workspace_member")
+            expected = registered[event["package_id"]]
+            require(package == expected["name"] and manifest.relative_to(root).as_posix() == expected["manifest"],
+                    "artifact_workspace_package_mismatch")
         require(binary not in contexts or contexts[binary] == package, "ambiguous_artifact_package")
         contexts[binary] = package
     require(set(contexts) == set(selected), "missing_artifact_package_identity")
     return contexts
 
 
-def suite_pass(raw, names):
+def suite_pass(raw, names, *, allowed_ignored=None, allow_empty=False):
     text = raw.decode()
     found = re.findall(r"^test (.+?) \.\.\. (ok|FAILED|ignored(?:, .*)?)$", text, re.MULTILINE)
     require(len(found) == len(names) and {name for name, _ in found} == names,
             "missing_or_duplicate_suite_results")
     ignored = {name for name, status in found if status.startswith("ignored")}
-    require(ignored <= ALLOWED_IGNORED and all(status == "ok" or name in ignored for name, status in found),
+    allowed = ALLOWED_IGNORED if allowed_ignored is None else allowed_ignored
+    require(ignored <= allowed and all(status == "ok" or name in ignored for name, status in found),
             "failed_or_unexpected_ignored_test")
     summary = re.findall(r"^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out;", text, re.MULTILINE)
     require(summary == [("ok", str(len(names) - len(ignored)), "0", str(len(ignored)), "0", "0")]
-            and len(names) > len(ignored), "vacuous_or_incomplete_suite_result")
+            and (len(names) > len(ignored) or allow_empty), "vacuous_or_incomplete_suite_result")
     return {"passed": len(names) - len(ignored), "ignored": sorted(ignored)}
 
 
@@ -236,6 +381,8 @@ def validate_case_inventory(expected, inventories):
 
 
 def role_requirements(target, name):
+    if target == "task_api_e2e" and name == "task_rpc_rechecks_changed_workspace_after_source_read_without_publishing":
+        return {"test", "daemon", "peer"}
     if target in ("synthesized_review_e2e", CONTAINED_TARGET):
         return {"test", "daemon", "peer"}
     if target == "mcp_gateway_e2e":
@@ -243,7 +390,7 @@ def role_requirements(target, name):
         if name in (CASES[target][0], CASES[target][5]):
             roles.add("adapter")
         return roles
-    if target in ("task_api_e2e", "resource_authority_e2e"):
+    if target in ("task_api_e2e", "resource_authority_e2e", "trust_domain_e2e"):
         return {"test", "daemon"}
     return {"test"}
 
@@ -258,25 +405,51 @@ def profile_inventory(directory, target, name=None):
                 "empty_or_invalid_execution_profile")
         role = path.name.split("-", 1)[0]
         require(role in {"test", "daemon", "adapter", "peer"}, "unknown_execution_profile_role")
+        process = re.match(r"^[a-z]+-([1-9][0-9]*)-", path.name)
+        require(process is not None, "missing_profile_process_identity")
         roles.add(role)
-        entries.append({"path": str(path), "sha256": sha(path), "bytes": path.stat().st_size, "role": role})
+        entries.append({"path": str(path), "sha256": sha(path), "bytes": path.stat().st_size,
+                        "role": role, "process_id": int(process[1])})
     require(role_requirements(target, name) <= roles, "missing_required_child_profiles")
     peers = sorted(directory.glob("peer-binary-*"))
-    require(target not in ("synthesized_review_e2e", CONTAINED_TARGET) or bool(peers), "missing_instrumented_peer_object")
+    require("peer" not in role_requirements(target, name) or bool(peers), "missing_instrumented_peer_object")
     require(all(p.is_file() and not p.is_symlink() and p.stat().st_size for p in peers),
             "invalid_instrumented_peer_object")
     return entries, peers
 
 
-def source_inventory(root):
+def source_inventory(root, workspace):
     inventory = []
-    for package in PACKAGES:
-        directory = root / "crates" / package / "src"
-        files = sorted(directory.rglob("*.rs"))
-        require(bool(files), "empty_declared_source_package")
-        for path in files:
+    seen = set()
+    member_roots = {(root / p["manifest"]).parent for p in workspace}
+    for package in workspace:
+        production = [t for t in package["targets"] if t["kind"] in ("lib", "bin") and t["eligible"]]
+        directory = (root / package["manifest"]).parent
+        files = set()
+        roots = {(root / target["source"]).parent for target in production}
+        if production:
+            for path in directory.rglob("*.rs"):
+                relative = path.relative_to(directory)
+                if path.name == "build.rs" or relative.parts[0] == "target":
+                    continue
+                if any(other != directory and other.is_relative_to(directory) and path.is_relative_to(other)
+                       for other in member_roots):
+                    continue
+                # Integration/benchmark/example harnesses are not runtime
+                # source. Explicit Cargo runtime targets in such a location
+                # still win; nested src/tests modules remain inventoried and
+                # their reviewed coverage(off) annotations suppress counters.
+                if relative.parts[0] in {"tests", "examples", "benches"} and not any(
+                        runtime != directory and path.is_relative_to(runtime) for runtime in roots):
+                    continue
+                files.add(path)
+        require(not production or bool(files), "empty_declared_source_package")
+        require(all(root / target["source"] in files for target in production), "workspace_runtime_entrypoint_missing_from_scope")
+        for path in sorted(files):
             require(not path.is_symlink(), "symlink_in_declared_source_scope")
-            inventory.append({"package": package, "path": str(path.relative_to(root)), "sha256": sha(path)})
+            require(path not in seen, "overlapping_workspace_production_source")
+            seen.add(path)
+            inventory.append({"package": package["name"], "path": str(path.relative_to(root)), "sha256": sha(path)})
     require(set(REQUIRED_FILES) <= {item["path"] for item in inventory}, "required_source_not_in_inventory")
     return inventory
 
@@ -291,6 +464,47 @@ def validate_report_scope(report, sources, root):
         measured.add(path)
     require(set(REQUIRED_FILES) <= measured, "required_source_missing_from_collection")
     return sorted(declared - measured)
+
+
+def package_report_subset(report, packages, root):
+    """Select source rows from a validated export and rebuild their own totals.
+
+    LLVM's expanded totals must not qualify a narrower comparison scope. The
+    caller validates the complete export first; this keeps the original scope
+    comparable while preserving all omitted-package deficits in the main gate.
+    """
+    require(bool(packages) and len(packages) == len(set(packages))
+            and set(packages) <= set(ORIGINAL_PACKAGES), "invalid_report_subset_packages")
+    roots = [root / "crates" / package / "src" for package in packages]
+    files = [item for item in report["data"][0]["files"]
+             if any(Path(item["filename"]).resolve().is_relative_to(directory) for directory in roots)]
+    require(bool(files), "empty_report_package_subset")
+    totals = {metric: {key: sum(item["summary"][metric][key] for item in files)
+                       for key in ("count", "covered")}
+              for metric in ("lines", "branches")}
+    return {"type": report["type"], "data": [{"files": files, "totals": totals}]}
+
+
+def workspace_package_coverage(report, sources, workspace, root):
+    owners = {item["path"]: item["package"] for item in sources}
+    measured = {p["name"]: [] for p in workspace}
+    for item in report["data"][0]["files"]:
+        name = Path(item["filename"]).resolve().relative_to(root).as_posix()
+        require(name in owners, "undeclared_report_source")
+        measured[owners[name]].append(item)
+    rows = []
+    for package in workspace:
+        files = measured[package["name"]]
+        production = [t for t in package["targets"] if t["kind"] in ("lib", "bin") and t["eligible"]]
+        counts = {metric: {key: sum(f["summary"][metric][key] for f in files) for key in ("count", "covered")}
+                  for metric in ("lines", "branches")}
+        status = "measured" if counts["lines"]["count"] > 0 else "unqualified_zero_native_mapping" if production else "no_runtime_targets"
+        rows.append({"package": package["name"], "manifest": package["manifest"], "status": status,
+                     "mapped_files": len(files), "measured": counts,
+                     "reason": ("No executable mapping was emitted for this package on this native target; "
+                                "compiled-out or zero-line code is not qualified by another platform.")
+                               if status == "unqualified_zero_native_mapping" else None})
+    return rows
 
 
 def stop_process(process):
@@ -317,14 +531,18 @@ class Collector:
         self.env.update({"RUSTUP_TOOLCHAIN": TOOLCHAIN, "CARGO_TARGET_DIR": str(target),
                          "CARGO_BUILD_JOBS": str(jobs)})
         self.commands = 0
+        self.last_command_pid = None
         self.package_by_binary = {}
+        self.test_kind_by_binary = {}
+        self.workspace = []
+        self.test_inventories = {}
         self.declared_inventory_validated = False
         self.result = {"schema": SCHEMA, "status": "collecting", "platform": sys.platform,
-                       "machine": platform.machine(), "coverage_packages": list(PACKAGES),
-                       "test_collection_packages": [*PACKAGES, "opaqued", "opaque-mcp"],
+                       "machine": platform.machine(), "coverage_packages": [],
+                       "test_collection_packages": [], "workspace_packages": [],
                        "instrumentation": self.flags, "toolchain": TOOLCHAIN,
                        "collector_version": COLLECTOR_VERSION, "executions": [], "profiles": [],
-                       "binaries": [], "failures": [],
+                       "binaries": [], "failures": [], "test_targets": [], "skipped_tests": [],
                        "not_qualified": ["live vendor accounts", "real model completions", "native human approval",
                                          "contained Vault/OpenSSH/systemd service", "other native platforms"]}
 
@@ -339,6 +557,7 @@ class Collector:
                                        stdin=subprocess.DEVNULL, stdout=stream,
                                        stderr=subprocess.STDOUT if export is None else subprocess.PIPE,
                                        start_new_session=True)
+            self.last_command_pid = process.pid
             try:
                 _, stderr = process.communicate(timeout=timeout)
             except subprocess.TimeoutExpired:
@@ -363,7 +582,6 @@ class Collector:
         if self.contained:
             self.result["contained_service_profile"] = contained_prerequisites(sys.platform)
         self.result["source_before"] = suite.source_snapshot(self.root)
-        self.result["source_inventory"] = source_inventory(self.root)
         version = self.command("collector-version", [self.collector, "llvm-cov", "--version"]).decode().strip()
         require(version == f"cargo-llvm-cov {COLLECTOR_VERSION}", "unexpected_collector_version")
         verbose = self.command("compiler-identity", ["rustc", "-vV"]).decode()
@@ -372,6 +590,15 @@ class Collector:
         require(len(host) == 1, "missing_native_target")
         self.result["compiler"] = verbose.strip().splitlines()
         self.result["target"] = host[0]
+        metadata_raw = self.command("workspace-metadata", ["cargo", "metadata", "--locked", "--format-version", "1",
+                                   "--no-deps", "--all-features", "--filter-platform", host[0]])
+        self.workspace = workspace_inventory(json.loads(metadata_raw), self.root)
+        self.result["workspace_metadata_sha256"] = hashlib.sha256(metadata_raw).hexdigest()
+        self.result["workspace_packages"] = self.workspace
+        self.result["coverage_packages"] = [p["name"] for p in self.workspace]
+        self.result["test_collection_packages"] = self.result["coverage_packages"][:]
+        self.result["feature_selection"] = "all workspace features; native compiler target"
+        self.result["source_inventory"] = source_inventory(self.root, self.workspace)
         sysroot = Path(self.command("compiler-sysroot", ["rustc", "--print", "sysroot"]).decode().strip())
         self.llvm_cov = str(sysroot / "lib/rustlib" / host[0] / "bin/llvm-cov")
         self.llvm_profdata = str(sysroot / "lib/rustlib" / host[0] / "bin/llvm-profdata")
@@ -422,38 +649,36 @@ class Collector:
                 "profile_sha256": [sha(p) for p in profiles]}
 
     def read_artifacts(self, raw):
-        selected = artifacts(raw, self.target)
-        self.package_by_binary.update(artifact_packages(raw, set(selected.values()), self.root))
-        return selected
+        selected = artifacts(raw, self.target, qualified=True)
+        self.package_by_binary.update(artifact_packages(raw, set(selected.values()), self.root, self.workspace))
+        self.test_kind_by_binary.update({path: kind for (_identity, _name, kind, is_test), path in selected.items() if is_test})
+        return {(self.package_by_binary[path], name, kind, is_test): path
+                for (_identity, name, kind, is_test), path in selected.items()}
 
     def build(self):
-        baseline = ["cargo", "test", "--locked", "--all-features", "--tests", "--no-run", "--message-format=json"]
-        for package in PACKAGES:
-            baseline += ["-p", package]
-        self.baseline = self.read_artifacts(self.command("build-library-tests", baseline))
-        require({("opaque_core", "lib", True), ("opaque_bounded_work", "lib", True),
-                 ("opaque_approval", "lib", True)} <= self.baseline.keys(), "missing_critical_library_test_artifacts")
-        normal = self.read_artifacts(self.command("build-daemon-and-adapter", ["cargo", "build", "--locked", "--all-features",
-                           "-p", "opaqued", "-p", "opaque-mcp", "--bins", "--message-format=json"]))
-        require({("opaqued", "bin", False), ("opaque-mcp", "bin", False)} <= normal.keys(), "missing_instrumented_daemon_or_adapter")
-        selected = self.cases
-        argv = ["cargo", "test", "--locked", "--all-features", "-p", "opaqued", "--bin", "opaqued"]
-        for target in selected:
-            if target != "opaqued":
-                argv += ["--test", target]
-        self.composition = self.read_artifacts(self.command("build-existing-composition-tests", argv + ["--no-run", "--message-format=json"]))
-        self.objects = set(self.baseline.values()) | set(normal.values()) | set(self.composition.values())
+        require(bool(self.workspace), "workspace_metadata_not_loaded")
+        self.normal = self.read_artifacts(self.command("build-all-workspace-binaries", ["cargo", "build", "--locked",
+                           "--workspace", "--all-features", "--bins", "--message-format=json"]))
+        validate_workspace_artifacts(self.workspace, self.normal, tests=False)
+        self.baseline = self.read_artifacts(self.command("build-all-workspace-tests", ["cargo", "test", "--locked",
+                           "--workspace", "--all-features", "--tests", "--no-run", "--message-format=json"]))
+        validate_workspace_artifacts(self.workspace, self.baseline, tests=True)
+        self.composition = self.baseline
+        self.objects = set(self.baseline.values()) | set(self.normal.values())
+        self.result["compiled_target_inventory"] = [{"package": package, "target": name, "kind": kind,
+                                                     "test_harness": is_test, "path": str(path)}
+            for (package, name, kind, is_test), path in sorted({**self.normal, **self.baseline}.items())]
 
     def validate_cases(self):
         expected = dict(self.cases)
         binaries = {}
         for target in expected:
-            key = (target, "bin" if target == "opaqued" else "test", True)
+            key = ("opaqued", target, "bin" if target == "opaqued" else "test", True)
             require(key in self.composition, "missing_composition_test_artifact")
             binaries[target] = self.composition[key]
         if sys.platform == "linux":
             expected["opaque_core"] = (ROOT_CASE,)
-            binaries["opaque_core"] = self.baseline[("opaque_core", "lib", True)]
+            binaries["opaque_core"] = self.baseline[("opaque-core", "opaque_core", "lib", True)]
         directory = fresh_directory(self.output / "inventory-preflight")
         env = dict(self.env, LLVM_PROFILE_FILE=str(directory / "inventory-%p-%m-%c.profraw"))
         inventories = {}
@@ -462,6 +687,29 @@ class Collector:
             inventories[target] = suite.inventory(self.command("preflight-inventory-" + target,
                                                                [str(binary), "--list"], env=env, timeout=60))
         self.result["declared_test_inventory"] = validate_case_inventory(expected, inventories)
+        for (package, name, kind, is_test), binary in sorted(self.baseline.items()):
+            if not is_test:
+                continue
+            env["CARGO_PKG_NAME"] = package
+            inventory_raw = self.command("workspace-inventory-" + package + "-" + name,
+                                         [str(binary), "--list"], env=env, timeout=60)
+            names = test_inventory(inventory_raw)
+            ignored_raw = self.command("workspace-ignored-" + package + "-" + name,
+                                       [str(binary), "--list", "--ignored"], env=env, timeout=60)
+            ignored = test_inventory(ignored_raw)
+            require(ignored <= names, "ignored_tests_not_in_native_inventory")
+            reviewed = reviewed_ignored_tests(package, name, ignored)
+            self.test_inventories[binary] = (names, ignored)
+            self.result["test_targets"].append({"package": package, "target": name, "kind": kind,
+                "compiled_tests": len(names), "non_ignored_tests": len(names - ignored), "ignored_tests": sorted(ignored),
+                "compiled_test_names": sorted(names), "non_ignored_test_names": sorted(names - ignored),
+                "counter_diagnostics": sorted(set(counter_diagnostics(inventory_raw, zero_tests=not names)
+                                                   + counter_diagnostics(ignored_raw, zero_tests=not names))),
+                "status": "selected" if names - ignored else "ignored_only" if names else "zero_tests_on_native_target",
+                "reason": None if names - ignored else "No non-ignored test will be claimed as passed for this native target."})
+            self.result["skipped_tests"].extend({"package": package, "target": name, "test": test,
+                 "reason": reviewed[test], "reviewed_prerequisite": reviewed[test],
+                 "executed_by_explicit_profile": False} for test in sorted(ignored))
         self.declared_inventory_validated = True
 
     def execute(self, target, binary, name=None):
@@ -474,7 +722,7 @@ class Collector:
         # Cargo supplies this at runtime. The existing resource gateway fixture
         # uses its package name as a harmless synthetic source credential.
         env["CARGO_PKG_NAME"] = self.package_by_binary[binary]
-        names = suite.inventory(self.command("inventory-" + target, [str(binary), "--list"], env=env, timeout=60))
+        names = test_inventory(self.command("inventory-" + target, [str(binary), "--list"], env=env, timeout=60))
         # Inventory itself can produce empty-count test profiles; remove them so
         # their existence cannot satisfy execution/child-profile requirements.
         for path in directory.glob("*.profraw"):
@@ -484,20 +732,42 @@ class Collector:
         else:
             require(name in names, "required_named_test_not_found")
             argv = [str(binary), "--exact", name, "--nocapture", "--test-threads=1"]
-            if target in ("synthesized_review_e2e", CONTAINED_TARGET) or name == ROOT_CASE:
+            if target in ("synthesized_review_e2e", CONTAINED_TARGET, "trust_domain_e2e") or name in (ROOT_CASE, DAEMON_ROOT_CASE):
                 argv += ["--include-ignored"]
         raw = self.command("execute-" + target, argv, env=env, timeout=1200)
+        test_pid = self.last_command_pid
+        no_test_execution = name is None and not names - self.test_inventories[binary][1]
         if name is None:
-            counts = suite_pass(raw, names)
+            counts = suite_pass(raw, names, allowed_ignored=self.test_inventories[binary][1], allow_empty=no_test_execution)
         else:
             suite.named_pass(raw, name)
             counts = {"passed": 1, "ignored": []}
-        profiles, peers = profile_inventory(directory, target, name)
+        diagnostics = counter_diagnostics(raw, zero_tests=no_test_execution and not names)
+        if no_test_execution:
+            profiles, peers = (profile_inventory(directory, "zero-tests") if list(directory.glob("*.profraw")) else ([], []))
+        else:
+            profiles, peers = profile_inventory(directory, target, name)
         self.objects.update(peers)
         self.result["profiles"].extend(profiles)
         self.result["executions"].append({"target": target, "test": name, "package": self.package_by_binary[binary], "binary_sha256": sha(binary),
+                                          "kind": self.test_kind_by_binary.get(binary),
                                           "inventory_count": len(names), **counts,
+                                          "passed_test_names": sorted(names - set(counts["ignored"])) if name is None else [name],
+                                          "qualification": "no_tests_executed" if no_test_execution else "passed",
+                                          "counter_diagnostics": diagnostics,
+                                          "test_process_id": test_pid,
+                                          "profile_process_ids": sorted({p["process_id"] for p in profiles}),
+                                          "additional_profile_process_ids": sorted({p["process_id"] for p in profiles} - {test_pid}),
+                                          "process_scope": "profile PID distinguishes inherited child counters; semantic roles require explicit fixture tagging",
                                           "profiles": [p["path"] for p in profiles]})
+        reasons = dict(re.findall(r"^test (.+?) \.\.\. ignored(?:, (.*))?$", raw.decode(), re.MULTILINE))
+        for skipped in self.result["skipped_tests"]:
+            if skipped["package"] == self.package_by_binary[binary] and skipped["target"] == target and skipped["test"] in reasons:
+                skipped["reason"] = reasons[skipped["test"]] or "compiled #[ignore] without a reason annotation"
+        if name is not None:
+            for skipped in self.result["skipped_tests"]:
+                if skipped["test"] == name and skipped["target"] == target and skipped["package"] == self.package_by_binary[binary]:
+                    skipped["executed_by_explicit_profile"] = True
 
     def export(self, label, objects, profiles):
         merged = self.output / f"{label}.profdata"
@@ -512,31 +782,48 @@ class Collector:
         raw = self.command("export-" + label, argv, export=report_path)
         report = json.loads(raw)
         missing = validate_report_scope(report, self.result["source_inventory"], self.root)
+        package_rows = workspace_package_coverage(report, self.result["source_inventory"], self.workspace, self.root)
+        if label == "critical":
+            self.result["workspace_package_coverage"] = package_rows
+        require(all(row["status"] != "unqualified_zero_native_mapping" for row in package_rows),
+                "eligible_workspace_package_missing_native_mapping:"
+                + ",".join(row["package"] for row in package_rows if row["status"] == "unqualified_zero_native_mapping"))
         summary = gate.evaluate(report, source_root=self.root, required_files=REQUIRED_FILES, require_branches=True)
         summary.update({"platform": sys.platform, "target": self.result["target"], "toolchain": TOOLCHAIN,
-                        "coverage_packages": list(PACKAGES), "input_sha256": hashlib.sha256(raw).hexdigest()})
+                        "coverage_packages": self.result["coverage_packages"], "workspace_packages": package_rows,
+                        "input_sha256": hashlib.sha256(raw).hexdigest()})
         save(self.output / ("coverage-summary.json" if label == "critical" else f"{label}-summary.json"), summary)
+        if label == "critical":
+            original = package_report_subset(report, ORIGINAL_PACKAGES, self.root)
+            original_summary = gate.evaluate(original, source_root=self.root, required_files=ORIGINAL_REQUIRED_FILES,
+                                             require_branches=True)
+            original_summary.update({"platform": sys.platform, "target": self.result["target"],
+                                     "toolchain": TOOLCHAIN, "input_sha256": hashlib.sha256(raw).hexdigest(),
+                                     "coverage_packages": list(ORIGINAL_PACKAGES),
+                                     "scope": "historical three-package comparison only; never whole-workspace qualification"})
+            save(self.output / "original-scope-summary.json", original_summary)
         return {"coverage_gate": summary["status"], "coverage_report_sha256": summary["input_sha256"],
                 "merged_profile_sha256": sha(merged), "sources_without_mapping": missing,
+                "unmapped_source_scope": "no mapping emitted on this native target; may be test-only coverage(off), compiled-out, or uninstantiated code; not qualification from another OS",
                 "measured": summary["measured"], "binary_count": len(objects), "profile_count": len(profiles)}
 
     def collect(self):
         require(self.declared_inventory_validated, "declared_inventory_not_validated")
-        for (name, kind, is_test), binary in sorted(self.baseline.items()):
+        for (package, name, kind, is_test), binary in sorted(self.baseline.items()):
             if is_test:
                 self.execute(name, binary)
-        require(bool(self.result["executions"]), "no_library_tests_executed")
+        require(any(row["passed"] > 0 for row in self.result["executions"]), "no_workspace_tests_executed")
         baseline_profiles = list(self.result["profiles"])
-        baseline_objects = set(self.baseline.values())
+        baseline_objects = set(self.baseline.values()) | set(self.normal.values())
         self.result["baseline"] = self.export("baseline", baseline_objects, baseline_profiles)
         self.result["baseline"]["execution_count"] = len(self.result["executions"])
         self.result["baseline"]["binary_paths"] = [str(p) for p in sorted(baseline_objects)]
         self.result["baseline"]["profile_paths"] = [p["path"] for p in baseline_profiles]
         if sys.platform == "linux":
-            self.execute("opaque_core", self.baseline[("opaque_core", "lib", True)], ROOT_CASE)
+            self.execute("opaque_core", self.baseline[("opaque-core", "opaque_core", "lib", True)], ROOT_CASE)
             self.result["ignored_reconciled_by_explicit_execution"] = [ROOT_CASE]
         for target, names in self.cases.items():
-            key = (target, "bin" if target == "opaqued" else "test", True)
+            key = ("opaqued", target, "bin" if target == "opaqued" else "test", True)
             require(key in self.composition, "missing_composition_test_artifact")
             for name in names:
                 self.execute(target, self.composition[key], name)
@@ -546,6 +833,7 @@ class Collector:
                                    for path in sorted(self.objects)]
         self.result.update(self.export("critical", self.objects, self.result["profiles"]))
         self.result["source_after"] = suite.source_snapshot(self.root)
+        self.result["counts"] = test_execution_counts(self.result["executions"], self.result["test_targets"], self.result["skipped_tests"])
         require(self.result["source_after"] == self.result["source_before"], "source_changed_during_collection")
         self.result["status"] = "collected"
         if self.contained:
@@ -565,6 +853,7 @@ def main(argv=None):
     parser.add_argument("--reuse-target-dir", action="store_true",
                         help="Reuse the compiler cache; profiles still require a fresh output directory")
     parser.add_argument("--preflight-only", action="store_true")
+    parser.add_argument("--build-only", action="store_true", help="discover and compile every workspace target without claiming collected coverage")
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--contained", action="store_true",
                         help="Also require real SSH and controlled inference RPC scenarios inside the marked disposable host")
@@ -591,8 +880,11 @@ def main(argv=None):
             collector.result["status"] = "preflight_only"
         else:
             collector.build()
-            collector.validate_cases()
-            collector.collect()
+            if args.build_only:
+                collector.result["status"] = "build_only"
+            else:
+                collector.validate_cases()
+                collector.collect()
         status = 0
     except KeyboardInterrupt:
         result = collector.result if collector else {"schema": SCHEMA, "platform": sys.platform, "failures": []}

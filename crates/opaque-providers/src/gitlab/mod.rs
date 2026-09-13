@@ -45,6 +45,7 @@ impl GitLabHandler {
     }
 
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn with_client(audit: Arc<dyn AuditSink>, client: GitLabClient) -> Self {
         Self { audit, client }
     }
@@ -324,6 +325,7 @@ impl GitLabHandler {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use opaque_core::audit::InMemoryAuditEmitter;

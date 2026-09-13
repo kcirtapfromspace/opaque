@@ -50,6 +50,7 @@ pub fn encrypt_secret(plaintext: &[u8], public_key_b64: &str) -> Result<String, 
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crypto_box::SecretKey;

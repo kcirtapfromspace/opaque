@@ -1,6 +1,7 @@
 //! Prepared Azure Key Vault metadata and write operations; raw values stay in resolvers.
 pub mod client;
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod prepared_tests;
 pub mod resolve;
 use client::AzureKeyVaultClient;

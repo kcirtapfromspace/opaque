@@ -1,6 +1,6 @@
 {
   "schema": "opaque.synthesized-suite.v1",
-  "scope": "Only the declared public-core acceptance requirements selected from this manifest. A pass is not overall product, line/branch, real-vendor, real-model or native-human coverage.",
+  "scope": "Only the declared public-core acceptance requirements selected from this manifest. The model profile qualifies its pinned actual engine; other profiles do not. A pass does not establish overall product, line/branch, real-vendor account or native-human coverage.",
   "profiles": [
     "protocol",
     "contained",
@@ -366,6 +366,69 @@
       "name": "ssh_planning_without_tenant_is_denied_before_provider_io",
       "timeout_seconds": 120,
       "include_ignored": false
+    },
+    {
+      "id": "task-workspace-final",
+      "target": "task-api",
+      "name": "task_rpc_rechecks_changed_workspace_after_source_read_without_publishing",
+      "timeout_seconds": 120,
+      "include_ignored": false
+    },
+    {
+      "id": "contained-principal",
+      "target": "contained-ssh",
+      "name": "contained_ssh_rpc_rejects_absent_and_disabled_principals_without_effects",
+      "timeout_seconds": 180,
+      "include_ignored": true
+    },
+    {
+      "id": "contained-tenant",
+      "target": "contained-ssh",
+      "name": "contained_ssh_rpc_rejects_foreign_tenant_and_broker_bindings_without_effects",
+      "timeout_seconds": 180,
+      "include_ignored": true
+    },
+    {
+      "id": "contained-live-revoke",
+      "target": "contained-ssh",
+      "name": "contained_ssh_revoke_during_probe_preserves_charge_and_stops_observed_processes",
+      "timeout_seconds": 180,
+      "include_ignored": true
+    },
+    {
+      "id": "ledger-two-slot-histories",
+      "target": "state-model",
+      "name": "two_slot_reserve_finalize_revoke_restart_histories_match_reference",
+      "timeout_seconds": 180,
+      "include_ignored": false
+    },
+    {
+      "id": "ledger-two-slot-races",
+      "target": "state-model",
+      "name": "concurrent_two_slot_effects_match_a_serial_history_and_remain_charged_on_restart",
+      "timeout_seconds": 180,
+      "include_ignored": false
+    },
+    {
+      "id": "ledger-killed-writer",
+      "target": "task-store",
+      "name": "task_store::tests::killed_writer_recovers_committed_charges_and_discards_uncommitted_rows",
+      "timeout_seconds": 120,
+      "include_ignored": false
+    },
+    {
+      "id": "ledger-sqlite-write-failures",
+      "target": "task-store",
+      "name": "task_store::tests::sqlite_readonly_and_full_errors_preserve_charges_and_atomic_rows",
+      "timeout_seconds": 120,
+      "include_ignored": false
+    },
+    {
+      "id": "real-model-signed-completions",
+      "target": "contained-ssh",
+      "name": "contained_real_model_completions_require_signed_review_and_survive_restart",
+      "timeout_seconds": 300,
+      "include_ignored": true
     }
   ],
   "requirements": [
@@ -488,23 +551,33 @@
     {
       "id": "model.pinned-actual-completions",
       "profile": "model",
-      "status": "missing",
-      "tests": [],
-      "description": "A reproducible unattended pinned local model and controlled-source profile is not implemented by this runner."
+      "status": "implemented",
+      "tests": [
+        "real-model-signed-completions"
+      ],
+      "description": "Owned pinned CPU llama.cpp/GGUF service, real split-UID broker, scripted signed rejection/approval, actual observed completions/metrics and durable receipt/replay checks. No model-quality or native-human claim."
     },
     {
       "id": "packaged.linux-installed-custody",
       "profile": "packaged",
-      "status": "missing",
+      "status": "implemented",
       "tests": [],
-      "description": "Installed Linux release artifacts and actual account/HOME/custody acceptance are not composed by this runner."
+      "description": "Actual installed native build archive, exact source/payload hashes, distinct account custody and fail-closed native diagnostics; controlled local download transport, no published signature or human claim.",
+      "runner": "installed-artifacts",
+      "platforms": [
+        "linux"
+      ]
     },
     {
       "id": "packaged.macos-installed-runtime",
       "profile": "packaged",
-      "status": "missing",
+      "status": "implemented",
       "tests": [],
-      "description": "Installed macOS artifact and native package diagnostics are not composed by this runner; human approval remains separate."
+      "description": "Actual installed native build archive, exact source/payload hashes, private custody and relocated ad-hoc signed macOS app diagnostics; no published signature, notarization or human claim.",
+      "runner": "installed-artifacts",
+      "platforms": [
+        "darwin"
+      ]
     },
     {
       "id": "external.vendor-accounts",
@@ -579,6 +652,78 @@
         "ssh-planning-missing-tenant"
       ],
       "description": "The real task planning RPC rejects SSH planning without a tenant before provider I/O or durable task creation."
+    },
+    {
+      "id": "task.final-workspace",
+      "profile": "protocol",
+      "status": "implemented",
+      "tests": [
+        "task-workspace-final"
+      ],
+      "description": "Actual caller workspace changes during a Vault source read; final RPC dispatch stays charged and denies GitHub publication and replay across restart."
+    },
+    {
+      "id": "contained-principal",
+      "profile": "contained",
+      "status": "implemented",
+      "tests": [
+        "contained-principal"
+      ],
+      "description": "Independent absent and disabled requester denials through real broker RPCs produce no protected effects."
+    },
+    {
+      "id": "contained-tenant",
+      "profile": "contained",
+      "status": "implemented",
+      "tests": [
+        "contained-tenant"
+      ],
+      "description": "Foreign tenant and broker bindings are denied without a slot charge or host effect."
+    },
+    {
+      "id": "contained-live-revoke",
+      "profile": "contained",
+      "status": "implemented",
+      "tests": [
+        "contained-live-revoke"
+      ],
+      "description": "Revocation during an observed real SSH probe preserves charges, stops process identities and prevents replay after restart."
+    },
+    {
+      "id": "ledger-two-slot-histories",
+      "profile": "protocol",
+      "status": "implemented",
+      "tests": [
+        "ledger-two-slot-histories"
+      ],
+      "description": "720 declared two-slot sequential schedules checked against an independent oracle; separate from the original one-slot graph."
+    },
+    {
+      "id": "ledger-two-slot-races",
+      "profile": "protocol",
+      "status": "implemented",
+      "tests": [
+        "ledger-two-slot-races"
+      ],
+      "description": "Actual concurrent two-slot operations must match a permitted serial history and retain charges after restart."
+    },
+    {
+      "id": "ledger-killed-writer",
+      "profile": "protocol",
+      "status": "implemented",
+      "tests": [
+        "ledger-killed-writer"
+      ],
+      "description": "Four actual child SIGKILL phases retain committed charges and discard uncommitted SQLite mutations."
+    },
+    {
+      "id": "ledger-sqlite-write-failures",
+      "profile": "protocol",
+      "status": "implemented",
+      "tests": [
+        "ledger-sqlite-write-failures"
+      ],
+      "description": "Real SQLite READONLY and FULL failures leave exact logical rows and charges unchanged; restored capacity permits the same write."
     }
   ]
 }

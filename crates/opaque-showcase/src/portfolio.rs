@@ -603,6 +603,7 @@ pub fn tool_schema(measures: &[Measure]) -> Value {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     fn query(view: View) -> PortfolioQuery {
@@ -844,6 +845,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod consistency_tests {
     use super::*;
     #[test]

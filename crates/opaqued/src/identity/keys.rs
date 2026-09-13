@@ -47,6 +47,7 @@ pub fn load_or_create_signing_key(path: &Path) -> io::Result<SigningKey> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

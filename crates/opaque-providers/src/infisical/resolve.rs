@@ -141,6 +141,7 @@ impl SecretResolver for InfisicalResolver {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

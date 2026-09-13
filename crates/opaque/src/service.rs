@@ -634,6 +634,7 @@ fn find_opaqued() -> Result<PathBuf, String> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

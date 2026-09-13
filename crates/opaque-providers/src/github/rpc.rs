@@ -108,6 +108,7 @@ pub async fn handle_github_rpc(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use serde_json::json;

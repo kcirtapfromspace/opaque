@@ -1,0 +1,11 @@
+{
+  "name": "opaque-browser-acceptance",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test --test-concurrency=1 processes.test.mjs dashboard.test.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1"
+  }
+}

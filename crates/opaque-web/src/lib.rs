@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 //! Composable local dashboard. Trusted applications consume this library; the
 //! default binary needs no organization service or private package.
 
@@ -127,6 +129,7 @@ pub fn render_shell(extension: &DashboardExtension) -> String {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod extension_tests {
     use super::*;
     use axum::{
@@ -247,6 +250,7 @@ fn open_browser(url: &str) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod integration_tests {
     use super::*;
     use axum::body::{Body, to_bytes};

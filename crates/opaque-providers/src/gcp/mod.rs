@@ -1,6 +1,7 @@
 //! Broker-prepared Google Secret Manager operations. Secret values stay in resolvers.
 pub mod client;
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod prepared_tests;
 pub mod resolve;
 use client::GcpSecretManagerClient;

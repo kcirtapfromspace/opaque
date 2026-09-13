@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -40,8 +42,10 @@ mod identity;
 mod mcp_gateway;
 mod provisioning_api;
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod provisioning_api_tests;
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod resource_authority_provisioning_tests;
 mod rpc_wrappers;
 mod trust_domain;
@@ -902,6 +906,7 @@ fn config_uses_file_seal(config: &DaemonConfig, config_path: &Path, home: &Path)
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod seal_scope_tests {
     use super::*;
     #[test]
@@ -5458,6 +5463,7 @@ async fn handle_request(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use bytes::Bytes;

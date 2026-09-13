@@ -232,6 +232,7 @@ where
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use base64::{Engine, engine::general_purpose::STANDARD as BASE64};

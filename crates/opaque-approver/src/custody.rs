@@ -159,6 +159,7 @@ pub fn save(directory: &Path, state: &WorkstationState) -> Result<(), String> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

@@ -436,6 +436,7 @@ pub fn urldecode(s: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) mod tests {
     use super::*;
     use wiremock::matchers::{method, path};

@@ -38,3 +38,6 @@ wiremock = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 webauthn-authenticator-rs = { version = "0.5.5", default-features = false, features = ["softpasskey"] }
 aws-lc-rs = "1"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }

@@ -35,3 +35,6 @@ uuid = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
 wiremock = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }

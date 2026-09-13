@@ -87,6 +87,7 @@ impl CompositeResolver {
 
     /// Create a resolver with no provider backends configured (for testing).
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn without_onepassword() -> Self {
         Self::new(Vec::new())
     }
@@ -217,6 +218,7 @@ pub fn resolve_all(
 // `opaque-core/src/resolver.rs`. This module keeps only the tests specific
 // to `CompositeResolver`'s dispatch/type-erasure behavior.
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

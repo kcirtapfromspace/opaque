@@ -23,6 +23,7 @@ pub fn bind_to_parent(command: &mut Command) {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use std::io::{BufRead, Write};

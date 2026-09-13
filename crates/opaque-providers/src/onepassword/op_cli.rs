@@ -54,6 +54,7 @@ impl OpCliClient {
     }
 
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(super) fn preparation_fixture() -> Self {
         Self {
             op_path: "/opaque-fixture-not-executed".into(),
@@ -242,6 +243,7 @@ impl From<CliField> for Field {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

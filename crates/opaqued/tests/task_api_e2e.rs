@@ -354,6 +354,234 @@ fn ok(resp: &Value, context: &str) {
     );
 }
 
+/// A real socket caller with an independently observable process cwd. Keeping
+/// its repository private avoids changing the test runner's cwd or checkout.
+struct WorkspacePeer {
+    repository: PathBuf,
+    binary: PathBuf,
+}
+impl WorkspacePeer {
+    fn new(fixture: &Fixture) -> Self {
+        let repository = fixture.home.path().join("workspace");
+        std::fs::create_dir(&repository).unwrap();
+        Self::git(&repository, &["init", "--quiet", "--initial-branch=main"]);
+        Self::git(
+            &repository,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/task-widgets",
+            ],
+        );
+        Self::git(
+            &repository,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "Fixture workspace",
+            ],
+        );
+        let source = fixture.home.path().join("workspace-peer.rs");
+        let binary = fixture.home.path().join("workspace-peer");
+        std::fs::write(&source, include_str!("support/rpc_peer.rs")).unwrap();
+        #[cfg(coverage)]
+        coverage::compile_peer(&source, &binary);
+        #[cfg(not(coverage))]
+        {
+            let result = Command::new("rustc")
+                .arg("--edition=2024")
+                .arg(&source)
+                .arg("-o")
+                .arg(&binary)
+                .output()
+                .unwrap();
+            assert!(result.status.success(), "workspace peer compilation failed");
+        }
+        Self { repository, binary }
+    }
+    fn git(repository: &Path, args: &[&str]) {
+        let result = Command::new("/usr/bin/git")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .arg("-c")
+            .arg("core.hooksPath=/dev/null")
+            .args(args)
+            .current_dir(repository)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "fixture Git operation failed");
+    }
+    fn claim(&self) -> Value {
+        json!({"repo_root": self.repository.canonicalize().unwrap(),
+            "remote_url":"https://github.com/acme/task-widgets", "branch":"main",
+            "head_sha":null, "dirty":false})
+    }
+    async fn call(&self, daemon: &Daemon, method: &str, params: Value) -> Value {
+        use tokio::io::AsyncWriteExt;
+        let mut input = Vec::new();
+        for value in [
+            json!({"handshake":"v1", "daemon_token":daemon.token}),
+            json!({"id":1,"method":method,"params":params}),
+        ] {
+            let frame = serde_json::to_vec(&value).unwrap();
+            input.extend_from_slice(&(frame.len() as u32).to_be_bytes());
+            input.extend(frame);
+        }
+        let mut command = tokio::process::Command::new(&self.binary);
+        command
+            .arg(&daemon.sock)
+            .current_dir(&self.repository)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(coverage)]
+        coverage::subprocess(command.as_std_mut(), "peer");
+        let mut child = command.spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(&input).await.unwrap();
+        drop(stdin);
+        let output = tokio::time::timeout(Duration::from_secs(35), child.wait_with_output())
+            .await
+            .expect("workspace peer deadline")
+            .unwrap();
+        assert!(output.status.success(), "workspace peer RPC failed");
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn task_rpc_rechecks_changed_workspace_after_source_read_without_publishing() {
+    let _serial = serial_guard();
+    let github = mock_github().await;
+    let vault = MockServer::start().await;
+    let fixture = Fixture::new();
+    let workspace = WorkspacePeer::new(&fixture);
+    let repository = workspace.repository.clone();
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/task-app"))
+        .and(header("x-vault-token", TEST_VAULT_TOKEN))
+        .respond_with(move |_: &wiremock::Request| {
+            // The initial real-cwd workspace check and reservation have
+            // completed. Change exactly the remote before final dispatch.
+            WorkspacePeer::git(
+                &repository,
+                &[
+                    "remote",
+                    "set-url",
+                    "origin",
+                    "https://github.com/acme/foreign-workspace",
+                ],
+            );
+            ResponseTemplate::new(200).set_body_json(json!({"data": {
+                "data":{"TOKEN":TEST_SECRET_VALUE},
+                "metadata":{"version":1,"destroyed":false,"deletion_time":""}
+            }}))
+        })
+        .mount(&vault)
+        .await;
+    let config = fixture.write_config();
+    let daemon = fixture.spawn(&config, &github.uri(), &vault.uri());
+    let planned = workspace
+        .call(
+            &daemon,
+            "task_plan",
+            json!({
+                "manifest":manifest("Workspace dispatch fence"), "workspace":workspace.claim()
+            }),
+        )
+        .await;
+    ok(&planned, "workspace planning");
+    let task_id = &planned["result"]["task"]["id"];
+    let response = workspace
+        .call(
+            &daemon,
+            "task_run",
+            json!({
+                "task_id":task_id,"workspace":workspace.claim()
+            }),
+        )
+        .await;
+    ok(&response, "workspace final denial");
+    let charged = &response["result"]["task"];
+    assert_eq!(charged["state"], "partial");
+    assert_eq!(charged["slots"].as_array().unwrap().len(), 1);
+    assert_eq!(charged["slots"][0]["state"], "rejected");
+    assert_eq!(charged["slots"][0]["outcome"]["code"], "policy_denied");
+    assert!(charged["slots"][0]["reserved_at"].is_number());
+    assert!(charged["slots"][0]["request_id"].is_string());
+    assert!(!response.to_string().contains(TEST_SECRET_VALUE));
+    assert_eq!(vault.received_requests().await.unwrap().len(), 1);
+    let requests = github.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3); // Planning identity, public key, final identity.
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.method.as_str() == "GET")
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path() == "/repos/acme/task-widgets")
+            .count(),
+        2
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path()
+                == "/repos/acme/task-widgets/actions/secrets/public-key")
+            .count(),
+        1
+    );
+
+    WorkspacePeer::git(
+        &workspace.repository,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/acme/task-widgets",
+        ],
+    );
+    // Restoring the claim cannot refund an already charged denied slot.
+    let mut daemon = daemon;
+    for pass in 0..2 {
+        let denied = workspace
+            .call(
+                &daemon,
+                "task_run",
+                json!({
+                    "task_id":task_id,"workspace":workspace.claim()
+                }),
+            )
+            .await;
+        assert_eq!(denied["error"]["code"], "task_unavailable");
+        assert!(denied["result"].is_null());
+        let persisted = daemon.call("task_get", json!({"task_id":task_id})).await;
+        ok(&persisted, "unchanged charged task");
+        assert_eq!(persisted["result"]["task"], *charged);
+        assert_eq!(vault.received_requests().await.unwrap().len(), 1);
+        assert_eq!(github.received_requests().await.unwrap().len(), 3);
+        if pass == 0 {
+            daemon.shutdown();
+            daemon = fixture.spawn(&config, &github.uri(), &vault.uri());
+        }
+    }
+    daemon.shutdown();
+}
+
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn ssh_planning_without_tenant_is_denied_before_provider_io() {

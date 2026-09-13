@@ -169,6 +169,7 @@ pub fn expiry(ttl: u64) -> Result<i64, String> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

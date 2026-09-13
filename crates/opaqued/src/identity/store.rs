@@ -131,6 +131,7 @@ impl IdentityStore {
 
     /// In-memory store for tests.
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn open_in_memory() -> Result<Self, String> {
         let conn = Connection::open_in_memory().map_err(|e| e.to_string())?;
         conn.execute_batch(SCHEMA_SQL).map_err(|e| e.to_string())?;
@@ -387,6 +388,7 @@ impl IdentityStore {
 
     /// Enable or disable a principal (revocation switch).
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn set_disabled(&self, id: &PrincipalId, disabled: bool) -> Result<(), String> {
         let conn = self.lock();
         let n = conn
@@ -491,6 +493,7 @@ impl IdentityStore {
 
     /// Number of enabled principals holding `role`.
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn count_with_role(&self, role: Role) -> Result<u64, String> {
         let principals = self.list_principals()?;
         Ok(principals
@@ -503,6 +506,7 @@ impl IdentityStore {
 
     /// Create a login session for `principal`, valid for `ttl_secs`.
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn create_human_session(
         &self,
         principal: &PrincipalId,
@@ -779,6 +783,7 @@ fn row_to_delegation(row: &rusqlite::Row<'_>) -> rusqlite::Result<DelegationReco
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
@@ -1162,6 +1167,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod resource_tests {
     use super::*;
 

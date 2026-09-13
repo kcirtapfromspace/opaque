@@ -247,6 +247,7 @@ pub fn has_identity_claim(value: &serde_json::Value) -> bool {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

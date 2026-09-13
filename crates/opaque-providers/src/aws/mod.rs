@@ -594,6 +594,7 @@ impl OperationHandler for AwsHandler {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;

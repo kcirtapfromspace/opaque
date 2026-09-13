@@ -701,6 +701,7 @@ fn observe_run(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use opaque_core::release::STAGING_RELEASE_OPERATION;

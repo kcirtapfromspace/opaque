@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 //! Sandbox orchestrator for `sandbox.exec` operations.
 //!
 //! The `SandboxExecutor` implements `OperationHandler` and coordinates:
@@ -559,6 +561,7 @@ async fn execute_platform_sandbox(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
@@ -965,6 +968,7 @@ max_output_bytes = 1024
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod lifecycle_tests {
     use super::*;
     use std::time::Duration;

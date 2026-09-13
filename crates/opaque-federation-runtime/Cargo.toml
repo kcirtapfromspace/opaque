@@ -28,3 +28,6 @@ tracing = { workspace = true }
 tempfile = "3"
 toml_edit = { workspace = true }
 wiremock = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }

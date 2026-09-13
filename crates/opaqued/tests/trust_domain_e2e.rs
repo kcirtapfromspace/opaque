@@ -27,6 +27,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+#[cfg(coverage)]
+#[path = "support/coverage.rs"]
+mod coverage;
+
 const DAEMON_UID: u32 = 7381;
 const AGENT_UID: u32 = 7382;
 const SOCKET_GID: u32 = 7999;
@@ -152,6 +156,8 @@ impl SplitDaemon {
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
+        #[cfg(coverage)]
+        coverage::subprocess(&mut cmd, "daemon");
         let mut child = cmd.spawn().expect("spawn opaqued via setpriv");
 
         let token_path = run.join("daemon.token");
@@ -614,6 +620,8 @@ async fn split_daemon_refuses_stolen_custody() {
             Ok(())
         });
     }
+    #[cfg(coverage)]
+    coverage::subprocess(&mut cmd, "daemon");
     let out = cmd.output().expect("spawn opaqued");
     assert!(
         !out.status.success(),

@@ -595,6 +595,7 @@ const ERROR_PAGE: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><ti
 const NOT_FOUND_PAGE: &str = "<!doctype html><html><body>not found</body></html>";
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::identity::oidc::tests::{base_claims, mount_discovery, sign_id_token};

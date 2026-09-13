@@ -236,6 +236,7 @@ fn has_prior_state(directory: &Path) -> Result<bool, TenantBoundaryError> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

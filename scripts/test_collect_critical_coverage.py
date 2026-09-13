@@ -36,13 +36,42 @@ class CollectionContracts(unittest.TestCase):
         path.write_bytes(body)
         return path
 
+    def workspace(self, extra=()):
+        names = sorted({path.split("/")[1] for path in collector.REQUIRED_FILES})
+        packages = []
+        for name, kind in [*((name, "lib") for name in names), *extra]:
+            directory = self.root / ("components" if name.startswith("new-") else "crates") / name
+            directory.mkdir(parents=True, exist_ok=True)
+            manifest = directory / "Cargo.toml"
+            manifest.write_text(f'[package]\nname = "{name}"\n')
+            source = directory / "src" / ("main.rs" if kind == "bin" else "lib.rs")
+            source.parent.mkdir(exist_ok=True)
+            source.write_text("fn production() {}\n")
+            packages.append({"id": "workspace:" + name, "name": name, "manifest_path": str(manifest),
+                             "features": {"acceptance": []}, "targets": [{"name": name.replace("-", "_") if kind == "lib" else name,
+                             "kind": [kind], "src_path": str(source), "test": True, "required-features": ["acceptance"]}]})
+        for name in collector.REQUIRED_FILES:
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("fn production_guard() {}\n")
+        metadata = {"workspace_root": str(self.root), "workspace_members": [p["id"] for p in packages],
+                    "workspace_default_members": [packages[0]["id"]], "packages": packages}
+        return metadata, collector.workspace_inventory(metadata, self.root)
+
+    def workspace_run(self, workspace):
+        run = collector.Collector(self.root, self.root, self.target, "cargo-llvm-cov")
+        run.workspace = workspace
+        run.result["coverage_packages"] = [p["name"] for p in workspace]
+        run.result["source_inventory"] = collector.source_inventory(self.root, workspace)
+        return run
+
     def test_linux_requires_existing_split_uid_tests_and_macos_reports_its_own_scope(self):
         linux = collector.selected_cases("linux")
         macos = collector.selected_cases("darwin")
         self.assertEqual(set(linux) - set(macos), {"synthesized_review_e2e"})
         self.assertEqual(len(linux["synthesized_review_e2e"]), 4)
-        self.assertEqual(sum(map(len, linux.values())), 26)
-        self.assertEqual(sum(map(len, macos.values())), 22)
+        self.assertEqual(sum(map(len, linux.values())), 28)
+        self.assertEqual(sum(map(len, macos.values())), 23)
         for cases in (linux, macos):
             self.assertIn("ssh_planning_without_tenant_is_denied_before_provider_io",
                           cases["task_api_e2e"])
@@ -56,7 +85,7 @@ class CollectionContracts(unittest.TestCase):
         contained = collector.selected_cases("linux", True)
         self.assertEqual({key: contained[key] for key in baseline}, baseline)
         self.assertEqual(contained[collector.CONTAINED_TARGET], collector.CONTAINED_CASES)
-        self.assertEqual(sum(map(len, contained.values())), 29)
+        self.assertEqual(sum(map(len, contained.values())), 36)
         self.assertEqual(collector.role_requirements(collector.CONTAINED_TARGET, collector.CONTAINED_CASES[0]),
                          {"test", "daemon", "peer"})
         with self.assertRaisesRegex(suite.Invalid, "contained_profile_requires_linux"):
@@ -189,6 +218,90 @@ class CollectionContracts(unittest.TestCase):
         self.assertEqual(len(profiles), 3)
         self.assertTrue(all(len(item["sha256"]) == 64 for item in profiles))
 
+    def test_workspace_rpc_requires_actual_peer_profile_and_mapping_on_each_platform(self):
+        name = "task_rpc_rechecks_changed_workspace_after_source_read_without_publishing"
+        for native_platform in ("linux", "darwin"):
+            self.assertIn(name, collector.selected_cases(native_platform)["task_api_e2e"])
+        self.profile("test")
+        self.profile("daemon")
+        peer = self.root / "peer-binary-fixture"
+        peer.write_bytes(b"retained caller mapping")
+        with self.assertRaisesRegex(suite.Invalid, "missing_required_child_profiles"):
+            collector.profile_inventory(self.root, "task_api_e2e", name)
+        self.profile("peer")
+        peer.unlink()
+        with self.assertRaisesRegex(suite.Invalid, "missing_instrumented_peer_object"):
+            collector.profile_inventory(self.root, "task_api_e2e", name)
+        peer.symlink_to(self.binary)
+        with self.assertRaisesRegex(suite.Invalid, "invalid_instrumented_peer_object"):
+            collector.profile_inventory(self.root, "task_api_e2e", name)
+        peer.unlink()
+        peer.write_bytes(b"")
+        with self.assertRaisesRegex(suite.Invalid, "invalid_instrumented_peer_object"):
+            collector.profile_inventory(self.root, "task_api_e2e", name)
+        peer.write_bytes(b"retained caller mapping")
+        profiles, objects = collector.profile_inventory(self.root, "task_api_e2e", name)
+        self.assertEqual({entry["role"] for entry in profiles}, {"test", "daemon", "peer"})
+        self.assertEqual(objects, [peer])
+
+    def test_metadata_discovers_every_member_and_nonstandard_bin_only_package(self):
+        metadata, workspace = self.workspace((("new-cli", "bin"), ("new-library", "lib")))
+        inventory = collector.source_inventory(self.root, workspace)
+        self.assertEqual({item["package"] for item in inventory}, {p["name"] for p in metadata["packages"]})
+        self.assertGreater(len(workspace), len(metadata["workspace_default_members"]))
+        self.assertIn("components/new-cli/src/main.rs", {item["path"] for item in inventory})
+        self.assertTrue(all(len(item["sha256"]) == 64 for item in inventory))
+        missing = copy.deepcopy(metadata)
+        missing["packages"].pop()
+        with self.assertRaisesRegex(suite.Invalid, "missing_or_duplicate_workspace_package"):
+            collector.workspace_inventory(missing, self.root)
+        unknown_feature = copy.deepcopy(metadata)
+        unknown_feature["packages"][0]["targets"][0]["required-features"] = ["not-declared"]
+        with self.assertRaisesRegex(suite.Invalid, "undeclared_required_target_features"):
+            collector.workspace_inventory(unknown_feature, self.root)
+        for package in workspace:
+            source = self.root / package["targets"][0]["source"]
+            directory = source.parent
+            directory.rename(directory.with_name("missing-src"))
+            try:
+                with self.assertRaisesRegex(suite.Invalid, "empty_declared_source_package|workspace_runtime_entrypoint_missing_from_scope"):
+                    collector.source_inventory(self.root, workspace)
+            finally:
+                directory.with_name("missing-src").rename(directory)
+
+    def test_workspace_build_requires_all_libraries_bins_and_exact_package_identities(self):
+        metadata, workspace = self.workspace((("new-cli", "bin"),))
+        events = {}
+        for package in metadata["packages"]:
+            target = package["targets"][0]
+            binary = self.target / (package["name"] + "-test")
+            binary.write_bytes(b"compiled mapping fixture")
+            events[package["name"]] = self.event(executable=str(binary), package_id=package["id"],
+                manifest_path=package["manifest_path"], target={"name": target["name"], "kind": target["kind"]})
+        normal_event = json.loads(events["new-cli"])
+        normal_event["profile"]["test"] = False
+        normal = json.dumps(normal_event).encode()
+        for package in metadata["packages"]:
+            run = self.workspace_run(workspace)
+            raw = b"\n".join(event for name, event in events.items() if name != package["name"])
+            with self.subTest(missing=package["name"]), patch.object(run, "command", side_effect=[normal, raw]) as command:
+                with self.assertRaisesRegex(suite.Invalid, "missing_workspace_test_artifacts"):
+                    run.build()
+                for call in command.call_args_list:
+                    self.assertIn("--workspace", call.args[1])
+                    self.assertIn("--all-features", call.args[1])
+                    self.assertNotIn("-p", call.args[1])
+        wrong = json.loads(events["new-cli"])
+        wrong["manifest_path"] = metadata["packages"][0]["manifest_path"]
+        with self.assertRaisesRegex(suite.Invalid, "artifact_workspace_package_mismatch"):
+            collector.artifact_packages(json.dumps(wrong).encode(), {Path(wrong["executable"])}, self.root, workspace)
+        run = self.workspace_run(workspace)
+        with patch.object(run, "command", side_effect=[normal, b"\n".join(events.values())]):
+            run.build()
+        self.assertEqual(set(run.baseline), collector.expected_artifacts(workspace, tests=True))
+        with self.assertRaisesRegex(suite.Invalid, "missing_workspace_binary_artifacts"):
+            collector.validate_workspace_artifacts(workspace, {}, tests=False)
+
     def test_empty_unknown_and_symlink_profiles_fail_before_merge(self):
         for role, contents, reason in (("test", b"", "empty_or_invalid_execution_profile"),
                                       ("unexpected", b"data", "unknown_execution_profile_role")):
@@ -200,6 +313,107 @@ class CollectionContracts(unittest.TestCase):
         link.symlink_to(self.binary)
         with self.assertRaisesRegex(suite.Invalid, "empty_or_invalid_execution_profile"):
             collector.profile_inventory(self.root, "opaque_core")
+
+    def test_target_names_are_qualified_by_workspace_package_before_collision_checks(self):
+        other = self.target / "other-package-test"
+        other.write_bytes(b"second mapping fixture")
+        first = self.event(package_id="workspace:first")
+        second = self.event(package_id="workspace:second", executable=str(other))
+        selected = collector.artifacts(first + b"\n" + second, self.target, qualified=True)
+        self.assertEqual(set(selected), {("workspace:first", "fixture", "test", True),
+                                         ("workspace:second", "fixture", "test", True)})
+        with self.assertRaisesRegex(suite.Invalid, "missing_compiler_package_id"):
+            collector.artifacts(self.event(), self.target, qualified=True)
+
+    def test_new_ignored_tests_require_reviewed_package_target_and_prerequisite(self):
+        accepted = collector.reviewed_ignored_tests("opaqued", "opaqued", {collector.DAEMON_ROOT_CASE})
+        self.assertIn("irreversible", accepted[collector.DAEMON_ROOT_CASE])
+        for package, target, names in (("opaqued", "opaqued", {"silently_disabled_guard"}),
+                                       ("other-package", "opaqued", {collector.DAEMON_ROOT_CASE}),
+                                       ("opaqued", "other-target", {collector.DAEMON_ROOT_CASE})):
+            with self.assertRaisesRegex(suite.Invalid, "unreviewed_ignored_workspace_tests"):
+                collector.reviewed_ignored_tests(package, target, names)
+        live = collector.reviewed_ignored_tests("opaque-providers", "opaque_providers", {"onepassword::op_cli::tests::live_read_field"})
+        self.assertIn("separate explicit opt-in", next(iter(live.values())))
+
+    def test_zero_test_target_preserves_mapping_inventory_without_a_vacuous_pass(self):
+        zero = collector.ZERO_COUNTER_DIAGNOSTIC + b"\n0 tests, 0 benchmarks\n"
+        self.assertEqual(collector.test_inventory(zero), set())
+        with self.assertRaises(suite.Invalid):
+            suite.inventory(zero)
+        summary = collector.ZERO_COUNTER_DIAGNOSTIC + b"\nrunning 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;\n"
+        with self.assertRaisesRegex(suite.Invalid, "vacuous_or_incomplete_suite_result"):
+            collector.suite_pass(summary, set())
+        run = collector.Collector(self.root, self.root, self.target, "cargo-llvm-cov")
+        (self.root / "profiles").mkdir()
+        run.package_by_binary[self.binary] = "opaque-approver"
+        run.test_inventories[self.binary] = (set(), set())
+        run.objects = {self.binary}
+        with patch.object(run, "command", side_effect=[zero, summary]):
+            run.execute("opaque-approver", self.binary)
+        entry = run.result["executions"][0]
+        self.assertEqual(entry["passed"], 0)
+        self.assertEqual(entry["qualification"], "no_tests_executed")
+        self.assertEqual(entry["counter_diagnostics"], ["no_continuous_counters_in_zero_test_harness"])
+        self.assertEqual(entry["profiles"], [])
+        self.assertIn(self.binary, run.objects)
+
+    def test_only_exact_zero_counter_diagnostic_is_allowed_with_observed_zero_tests(self):
+        self.assertEqual(collector.test_inventory(b"\n0 tests, 0 benchmarks\n"), set())
+        diagnostic = collector.ZERO_COUNTER_DIAGNOSTIC + b"\n"
+        for raw in (diagnostic + b"fixture: test\n1 test, 0 benchmarks\n",
+                    b"LLVM Profile Error: failed to write counters\n0 tests, 0 benchmarks\n",
+                    diagnostic * 2 + b"0 tests, 0 benchmarks\n",
+                    diagnostic + b"unexpected output\n0 tests, 0 benchmarks\n"):
+            with self.subTest(raw=raw), self.assertRaisesRegex(suite.Invalid, "unexpected_llvm_profile_error"):
+                collector.test_inventory(raw)
+        with self.assertRaisesRegex(suite.Invalid, "unexpected_llvm_profile_error"):
+            collector.counter_diagnostics(diagnostic, zero_tests=False)
+        with self.assertRaisesRegex(suite.Invalid, "unexpected_llvm_profile_error"):
+            collector.counter_diagnostics(b"LLVM Profile Error: failed to write counters\n", zero_tests=True)
+
+    def test_ignored_only_target_reports_reason_without_child_profile_or_ignored_execution(self):
+        name = collector.CONTAINED_CASES[0]
+        listing = f"{name}: test\n\n1 test, 0 benchmarks\n".encode()
+        summary = (f"test {name} ... ignored, requires marked systemd fixture\n"
+                   "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out;\n").encode()
+        run = collector.Collector(self.root, self.root, self.target, "cargo-llvm-cov")
+        (self.root / "profiles").mkdir()
+        run.package_by_binary[self.binary] = "opaqued"
+        run.test_inventories[self.binary] = ({name}, {name})
+        run.objects = {self.binary}
+        run.result["skipped_tests"] = [{"package": "opaqued", "target": collector.CONTAINED_TARGET,
+                                        "test": name, "executed_by_explicit_profile": False}]
+        with patch.object(run, "command", side_effect=[listing, summary]) as command:
+            run.execute(collector.CONTAINED_TARGET, self.binary)
+        self.assertFalse(any("--include-ignored" in call.args[1] for call in command.call_args_list))
+        self.assertEqual(run.result["executions"][0]["qualification"], "no_tests_executed")
+        self.assertEqual(run.result["skipped_tests"][0]["reason"], "requires marked systemd fixture")
+        self.assertFalse(run.result["skipped_tests"][0]["executed_by_explicit_profile"])
+
+    def test_inherited_child_profiles_preserve_distinct_process_identity_without_forged_roles(self):
+        self.profile("test")
+        (self.root / "test-200-500-.profraw").write_bytes(b"inherited child profile")
+        profiles, _ = collector.profile_inventory(self.root, "other-target")
+        self.assertEqual({p["process_id"] for p in profiles}, {100, 200})
+        self.assertEqual({p["role"] for p in profiles}, {"test"})
+        with self.assertRaisesRegex(suite.Invalid, "missing_required_child_profiles"):
+            collector.profile_inventory(self.root, "trust_domain_e2e")
+
+    def test_unique_test_counts_never_include_repeated_invocations_or_other_package_aliases(self):
+        baseline = {"package": "first-package", "target": "shared", "kind": "lib", "passed": 2,
+                    "passed_test_names": ["first", "second"], "qualification": "passed"}
+        repeated = {**baseline, "passed": 1, "passed_test_names": ["first"]}
+        foreign = {**repeated, "package": "second-package"}
+        binary = {**repeated, "kind": "bin"}
+        zero = {**baseline, "passed": 0, "passed_test_names": [], "qualification": "no_tests_executed"}
+        counts = collector.test_execution_counts([baseline, repeated, foreign, binary, zero],
+            [{"compiled_tests": 5, "non_ignored_tests": 4}], [{"executed_by_explicit_profile": False}])
+        self.assertEqual(counts["unique_passed_tests"], 4)
+        self.assertEqual(counts["passed_test_invocations"], 5)
+        self.assertEqual(counts["repeated_pass_invocations"], 1)
+        self.assertEqual(counts["zero_test_process_invocations"], 1)
+        self.assertEqual(counts["ignored_tests_not_executed"], 1)
 
     def test_suite_results_reject_zero_duplicate_missing_or_new_ignored_tests(self):
         valid = b"test fixture ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;\n"
@@ -215,9 +429,102 @@ class CollectionContracts(unittest.TestCase):
         names = {"passing", *collector.ALLOWED_IGNORED}
         raw = "test passing ... ok\n" + "".join(f"test {name} ... ignored, explicit prerequisite\n"
                                                 for name in sorted(collector.ALLOWED_IGNORED))
-        raw += "test result: ok. 1 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out;\n"
+        raw += f"test result: ok. 1 passed; 0 failed; {len(collector.ALLOWED_IGNORED)} ignored; 0 measured; 0 filtered out;\n"
         self.assertEqual(collector.suite_pass(raw.encode(), names),
                          {"passed": 1, "ignored": sorted(collector.ALLOWED_IGNORED)})
+
+    def coverage_report(self, original_complete):
+        self.coverage_workspace = self.workspace()[1]
+        files = []
+        for name in collector.REQUIRED_FILES:
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("pub fn production_guard() {}\n")
+            original = name in collector.ORIGINAL_REQUIRED_FILES
+            count = 10 if original else 1000
+            covered = count if original == original_complete else count - 1
+            summary = {metric: {"count": count, "covered": covered}
+                       for metric in ("lines", "branches")}
+            files.append({"filename": str(path), "summary": summary})
+        totals = {metric: {key: sum(item["summary"][metric][key] for item in files)
+                          for key in ("count", "covered")}
+                  for metric in ("lines", "branches")}
+        return {"type": "llvm.coverage.json.export", "data": [{"files": files, "totals": totals}]}
+
+    def test_original_scope_export_uses_its_own_counts_and_literal_gate(self):
+        for complete in (True, False):
+            with self.subTest(original_complete=complete):
+                report = self.coverage_report(complete)
+                unchanged = copy.deepcopy(report)
+                raw = json.dumps(report).encode()
+                run = self.workspace_run(self.coverage_workspace)
+                run.result["target"] = "fixture-native-target"
+                run.llvm_cov, run.llvm_profdata = "fixture-cov", "fixture-profdata"
+                def command(label, argv, **options):
+                    if label == "merge-critical":
+                        Path(argv[-1]).write_bytes(b"merged fixture profile")
+                        return b""
+                    self.assertEqual(label, "export-critical")
+                    options["export"].write_bytes(raw)
+                    return raw
+                with patch.object(run, "command", side_effect=command):
+                    result = run.export("critical", {self.binary}, [{"path": "fixture.profraw"}])
+                expanded = json.loads((self.root / "coverage-summary.json").read_text())
+                original = json.loads((self.root / "original-scope-summary.json").read_text())
+                self.assertEqual(result["coverage_gate"], "failed")
+                self.assertEqual(expanded["coverage_packages"], [p["name"] for p in self.coverage_workspace])
+                self.assertEqual(original["coverage_packages"], list(collector.ORIGINAL_PACKAGES))
+                self.assertEqual(original["required_source_files"], sorted(collector.ORIGINAL_REQUIRED_FILES))
+                self.assertEqual(original["status"], "passed" if complete else "failed")
+                self.assertEqual(original["thresholds"], {"lines": 100.0, "branches": 100.0})
+                self.assertEqual(original["input_sha256"], expanded["input_sha256"])
+                self.assertEqual(original["target"], "fixture-native-target")
+                for metric in ("lines", "branches"):
+                    self.assertEqual(original["measured"][metric]["count"], 60)
+                    self.assertEqual(original["measured"][metric]["covered"], 60 if complete else 54)
+                    self.assertEqual(original["measured"][metric]["percent"], 100.0 if complete else 90.0)
+                    self.assertEqual(expanded["measured"][metric]["count"], 3060)
+                self.assertEqual(report, unchanged)
+
+    def test_expanded_export_cannot_hide_invalid_totals_by_rebuilding_the_subset(self):
+        report = self.coverage_report(True)
+        report["data"][0]["totals"]["lines"]["covered"] -= 1
+        raw = json.dumps(report).encode()
+        run = self.workspace_run(self.coverage_workspace)
+        run.result["target"] = "fixture-native-target"
+        run.llvm_cov, run.llvm_profdata = "fixture-cov", "fixture-profdata"
+        with patch.object(run, "command", return_value=raw):
+            with self.assertRaisesRegex(collector.gate.CoverageError, "merged totals disagree"):
+                run.export("critical", {self.binary}, [{"path": "fixture.profraw"}])
+        self.assertFalse((self.root / "original-scope-summary.json").exists())
+
+    def test_workspace_export_cannot_omit_a_new_package_even_when_other_packages_are_complete(self):
+        report = self.coverage_report(True)
+        _, workspace = self.workspace((("new-public-api", "lib"),))
+        run = self.workspace_run(workspace)
+        run.result["target"] = "fixture-native-target"
+        run.llvm_cov, run.llvm_profdata = "fixture-cov", "fixture-profdata"
+        rows = collector.workspace_package_coverage(report, run.result["source_inventory"], workspace, self.root)
+        missing = next(row for row in rows if row["package"] == "new-public-api")
+        self.assertEqual(missing["status"], "unqualified_zero_native_mapping")
+        self.assertEqual(missing["measured"]["lines"]["count"], 0)
+        with patch.object(run, "command", return_value=json.dumps(report).encode()):
+            with self.assertRaisesRegex(suite.Invalid, "eligible_workspace_package_missing_native_mapping:new-public-api"):
+                run.export("critical", {self.binary}, [{"path": "fixture.profraw"}])
+        self.assertEqual(run.result["workspace_package_coverage"], rows)
+        self.assertFalse((self.root / "coverage-summary.json").exists())
+
+    def test_metadata_preserves_feature_eligibility_and_explicit_nonruntime_targets(self):
+        metadata, _ = self.workspace((("new-runtime", "bin"),))
+        target = copy.deepcopy(metadata["packages"][-1]["targets"][0])
+        target.update(name="not-runtime", kind=["example"], test=False)
+        metadata["packages"][-1]["targets"].append(target)
+        workspace = collector.workspace_inventory(metadata, self.root)
+        package = next(p for p in workspace if p["name"] == "new-runtime")
+        self.assertEqual(package["features"], ["acceptance"])
+        self.assertEqual(package["targets"][0]["required_features"], ["acceptance"])
+        self.assertFalse(package["targets"][1]["eligible"])
+        self.assertNotIn(("new-runtime", "not-runtime", "example", True), collector.expected_artifacts(workspace, tests=True))
 
     def test_report_scope_cannot_grow_to_other_packages_or_drop_required_handlers(self):
         sources = [{"path": name} for name in collector.REQUIRED_FILES]

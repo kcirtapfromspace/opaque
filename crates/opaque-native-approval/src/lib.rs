@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 //! Shared native review and authentication for the daemon and workstation approver.
 
 use thiserror::Error;
@@ -120,10 +122,17 @@ async fn run_task_review(
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|_| {
-            ApprovalError::Failed(
-                "native review helper could not start; run opaque-approver check-native".into(),
-            )
+        .map_err(|error| {
+            // The errno distinguishes a missing helper, permissions and an
+            // executable still open for writing without exposing its path or
+            // any reviewed content in operator diagnostics.
+            let cause = error
+                .raw_os_error()
+                .map(|code| format!("OS error {code}"))
+                .unwrap_or_else(|| format!("I/O kind {:?}", error.kind()));
+            ApprovalError::Failed(format!(
+                "native review helper could not start ({cause}); run opaque-approver check-native"
+            ))
         })?;
     let mut stdin = child.stdin.take().ok_or(ApprovalError::Unavailable)?;
     let stdout = child.stdout.take().ok_or(ApprovalError::Unavailable)?;
@@ -487,6 +496,7 @@ fn find_approve_helper() -> Result<std::path::PathBuf, ApprovalError> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
@@ -532,12 +542,22 @@ mod tests {
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    fn review_test_helper(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
+    fn review_test_helper(scenario: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("review-helper");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path().join(format!("review-helper-{scenario}"));
+        // Never write an executable while concurrent tests are spawning. A
+        // fork can transiently inherit another thread's writable descriptor,
+        // making Linux reject that executable with ETXTBSY even after the
+        // writing thread closed it. The checked-in fixture is immutable;
+        // private symlinks keep its per-review output isolated.
+        std::os::unix::fs::symlink(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/review-helper.sh"
+            ),
+            &path,
+        )
+        .unwrap();
         (directory, path)
     }
 
@@ -550,9 +570,7 @@ mod tests {
         // fixture so a second process need not start before the stage marker.
         // Leave startup headroom when other workspace tests compile/link; the
         // helper's stall still greatly exceeds this test's explicit deadline.
-        let (_directory, helper) = review_test_helper(
-            "IFS= read -r review\nprintf '%s' \"$review\" > \"$0.review\" || exit 2\nprintf '%s\\n' $$ > \"$0.pid\"\nprintf '%s\\n' 'opaque-review-stage: window-ordered'\nexec /bin/sleep 30",
-        );
+        let (_directory, helper) = review_test_helper("timeout");
         let review = "complete task";
         let deadline = std::time::Duration::from_secs(5);
         let started = std::time::Instant::now();
@@ -585,7 +603,7 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[tokio::test]
     async fn unread_review_input_cannot_escape_the_deadline() {
-        let (_directory, helper) = review_test_helper("exec /bin/sleep 5");
+        let (_directory, helper) = review_test_helper("unread");
         let started = std::time::Instant::now();
         let error = run_task_review(
             &helper,
@@ -602,20 +620,84 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[tokio::test]
     async fn helper_markers_cannot_override_denial_or_failure() {
-        let (_directory, helper) = review_test_helper(
-            "cat >/dev/null\nprintf '%s\\n' 'opaque-review-stage: review-confirmed'\nexit 1",
-        );
+        let (_directory, helper) = review_test_helper("deny");
         assert!(
             !run_task_review(&helper, "task", std::time::Duration::from_secs(2))
                 .await
                 .unwrap()
         );
-        let (_directory, helper) = review_test_helper("cat >/dev/null\nexit 2");
+        let (_directory, helper) = review_test_helper("unavailable");
         let error = run_task_review(&helper, "task", std::time::Duration::from_secs(2))
             .await
             .unwrap_err()
             .to_string();
         assert!(error.contains("native review UI unavailable"), "{error}");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parallel_review_helpers_preserve_exact_decisions() {
+        let mut tasks = tokio::task::JoinSet::new();
+        // Repeated simultaneous creation exercises the executable-write race,
+        // but cap live processes so this regression does not exhaust a busy
+        // workspace runner's process/file-descriptor budget.
+        for worker in 0..8 {
+            tasks.spawn(async move {
+                for iteration in 0..12 {
+                    let index = worker * 12 + iteration;
+                    let scenario = match index % 3 {
+                        0 => "approve",
+                        1 => "deny",
+                        _ => "unavailable",
+                    };
+                    let (_directory, helper) = review_test_helper(scenario);
+                    let review = format!("exact task {index}\nits unique scope\n");
+                    let outcome =
+                        run_task_review(&helper, &review, std::time::Duration::from_secs(2)).await;
+                    match index % 3 {
+                        0 => assert!(outcome.unwrap()),
+                        1 => assert!(!outcome.unwrap()),
+                        _ => {
+                            let error = outcome.unwrap_err().to_string();
+                            assert!(error.contains("native review UI unavailable"), "{error}");
+                        }
+                    }
+                    assert_eq!(
+                        std::fs::read_to_string(helper.with_extension("review")).unwrap(),
+                        review
+                    );
+                }
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn helper_spawn_failure_reports_errno_without_review_or_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let helper = directory.path().join("private-helper-location");
+        let review = "private review content";
+        let error = run_task_review(&helper, review, std::time::Duration::from_secs(2))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("native review helper could not start"),
+            "{error}"
+        );
+        assert!(
+            error.contains(&format!("OS error {}", libc::ENOENT)),
+            "{error}"
+        );
+        assert!(!error.contains("private-helper-location"), "{error}");
+        assert!(
+            !error.contains(directory.path().to_str().unwrap()),
+            "{error}"
+        );
+        assert!(!error.contains(review), "{error}");
     }
 
     #[test]

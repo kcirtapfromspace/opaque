@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 //! Opaque Approval Helper
 //!
 //! A small standalone binary launched by the Opaque daemon to display an
@@ -232,6 +234,7 @@ fn polkit_authenticate() -> Result<bool, String> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

@@ -404,23 +404,22 @@ impl Fixture {
             authority.public_key_hex,
             self.workstation.state.public_key_hex
         );
-        let text: &[&str] = if task["manifest"]["schema_version"] == 4 {
-            &[
+        let text: Vec<&str> = if task["manifest"]["schema_version"] == 4 {
+            vec![
                 "contained-health",
                 "127.0.0.1",
                 "OPAQUE_CONTAINED_VAULT_TOKEN",
             ]
         } else {
-            &[
-                "inference-rpc-fixture",
-                "fixture-model.gguf",
-                "opaque-public-receipts-v1",
-            ]
+            ["profile_id", "model_id", "source_id"]
+                .into_iter()
+                .map(|key| task["manifest"]["actions"][0][key].as_str().unwrap())
+                .collect()
         };
         for text in text {
             assert!(
-                review.review_text.contains(*text),
-                "SSH review omitted scope"
+                review.review_text.contains(text),
+                "trusted review omitted manifest scope"
             );
         }
         assert!(!review.review_text.contains(&self.signer));
@@ -441,6 +440,54 @@ impl Fixture {
             )
             .await["task"]
             .clone()
+    }
+    fn task_rows(&self) -> Vec<(String, String, String)> {
+        let database = rusqlite::Connection::open_with_flags(
+            self.layout.state.join("tasks.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        database.busy_timeout(Duration::from_secs(2)).unwrap();
+        database
+            .prepare("SELECT id, owner_key, record FROM bounded_tasks ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+    async fn wait_probe(&self) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let observed = Services::call("snapshot", &[]);
+            if observed["reads"] == 1 {
+                assert_eq!(observed["vault_sign_requests"], 1);
+                assert_eq!(observed["grants"].as_array().unwrap().len(), 1);
+                assert_eq!(observed["grants"][0]["state"], "reserved");
+                assert_eq!(observed["probe_observations"].as_array().unwrap().len(), 1);
+                assert_eq!(observed["guard_idle"], false);
+                return observed;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "real SSH probe observation deadline"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    async fn wait_guard_idle(&self) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let observed = Services::call("snapshot", &[]);
+            if observed["guard_idle"] == true {
+                return observed;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "observed probe identities survived cancellation"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
     async fn receipt(&self, task: &Value) -> SignedWorkstationReceipt {
         let reference = &task["workstation_receipt"];
@@ -499,6 +546,252 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         self.daemon.stop();
     }
+}
+
+#[tokio::test]
+#[ignore = "requires disposable Vault/OpenSSH/systemd container and Linux root with SYS_PTRACE"]
+#[allow(clippy::await_holding_lock)]
+async fn contained_ssh_rpc_rejects_absent_and_disabled_principals_without_effects() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let mut fixture = Fixture::new().await;
+    let task = fixture.plan().await;
+    let before = fixture.task_rows();
+    let host_before = Services::call("snapshot", &[]);
+
+    // This is an independently verified human executable in a valid tenant.
+    // A human login exists, but the RPC has no delegated principal context;
+    // neither OS identity nor a previous login substitutes for that binding.
+    let denied = fixture
+        .daemon
+        .human()
+        .call(
+            "task_plan_ssh",
+            json!({"title":"Missing delegated principal", "expires_in_secs":120}),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied["error"]["code"], "task_unavailable");
+    assert_eq!(
+        denied["error"]["message"],
+        "tenant tasks require an authenticated tenant principal and live delegation"
+    );
+    assert!(denied["result"].is_null());
+    assert_eq!(fixture.task_rows(), before);
+
+    // Disable only the delegating principal in this disposable identity DB.
+    // Production SQLite triggers retire its delegations and human sessions
+    // atomically; this exercises those real RPC consequences independently
+    // of subject admission, tenant binding, and the signed OIDC response.
+    let identity = rusqlite::Connection::open(fixture.layout.state.join("identity.db")).unwrap();
+    identity.busy_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(
+        identity
+            .execute(
+                "UPDATE principals SET disabled=1 WHERE id=?1 AND disabled=0",
+                [&fixture.requester],
+            )
+            .unwrap(),
+        1
+    );
+    for (method, params) in [
+        (
+            "task_plan_ssh",
+            json!({"title":"Disabled delegated principal", "expires_in_secs":120}),
+        ),
+        ("task_run", json!({"task_id":task["id"]})),
+        ("task_revoke", json!({"task_id":task["id"]})),
+    ] {
+        let denied = fixture
+            .daemon
+            .agent()
+            .call(method, params, Some(&fixture.session))
+            .await
+            .unwrap();
+        assert_eq!(denied["error"]["code"], "delegation_invalid", "{method}");
+        assert!(denied["result"].is_null());
+        assert_eq!(
+            fixture.task_rows(),
+            before,
+            "{method} changed durable authority"
+        );
+        assert_eq!(Services::call("snapshot", &[]), host_before);
+        assert!(fixture.workstation.pending().await.is_empty());
+    }
+    let old_delegation = task["manifest"]["actions"][0]["delegation_id"]
+        .as_str()
+        .unwrap();
+    let revoked_at: i64 = identity
+        .query_row(
+            "SELECT revoked_at FROM delegations WHERE jti=?1",
+            [old_delegation],
+            |row| row.get(0),
+        )
+        .unwrap();
+    // Re-enabling the fixture principal must not resurrect its old authority.
+    assert_eq!(
+        identity
+            .execute(
+                "UPDATE principals SET disabled=0 WHERE id=?1 AND disabled=1",
+                [&fixture.requester],
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        identity
+            .query_row(
+                "SELECT revoked_at FROM delegations WHERE jti=?1",
+                [old_delegation],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        revoked_at
+    );
+    let old_session = fixture.session.clone();
+    let still_denied = fixture
+        .daemon
+        .agent()
+        .call(
+            "task_get",
+            json!({"task_id":task["id"]}),
+            Some(&old_session),
+        )
+        .await
+        .unwrap();
+    assert_eq!(still_denied["error"]["code"], "delegation_invalid");
+    assert!(still_denied["result"].is_null());
+    drop(identity);
+    let fresh_identity = login(&fixture.daemon.human(), &fixture._idp, "requester").await;
+    assert_eq!(fresh_identity["principal_id"], fixture.requester);
+    fixture.session = fixture.delegate().await;
+    assert_ne!(fixture.session, old_session);
+    assert_eq!(fixture.get(&task).await, task);
+    fixture.restart(&task).await;
+    assert_eq!(fixture.get(&task).await, task);
+    assert_eq!(fixture.task_rows(), before);
+    assert_eq!(Services::call("snapshot", &[]), host_before);
+}
+
+#[tokio::test]
+#[ignore = "requires disposable Vault/OpenSSH/systemd container and Linux root with SYS_PTRACE"]
+#[allow(clippy::await_holding_lock)]
+async fn contained_ssh_rpc_rejects_foreign_tenant_and_broker_bindings_without_effects() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let mut fixture = Fixture::new().await;
+    let task = fixture.plan().await;
+    let before = fixture.task_rows();
+    let host_before = Services::call("snapshot", &[]);
+    for (field, foreign) in [
+        ("tenant_id", json!("another-admitted-tenant")),
+        ("broker_id", json!(uuid::Uuid::new_v4())),
+    ] {
+        let mut manifest = task["manifest"].clone();
+        manifest["actions"][0]["tenant"][field] = foreign;
+        // A well-formed manifest with exactly one different authority field
+        // must reach the trusted profile binding check, not JSON rejection.
+        let parsed: opaque_core::task::TaskManifest =
+            serde_json::from_value(manifest.clone()).unwrap();
+        parsed.validate().unwrap();
+        let denied = fixture
+            .daemon
+            .agent()
+            .call(
+                "task_plan",
+                json!({"manifest":manifest}),
+                Some(&fixture.session),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied["error"]["code"], "task_unavailable", "{field}");
+        assert_eq!(
+            denied["error"]["message"], "SSH profile or authenticated host evidence unavailable",
+            "{field}"
+        );
+        assert!(denied["result"].is_null());
+        assert_eq!(fixture.task_rows(), before);
+        assert_eq!(Services::call("snapshot", &[]), host_before);
+        assert!(fixture.workstation.pending().await.is_empty());
+    }
+    assert_eq!(fixture.get(&task).await, task);
+    fixture.restart(&task).await;
+    assert_eq!(fixture.task_rows(), before);
+    assert_eq!(fixture.get(&task).await, task);
+    assert_eq!(Services::call("snapshot", &[]), host_before);
+}
+
+#[tokio::test]
+#[ignore = "requires disposable Vault/OpenSSH/systemd container and Linux root with SYS_PTRACE"]
+#[allow(clippy::await_holding_lock)]
+async fn contained_ssh_revoke_during_probe_preserves_charge_and_stops_observed_processes() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let mut fixture = Fixture::new().await;
+    let task = fixture.plan().await;
+    Services::call("stall", &[]);
+    let running = fixture.run(&task);
+    let review = fixture.workstation.wait_review("ssh.health_manifest").await;
+    fixture.verify_review(&review, &task);
+    fixture.assert_unapproved_host();
+    fixture.workstation.respond(&review, true).await.unwrap();
+    let observed = fixture.wait_probe().await;
+    let reserved = fixture.get(&task).await;
+    assert_eq!(reserved["slots"][0]["state"], "reserved");
+    assert!(reserved["slots"][0]["reserved_at"].is_number());
+
+    // Both real effects already happened: Vault signed once and the NSS
+    // workload reached the health service once. Revoke through the actual
+    // broker RPC while its SSH driver is collecting the blocked response.
+    let revoked = fixture
+        .daemon
+        .agent()
+        .ok(
+            "task_revoke",
+            json!({"task_id":task["id"]}),
+            Some(&fixture.session),
+        )
+        .await;
+    assert_eq!(revoked["task"]["state"], "revoked");
+    let response = running.await.unwrap().unwrap();
+    assert!(response["error"].is_null());
+    let charged = &response["result"]["task"];
+    assert_eq!(charged["state"], "revoked");
+    assert_eq!(charged["slots"][0]["state"], "unknown");
+    assert_eq!(charged["slots"][0]["outcome"]["code"], "transport_unknown");
+    assert!(charged["slots"][0]["outcome"]["ssh_receipt"].is_null());
+    assert_eq!(
+        charged["slots"][0]["reserved_at"],
+        reserved["slots"][0]["reserved_at"]
+    );
+    fixture.receipt(charged).await;
+    let stopped = fixture.wait_guard_idle().await;
+    assert_eq!(stopped["reads"], 1);
+    assert_eq!(stopped["vault_sign_requests"], 1);
+    assert_eq!(
+        stopped["probe_observations"],
+        observed["probe_observations"]
+    );
+    assert_eq!(stopped["grants"].as_array().unwrap().len(), 1);
+    // Host ledger `completed` means its one reservation was finalized;
+    // the authenticated receipt below carries the actual revoked outcome.
+    assert_eq!(stopped["grants"][0]["state"], "completed");
+    assert_eq!(stopped["grants"][0]["revoked"], 1);
+    assert!(
+        stopped["receipts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|receipt| receipt["status"] == "revoked" && receipt["result_code"] == "revoked")
+    );
+    Services::call(
+        "replay-host",
+        &[&fixture.layout.base.path().join("planned-task.json")],
+    );
+    let host_after_replay = Services::call("snapshot", &[]);
+    fixture.no_replay(&task).await;
+    fixture.restart(&task).await;
+    assert_eq!(fixture.get(&task).await, *charged);
+    assert_eq!(Services::call("snapshot", &[]), host_after_replay);
+    fixture.no_replay(&task).await;
 }
 
 #[tokio::test]
@@ -880,4 +1173,180 @@ async fn contained_inference_rpc_rechecks_authority_after_metadata_without_refun
     assert!(fixture.run(&task).await.unwrap().unwrap()["error"].is_object());
     assert_eq!(model.count(), 3);
     assert!(fixture.workstation.pending().await.is_empty());
+}
+
+/// Observe the real llama-server's independent generation counter. The
+/// dedicated runner owns the server/model processes and their byte hashes;
+/// this test never stands in for its metadata, tokenizer, or completions.
+async fn actual_generated_tokens(profile: &Value) -> u64 {
+    let mut endpoint = reqwest::Url::parse(profile["api_url"].as_str().unwrap()).unwrap();
+    endpoint.set_path("/metrics");
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap()
+        .get(endpoint)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let metrics = response.text().await.unwrap();
+    assert!(metrics.len() <= 64 * 1024, "unexpected model metrics size");
+    let samples: Vec<_> = metrics
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            if fields.next() != Some("llamacpp:tokens_predicted_total") {
+                return None;
+            }
+            let value = fields.next().unwrap().parse::<u64>().unwrap();
+            assert!(fields.next().is_none(), "unexpected model metric labels");
+            Some(value)
+        })
+        .collect();
+    assert_eq!(
+        samples.len(),
+        1,
+        "real model generation counter unavailable"
+    );
+    samples[0]
+}
+
+#[tokio::test]
+#[ignore = "requires the owned real-model profile, pinned llama-server/GGUF, and Linux systemd fixture"]
+#[allow(clippy::await_holding_lock)]
+async fn contained_real_model_completions_require_signed_review_and_survive_restart() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let profile_path = PathBuf::from(
+        std::env::var_os("OPAQUE_TEST_REAL_MODEL_PROFILE")
+            .expect("the real-model runner must supply its observed profile"),
+    );
+    assert!(profile_path.is_absolute());
+    let mut profile: Value = serde_json::from_slice(&std::fs::read(profile_path).unwrap()).unwrap();
+    assert_eq!(
+        profile["source_id"],
+        opaque_bounded_work::inference::DEMO_SOURCE_ID
+    );
+    let source_snapshot = opaque_bounded_work::inference::demo_source_snapshot_sha256();
+    if let Some(supplied) = profile.get("source_snapshot_sha256") {
+        assert!(supplied == "" || supplied == &source_snapshot);
+    }
+    // Derive the fixed public source identity from production code, rather
+    // than duplicating its prompts or hash in the process-owning Python layer.
+    profile["source_snapshot_sha256"] = json!(source_snapshot);
+    assert_eq!(actual_generated_tokens(&profile).await, 0);
+    let mut fixture = Fixture::with_inference(Some(&profile)).await;
+    let args =
+        json!({"title":"Actual model completions under signed review", "expires_in_secs":300});
+    let rejected = fixture
+        .daemon
+        .agent()
+        .ok("task_plan_inference", args.clone(), Some(&fixture.session))
+        .await["task"]
+        .clone();
+    let running = fixture.run(&rejected);
+    let review = fixture
+        .workstation
+        .wait_review("inference.fixed_manifest")
+        .await;
+    fixture.verify_review(&review, &rejected);
+    assert_eq!(actual_generated_tokens(&profile).await, 0);
+    fixture.workstation.respond(&review, false).await.unwrap();
+    let denied = running.await.unwrap().unwrap();
+    assert_eq!(denied["error"]["code"], "task_unavailable");
+    assert!(denied["result"].is_null());
+    let uncharged = fixture.get(&rejected).await;
+    assert_eq!(uncharged["state"], "partial");
+    for field in ["approved_at", "approval_mode", "workstation_receipt"] {
+        assert!(uncharged[field].is_null());
+    }
+    assert_eq!(uncharged["slots"].as_array().unwrap().len(), 3);
+    for slot in uncharged["slots"].as_array().unwrap() {
+        assert_eq!(slot["state"], "pending");
+        for field in ["reserved_at", "request_id", "outcome", "finished_at"] {
+            assert!(slot[field].is_null());
+        }
+    }
+    assert!(fixture.run(&rejected).await.unwrap().unwrap()["error"].is_object());
+    assert!(fixture.workstation.pending().await.is_empty());
+    assert_eq!(fixture.get(&rejected).await, uncharged);
+    assert_eq!(actual_generated_tokens(&profile).await, 0);
+
+    let approved = fixture
+        .daemon
+        .agent()
+        .ok("task_plan_inference", args, Some(&fixture.session))
+        .await["task"]
+        .clone();
+    assert_ne!(approved["id"], rejected["id"]);
+    for action in approved["manifest"]["actions"].as_array().unwrap() {
+        for field in [
+            "profile_id",
+            "model_id",
+            "model_artifact_sha256",
+            "source_id",
+            "source_snapshot_sha256",
+        ] {
+            assert_eq!(
+                action[field], profile[field],
+                "approved {field} differs from observed profile"
+            );
+        }
+    }
+    let running = fixture.run(&approved);
+    let review = fixture
+        .workstation
+        .wait_review("inference.fixed_manifest")
+        .await;
+    fixture.verify_review(&review, &approved);
+    assert_eq!(actual_generated_tokens(&profile).await, 0);
+    fixture.workstation.respond(&review, true).await.unwrap();
+    let response = running.await.unwrap().unwrap();
+    assert!(response["error"].is_null(), "actual model task failed");
+    let completed = &response["result"]["task"];
+    assert_eq!(completed["state"], "completed");
+    assert_eq!(completed["slots"].as_array().unwrap().len(), 3);
+    let mut predicted_tokens = 0;
+    let mut request_ids = std::collections::BTreeSet::new();
+    for slot in completed["slots"].as_array().unwrap() {
+        assert_eq!(slot["state"], "api_accepted");
+        assert!(slot["reserved_at"].is_number());
+        assert!(request_ids.insert(slot["request_id"].as_str().unwrap()));
+        let receipt = &slot["outcome"]["inference_receipt"];
+        assert_eq!(receipt["code"], "completion_observed");
+        assert_eq!(receipt["reserved_output_tokens"], 96);
+        assert!((1..=512).contains(&receipt["input_tokens"].as_u64().unwrap()));
+        let tokens = receipt["observed_output_tokens"].as_u64().unwrap();
+        assert!((1..=96).contains(&tokens));
+        let output = receipt["output_text"].as_str().unwrap();
+        assert!(
+            !output.trim().is_empty(),
+            "actual model returned no completion text"
+        );
+        assert_eq!(
+            receipt["output_sha256"],
+            opaque_core::inference::sha256(output.as_bytes())
+        );
+        assert_eq!(receipt["tenant"], approved["tenant"]);
+        predicted_tokens += tokens;
+    }
+    let signed_receipt = fixture.receipt(completed).await;
+    assert_eq!(actual_generated_tokens(&profile).await, predicted_tokens);
+    let rows = fixture.task_rows();
+    for restarted in [false, true] {
+        if restarted {
+            fixture.restart(&approved).await;
+        }
+        assert_eq!(fixture.get(&approved).await, *completed);
+        assert_eq!(fixture.get(&rejected).await, uncharged);
+        assert_eq!(fixture.receipt(completed).await, signed_receipt);
+        for task in [&approved, &rejected] {
+            assert!(fixture.run(task).await.unwrap().unwrap()["error"].is_object());
+        }
+        assert!(fixture.workstation.pending().await.is_empty());
+        assert_eq!(fixture.task_rows(), rows);
+        assert_eq!(actual_generated_tokens(&profile).await, predicted_tokens);
+    }
 }
