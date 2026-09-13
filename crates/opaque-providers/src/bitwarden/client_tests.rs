@@ -33,16 +33,20 @@ fn official_cloud_and_self_hosted_endpoints_are_explicit() {
 async fn official_cli_commands_parse_and_preserve_values() {
     use crate::bitwarden::test_support::*;
     let fixture = Fixture::new();
-    let projects = fixture.client.list_projects(TOKEN).await.unwrap();
+    let projects = fixture.client.list_projects(&fixture.token).await.unwrap();
     assert_eq!(projects[0].name, "Production");
     let summaries = fixture
         .client
-        .list_secrets(TOKEN, Some(PROJECT_ID))
+        .list_secrets(&fixture.token, Some(PROJECT_ID))
         .await
         .unwrap();
     assert_eq!(summaries[0].key, "DB_PASSWORD");
     assert!(!serde_json::to_string(&summaries).unwrap().contains("value"));
-    let secret = fixture.client.get_secret(TOKEN, SECRET_ID).await.unwrap();
+    let secret = fixture
+        .client
+        .get_secret(&fixture.token, SECRET_ID)
+        .await
+        .unwrap();
     assert_eq!(
         secret.value.as_deref(),
         Some("secret with trailing spaces  \n")
@@ -52,11 +56,11 @@ async fn official_cli_commands_parse_and_preserve_values() {
     let args = fixture.recorded_args();
     assert!(args.contains("secret\nlist\n"));
     assert!(args.contains(PROJECT_ID));
-    assert!(!args.contains(TOKEN));
+    assert!(!args.contains(&fixture.token));
     let config = std::fs::read_to_string(fixture.dir.path().join("config")).unwrap();
     assert!(config.contains("state_opt_out = \"true\""));
     assert!(config.contains("https://identity.bitwarden.com"));
-    assert!(!config.contains(TOKEN));
+    assert!(!config.contains(&fixture.token));
 }
 
 #[cfg(unix)]
@@ -64,12 +68,56 @@ async fn official_cli_commands_parse_and_preserve_values() {
 async fn changed_executable_is_rejected_before_token_delivery() {
     use crate::bitwarden::test_support::*;
     let fixture = Fixture::new();
-    std::fs::write(&fixture.executable, "#!/bin/sh\nexit 0\n").unwrap();
+    // Only this copy is mutated; the immutable shared fixture is untouched.
+    // The hash guard must reject it before the copy can ever execute.
+    let changed = fixture.dir.path().join("changed-bws");
+    std::fs::copy(&fixture.executable, &changed).unwrap();
+    let client = BitwardenClient::with_executable(
+        fixture.client.base_url(),
+        fixture.client.identity_url(),
+        &changed,
+    )
+    .unwrap();
+    std::fs::write(&changed, "#!/bin/sh\nexit 0\n").unwrap();
     assert!(matches!(
-        fixture.client.list_projects(TOKEN).await,
+        client.list_projects(&fixture.token).await,
         Err(BitwardenApiError::ExecutableChanged)
     ));
     assert!(!fixture.dir.path().join("args").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn parallel_cli_fixtures_keep_credentials_and_responses_isolated() {
+    use crate::bitwarden::test_support::*;
+    let shared = Fixture::new();
+    let before = std::fs::read(&shared.executable).unwrap();
+    let mut tasks = tokio::task::JoinSet::new();
+    for index in 0..64 {
+        tasks.spawn(async move {
+            let fixture = Fixture::new();
+            let expected = format!("isolated-secret-{index} \r\n\t");
+            std::fs::write(
+                fixture.dir.path().join("secret.json"),
+                serde_json::json!({"id":SECRET_ID,"key":"DB_PASSWORD","value":expected,"projectId":PROJECT_ID}).to_string(),
+            )
+            .unwrap();
+            let actual = fixture
+                .client
+                .get_secret(&fixture.token, SECRET_ID)
+                .await
+                .unwrap();
+            assert_eq!(actual.value.as_deref(), Some(expected.as_str()));
+            assert!(!fixture.recorded_args().contains(&fixture.token));
+            let config = std::fs::read_to_string(fixture.dir.path().join("config")).unwrap();
+            assert!(!config.contains(&fixture.token));
+            assert!(!config.contains(&expected));
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        result.unwrap();
+    }
+    assert_eq!(std::fs::read(&shared.executable).unwrap(), before);
 }
 
 #[cfg(unix)]
@@ -84,13 +132,13 @@ async fn invalid_ids_and_mismatched_response_are_rejected() {
         "00000000-0000-0000-0000-000000000000",
     ] {
         assert!(matches!(
-            fixture.client.get_secret(TOKEN, id).await,
+            fixture.client.get_secret(&fixture.token, id).await,
             Err(BitwardenApiError::InvalidSelector)
         ));
     }
     assert!(!fixture.dir.path().join("args").exists());
     assert!(matches!(
-        fixture.client.get_secret(TOKEN, OTHER_ID).await,
+        fixture.client.get_secret(&fixture.token, OTHER_ID).await,
         Err(BitwardenApiError::InvalidResponse)
     ));
 }
@@ -111,7 +159,7 @@ async fn ambiguous_names_do_not_choose_an_arbitrary_secret() {
     assert!(matches!(
         fixture
             .client
-            .find_project_by_name(TOKEN, "Production")
+            .find_project_by_name(&fixture.token, "Production")
             .await,
         Err(BitwardenApiError::AmbiguousName)
     ));
@@ -126,14 +174,18 @@ async fn child_failures_invalid_output_and_timeouts_are_sanitized() {
         "printf 'secret-child-output'; exit 0",
     ] {
         let fixture = Fixture::script(script);
-        let error = fixture.client.list_projects(TOKEN).await.unwrap_err();
+        let error = fixture
+            .client
+            .list_projects(&fixture.token)
+            .await
+            .unwrap_err();
         assert!(!error.to_string().contains("secret-child"));
     }
     // A shell builtin loop avoids leaving a sleeping grandchild behind.
     let mut fixture = Fixture::script("while :; do :; done");
     fixture.client.timeout = Duration::from_millis(100);
     assert!(matches!(
-        fixture.client.list_projects(TOKEN).await,
+        fixture.client.list_projects(&fixture.token).await,
         Err(BitwardenApiError::Timeout)
     ));
 }
@@ -173,14 +225,14 @@ async fn excessive_output_is_bounded_and_ambient_configuration_is_not_inherited(
     use crate::bitwarden::test_support::*;
     let fixture = Fixture::script("exec /usr/bin/head -c 16777217 /dev/zero");
     assert!(matches!(
-        fixture.client.list_projects(TOKEN).await,
+        fixture.client.list_projects(&fixture.token).await,
         Err(BitwardenApiError::OutputLimit)
     ));
     unsafe {
         std::env::set_var("OPAQUE_BWS_PARENT_ONLY", "must-not-reach-child");
     }
     let fixture = Fixture::new();
-    fixture.client.list_projects(TOKEN).await.unwrap();
+    fixture.client.list_projects(&fixture.token).await.unwrap();
     unsafe {
         std::env::remove_var("OPAQUE_BWS_PARENT_ONLY");
     }

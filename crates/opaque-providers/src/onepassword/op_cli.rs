@@ -248,15 +248,16 @@ mod tests {
     use super::*;
 
     fn read_fixture(value: &[u8]) -> (tempfile::TempDir, OpCliClient) {
-        use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().unwrap();
         let executable = directory.path().join("op");
-        std::fs::write(
+        // Keep executable bytes immutable while other tests spawn children.
+        // A concurrent fork can transiently inherit a writable descriptor and
+        // cause Linux ETXTBSY even after the writer has closed its own handle.
+        std::os::unix::fs::symlink(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/op-read.sh"),
             &executable,
-            "#!/bin/sh\n[ \"$#\" -eq 3 ] && [ \"$1\" = read ] && [ \"$2\" = op://vault/item/field ] && [ \"$3\" = --no-newline ] || exit 2\nexec /bin/cat \"$0.value\"\n",
         )
         .unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::write(directory.path().join("op.value"), value).unwrap();
         let client = OpCliClient {
             op_path: executable.to_str().unwrap().into(),
@@ -289,6 +290,34 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, OpCliError::ParseError(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn parallel_read_fixtures_keep_values_isolated_and_executable_immutable() {
+        let executable = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/op-read.sh"
+        ));
+        let before = std::fs::read(executable).unwrap();
+        let mut tasks = tokio::task::JoinSet::new();
+        for index in 0..64 {
+            tasks.spawn(async move {
+                let expected = format!("isolated-{index}\r\n \t\n");
+                let (_directory, client) = read_fixture(expected.as_bytes());
+                assert_eq!(
+                    std::path::Path::new(client.executable_path())
+                        .canonicalize()
+                        .unwrap(),
+                    executable.canonicalize().unwrap()
+                );
+                let actual = client.read_field("vault", "item", "field").await.unwrap();
+                assert_eq!(actual.as_bytes(), expected.as_bytes());
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
+        assert_eq!(std::fs::read(executable).unwrap(), before);
     }
 
     #[test]

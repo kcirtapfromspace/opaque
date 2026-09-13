@@ -610,32 +610,18 @@ factors = ["local_bio"]
     daemon.shutdown();
 }
 
-/// Explicit test fixture for the official `bws` subprocess contract. Production
-/// uses an installed official executable; this file exists only inside the test.
+/// Immutable fixture for the official `bws` subprocess contract. Its
+/// disposable credential identifies private invocation evidence after the
+/// production client canonicalizes the executable and clears ambient env.
 #[cfg(unix)]
-fn bitwarden_cli_fixture(fixture: &Fixture) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-    let executable = fixture.home.path().join("bws-fixture");
-    std::fs::write(
-        &executable,
-        r#"#!/bin/sh
-set -eu
-[ -n "$0" ] && : > "$0.invoked"
-[ "${BWS_ACCESS_TOKEN-}" = 'test-bw-token' ] || exit 9
-[ "$1" = '--config-file' ] && [ -f "$2" ] || exit 10
-[ "$3 $4 $5 $6 $7 $8" = '--profile opaque --output json --color no' ] || exit 11
-case "$9 ${10}" in
-  'project list') printf '%s' '[{"id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","name":"backend-secrets"}]' ;;
-  'secret get')
-    [ "${11}" = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' ] || exit 12
-    printf '%s' '{"id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","key":"TUTORIAL_KEY","value":"tutorial-value-plaintext","note":"private fixture note"}' ;;
-  *) exit 13 ;;
-esac
-"#,
+fn bitwarden_cli_fixture(fixture: &Fixture) -> (PathBuf, String) {
+    (
+        PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/bws-provider.sh"
+        )),
+        format!("test-bw-token:{}", fixture.home.path().to_str().unwrap()),
     )
-    .unwrap();
-    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-    executable
 }
 
 /// Daemon policy, approval, environment-ref token resolution, official CLI
@@ -647,7 +633,7 @@ esac
 async fn bitwarden_list_projects_succeeds_end_to_end() {
     let _serial = serial_guard();
     let fixture = Fixture::new();
-    let executable = bitwarden_cli_fixture(&fixture);
+    let (executable, token) = bitwarden_cli_fixture(&fixture);
     let config_path = fixture.write_config_with_rules(
         r#"
 [[rules]]
@@ -672,7 +658,7 @@ factors = ["local_bio"]
             ),
             ("OPAQUE_BITWARDEN_CLI_PATH", executable.to_str().unwrap()),
             ("OPAQUE_BITWARDEN_TOKEN_REF", "env:OPAQUE_E2E_BW_TOKEN"),
-            ("OPAQUE_E2E_BW_TOKEN", "test-bw-token"),
+            ("OPAQUE_E2E_BW_TOKEN", &token),
         ],
     );
 
@@ -693,6 +679,7 @@ factors = ["local_bio"]
     );
     let result = resp.get("result").expect("result");
     assert_eq!(result, &json!({"projects":[{"name":"backend-secrets"}]}));
+    assert!(fixture.home.path().join("bws-fixture.invoked").is_file());
     let rendered = serde_json::to_string(&resp).unwrap();
     assert!(!rendered.contains("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"));
     assert!(!rendered.contains("test-bw-token"));
@@ -719,7 +706,7 @@ async fn bitwarden_value_ref_reaches_github_end_to_end() {
         .mount(&github)
         .await;
     let fixture = Fixture::new();
-    let executable = bitwarden_cli_fixture(&fixture);
+    let (executable, token) = bitwarden_cli_fixture(&fixture);
     let config_path = fixture.write_config();
     let daemon = fixture.spawn_with_env(
         &config_path,
@@ -732,7 +719,7 @@ async fn bitwarden_value_ref_reaches_github_end_to_end() {
             ),
             ("OPAQUE_BITWARDEN_CLI_PATH", executable.to_str().unwrap()),
             ("OPAQUE_BITWARDEN_TOKEN_REF", "env:OPAQUE_E2E_BW_TOKEN"),
-            ("OPAQUE_E2E_BW_TOKEN", "test-bw-token"),
+            ("OPAQUE_E2E_BW_TOKEN", &token),
         ],
     );
     let response = daemon
@@ -759,6 +746,7 @@ async fn bitwarden_value_ref_reaches_github_end_to_end() {
         .decode(body["encrypted_value"].as_str().unwrap())
         .unwrap();
     assert_eq!(key.unseal(&ciphertext).unwrap(), TEST_VALUE.as_bytes());
+    assert!(fixture.home.path().join("bws-fixture.invoked").is_file());
     let rendered = format!(
         "{response} {}",
         std::fs::read_to_string(&daemon.log).unwrap()
@@ -1331,7 +1319,7 @@ async fn canonical_action_rejects_malformed_targets_and_unknown_provider_fields(
     let _serial = serial_guard();
     let github = mock_github().await;
     let fixture = Fixture::new();
-    let executable = bitwarden_cli_fixture(&fixture);
+    let (executable, token) = bitwarden_cli_fixture(&fixture);
     let config = fixture.write_config();
     let daemon = fixture.spawn_with_env(
         &config,
@@ -1345,10 +1333,8 @@ async fn canonical_action_rejects_malformed_targets_and_unknown_provider_fields(
                 "https://identity.bitwarden.com",
             ),
             ("OPAQUE_BITWARDEN_CLI_PATH", executable.to_str().unwrap()),
-            (
-                "OPAQUE_BITWARDEN_TOKEN_REF",
-                "env:OPAQUE_E2E_MISSING_BW_TOKEN",
-            ),
+            ("OPAQUE_BITWARDEN_TOKEN_REF", "env:OPAQUE_E2E_BW_TOKEN"),
+            ("OPAQUE_E2E_BW_TOKEN", &token),
         ],
     );
     for target in [
@@ -1394,7 +1380,7 @@ async fn canonical_action_rejects_malformed_targets_and_unknown_provider_fields(
         )
         .await;
     assert_error(&malformed_project, "invalid_params");
-    assert!(!executable.with_extension("invoked").exists());
+    assert!(!fixture.home.path().join("bws-fixture.invoked").exists());
     let unknown_option = daemon
         .call(
             "onepassword",

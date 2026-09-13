@@ -138,6 +138,28 @@ class CollectionContracts(unittest.TestCase):
         with self.assertRaisesRegex(suite.Invalid, "invalid_native_page_size"):
             collector.instrumentation_flags("darwin", 1234)
 
+    def test_debug_symbol_settings_preserve_coverage_flags_for_cargo_and_bare_peers(self):
+        with patch.dict(os.environ, {"CARGO_PROFILE_DEV_DEBUG": "2", "CARGO_PROFILE_TEST_DEBUG": "2"}):
+            run = collector.Collector(self.root, self.root, self.target, "cargo-llvm-cov")
+        self.assertEqual(run.env["CARGO_PROFILE_DEV_DEBUG"], "0")
+        self.assertEqual(run.env["CARGO_PROFILE_TEST_DEBUG"], "0")
+        settings = run.result["debug_symbol_settings"]
+        self.assertEqual(settings["cargo_profile_environment"],
+                         {"CARGO_PROFILE_DEV_DEBUG": "0", "CARGO_PROFILE_TEST_DEBUG": "0"})
+        self.assertEqual(settings["rustc_flag"], "-Cdebuginfo=0")
+        for platform in ("linux", "darwin"):
+            flags = collector.instrumentation_flags(platform, 4096)
+            self.assertEqual(flags[:len(collector.BASE_FLAGS)], list(collector.BASE_FLAGS))
+            self.assertIn("-Zcoverage-options=branch", flags)
+            self.assertIn("-Cdebuginfo=0", flags)
+            self.assertFalse(any("strip" in flag or "opt-level" in flag for flag in flags))
+            raw = ("__CARGO_LLVM_COV_RUSTC_WRAPPER=1\nCARGO_LLVM_COV=1\n"
+                   "RUSTC_WRAPPER=/fixture/cargo-llvm-cov\n"
+                   "__CARGO_LLVM_COV_RUSTC_WRAPPER_RUSTFLAGS='"
+                   + "\x1f".join(collector.BASE_FLAGS) + "'\n").encode()
+            parsed = collector.parse_environment(raw, flags)
+            self.assertEqual(parsed["__CARGO_LLVM_COV_RUSTC_WRAPPER_RUSTFLAGS"].split("\x1f"), flags)
+
     def test_show_env_is_parsed_without_shell_evaluation_and_missing_flags_fail(self):
         flags = collector.instrumentation_flags("linux", 4096)
         encoded = "\x1f".join(collector.BASE_FLAGS)
@@ -396,6 +418,38 @@ class CollectionContracts(unittest.TestCase):
             collector.counter_diagnostics(diagnostic, zero_tests=False)
         with self.assertRaisesRegex(suite.Invalid, "unexpected_llvm_profile_error"):
             collector.counter_diagnostics(b"LLVM Profile Error: failed to write counters\n", zero_tests=True)
+
+    def test_named_collection_captures_diagnostics_and_preserves_exact_result_guards(self):
+        name = "split_daemon_custody_and_signature_bound_approver"
+        listing = f"{name}: test\n\n1 test, 0 benchmarks\n".encode()
+        result = b"test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;\n"
+        captured = f"test {name} ... ok\n".encode() + result
+        interleaved = f"test {name} ... audit tail:\nfixture diagnostic\nok\n".encode() + result
+        with self.assertRaisesRegex(suite.Invalid, "missing_or_nonpassing_named_result"):
+            suite.named_pass(interleaved, name)
+        run = collector.Collector(self.root, self.root, self.target, "cargo-llvm-cov")
+        (self.root / "profiles").mkdir()
+        run.package_by_binary[self.binary] = "opaqued"
+        run.test_inventories[self.binary] = ({name}, {name})
+        run.objects = {self.binary}
+        def command(label, argv, env, timeout):
+            if "--list" in argv:
+                return listing
+            self.assertIn("--exact", argv)
+            self.assertIn(name, argv)
+            self.assertIn("--include-ignored", argv)
+            self.assertNotIn("--nocapture", argv)
+            profiles = Path(env["OPAQUE_COVERAGE_PROFILE_DIR"])
+            for role, pid in (("test", 100), ("daemon", 200)):
+                (profiles / f"{role}-{pid}-500-.profraw").write_bytes(b"fixture profile")
+            run.last_command_pid = 100
+            return captured
+        with patch.object(run, "command", side_effect=command):
+            run.execute("trust_domain_e2e", self.binary, name)
+        entry = run.result["executions"][0]
+        self.assertEqual(entry["passed_test_names"], [name])
+        self.assertEqual(entry["passed"], 1)
+        self.assertEqual(entry["additional_profile_process_ids"], [200])
 
     def test_ignored_only_target_reports_reason_without_child_profile_or_ignored_execution(self):
         name = collector.CONTAINED_CASES[0]

@@ -32,11 +32,15 @@ TOOLCHAIN = "nightly-2026-09-13"
 COLLECTOR_VERSION = "0.9.1"
 ORIGINAL_PACKAGES = ("opaque-core", "opaque-bounded-work", "opaque-approval")
 BASE_FLAGS = ("-C", "instrument-coverage", "--cfg=coverage", "--cfg=coverage_nightly")
+BUILD_PROFILE_ENV = {"CARGO_PROFILE_DEV_DEBUG": "0", "CARGO_PROFILE_TEST_DEBUG": "0"}
 
 
 def instrumentation_flags(native_platform, page_size):
     require(native_platform in ("linux", "darwin"), "unsupported_native_platform")
-    flags = [*BASE_FLAGS, "-Zcoverage-options=branch"]
+    # DWARF makes the test peer executable artificially large for the daemon's
+    # real, fresh executable hash. LLVM source/branch maps and counters are
+    # independent of DWARF. Apply the same setting to Cargo and bare-rustc peers.
+    flags = [*BASE_FLAGS, "-Zcoverage-options=branch", "-Cdebuginfo=0"]
     if native_platform == "linux":
         flags.append("-Cllvm-args=-runtime-counter-relocation")
     else:
@@ -531,7 +535,7 @@ class Collector:
         self.flags = instrumentation_flags(sys.platform, os.sysconf("SC_PAGE_SIZE"))
         self.env = suite.environment()
         self.env.update({"RUSTUP_TOOLCHAIN": TOOLCHAIN, "CARGO_TARGET_DIR": str(target),
-                         "CARGO_BUILD_JOBS": str(jobs)})
+                         "CARGO_BUILD_JOBS": str(jobs), **BUILD_PROFILE_ENV})
         self.commands = 0
         self.last_command_pid = None
         self.package_by_binary = {}
@@ -543,6 +547,9 @@ class Collector:
                        "machine": platform.machine(), "coverage_packages": [],
                        "test_collection_packages": [], "workspace_packages": [],
                        "instrumentation": self.flags, "toolchain": TOOLCHAIN,
+                       "debug_symbol_settings": {"cargo_profile_environment": dict(BUILD_PROFILE_ENV),
+                                                 "rustc_flag": "-Cdebuginfo=0",
+                                                 "scope": "DWARF omitted at build; LLVM source/branch maps and counters retained; no post-build stripping"},
                        "collector_version": COLLECTOR_VERSION, "executions": [], "profiles": [],
                        "binaries": [], "failures": [], "test_targets": [], "skipped_tests": [],
                        "not_qualified": ["live vendor accounts", "real model completions", "native human approval",
@@ -733,7 +740,9 @@ class Collector:
             argv = [str(binary), "--test-threads=1"]
         else:
             require(name in names, "required_named_test_not_found")
-            argv = [str(binary), "--exact", name, "--nocapture", "--test-threads=1"]
+            # Capture successful fixture diagnostics so they cannot split the
+            # exact libtest result line. Failures still print captured output.
+            argv = [str(binary), "--exact", name, "--test-threads=1"]
             if target in ("synthesized_review_e2e", CONTAINED_TARGET, "trust_domain_e2e") or name in (ROOT_CASE, DAEMON_ROOT_CASE):
                 argv += ["--include-ignored"]
         raw = self.command("execute-" + target, argv, env=env, timeout=1200)

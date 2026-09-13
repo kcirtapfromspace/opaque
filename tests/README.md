@@ -59,6 +59,9 @@ MCP and composed-review scenarios. It builds
 the daemon, adapter and bare-rustc peer with the same pinned instrumentation,
 requires fresh child profiles, and verifies that branch counters survive a real
 SIGKILL before collecting any results. It preserves crash behavior in the tests.
+Coverage builds omit DWARF debug symbols while retaining LLVM source and branch
+maps. This keeps the real executable-hashing checks within existing test
+deadlines without skipping identity checks or stripping coverage objects.
 
 On macOS, install the pinned tools and run the native collector:
 

@@ -143,11 +143,11 @@ fn invalid_actions_and_extra_fields_fail_before_provider_work() {
 
 #[tokio::test]
 async fn prepared_execution_retains_selector_and_sanitizes_browsing() {
+    let fixture = Fixture::new();
     // Only this test uses this dedicated environment key; no shared Keychain.
     unsafe {
-        std::env::set_var("OPAQUE_BW_HANDLER_TEST_TOKEN", TOKEN);
+        std::env::set_var("OPAQUE_BW_HANDLER_TEST_TOKEN", &fixture.token);
     }
-    let fixture = Fixture::new();
     let (handler, audit) = handler(&fixture);
     let mut req = request(
         "bitwarden.read_secret",
@@ -178,7 +178,7 @@ async fn prepared_execution_retains_selector_and_sanitizes_browsing() {
         serde_json::json!({"projects":[{"name":"Production"}]})
     );
     let audit_json = serde_json::to_string(&audit.events()).unwrap();
-    assert!(!audit_json.contains(TOKEN));
+    assert!(!audit_json.contains(&fixture.token));
     assert!(!audit_json.contains("secret with trailing"));
     assert!(!audit_json.contains("private fixture note"));
     unsafe {
