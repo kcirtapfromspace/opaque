@@ -836,13 +836,16 @@ async fn bearer_is_exactly_one_authorization_header_and_never_url_or_payload_dat
 #[derive(Clone, Copy)]
 enum StreamMutation {
     OversizedHealth,
+    ClosedHealthBeforeHeaders,
     OversizedCompletion,
     TruncatedCompletion,
+    ClosedCompletionBeforeHeaders,
 }
 
 struct StreamingFixture {
     url: String,
     completions: std::sync::Arc<AtomicUsize>,
+    closed_before_headers: std::sync::Arc<AtomicUsize>,
     worker: tokio::task::JoinHandle<()>,
 }
 impl Drop for StreamingFixture {
@@ -865,6 +868,8 @@ async fn streaming_fixture(
     let upstream = upstream.to_owned();
     let completions = std::sync::Arc::new(AtomicUsize::new(0));
     let counted = completions.clone();
+    let closed_before_headers = std::sync::Arc::new(AtomicUsize::new(0));
+    let closed = closed_before_headers.clone();
     let worker = tokio::spawn(async move {
         let forward = reqwest::Client::builder().no_proxy().build().unwrap();
         loop {
@@ -910,6 +915,17 @@ async fn streaming_fixture(
                 || path == "/completion";
             if path == "/completion" {
                 counted.fetch_add(1, Ordering::SeqCst);
+            }
+            if (path == "/health" && matches!(mutation, StreamMutation::ClosedHealthBeforeHeaders))
+                || (path == "/completion"
+                    && matches!(mutation, StreamMutation::ClosedCompletionBeforeHeaders))
+            {
+                // The full request was accepted above. Close without sending
+                // even response headers, so this reaches send() uncertainty
+                // rather than the separate response-body read error.
+                closed.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+                continue;
             }
             if mutated {
                 let mut value = if path == "/health" {
@@ -966,6 +982,7 @@ async fn streaming_fixture(
     StreamingFixture {
         url,
         completions,
+        closed_before_headers,
         worker,
     }
 }
@@ -974,20 +991,25 @@ async fn streaming_fixture(
 async fn streamed_body_limits_and_transport_loss_keep_effects_bounded_and_durable() {
     for mutation in [
         StreamMutation::OversizedHealth,
+        StreamMutation::ClosedHealthBeforeHeaders,
         StreamMutation::OversizedCompletion,
         StreamMutation::TruncatedCompletion,
+        StreamMutation::ClosedCompletionBeforeHeaders,
     ] {
         let (server, mut profile, _) = fixture().await;
         let stream = streaming_fixture(&server.uri(), completion(&profile), mutation).await;
         profile.config.api_url = stream.url.clone();
         let manifest =
             public_demo_manifest(&profile, "Streamed protocol evidence".into(), 600).unwrap();
-        if matches!(mutation, StreamMutation::OversizedHealth) {
+        if matches!(
+            mutation,
+            StreamMutation::OversizedHealth | StreamMutation::ClosedHealthBeforeHeaders
+        ) {
             let result = execute_inference_action(
                 &manifest,
                 manifest.actions[0].as_inference().unwrap(),
                 &profile,
-                || async { panic!("oversized health must not dispatch a completion") },
+                || async { panic!("failed health must not dispatch a completion") },
             )
             .await;
             assert_eq!(result.outcome.state, SlotState::Rejected);
@@ -998,7 +1020,11 @@ async fn streamed_body_limits_and_transport_loss_keep_effects_bounded_and_durabl
             retain_unknown_across_restart(
                 &profile,
                 manifest,
-                if matches!(mutation, StreamMutation::TruncatedCompletion) {
+                if matches!(
+                    mutation,
+                    StreamMutation::TruncatedCompletion
+                        | StreamMutation::ClosedCompletionBeforeHeaders
+                ) {
                     "transport_unknown"
                 } else {
                     "provider_contract_violation"
@@ -1007,5 +1033,13 @@ async fn streamed_body_limits_and_transport_loss_keep_effects_bounded_and_durabl
             .await;
             assert_eq!(stream.completions.load(Ordering::SeqCst), 1);
         }
+        assert_eq!(
+            stream.closed_before_headers.load(Ordering::SeqCst),
+            usize::from(matches!(
+                mutation,
+                StreamMutation::ClosedHealthBeforeHeaders
+                    | StreamMutation::ClosedCompletionBeforeHeaders
+            ))
+        );
     }
 }

@@ -34,6 +34,9 @@ HOST = Path("/etc/opaque-ssh")
 ROLE = "contained-health"
 UNITS = ("opaque-ssh-sshd", "opaque-ssh-control", "opaque-ssh-guard",
          "opaque-contained-health", "opaque-contained-vault")
+SPEC = importlib.util.spec_from_file_location("contained_processes", Path(__file__).with_name("processes.py"))
+PROCESSES = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(PROCESSES)
 
 
 def require(condition, reason):
@@ -211,6 +214,7 @@ def configure(task_path):
     write(HOST / "sshd_config", (ROOT / "packaging/ssh-host/sshd_config.example").read_text()
           .replace("192.0.2.10", "127.0.0.1"))
     write(Path("/opt/opaque-contained-health.py"), Path(__file__).with_name("health.py").read_bytes(), 0o644)
+    write(Path("/opt/opaque-contained-processes.py"), Path(__file__).with_name("processes.py").read_bytes(), 0o644)
     unit("opaque-contained-health", """[Service]
 Type=simple
 ExecStart=/usr/bin/python3 -I /opt/opaque-contained-health.py
@@ -229,31 +233,33 @@ TimeoutStopSec=5
                 (ROOT / "packaging/ssh-host" / (name + ".py")).read_bytes(), "installed source drift")
 
 
+def observations():
+    require(not (STATE / "observation-error").exists(), "actual probe identity observation failed")
+    path = STATE / "probe-observations.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
 def snapshot():
     ledger = Path("/var/lib/opaque-ssh/grants.sqlite")
     with sqlite3.connect("file:" + str(ledger) + "?mode=ro", uri=True) as database:
         database.row_factory = sqlite3.Row
-        grants = [dict(row) for row in database.execute("SELECT id,state,revoked FROM grants ORDER BY id")]
-        receipts = [json.loads(row[0]) for row in database.execute("SELECT receipt FROM receipts ORDER BY sequence")]
-    probes = []
-    for candidate in Path("/proc").iterdir():
-        if candidate.name.isdecimal():
-            try:
-                argv = (candidate / "cmdline").read_bytes().split(b"\0")
-                if b"/opt/opaque-ssh/health_probe.py" in argv:
-                    probes.append(int(candidate.name))
-            except (FileNotFoundError, ProcessLookupError, PermissionError):
-                pass
+        database.execute("BEGIN")
+        ledger_rows = {table: [dict(row) for row in database.execute(f"SELECT * FROM {table} ORDER BY {key}")]
+                       for table, key in (("grants", "id"), ("receipts", "sequence"),
+                                          ("broker_authority", "grant_id"), ("broker_nonces", "nonce"))}
+    recorded = observations()
     sign_requests = sum(event.get("type") == "request" and event.get("request", {}).get("path") == "ssh/sign/" + ROLE
                         for line in (STATE / "vault-audit.jsonl").read_text().splitlines()
                         if (event := json.loads(line)))
-    return {"reads": int((STATE / "reads").read_text()), "vault_sign_requests": sign_requests, "grants": grants,
-            "receipts": receipts, "probe_pids": probes}
+    return {"reads": int((STATE / "reads").read_text()), "vault_sign_requests": sign_requests,
+            "grants": ledger_rows["grants"], "ledger": ledger_rows,
+            "receipts": [json.loads(row["receipt"]) for row in ledger_rows["receipts"]],
+            "probe_observations": recorded, "guard_idle": PROCESSES.guard_idle(recorded)}
 
 
 def replay_host(task_path):
     action = json.loads(task_path.read_bytes())["manifest"]["actions"][0]
-    before = snapshot()["reads"]
+    before = snapshot()
     result = subprocess.run(["setpriv", "--reuid=7382", "--regid=7382", "--clear-groups",
                              "--bounding-set=-all", "/usr/bin/python3", "-I",
                              "/opt/opaque-ssh/host_guard.py", "enter", action["grant_id"]],
@@ -267,15 +273,40 @@ def replay_host(task_path):
     receipt = json.loads(raw)
     require(receipt["manifest"] == action and receipt["response"]["status"] == "denied",
             "host replay denial lost its signed authority binding")
-    require(snapshot()["reads"] == before, "host replay created a second probe")
+    after = snapshot()
+    for field in ("reads", "vault_sign_requests", "grants", "probe_observations"):
+        require(after[field] == before[field], "host replay changed one-use execution evidence")
+    for table in ("grants", "broker_authority", "broker_nonces"):
+        require(after["ledger"][table] == before["ledger"][table], "host replay mutated authority ledger")
+    previous = before["ledger"]["receipts"]
+    current = after["ledger"]["receipts"]
+    require(len(current) == len(previous) + 1 and current[:-1] == previous,
+            "host replay did not append exactly one denial")
+    appended = json.loads(current[-1]["receipt"])
+    signed = dict(receipt["response"]["receipt"])
+    require(signed.pop("sequence") == current[-1]["sequence"] and signed == appended
+            and appended["status"] == "denied" and appended["grant_id"] == action["grant_id"],
+            "new durable denial differs from signed host response")
+    require(after["guard_idle"], "host replay left a descendant process")
 
 
 def cleanup():
+    # Capture the complete owned service cgroups before stopping them. Command
+    # line changes or a reparented descendant cannot hide from these checks.
+    states = [PROCESSES.unit_state(name) for name in UNITS]
+    captured = [identity for state in states if state["ControlGroup"]
+                for identity in PROCESSES.cgroup_members(state["ControlGroup"])]
+    path = STATE / "probe-observations.jsonl"
+    if path.exists():
+        captured += [identity for line in path.read_text().splitlines()
+                     for identity in json.loads(line)["members"]]
     command("systemctl", "stop", *UNITS, check=False)
-    require(not any(line == b"active" for line in command(
-        "systemctl", "is-active", *UNITS, check=False).stdout.splitlines()), "fixture service survived cleanup")
-    if (Path("/var/lib/opaque-ssh") / "grants.sqlite").exists():
-        require(not snapshot()["probe_pids"], "fixed probe survived cleanup")
+    def stopped():
+        current = [PROCESSES.unit_state(name) for name in UNITS]
+        return (all(state["ActiveState"] in ("inactive", "failed") and state["MainPID"] == 0 for state in current)
+                and all(not PROCESSES.cgroup_members(state["ControlGroup"]) for state in states if state["ControlGroup"])
+                and PROCESSES.gone(captured))
+    wait_for(stopped)
     for directory in (HOST, Path("/var/lib/opaque-ssh"), STATE):
         if directory.exists():
             shutil.rmtree(directory)
@@ -312,11 +343,13 @@ def main():
     elif args.action == "crash-guard":
         # Kill the actual supervisor while a real fixed probe is in flight.
         # Its systemd restart and kernel parent-death cleanup remain enabled.
-        pid = int(command("systemctl", "show", "--property=MainPID", "--value", "opaque-ssh-guard").stdout)
-        require(pid > 1 and snapshot()["probe_pids"], "no in-flight fixed probe")
+        recorded = observations()
+        require(len(recorded) == 1, "expected exactly one observed real probe")
+        live = PROCESSES.observe_probe()
+        require(PROCESSES.same_identity(recorded[0]["probe"], live["probe"]), "observed probe changed before crash")
+        pid = live["guard"]["pid"]
         os.kill(pid, signal.SIGKILL)
-        wait_for(lambda: command("systemctl", "is-active", "opaque-ssh-guard", check=False).stdout.strip() == b"active"
-                 and not snapshot()["probe_pids"]
+        wait_for(lambda: PROCESSES.guard_idle(recorded, restarted=True)
                  and all(grant["state"] != "reserved" for grant in snapshot()["grants"]))
     else:
         cleanup()

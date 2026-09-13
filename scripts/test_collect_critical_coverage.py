@@ -41,9 +41,11 @@ class CollectionContracts(unittest.TestCase):
         macos = collector.selected_cases("darwin")
         self.assertEqual(set(linux) - set(macos), {"synthesized_review_e2e"})
         self.assertEqual(len(linux["synthesized_review_e2e"]), 4)
-        self.assertEqual(sum(map(len, linux.values())), 25)
-        self.assertEqual(sum(map(len, macos.values())), 21)
+        self.assertEqual(sum(map(len, linux.values())), 26)
+        self.assertEqual(sum(map(len, macos.values())), 22)
         for cases in (linux, macos):
+            self.assertIn("ssh_planning_without_tenant_is_denied_before_provider_io",
+                          cases["task_api_e2e"])
             self.assertTrue(any("requester_reviewer_and_device_revocation" in name
                                 for name in cases["opaqued"]))
         with self.assertRaisesRegex(suite.Invalid, "unsupported_native_platform"):
@@ -54,7 +56,7 @@ class CollectionContracts(unittest.TestCase):
         contained = collector.selected_cases("linux", True)
         self.assertEqual({key: contained[key] for key in baseline}, baseline)
         self.assertEqual(contained[collector.CONTAINED_TARGET], collector.CONTAINED_CASES)
-        self.assertEqual(sum(map(len, contained.values())), 28)
+        self.assertEqual(sum(map(len, contained.values())), 29)
         self.assertEqual(collector.role_requirements(collector.CONTAINED_TARGET, collector.CONTAINED_CASES[0]),
                          {"test", "daemon", "peer"})
         with self.assertRaisesRegex(suite.Invalid, "contained_profile_requires_linux"):

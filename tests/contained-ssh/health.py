@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Count fixed synthetic health reads, including a controlled stalled response."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import importlib.util
 import json
 from pathlib import Path
 import threading
@@ -8,6 +9,9 @@ import time
 
 STATE = Path("/var/lib/opaque-contained")
 LOCK = threading.Lock()
+SPEC = importlib.util.spec_from_file_location("contained_processes", "/opt/opaque-contained-processes.py")
+PROCESSES = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(PROCESSES)
 
 
 class Health(BaseHTTPRequestHandler):
@@ -19,6 +23,16 @@ class Health(BaseHTTPRequestHandler):
             self.send_error(404)
             return
         with LOCK:
+            # Observe the real caller while its production probe is blocked on
+            # this HTTP response, before either the success or crash path exits.
+            try:
+                observation = PROCESSES.observe_probe()
+                with (STATE / "probe-observations.jsonl").open("a") as stream:
+                    stream.write(json.dumps(observation, sort_keys=True) + "\n")
+            except Exception:
+                (STATE / "observation-error").write_text("actual process evidence unavailable")
+                self.send_error(500)
+                return
             counter = STATE / "reads"
             count = int(counter.read_text()) if counter.exists() else 0
             counter.write_text(str(count + 1))

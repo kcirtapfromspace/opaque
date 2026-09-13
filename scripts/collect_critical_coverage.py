@@ -54,7 +54,10 @@ REQUIRED_FILES = (
     "crates/opaque-approval/src/approval_server/workstation.rs",
 )
 CASES = {
-    "task_api_e2e": ("task_plan_run_get_list_revoke_end_to_end",),
+    "task_api_e2e": (
+        "task_plan_run_get_list_revoke_end_to_end",
+        "ssh_planning_without_tenant_is_denied_before_provider_io",
+    ),
     "resource_authority_e2e": ("broker_identity_is_live_for_gateway_queries_disclosures_and_logout",),
     "mcp_gateway_e2e": (
         "adapter_signed_tool_daemon_effect_receipt_and_replay_survive_restart",

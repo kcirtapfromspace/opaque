@@ -125,6 +125,20 @@
       ],
       "build_timeout_seconds": 1800,
       "requires_sys_ptrace": true
+    },
+    {
+      "id": "task-api",
+      "package": "opaqued",
+      "kind": "test",
+      "name": "task_api_e2e",
+      "features": [],
+      "platforms": [
+        "linux",
+        "darwin"
+      ],
+      "root": false,
+      "tools": [],
+      "build_timeout_seconds": 1800
     }
   ],
   "tests": [
@@ -345,6 +359,13 @@
       "name": "approval_server::workstation::tests::workstation_tls_expired_fetch_and_signed_response_never_decide",
       "timeout_seconds": 120,
       "include_ignored": false
+    },
+    {
+      "id": "ssh-planning-missing-tenant",
+      "target": "task-api",
+      "name": "ssh_planning_without_tenant_is_denied_before_provider_io",
+      "timeout_seconds": 120,
+      "include_ignored": false
     }
   ],
   "requirements": [
@@ -549,6 +570,15 @@
         "workstation-expired-fetch-response"
       ],
       "description": "Pinned TLS rejects a different enrolled signer under another authenticated device without consuming the pending round; a correctly signed Reject consumes once. Expired fetch and correctly signed response return 410 after wall or local elapsed deadlines without a decision. No native human claim."
+    },
+    {
+      "id": "protocol.ssh-planning-tenant-required",
+      "profile": "protocol",
+      "status": "implemented",
+      "tests": [
+        "ssh-planning-missing-tenant"
+      ],
+      "description": "The real task planning RPC rejects SSH planning without a tenant before provider I/O or durable task creation."
     }
   ]
 }

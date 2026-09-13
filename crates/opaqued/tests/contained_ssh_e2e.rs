@@ -482,9 +482,17 @@ impl Fixture {
         assert_eq!(self._idp.counts(), identity_counts);
     }
     async fn no_replay(&self, task: &Value) {
+        let before = Services::call("snapshot", &[]);
+        let persisted = self.get(task).await;
         assert!(self.run(task).await.unwrap().unwrap()["error"].is_object());
         assert!(self.workstation.pending().await.is_empty());
-        assert_eq!(Services::call("snapshot", &[])["reads"], 1);
+        assert_eq!(self.get(task).await, persisted);
+        assert_eq!(Services::call("snapshot", &[]), before);
+        assert_eq!(before["reads"], 1);
+        assert_eq!(before["vault_sign_requests"], 1);
+        assert_eq!(before["grants"].as_array().unwrap().len(), 1);
+        assert_eq!(before["probe_observations"].as_array().unwrap().len(), 1);
+        assert_eq!(before["guard_idle"], true);
     }
 }
 impl Drop for Fixture {
@@ -537,10 +545,24 @@ async fn contained_signed_ssh_runs_one_probe_and_rejects_replay_after_restart() 
     assert_eq!(evidence["grants"].as_array().unwrap().len(), 1);
     assert_eq!(evidence["grants"][0]["state"], "completed");
     assert_eq!(evidence["grants"][0]["revoked"], 1);
-    assert!(evidence["probe_pids"].as_array().unwrap().is_empty());
+    assert_eq!(evidence["guard_idle"], true);
+    assert_eq!(evidence["probe_observations"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        evidence["probe_observations"][0]["probe"]["uids"],
+        json!([7382, 7382, 7382, 7382])
+    );
+    assert_eq!(
+        evidence["probe_observations"][0]["probe"]["gids"],
+        json!([7382, 7382, 7382, 7382])
+    );
+    assert_eq!(
+        evidence["probe_observations"][0]["probe"]["groups"],
+        json!([])
+    );
     let receipt = fixture.receipt(completed).await;
     fixture.no_replay(&task).await;
     fixture.restart(&task).await;
+    assert_eq!(Services::call("snapshot", &[]), evidence);
     assert_eq!(fixture.get(&task).await, *completed);
     assert_eq!(fixture.receipt(completed).await, receipt);
     fixture.no_replay(&task).await;
@@ -586,7 +608,21 @@ async fn contained_guard_crash_preserves_unknown_and_kills_probe_without_replay(
     assert_eq!(snapshot["vault_sign_requests"], 1);
     assert_eq!(snapshot["grants"][0]["state"], "unknown");
     assert_eq!(snapshot["grants"][0]["revoked"], 1);
-    assert!(snapshot["probe_pids"].as_array().unwrap().is_empty());
+    assert_eq!(snapshot["grants"].as_array().unwrap().len(), 1);
+    assert_eq!(snapshot["guard_idle"], true);
+    assert_eq!(snapshot["probe_observations"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        snapshot["probe_observations"][0]["probe"]["uids"],
+        json!([7382, 7382, 7382, 7382])
+    );
+    assert_eq!(
+        snapshot["probe_observations"][0]["probe"]["gids"],
+        json!([7382, 7382, 7382, 7382])
+    );
+    assert_eq!(
+        snapshot["probe_observations"][0]["probe"]["groups"],
+        json!([])
+    );
     assert!(
         snapshot["receipts"]
             .as_array()
@@ -595,9 +631,15 @@ async fn contained_guard_crash_preserves_unknown_and_kills_probe_without_replay(
             .any(|receipt| receipt["status"] == "unknown"
                 && receipt["result_code"] == "restart_unknown")
     );
+    Services::call(
+        "replay-host",
+        &[&fixture.layout.base.path().join("planned-task.json")],
+    );
+    let after_denial = Services::call("snapshot", &[]);
     assert_eq!(fixture.get(&task).await, *task_state);
     fixture.no_replay(&task).await;
     fixture.restart(&task).await;
+    assert_eq!(Services::call("snapshot", &[]), after_denial);
     assert_eq!(fixture.get(&task).await, *task_state);
     fixture.receipt(task_state).await;
     fixture.no_replay(&task).await;

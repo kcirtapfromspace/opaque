@@ -21,11 +21,20 @@ Two SSH tests in the synthesized `contained` profile establish:
   systemd host guard. Broker, RPC caller and host login use actual distinct NSS
   accounts and kernel peer identity; no synthetic `whoami` override is used.
 - Exactly one Vault signing request in Vault's audit sink and one fixed local
-  health read. A signed host denial rejects the consumed grant, and task replay
-  after daemon restart creates no further probe.
+  health read. The responder observes the executing probe's four UID/GID values
+  as the host NSS account, no supplementary groups, and actual guard ancestry
+  and cgroup membership before returning its HTTP response. Signed host denials
+  reject completed and unknown grants. Task replay and daemon restart preserve
+  every host grant, authority, nonce and receipt row without another signature
+  request or health read.
 - Killing the actual guard during an observed stalled health read leaves the
   broker slot `unknown`, recovers host `restart_unknown`, revokes the grant and
   kills the fixed probe. It neither fabricates a completion nor refunds replay.
+  Captured PID/start-time identities disappear and the guard cgroup contains
+  only the restarted supervisor. Cleanup checks every owned service's terminal
+  state, zero MainPID, empty cgroup and disappearance of observed processes.
+  The fixed probe does not fork; this does not claim arbitrary descendant
+  workload acceptance.
 
 A third test covers inference task RPC with a controlled HTTP peer. It rejects
 planning authority revoked during a metadata read, verifies three typed

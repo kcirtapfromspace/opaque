@@ -343,6 +343,37 @@ fn ok(resp: &Value, context: &str) {
     );
 }
 
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn ssh_planning_without_tenant_is_denied_before_provider_io() {
+    let _serial = serial_guard();
+    let github = MockServer::start().await;
+    let vault = MockServer::start().await;
+    // A daemon that permits plain tasks must still reject tenant-only SSH
+    // planning. Tenant-enabled scenarios use the isolated broker fixture;
+    // startup deliberately rejects tenant mode in this same-UID fixture.
+    let fixture = Fixture::new();
+    let config_path = fixture.write_config();
+    let daemon = fixture.spawn(&config_path, &github.uri(), &vault.uri());
+    let denied = daemon
+        .call(
+            "task_plan_ssh",
+            json!({"title":"unauthenticated SSH plan","expires_in_secs":60}),
+        )
+        .await;
+    assert_eq!(denied["error"]["code"], "task_unavailable");
+    assert_eq!(
+        denied["error"]["message"],
+        "tenant tasks require an authenticated tenant principal and live delegation"
+    );
+    assert!(denied["result"].is_null());
+    let listed = daemon.call("task_list", json!({})).await;
+    ok(&listed, "list after denied SSH plan");
+    assert_eq!(listed["result"]["tasks"], json!([]));
+    assert!(github.received_requests().await.unwrap().is_empty());
+    assert!(vault.received_requests().await.unwrap().is_empty());
+}
+
 /// Full lifecycle: plan two tasks, list and fetch the first, run it to
 /// completion against mocked GitHub/Vault, then revoke the second (never
 /// run) task.
