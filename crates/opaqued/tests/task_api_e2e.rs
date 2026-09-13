@@ -193,6 +193,17 @@ struct Daemon {
     log: PathBuf,
 }
 
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        // std::process::Child does not stop or reap a process on drop. Preserve
+        // fixture cleanup when an assertion or readiness check unwinds.
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
 impl Daemon {
     async fn call(&self, method: &str, params: Value) -> Value {
         use futures_util::{SinkExt, StreamExt};
@@ -372,6 +383,7 @@ async fn ssh_planning_without_tenant_is_denied_before_provider_io() {
     assert_eq!(listed["result"]["tasks"], json!([]));
     assert!(github.received_requests().await.unwrap().is_empty());
     assert!(vault.received_requests().await.unwrap().is_empty());
+    daemon.shutdown();
 }
 
 /// Full lifecycle: plan two tasks, list and fetch the first, run it to
