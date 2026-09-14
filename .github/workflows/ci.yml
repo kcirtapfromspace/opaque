@@ -177,7 +177,9 @@ jobs:
           node-version: "22"
       - name: Verify disposable host runner regressions
         if: matrix.platform == 'linux'
-        run: python3 -B -m unittest discover -s tests/contained-ssh -p 'test_*.py' -v
+        run: |
+          python3 -m pip install --disable-pip-version-check -r scripts/requirements-test.txt
+          python3 -B -m unittest discover -s tests/contained-ssh -p 'test_*.py' -v
       - name: Collect every workspace package and instrumented subprocess
         # A killed-child preflight verifies continuous branch profiles before
         # any measurements. The same instrumentation builds test, daemon and
