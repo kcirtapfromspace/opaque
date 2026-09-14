@@ -8,6 +8,8 @@
 //! An independent authority/charge model generates the reachable abstract graph.
 //! Every outgoing edge is replayed from its shortest witness in a fresh database;
 //! the complete observable record is checked after every prefix, including reopen.
+//! Four workers overlap independent databases' durable I/O. Each witness remains
+//! sequential; this scheduling does not add concurrent histories to the model.
 //! Histories reaching the same model state are merged. This is a bounded model
 //! check, not exhaustive concurrent, multi-slot, corruption, or crash-I/O testing.
 //!
@@ -472,6 +474,48 @@ fn replay(case: &str, sequence: &[Action]) -> usize {
     sequence.len() + 1
 }
 
+fn replay_independent_databases(sequences: &[(String, Vec<Action>)]) -> usize {
+    // FULL-sync writes and independent read-only observations remain unchanged.
+    // Bound simultaneous databases rather than serializing thousands of fsyncs
+    // against a hosted runner's variable disk latency. Strided assignment keeps
+    // work deterministic without sharing a ledger or any mutable model state.
+    const WORKERS: usize = 4;
+    let mut completed = std::thread::scope(|scope| {
+        let workers = (0..WORKERS)
+            .map(|worker| {
+                scope.spawn(move || {
+                    sequences
+                        .iter()
+                        .enumerate()
+                        .skip(worker)
+                        .step_by(WORKERS)
+                        .map(|(index, (case, sequence))| (index, replay(case, sequence)))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        workers
+            .into_iter()
+            .flat_map(|worker| match worker.join() {
+                Ok(completed) => completed,
+                Err(panic) => std::panic::resume_unwind(panic),
+            })
+            .collect::<Vec<_>>()
+    });
+    // Missing or duplicate work must not be hidden by an equal aggregate
+    // transition count. Every original witness has exactly one completion.
+    completed.sort_unstable_by_key(|(index, _)| *index);
+    assert_eq!(completed.len(), sequences.len());
+    completed
+        .into_iter()
+        .enumerate()
+        .map(|(expected, (actual, checks))| {
+            assert_eq!(actual, expected, "missing or duplicate state-model witness");
+            checks
+        })
+        .sum()
+}
+
 #[test]
 fn bounded_task_store_matches_reference_state_graph() {
     use Action::*;
@@ -569,10 +613,10 @@ fn bounded_task_store_matches_reference_state_graph() {
             .len(),
         cases.len()
     );
-    let mut checks = 0;
-    for (id, sequence) in &cases {
-        checks += replay(id, sequence);
-    }
+    let mut sequences = cases
+        .iter()
+        .map(|(id, sequence)| ((*id).to_owned(), sequence.to_vec()))
+        .collect::<Vec<_>>();
 
     let initial = Model::planned();
     let mut seen = BTreeSet::from([initial.clone()]);
@@ -601,13 +645,14 @@ fn bounded_task_store_matches_reference_state_graph() {
             }
             let mut sequence = witness.clone();
             sequence.push(action);
-            checks += replay(&format!("TSM-GRAPH-{edges:04}"), &sequence);
+            sequences.push((format!("TSM-GRAPH-{edges:04}"), sequence.clone()));
             edges += 1;
             if seen.insert(next.clone()) {
                 queue.push_back((next, sequence));
             }
         }
     }
+    let checks = replay_independent_databases(&sequences);
     assert_eq!(edges, seen.len() * ACTIONS.len());
     // Fixed coverage for this declared alphabet/model. Change these only with
     // a reviewed scope change; a smaller or truncated graph must fail loudly.

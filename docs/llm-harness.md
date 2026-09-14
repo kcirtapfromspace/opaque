@@ -60,6 +60,13 @@ succeeds; a failed or unacknowledged revocation exits nonzero. After an abrupt
 wrapper kill or a lost daemon connection, inspect `opaque agent list` and revoke
 any remaining session with `opaque agent end <session-id>`.
 
+In an interactive terminal, Ctrl-C reaches the agent directly, so its own
+interrupt handler can exit or continue. Suspend and resume work through the
+invoking shell; the wrapper restores terminal settings when the agent stops or
+exits. A SIGINT or SIGTERM sent directly to the wrapper cancels the agent's
+process group, allowing five seconds to exit before forcing cleanup. Group
+cleanup also removes remaining members after the agent exits.
+
 ## Secret Inputs: Refs, Not Values
 
 Operations accept **secret references** (refs), not raw values.

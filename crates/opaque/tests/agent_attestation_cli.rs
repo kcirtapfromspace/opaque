@@ -215,9 +215,9 @@ fn agent_environment_exit_status_and_cleanup_are_observed_in_child() {
 }
 #[test]
 fn agent_spawn_and_child_signal_failures_revoke_the_grant() {
-    for args in [
-        vec!["/definitely/missing/opaque-agent"],
-        vec!["/bin/sh", "-c", "kill -TERM $$"],
+    for (args, expected) in [
+        (vec!["/definitely/missing/opaque-agent"], 1),
+        (vec!["/bin/sh", "-c", "kill -TERM $$"], 128 + libc::SIGTERM),
     ] {
         let peer = Peer::new(vec![
             ("agent_session_start", result(grant())),
@@ -227,7 +227,7 @@ fn agent_spawn_and_child_signal_failures_revoke_the_grant() {
             ),
         ]);
         let output = run(peer.command().args(["agent", "run", "--"]).args(args));
-        assert_exit(&output, 1);
+        assert_exit(&output, expected);
         assert_ended(&peer.finish());
     }
 }
@@ -542,7 +542,7 @@ fn human_attestation_output_never_renders_invalid_evidence_as_verified() {
 }
 
 #[test]
-fn agent_with_terminal_descriptor_inherits_wrapper_process_group() {
+fn agent_with_noncontrolling_terminal_descriptor_owns_its_process_group() {
     use std::os::fd::FromRawFd;
     use std::os::unix::process::CommandExt;
     let (mut master, mut slave) = (-1, -1);
@@ -577,7 +577,7 @@ fn agent_with_terminal_descriptor_inherits_wrapper_process_group() {
         "--",
         "/bin/sh",
         "-c",
-        "test \"$(ps -o pgid= -p $$ | tr -d ' ')\" = \"$PPID\"",
+        "test \"$(ps -o pgid= -p $$ | tr -d ' ')\" = \"$$\"",
     ]);
     assert_exit(&run(&mut command), 0);
     assert_ended(&peer.finish());
@@ -686,6 +686,143 @@ fn agent_termination_reaps_a_group_when_its_leader_exits_before_a_stubborn_desce
 fn agent_interrupt_escalates_and_reaps_a_group_that_ignores_signals() {
     let script = "trap \"\" INT TERM; echo $$ > \"$1.tmp\"; /bin/mv \"$1.tmp\" \"$1\"; while :; do /bin/sleep 1; done";
     assert_cancelled_group(script, libc::SIGINT);
+}
+
+#[test]
+fn agent_cancellation_reaps_a_direct_child_that_leaves_its_owned_group() {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Stdio};
+
+    struct Cleanup {
+        wrapper: Child,
+        sentinel: Option<Child>,
+        sentinel_reaped: bool,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let group = self.wrapper.id() as i32;
+            // Only teardown signals this wholly owned group. Its unreaped
+            // sentinel fences reuse even if the child failed before publishing
+            // readiness. Normal-path assertions verify the sentinel beforehand.
+            if let Some(sentinel) = &self.sentinel
+                && !self.sentinel_reaped
+                && unsafe { libc::getpgid(sentinel.id() as i32) } == group
+                && group != unsafe { libc::getpgrp() }
+            {
+                unsafe { libc::kill(-group, libc::SIGKILL) };
+            }
+            let _ = self.wrapper.kill();
+            let _ = self.wrapper.wait();
+            if let Some(sentinel) = &mut self.sentinel {
+                let _ = sentinel.kill();
+                let _ = sentinel.wait();
+            }
+        }
+    }
+
+    for signal in [libc::SIGINT, libc::SIGTERM] {
+        let (release, grant_ready) = std::sync::mpsc::channel();
+        let peer = Peer::new(vec![
+            (
+                "agent_session_start",
+                Box::new(move |_| {
+                    grant_ready.recv_timeout(Duration::from_secs(15)).unwrap();
+                    json!({"id":1,"result":grant()})
+                }),
+            ),
+            (
+                "agent_session_end",
+                result(json!({"status":"ended","session_id":"test-session"})),
+            ),
+        ]);
+        let marker = peer._dir.path().join("moved-child.json");
+        let script = r#"
+import json, os, pathlib, signal, sys
+signal.signal(signal.SIGINT, signal.SIG_IGN)
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+original = os.getpgrp()
+wrapper_group = os.getpgid(os.getppid())
+os.setpgid(0, wrapper_group)
+path = pathlib.Path(sys.argv[1])
+temporary = path.with_suffix('.tmp')
+temporary.write_text(json.dumps({'pid':os.getpid(), 'original':original, 'joined':os.getpgrp()}))
+temporary.replace(path)
+while True:
+    signal.pause()
+"#;
+        let stdout = tempfile::tempfile().unwrap();
+        let stderr = tempfile::tempfile().unwrap();
+        let wrapper = peer
+            .command()
+            .process_group(0)
+            .args([
+                "--json",
+                "agent",
+                "run",
+                "--",
+                "/usr/bin/python3",
+                "-c",
+                script,
+            ])
+            .arg(&marker)
+            .stdin(Stdio::null())
+            .stdout(stdout.try_clone().unwrap())
+            .stderr(stderr.try_clone().unwrap())
+            .spawn()
+            .unwrap();
+        let mut cleanup = Cleanup {
+            wrapper,
+            sentinel: None,
+            sentinel_reaped: false,
+        };
+        let wrapper_group = cleanup.wrapper.id() as i32;
+        assert_ne!(wrapper_group, unsafe { libc::getpgrp() });
+        cleanup.sentinel = Some(
+            Command::new("/bin/sleep")
+                .arg("60")
+                .process_group(wrapper_group)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        // No direct child can launch before teardown owns its group sentinel.
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !marker.is_file() {
+            assert!(Instant::now() < deadline, "moved child readiness deadline");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let observed: Value = serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+        let pid = observed["pid"].as_i64().unwrap() as i32;
+        assert_eq!(observed["original"], pid);
+        assert_eq!(observed["joined"], wrapper_group);
+        assert_ne!(pid, wrapper_group);
+        assert_eq!(unsafe { libc::getpgid(pid) }, wrapper_group);
+        assert_eq!(unsafe { libc::kill(wrapper_group, signal) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = cleanup.wrapper.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "moved child cancellation deadline"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(status.code(), Some(128 + signal));
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "direct child survived");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        let sentinel_status = cleanup.sentinel.as_mut().unwrap().try_wait().unwrap();
+        cleanup.sentinel_reaped = sentinel_status.is_some();
+        assert!(sentinel_status.is_none());
+        assert_ended(&peer.finish());
+    }
 }
 
 #[test]

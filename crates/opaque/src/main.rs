@@ -18,6 +18,7 @@ use opaque_core::socket::{socket_path, verify_socket_safety};
 use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
+mod agent_process;
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod ipc_tests;
@@ -2020,60 +2021,13 @@ async fn run_agent_wrapped(
         child.stdin(std::process::Stdio::inherit());
         child.stdout(std::process::Stdio::inherit());
         child.stderr(std::process::Stdio::inherit());
-        // Detached flows need a group so cancellation reaches descendants.
-        // Interactive agents must remain in the foreground terminal group;
-        // moving them to a background group would stop reads with SIGTTIN.
-        use std::io::IsTerminal;
-        let separate_group = !std::io::stdin().is_terminal();
-        if separate_group {
-            child.process_group(0);
-        }
-        child.kill_on_drop(true);
         tokio::select! {
             biased;
             _ = interrupt.recv() => return Ok(128 + libc::SIGINT),
             _ = terminate.recv() => return Ok(128 + libc::SIGTERM),
             _ = std::future::ready(()) => {},
         }
-        let mut child = child
-            .spawn()
-            .map_err(|e| format!("failed to spawn agent command: {e}"))?;
-        let child_pid = child.id().expect("newly spawned child has a PID");
-        let signal = tokio::select! {
-            status = child.wait() => {
-                return status.map(|s| s.code().unwrap_or(1))
-                    .map_err(|e| format!("agent command failed to run: {e}"));
-            }
-            _ = interrupt.recv() => libc::SIGINT,
-            _ = terminate.recv() => libc::SIGTERM,
-        };
-        let signal_target = if separate_group {
-            -(child_pid as i32)
-        } else {
-            child_pid as i32
-        };
-        // SAFETY: target is the child, or its newly created process group.
-        // Never signal the caller's foreground terminal group.
-        unsafe {
-            libc::kill(signal_target, signal);
-        }
-        let reaped = matches!(
-            tokio::time::timeout(Duration::from_secs(5), child.wait()).await,
-            Ok(Ok(_))
-        );
-        // A leader can exit while a descendant ignores the forwarded signal.
-        // Clear the detached group even after reaping that leader; otherwise
-        // successful session revocation would leave the local agent running.
-        if separate_group || !reaped {
-            unsafe {
-                libc::kill(signal_target, libc::SIGKILL);
-            }
-        }
-        if !reaped {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-        }
-        Ok(128 + signal)
+        agent_process::run(child, &mut interrupt, &mut terminate).await
     }
     .await;
 

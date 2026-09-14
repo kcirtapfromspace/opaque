@@ -36,6 +36,9 @@ COLLECTOR_VERSION = "0.9.1"
 ORIGINAL_PACKAGES = ("opaque-core", "opaque-bounded-work", "opaque-approval")
 BASE_FLAGS = ("-C", "instrument-coverage", "--cfg=coverage", "--cfg=coverage_nightly")
 BUILD_PROFILE_ENV = {"CARGO_PROFILE_DEV_DEBUG": "0", "CARGO_PROFILE_TEST_DEBUG": "0"}
+CACHE_BINDING = ".opaque-coverage-workspace.json"
+CACHE_SCHEMA = "opaque.coverage-workspace-cache.v1"
+CACHE_TAG_SIGNATURE = b"Signature: 8a477f597d28d172789f06886806bc55"
 
 
 def instrumentation_flags(native_platform, page_size):
@@ -254,6 +257,97 @@ def sha(path):
 
 def save(path, value):
     path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
+
+
+def command_failure_metadata(label, log, *, classification, returncode=None, error_number=None,
+                             root, test_context=None):
+    """Allowlist failure metadata; never publish captured output or arguments."""
+    result = {"command": label if re.fullmatch(r"[A-Za-z0-9_:-]{1,200}", label) else "unrecognized",
+              "classification": classification, "exit_code": returncode if returncode is not None and returncode >= 0 else None,
+              "signal": -returncode if returncode is not None and returncode < 0 else None,
+              "os_error_number": error_number,
+              "private_log": log.name if re.fullmatch(r"command-[0-9]{3,8}\.log", log.name) else "unrecognized",
+              "output_scope": "metadata only; raw output remains in the private command log"}
+    known = set()
+    if test_context is not None:
+        package, target, requested, inventory = test_context
+        identity = r"[A-Za-z0-9_][A-Za-z0-9_:-]{0,199}"
+        require(re.fullmatch(identity, package) and re.fullmatch(identity, target), "invalid_failure_test_identity")
+        known = {name for name in inventory if isinstance(name, str) and re.fullmatch(identity, name)}
+        require(requested is None or requested in known, "invalid_failure_requested_test")
+        result["test_context"] = {"package": package, "target": target, "requested_test": requested}
+    if not log.is_file() or log.is_symlink():
+        return result
+    # Only parse bounded first/last windows, even for a runaway diagnostic.
+    limit = 65536
+    with log.open("rb") as stream:
+        size = os.fstat(stream.fileno()).st_size
+        raw = stream.read(limit)
+        if size > limit:
+            stream.seek(max(limit, size - limit))
+            raw += b"\n" + stream.read(limit)
+    text = raw.decode("utf-8", errors="replace")
+    failed = set(re.findall(r"^test ([A-Za-z0-9_:]+) \.\.\. FAILED$", text, re.MULTILINE)) & known
+    result["failed_tests"] = sorted(failed)[:100]
+    result["failed_tests_truncated"] = len(failed) > 100
+    result["diagnostic_window_truncated"] = size > limit * 2
+    result["observed_libtest_summaries"] = [
+        {"result": status, "passed": int(passed), "failed": int(failed_count), "ignored": int(ignored)}
+        for status, passed, failed_count, ignored in re.findall(
+            r"^test result: (ok|FAILED)\. ([0-9]{1,7}) passed; ([0-9]{1,7}) failed; ([0-9]{1,7}) ignored;", text, re.MULTILINE)[:8]]
+    indicators = []
+    if re.search(r"^assertion(?: `[^`\n]{1,80}`)? failed", text, re.MULTILINE):
+        indicators.append("assertion_failed")
+    for pattern, indicator in (
+        (r"^fatal: detected dubious ownership in repository at ", "git_checkout_ownership_rejected"),
+        (r"^ValueError: release source must be clean;", "release_source_dirty"),
+        (r"^ValueError: expected revision does not match source HEAD$", "release_revision_mismatch"),
+        (r"^ValueError: unsupported target or invalid version$", "unsupported_release_identity"),
+        (r"^.+: error: all eight regular compiled tool files are required$", "missing_regular_compiled_tools"),
+    ):
+        if re.search(pattern, text, re.MULTILINE):
+            indicators.append(indicator)
+    result["failure_indicators"] = indicators
+    result["observed_os_error_numbers"] = sorted({int(code) for code in re.findall(r"\(os error ([0-9]{1,3})\)", text)})
+    locations = []
+    for name, file, line, column in re.findall(
+            r"^thread '([A-Za-z0-9_:]+)'(?: \([0-9]+\))? panicked at ([^\n]+):([0-9]{1,7}):([0-9]{1,7}):$", text, re.MULTILINE):
+        if name not in known or not re.fullmatch(r"[A-Za-z0-9_./-]+\.rs", file):
+            continue
+        path = Path(file)
+        if not path.is_absolute():
+            path = root / path
+        try:
+            relative = path.resolve(strict=True).relative_to(root)
+        except (OSError, ValueError):
+            continue
+        if not path.is_file() or line == "0" or column == "0":
+            continue
+        location = {"test": name, "source": relative.as_posix(), "line": int(line), "column": int(column)}
+        if location not in locations:
+            locations.append(location)
+    result["panic_locations"] = locations[:32]
+    result["panic_locations_truncated"] = len(locations) > 32
+    result["python_exception_classes"] = sorted(set(re.findall(
+        r"^(?:subprocess\.)?(ValueError|RuntimeError|FileNotFoundError|PermissionError|CalledProcessError|TimeoutExpired|OSError|Invalid):", text, re.MULTILINE)))
+    python_locations = []
+    for file, line in re.findall(r'^  File "([^"\n]+)", line ([0-9]{1,7}), in [A-Za-z0-9_<>]+$', text, re.MULTILINE):
+        if not re.fullmatch(r"[A-Za-z0-9_./-]+\.py", file):
+            continue
+        path = Path(file)
+        if not path.is_absolute():
+            path = root / path
+        try:
+            relative = path.resolve(strict=True).relative_to(root)
+        except (OSError, ValueError):
+            continue
+        if path.is_file() and line != "0":
+            location = {"source": relative.as_posix(), "line": int(line)}
+            if location not in python_locations:
+                python_locations.append(location)
+    result["python_locations"] = python_locations[:32]
+    result["python_locations_truncated"] = len(python_locations) > 32
+    return result
 
 
 def fresh_directory(path, mode=0o711):
@@ -613,30 +707,50 @@ class Collector:
                                                  "rustc_flag": "-Cdebuginfo=0",
                                                  "scope": "DWARF omitted at build; LLVM source/branch maps and counters retained; no post-build stripping"},
                        "collector_version": COLLECTOR_VERSION, "executions": [], "profiles": [], "acceptance_executions": [],
-                       "binaries": [], "failures": [], "test_targets": [], "skipped_tests": [],
+                       "binaries": [], "failures": [], "failed_commands": [], "test_targets": [], "skipped_tests": [],
                        "not_qualified": ["live vendor accounts", "real model completions", "native human approval",
                                          "contained Vault/OpenSSH/systemd service", "other native platforms"]}
 
-    def command(self, label, argv, env=None, timeout=1800, export=None):
+    def command(self, label, argv, env=None, timeout=1800, export=None, test_context=None):
         print(f"coverage: {label}", flush=True)
         self.commands += 1
         log = self.output / f"command-{self.commands:03d}.log"
+        def failed(classification, process=None, error=None):
+            self.result["failed_commands"].append(command_failure_metadata(label, log,
+                classification=classification, returncode=process.returncode if process else None,
+                error_number=error.errno if isinstance(error, OSError) else None,
+                root=self.root, test_context=test_context))
         # Raw fixture output is private local data; only sanitized reports are CI artifacts.
         with log.open("wb") as stream:
             log.chmod(0o600)
-            process = subprocess.Popen(argv, cwd=self.root, env=env or self.env,
-                                       stdin=subprocess.DEVNULL, stdout=stream,
-                                       stderr=subprocess.STDOUT if export is None else subprocess.PIPE,
-                                       start_new_session=True)
+            try:
+                process = subprocess.Popen(argv, cwd=self.root, env=env or self.env,
+                                           stdin=subprocess.DEVNULL, stdout=stream,
+                                           stderr=subprocess.STDOUT if export is None else subprocess.PIPE,
+                                           start_new_session=True)
+            except OSError as error:
+                failed("process_start_error", error=error)
+                raise
             self.last_command_pid = process.pid
             try:
                 _, stderr = process.communicate(timeout=timeout)
             except subprocess.TimeoutExpired:
-                stop_process(process)
+                try:
+                    stop_process(process)
+                finally:
+                    failed("deadline_exceeded", process)
                 raise suite.Invalid("command_timeout") from None
             finally:
-                leaked = stop_process(process)
+                try:
+                    leaked = stop_process(process)
+                except (OSError, suite.Invalid) as error:
+                    failed("process_group_cleanup_failed", process, error)
+                    raise
+        if leaked:
+            failed("owned_process_group_leaked", process)
         require(not leaked, "command_leaked_process_group")
+        if process.returncode != 0:
+            failed("process_signal" if process.returncode < 0 else "nonzero_exit", process)
         require(process.returncode == 0, f"command_failed_{label}")
         require(log.stat().st_size <= 256 * 1024 * 1024, "command_output_limit")
         if export is not None:
@@ -686,6 +800,74 @@ class Collector:
                 "collector_changed_target_directory")
         self.result["preflight"] = self.preflight()
 
+    def bind_workspace_cache(self):
+        """Cargo can reuse path-dependent objects after a checkout moves.
+
+        In particular, a fresh artifact event may still contain an old
+        CARGO_MANIFEST_DIR or LLVM filename. Invalidate only workspace packages
+        when the source root changes; registry dependencies and sibling target
+        directories are outside this cleanup.
+        """
+        require(bool(self.workspace), "workspace_metadata_not_loaded")
+        path = self.target / CACHE_BINDING
+        require(not path.is_symlink(), "symlink_workspace_cache_binding")
+        expected = {"schema": CACHE_SCHEMA, "source_root": str(self.root),
+                    "workspace_packages": sorted(p["name"] for p in self.workspace)}
+        previous = None
+        if path.exists():
+            require(path.is_file() and path.stat().st_size <= 1024 * 1024,
+                    "invalid_workspace_cache_binding")
+            try:
+                previous = suite.json_read(path)
+            except (ValueError, suite.Invalid) as error:
+                raise suite.Invalid("invalid_workspace_cache_binding") from error
+            require(isinstance(previous, dict) and set(previous) == set(expected)
+                    and previous["schema"] == CACHE_SCHEMA
+                    and isinstance(previous["source_root"], str)
+                    and Path(previous["source_root"]).is_absolute()
+                    and isinstance(previous["workspace_packages"], list)
+                    and bool(previous["workspace_packages"])
+                    and all(isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name)
+                            for name in previous["workspace_packages"])
+                    and previous["workspace_packages"] == sorted(set(previous["workspace_packages"])),
+                    "invalid_workspace_cache_binding")
+        invalidated = previous != expected
+        if invalidated:
+            # main() creates or explicitly accepts this compiler-cache root.
+            # The pinned Cargo requires its standard tag before scoped clean,
+            # but does not create it when the caller pre-created the directory.
+            tag = self.target / "CACHEDIR.TAG"
+            require(not tag.is_symlink(), "symlink_cargo_cache_tag")
+            if tag.exists():
+                require(tag.is_file() and tag.stat().st_size <= 4096
+                        and tag.read_bytes().startswith(CACHE_TAG_SIGNATURE), "invalid_cargo_cache_tag")
+            else:
+                with tag.open("xb") as stream:
+                    stream.write(CACHE_TAG_SIGNATURE + b"\n# Explicit Opaque coverage compiler cache.\n")
+            argv = ["cargo", "clean", "--manifest-path", str(self.root / "Cargo.toml"),
+                    "--target-dir", str(self.target)]
+            for package in expected["workspace_packages"]:
+                argv.extend(["--package", package])
+            # Never bind an uncertain or failed cleanup as safe for reuse.
+            self.command("invalidate-workspace-source-cache", argv)
+            temporary = path.with_name(path.name + f".tmp-{os.getpid()}")
+            created = False
+            try:
+                with temporary.open("x") as stream:
+                    created = True
+                    temporary.chmod(0o600)
+                    json.dump(expected, stream, sort_keys=True)
+                    stream.write("\n")
+                temporary.replace(path)
+            finally:
+                if created:
+                    temporary.unlink(missing_ok=True)
+        self.result["workspace_cache"] = {"binding": expected,
+            "status": "workspace_packages_invalidated" if invalidated else "same_source_root_reused",
+            "reason": "unbound_cache" if previous is None else "source_root_or_workspace_changed" if invalidated else None,
+            "invalidated_packages": expected["workspace_packages"] if invalidated else [],
+            "scope": "workspace packages only; registry dependencies and sibling target directories preserved"}
+
     def preflight(self):
         directory = fresh_directory(self.output / "continuous-preflight")
         source = directory / "probe.rs"
@@ -731,6 +913,7 @@ class Collector:
 
     def build(self):
         require(bool(self.workspace), "workspace_metadata_not_loaded")
+        self.bind_workspace_cache()
         self.normal = self.read_artifacts(self.command("build-all-workspace-binaries", ["cargo", "build", "--locked",
                            "--workspace", "--all-features", "--bins", "--message-format=json"]))
         validate_workspace_artifacts(self.workspace, self.normal, tests=False)
@@ -810,7 +993,8 @@ class Collector:
             argv = [str(binary), "--exact", name, "--test-threads=1"]
             if target in ("synthesized_review_e2e", CONTAINED_TARGET, "trust_domain_e2e") or name in (ROOT_CASE, DAEMON_ROOT_CASE):
                 argv += ["--include-ignored"]
-        raw = self.command("execute-" + target, argv, env=env, timeout=1200)
+        raw = self.command("execute-" + target, argv, env=env, timeout=1200,
+                           test_context=(self.package_by_binary[binary], target, name, names))
         test_pid = self.last_command_pid
         no_test_execution = name is None and not names - self.test_inventories[binary][1]
         if name is None:
@@ -1091,7 +1275,7 @@ def main(argv=None):
     parser.add_argument("--target-dir", type=Path, required=True)
     parser.add_argument("--collector", default="cargo-llvm-cov")
     parser.add_argument("--reuse-target-dir", action="store_true",
-                        help="Reuse the compiler cache; profiles still require a fresh output directory")
+                        help="Reuse the compiler cache; changed or unbound source roots invalidate workspace packages only; profiles remain fresh")
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--build-only", action="store_true", help="discover and compile every workspace target without claiming collected coverage")
     parser.add_argument("--jobs", type=int, default=4)

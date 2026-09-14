@@ -318,6 +318,9 @@ class CollectionContracts(unittest.TestCase):
                 directory.with_name("missing-src").rename(directory)
 
     def test_workspace_build_requires_all_libraries_bins_and_exact_package_identities(self):
+        binding = patch.object(collector.Collector, "bind_workspace_cache")
+        binding.start()
+        self.addCleanup(binding.stop)
         metadata, workspace = self.workspace((("new-cli", "bin"),))
         events = {}
         for package in metadata["packages"]:
@@ -349,6 +352,104 @@ class CollectionContracts(unittest.TestCase):
         self.assertEqual(set(run.baseline), collector.expected_artifacts(workspace, tests=True))
         with self.assertRaisesRegex(suite.Invalid, "missing_workspace_binary_artifacts"):
             collector.validate_workspace_artifacts(workspace, {}, tests=False)
+
+    def test_unbound_cache_cleans_every_metadata_package_and_preserves_other_cache_scopes(self):
+        _metadata, workspace = self.workspace((("new-cli", "bin"),))
+        run = self.workspace_run(workspace)
+        dependency = self.target / "registry-dependency"
+        dependency.write_bytes(b"cached dependency")
+        sibling = self.target / "cli-admin-next"
+        sibling.mkdir()
+        (sibling / "retained").write_bytes(b"separate target")
+        with patch.object(run, "command", return_value=b"") as command:
+            run.bind_workspace_cache()
+        argv = command.call_args.args[1]
+        self.assertEqual(argv[:6], ["cargo", "clean", "--manifest-path", str(self.root / "Cargo.toml"),
+                                   "--target-dir", str(self.target)])
+        self.assertEqual(argv[6::2], ["--package"] * len(workspace))
+        self.assertEqual(argv[7::2], sorted(p["name"] for p in workspace))
+        self.assertEqual(dependency.read_bytes(), b"cached dependency")
+        self.assertEqual((sibling / "retained").read_bytes(), b"separate target")
+        self.assertEqual(run.result["workspace_cache"]["reason"], "unbound_cache")
+        marker = json.loads((self.target / collector.CACHE_BINDING).read_text())
+        self.assertEqual(marker["source_root"], str(self.root))
+        self.assertEqual(marker["workspace_packages"], argv[7::2])
+        self.assertTrue((self.target / "CACHEDIR.TAG").read_bytes().startswith(collector.CACHE_TAG_SIGNATURE))
+
+    def test_same_source_cache_reuses_but_moved_root_or_new_workspace_member_invalidates(self):
+        _metadata, workspace = self.workspace()
+        run = self.workspace_run(workspace)
+        with patch.object(run, "command", return_value=b""):
+            run.bind_workspace_cache()
+        with patch.object(run, "command") as command:
+            run.bind_workspace_cache()
+            command.assert_not_called()
+        self.assertEqual(run.result["workspace_cache"]["status"], "same_source_root_reused")
+        run.root = self.root / "moved-checkout"
+        with patch.object(run, "command", return_value=b"") as command:
+            run.bind_workspace_cache()
+            command.assert_called_once()
+        self.assertEqual(run.result["workspace_cache"]["reason"], "source_root_or_workspace_changed")
+        run.workspace.append({"name": "newly-discovered-package"})
+        with patch.object(run, "command", return_value=b"") as command:
+            run.bind_workspace_cache()
+        self.assertIn("newly-discovered-package", command.call_args.args[1])
+
+    def test_failed_cache_cleanup_never_rebinds_or_builds_workspace_objects(self):
+        _metadata, workspace = self.workspace()
+        run = self.workspace_run(workspace)
+        marker = self.target / collector.CACHE_BINDING
+        previous = {"schema": collector.CACHE_SCHEMA, "source_root": "/previous-checkout",
+                    "workspace_packages": sorted(p["name"] for p in workspace)}
+        marker.write_text(json.dumps(previous))
+        with patch.object(run, "command", side_effect=suite.Invalid("cleanup_failed")) as command:
+            with self.assertRaisesRegex(suite.Invalid, "cleanup_failed"):
+                run.build()
+        command.assert_called_once()
+        self.assertEqual(command.call_args.args[0], "invalidate-workspace-source-cache")
+        self.assertEqual(json.loads(marker.read_text()), previous)
+        self.assertNotIn("workspace_cache", run.result)
+
+    def test_malformed_or_symlink_cache_binding_fails_before_any_cleanup(self):
+        _metadata, workspace = self.workspace()
+        run = self.workspace_run(workspace)
+        marker = self.target / collector.CACHE_BINDING
+        valid = {"schema": collector.CACHE_SCHEMA, "source_root": str(self.root),
+                 "workspace_packages": ["opaque-core"]}
+        for value in ([], {**valid, "schema": "unknown"}, {**valid, "source_root": "relative"},
+                      {**valid, "workspace_packages": ["opaque-core", "opaque-core"]},
+                      {**valid, "workspace_packages": ["--unsafe"]}):
+            marker.write_text(json.dumps(value))
+            with self.subTest(value=value), patch.object(run, "command") as command:
+                with self.assertRaisesRegex(suite.Invalid, "invalid_workspace_cache_binding"):
+                    run.bind_workspace_cache()
+                command.assert_not_called()
+        marker.write_text('{"schema": "one", "schema": "two"}')
+        with self.assertRaisesRegex(suite.Invalid, "invalid_workspace_cache_binding"):
+            run.bind_workspace_cache()
+        marker.unlink()
+        marker.symlink_to(self.binary)
+        with patch.object(run, "command") as command:
+            with self.assertRaisesRegex(suite.Invalid, "symlink_workspace_cache_binding"):
+                run.bind_workspace_cache()
+            command.assert_not_called()
+
+    def test_existing_invalid_cargo_cache_tag_is_never_overwritten_or_cleaned(self):
+        _metadata, workspace = self.workspace()
+        run = self.workspace_run(workspace)
+        tag = self.target / "CACHEDIR.TAG"
+        tag.write_bytes(b"unrelated file")
+        with patch.object(run, "command") as command:
+            with self.assertRaisesRegex(suite.Invalid, "invalid_cargo_cache_tag"):
+                run.bind_workspace_cache()
+            command.assert_not_called()
+        self.assertEqual(tag.read_bytes(), b"unrelated file")
+        tag.unlink()
+        tag.symlink_to(self.binary)
+        with patch.object(run, "command") as command:
+            with self.assertRaisesRegex(suite.Invalid, "symlink_cargo_cache_tag"):
+                run.bind_workspace_cache()
+            command.assert_not_called()
 
     def test_empty_unknown_and_symlink_profiles_fail_before_merge(self):
         for role, contents, reason in (("test", b"", "empty_or_invalid_execution_profile"),
@@ -433,13 +534,14 @@ class CollectionContracts(unittest.TestCase):
         run.package_by_binary[self.binary] = "opaqued"
         run.test_inventories[self.binary] = ({name}, {name})
         run.objects = {self.binary}
-        def command(label, argv, env, timeout):
+        def command(label, argv, env, timeout, test_context=None):
             if "--list" in argv:
                 return listing
             self.assertIn("--exact", argv)
             self.assertIn(name, argv)
             self.assertIn("--include-ignored", argv)
             self.assertNotIn("--nocapture", argv)
+            self.assertEqual(test_context, ("opaqued", "trust_domain_e2e", name, {name}))
             profiles = Path(env["OPAQUE_COVERAGE_PROFILE_DIR"])
             for role, pid in (("test", 100), ("daemon", 200)):
                 (profiles / f"{role}-{pid}-500-.profraw").write_bytes(b"fixture profile")
@@ -734,8 +836,82 @@ class CollectionContracts(unittest.TestCase):
             run.command("fixture", [sys.executable, "-c", "raise SystemExit(17)"], timeout=2)
         with self.assertRaisesRegex(suite.Invalid, "command_timeout|process_group_cleanup_denied"):
             run.command("deadline", [sys.executable, "-c", "import time; time.sleep(60)"], timeout=0.1)
+        with self.assertRaises(FileNotFoundError):
+            run.command("missing-tool", [str(self.root / "SECRET_EXECUTABLE_ARGUMENT")])
+        failures = run.result["failed_commands"]
+        self.assertEqual(failures[0]["classification"], "nonzero_exit")
+        self.assertEqual(failures[0]["exit_code"], 17)
+        self.assertEqual(failures[1]["classification"], "deadline_exceeded")
+        self.assertEqual(failures[2]["classification"], "process_start_error")
+        self.assertEqual(failures[2]["os_error_number"], 2)
+        self.assertNotIn("SECRET_EXECUTABLE_ARGUMENT", json.dumps(failures))
         for path in self.root.glob("command-*.log"):
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_failure_metadata_keeps_only_known_test_names_and_local_source_locations(self):
+        source = self.root / "crates/fixture/tests/gateway.rs"
+        source.parent.mkdir(parents=True)
+        source.write_text("// known fixture source\n")
+        log = self.root / "command-001.log"
+        log.write_text("test actual_guard ... FAILED\n"
+            "test SECRET_SESSION_VALUE ... FAILED\n"
+            "thread 'actual_guard' (123) panicked at crates/fixture/tests/gateway.rs:42:9:\n"
+            "assertion `left == right` failed\n  left: SECRET_PAYLOAD\n right: bearer SECRET_TOKEN\n"
+            "thread 'SECRET_SESSION_VALUE' panicked at crates/fixture/tests/gateway.rs:1:1:\n"
+            "thread 'actual_guard' panicked at /private/SECRET_PATH.rs:8:2:\n"
+            "private URL https://secret.invalid/?token=SECRET_URL\nText file busy (os error 26)\n")
+        report = collector.command_failure_metadata("execute-gateway", log, classification="nonzero_exit",
+            returncode=101, root=self.root, test_context=("fixture", "gateway", None, {"actual_guard"}))
+        self.assertEqual(report["failed_tests"], ["actual_guard"])
+        self.assertEqual(report["panic_locations"], [{"test": "actual_guard", "source": "crates/fixture/tests/gateway.rs",
+                                                      "line": 42, "column": 9}])
+        self.assertEqual(report["failure_indicators"], ["assertion_failed"])
+        self.assertEqual(report["observed_os_error_numbers"], [26])
+        self.assertNotIn("SECRET", json.dumps(report))
+        self.assertNotIn("https://", json.dumps(report))
+        self.assertIn("SECRET_PAYLOAD", log.read_text())
+        source.unlink()
+        source.symlink_to(Path(__file__).resolve())
+        report = collector.command_failure_metadata("execute-gateway", log, classification="nonzero_exit",
+            root=self.root, test_context=("fixture", "gateway", None, {"actual_guard"}))
+        self.assertEqual(report["panic_locations"], [])
+        with self.assertRaisesRegex(suite.Invalid, "invalid_failure_requested_test"):
+            collector.command_failure_metadata("fixture", log, classification="nonzero_exit", root=self.root,
+                test_context=("fixture", "gateway", "unvalidated_test", {"actual_guard"}))
+        with self.assertRaisesRegex(suite.Invalid, "invalid_failure_test_identity"):
+            collector.command_failure_metadata("fixture", log, classification="nonzero_exit", root=self.root,
+                test_context=("https://SECRET", "gateway", None, {"actual_guard"}))
+
+    def test_python_failure_diagnostics_omit_exception_payload_and_external_frames(self):
+        source = self.root / "tests/packaged/build.py"
+        source.parent.mkdir(parents=True)
+        source.write_text("# known package builder\n")
+        log = self.root / "command-002.log"
+        log.write_text(f'  File "{source}", line 37, in main\n'
+            '  File "/outside/SECRET_PATH.py", line 123, in run\n'
+            "fatal: detected dubious ownership in repository at '/private/SECRET_CHECKOUT'\n"
+            "subprocess.CalledProcessError: command SECRET_ARGUMENT returned non-zero exit status 128\n"
+            "ValueError: release source must be clean; --allow-dirty creates a local candidate only\n")
+        report = collector.command_failure_metadata("build-instrumented-package", log,
+            classification="nonzero_exit", returncode=1, root=self.root)
+        self.assertEqual(report["python_locations"], [{"source": "tests/packaged/build.py", "line": 37}])
+        self.assertEqual(report["python_exception_classes"], ["CalledProcessError", "ValueError"])
+        self.assertEqual(report["failure_indicators"], ["git_checkout_ownership_rejected", "release_source_dirty"])
+        self.assertNotIn("SECRET", json.dumps(report))
+        self.assertNotIn("test_context", report)
+
+    def test_failure_diagnostic_windows_are_bounded_without_echoing_untrusted_output(self):
+        log = self.root / "command-003.log"
+        log.write_bytes(b"SECRET_FILLER" * 65536 + b"\ntest actual_guard ... FAILED\n")
+        report = collector.command_failure_metadata("invalid SECRET label", log,
+            classification="process_signal", returncode=-9, root=self.root,
+            test_context=("fixture", "gateway", None, {"actual_guard"}))
+        self.assertTrue(report["diagnostic_window_truncated"])
+        self.assertEqual(report["failed_tests"], ["actual_guard"])
+        self.assertEqual(report["signal"], 9)
+        self.assertEqual(report["command"], "unrecognized")
+        self.assertNotIn("SECRET", json.dumps(report))
+        self.assertLess(len(json.dumps(report)), 2000)
 
 
 if __name__ == "__main__":

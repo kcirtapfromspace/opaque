@@ -38,7 +38,7 @@ def main():
         subprocess.run(["python3", str(ROOT / "scripts/package-reviewer-macos.py"),
                         "--binary-dir", str(payload), "--output", str(payload / RELEASE.APP),
                         "--ad-hoc", "--version", version], check=True, timeout=120)
-    revision = subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True).strip()
+    revision = subprocess.check_output(RELEASE.source_git_command(ROOT, "rev-parse", "HEAD"), text=True).strip()
     host = subprocess.check_output(["rustc", "-vV"], text=True)
     target = next(line.split(": ", 1)[1] for line in host.splitlines() if line.startswith("host: "))
     manifest = RELEASE.create_manifest(ROOT, payload, target, version, revision, allow_dirty=args.allow_dirty)

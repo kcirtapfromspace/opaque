@@ -6,7 +6,42 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
+
+struct CliImage {
+    _dir: tempfile::TempDir,
+    executable: PathBuf,
+}
+
+static CLI_IMAGE: Mutex<Weak<CliImage>> = Mutex::new(Weak::new());
+
+fn cli_image() -> Arc<CliImage> {
+    let mut published = CLI_IMAGE.lock().unwrap();
+    if let Some(image) = published.upgrade() {
+        return image;
+    }
+    // Publish only after the writer is closed, before any fixture can spawn.
+    // A per-fixture copy races another test's fork: that child can inherit the
+    // writer temporarily and cause Linux exec to reject the copy with ETXTBSY.
+    let dir = tempfile::tempdir().unwrap();
+    let executable = dir.path().join("opaque");
+    {
+        // Publish the exact bytes into a fresh inode without changing signatures.
+        let mut source = fs::File::open(env!("CARGO_BIN_EXE_opaque")).unwrap();
+        let mut destination = fs::File::create_new(&executable).unwrap();
+        std::io::copy(&mut source, &mut destination).unwrap();
+        destination
+            .set_permissions(source.metadata().unwrap().permissions())
+            .unwrap();
+    }
+    let image = Arc::new(CliImage {
+        _dir: dir,
+        executable,
+    });
+    *published = Arc::downgrade(&image);
+    image
+}
 
 struct Fixture {
     _dir: tempfile::TempDir,
@@ -14,15 +49,28 @@ struct Fixture {
     bin: PathBuf,
     config: PathBuf,
     service: PathBuf,
+    // Drop private hardlinks before the last owner removes the shared image.
+    _image: Arc<CliImage>,
 }
 
 fn script(path: &Path, body: &str) {
-    fs::write(path, format!("#!/bin/sh\nset -eu\n{body}\n")).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    // The interpreter's executable inode is immutable. Only an owned sidecar
+    // changes between command scenarios, never while that fixture is running.
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push(".body");
+    fs::write(PathBuf::from(sidecar), format!("{body}\n")).unwrap();
+    let implementation =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/admin-command.sh");
+    if path.symlink_metadata().is_ok() {
+        assert_eq!(fs::read_link(path).unwrap(), implementation);
+    } else {
+        std::os::unix::fs::symlink(implementation, path).unwrap();
+    }
 }
 
 impl Fixture {
     fn new() -> Self {
+        let image = cli_image();
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let bin = dir.path().join("bin");
@@ -30,7 +78,16 @@ impl Fixture {
         fs::set_permissions(home.join(".opaque"), fs::Permissions::from_mode(0o700)).unwrap();
         fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
         fs::create_dir(&bin).unwrap();
-        fs::copy(env!("CARGO_BIN_EXE_opaque"), bin.join("opaque")).unwrap();
+        // Linux requires the shared immutable inode to avoid inherited writer
+        // descriptors. Both temporary directories use the same filesystem, and
+        // a hardlink keeps current_exe sibling discovery in the private bin.
+        #[cfg(target_os = "linux")]
+        fs::hard_link(&image.executable, bin.join("opaque")).unwrap();
+        // Native macOS code-signing validation must see a separate inode for
+        // each executable path; concurrent hardlinked aliases can be killed by
+        // AMFI before main. Finish this private copy before its first spawn.
+        #[cfg(target_os = "macos")]
+        fs::copy(&image.executable, bin.join("opaque")).unwrap();
         let config = dir.path().join("custom/config.toml");
         fs::create_dir(config.parent().unwrap()).unwrap();
         fs::set_permissions(config.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -92,6 +149,7 @@ esac
             bin,
             config,
             service,
+            _image: image,
         }
     }
 

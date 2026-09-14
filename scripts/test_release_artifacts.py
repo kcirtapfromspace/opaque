@@ -7,6 +7,7 @@ import subprocess
 import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import release_artifacts as release
 
@@ -51,6 +52,20 @@ class ReleaseArtifactsTests(unittest.TestCase):
         result = release.verify_archive(self.archive(), **self.args, smoke=True)
         self.assertEqual(result, manifest)
         self.assertEqual(set(manifest["files"]), set(release.BINS))
+
+    def test_manifest_git_reads_trust_only_the_exact_source_root_and_keep_identity_gates(self):
+        with patch.object(release, "run", wraps=release.run) as invoke:
+            self.manifest()
+        commands = [call.args[0] for call in invoke.call_args_list]
+        self.assertEqual(len(commands), 3)
+        prefix = ["git", "-c", "safe.directory=" + str(self.source.resolve()), "-C", str(self.source.resolve())]
+        self.assertTrue(all(command[:5] == prefix for command in commands))
+        self.assertFalse(any("--global" in command or "safe.directory=*" in command for command in commands))
+        with self.assertRaisesRegex(ValueError, "expected revision"):
+            self.manifest(revision="0" * 40)
+        (self.source / "untracked").write_text("changed source")
+        with self.assertRaisesRegex(ValueError, "must be clean"):
+            self.manifest()
 
     def test_missing_new_tool_fails_before_any_smoke(self):
         self.manifest()

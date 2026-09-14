@@ -1641,7 +1641,7 @@ async fn organization_support_requires_assigned_subject_reason_and_expiring_case
     assert!(!audit.contains(&support_token));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn organization_epoch_blocks_queued_results_and_delayed_nested_mcp_after_analyst_engineer_analyst()
  {
     let fixture = Fixture::organization(false).await;
@@ -1663,13 +1663,40 @@ async fn organization_epoch_blocks_queued_results_and_delayed_nested_mcp_after_a
             json!({"message":"Watch my manual review rate live"}),
         )
         .await;
+    // Keep the response entirely unpolled. Its four slots hold status,
+    // tool_check, tool request and source_read. This current-thread producer
+    // then blocks sending the first result, before another live-read timer.
+    // Observe the published source decision only after the MCP transaction has
+    // completed; observing the incoming source HTTP request races that commit.
     tokio::time::timeout(Duration::from_secs(5), async {
-        while fixture.source.received_requests().await.unwrap().is_empty() {
+        loop {
+            let readiness = fixture
+                .browser("GET", "/api/session", &analyst, Value::Null)
+                .await;
+            let status = readiness.status();
+            let session = body(readiness).await;
+            if status == StatusCode::SERVICE_UNAVAILABLE {
+                // A read-only readiness probe may observe the source commit's
+                // lock. Persona mutations below still run exactly once.
+                assert_eq!(session["error"]["code"], "organization_unavailable");
+            } else {
+                assert_eq!(status, StatusCode::OK, "{session}");
+                assert_eq!(session["organization"]["generation"], epoch);
+                let decision = &session["policy_context"]["latest_decision"];
+                assert_ne!(decision["outcome"], "denied", "{decision}");
+                if decision["phase"] == "source_read" {
+                    assert_eq!(decision["source_accessed"], true);
+                    assert_eq!(decision["outcome"], "allowed");
+                    assert_eq!(decision["reason_code"], "source_evidence_received");
+                    break;
+                }
+            }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
     .unwrap();
+    assert_eq!(fixture.source.received_requests().await.unwrap().len(), 1);
     activate(&fixture, &engineer, Persona::Engineer, None).await;
     let returned = activate(&fixture, &analyst, Persona::CustomerAnalyst, None).await;
     assert!(returned["organization"]["generation"].as_u64().unwrap() > epoch);
@@ -2182,6 +2209,8 @@ async fn portfolio_denies_unsupported_history_fields_and_scope_before_model_or_s
 }
 #[tokio::test]
 async fn portfolio_engineer_support_and_queued_result_obey_current_epoch() {
+    use futures_util::StreamExt;
+
     let fixture = Fixture::portfolio(false, true).await;
     portfolio_source(&fixture, Duration::ZERO).await;
     let (_, analyst) = org_identity(&fixture, Persona::CustomerAnalyst).await;
@@ -2195,13 +2224,50 @@ async fn portfolio_engineer_support_and_queued_result_obey_current_epoch() {
             json!({"message":"Which channel has the most reviews?"}),
         )
         .await;
+    // Read only through the source acknowledgment, then hold the response body.
+    // Merely observing an HTTP request races the producer's organization-state
+    // update, where a concurrent persona transition correctly returns 503.
+    let mut stream = response.into_body().into_data_stream();
+    let mut prefix = String::new();
     tokio::time::timeout(Duration::from_secs(5), async {
-        while fixture.source.received_requests().await.unwrap().is_empty() {
+        loop {
+            let chunk = stream.next().await.expect("source acknowledgment").unwrap();
+            prefix.push_str(std::str::from_utf8(&chunk).unwrap());
+            assert!(!prefix.contains("event: portfolio_result"));
+            assert!(!prefix.contains("event: answer"));
+            if policy_events(&prefix)
+                .iter()
+                .any(|event| event["phase"] == "source_read" && event["source_accessed"] == true)
+            {
+                break;
+            }
+        }
+        // The remaining result and answer fit in the response queue. Observing
+        // completion proves those events were produced under the old identity
+        // and that no source transaction is still competing with activation.
+        loop {
+            let activity_response = fixture
+                .browser("GET", "/api/organization/activity", &analyst, Value::Null)
+                .await;
+            assert_eq!(activity_response.status(), StatusCode::OK);
+            let activity = body(activity_response).await;
+            let chat = activity["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|record| record["kind"] == "chat")
+                .expect("recorded chat");
+            assert_ne!(chat["outcome"], "failed", "{chat}");
+            if chat["outcome"] == "completed" {
+                assert_eq!(chat["source_accessed"], true);
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
     .unwrap();
+    assert_eq!(fixture.source.received_requests().await.unwrap().len(), 1);
     let session = activate(&fixture, &engineer, Persona::Engineer, None).await;
     assert_eq!(session["dataset"]["can_query"], false);
     assert_eq!(session["dataset"]["measures"], json!([]));
@@ -2221,7 +2287,7 @@ async fn portfolio_engineer_support_and_queued_result_obey_current_epoch() {
     );
     activate(&fixture, &analyst, Persona::CustomerAnalyst, None).await;
     let events = String::from_utf8(
-        to_bytes(response.into_body(), 65536)
+        to_bytes(Body::from_stream(stream), 65536)
             .await
             .unwrap()
             .to_vec(),
