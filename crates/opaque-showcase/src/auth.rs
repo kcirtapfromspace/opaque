@@ -57,3 +57,56 @@ fn broker_call<T>(operation: impl FnOnce() -> T) -> T {
         operation()
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn synchronous_and_current_thread_callers_preserve_errors_without_replay() {
+        for runtime in [false, true] {
+            let mut attempts = 0;
+            let mut operation = || {
+                broker_call(|| {
+                    attempts += 1;
+                    Err::<(), _>("fixture broker rejected authority")
+                })
+            };
+            let result = if runtime {
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap()
+                    .block_on(async { operation() })
+            } else {
+                operation()
+            };
+            assert_eq!(result, Err("fixture broker rejected authority"));
+            assert_eq!(attempts, 1);
+        }
+    }
+
+    #[test]
+    fn blocking_broker_call_releases_the_only_tokio_worker_for_other_requests() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (entered, entry) = tokio::sync::oneshot::channel();
+            let (reply, response) = std::sync::mpsc::channel();
+            let broker = tokio::spawn(async move {
+                broker_call(|| {
+                    entered.send(()).unwrap();
+                    response.recv_timeout(std::time::Duration::from_secs(2))
+                })
+            });
+            let other_request = tokio::spawn(async move {
+                entry.await.unwrap();
+                reply.send("other request progressed").unwrap();
+            });
+            assert_eq!(broker.await.unwrap().unwrap(), "other request progressed");
+            other_request.await.unwrap();
+        });
+    }
+}

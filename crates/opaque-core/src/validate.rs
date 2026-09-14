@@ -308,6 +308,88 @@ mod tests {
     use super::*;
 
     #[test]
+    fn review_reference_and_target_byte_limits_preserve_exact_accepted_values() {
+        let key = format!("{}1_", "a".repeat(62));
+        let accepted = HashMap::from([(key.clone(), "  release candidate  ".into())]);
+        assert_eq!(
+            InputValidator::validate_target(&accepted).unwrap(),
+            HashMap::from([(key.clone(), "release candidate".into())])
+        );
+        let oversized = HashMap::from([(format!("{key}a"), "value".into())]);
+        assert!(matches!(
+            InputValidator::validate_target(&oversized),
+            Err(ValidationError::TooLong {
+                max: 64,
+                actual: 65,
+                ..
+            })
+        ));
+        // Dotted selector segments avoid presenting a long base64-like token
+        // as the valid boundary case; secret detection remains independent.
+        let reference = format!("keychain:{}q", "q.".repeat(59));
+        assert_eq!(reference.len(), 128);
+        assert_eq!(
+            InputValidator::validate_secret_ref_names(std::slice::from_ref(&reference)).unwrap(),
+            vec![reference.clone()]
+        );
+        assert!(matches!(
+            InputValidator::validate_secret_ref_names(&[format!("{reference}a")]),
+            Err(ValidationError::TooLong {
+                max: 128,
+                actual: 129,
+                ..
+            })
+        ));
+        let prepared = format!("onepassword:Vault/{}/field", "q.".repeat(2036));
+        assert_eq!(prepared.len(), 4096);
+        InputValidator::validate_prepared_refs(std::slice::from_ref(&prepared)).unwrap();
+        assert!(matches!(
+            InputValidator::validate_prepared_refs(&[format!("{prepared}a")]),
+            Err(ValidationError::TooLong {
+                max: 4096,
+                actual: 4097,
+                ..
+            })
+        ));
+        for blank in ["", " \t\n "] {
+            assert!(matches!(
+                InputValidator::validate_prepared_refs(&[blank.into()]),
+                Err(ValidationError::InvalidCharset { value, .. }) if value.is_empty()
+            ));
+        }
+    }
+
+    #[test]
+    fn url_redaction_distinguishes_authority_credentials_from_path_at_signs() {
+        for (input, expected) in [
+            (
+                "ssh://git@example.com/team/repo",
+                "ssh://git@example.com/team/repo",
+            ),
+            (
+                "https://host.example/path/@release",
+                "https://host.example/path/@release",
+            ),
+            (
+                "http://host.example/path/@release",
+                "http://host.example/path/@release",
+            ),
+            ("http://host.example/path", "http://host.example/path"),
+            (
+                "https://user:synthetic@host.example/path/@release",
+                "https://host.example/path/@release",
+            ),
+            (
+                "http://user:synthetic@host.example/path/@release",
+                "http://host.example/path/@release",
+            ),
+            ("fixture:opaque-selector", "fixture:opaque-selector"),
+        ] {
+            assert_eq!(InputValidator::sanitize_url(input), expected);
+        }
+    }
+
+    #[test]
     fn prepared_onepassword_refs_preserve_names_without_hiding_secret_bodies() {
         assert!(
             InputValidator::validate_prepared_refs(&[

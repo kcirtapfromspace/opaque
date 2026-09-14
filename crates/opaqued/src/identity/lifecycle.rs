@@ -1088,4 +1088,340 @@ mod tests {
             }
         }
     }
+    fn retained_state(f: &Fixture) -> Vec<Vec<Vec<String>>> {
+        let connection = f.runtime.store.lock();
+        [
+            "principals",
+            "human_sessions",
+            "delegations",
+            "identity_authority_epochs",
+            "lifecycle_config",
+            "lifecycle_subjects",
+        ]
+        .into_iter()
+        .map(|table| {
+            let mut query = connection
+                .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                .unwrap();
+            let columns = query.column_count();
+            query
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|index| row.get_ref(index).map(|value| format!("{value:?}")))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        })
+        .collect()
+    }
+
+    #[test]
+    fn invalid_lifecycle_batches_preserve_every_authority_row_and_next_revision() {
+        let f = Fixture::new();
+        f.apply(&f.batch(1, true, &["reviewers"])).unwrap();
+        let principal = f.principal();
+        f.runtime
+            .store
+            .create_human_session(&principal.id, 600, &f.runtime.config.issuer)
+            .unwrap();
+        let before = retained_state(&f);
+        for case in 0..18 {
+            let mut batch = f.batch(2, false, &[]);
+            match case {
+                0 => batch.schema_version = 2,
+                1 => batch.revision = i64::MAX as u64 + 1,
+                2 => batch.updates = vec![batch.updates[0].clone(); MAX_BATCH_UPDATES + 1],
+                3 => batch.suspend = true,
+                4 => batch.updates[0].subject.clear(),
+                5 => batch.updates[0].subject = "x".repeat(256),
+                6 => batch.updates[0].subject = " alice".into(),
+                7 => batch.updates[0].subject = "alice\n".into(),
+                8 => batch.updates.push(batch.updates[0].clone()),
+                9 => batch.updates[0].groups = (0..129).map(|i| format!("group-{i}")).collect(),
+                10 => batch.updates[0].groups = vec!["same".into(); 2],
+                11 => batch.updates[0].groups = vec![String::new()],
+                12 => batch.updates[0].groups = vec!["x".repeat(256)],
+                13 => batch.updates[0].groups = vec!["bad\tgroup".into()],
+                14 => {
+                    batch.updates[0].deleted = true;
+                    batch.updates[0].active = true;
+                }
+                15 => {
+                    batch.updates[0].deleted = true;
+                    batch.updates[0].groups = vec!["reviewers".into()];
+                }
+                16 => batch.updates[0].groups = vec![" padded".into()],
+                _ => {
+                    // Every individual identifier and collection remains bounded;
+                    // the aggregate encoded batch exceeds its independent limit.
+                    batch.updates = (0..MAX_BATCH_UPDATES)
+                        .map(|i| SubjectUpdate {
+                            subject: format!("subject-{i}"),
+                            active: false,
+                            deleted: false,
+                            groups: (0..128)
+                                .map(|j| format!("{j:03}{}", "x".repeat(252)))
+                                .collect(),
+                        })
+                        .collect();
+                }
+            }
+            assert!(f.apply(&batch).is_err(), "case {case}");
+            assert_eq!(retained_state(&f), before, "case {case} mutated authority");
+        }
+        f.apply(&f.batch(2, false, &[])).unwrap();
+        assert!(f.principal().disabled);
+    }
+
+    #[test]
+    fn later_subject_denial_and_sqlite_fault_roll_back_prior_subject_and_epoch_updates() {
+        for database_fault in [false, true] {
+            let f = Fixture::new();
+            let mut initial = f.batch(1, true, &["reviewers"]);
+            let mut bob = initial.updates[0].clone();
+            bob.subject = "bob".into();
+            initial.updates.push(bob);
+            f.apply(&initial).unwrap();
+            let principal = f.principal();
+            f.runtime
+                .store
+                .create_human_session(&principal.id, 600, &f.runtime.config.issuer)
+                .unwrap();
+            let before = retained_state(&f);
+            let mut batch = initial.clone();
+            batch.revision = 2;
+            for update in &mut batch.updates {
+                update.active = false;
+                update.groups.clear();
+            }
+            if database_fault {
+                f.runtime.store.lock().execute_batch("CREATE TRIGGER reject_second_subject BEFORE UPDATE ON lifecycle_subjects WHEN NEW.subject='bob' BEGIN SELECT RAISE(ABORT,'fixture second subject failure'); END;").unwrap();
+            } else {
+                batch.updates[1].subject = "not-admitted".into();
+            }
+            let error = f.apply(&batch).unwrap_err();
+            assert_eq!(
+                error,
+                if database_fault {
+                    "identity lifecycle store unavailable"
+                } else {
+                    "subject outside trusted issuer admission"
+                }
+            );
+            assert_eq!(
+                retained_state(&f),
+                before,
+                "partial transaction escaped rollback"
+            );
+            if database_fault {
+                f.runtime
+                    .store
+                    .lock()
+                    .execute_batch("DROP TRIGGER reject_second_subject")
+                    .unwrap();
+            }
+            batch.updates[1].subject = "bob".into();
+            let receipt = f.apply(&batch).unwrap();
+            assert_eq!(receipt.revision, 2);
+            assert!(f.principal().disabled);
+            assert!(f.runtime.store.current_human_session().unwrap().is_none());
+            assert_eq!(f.apply(&batch).unwrap(), receipt);
+        }
+    }
+
+    #[test]
+    fn lifecycle_configuration_cannot_rebind_custody_or_admit_invalid_subject_sets() {
+        let f = Fixture::new();
+        f.apply(&f.batch(1, true, &["reviewers"])).unwrap();
+        let before = retained_state(&f);
+        for admission in [
+            vec![],
+            vec!["x".into(); MAX_SUBJECTS as usize + 1],
+            vec![String::new()],
+            vec!["x".repeat(256)],
+            vec![" alice".into()],
+            vec!["ali\tce".into()],
+        ] {
+            assert_eq!(
+                f.runtime
+                    .store
+                    .configure_lifecycle(
+                        &f.binding,
+                        &f.runtime.config.issuer,
+                        &BTreeMap::new(),
+                        &admission
+                    )
+                    .unwrap_err(),
+                "bounded explicit lifecycle admission required"
+            );
+            assert_eq!(retained_state(&f), before);
+        }
+        for foreign_binding in [false, true] {
+            let mut binding = f.binding.clone();
+            if foreign_binding {
+                binding.broker_id = uuid::Uuid::new_v4();
+            }
+            let issuer = if foreign_binding {
+                f.runtime.config.issuer.as_str()
+            } else {
+                "https://foreign.example"
+            };
+            assert_eq!(
+                f.runtime
+                    .store
+                    .configure_lifecycle(&binding, issuer, &BTreeMap::new(), &["alice".into()])
+                    .unwrap_err(),
+                "lifecycle tenant/issuer cannot be rebound"
+            );
+            assert_eq!(retained_state(&f), before);
+        }
+    }
+
+    #[test]
+    fn lifecycle_credential_custody_and_byte_limits_are_enforced_without_rewriting() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity-lifecycle.token");
+        for bytes in [
+            vec![b'a'; 31],
+            vec![b'a'; 129],
+            vec![b'a'; 257],
+            vec![0xff; 32],
+            b"abcdefghijklmnopqrstuvwxyz01234!".to_vec(),
+            b"abcdefghijklmnopqrstuvwxyz01234\n".to_vec(),
+        ] {
+            std::fs::write(&path, &bytes).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(read_token(&path).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+        for size in [32, 128] {
+            let token = "a_0-Z".repeat(26)[..size].to_owned();
+            std::fs::write(&path, &token).unwrap();
+            assert_eq!(read_token(&path).unwrap().as_str(), token);
+        }
+        let alias = dir.path().join("alias");
+        std::fs::hard_link(&path, &alias).unwrap();
+        assert!(read_token(&path).is_err());
+        std::fs::remove_file(alias).unwrap();
+        for mode in [0o640, 0o2600] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(read_token(&path).is_err());
+        }
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(read_token(&path).is_err());
+        std::fs::remove_dir(&path).unwrap();
+        std::os::unix::fs::symlink("absent", &path).unwrap();
+        assert!(read_token(&path).is_err());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_startup_rejects_missing_identity_token_and_mapping_prerequisites_without_binding()
+     {
+        for case in 0..12 {
+            let mut f = Fixture::new();
+            let mut config = LifecycleConfig {
+                socket_path: f.dir.path().join("lifecycle.sock"),
+                token_file: f.dir.path().join("identity-lifecycle.token"),
+                allowed_adapter_uids: BTreeSet::from([unsafe { libc::geteuid() }]),
+                socket_gid: None,
+                group_roles: BTreeMap::new(),
+            };
+            match case {
+                0 => Arc::get_mut(&mut f.runtime).unwrap().config.required = false,
+                1 => Arc::get_mut(&mut f.runtime)
+                    .unwrap()
+                    .config
+                    .allowed_subjects
+                    .clear(),
+                2 => config.token_file = f.dir.path().join("nested/identity-lifecycle.token"),
+                3 => config.token_file = f.dir.path().join("daemon.token"),
+                4 => config.allowed_adapter_uids.clear(),
+                5 => config.allowed_adapter_uids = (0..33).collect(),
+                6 => config.group_roles = (0..129).map(|i| (format!("g{i}"), vec![])).collect(),
+                7 => {
+                    config.group_roles.insert(String::new(), vec![]);
+                }
+                8 => {
+                    config.group_roles.insert("x".repeat(256), vec![]);
+                }
+                9 => {
+                    config.group_roles.insert(" padded".into(), vec![]);
+                }
+                10 => {
+                    config.group_roles.insert("control\tgroup".into(), vec![]);
+                }
+                _ => {
+                    config
+                        .group_roles
+                        .insert("reviewers".into(), vec!["invented-role".into()]);
+                }
+            }
+            let before = retained_state(&f);
+            let path = config.socket_path.clone();
+            assert!(
+                start(config, f.runtime.clone(), f.binding.clone(), f.dir.path())
+                    .await
+                    .is_err(),
+                "case {case}"
+            );
+            assert!(!path.exists());
+            assert!(!path.with_extension("writer").exists());
+            assert_eq!(retained_state(&f), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_cleanup_preserves_replacement_and_rejects_aliased_writer() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::Builder::new()
+            .prefix("oqep-")
+            .tempdir_in(Path::new("/tmp").canonicalize().unwrap())
+            .unwrap();
+        let config = LifecycleConfig {
+            socket_path: dir.path().join("lifecycle.sock"),
+            token_file: dir.path().join("unused"),
+            allowed_adapter_uids: BTreeSet::from([unsafe { libc::geteuid() }]),
+            socket_gid: Some(unsafe { libc::getegid() }),
+            group_roles: BTreeMap::new(),
+        };
+        let (listener, endpoint) = bind_endpoint(&config).await.unwrap();
+        assert_eq!(
+            std::fs::metadata(&config.socket_path).unwrap().gid(),
+            unsafe { libc::getegid() }
+        );
+        let old = dir.path().join("old.sock");
+        std::fs::rename(&config.socket_path, &old).unwrap();
+        std::fs::write(&config.socket_path, b"foreign replacement").unwrap();
+        drop(endpoint);
+        drop(listener);
+        assert_eq!(
+            std::fs::read(&config.socket_path).unwrap(),
+            b"foreign replacement"
+        );
+        std::fs::remove_file(&config.socket_path).unwrap();
+        let writer = config.socket_path.with_extension("writer");
+        let alias = dir.path().join("writer.alias");
+        std::fs::hard_link(&writer, &alias).unwrap();
+        assert!(
+            bind_endpoint(&config)
+                .await
+                .err()
+                .unwrap()
+                .contains("owner-only and unshared")
+        );
+        std::fs::remove_file(alias).unwrap();
+        std::fs::set_permissions(&writer, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(
+            bind_endpoint(&config)
+                .await
+                .err()
+                .unwrap()
+                .contains("owner-only and unshared")
+        );
+        assert!(!config.socket_path.exists());
+    }
 }

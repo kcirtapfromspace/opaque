@@ -234,6 +234,62 @@ mod tests {
     }
 
     #[test]
+    fn reference_length_and_control_guards_preserve_the_input_in_typed_errors() {
+        for reference in [
+            format!("aws:{}", "a".repeat(2049)),
+            "aws:secret\nname".into(),
+            "aws:ssm:/parameter\u{7f}".into(),
+        ] {
+            assert!(matches!(
+                AwsResolver::parse_ref(&reference),
+                Err(ResolveError::AwsError(rejected, reason))
+                    if rejected == reference && reason == "empty ref after 'aws:' prefix"
+            ));
+        }
+        let allowed = "a".repeat(2048);
+        assert_eq!(
+            AwsResolver::parse_ref(&format!("aws:{allowed}")).unwrap(),
+            AwsRef::SecretsManager(&allowed)
+        );
+    }
+
+    #[tokio::test]
+    async fn aliased_or_non_base_credentials_are_rejected_before_resolution_or_transport() {
+        let server = wiremock::MockServer::start().await;
+        for (access, secret, session) in [
+            ("vault:access", "env:UNRESOLVED_SECRET", None),
+            ("env:UNRESOLVED_ACCESS", "aws:secret", None),
+            ("env:UNRESOLVED_ACCESS", "env:UNRESOLVED_ACCESS", None),
+            (
+                "env:UNRESOLVED_ACCESS",
+                "env:UNRESOLVED_SECRET",
+                Some("env:UNRESOLVED_ACCESS"),
+            ),
+            (
+                "env:UNRESOLVED_ACCESS",
+                "env:UNRESOLVED_SECRET",
+                Some("env:UNRESOLVED_SECRET"),
+            ),
+        ] {
+            let mut client = AwsClient::new_single(&server.uri());
+            if let Some(session) = session {
+                client = client.with_session_token_ref(session).unwrap();
+            }
+            let resolver = AwsResolver {
+                client,
+                access_key_ref: access.into(),
+                secret_key_ref: secret.into(),
+            };
+            assert!(matches!(
+                resolver.resolve("aws:fixture"),
+                Err(ResolveError::AwsError(reference, reason))
+                    if reference == "aws:fixture" && reason == "invalid AWS base credential references"
+            ));
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[test]
     fn resolver_debug() {
         let client = AwsClient::new_single("http://127.0.0.1:8080");
         let resolver = AwsResolver::new(client);

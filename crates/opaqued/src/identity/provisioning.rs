@@ -1579,4 +1579,380 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn malformed_profile_updates_preserve_the_active_profile_and_existing_mandate() {
+        let f = Fixture::new();
+        let parent = f.mandate(2);
+        let original = f.store.provisioning_profile("engineering-metrics").unwrap();
+        for case in 0..13 {
+            let mut p = profile();
+            match case {
+                0 => p.id.clear(),
+                1 => p.id = "x".repeat(65),
+                2 => p.id = "UPPER".into(),
+                3 => p.revision = 0,
+                4 => p.revision = i64::MAX as u64 + 1,
+                5 => p.eligible_group.clear(),
+                6 => p.eligible_group = "x".repeat(129),
+                7 => p.eligible_group = " Engineering".into(),
+                8 => p.eligible_group = "bad\tgroup".into(),
+                9 => p.max_mandate_ttl_secs = 0,
+                10 => p.max_mandate_ttl_secs = MAX_MANDATE_TTL + 1,
+                11 => p.max_issuances = 0,
+                _ => p.scopes.clear(),
+            }
+            assert!(
+                f.store
+                    .sync_profiles(&ProvisioningConfig { profiles: vec![p] })
+                    .is_err(),
+                "case {case}"
+            );
+            assert_eq!(
+                f.store.provisioning_profile("engineering-metrics").unwrap(),
+                original
+            );
+            assert_eq!(f.store.get_mandate(&f.binding, &parent.id).unwrap(), parent);
+        }
+        let too_many = ProvisioningConfig {
+            profiles: (0..MAX_PROFILES + 1)
+                .map(|i| {
+                    let mut p = profile();
+                    p.id = format!("profile-{i}");
+                    p
+                })
+                .collect(),
+        };
+        assert_eq!(
+            f.store.sync_profiles(&too_many).unwrap_err(),
+            "too many provisioning profiles"
+        );
+        assert_eq!(
+            f.store.provisioning_profile("engineering-metrics").unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn mandate_commit_rejects_stale_epochs_invalid_credential_and_lifetime_without_rows() {
+        let f = Fixture::new();
+        let profile_epoch = f
+            .store
+            .provisioning_profile("engineering-metrics")
+            .unwrap()
+            .1;
+        let issuer_epoch = f.store.provisioning_principal_epoch(&f.issuer).unwrap();
+        for case in 0..10 {
+            let (mut profile, mut issuer, mut now, mut expires, mut count, mut credential) = (
+                profile_epoch,
+                issuer_epoch,
+                f.now,
+                f.now + 300,
+                1,
+                "credential-1".to_owned(),
+            );
+            match case {
+                0 => credential.clear(),
+                1 => credential = "x".repeat(513),
+                2 => credential = "bad\ncredential".into(),
+                3 => profile += 1,
+                4 => issuer += 1,
+                5 => count = 0,
+                6 => count = MAX_ISSUANCES,
+                7 => now = -1,
+                8 => expires = now,
+                _ => expires = now + MAX_MANDATE_TTL as i64 + 1,
+            }
+            assert!(
+                f.store
+                    .create_mandate(
+                        &f.binding,
+                        &f.issuer,
+                        &f.service,
+                        "engineering-metrics",
+                        profile,
+                        issuer,
+                        &f.session,
+                        expires,
+                        count,
+                        &credential,
+                        now,
+                        |_| true
+                    )
+                    .is_err(),
+                "case {case}"
+            );
+            assert!(f.store.list_mandates(&f.binding).unwrap().is_empty());
+            assert_eq!(
+                f.store.provisioning_principal_epoch(&f.issuer).unwrap(),
+                issuer_epoch
+            );
+        }
+        assert_eq!(f.mandate(1).issued_count, 0);
+    }
+
+    #[test]
+    fn invalid_request_ids_and_expiry_arithmetic_never_charge_a_mandate() {
+        let f = Fixture::new();
+        let parent = f.mandate(2);
+        for request in [
+            "".to_owned(),
+            Uuid::nil().to_string(),
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_uppercase(),
+            "a".repeat(32),
+            "not-a-uuid".into(),
+        ] {
+            assert!(f.issue(&parent, &request).is_err());
+            assert!(f.store.get_mandate(&f.binding, &request).is_err());
+            assert!(f.store.get_access_grant(&f.binding, &request).is_err());
+        }
+        for (now, expiry) in [
+            (-1, 1),
+            (f.now, f.now),
+            (f.now, f.now - 1),
+            (i64::MIN, i64::MAX),
+        ] {
+            assert!(
+                f.store
+                    .issue_access(
+                        &f.binding,
+                        &parent.id,
+                        &f.service,
+                        &f.delegation,
+                        &f.recipient,
+                        &Uuid::new_v4().to_string(),
+                        expiry,
+                        now,
+                        300,
+                        |_| true
+                    )
+                    .is_err()
+            );
+        }
+        assert_eq!(f.store.get_mandate(&f.binding, &parent.id).unwrap(), parent);
+        assert!(f.store.list_access_grants(&f.binding).unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_conditional_charge_or_grant_insert_rolls_back_and_same_request_can_commit_once() {
+        for suppress_charge in [false, true] {
+            let f = Fixture::new();
+            let parent = f.mandate(2);
+            let request = Uuid::new_v4().to_string();
+            let trigger = if suppress_charge {
+                "CREATE TRIGGER refuse_issue BEFORE UPDATE OF issued_count ON provisioning_mandates BEGIN SELECT RAISE(IGNORE); END;"
+            } else {
+                "CREATE TRIGGER refuse_issue BEFORE INSERT ON provisioning_access BEGIN SELECT RAISE(ABORT,'fixture grant insert failure'); END;"
+            };
+            f.store.lock().execute_batch(trigger).unwrap();
+            let error = f.issue(&parent, &request).unwrap_err();
+            assert_eq!(
+                error,
+                if suppress_charge {
+                    "provisioning issuance allowance exhausted"
+                } else {
+                    "provisioning store unavailable"
+                }
+            );
+            assert_eq!(f.store.get_mandate(&f.binding, &parent.id).unwrap(), parent);
+            assert!(f.store.list_access_grants(&f.binding).unwrap().is_empty());
+            f.store
+                .lock()
+                .execute_batch("DROP TRIGGER refuse_issue")
+                .unwrap();
+            let grant = f.issue(&parent, &request).unwrap();
+            assert_eq!(f.issue(&parent, &request).unwrap(), grant);
+            assert_eq!(
+                f.store
+                    .get_mandate(&f.binding, &parent.id)
+                    .unwrap()
+                    .issued_count,
+                1
+            );
+            assert_eq!(f.store.list_access_grants(&f.binding).unwrap(), vec![grant]);
+        }
+    }
+
+    #[test]
+    fn expired_parent_and_consumed_expired_request_cannot_issue_or_restore_access() {
+        for parent_expired in [false, true] {
+            let f = Fixture::new();
+            let parent = f.mandate(2);
+            let request = Uuid::new_v4().to_string();
+            let grant = f.issue(&parent, &request).unwrap();
+            if parent_expired {
+                f.store
+                    .lock()
+                    .execute(
+                        "UPDATE provisioning_mandates SET expires_at=?1 WHERE id=?2",
+                        params![f.now, parent.id],
+                    )
+                    .unwrap();
+            } else {
+                f.store
+                    .lock()
+                    .execute(
+                        "UPDATE provisioning_access SET expires_at=?1 WHERE id=?2",
+                        params![f.now, grant.id],
+                    )
+                    .unwrap();
+            }
+            let error = f.issue(&parent, &request).unwrap_err();
+            assert_eq!(
+                error,
+                if parent_expired {
+                    "provisioning mandate inactive"
+                } else {
+                    "previous issuance is no longer active; request ID remains consumed"
+                }
+            );
+            assert!(f.scopes().is_empty());
+            let revoked = f.store.get_access_grant(&f.binding, &grant.id).unwrap();
+            assert_eq!(revoked.revoked_at, Some(f.now));
+            f.store
+                .lock()
+                .execute(
+                    "UPDATE provisioning_mandates SET expires_at=?1 WHERE id=?2",
+                    params![parent.expires_at, parent.id],
+                )
+                .unwrap();
+            f.store
+                .lock()
+                .execute(
+                    "UPDATE provisioning_access SET expires_at=?1 WHERE id=?2",
+                    params![grant.expires_at, grant.id],
+                )
+                .unwrap();
+            assert!(f.scopes().is_empty());
+            assert!(f.issue(&parent, &request).is_err());
+            assert_eq!(
+                f.store
+                    .get_mandate(&f.binding, &parent.id)
+                    .unwrap()
+                    .issued_count,
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn corrupted_profile_identity_and_epoch_are_rejected_without_new_authority() {
+        // Explicit retained-store faults, not ordinarily reachable policy transitions.
+        for case in 0..4 {
+            let f = Fixture::new();
+            let parent = f.mandate(2);
+            let (original, epoch) = f.store.provisioning_profile("engineering-metrics").unwrap();
+            let mut altered = original.clone();
+            altered.id = "foreign-profile".into();
+            match case {
+                0 => {
+                    f.store
+                        .lock()
+                        .execute(
+                            "UPDATE provisioning_profiles SET profile_json=?1",
+                            [serde_json::to_string(&altered).unwrap()],
+                        )
+                        .unwrap();
+                }
+                1 => {
+                    let error = f
+                        .store
+                        .lock()
+                        .execute("UPDATE provisioning_profiles SET epoch=0", [])
+                        .unwrap_err();
+                    assert!(error.to_string().contains("CHECK constraint failed"));
+                }
+                2 => {
+                    f.store
+                        .lock()
+                        .execute(
+                            "UPDATE provisioning_profile_history SET profile_json=?1",
+                            [serde_json::to_string(&altered).unwrap()],
+                        )
+                        .unwrap();
+                }
+                _ => {
+                    f.store
+                        .lock()
+                        .execute(
+                            "UPDATE provisioning_mandates SET profile_epoch=profile_epoch+1",
+                            [],
+                        )
+                        .unwrap();
+                }
+            }
+            if case == 1 {
+                assert_eq!(
+                    f.store.provisioning_profile(&original.id).unwrap(),
+                    (original.clone(), epoch)
+                );
+            } else if case == 2 {
+                assert!(
+                    f.store
+                        .provisioning_profile_at(&original.id, epoch)
+                        .is_err()
+                );
+            } else {
+                assert!(f.issue(&parent, &Uuid::new_v4().to_string()).is_err());
+            }
+            assert_eq!(
+                f.store
+                    .get_mandate(&f.binding, &parent.id)
+                    .unwrap()
+                    .issued_count,
+                0
+            );
+            assert!(f.store.list_access_grants(&f.binding).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn grant_profile_mismatch_is_durably_revoked_without_replenishing_issuance() {
+        for epoch in [false, true] {
+            let f = Fixture::new();
+            let parent = f.mandate(2);
+            let request = Uuid::new_v4().to_string();
+            let grant = f.issue(&parent, &request).unwrap();
+            if epoch {
+                f.store
+                    .lock()
+                    .execute(
+                        "UPDATE provisioning_access SET profile_epoch=profile_epoch+1 WHERE id=?1",
+                        [&grant.id],
+                    )
+                    .unwrap();
+            } else {
+                f.store
+                    .lock()
+                    .execute(
+                        "UPDATE provisioning_access SET profile_id='foreign-profile' WHERE id=?1",
+                        [&grant.id],
+                    )
+                    .unwrap();
+            }
+            assert!(f.scopes().is_empty());
+            assert_eq!(
+                f.store
+                    .get_access_grant(&f.binding, &grant.id)
+                    .unwrap()
+                    .revoked_at,
+                Some(f.now)
+            );
+            f.store
+                .lock()
+                .execute(
+                    "UPDATE provisioning_access SET profile_epoch=?1,profile_id=?2 WHERE id=?3",
+                    params![grant.profile_epoch, grant.profile_id, grant.id],
+                )
+                .unwrap();
+            assert!(f.scopes().is_empty());
+            assert!(f.issue(&parent, &request).is_err());
+            assert_eq!(
+                f.store
+                    .get_mandate(&f.binding, &parent.id)
+                    .unwrap()
+                    .issued_count,
+                1
+            );
+        }
+    }
 }

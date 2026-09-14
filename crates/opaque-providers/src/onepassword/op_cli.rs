@@ -73,8 +73,14 @@ impl OpCliClient {
             .arg("op")
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .output()
-            .map_err(|_| OpCliError::NotFound)?;
+            .output();
+        Self::path_from_search(output)
+    }
+
+    fn path_from_search(
+        output: std::io::Result<std::process::Output>,
+    ) -> Result<String, OpCliError> {
+        let output = output.map_err(|_| OpCliError::NotFound)?;
 
         if output.status.success() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
@@ -246,6 +252,70 @@ impl From<CliField> for Field {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_canonicalizes_real_search_output_and_rejects_failed_or_empty_results() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("op fixture");
+        std::fs::write(&executable, "synthetic discovery marker; never executed").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let alias = directory.path().join("op");
+        std::os::unix::fs::symlink(&executable, &alias).unwrap();
+        let canonical = std::fs::canonicalize(&executable).unwrap();
+        for (reported, exit, accepted) in [
+            (executable.display().to_string(), "0", true),
+            (format!("  {}\n", alias.display()), "0", true),
+            (executable.display().to_string(), "1", false),
+            (String::new(), "0", false),
+            (" \t\n".into(), "0", false),
+            (directory.path().display().to_string(), "0", false),
+            (
+                directory.path().join("missing").display().to_string(),
+                "0",
+                false,
+            ),
+        ] {
+            // Actual isolated process output, with values passed as arguments.
+            // This neither changes process-wide PATH nor invokes an installed op.
+            let output = std::process::Command::new("/bin/sh")
+                .env_clear()
+                .args([
+                    "-c",
+                    "printf '%s' \"$1\"; exit \"$2\"",
+                    "fixture",
+                    &reported,
+                    exit,
+                ])
+                .output();
+            let resolved = OpCliClient::path_from_search(output);
+            if accepted {
+                assert_eq!(resolved.unwrap(), canonical.to_str().unwrap());
+            } else {
+                assert!(matches!(resolved, Err(OpCliError::NotFound)));
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(&executable).unwrap(),
+            "synthetic discovery marker; never executed"
+        );
+    }
+
+    #[test]
+    fn discovery_reports_absent_search_process_without_using_its_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(directory.path().join("absent-search-tool"))
+            .env_clear()
+            .output();
+        assert_eq!(
+            output.as_ref().unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert!(matches!(
+            OpCliClient::path_from_search(output),
+            Err(OpCliError::NotFound)
+        ));
+    }
 
     fn read_fixture(value: &[u8]) -> (tempfile::TempDir, OpCliClient) {
         let directory = tempfile::tempdir().unwrap();

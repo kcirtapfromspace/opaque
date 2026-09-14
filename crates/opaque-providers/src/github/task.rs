@@ -560,4 +560,136 @@ mod tests {
                 .all(|request| request.method != "PUT")
         );
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn invalid_binding_and_current_endpoint_mutations_stop_before_source_access() {
+        let _guard = super::super::TEST_ENV_LOCK.lock().await;
+        let github = MockServer::start().await;
+        let vault = MockServer::start().await;
+        let foreign = MockServer::start().await;
+        let _env = configure(&github, &vault);
+        mount_repository(&github, 101).await;
+        let planned = plan_task_manifest(manifest()).await.unwrap();
+        github.reset().await;
+        for case in 0..7 {
+            let mut candidate = planned.clone();
+            let mut action = candidate.actions[0].as_publish().unwrap().clone();
+            let _changed = match case {
+                0 => {
+                    candidate.schema_version = 0;
+                    None
+                }
+                1 => {
+                    action.secret_name = "UNAPPROVED_TARGET".into();
+                    None
+                }
+                2 => Some(EnvRestore::set(&[(GITHUB_API_URL_ENV, "not-a-url")])),
+                3 => Some(EnvRestore::set(&[(VAULT_URL_ENV, "file:///tmp/vault")])),
+                4 => Some(EnvRestore::set(&[(VAULT_URL_ENV, &foreign.uri())])),
+                5 => Some(EnvRestore::set(&[(
+                    GITHUB_API_URL_ENV,
+                    "https://:password@api.github.com",
+                )])),
+                6 => Some(EnvRestore::set(&[(
+                    VAULT_URL_ENV,
+                    "https://vault.example/#fragment",
+                )])),
+                _ => unreachable!(),
+            };
+            let result = execute_task_action(&candidate, &action, || async {
+                panic!("invalid authority must not reach the publish fence")
+            })
+            .await;
+            assert_eq!(result, unavailable(), "case {case}");
+            assert!(github.received_requests().await.unwrap().is_empty());
+            assert!(vault.received_requests().await.unwrap().is_empty());
+            assert!(foreign.received_requests().await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn preparation_errors_and_invalid_fence_receipts_never_send_a_write() {
+        let _guard = super::super::TEST_ENV_LOCK.lock().await;
+        let github = MockServer::start().await;
+        let vault = MockServer::start().await;
+        let _env = configure(&github, &vault);
+        mount_repository(&github, 101).await;
+        let planned = plan_task_manifest(manifest()).await.unwrap();
+        for case in 0..6 {
+            github.reset().await;
+            vault.reset().await;
+            mount_source(&vault, 7).await;
+            mount_public_key(&github).await;
+            mount_repository(&github, 101).await;
+            let mut candidate = planned.clone();
+            let (expected_github_reads, expected_fence_calls) = match case {
+                0 => {
+                    vault.reset().await;
+                    (0, 0)
+                }
+                1 => {
+                    candidate.actions[0]
+                        .as_publish_mut()
+                        .unwrap()
+                        .github_token_ref = Some(format!(
+                        "env:OPAQUE_MISSING_{}",
+                        uuid::Uuid::new_v4().simple()
+                    ));
+                    (0, 0)
+                }
+                2 | 3 => {
+                    let response = if case == 2 {
+                        ResponseTemplate::new(500)
+                    } else {
+                        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                            "key_id": "invalid-key", "key": BASE64.encode([0_u8; 31])
+                        }))
+                    };
+                    Mock::given(method("GET"))
+                        .and(path("/repos/thinkstudio/opaque/actions/secrets/public-key"))
+                        .respond_with(response)
+                        .with_priority(1)
+                        .expect(1)
+                        .mount(&github)
+                        .await;
+                    (1, 0)
+                }
+                4 => {
+                    Mock::given(method("GET"))
+                        .and(path("/repos/thinkstudio/opaque"))
+                        .respond_with(ResponseTemplate::new(500))
+                        .with_priority(1)
+                        .expect(1)
+                        .mount(&github)
+                        .await;
+                    (2, 0)
+                }
+                5 => (2, 1),
+                _ => unreachable!(),
+            };
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            let result = execute_task_action(
+                &candidate,
+                candidate.actions[0].as_publish().unwrap(),
+                || async {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(outcome(SlotState::ApiAccepted, "not_a_valid_receipt"))
+                },
+            )
+            .await;
+            assert_eq!(result, unavailable(), "case {case}");
+            result.validate().unwrap();
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                expected_fence_calls,
+                "case {case}"
+            );
+            let requests = github.received_requests().await.unwrap();
+            assert_eq!(requests.len(), expected_github_reads, "case {case}");
+            assert!(requests.iter().all(|request| request.method == "GET"));
+            let source_requests = vault.received_requests().await.unwrap();
+            assert_eq!(source_requests.len(), 1, "case {case}");
+            assert_eq!(source_requests[0].method, "GET");
+        }
+    }
 }

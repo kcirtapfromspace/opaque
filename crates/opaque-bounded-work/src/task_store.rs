@@ -2488,6 +2488,46 @@ mod tests {
             observed.approval_mode,
             Some(TaskApprovalMode::PairedWorkstation)
         );
+        let mut future = observation.clone();
+        future.checked_at = 112;
+        assert!(matches!(
+            store.record_release_observation(&task.id, "owner", future, 111),
+            Err(TaskStoreError::InvalidInput)
+        ));
+        let mut stale = observation.clone();
+        stale.checked_at = 109;
+        stale.state = ReleaseObservationState::Running;
+        stale.code = "run_in_progress".into();
+        stale
+            .validate(
+                task.manifest.actions[0].as_release().unwrap(),
+                &task.manifest.github_api_url,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .record_release_observation(&task.id, "owner", stale, 111)
+                .unwrap(),
+            observed
+        );
+        let mut running = observation.clone();
+        running.checked_at = 111;
+        running.state = ReleaseObservationState::Running;
+        running.code = "run_in_progress".into();
+        running
+            .validate(
+                task.manifest.actions[0].as_release().unwrap(),
+                &task.manifest.github_api_url,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .record_release_observation(&task.id, "owner", running, 111)
+                .unwrap(),
+            observed,
+            "a later poll must not replace an observed terminal result with running"
+        );
+        assert_eq!(store.get(&task.id, "owner", 111).unwrap(), observed);
         assert!(store.claim(&task.id, "owner", 111).is_err());
         assert!(
             store
@@ -2539,6 +2579,55 @@ mod tests {
             final_record.approval_mode,
             Some(TaskApprovalMode::PairedWorkstation)
         );
+    }
+
+    #[test]
+    fn database_identity_columns_cannot_rebind_an_unchanged_valid_receipt() {
+        for change_owner in [false, true] {
+            let (directory, store) = fixture();
+            let task = store.create(OWNER, manifest(1), NOW).unwrap();
+            verify_record(&task).unwrap();
+            let encoded = serde_json::to_string(&task).unwrap();
+            let (row_id, row_owner) = if change_owner {
+                (task.id.clone(), "another-owner".to_owned())
+            } else {
+                (uuid::Uuid::new_v4().to_string(), OWNER.to_owned())
+            };
+            let connection = store.connection().unwrap();
+            assert_eq!(
+                connection
+                    .execute(
+                        "UPDATE bounded_tasks SET id=?1, owner_key=?2 WHERE id=?3",
+                        params![row_id, row_owner, task.id],
+                    )
+                    .unwrap(),
+                1
+            );
+            drop(connection);
+            assert!(matches!(
+                store.get(&row_id, &row_owner, NOW),
+                Err(TaskStoreError::Corrupt)
+            ));
+            drop(store);
+            let path = directory.path().join("tasks.sqlite3");
+            assert!(matches!(
+                TaskStore::open(&path),
+                Err(TaskStoreError::Corrupt)
+            ));
+            let connection = Connection::open(&path).unwrap();
+            let persisted: (String, String, String) = connection
+                .query_row(
+                    "SELECT id, owner_key, record FROM bounded_tasks",
+                    [],
+                    row_columns,
+                )
+                .unwrap();
+            assert_eq!(
+                persisted,
+                (row_id, row_owner, encoded),
+                "corrupt authority must not be repaired"
+            );
+        }
     }
 
     #[test]

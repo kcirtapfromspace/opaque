@@ -482,4 +482,175 @@ mod tests {
             Finding::new("approval_missing", &changed, Some(0)).id
         );
     }
+
+    #[test]
+    fn persisted_detector_mutations_cannot_be_accepted_as_continuous_evidence() {
+        let mut original = ApprovalDetector::default();
+        original.observe_findings(&record(0, &json!({"kind":"approval.required"})));
+        original.outbox.push(Finding::new(
+            "approval_missing",
+            &record(0, &json!({})),
+            Some(0),
+        ));
+        assert!(original.valid(1));
+        for case in 0..29 {
+            let mut state = original.clone();
+            match case {
+                0 => state.version += 1,
+                1 => state.last_rowid = 2,
+                2 => state.last_sequence = None,
+                3 => state.last_sequence = Some(-1),
+                4 => {
+                    let value = state.pending.values().next().unwrap().clone();
+                    state.pending = (0..=DETECTOR_CAP)
+                        .map(|i| (format!("request-{i}"), value.clone()))
+                        .collect();
+                    state.order = state.pending.keys().cloned().collect();
+                }
+                5 => state.order.clear(),
+                6 => {
+                    let value = state.pending.values().next().unwrap().clone();
+                    state.pending.insert("second".into(), value);
+                    state.order.push_back("private-request".into());
+                }
+                7 => state.order[0] = "unknown-request".into(),
+                8..=10 => {
+                    let invalid = match case {
+                        8 => String::new(),
+                        9 => "a".repeat(129),
+                        _ => "request\n".into(),
+                    };
+                    let value = state.pending.remove("private-request").unwrap();
+                    state.pending.insert(invalid.clone(), value);
+                    state.order[0] = invalid;
+                }
+                11..=13 => {
+                    state.pending.get_mut("private-request").unwrap().action = Some(match case {
+                        11 => "a".repeat(63),
+                        12 => "g".repeat(64),
+                        _ => "A".repeat(64),
+                    })
+                }
+                14..=16 => {
+                    state.pending.get_mut("private-request").unwrap().approval = Some(match case {
+                        14 => String::new(),
+                        15 => "a".repeat(129),
+                        _ => "round\n".into(),
+                    })
+                }
+                17 => state.pending.get_mut("private-request").unwrap().sequence = -1,
+                18 => {
+                    state.failed_transports.insert("unknown-transport".into());
+                }
+                19 => state.outbox = vec![state.outbox[0].clone(); 4097],
+                20 => state.outbox.push(state.outbox[0].clone()),
+                21 => state.outbox[0].schema = "untrusted-schema".into(),
+                22 => state.outbox[0].rule = "untrusted-rule".into(),
+                23 => state.outbox[0].sequence = -1,
+                24 => state.outbox[0].related_sequence = Some(-1),
+                25 => state.outbox[0].id.pop().map(|_| ()).unwrap(),
+                26 => state.outbox[0].id = state.outbox[0].id.replacen('-', "a", 1),
+                27 => {
+                    state.outbox[0].id = format!(
+                        "{}-{}-{}-{}",
+                        "a".repeat(15),
+                        "a".repeat(17),
+                        "a".repeat(16),
+                        "a".repeat(16)
+                    )
+                }
+                _ => {
+                    state.outbox[0].id = format!(
+                        "{}-{}-{}-{}",
+                        "G".repeat(16),
+                        "a".repeat(16),
+                        "a".repeat(16),
+                        "a".repeat(16)
+                    )
+                }
+            }
+            let serialized = serde_json::to_vec(&state).unwrap();
+            let restored: ApprovalDetector = serde_json::from_slice(&serialized).unwrap();
+            assert!(
+                !restored.valid(1),
+                "case {case} accepted corrupt persisted state"
+            );
+            assert!(
+                original.valid(1),
+                "the independent original remains admissible"
+            );
+        }
+        for valid_transport in ["spool", "webhook", "syslog"] {
+            original.failed_transports.insert(valid_transport.into());
+        }
+        original.outbox[0].id = original.outbox[0].id.replace('a', "A");
+        // Uppercase hexadecimal is rejected even when all widths remain valid.
+        original.outbox[0].id.replace_range(0..1, "A");
+        assert!(!original.valid(1));
+    }
+
+    #[test]
+    fn missing_lineage_is_uncertainty_and_clock_or_row_gaps_remain_visible() {
+        for action in [
+            None,
+            Some("a".repeat(63)),
+            Some("g".repeat(64)),
+            Some("A".repeat(64)),
+        ] {
+            let mut state = ApprovalDetector::default();
+            let required = record(
+                0,
+                &json!({"kind":"approval.required","request_hash":action}),
+            );
+            assert!(state.observe_findings(&required).is_empty());
+            let grant = record(
+                1,
+                &json!({"kind":"approval.granted","request_hash":action,"ts_utc_ms":-1}),
+            );
+            assert!(state.observe_findings(&grant).is_empty());
+            assert_eq!(state.health["clock_regressions"], 1);
+            assert!(
+                state
+                    .observe_findings(&record(
+                        2,
+                        &json!({"kind":"operation.succeeded","request_hash":action})
+                    ))
+                    .is_empty()
+            );
+            assert_eq!(state.pending_count(), 0);
+            assert_eq!(state.health["missing_lineage"], 3);
+        }
+        let mut state = ApprovalDetector::default();
+        state.observe_findings(&record(0, &json!({"kind":"approval.required"})));
+        let findings =
+            state.observe_findings(&record(1, &json!({"kind":"approval.granted","rowid":99})));
+        assert_eq!(
+            findings.iter().map(|f| f.rule.as_str()).collect::<Vec<_>>(),
+            ["evidence_gap"]
+        );
+        assert_eq!(state.pending_count(), 0);
+        for request_id in ["", "\n", &"a".repeat(129)] {
+            let mut state = ApprovalDetector::default();
+            assert!(
+                state
+                    .observe_findings(&record(
+                        0,
+                        &json!({"kind":"operation.succeeded","request_id":request_id})
+                    ))
+                    .is_empty()
+            );
+            assert_eq!(state.health["missing_request_identity"], 1);
+            assert_eq!(state.pending_count(), 0);
+        }
+        let mut state = ApprovalDetector::default();
+        state.health.insert("observed_records".into(), u64::MAX);
+        assert!(state.observe(&record(0, &json!({}))).is_none());
+        assert_eq!(state.health["observed_records"], u64::MAX);
+        let encoded = state
+            .observe(&record(1, &json!({"kind":"audit.dropped"})))
+            .unwrap();
+        let finding: Finding = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(finding.rule, "audit_loss_recorded");
+        assert_eq!(finding.related_sequence, None);
+    }
 }

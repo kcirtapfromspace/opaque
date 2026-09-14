@@ -1449,6 +1449,171 @@ mod boundary_tests {
             assert!(validate_url_scheme(url).is_err());
         }
     }
+
+    #[test]
+    fn explicit_reference_selector_and_tenant_limits_reject_each_boundary() {
+        for reference in [
+            "env:".into(),
+            format!("env:{}", "a".repeat(257)),
+            "env:has-dash".into(),
+            "keychain:missing".into(),
+            "keychain:/a".into(),
+            "keychain:s/".into(),
+            format!("keychain:s/{}", "a".repeat(512)),
+            "keychain:s/white space".into(),
+            "raw-token".into(),
+        ] {
+            assert!(validate_ref(&reference).is_err(), "{reference}");
+        }
+        for reference in ["env:NAME_1", "keychain:service/account"] {
+            validate_ref(reference).unwrap();
+        }
+        for name in ["".into(), "a".repeat(128), "has_underscore".into()] {
+            assert!(matches!(
+                validate_name(&name),
+                Err(AzureApiError::InvalidUrl(_))
+            ));
+        }
+        for version in ["".into(), "a".repeat(129), "has-dash".into()] {
+            assert!(matches!(
+                validate_version(&version),
+                Err(AzureApiError::InvalidUrl(_))
+            ));
+        }
+        for vault in ["ab", "1vault", "vault-", "va--ult", "va_ult"] {
+            assert!(matches!(
+                validate_vault(vault),
+                Err(AzureApiError::InvalidUrl(_))
+            ));
+        }
+        for id in [
+            "".to_owned(),
+            "a".repeat(256),
+            "contains space".into(),
+            "consumers".into(),
+        ] {
+            for tenant in [true, false] {
+                assert!(matches!(
+                    AzureKeyVaultClient::new(
+                        "https://fixture.vault.azure.net",
+                        if tenant { id.clone() } else { "tenant".into() },
+                        if tenant { "client".into() } else { id.clone() },
+                        "env:UNREAD".into()
+                    ),
+                    Err(AzureApiError::AuthError)
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn continuation_and_resource_identity_matrices_never_accept_foreign_authority() {
+        let (client, server) = client().await;
+        for suffix in [
+            "?api-version=7.4&api-version=7.4",
+            "?api-version=7.4&foreign=x",
+            "?api-version=wrong",
+            "?skiptoken=x",
+            "?api-version=7.4#fragment",
+        ] {
+            let suffix = suffix.replace("7.4", API_VERSION);
+            assert!(matches!(
+                client.next_page(&format!("{}/secrets{suffix}", server.uri()), "/secrets"),
+                Err(AzureApiError::InvalidResponse)
+            ));
+        }
+        for value in [
+            "x".repeat(8193),
+            format!("{}/keys?api-version=7.4", server.uri()),
+            format!("http://user@{}/secrets?api-version=7.4", server.address()),
+            format!(
+                "http://:password@{}/secrets?api-version=7.4",
+                server.address()
+            ),
+        ] {
+            assert!(matches!(
+                client.next_page(&value.replace("7.4", API_VERSION), "/secrets"),
+                Err(AzureApiError::InvalidResponse)
+            ));
+        }
+        let valid = format!(
+            "{}/secrets?api-version={API_VERSION}&skiptoken=opaque%2Ftoken",
+            server.uri()
+        );
+        assert_eq!(
+            client.next_page(&valid, "/secrets").unwrap().as_str(),
+            valid
+        );
+        for suffix in [
+            "/secrets/name/version?x=1",
+            "/secrets/name/version#fragment",
+            "/keys/name/version",
+            "/secrets/name/bad-version",
+            "/secrets/name/version/extra",
+            "/secrets/has_underscore/version",
+        ] {
+            assert!(
+                matches!(
+                    client.resource_name(&format!("{}{suffix}", server.uri()), "secrets"),
+                    Err(AzureApiError::InvalidResponse)
+                ),
+                "{suffix}"
+            );
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_oauth_success_never_populates_cache_or_reaches_vault() {
+        for body in [
+            json!({"access_token":"","expires_in":3600}),
+            json!({"access_token":"a".repeat(8193),"expires_in":3600}),
+            json!({"access_token":"has space","expires_in":3600}),
+            json!({"access_token":"valid","expires_in":0}),
+            json!({"access_token":"valid","expires_in":86401}),
+            json!({"access_token":"valid","expires_in":3600,"token_type":"Basic"}),
+        ] {
+            let (client, server) = client().await;
+            server.reset().await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            assert!(matches!(
+                client.list_secrets().await,
+                Err(AzureApiError::AuthError)
+            ));
+            assert!(client.cached_token.lock().await.is_none());
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].url.path(), "/token");
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_collection_and_secret_payload_do_not_produce_partial_success() {
+        let (client, server) = client().await;
+        Mock::given(method("GET"))
+            .and(path("/secrets"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"value":vec![json!({"id":format!("{}/secrets/name",server.uri())});26]}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert!(matches!(
+            client.list_secrets().await,
+            Err(AzureApiError::InvalidResponse)
+        ));
+        Mock::given(method("GET")).and(path("/secrets/name")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":format!("{}/secrets/name/version",server.uri()),"value":"x".repeat(25*1024+1)}))).expect(1).mount(&server).await;
+        assert!(matches!(
+            client.get_secret("name", None).await,
+            Err(AzureApiError::InvalidResponse)
+        ));
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
 }
 
 #[cfg(test)]

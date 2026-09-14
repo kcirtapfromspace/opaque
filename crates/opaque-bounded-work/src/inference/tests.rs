@@ -264,6 +264,66 @@ async fn final_gate_denial_after_delayed_preparation_prevents_generation() {
 }
 
 #[tokio::test]
+async fn invalid_final_authority_outcome_is_rejected_without_generation_or_receipt() {
+    let (server, profile, manifest) = fixture().await;
+    let calls = AtomicUsize::new(0);
+    let invalid = outcome(SlotState::Rejected, "caller_supplied_reason");
+    assert!(invalid.validate().is_err());
+    let result = execute_inference_action(
+        &manifest,
+        manifest.actions[0].as_inference().unwrap(),
+        &profile,
+        || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(invalid)
+        },
+    )
+    .await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(result.outcome.state, SlotState::Rejected);
+    assert_eq!(result.outcome.code, "internal_error");
+    assert!(result.outcome.validate().is_ok());
+    assert!(result.receipt.is_none());
+    assert!(completion_requests(&server).await.is_empty());
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|request| request.url.path() == "/tokenize")
+    );
+}
+
+#[tokio::test]
+async fn valid_foreign_manifest_cannot_authorize_an_unlisted_model_action() {
+    let (server, profile, inference) = fixture().await;
+    let mut publish: TaskManifest = serde_json::from_value(json!({
+        "schema_version":1,"title":"Separate publish authority","expires_in_secs":600,
+        "github_api_url":"https://api.github.com","vault_api_url":"https://vault.example.com",
+        "actions":[{"repo":"fixture/repo","repository_id":17,"secret_name":"MARKER",
+        "value_ref":"vault:kv/data/fixture?version=7#MARKER","github_token_ref":"keychain:fixture"}]
+    }))
+    .unwrap();
+    publish.validate().unwrap();
+    let before = publish.clone();
+    assert!(prepare_inference_manifest(&mut publish, &profile).is_err());
+    assert_eq!(publish, before);
+    let action = inference.actions[0].as_inference().unwrap();
+    assert!(profile.matches(action));
+    let called = AtomicUsize::new(0);
+    let result = execute_inference_action(&publish, action, &profile, || async {
+        called.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    })
+    .await;
+    assert_eq!(result.outcome.state, SlotState::Rejected);
+    assert!(result.receipt.is_none());
+    assert_eq!(called.load(Ordering::SeqCst), 0);
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn tokenizer_cap_is_enforced_before_dispatch() {
     let (server, profile, manifest) = fixture().await;
     Mock::given(method("POST"))

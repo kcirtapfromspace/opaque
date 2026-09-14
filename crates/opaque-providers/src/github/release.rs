@@ -1156,4 +1156,296 @@ mod tests {
         assert_eq!(observed.code, "run_correlation_ambiguous");
         assert_eq!(post_count(&server).await, 0);
     }
+
+    #[tokio::test]
+    async fn preparation_rejects_each_untrusted_profile_or_endpoint_component_without_io() {
+        let _lock = super::super::TEST_ENV_LOCK.lock().await;
+        let server = MockServer::start().await;
+        let _env = EnvRestore::configure(&server);
+        for endpoint_value in [
+            "file:///private",
+            "https://user@api.github.com",
+            "https://:password@api.github.com",
+            "https://api.github.com?query=1",
+            "https://api.github.com#fragment",
+            "http://api.github.com",
+        ] {
+            unsafe {
+                std::env::set_var(GITHUB_API_URL_ENV, endpoint_value);
+            }
+            assert_eq!(
+                prepare_staging_release(&mut manifest()).unwrap_err(),
+                unavailable()
+            );
+        }
+        unsafe {
+            std::env::set_var(GITHUB_API_URL_ENV, server.uri());
+        }
+        for field in 0..6 {
+            let mut candidate = manifest();
+            let action = candidate.actions[0].as_release_mut().unwrap();
+            match field {
+                0 => action.repo = "owner/foreign".into(),
+                1 => action.workflow_path = ".github/workflows/foreign.yml".into(),
+                2 => action.workflow_ref = "other".into(),
+                3 => action.workflow_sha256 = "d".repeat(64),
+                4 => action.image_repository = "ghcr.io/other/app".into(),
+                _ => action.environment = "production".into(),
+            }
+            assert_eq!(
+                prepare_staging_release(&mut candidate).unwrap_err(),
+                unavailable()
+            );
+        }
+        for name in [
+            "OPAQUE_STAGING_REPO",
+            "OPAQUE_STAGING_WORKFLOW_PATH",
+            "OPAQUE_STAGING_REF",
+            "OPAQUE_STAGING_WORKFLOW_SHA256",
+            "OPAQUE_STAGING_IMAGE_REPOSITORY",
+        ] {
+            let saved = std::env::var(name).unwrap();
+            unsafe {
+                std::env::set_var(name, "");
+            }
+            assert_eq!(
+                prepare_staging_release(&mut manifest()).unwrap_err(),
+                unavailable()
+            );
+            unsafe {
+                std::env::set_var(name, saved);
+            }
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn workflow_and_content_response_mutations_never_reach_dispatch_authority() {
+        let _lock = super::super::TEST_ENV_LOCK.lock().await;
+        for field in 0..12 {
+            let server = MockServer::start().await;
+            let _env = EnvRestore::configure(&server);
+            scope(&server, 42, &"a".repeat(40), true, WORKFLOW, 0).await;
+            let planned = plan_staging_release(manifest()).await.unwrap();
+            server.reset().await;
+            scope(&server, 42, &"a".repeat(40), true, WORKFLOW, 0).await;
+            let (route, body) = match field {
+                0 => (
+                    "/repos/owner/app".to_owned(),
+                    serde_json::json!({"id":0,"full_name":REPO}),
+                ),
+                1 => (
+                    "/repos/owner/app".to_owned(),
+                    serde_json::json!({"id":42,"full_name":"owner/foreign"}),
+                ),
+                2..=5 => {
+                    let mut value =
+                        serde_json::json!({"id":71,"path":WORKFLOW_PATH,"state":"active"});
+                    match field {
+                        2 => value["id"] = 0.into(),
+                        3 => value["path"] = ".github/workflows/foreign.yml".into(),
+                        4 => value["state"] = "disabled_manually".into(),
+                        _ => value["id"] = 72.into(),
+                    };
+                    ("/repos/owner/app/actions/workflows/71".into(), value)
+                }
+                6 => (
+                    "/repos/owner/app/branches/main".into(),
+                    serde_json::json!({"name":"foreign","protected":true,"commit":{"sha":"a".repeat(40)}}),
+                ),
+                _ => {
+                    let mut value = serde_json::json!({"type":"file","path":WORKFLOW_PATH,"encoding":"base64","content":base64::engine::general_purpose::STANDARD.encode(WORKFLOW)});
+                    match field {
+                        7 => value["type"] = "symlink".into(),
+                        8 => value["path"] = ".github/workflows/foreign.yml".into(),
+                        9 => value["encoding"] = "utf-8".into(),
+                        10 => value["content"] = "A".repeat(MAX_WORKFLOW_BYTES * 2 + 1).into(),
+                        _ => {
+                            value["content"] = base64::engine::general_purpose::STANDARD
+                                .encode(vec![0; MAX_WORKFLOW_BYTES + 1])
+                                .into()
+                        }
+                    };
+                    (format!("/repos/owner/app/contents/{WORKFLOW_PATH}"), value)
+                }
+            };
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .with_priority(1)
+                .expect(1)
+                .mount(&server)
+                .await;
+            let result = dispatch_staging_release(
+                &planned,
+                planned.actions[0].as_release().unwrap(),
+                TASK_ID,
+                || async { panic!("invalid observed contract reached reservation fence") },
+            )
+            .await;
+            assert_eq!(result.state, SlotState::Rejected);
+            assert_eq!(result.code, "source_unavailable");
+            assert_eq!(post_count(&server).await, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_acknowledgment_bounds_preserve_unknown_and_one_post() {
+        let _lock = super::super::TEST_ENV_LOCK.lock().await;
+        for (body, expected, id) in [
+            (
+                serde_json::json!({"workflow_run_id":0}).to_string(),
+                SlotState::Unknown,
+                None,
+            ),
+            (" ".repeat(16385), SlotState::Unknown, None),
+            (
+                serde_json::json!({"workflow_run_id":123,"url":"https://foreign.invalid"})
+                    .to_string(),
+                SlotState::ApiAccepted,
+                Some(123),
+            ),
+        ] {
+            let server = MockServer::start().await;
+            let _env = EnvRestore::configure(&server);
+            scope(&server, 42, &"a".repeat(40), true, WORKFLOW, 0).await;
+            let planned = plan_staging_release(manifest()).await.unwrap();
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let charged = std::cell::Cell::new(0);
+            let result = dispatch_staging_release(
+                &planned,
+                planned.actions[0].as_release().unwrap(),
+                TASK_ID,
+                || async {
+                    charged.set(charged.get() + 1);
+                    Ok(())
+                },
+            )
+            .await;
+            assert_eq!(charged.get(), 1);
+            assert_eq!(result.state, expected);
+            assert_eq!(result.provider_run_id, id);
+            assert_eq!(post_count(&server).await, 1);
+            assert_eq!(
+                result.code,
+                if id.is_some() {
+                    "api_accepted"
+                } else {
+                    "transport_unknown"
+                }
+            );
+            result.validate().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_dispatch_binding_and_invalid_fence_result_never_post() {
+        let _lock = super::super::TEST_ENV_LOCK.lock().await;
+        let server = MockServer::start().await;
+        let _env = EnvRestore::configure(&server);
+        scope(&server, 42, &"a".repeat(40), true, WORKFLOW, 0).await;
+        let planned = plan_staging_release(manifest()).await.unwrap();
+        let mut foreign = planned.actions[0].as_release().unwrap().clone();
+        foreign.workflow_id += 1;
+        for (action, id) in [
+            (&foreign, TASK_ID),
+            (planned.actions[0].as_release().unwrap(), "invalid-task-id"),
+        ] {
+            let result = dispatch_staging_release(&planned, action, id, || async {
+                panic!("invalid binding reached reservation")
+            })
+            .await;
+            assert_eq!(result.code, "source_unavailable");
+        }
+        let result = dispatch_staging_release(
+            &planned,
+            planned.actions[0].as_release().unwrap(),
+            TASK_ID,
+            || async { Err(outcome(SlotState::Rejected, "not_a_valid_reason")) },
+        )
+        .await;
+        assert_eq!(result.state, SlotState::Unknown);
+        assert_eq!(result.code, "internal_error");
+        assert_eq!(post_count(&server).await, 0);
+    }
+
+    #[tokio::test]
+    async fn direct_run_identity_requires_every_immutable_scope_component() {
+        let _lock = super::super::TEST_ENV_LOCK.lock().await;
+        for field in 0..8 {
+            let server = MockServer::start().await;
+            let _env = EnvRestore::configure(&server);
+            scope(&server, 42, &"a".repeat(40), true, WORKFLOW, 0).await;
+            let planned = plan_staging_release(manifest()).await.unwrap();
+            let mut evidence = run(&planned, 123);
+            match field {
+                0 => evidence["id"] = 0.into(),
+                1 => evidence["repository"]["full_name"] = "owner/foreign".into(),
+                2 => evidence["head_repository"]["id"] = 99.into(),
+                3 => evidence["head_repository"]["full_name"] = "owner/foreign".into(),
+                4 => evidence["head_branch"] = "foreign".into(),
+                5 => evidence["event"] = "push".into(),
+                6 => evidence["run_attempt"] = 0.into(),
+                _ => evidence["display_title"] = "foreign-task".into(),
+            }
+            assert!(!run_matches(
+                &serde_json::from_value(evidence.clone()).unwrap(),
+                planned.actions[0].as_release().unwrap(),
+                &staging_run_title(&planned, TASK_ID).unwrap()
+            ));
+            Mock::given(method("GET"))
+                .and(path("/repos/owner/app/actions/runs/123"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(evidence))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let observed = reconcile_staging_release(&planned, TASK_ID, Some(123))
+                .await
+                .unwrap();
+            assert_eq!(observed.state, ReleaseObservationState::Ambiguous);
+            assert_eq!(observed.code, "run_evidence_mismatch");
+            assert_eq!(observed.correlation, ReleaseCorrelation::DispatchResponse);
+            assert_eq!(post_count(&server).await, 0);
+            assert!(
+                !server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.url.path().ends_with("/71/runs"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn changing_pagination_and_duplicate_run_ids_are_ambiguous_not_absent() {
+        let _lock = super::super::TEST_ENV_LOCK.lock().await;
+        for mode in 0..4 {
+            let server = MockServer::start().await;
+            let _env = EnvRestore::configure(&server);
+            scope(&server, 42, &"a".repeat(40), true, WORKFLOW, 0).await;
+            let planned = plan_staging_release(manifest()).await.unwrap();
+            let first: Vec<_> = (1..=if mode == 1 { 101 } else { 100 })
+                .map(|id| {
+                    let mut value = run(&planned, id);
+                    value["display_title"] = "different task".into();
+                    value
+                })
+                .collect();
+            Mock::given(method("GET")).and(path("/repos/owner/app/actions/workflows/71/runs")).and(query_param("page","1")).respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"total_count":if mode==0 {301}else{101},"workflow_runs":first}))).expect(1).mount(&server).await;
+            if mode >= 2 {
+                Mock::given(method("GET")).and(path("/repos/owner/app/actions/workflows/71/runs")).and(query_param("page","2")).respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"total_count":if mode==2 {102}else{101},"workflow_runs":[run(&planned,1)]}))).expect(1).mount(&server).await;
+            }
+            let result = reconcile_staging_release(&planned, TASK_ID, None)
+                .await
+                .unwrap();
+            assert_eq!(result.state, ReleaseObservationState::Ambiguous);
+            assert_eq!(result.code, "run_correlation_ambiguous");
+            assert_eq!(post_count(&server).await, 0);
+        }
+    }
 }

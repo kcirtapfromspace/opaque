@@ -185,9 +185,9 @@ pub struct BundleApplier {
 }
 
 impl BundleApplier {
-    /// Verify + rollback-check + apply one bundle text. On success the policy
-    /// is swapped, state persisted, status updated, and the application
-    /// audited.
+    /// Verify + rollback-check + apply one bundle text. On success rollback
+    /// state is persisted before the policy is swapped, status updated and
+    /// the application audited.
     ///
     /// `strict_expiry` controls staleness: the first bundle under
     /// `require_bundle` must be unexpired; refreshes of a running daemon
@@ -249,9 +249,6 @@ impl BundleApplier {
             return Ok(verified);
         }
 
-        let engine = PolicyEngine::with_rules(verified.payload.rules.clone());
-        let rule_count = enclave.swap_policy(engine);
-
         bundle::save_state(
             state_file,
             &BundleState {
@@ -262,6 +259,11 @@ impl BundleApplier {
             },
         )
         .map_err(|e| format!("bundle state persist failed: {e}"))?;
+
+        // A failed state write must leave the active policy unchanged. Policy
+        // publication is infallible and follows its rollback record.
+        let engine = PolicyEngine::with_rules(verified.payload.rules.clone());
+        let rule_count = enclave.swap_policy(engine);
 
         status.set(Applied {
             org: verified.payload.org.clone(),
@@ -446,6 +448,141 @@ mod tests {
             status: Arc::new(FederationStatus::default()),
             audit: Arc::new(opaque_core::audit::TracingAuditEmitter::new()),
         }
+    }
+
+    #[test]
+    fn rollback_state_write_failure_never_activates_unpersisted_policy() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let enclave = Arc::new(FakeEnclave::new());
+        let mut applier = test_applier(directory.path(), &key);
+        applier.enclave = enclave.clone();
+        // Reading an absent state is valid first use; its absent parent makes
+        // the real write fail deterministically even for a contained root test.
+        applier.state_file = directory.path().join("absent-parent/bundle.state");
+        let before = enclave.policy.read().unwrap().rule_count();
+        let text = sign_bundle(&payload_with_rules(1), &key).unwrap();
+        assert!(
+            applier
+                .apply_text(&text, "fixture", true)
+                .unwrap_err()
+                .starts_with("bundle state persist failed:")
+        );
+        assert_eq!(enclave.policy.read().unwrap().rule_count(), before);
+        assert!(applier.status.current().is_none());
+        assert!(!applier.state_file.exists());
+        std::fs::create_dir(applier.state_file.parent().unwrap()).unwrap();
+        applier.apply_text(&text, "fixture", true).unwrap();
+        assert_eq!(enclave.policy.read().unwrap().rule_count(), 1);
+        assert_eq!(applier.status.current().unwrap().version, 1);
+        assert_eq!(
+            bundle::load_state(&applier.state_file)
+                .unwrap()
+                .unwrap()
+                .version,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn bundle_http_failure_uses_only_configured_fallback_and_preserves_source_identity() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("offline.bundle");
+        std::fs::write(&file, "exact offline bundle").unwrap();
+        let mut config = FederationConfig {
+            bundle_url: Some(format!("{}/bundle", server.uri())),
+            bundle_path: Some(file.clone()),
+            ..Default::default()
+        };
+        Mock::given(method("GET"))
+            .and(path("/bundle"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        assert_eq!(
+            fetch_bundle_text(&config).await.unwrap(),
+            (
+                "exact offline bundle".into(),
+                format!("file:{}", file.display())
+            )
+        );
+        config.bundle_path = None;
+        assert!(
+            fetch_bundle_text(&config)
+                .await
+                .unwrap_err()
+                .contains("HTTP 503")
+        );
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/bundle"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("exact online bundle"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        config.bundle_path = Some(file);
+        assert_eq!(
+            fetch_bundle_text(&config).await.unwrap(),
+            (
+                "exact online bundle".into(),
+                format!("url:{}/bundle", server.uri())
+            )
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(
+            fetch_bundle_text(&FederationConfig::default())
+                .await
+                .unwrap_err(),
+            "no bundle source configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_or_non_utf8_bundle_transport_never_reaches_signature_application() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        for (body, expected) in [
+            (vec![b'a'; 4 * 1024 * 1024 + 1], "bundle response too large"),
+            (vec![0xff], "invalid utf-8"),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let error = fetch_url(&server.uri()).await.unwrap_err();
+            assert!(error.contains(expected), "{error}");
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn expired_refresh_keeps_verified_authority_but_strict_startup_refuses_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let applier = test_applier(directory.path(), &key);
+        let mut payload = payload_with_rules(1);
+        payload.expires_at = Some(now_unix() - 1);
+        let expired = sign_bundle(&payload, &key).unwrap();
+        assert!(applier.apply_text(&expired, "fixture", true).is_err());
+        assert!(applier.status.current().is_none());
+        assert!(!applier.state_file.exists());
+        applier.apply_text(&expired, "fixture", false).unwrap();
+        assert_eq!(applier.status.current().unwrap().version, 1);
+        let before = std::fs::read(&applier.state_file).unwrap();
+        applier.apply_text(&expired, "fixture", false).unwrap();
+        assert_eq!(std::fs::read(&applier.state_file).unwrap(), before);
+        payload.version = 2;
+        payload.expires_at = Some(now_unix() + 600);
+        applier
+            .apply_text(&sign_bundle(&payload, &key).unwrap(), "fixture", false)
+            .unwrap();
+        assert_eq!(applier.status.current().unwrap().version, 2);
     }
 
     #[test]

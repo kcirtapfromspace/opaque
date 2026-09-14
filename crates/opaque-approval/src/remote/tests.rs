@@ -765,6 +765,76 @@ fn notice_credentials_require_exact_private_unaliased_bounded_bytes() {
 }
 
 #[test]
+fn unconfigured_notice_feed_has_no_authority_even_with_a_well_formed_token() {
+    let rig = Rig::new();
+    let remote = rig.open();
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "authorization",
+        axum::http::HeaderValue::from_static("Bearer fixture_notice_token_01234567890123456789"),
+    );
+    assert!(!remote.authorize_notice_feed(&headers));
+    assert!(remote.store.receipt("unissued-round").unwrap().is_none());
+}
+
+#[test]
+fn notice_credential_outside_custody_is_rejected_before_creating_the_ledger() {
+    let mut rig = Rig::new();
+    let foreign = tempfile::tempdir().unwrap();
+    let path = foreign.path().join("notice.token");
+    std::fs::write(&path, "a".repeat(32)).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    rig.config.notice_token_file = Some(path.clone());
+    let ledger = rig.dir.path().join("remote.db");
+    let result = RemoteApprovals::open(
+        rig.config.clone(),
+        &ledger,
+        rig.tenant.clone(),
+        rig.pairing.clone(),
+        Arc::new(|_, _| panic!("configuration rejection must not resolve reviewer authority")),
+        Arc::new(|_, _, _, _, _| panic!("configuration rejection must not dispatch")),
+    );
+    assert_eq!(
+        result.err().unwrap(),
+        "notice credential must be directly inside broker custody"
+    );
+    assert!(!ledger.exists());
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "a".repeat(32));
+}
+
+#[test]
+fn ledger_requires_a_directory_parent_and_rejects_fifo_without_blocking_or_replacing_it() {
+    use std::os::unix::fs::FileTypeExt;
+    let rig = Rig::new();
+    let parent = rig.dir.path().join("not-a-directory");
+    std::fs::write(&parent, "preserved").unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        RemoteStore::open(&parent.join("ledger"), rig.tenant.clone(), "broker".into())
+            .err()
+            .unwrap(),
+        "remote approval ledger requires an owner-only directory"
+    );
+    assert_eq!(std::fs::read_to_string(parent).unwrap(), "preserved");
+    let fifo = rig.dir.path().join("fifo-ledger");
+    let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    // The name is private to this fixture and the descriptor is opened nonblocking.
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    assert_eq!(
+        RemoteStore::open(&fifo, rig.tenant.clone(), "broker".into())
+            .err()
+            .unwrap(),
+        "remote approval ledger requires private regular files"
+    );
+    assert!(
+        std::fs::symlink_metadata(fifo)
+            .unwrap()
+            .file_type()
+            .is_fifo()
+    );
+}
+
+#[test]
 fn remote_ledger_rejects_aliases_permissions_and_unsupported_schema_without_rebinding() {
     use super::store::RemoteStore;
     let rig = Rig::new();

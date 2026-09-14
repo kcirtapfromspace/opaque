@@ -397,8 +397,17 @@ async fn prompt_linux_bounded(
     reason: &str,
     timeout: std::time::Duration,
 ) -> Result<PromptOutcome, ApprovalError> {
-    use tokio::io::AsyncReadExt;
     let helper = find_approve_helper()?;
+    launch_bounded_helper(&helper, reason, timeout).await
+}
+
+#[cfg(target_os = "linux")]
+async fn launch_bounded_helper(
+    helper: &std::path::Path,
+    reason: &str,
+    timeout: std::time::Duration,
+) -> Result<PromptOutcome, ApprovalError> {
+    use tokio::io::AsyncReadExt;
     let mut child = tokio::process::Command::new(helper)
         .args(["--reason", reason])
         .stdin(std::process::Stdio::null())
@@ -551,6 +560,89 @@ fn find_helper_in(
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bounded_authentication_uses_real_helper_status_and_reaps_expired_process() {
+        for scenario in [
+            "approved",
+            "anonymous",
+            "denied",
+            "unavailable",
+            "signal",
+            "timeout",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let helper = directory.path().join(format!("authentication-{scenario}"));
+            std::os::unix::fs::symlink(
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/authentication-helper.sh"
+                ),
+                &helper,
+            )
+            .unwrap();
+            let reason = "Authorize exact fixture fingerprint 0123456789abcdef";
+            let result =
+                launch_bounded_helper(&helper, reason, std::time::Duration::from_secs(2)).await;
+            assert_eq!(
+                std::fs::read_to_string(helper.with_extension("reason")).unwrap(),
+                reason
+            );
+            match scenario {
+                "approved" => assert_eq!(
+                    result.unwrap(),
+                    PromptOutcome::Approved {
+                        account: Some(UnixAccount {
+                            uid: 1234,
+                            username: "fixture-account".into()
+                        })
+                    }
+                ),
+                "anonymous" => {
+                    assert_eq!(result.unwrap(), PromptOutcome::Approved { account: None })
+                }
+                "denied" => assert_eq!(result.unwrap(), PromptOutcome::Denied),
+                _ => assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "approval failed: authentication expired or unavailable; no decision sent"
+                ),
+            }
+            let pid: i32 = std::fs::read_to_string(helper.with_extension("pid"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert_eq!(
+                unsafe { libc::kill(pid, 0) },
+                -1,
+                "{scenario} helper must be reaped"
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bounded_authentication_spawn_failures_never_report_a_decision() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let helper = directory.path().join("missing-or-not-executable");
+        for present in [false, true] {
+            if present {
+                std::fs::write(&helper, "private non-executable file").unwrap();
+                std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            assert!(matches!(
+                launch_bounded_helper(&helper, "fixture reason", std::time::Duration::from_secs(2))
+                    .await,
+                Err(ApprovalError::Unavailable)
+            ));
+        }
+    }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[tokio::test]

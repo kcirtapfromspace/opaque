@@ -4,6 +4,8 @@
 #![cfg(unix)]
 #[path = "support/response_contract.rs"]
 mod response_contract;
+#[path = "support/task_receipt_contract.rs"]
+mod task_receipt_contract;
 use ed25519_dalek::SigningKey;
 use opaque_core::attest::{
     AuditPosture, FederationPosture, ReportPayload, TrustDomainPosture, sign_report,

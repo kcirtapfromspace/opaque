@@ -98,6 +98,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn short_help_and_unknown_two_argument_commands_do_not_read_contracts() {
+        assert!(run(&["-h".into()]).is_ok());
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("not-created.json");
+        let error = run(&["execute".into(), missing.display().to_string()]).unwrap_err();
+        assert!(error.starts_with("expected validate"));
+        assert!(!missing.exists());
+        assert!(
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn contract_reader_accepts_exact_bound_and_refuses_large_or_substituted_files() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("contract.json");

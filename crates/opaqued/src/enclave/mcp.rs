@@ -477,4 +477,402 @@ mod tests {
                 .any(|e| e.kind == AuditEventKind::OperationStarted)
         );
     }
+    struct ApprovedFixture {
+        _directory: tempfile::TempDir,
+        gateway: Gateway,
+        enclave: Enclave,
+        action: Action,
+        request: OperationRequest,
+    }
+    async fn approved_fixture(
+        server: &wiremock::MockServer,
+        audit: Arc<dyn AuditSink>,
+        project: bool,
+    ) -> ApprovedFixture {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let bundle = directory.path().join("registry.bundle");
+        let credential = directory.path().join("credential");
+        std::fs::write(&credential, b"local-protocol-fixture").unwrap();
+        std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let schema = json!({"type":"object","additionalProperties":false,"required":["message"],"properties":{"message":{"type":"string","maxLength":64}}});
+        let mut registry:RegistryDocument=serde_json::from_value(json!({"version":2,"routes":[{"protocol_version":PROTOCOL_VERSION,"alias":"post_note","server_id":"fixture","endpoint":{"host":"mcp.example.com","path":"/mcp"},"tool":"post_note","credential_binding":"notes","input_schema":schema,"upstream_input_schema":schema,"output_policy":"typed_fields","output_projection":{"fields":[{"source":"id","name":"resource_id","value_type":{"kind":"integer_id","maximum":1000}}]},"max_request_bytes":4096,"max_response_bytes":4096,"timeout_ms":1000}]})).unwrap();
+        if !project {
+            registry.version = 1;
+            let route = &mut registry.routes[0];
+            route.upstream_input_schema = None;
+            route.output_projection = None;
+            route.output_policy = opaque_core::mcp::OutputPolicy::Withhold;
+        }
+        let key = ed25519_dalek::SigningKey::from_bytes(&[43; 32]);
+        let now = opaque_bounded_work::mcp::now();
+        let payload = BundlePayload {
+            org: "fixture".into(),
+            version: 1,
+            issued_at: now - 1,
+            expires_at: Some(now + 600),
+            key_id: String::new(),
+            teams: vec![],
+            rules: vec![],
+            mcp_registry: Some(registry),
+        };
+        std::fs::write(&bundle, sign_bundle(&payload, &key).unwrap()).unwrap();
+        let gateway = Gateway::new(
+            Config {
+                bundle_path: bundle,
+                org: "fixture".into(),
+                trust_anchors: vec![opaque_core::workstation::hex(
+                    key.verifying_key().as_bytes(),
+                )],
+                credentials: BTreeMap::from([("notes".into(), credential)]),
+                fixture_origin: Some(server.uri()),
+            },
+            &directory.path().join("ledger.db"),
+            None,
+            true,
+        )
+        .unwrap();
+        let action = gateway
+            .prepare(CallInput {
+                invocation_id: Uuid::new_v4().to_string(),
+                route: "post_note".into(),
+                arguments: serde_json::from_value(json!({"message":"review me"})).unwrap(),
+                expires_in_secs: 120,
+            })
+            .unwrap();
+        let mut operations = OperationRegistry::new();
+        operations.register(operation()).unwrap();
+        let mut policy = PolicyEngine::new();
+        policy.add_rule(serde_json::from_value(json!({"name":"fixture","operation_pattern":"mcp.call","allow":true,"approval":{"require":"never"}})).unwrap());
+        let enclave = Enclave::builder()
+            .registry(operations)
+            .policy(policy)
+            .approval_gate(Box::new(crate::enclave::test_support::AlwaysApproveGate))
+            .audit(audit)
+            .build()
+            .unwrap();
+        let request = OperationRequest {
+            request_id: Uuid::new_v4(),
+            client_identity: ClientIdentity {
+                uid: 501,
+                gid: 20,
+                pid: Some(123),
+                exe_path: None,
+                exe_sha256: None,
+                codesign_team_id: None,
+                workload: None,
+            },
+            client_type: ClientType::Agent,
+            principal: None,
+            operation: String::new(),
+            target: HashMap::new(),
+            secret_ref_names: vec![],
+            created_at: std::time::SystemTime::now(),
+            expires_at: None,
+            params: serde_json::Value::Null,
+            workspace: None,
+        };
+        wiremock::Mock::given(wiremock::matchers::method("POST")).and(wiremock::matchers::path("/mcp")).respond_with(move |request:&wiremock::Request| {
+            let message:serde_json::Value=serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(request.headers.get("authorization").unwrap(),"Bearer local-protocol-fixture");
+            let result=match message["method"].as_str().unwrap(){"initialize"=>json!({"protocolVersion":PROTOCOL_VERSION,"capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}}),"notifications/initialized"=>return wiremock::ResponseTemplate::new(202),"tools/list"=>json!({"tools":[{"name":"post_note","inputSchema":schema}]}),"tools/call"=>{assert_eq!(message["params"],json!({"name":"post_note","arguments":{"message":"review me"}}));json!({"content":[],"structuredContent":{"id":7,"private":"withheld-fixture-text"}})},_=>panic!("unexpected upstream method")};
+            wiremock::ResponseTemplate::new(200).set_body_json(json!({"jsonrpc":"2.0","id":message["id"],"result":result}))
+        }).mount(server).await;
+        ApprovedFixture {
+            _directory: directory,
+            gateway,
+            enclave,
+            action,
+            request,
+        }
+    }
+    async fn tool_calls(server: &wiremock::MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["method"]
+                    == "tools/call"
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn mcp_context_failure_at_each_async_boundary_preserves_charge_and_withholds_output() {
+        // Actual broker gateway, signed registry, SQLite ledger and loopback MCP.
+        // Context lookup failures are injected at the existing private boundary;
+        // this is not a claim of physical review or an external provider effect.
+        for fail_at in 1..=4 {
+            let server = wiremock::MockServer::start().await;
+            let f = approved_fixture(&server, Arc::new(InMemoryAuditEmitter::new()), true).await;
+            let calls = AtomicUsize::new(0);
+            let id = f.action.invocation_id.clone();
+            let outcome = f
+                .enclave
+                .execute_mcp(
+                    &f.gateway,
+                    "owner",
+                    f.request.clone(),
+                    f.action.clone(),
+                    || {
+                        let call = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                        async move {
+                            if call == fail_at {
+                                Err("live identity unavailable".into())
+                            } else {
+                                Ok(None)
+                            }
+                        }
+                    },
+                )
+                .await;
+            let retained = f.gateway.ledger.get("owner", &id).unwrap();
+            assert_eq!(tool_calls(&server).await, usize::from(fail_at == 4));
+            assert_eq!(retained.attempt_charged, fail_at > 1);
+            if fail_at == 1 {
+                assert_eq!(outcome.unwrap_err(), "live identity unavailable");
+                assert_eq!(retained.state, "cancelled");
+            } else {
+                let result = outcome.unwrap();
+                assert!(result.output.is_none());
+                assert_eq!(
+                    result.state,
+                    if fail_at == 4 { "accepted" } else { "rejected" }
+                );
+                if fail_at == 4 {
+                    assert_eq!(result.disclosure, Some("withheld_authority_changed"));
+                    assert!(result.response_sha256.is_none());
+                    assert!(result.response_bytes.is_none());
+                }
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), fail_at);
+            assert!(
+                f.enclave
+                    .execute_mcp(
+                        &f.gateway,
+                        "owner",
+                        f.request.clone(),
+                        f.action.clone(),
+                        || async { Ok(None) }
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_retained(&f.gateway, &id, &retained);
+            assert_eq!(tool_calls(&server).await, usize::from(fail_at == 4));
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_policy_publication_after_review_and_before_disclosure_fails_closed() {
+        for change_at in [1, 2, 3, 4] {
+            let server = wiremock::MockServer::start().await;
+            let f = approved_fixture(&server, Arc::new(InMemoryAuditEmitter::new()), true).await;
+            let calls = AtomicUsize::new(0);
+            let outcome = f
+                .enclave
+                .execute_mcp(
+                    &f.gateway,
+                    "owner",
+                    f.request.clone(),
+                    f.action.clone(),
+                    || {
+                        if calls.fetch_add(1, Ordering::SeqCst) + 1 == change_at {
+                            f.enclave.swap_policy(PolicyEngine::new());
+                        }
+                        async { Ok(None) }
+                    },
+                )
+                .await;
+            let retained = f
+                .gateway
+                .ledger
+                .get("owner", &f.action.invocation_id)
+                .unwrap();
+            assert_eq!(retained.attempt_charged, change_at > 1);
+            assert_eq!(tool_calls(&server).await, usize::from(change_at == 4));
+            if change_at == 1 {
+                assert_eq!(outcome.unwrap_err(), "MCP authority changed");
+            } else {
+                let result = outcome.unwrap();
+                assert!(result.output.is_none());
+                if change_at == 4 {
+                    assert_eq!(result.disclosure, Some("withheld_authority_changed"));
+                    assert!(result.response_sha256.is_none());
+                    assert!(result.response_bytes.is_none());
+                }
+            }
+            assert!(
+                f.enclave
+                    .execute_mcp(
+                        &f.gateway,
+                        "owner",
+                        f.request.clone(),
+                        f.action.clone(),
+                        || async { Ok(None) }
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(tool_calls(&server).await, usize::from(change_at == 4));
+            assert_retained(&f.gateway, &f.action.invocation_id, &retained);
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingMcpAudit {
+        calls: AtomicUsize,
+        fail_at: usize,
+    }
+    impl AuditSink for FailingMcpAudit {
+        fn emit(&self, _: AuditEvent) {}
+        fn flush(&self, _: Duration) -> Result<(), opaque_core::audit::AuditFlushError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) + 1 == self.fail_at {
+                Err(opaque_core::audit::AuditFlushError::Storage(
+                    "fixture MCP commit failure".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    #[tokio::test]
+    async fn mcp_audit_failure_before_or_after_dispatch_never_returns_successful_output() {
+        for fail_at in 1..=3 {
+            let server = wiremock::MockServer::start().await;
+            let audit = Arc::new(FailingMcpAudit {
+                calls: AtomicUsize::new(0),
+                fail_at,
+            });
+            let f = approved_fixture(&server, audit.clone(), true).await;
+            let outcome = f
+                .enclave
+                .execute_mcp(
+                    &f.gateway,
+                    "owner",
+                    f.request.clone(),
+                    f.action.clone(),
+                    || async { Ok(None) },
+                )
+                .await;
+            let retained = f
+                .gateway
+                .ledger
+                .get("owner", &f.action.invocation_id)
+                .unwrap();
+            assert_eq!(tool_calls(&server).await, usize::from(fail_at == 3));
+            assert_eq!(retained.attempt_charged, fail_at > 1);
+            if fail_at == 2 {
+                let result = outcome.unwrap();
+                assert_eq!(result.state, "rejected");
+                assert!(result.output.is_none());
+            } else {
+                assert_eq!(outcome.unwrap_err(), "MCP audit unavailable");
+            }
+            assert_eq!(
+                audit.calls.load(Ordering::SeqCst),
+                if fail_at == 2 { 3 } else { fail_at }
+            );
+            assert!(
+                f.enclave
+                    .execute_mcp(
+                        &f.gateway,
+                        "owner",
+                        f.request.clone(),
+                        f.action.clone(),
+                        || async { Ok(None) }
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(tool_calls(&server).await, usize::from(fail_at == 3));
+            assert_retained(&f.gateway, &f.action.invocation_id, &retained);
+        }
+    }
+    fn assert_retained(gateway: &Gateway, id: &str, expected: &Receipt) {
+        assert_eq!(
+            serde_json::to_value(gateway.ledger.get("owner", id).unwrap()).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
+    #[tokio::test]
+    async fn legacy_receipt_metadata_rechecks_current_policy_and_revocation_without_replay() {
+        for case in 0..4 {
+            let server = wiremock::MockServer::start().await;
+            let f = approved_fixture(&server, Arc::new(InMemoryAuditEmitter::new()), false).await;
+            let result = f
+                .enclave
+                .execute_mcp(
+                    &f.gateway,
+                    "owner",
+                    f.request.clone(),
+                    f.action.clone(),
+                    || async { Ok(None) },
+                )
+                .await
+                .unwrap();
+            assert!(result.attempt_charged);
+            assert!(result.response_sha256.is_some());
+            assert!(result.response_bytes.is_some());
+            let action = f
+                .gateway
+                .ledger
+                .get_action("owner", &f.action.invocation_id)
+                .unwrap();
+            let mut request = f.request.clone();
+            request.operation = "mcp.call".into();
+            request.target = action.target();
+            let mut receipt = result.receipt.clone();
+            match case {
+                0 => {}
+                1 => {
+                    f.enclave.swap_policy(PolicyEngine::new());
+                }
+                2 => {
+                    let mut policy = PolicyEngine::new();
+                    policy.add_rule(serde_json::from_value(json!({"name":"new allowed policy","operation_pattern":"mcp.call","allow":true,"approval":{"require":"never"}})).unwrap());
+                    f.enclave.swap_policy(policy);
+                }
+                _ => {
+                    f.gateway
+                        .ledger
+                        .revoke("owner", &action.invocation_id)
+                        .unwrap();
+                }
+            }
+            let retained = f
+                .gateway
+                .ledger
+                .get("owner", &action.invocation_id)
+                .unwrap();
+            f.enclave.filter_mcp_receipt_metadata(
+                &f.gateway,
+                "owner",
+                &request,
+                &action,
+                &mut receipt,
+            );
+            assert_eq!(receipt.response_sha256.is_some(), case == 0);
+            assert_eq!(receipt.response_bytes.is_some(), case == 0);
+            assert!(receipt.attempt_charged);
+            assert_eq!(receipt.state, "accepted");
+            assert_retained(&f.gateway, &action.invocation_id, &retained);
+            assert_eq!(tool_calls(&server).await, 1);
+            // Filtering must never repopulate already-empty metadata.
+            receipt.response_sha256 = None;
+            receipt.response_bytes = None;
+            f.enclave.filter_mcp_receipt_metadata(
+                &f.gateway,
+                "owner",
+                &request,
+                &action,
+                &mut receipt,
+            );
+            assert!(receipt.response_sha256.is_none());
+            assert!(receipt.response_bytes.is_none());
+            assert_eq!(tool_calls(&server).await, 1);
+        }
+    }
 }

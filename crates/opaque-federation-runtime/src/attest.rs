@@ -437,6 +437,120 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recorded_posture_distinguishes_healthy_custody_and_corrupt_audit_without_hiding_detail() {
+        use std::os::unix::fs::PermissionsExt;
+        for fault in 0..3 {
+            let directory = tempfile::tempdir().unwrap();
+            let service = test_service(directory.path(), true);
+            if fault == 1 {
+                std::fs::set_permissions(
+                    &service.config_path,
+                    std::fs::Permissions::from_mode(0o644),
+                )
+                .unwrap();
+            } else if fault == 2 {
+                std::fs::write(&service.audit_db, "invalid sqlite").unwrap();
+            }
+            let memory = Arc::new(opaque_core::audit::InMemoryAuditEmitter::new());
+            let sink: Arc<dyn AuditSink> = memory.clone();
+            service.record_posture(&sink, "fixture-observation");
+            let events = memory.events();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].kind, AuditEventKind::TrustDomainPosture);
+            assert_eq!(events[0].operation.as_deref(), Some("attestation"));
+            assert_eq!(
+                events[0].outcome.as_deref(),
+                Some(if fault == 0 { "healthy" } else { "unhealthy" })
+            );
+            assert_eq!(
+                events[0].level,
+                if fault == 0 {
+                    AuditLevel::Info
+                } else {
+                    AuditLevel::Error
+                }
+            );
+            let detail = events[0].detail.as_deref().unwrap();
+            assert!(detail.contains("reason=fixture-observation"));
+            if fault == 1 {
+                assert!(detail.contains("custody_ok=false"));
+                assert!(detail.contains("violations=["));
+            }
+            if fault == 2 {
+                assert!(detail.contains("chain_ok=false"));
+                assert!(detail.contains("chain_detail=chain verification failed:"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn release_protocol_rejects_non_hex_nonce_and_malformed_success_without_retry() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{header, method, path},
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let service = test_service(directory.path(), true);
+        for case in 0..4 {
+            let server = MockServer::start().await;
+            let nonce = if case == 0 {
+                "g".repeat(32)
+            } else {
+                NONCE.into()
+            };
+            Mock::given(method("GET"))
+                .and(path("/challenge"))
+                .and(header(
+                    "authorization",
+                    "Bearer synthetic-release-credential",
+                ))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"nonce":nonce})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            if case > 0 {
+                let response = match case {
+                    1 => ResponseTemplate::new(200).set_body_string("invalid response"),
+                    2 => ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"key_material":"not!base64"})),
+                    _ => ResponseTemplate::new(503),
+                };
+                Mock::given(method("POST"))
+                    .and(path("/release"))
+                    .and(header(
+                        "authorization",
+                        "Bearer synthetic-release-credential",
+                    ))
+                    .respond_with(response)
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+            let client = KeyReleaseClient::new(
+                server.uri(),
+                Some("Bearer synthetic-release-credential".into()),
+            )
+            .unwrap();
+            let error = client.release(&service).await.unwrap_err();
+            assert!(
+                error.starts_with(match case {
+                    0 => "verifier issued an unusable nonce",
+                    1 => "release response decode:",
+                    2 => "released key material is not base64url:",
+                    _ => "verifier refused key release:",
+                }),
+                "{error}"
+            );
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                if case == 0 { 1 } else { 2 }
+            );
+        }
+    }
+
     /// The full verify-before-trust exchange against a REFERENCE VERIFIER
     /// that enforces exactly what a KMS/SPIRE release policy would: known
     /// key, fresh nonce it issued, healthy posture.
