@@ -22,10 +22,23 @@
 > - **Approver attribution** (Findings 2.1/2.4): cryptographic for
 >   `paired_device`/`fido2`: a signature over a decision-bound challenge,
 >   not just a session name.
-> - **§8.1 C-6** (umask race before `bind()`): still open; the socket's
->   parent directory is `0700` before bind, which narrows but doesn't close it.
+> - **§8.1 C-6** (umask race before `bind()`): CLOSED 2026-09-14. The daemon
+>   now binds through `bind_unix_listener_private` (a 0o177 umask guard in
+>   `../crates/opaque-core/src/socket.rs`), so the socket file is 0600 from
+>   its first instant. A regression test asserts the mode at birth under a
+>   fully permissive umask.
 > - Central policy, SIEM export, posture attestation: shipped, see
 >   [federation](federation.md).
+>
+> **Verification pass (2026-09-14):** every finding below was re-verified
+> against the current code; per-finding status notes were added or updated
+> in place. Fixed in that pass: C-6 (umask race), H-5 (socket directory
+> custody check), L-3 (`SAFETY` documentation on the unsafe FFI blocks),
+> L-4 (double-invocation warning in the LocalAuthentication callback).
+> Still open, with recommendations inline: H-8 startup session preflight,
+> screen-lock and Fast User Switching testing (§4.1.2), APNs relay wiring
+> (compiled but deliberately unwired), L-2, L-6, L-7, L-9, L-10, and the
+> polkit policy-file integrity check (§4.2.2).
 >
 > Appendix A/B file lists and dependency counts are frozen at 2026-02-12.
 >
@@ -293,6 +306,11 @@ let rc = unsafe {
 - Consider adding `# Safety` documentation comments to each `unsafe` block explaining the preconditions.
 - Consider using the `rustix` crate (already in the dependency tree via `zbus`) which provides safe wrappers for `getpeereid` and `getsockopt`.
 
+**Status (RESOLVED, 2026-09-14):** All three blocks in
+`../crates/opaque-core/src/peer.rs` now carry `SAFETY` comments stating
+their preconditions (L-3). The `rustix` migration (L-9) remains tracked but
+optional; the raw `libc` calls are sound as reviewed.
+
 ---
 
 ### Finding 2.6: HIGH -- Unsafe Code Review in `approval.rs`
@@ -338,6 +356,11 @@ unsafe {
 - Add `# Safety` documentation.
 - Consider adding a log warning if `tx.take()` returns `None` (indicates the callback was invoked more than once).
 
+**Status (RESOLVED, 2026-09-14):** This code now lives in
+`../crates/opaque-native-approval/src/lib.rs`. All `unsafe` blocks carry
+`SAFETY` comments, and the reply block logs a warning when the callback is
+invoked more than once instead of dropping the second result silently (L-4).
+
 ---
 
 ### Finding 2.7: MEDIUM -- Denial of Service via Approval Semaphore Starvation
@@ -367,6 +390,14 @@ Even without a malicious actor, a legitimate but slow approval (user steps away)
 - Add a per-client request timeout shorter than the approval timeout (e.g., if the requester disconnects, cancel the approval and release the semaphore).
 - Implement a queue with a maximum depth (e.g., 3 pending approvals). Reject additional requests with a `"approval_busy"` error code.
 - When client identity is implemented, rate-limit approval requests per client identity.
+
+**Status (RESOLVED):** The approval semaphore now lives in the enclave
+(`../crates/opaqued/src/enclave.rs`) and is released when the requesting
+client disconnects (the in-flight request future is dropped when the
+connection splits detect EOF, see `handle_conn` in
+`../crates/opaqued/src/main.rs`). An `ApprovalRateLimiter` keyed on
+(pid, operation) rejects rapid-fire prompts, and the native prompt timeout
+is 60 seconds (see Finding 4.1.4).
 
 ---
 
@@ -399,6 +430,12 @@ A malicious process opens thousands of connections to the UDS socket. Each conne
 - Add per-client-IP (per-PID where available) connection limits.
 - Set a connection idle timeout (e.g., drop connections that haven't sent a request in 30 seconds).
 
+**Status (RESOLVED):** A `connection_semaphore` capped at 64 concurrent
+connections and a 30-second idle timeout are implemented in
+`../crates/opaqued/src/main.rs` (`DaemonState.connection_semaphore`,
+`handle_conn`). Per-PID limits were not added; the global cap plus the
+per-connection rate limiter (Finding 2.13) bound the resource cost.
+
 ---
 
 ### Finding 2.9: MEDIUM -- Connection Error Leaks Frame Parsing Details
@@ -428,6 +465,10 @@ This information assists in fingerprinting the server implementation.
 - Return fixed error messages: `"invalid frame"` and `"invalid request"`.
 - Log the detailed errors server-side at debug level.
 
+**Status (RESOLVED):** Clients now receive the fixed strings
+`"malformed frame"` and `"invalid JSON request"`
+(`../crates/opaqued/src/main.rs`, `handle_conn`); details stay server-side.
+
 ---
 
 ### Finding 2.10: MEDIUM -- Peer Credentials Not Verified Against UID
@@ -450,6 +491,14 @@ If socket permissions are misconfigured (e.g., the directory is world-readable d
 - After obtaining peer credentials, verify `peer.uid == current_uid`. Reject connections from different UIDs.
 - If peer credentials are unavailable (the `.ok()` path), reject the connection rather than proceeding.
 
+**Status (RESOLVED):** `trust_domain::peer_uid_allowed` gates every
+connection in `handle_conn` (`../crates/opaqued/src/main.rs`), mode-aware:
+shared-uid mode admits only the daemon's own uid, and the enforced split
+refuses exactly that uid while gating everyone else by socket group plus
+the daemon token handshake. Connections whose workload attestation is
+unavailable (including missing peer credentials) are rejected in
+`attest_connection`.
+
 ---
 
 ### Finding 2.11: LOW -- `whoami` Endpoint Not Implemented
@@ -470,6 +519,11 @@ The `whoami` endpoint returns `{"note": "not implemented"}`. When implemented, i
 - When implemented, return only the information the policy allows the client to see about itself.
 - Do not return the executable hash or codesign info to the client -- that information is for the daemon's policy engine, not for the client.
 
+**Status (RESOLVED):** `whoami` is implemented with disclosure scoped by
+client type: agent clients get minimal fields to prevent reconnaissance,
+human clients get the debugging view plus the logged-in principal
+(`../crates/opaqued/src/main.rs`, the `"whoami"` arm of `handle_request`).
+
 ---
 
 ### Finding 2.12: LOW -- Request ID Type Is Not Cryptographically Random
@@ -483,6 +537,11 @@ The `Request.id` field is a `u64`, and the client CLI hardcodes it to `1`. When 
 - Use UUID v4 (or v7 for time-ordered) for request identifiers.
 - The daemon should generate the canonical `request_id` for audit, not trust a client-supplied one.
 
+**Status (RESOLVED):** `OperationRequest.request_id` is a UUID v4 generated
+server-side (`../crates/opaque-core/src/operation.rs`); the wire-level
+`Request.id` remains a per-connection `u64` correlation id only, never used
+for audit identity.
+
 ---
 
 ### Finding 2.13: LOW -- No Rate Limiting on Any Endpoint
@@ -495,6 +554,12 @@ There is no rate limiting on RPC calls. A malicious client can send thousands of
 **Recommended Fix:**
 - Implement per-connection rate limiting (e.g., token bucket: 10 requests/second burst, 2 requests/second sustained).
 - Implement per-method rate limiting for sensitive endpoints (approval: 1 per 5 seconds).
+
+**Status (RESOLVED):** `ConnectionRateLimiter` (burst 10, sustained 2/s)
+runs per connection in `handle_conn`, and the enclave's
+`ApprovalRateLimiter` additionally windows approval prompts per
+(pid, operation) (`../crates/opaqued/src/main.rs`,
+`../crates/opaqued/src/enclave.rs`).
 
 ---
 
@@ -540,6 +605,11 @@ Both client and server use `LengthDelimitedCodec` with a 1MB max frame length. T
 **Recommendation:**
 - Reduce `max_frame_length` to 64KB or 128KB unless there is a specific need for larger frames. Current RPC payloads are tiny (< 1KB).
 - Combine with the connection limit from Finding 2.8.
+
+**Status (RESOLVED):** `opaque_core::MAX_FRAME_LENGTH` is 128KB
+(`../crates/opaque-core/src/lib.rs`) and every codec in the daemon and
+clients uses it; combined with the 64-connection cap, worst-case buffer
+allocation is bounded at 8MB.
 
 ### 3.3 Replay Attacks
 
@@ -612,7 +682,37 @@ The code at line 59 calls `canEvaluatePolicy_error` which should detect this and
 - Test behavior when the screen is locked.
 - Consider detecting `IOServiceGetMatchingService(kIOMainPortDefault, ...)` for display sleep state.
 
-**Status (PARTIALLY RESOLVED):** The deployment model (LaunchAgent only, `LimitLoadToSessionType: Aqua`) is now documented in [Deployment](deployment.md). The LaunchAgent plist prevents loading in non-GUI sessions. Session detection at daemon startup (calling `canEvaluatePolicy` as a preflight and refusing to start on failure) is specified but not yet implemented. Screen-lock behavior and Fast User Switching remain to be tested.
+**Status (PARTIALLY RESOLVED, re-verified 2026-09-14):** The deployment
+model (LaunchAgent only, `LimitLoadToSessionType: Aqua`) is documented in
+[Deployment](deployment.md). A per-prompt `canEvaluatePolicy` preflight is
+implemented (`../crates/opaque-native-approval/src/lib.rs`,
+`prompt_macos_blocking`): an unusable session yields a fixed
+`approval_unavailable` error at prompt time, so the failure mode is
+fail-closed, not undefined.
+
+Still open, with the blocking decision spelled out:
+
+- *Startup session preflight (H-8).* [Deployment](deployment.md) specifies
+  refusing to start when `canEvaluatePolicy` fails at startup. Implementing
+  that unconditionally would break two supported shapes: split deployments
+  (the daemon deliberately owns no GUI session and uses out-of-band factors
+  such as paired device or FIDO2) and session-mode configs whose factors do
+  not include `local_bio`. The decision needed: preflight only when the
+  effective factor set includes `local_bio` AND trust-domain enforcement is
+  off, and choose whether failure is fatal (exit non-zero per the spec) or
+  a startup warning plus the existing per-prompt fail-closed behavior. The
+  implementation is then a ~20-line check next to the config validation in
+  `../crates/opaqued/src/main.rs`, calling a small
+  `session_supports_local_authentication()` helper exported from
+  `opaque-native-approval`.
+- *Screen lock and Fast User Switching.* Cannot be verified in an automated
+  environment; needs a manual pass on hardware: (1) trigger an approval with
+  the screen locked, expect the dialog on the lock screen; (2) trigger an
+  approval while a second user owns the console, expect either a dialog on
+  the daemon owner's session or a clean `approval_unavailable`, never an
+  approval surfaced to the wrong user. Record the results in the
+  [Deployment](deployment.md) macOS edge-case table, whose FUS row is
+  explicitly marked "Needs testing".
 
 #### 4.1.3 Process Interaction with Prompt
 
@@ -643,6 +743,11 @@ The 120-second timeout on `rx.recv_timeout(Duration::from_secs(120))` means the 
 - Reduce the timeout to 60 seconds.
 - Add a mechanism for the user to cancel the approval from the daemon side (e.g., via the CLI: `opaque cancel`).
 - Release the semaphore when the requesting connection is dropped.
+
+**Status (RESOLVED):** The timeout is 60 seconds
+(`../crates/opaque-native-approval/src/lib.rs`, `prompt_macos_blocking`),
+and the approval semaphore is released when the requesting client
+disconnects (future cancellation in `handle_conn`, see Finding 2.7).
 
 ### 4.2 Linux polkit
 
@@ -690,6 +795,11 @@ The polkit action ID `com.opaque.approve` is a reverse-DNS identifier. A malicio
 - Verify the policy file integrity at daemon startup (hash check).
 - Consider namespacing operations into separate action IDs (e.g., `com.opaque.approve.github`, `com.opaque.approve.k8s`) for more granular policy in the future.
 
+**Status (OPEN, low):** Neither the startup hash check nor action-ID
+namespacing is implemented. Risk remains low (modifying the policy file
+requires root, and root bypasses polkit anyway); track as hardening, not a
+vulnerability.
+
 ### 4.3 Mobile (iOS) Pairing
 
 #### 4.3.1 QR Pairing Crypto Protocol Weaknesses
@@ -717,6 +827,15 @@ The documentation says "high-entropy" but does not specify the length or charact
 - Rate-limit pairing attempts to prevent brute-force (max 5 attempts per pairing session).
 - Add device listing: `opaque devices list` should show paired devices with their last-seen timestamp.
 
+**Status (RESOLVED):** Implemented in
+`../crates/opaque-approval/src/pairing/`: freshly paired devices are
+quarantined (`confirmed: false`) and no token they hold works until a human
+confirms the key fingerprint through the confirmation ceremony
+(`store.rs`); the pairing nonce is 32 random bytes with a session TTL and
+sessions are one-shot (`consumed` flag in `mod.rs`), which removes the
+brute-force window a per-attempt rate limit was meant to bound; device
+bearer tokens are 256-bit and stored only as SHA-256 digests.
+
 #### 4.3.2 MitM Prevention During Pairing
 
 **Analysis:**
@@ -730,6 +849,20 @@ The QR code includes either a pinned self-signed cert fingerprint or the server'
 - Always pin the server certificate using the pubkey from the QR code.
 - Use certificate-based mutual TLS after pairing (the device presents its Secure Enclave-backed certificate).
 - Never fall back to unpinned TLS.
+
+**Status (RESOLVED for the LAN server):** The approval server persists its
+TLS identity so paired devices can pin the certificate across restarts
+(`../crates/opaque-approval/src/approval_server.rs`,
+`load_or_create_tls_identity`); there is no unpinned fallback path.
+
+**Note (2026-09-14):** The APNs push relay
+(`../crates/opaque-approval/src/push.rs`) is compiled and unit-tested but
+deliberately NOT wired: the LAN approval server is the live second-device
+transport, and the relay activates only when an `[approval.apns]` config
+surface lands, since it is unusable without Apple credentials. Wiring it is
+a product decision (credential provisioning, fallback ordering between LAN
+and push, and notification content policy), not a code gap; leaving it dark
+adds no attack surface.
 
 #### 4.3.3 Challenge Construction Security
 
@@ -750,6 +883,12 @@ challenge = H(server_id || request_id || sha256(request_summary_json) || expires
 - Use a structured encoding before hashing (e.g., `canonical_json({server_id, request_id, summary_hash, expires_at})`) or use length-prefixed encoding.
 - Alternatively, use HMAC-SHA256 with the device's shared secret as the key, and include the structured fields as the message.
 - Specify the hash algorithm explicitly (SHA-256 recommended).
+
+**Status (RESOLVED):** Implemented with length-prefixed encoding (4-byte LE
+length per field) hashed with SHA-256, and the approve/reject decision is
+bound into the signed bytes so a relayed signed rejection can never be
+replayed as an approval
+(`../crates/opaque-approval/src/pairing/challenge.rs`, with tests).
 
 ---
 
@@ -778,6 +917,16 @@ unsafe { libc::umask(old_umask) };
 ```
 - This ensures the socket is created with restrictive permissions from the start.
 
+**Status (FIXED, 2026-09-14):** The daemon binds through
+`bind_unix_listener_private` in `../crates/opaque-core/src/socket.rs`,
+which swaps in a `0o177` umask for the duration of the `bind()` (RAII
+guard, restored even on error), so the socket file is exactly 0600 from
+its first instant; `lock_down_socket_path` remains as normalization. The
+regression test
+`bind_unix_listener_private_is_0600_from_birth_and_restores_umask` binds
+under a fully permissive umask and asserts the mode at birth plus umask
+restoration. This closes roadmap item C-6.
+
 ### 5.2 Directory Permission Race Conditions
 
 **File:** `../crates/opaque-core/src/socket.rs`, lines 24-39
@@ -800,6 +949,17 @@ if meta.uid() != current_uid {
     return Err(io::Error::new(io::ErrorKind::Other, "socket directory not owned by current user"));
 }
 ```
+
+**Status (FIXED, 2026-09-14):** `ensure_socket_parent_dir` now verifies the
+directory it adopts: `check_socket_dir_custody` in
+`../crates/opaque-core/src/socket.rs` refuses a symlinked parent and any
+owner other than the daemon's effective uid or root (root pre-creates
+`/run/opaque` in split deployments; a root daemon may adopt any directory).
+Symlinks deeper in the chain are rejected by `validate_path_chain`, which
+the daemon now runs before writing the pid file (see 5.4). Covered by
+`socket_dir_custody_rules` and
+`ensure_socket_parent_dir_rejects_symlinked_parent` tests. This closes
+roadmap item H-5.
 
 ### 5.3 Stale Socket File Handling (TOCTOU)
 
@@ -841,6 +1001,11 @@ if flock(lock.as_raw_fd(), FlockArg::LockExclusiveNonblock).is_err() {
 ```
 - This eliminates the race entirely.
 
+**Status (RESOLVED):** `PidFileGuard` in `../crates/opaqued/src/main.rs`
+takes a non-blocking exclusive `flock` on `<socket_dir>/opaqued.pid` before
+the stale-socket check, so two daemons can no longer race on stale-socket
+removal. This closes roadmap item H-6.
+
 ### 5.4 Symlink Attacks on Socket Path
 
 **File:** `../crates/opaque-core/src/socket.rs`, lines 6-22
@@ -861,6 +1026,14 @@ if socket.symlink_metadata()?.file_type().is_symlink() {
 }
 ```
 - Combine with the directory ownership check from 5.2.
+
+**Status (RESOLVED):** The daemon never trusts `OPAQUE_SOCK` from the
+environment (`socket_path_for_client(false)` in
+`../crates/opaque-core/src/socket.rs`) and runs `validate_path_chain`,
+which rejects a symlink at any component of the socket path, before the
+pid file is written and before `bind()` (`../crates/opaqued/src/main.rs`).
+Clients independently refuse symlinked or mis-permissioned sockets via
+`verify_socket_safety`. This closes roadmap item M-4.
 
 ---
 
@@ -1073,52 +1246,52 @@ restore command. See [deployment](deployment.md#upgrading-existing-custody).
 | C-3 | Finding 2.4 | ~~Never pass client-supplied strings to OS approval dialogs.~~ **DONE:** Approval description is constructed by the enclave from verified `OperationRequest` fields, never from client-supplied reason text. | Small |
 | C-4 | Finding 2.3 | ~~Sanitize all error messages returned to clients.~~ **DONE:** Error messages scrubbed in hardening pass. `bad_frame` -> `"malformed frame"`, `bad_json` -> `"invalid JSON request"`, workspace errors -> generic message. Details logged server-side only. | Small |
 | C-5 | Finding 2.10 | ~~Verify peer UID matches daemon UID.~~ **DONE:** `verify_peer_uid()` implemented. Connections from different UIDs or with unavailable peer creds are silently rejected. | Small |
-| C-6 | Section 5.1 | Set umask to `0o077` before `bind()` to eliminate the socket permission race window. | Small |
+| C-6 | Section 5.1 | ~~Set umask to `0o077` before `bind()` to eliminate the socket permission race window.~~ **DONE (2026-09-14):** `bind_unix_listener_private` (0o177 umask guard in `opaque-core/src/socket.rs`) makes the socket 0600 from birth; regression-tested. | Small |
 
 ### 8.2 High Priority -- Do Before v1 Release
 
 | ID | Finding | Action | Effort |
 |----|---------|--------|--------|
-| H-1 | Finding 2.8 | Add a connection semaphore (max 64 concurrent connections). | Small |
-| H-2 | Finding 2.7 | Add per-client approval rate limiting. Release semaphore when client disconnects. | Medium |
-| H-3 | Section 3.2 | Reduce `max_frame_length` from 1MB to 128KB. | Small |
-| H-4 | Finding 2.13 | Implement per-connection rate limiting (token bucket). | Medium |
-| H-5 | Section 5.2 | Add symlink and ownership checks on socket directory. | Small |
-| H-6 | Section 5.3 | Add PID file with advisory locking for single-instance protection. | Small |
+| H-1 | Finding 2.8 | ~~Add a connection semaphore (max 64 concurrent connections).~~ **DONE:** `connection_semaphore` (64) in `opaqued/src/main.rs`, plus a 30s idle timeout. | Small |
+| H-2 | Finding 2.7 | ~~Add per-client approval rate limiting. Release semaphore when client disconnects.~~ **DONE:** `ApprovalRateLimiter` per (pid, operation) in `opaqued/src/enclave.rs`; disconnect cancels the in-flight request and releases the semaphore. | Medium |
+| H-3 | Section 3.2 | ~~Reduce `max_frame_length` from 1MB to 128KB.~~ **DONE:** `MAX_FRAME_LENGTH = 128 * 1024` in `opaque-core/src/lib.rs`, used by every codec. | Small |
+| H-4 | Finding 2.13 | ~~Implement per-connection rate limiting (token bucket).~~ **DONE:** `ConnectionRateLimiter` (burst 10, sustained 2/s) in `opaqued/src/main.rs`. | Medium |
+| H-5 | Section 5.2 | ~~Add symlink and ownership checks on socket directory.~~ **DONE (2026-09-14):** `check_socket_dir_custody` in `opaque-core/src/socket.rs` (symlink + ownership), with `validate_path_chain` covering the full path before the pid file and bind. | Small |
+| H-6 | Section 5.3 | ~~Add PID file with advisory locking for single-instance protection.~~ **DONE:** `PidFileGuard` (`flock` LOCK_EX\|LOCK_NB) in `opaqued/src/main.rs`. | Small |
 | H-7 | Section 4.2.1 | ~~Implement polkit intent visibility detection. Fail closed when the auth agent cannot show operation details.~~ **DONE:** Two-step approval flow (intent dialog + polkit auth) implemented. Supported desktops documented in [Deployment](deployment.md). | Medium |
-| H-8 | Section 4.1.2 | ~~Document supported macOS deployment models (LaunchAgent only).~~ **PARTIALLY DONE:** Documented in [Deployment](deployment.md). Session detection at daemon startup not yet implemented. | Medium |
-| H-9 | Section 6.3 | Add `cargo audit` to CI pipeline. Pin all dependency versions. | Small |
-| H-10 | -- | Implement the `OperationRequest` envelope (PRD US-002) with versioning, binding approvals to specific operations. | Large |
+| H-8 | Section 4.1.2 | ~~Document supported macOS deployment models (LaunchAgent only).~~ **PARTIALLY DONE:** Documented in [Deployment](deployment.md); per-prompt `canEvaluatePolicy` preflight fails closed. Startup session detection still open; the gating decision and implementation sketch are written out in the 4.1.2 status note. | Medium |
+| H-9 | Section 6.3 | ~~Add `cargo audit` to CI pipeline. Pin all dependency versions.~~ **DONE:** `cargo-deny` (with `[advisories]` in `deny.toml`) runs in `ci.yml`; `dependency-review.yml` and OSSF `scorecard.yml` also run; versions pinned via `Cargo.lock`. | Small |
+| H-10 | -- | ~~Implement the `OperationRequest` envelope (PRD US-002) with versioning, binding approvals to specific operations.~~ **DONE:** `OperationRequest` in `opaque-core/src/operation.rs`; approvals bind to the canonical request hash (params included, request_id excluded). | Large |
 
 ### 8.3 Medium Priority -- Address in v1 Lifecycle
 
 | ID | Finding | Action | Effort |
 |----|---------|--------|--------|
-| M-1 | Section 4.3.1 | Implement key confirmation step for mobile pairing. | Medium |
-| M-2 | Section 4.3.3 | Use structured encoding (canonical JSON or length-prefixed) for challenge construction. | Small |
-| M-3 | Finding 2.12 | Use UUID v4/v7 for request identifiers. Generate canonical IDs server-side. | Small |
-| M-4 | Section 5.4 | Add symlink check before binding to socket path (especially when `OPAQUE_SOCK` is set). | Small |
-| M-5 | Section 3.5 | Implement per-session challenge-response to prevent PID reuse attacks. | Medium |
-| M-6 | -- | Implement audit log with redaction levels (human vs. agent feed). | Large |
-| M-7 | -- | Implement approval leases with scoped TTL (PRD US-004). | Medium |
-| M-8 | -- | Add client executable hash verification on macOS (codesign) and Linux (/proc/pid/exe). | Medium |
-| M-9 | Section 7.1 | Implement core dump prevention (`prctl(PR_SET_DUMPABLE, 0)` on Linux). | Small |
-| M-10 | -- | Implement connection idle timeout (30 seconds without a request). | Small |
+| M-1 | Section 4.3.1 | ~~Implement key confirmation step for mobile pairing.~~ **DONE:** confirmation ceremony with key fingerprint; unconfirmed devices are quarantined (`opaque-approval/src/pairing/store.rs`). | Medium |
+| M-2 | Section 4.3.3 | ~~Use structured encoding (canonical JSON or length-prefixed) for challenge construction.~~ **DONE:** length-prefixed SHA-256 encoding with decision binding (`opaque-approval/src/pairing/challenge.rs`). | Small |
+| M-3 | Finding 2.12 | ~~Use UUID v4/v7 for request identifiers. Generate canonical IDs server-side.~~ **DONE:** `OperationRequest.request_id` is a server-generated UUID v4. | Small |
+| M-4 | Section 5.4 | ~~Add symlink check before binding to socket path (especially when `OPAQUE_SOCK` is set).~~ **DONE:** `validate_path_chain` before bind; the daemon ignores `OPAQUE_SOCK` entirely. | Small |
+| M-5 | Section 3.5 | ~~Implement per-session challenge-response to prevent PID reuse attacks.~~ **DONE (different mechanism):** the first frame of every connection must present the daemon token (0600 file beside the socket), sessions carry their own tokens, and `opqd1` Ed25519 delegation tokens bind requests to a verified principal; identity no longer rests on the PID alone. | Medium |
+| M-6 | -- | ~~Implement audit log with redaction levels (human vs. agent feed).~~ **DONE:** hash-chained SQLite audit sink with sanitized summaries (`opaque-core/src/audit.rs`, `sanitize.rs`). | Large |
+| M-7 | -- | ~~Implement approval leases with scoped TTL (PRD US-004).~~ **DONE:** lease cache keyed on (client, operation, target, secrets, params hash) in `opaqued/src/enclave.rs`. | Medium |
+| M-8 | -- | ~~Add client executable hash verification on macOS (codesign) and Linux (/proc/pid/exe).~~ **DONE:** `ClientIdentity` carries `exe_path`, `exe_sha256`, `codesign_team_id` (`opaque-core/src/operation.rs`); policy matches on them. | Medium |
+| M-9 | Section 7.1 | ~~Implement core dump prevention (`prctl(PR_SET_DUMPABLE, 0)` on Linux).~~ **DONE:** `PR_SET_DUMPABLE=0` on Linux and `RLIMIT_CORE=0` on macOS at startup (`opaqued/src/main.rs`). | Small |
+| M-10 | -- | ~~Implement connection idle timeout (30 seconds without a request).~~ **DONE:** 30s idle timeout in `handle_conn`. | Small |
 
 ### 8.4 Low Priority -- Track for Future
 
 | ID | Finding | Action | Effort |
 |----|---------|--------|--------|
-| L-1 | Finding 2.11 | Implement `whoami` with appropriate information disclosure controls. | Small |
-| L-2 | Section 3.1 | Define typed param structs per RPC method instead of `serde_json::Value`. | Medium |
-| L-3 | Finding 2.5 | Add `# Safety` documentation to all `unsafe` blocks. | Small |
-| L-4 | Finding 2.6 | Add logging for unexpected double-invocation of the LA callback. | Small |
-| L-5 | Section 4.3.1 | Specify minimum pairing code entropy (128 bits). Rate-limit pairing attempts. | Small |
-| L-6 | Section 6.2 | Consider vendoring `objc2` and `zbus` ecosystems for production builds. | Medium |
-| L-7 | -- | Implement reproducible builds for binary verification. | Large |
-| L-8 | -- | Add integration tests that verify error messages never contain secret values. | Medium |
-| L-9 | -- | Consider `rustix` safe wrappers for peer credential lookups instead of raw `libc` FFI. | Medium |
-| L-10 | Section 4.1.3 | Consider requiring biometrics-only policy (`LAPolicyDeviceOwnerAuthenticationWithBiometrics`) to prevent password fallback. | Small |
+| L-1 | Finding 2.11 | ~~Implement `whoami` with appropriate information disclosure controls.~~ **DONE:** agent clients get minimal fields, human clients the debugging view (`opaqued/src/main.rs`). | Small |
+| L-2 | Section 3.1 | Define typed param structs per RPC method instead of `serde_json::Value`. **OPEN (partial):** the wrapper methods parse into typed `OperationRequest`s with validation (`opaqued/src/rpc_wrappers.rs`), but top-level `params` remains `serde_json::Value`. Acceptable; revisit if the method surface grows. | Medium |
+| L-3 | Finding 2.5 | ~~Add `# Safety` documentation to all `unsafe` blocks.~~ **DONE (2026-09-14):** `SAFETY` comments on the FFI blocks in `opaque-core/src/peer.rs`, `opaque-core/src/socket.rs`, and `opaque-native-approval/src/lib.rs`. | Small |
+| L-4 | Finding 2.6 | ~~Add logging for unexpected double-invocation of the LA callback.~~ **DONE (2026-09-14):** the reply block warns instead of silently dropping a second result (`opaque-native-approval/src/lib.rs`). | Small |
+| L-5 | Section 4.3.1 | ~~Specify minimum pairing code entropy (128 bits). Rate-limit pairing attempts.~~ **DONE:** 256-bit one-shot pairing nonce with TTL; 256-bit bearer tokens stored as SHA-256; quarantine until fingerprint confirmation. | Small |
+| L-6 | Section 6.2 | Consider vendoring `objc2` and `zbus` ecosystems for production builds. **OPEN:** not vendored; mitigated by `Cargo.lock` pinning, `cargo-deny` advisories, and dependency review in CI. | Medium |
+| L-7 | -- | Implement reproducible builds for binary verification. **OPEN:** release workflow has no provenance attestation yet; SBOM/CI work is in flight on this branch. Recommend `cargo auditable` plus SLSA provenance in `release.yml` once the SBOM lands. | Large |
+| L-8 | -- | Add integration tests that verify error messages never contain secret values. **PARTIALLY DONE:** `opaque-core/src/sanitize.rs` unit tests cover scrubbing, and `opaqued/tests/provider_e2e.rs` drives a live daemon asserting the agent feed never sees the secret; a dedicated error-path secret-leak sweep is still worth adding. | Medium |
+| L-9 | -- | Consider `rustix` safe wrappers for peer credential lookups instead of raw `libc` FFI. **OPEN:** still raw `libc`, now with `SAFETY` documentation; migration is optional hardening. | Medium |
+| L-10 | Section 4.1.3 | Consider requiring biometrics-only policy (`LAPolicyDeviceOwnerAuthenticationWithBiometrics`) to prevent password fallback. **OPEN (deliberate):** `DeviceOwnerAuthentication` retains the password fallback so Macs without biometric hardware keep working ([Deployment](deployment.md) edge cases). Recommend an opt-in config knob for biometrics-only rather than a default change. | Small |
 
 ---
 
