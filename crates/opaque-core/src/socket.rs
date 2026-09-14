@@ -303,6 +303,14 @@ pub fn validate_path_chain(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Serializes tests that open a process-wide umask window (which
+/// `bind_unix_listener_private` does) against tests elsewhere in the crate
+/// that create mode-sensitive temp directories. The test runner is
+/// multi-threaded and umask is process-global, so without this a concurrent
+/// temp dir can be created non-searchable and its later writes fail.
+#[cfg(test)]
+pub(crate) static UMASK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -515,6 +523,9 @@ mod tests {
     #[test]
     fn bind_unix_listener_private_is_0600_from_birth_and_restores_umask() {
         use std::os::unix::fs::MetadataExt;
+        // Held for the whole test: the umask window below is process-global and
+        // would otherwise corrupt a concurrent test's temp dir creation.
+        let _serial = UMASK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Socket paths must stay under SUN_LEN (macOS: 104 bytes), so this
         // lives directly under /tmp rather than in a nested tempdir.
         let dir = PathBuf::from("/tmp")
