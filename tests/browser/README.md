@@ -25,3 +25,13 @@ visual/accessibility certification, or native human approval qualification.
 A separate process regression creates an actual orphaned descendant, verifies
 that cleanup removes its owned process group, and retains the cleanup failure.
 Requiring forced termination fails acceptance even after the process is removed.
+# Dashboard checks in workspace coverage
+
+`collect_critical_coverage.py --acceptance browser` runs the same four Node tests,
+including the three actual Chromium dashboard scenarios. The runner copies the
+locked browser harness to private runtime output and uses the collector's exact
+`opaque-web` and `opaqued` binaries. Each observed Rust process must retain its own
+fresh LLVM counters and preserve its binary hash and cleanup result. Browser and
+JavaScript code are outside the Rust workspace percentage. macOS and Linux are
+qualified separately. `--browser-cache` can select an existing Playwright engine
+cache explicitly; otherwise the locked Playwright version installs its engine.

@@ -8,10 +8,11 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import xml.etree.ElementTree as ET
 
 import synthesized_suite as suite
+import acceptance_coverage
 
 
 class RunnerTests(unittest.TestCase):
@@ -291,6 +292,39 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(report["tests"][0]["reason"], "model_profile_changed")
         self.assertEqual(report["counts"]["unique_tests_passed"], 0)
 
+    def test_explicit_model_coverage_uses_exact_prebuilt_object_without_cargo_rebuild(self):
+        self.model_requirement()
+        self.manifest["targets"][0].update(package="opaqued", name="contained_ssh_e2e")
+        model = self.root / "model.json"
+        model.write_text("explicit synthetic model profile")
+        value = {"objects": {"model-test": {"path": str(self.binary)}}, "target": "x86_64-unknown-linux-gnu",
+                 "_input_sha256": "d" * 64}
+        observed = []
+        def fake(argv, **kwargs):
+            if argv[0] == "rustc":
+                return suite.CommandResult(0, ("release: 1.98.0-nightly\nhost: " + value["target"] + "\ncommit-hash: " + "a"*40 + "\n").encode())
+            if "--exact" in argv:
+                observed.append(kwargs["env"].copy())
+            return self.fake(argv, **kwargs)
+        with patch.object(acceptance_coverage, "load", return_value=value), \
+             patch.object(acceptance_coverage, "environment", return_value={"LLVM_PROFILE_FILE": "/explicit/test-%p-%m-%c.profraw"}), \
+             patch.object(suite.shutil, "which", return_value="/fixture/tool"):
+            report = suite.run_suite(self.manifest, self.root, "model", self.target, executor=fake,
+                snapshot=lambda _: self.snapshot_value, model_profile=model, coverage_input=self.root / "coverage.json")
+        self.assertEqual(report["status"], "passed")
+        self.assertFalse(any(call[0] == "cargo" for call in self.calls))
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(observed[0]["LLVM_PROFILE_FILE"], "/explicit/test-%p-%m-%c.profraw")
+        self.assertEqual(report["instrumented_acceptance_input_sha256"], "d" * 64)
+
+    def test_ambient_coverage_input_never_changes_the_stable_default_runner(self):
+        with patch.dict(os.environ, {"OPAQUE_COVERAGE_INPUT": "/ambient/objects.json", "LLVM_PROFILE_FILE": "/ambient.profraw"}), \
+             patch.object(acceptance_coverage, "load") as load:
+            report = self.run_report()
+        self.assertEqual(report["status"], "passed")
+        self.assertIsNone(report["instrumented_acceptance_input_sha256"])
+        load.assert_not_called()
+
     def packaged_fixture(self):
         self.manifest["requirements"] = [r for r in self.manifest["requirements"] if r["profile"] != "packaged"]
         for system in ("linux", "darwin"):
@@ -448,6 +482,26 @@ class RunnerTests(unittest.TestCase):
         while alive() and time.monotonic() < deadline:
             time.sleep(0.02)
         self.assertFalse(alive())
+
+    def test_zombie_permission_race_requires_observed_group_absence_and_reaping(self):
+        process = Mock(pid=12345)
+        with patch.object(suite.os, "killpg", side_effect=[None, PermissionError(1, "synthetic EPERM"), ProcessLookupError()]) as killpg, \
+             patch.object(suite.time, "sleep"):
+            self.assertTrue(suite.stop_group(process))
+        self.assertEqual([call.args for call in killpg.call_args_list], [(12345, signal.SIGTERM), (12345, 0), (12345, 0)])
+        self.assertEqual(process.poll.call_count, 2)
+        process.wait.assert_called_once_with(timeout=1)
+
+    def test_persistent_group_permission_denial_fails_and_still_reaps_direct_child(self):
+        process = Mock(pid=12345)
+        with patch.object(suite.os, "killpg", side_effect=PermissionError(1, "synthetic live-group denial")) as killpg, \
+             patch.object(suite.time, "monotonic", side_effect=[0, 0, 1, 1, 1, 2]), \
+             patch.object(suite.time, "sleep"):
+            with self.assertRaisesRegex(suite.Invalid, "cleanup_permission_denied"):
+                suite.stop_group(process)
+        self.assertEqual([call.args for call in killpg.call_args_list],
+                         [(12345, signal.SIGTERM), (12345, 0), (12345, signal.SIGKILL), (12345, 0)])
+        process.wait.assert_called_once_with(timeout=1)
 
 
 if __name__ == "__main__":

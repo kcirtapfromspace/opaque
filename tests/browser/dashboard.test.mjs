@@ -11,6 +11,11 @@ import {processFixture} from './processes.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const binaries = resolve(process.env.OPAQUE_BROWSER_BINARY_DIR || join(root, 'target/debug'));
+const coverageProfiles = process.env.OPAQUE_BROWSER_COVERAGE_PROFILE_DIR;
+const coverageEvents = process.env.OPAQUE_BROWSER_COVERAGE_EVENTS;
+assert.equal(Boolean(coverageProfiles), Boolean(coverageEvents), 'coverage requires both explicit output paths');
+const withCoverage = (env, role) => coverageProfiles ? {...env,
+  LLVM_PROFILE_FILE: join(coverageProfiles, `${role}-%p-%m-%c.profraw`)} : env;
 const hostileName = '<img src=x onerror="window.opaqueInjected=true">';
 
 async function waitFor(check, description, timeout = 20_000) {
@@ -40,14 +45,14 @@ async function fixture(t, {live = false, viewport} = {}) {
   const env = {PATH: process.env.PATH, HOME: directory, LANG: 'C', RUST_LOG: 'info', OPAQUE_CONFIG: config};
   let daemon;
   if (live) {
-    daemon = processFixture(join(binaries, 'opaqued'), [], env);
+    daemon = processFixture(join(binaries, 'opaqued'), [], withCoverage(env, 'daemon'), coverageEvents);
     cleanup.push(() => daemon.stop());
     await waitFor(async () => {
       daemon.alive();
       try { await readFile(join(directory, 'run/daemon.token')); return true; } catch { return false; }
     }, 'real daemon socket/token');
   }
-  const web = processFixture(join(binaries, 'opaque-web'), ['--port', '0', '--data-dir', directory, '--config', config, '--socket', socket], env);
+  const web = processFixture(join(binaries, 'opaque-web'), ['--port', '0', '--data-dir', directory, '--config', config, '--socket', socket], withCoverage(env, 'web'), coverageEvents);
   cleanup.push(() => web.stop());
   await waitFor(() => {
     web.alive();

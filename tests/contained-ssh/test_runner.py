@@ -18,6 +18,18 @@ def result(code=0, stdout=b""):
 
 
 class CleanupTests(unittest.TestCase):
+    def test_coverage_acceptance_is_explicit_and_rejects_invalid_combinations_before_docker(self):
+        invalid = (["--acceptance", "model"], ["--coverage-allow-dirty"],
+                   ["--coverage", "--coverage-acceptance-only"],
+                   ["--coverage", "--acceptance", "model", "--acceptance", "model"],
+                   ["--coverage", "--model-file", "/unused/model.gguf"])
+        for arguments in invalid:
+            with self.subTest(arguments=arguments), patch.object(RUNNER.sys, "argv", ["run.py", "--output", "/unused/output", *arguments]), \
+                 patch.object(RUNNER, "command") as command:
+                with self.assertRaises(SystemExit):
+                    RUNNER.main()
+                command.assert_not_called()
+
     def test_restrictive_umask_keeps_outer_private_and_mount_traversable(self):
         previous_umask = os.umask(0o077)
         try:

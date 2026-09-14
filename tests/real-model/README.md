@@ -50,3 +50,23 @@ Runner regressions, without downloading a model or starting Docker:
 ```sh
 python3 -B -m unittest discover -s tests/real-model -p 'test_*.py' -v
 ```
+# Actual completions in workspace coverage
+
+Run the existing completion and signed-review check against instrumented Rust
+objects in the same owned Linux host:
+
+```sh
+python3 -B tests/contained-ssh/run.py --coverage \
+  --acceptance packaged --acceptance browser --acceptance model --acceptance service \
+  --output /tmp/opaque-workspace-acceptance-coverage
+```
+
+The collector compiles every Cargo workspace package once with the same pinned
+nightly instrumentation, then gives the model runner an explicit prebuilt test
+object. The pinned engine still performs real completions; its native metadata,
+artifact hashes, observed generation and signed-review/replay checks remain
+mandatory. Rust daemon, test and peer counters join the native workspace report.
+The external model engine is not counted as Rust workspace source. Stable model
+acceptance retains its original toolchain and does not inherit coverage inputs.
+`--coverage-acceptance-only` is a partial development probe and cannot report a
+full workspace collection; dirty candidates require `--coverage-allow-dirty`.

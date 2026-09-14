@@ -102,9 +102,20 @@ def main():
     parser.add_argument("--model-file", type=Path,
                         help="existing pinned GGUF; otherwise download the immutable public asset")
     parser.add_argument("--model-image", default="opaque-contained-real-model:local")
+    parser.add_argument("--acceptance", action="append", choices=("packaged", "browser", "model", "service"), default=[],
+                        help="with --coverage, run existing acceptance using the same instrumented objects")
+    parser.add_argument("--coverage-acceptance-only", action="store_true", help="partial development collection; not a full qualification")
+    parser.add_argument("--coverage-allow-dirty", action="store_true", help="explicit local instrumented candidate only")
     args = parser.parse_args()
-    if args.model_file and not args.real_model:
-        parser.error("--model-file requires --real-model")
+    wants_model = args.real_model or (args.coverage and "model" in args.acceptance)
+    if args.model_file and not wants_model:
+        parser.error("--model-file requires --real-model or explicit model coverage acceptance")
+    if (args.acceptance or args.coverage_acceptance_only or args.coverage_allow_dirty) and not args.coverage:
+        parser.error("coverage acceptance options require --coverage")
+    if len(args.acceptance) != len(set(args.acceptance)):
+        parser.error("each acceptance may be selected once")
+    if args.coverage_acceptance_only and not args.acceptance:
+        parser.error("--coverage-acceptance-only requires explicit acceptance selection")
     os.umask(0o077)
     for cache in (args.registry_cache, args.target_cache):
         if cache and not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}", cache):
@@ -133,18 +144,24 @@ def main():
     model = None
     assets = None
     try:
-        if args.real_model:
+        if wants_model:
             assets = model_assets()
             model = assets.obtain_model(args.model_file, output)
             record["model_host_before"] = assets.verify_model(model)
         command(["docker", "build", "--tag", args.image, str(Path(__file__).parent)],
                 timeout=900, log=output / "image-build.log")
         selected_image = args.image
-        if args.real_model:
+        if wants_model:
             command(["docker", "build", "--build-arg", "CONTAINED_IMAGE=" + args.image,
                      "--tag", args.model_image, str(ROOT / "tests/real-model")],
                     timeout=1800, log=output / "model-image-build.log")
             selected_image = args.model_image
+        if "service" in args.acceptance:
+            service_image = selected_image + "-service"
+            command(["docker", "build", "--build-arg", "CONTAINED_IMAGE=" + selected_image,
+                     "--tag", service_image, str(ROOT / "tests/service")],
+                    timeout=300, log=output / "service-image-build.log")
+            selected_image = service_image
         image = json.loads(command(["docker", "image", "inspect", selected_image]).stdout)[0]
         record["image"] = {"id": image["Id"], "architecture": image["Architecture"], "os": image["Os"]}
         common = Path(git("rev-parse", "--git-common-dir"))
@@ -185,8 +202,14 @@ def main():
             arguments = ["scripts/collect_critical_coverage.py", "--contained", "--source-root", str(ROOT),
                          "--target-dir", "/target", "--reuse-target-dir", "--output", "/evidence/coverage",
                          "--collector", "/coverage-tools/bin/cargo-llvm-cov"]
+            for purpose in args.acceptance:
+                arguments += ["--acceptance", purpose]
+            if args.coverage_acceptance_only:
+                arguments.append("--acceptance-only")
+            if args.coverage_allow_dirty:
+                arguments.append("--acceptance-allow-dirty")
             report_path = artifacts / "coverage/collection.json"
-            expected = "collected"
+            expected = "acceptance_only_collected" if args.coverage_acceptance_only else "collected"
         elif args.real_model:
             arguments = ["tests/real-model/service.py", "--source-root", str(ROOT),
                          "--target-dir", "/target", "--output", "/evidence/model",
@@ -249,7 +272,7 @@ def main():
     print(json.dumps({"status": record["status"], "cleanup": record["cleanup"], "output": str(output)}))
     # Successful collection does not mean the literal coverage gate passed.
     # Consumers must enforce coverage/coverage-summary.json independently.
-    return 0 if record["status"] in ("passed", "collected") else 1
+    return 0 if record["status"] in ("passed", "collected", "acceptance_only_collected") else 1
 
 
 if __name__ == "__main__":

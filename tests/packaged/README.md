@@ -44,3 +44,14 @@ Run transport and report-rejection tests with:
 ```sh
 python3 -B -m unittest discover -s tests/packaged -p 'test_*.py'
 ```
+# Installed checks in workspace coverage
+
+The workspace collector can run these same checks with `--acceptance packaged`.
+It packages its already instrumented native tools, binds their checksums to an
+explicit coverage input, and requires a fresh per-process LLVM profile from every
+installed Rust command, including commands run as the separate custody accounts.
+The existing archive, source revision, signed-app and negative custody checks stay
+mandatory. This is an instrumented build candidate; it does not qualify a published
+signature or native human approval. Ordinary acceptance never inherits ambient
+coverage flags. Private counter files and exact mapping objects stay in the local
+collection output; only sanitized reports are CI artifacts.

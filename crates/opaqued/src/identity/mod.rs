@@ -235,6 +235,9 @@ impl IdentityRuntime {
         };
         let now = opaque_core::identity::now_unix();
         if let Some(context) = requester {
+            if self.store.delegation_revocation_failed(&context.jti) {
+                return Err("requester delegation revocation could not be persisted".into());
+            }
             let principal = read_principal(&context.sub)?;
             let actor = read_principal(&context.act)?;
             if !self.principal_permitted(&principal)

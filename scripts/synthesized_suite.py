@@ -157,25 +157,39 @@ class CommandResult:
 def stop_group(process):
     """Terminate only the process group created for this invocation."""
     forced = False
-    for sig, grace in ((signal.SIGTERM, 0.5), (signal.SIGKILL, 0.5)):
-        try:
-            os.killpg(process.pid, sig)
-            forced = True
-        except ProcessLookupError:
-            break
-        deadline = time.monotonic() + grace
-        while time.monotonic() < deadline:
-            process.poll()
+    denied = None
+    try:
+        for sig, grace in ((signal.SIGTERM, 0.5), (signal.SIGKILL, 0.5)):
             try:
-                os.killpg(process.pid, 0)
+                os.killpg(process.pid, sig)
+                forced = True
             except ProcessLookupError:
                 return forced
-            time.sleep(0.02)
-    try:
-        process.wait(timeout=1)
-    except subprocess.TimeoutExpired:
-        pass
-    return forced
+            except PermissionError as error:
+                denied = error
+            deadline = time.monotonic() + grace
+            while time.monotonic() < deadline:
+                process.poll()
+                try:
+                    os.killpg(process.pid, 0)
+                except ProcessLookupError:
+                    return forced
+                except PermissionError as error:
+                    # Darwin can return EPERM for an exited, zombie-only group.
+                    # Reap/poll within the same deadline and require real ESRCH;
+                    # permission denial alone never proves group removal.
+                    denied = error
+                time.sleep(0.02)
+        if denied is not None:
+            raise Invalid("process_group_cleanup_permission_denied") from denied
+        return forced
+    finally:
+        # An inspection error must not bypass retirement of our direct child.
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=1)
 
 
 def invoke(argv, *, cwd, env, timeout):
@@ -369,7 +383,7 @@ def toolchain_snapshot(root, executor):
 def packaged_report(value, *, source, target, version, archive_sha256):
     fields(value, ("schema", "status", "version", "target", "source_revision", "source_tree_sha256",
                    "archive_sha256", "candidate_qualification", "transport", "published_signature_verified",
-                   "native_human_approval", "service_registration", "cases", "native_capability"))
+                   "native_human_approval", "service_registration", "cases", "native_capability"), ("coverage",))
     require(value["schema"] == "opaque.packaged-acceptance.v1" and value["status"] == "passed", "packaged_runner_did_not_pass")
     require(value["source_revision"] == source["revision"] and value["version"] == version
             and value["source_tree_sha256"] == source["release_tree_sha256"], "packaged_source_identity_mismatch")
@@ -389,7 +403,8 @@ def packaged_report(value, *, source, target, version, archive_sha256):
 
 
 def run_suite(manifest, root, profile, target_dir, *, executor=invoke, snapshot=source_snapshot, model_profile=None,
-              packaged_archive=None, packaged_owner_user=None, packaged_peer_user=None, packaged_allow_dirty=False):
+              packaged_archive=None, packaged_owner_user=None, packaged_peer_user=None, packaged_allow_dirty=False,
+              coverage_input=None):
     validate_manifest(manifest)
     require(profile in (*SOFTWARE, "all"), "unknown_profile")
     selected = set(SOFTWARE if profile == "all" else (profile,))
@@ -413,6 +428,11 @@ def run_suite(manifest, root, profile, target_dir, *, executor=invoke, snapshot=
         initial = snapshot(root)
     except (Invalid, OSError, ValueError, UnicodeError):
         initial = None
+    coverage = None
+    if coverage_input is not None:
+        import acceptance_coverage
+        require(profile in ("model", "packaged") and initial is not None, "coverage_requires_explicit_native_acceptance_profile")
+        coverage = acceptance_coverage.load(coverage_input, root=root, purpose=profile, source=initial)
     results = {}
     commands = []
     artifacts = {}
@@ -437,14 +457,26 @@ def run_suite(manifest, root, profile, target_dir, *, executor=invoke, snapshot=
                 require(not target["root"] or os.geteuid() == 0, "root_required")
                 require(not target.get("requires_sys_ptrace") or has_sys_ptrace(), "sys_ptrace_required")
                 require(all(shutil.which(tool) for tool in ("cargo", "git", *target["tools"])), "tool_unavailable")
-                built = executor(build_argv(target, target_dir), cwd=root, env=environment(),
-                                 timeout=target["build_timeout_seconds"])
-                command_ok(built)
-                binary = artifact(built.output, target, target_dir)
+                if coverage:
+                    require(profile == "model" and target["package"] == "opaqued"
+                            and target["kind"] == "test" and target["name"] == "contained_ssh_e2e",
+                            "coverage_prebuilt_target_mismatch")
+                    require(toolchain["host"] == coverage["target"] and "-nightly" in toolchain["release"],
+                            "coverage_native_toolchain_mismatch")
+                    binary = Path(coverage["objects"]["model-test"]["path"])
+                    require(binary.resolve().is_relative_to(target_dir.resolve()), "coverage_target_directory_mismatch")
+                else:
+                    built = executor(build_argv(target, target_dir), cwd=root, env=environment(),
+                                     timeout=target["build_timeout_seconds"])
+                    command_ok(built)
+                    binary = artifact(built.output, target, target_dir)
                 binary_hash = digest(binary.read_bytes())
                 # Libtest's terse listing omits its inventory-count footer.
                 # The ordinary format lets us reject a truncated listing.
-                listed = executor([str(binary), "--list"], cwd=root, env=run_env, timeout=30)
+                inventory_env = run_env.copy()
+                if coverage:
+                    inventory_env["LLVM_PROFILE_FILE"] = str(Path(temporary) / "inventory-%p-%m-%c.profraw")
+                listed = executor([str(binary), "--list"], cwd=root, env=inventory_env, timeout=30)
                 command_ok(listed)
                 discovered = inventory(listed.output)
                 require(all(case["name"] in discovered for case in cases), "required_test_missing")
@@ -473,6 +505,8 @@ def run_suite(manifest, root, profile, target_dir, *, executor=invoke, snapshot=
                         require(model_profile is not None, "required_real_model_profile_missing")
                         require(digest(model_profile.read_bytes()) == model_digest, "model_profile_changed")
                         case_env["OPAQUE_TEST_REAL_MODEL_PROFILE"] = str(model_profile)
+                        if coverage:
+                            case_env.update(acceptance_coverage.environment(coverage))
                     result = executor(argv, cwd=root, env=case_env, timeout=case["timeout_seconds"])
                     entry.update(executed=True, output_sha256=digest(result.output),
                                  output_bytes=len(result.output), cleanup_forced=result.cleanup_forced)
@@ -493,6 +527,9 @@ def run_suite(manifest, root, profile, target_dir, *, executor=invoke, snapshot=
             entry = {"id": "installed-artifacts", "executed": False}
             try:
                 require(initial is not None and toolchain is not None, "packaged_source_or_toolchain_unavailable")
+                if coverage:
+                    require(toolchain["host"] == coverage["target"] and "-nightly" in toolchain["release"],
+                            "coverage_native_toolchain_mismatch")
                 require(not initial["dirty"] or packaged_allow_dirty, "packaged_clean_source_required")
                 require(toolchain["host"].endswith({"linux": "unknown-linux-gnu", "darwin": "apple-darwin"}.get(sys.platform, "unsupported")),
                         "packaged_native_target_required")
@@ -512,6 +549,8 @@ def run_suite(manifest, root, profile, target_dir, *, executor=invoke, snapshot=
                         argv.extend([flag, value])
                 if packaged_allow_dirty:
                     argv.append("--allow-dirty")
+                if coverage:
+                    argv.extend(["--coverage-input", str(coverage_input)])
                 result = executor(argv, cwd=root, env=run_env, timeout=300)
                 entry.update(executed=True, output_sha256=digest(result.output), output_bytes=len(result.output),
                              cleanup_forced=result.cleanup_forced)
@@ -519,6 +558,11 @@ def run_suite(manifest, root, profile, target_dir, *, executor=invoke, snapshot=
                 require(output.is_file() and not output.is_symlink(), "missing_packaged_report")
                 qualified = packaged_report(json_read(output), source=initial, target=toolchain["host"],
                                             version=version, archive_sha256=archive_hash)
+                if coverage:
+                    require(qualified.get("coverage", {}).get("input_sha256") == acceptance_coverage.digest(coverage_input),
+                            "packaged_coverage_input_not_executed")
+                else:
+                    require("coverage" not in qualified, "unsolicited_packaged_coverage_claim")
                 require(qualified["candidate_qualification"] != "local_candidate" or packaged_allow_dirty,
                         "packaged_dirty_candidate_not_allowed")
                 with archive.open("rb") as stream:
@@ -563,6 +607,7 @@ def run_suite(manifest, root, profile, target_dir, *, executor=invoke, snapshot=
             "manifest_sha256": digest(json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()),
             "source_before": initial, "source_after": final, "gates": gates,
             "model_profile_sha256": model_digest,
+            "instrumented_acceptance_input_sha256": coverage["_input_sha256"] if coverage else None,
             "runtime": {"platform": sys.platform, "architecture": platform.machine(),
                         "effective_uid": os.geteuid(), "rustc": toolchain},
             "started_unix": started, "finished_unix": time.time(), "artifacts": artifacts,
@@ -639,6 +684,7 @@ def main():
     parser.add_argument("--packaged-owner-user", help="existing non-root Linux custody owner in a disposable runner")
     parser.add_argument("--packaged-peer-user", help="existing distinct non-root Linux peer in a disposable runner")
     parser.add_argument("--packaged-allow-dirty", action="store_true", help="local candidate only; never release qualification")
+    parser.add_argument("--coverage-input", type=Path, help="explicit collector-built native acceptance input; never inherited")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     manifest = validate_manifest(json_read(args.manifest or root / "tests/synthesized-suite.json"))
@@ -647,7 +693,8 @@ def main():
     target = (args.target_dir or Path(os.environ.get("CARGO_TARGET_DIR", str(root / "target")))).resolve()
     report = run_suite(manifest, root, args.profile, target, model_profile=args.model_profile,
                        packaged_archive=args.packaged_archive, packaged_owner_user=args.packaged_owner_user,
-                       packaged_peer_user=args.packaged_peer_user, packaged_allow_dirty=args.packaged_allow_dirty)
+                       packaged_peer_user=args.packaged_peer_user, packaged_allow_dirty=args.packaged_allow_dirty,
+                       coverage_input=args.coverage_input)
     write_reports(report, output)
     print(json.dumps({"status": report["status"], "profile": args.profile, "counts": report["counts"],
                       "overall_product_coverage": "not_measured", "report_directory": str(output)}))

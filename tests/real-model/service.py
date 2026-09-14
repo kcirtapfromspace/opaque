@@ -118,6 +118,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--suite-output", type=Path, required=True)
     parser.add_argument("--target-dir", type=Path, required=True)
+    parser.add_argument("--coverage-input", type=Path,
+                        help="explicit collector-built model test; stable default acceptance remains unchanged")
     args = parser.parse_args()
     os.umask(0o077)
     args.output.mkdir(mode=0o700)
@@ -136,6 +138,11 @@ def main():
     for number in (signal.SIGINT, signal.SIGTERM):
         previous_handlers[number] = signal.signal(number, interrupt)
     try:
+        coverage = None
+        if args.coverage_input is not None:
+            sys.path.insert(0, str(args.source_root / "scripts"))
+            import acceptance_coverage
+            coverage = acceptance_coverage.load(args.coverage_input, root=args.source_root, purpose="model")
         if Path("/opt/opaque-model/source-commit").read_text().strip() != LLAMA_COMMIT:
             raise ValueError("server image has the wrong source pin")
         report["model_before"] = verify_model(MODEL)
@@ -182,11 +189,14 @@ def main():
         env = {"PATH": "/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", "HOME": "/root",
                "CARGO_HOME": "/usr/local/cargo", "RUSTUP_HOME": "/usr/local/rustup",
                "RUSTUP_TOOLCHAIN": "1.95.0"}
+        suite_arguments = [sys.executable, "-B", str(args.source_root / "scripts/synthesized_suite.py"),
+                           "--profile", "model", "--target-dir", str(args.target_dir),
+                           "--model-profile", str(profile_path), "--output", str(args.suite_output)]
+        if coverage:
+            env["RUSTUP_TOOLCHAIN"] = coverage["toolchain"]
+            suite_arguments += ["--coverage-input", str(args.coverage_input)]
         with (args.output / "acceptance.log").open("xb") as log:
-            suite = subprocess.Popen([sys.executable, "-B", str(args.source_root / "scripts/synthesized_suite.py"),
-                                      "--profile", "model", "--target-dir", str(args.target_dir),
-                                      "--model-profile", str(profile_path),
-                                      "--output", str(args.suite_output)],
+            suite = subprocess.Popen(suite_arguments,
                                      cwd=args.source_root, env=env, stdin=subprocess.DEVNULL,
                                      stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         report["suite_exit_code"] = suite.wait(timeout=2400)
@@ -196,6 +206,10 @@ def main():
         acceptance = json.loads((args.suite_output / "report.json").read_text())
         report["counts"] = acceptance.get("counts")
         if report["suite_exit_code"] == 0 and acceptance.get("status") == "passed":
+            if coverage:
+                report["coverage"] = {"input_sha256": acceptance_coverage.digest(args.coverage_input),
+                                      "qualification": coverage["qualification"],
+                                      "profiles": acceptance_coverage.profiles(coverage, roles={"test", "daemon", "peer"})}
             report["status"] = "passed"
     except (KeyboardInterrupt, OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
         report["failure_kind"] = type(error).__name__

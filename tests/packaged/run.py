@@ -25,6 +25,8 @@ import tarfile
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "scripts"))
+import acceptance_coverage as COVERAGE
 SPEC = importlib.util.spec_from_file_location("release_artifacts", ROOT / "scripts/release_artifacts.py")
 RELEASE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(RELEASE)
@@ -52,13 +54,22 @@ def host_target():
     return f"{arch}-{os_target}"
 
 
-def execute(command, *, environment, cwd, account=None):
+def execute(command, *, environment, cwd, account=None, coverage=None):
     options = {}
     if account and os.geteuid() == 0:
         options = {"user": account.pw_uid, "group": account.pw_gid, "extra_groups": []}
-    return subprocess.run([str(value) for value in command], env=environment, cwd=cwd,
-                          stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                          timeout=15, **options)
+    process = subprocess.Popen([str(value) for value in command], env=environment, cwd=cwd,
+                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, **options)
+    try:
+        stdout, stderr = process.communicate(timeout=15)
+    except BaseException:
+        process.kill()
+        process.communicate()
+        raise
+    if coverage is not None and Path(command[0]).name in RELEASE.BINS:
+        COVERAGE.profiles(coverage, roles={"installed"}, process_ids={process.pid})
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
 def private_directory(path, account, mode=0o700):
@@ -109,6 +120,7 @@ def native_report(helper, approver):
 
 def acceptance(args):
     require(args.target == host_target(), "archive target must match the executing host")
+    coverage = COVERAGE.load(args.coverage_input, root=ROOT, purpose="packaged") if getattr(args, "coverage_input", None) else None
     linux = platform.system() == "Linux"
     if linux:
         require(os.geteuid() == 0 and args.owner_user and args.peer_user,
@@ -139,6 +151,12 @@ def acceptance(args):
                                          target=args.target, allow_dirty=args.allow_dirty)
         report.update({"archive_sha256": digest(archive), "source_tree_sha256": manifest["source_tree_sha256"],
                        "candidate_qualification": manifest["qualification"]})
+        if coverage:
+            require(manifest["source_revision"] == coverage["source"]["revision"]
+                    and manifest["source_tree_sha256"] == coverage["source"]["release_tree_sha256"],
+                    "instrumented archive source identity differs")
+            require(all(manifest["files"][name]["sha256"] == coverage["objects"][name]["sha256"]
+                        for name in RELEASE.BINS), "archive differs from collector mapping objects")
         payload = root / "payload"
         payload.mkdir(mode=0o755)
         payload.chmod(0o755)
@@ -159,6 +177,8 @@ def acceptance(args):
         for path, mode in ((home, 0o700), (scratch, 0o700), (prefix, 0o755)):
             private_directory(path, owner, mode)
         environment = clean_environment(home, scratch, prefix)
+        if coverage:
+            environment.update(COVERAGE.environment(coverage, "installed"))
         transport = root / "transport"
         transport.mkdir(mode=0o755)
         transport.chmod(0o755)
@@ -191,10 +211,10 @@ def acceptance(args):
         for name in RELEASE.BINS:
             if name == "opaque-approve-helper":
                 continue
-            result = execute([prefix / name, "--help"], environment=environment, cwd=home, account=owner)
+            result = execute([prefix / name, "--help"], environment=environment, cwd=home, account=owner, coverage=coverage)
             require(result.returncode == 0 and result.stdout.strip(), "installed CLI help failed")
         for name in ("opaque", "opaqued"):
-            result = execute([prefix / name, "--version"], environment=environment, cwd=home, account=owner)
+            result = execute([prefix / name, "--version"], environment=environment, cwd=home, account=owner, coverage=coverage)
             matched = re.fullmatch(re.escape(f"{name} {args.version}") + r"\+([0-9a-f]{7,40})", result.stdout.strip())
             require(result.returncode == 0 and matched and args.revision.startswith(matched[1]),
                     "installed binary identity differs from its selected revision")
@@ -203,7 +223,7 @@ def acceptance(args):
         approver = prefix / "opaque-approver"
         custody = home / "custody"
         def call(*arguments, account=owner, extra_environment=None):
-            return execute([approver, *arguments], environment={**environment, **(extra_environment or {})}, cwd=root, account=account)
+            return execute([approver, *arguments], environment={**environment, **(extra_environment or {})}, cwd=root, account=account, coverage=coverage)
         def denied(result, expected):
             require(result.returncode == 1 and not result.stdout and expected in result.stderr,
                     "installed custody guard did not reject the selected mutation")
@@ -265,7 +285,7 @@ def acceptance(args):
             require(probe.returncode == 0 and not probe.stdout, "separate Linux account could read owner custody")
             report["cases"].append("installed_linux_distinct_uid_and_spoofed_home_denial")
 
-        helper_result = execute([prefix / "opaque-approve-helper", "--check-ui"], environment=environment, cwd=home, account=owner)
+        helper_result = execute([prefix / "opaque-approve-helper", "--check-ui"], environment=environment, cwd=home, account=owner, coverage=coverage)
         approver_result = call("check-native")
         report["native_capability"] = native_report(helper_result, approver_result)
         report["cases"].append("installed_native_capability_protocol_without_prompt")
@@ -286,6 +306,11 @@ def acceptance(args):
             report["cases"].append("installed_macos_relocated_signed_app_runtime")
         require(not (home / ".opaque").exists(), "installed command unexpectedly initialized default daemon state")
         report["cases"].append("isolated_home_without_default_daemon_state")
+        if coverage:
+            report["coverage"] = {"qualification": coverage["qualification"],
+                                  "input_sha256": COVERAGE.digest(args.coverage_input),
+                                  "profiles": COVERAGE.profiles(coverage, roles={"installed"}),
+                                  "scope": "Rust workspace runtime counters; system installer, Swift launcher and native human presence are not Rust coverage"}
         report["status"] = "passed"
     return report
 
@@ -300,6 +325,7 @@ def main():
     parser.add_argument("--allow-dirty", action="store_true")
     parser.add_argument("--owner-user")
     parser.add_argument("--peer-user")
+    parser.add_argument("--coverage-input", type=Path, help="explicit collector-built objects and fresh LLVM output; never ambient")
     args = parser.parse_args()
     try:
         require(not args.output.exists(), "choose a fresh acceptance output path")

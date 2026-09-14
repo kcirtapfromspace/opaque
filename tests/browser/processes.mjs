@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {basename} from 'node:path';
 import {setTimeout as delay} from 'node:timers/promises';
+import {appendFile, readFile} from 'node:fs/promises';
+import {createHash} from 'node:crypto';
 
 function signalGroup(pid, signal) {
   try {
@@ -14,7 +16,7 @@ function signalGroup(pid, signal) {
   }
 }
 
-export function processFixture(binary, args, env) {
+export function processFixture(binary, args, env, coverageEvents) {
   const child = spawn(binary, args, {
     env, detached: true, stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -59,6 +61,11 @@ export function processFixture(binary, args, env) {
       }
       assert.equal(removed, true, 'owned process group survived bounded cleanup');
       stopped = true;
+      if (coverageEvents) {
+        const sha256 = createHash('sha256').update(await readFile(binary)).digest('hex');
+        await appendFile(coverageEvents, JSON.stringify({binary, name: basename(binary), pid: child.pid,
+          sha256, exit_code: child.exitCode, signal: child.signalCode, forced_cleanup: forced}) + '\n');
+      }
       assert.equal(forced, false, 'owned fixture required forced process-group cleanup');
     },
   };

@@ -37,6 +37,9 @@ const DAEMON_TOKEN_FILENAME: &str = "daemon.token";
 
 mod agent_session;
 mod connection;
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod connection_flow_tests;
 mod enclave;
 mod identity;
 mod mcp_gateway;
@@ -3087,17 +3090,19 @@ impl ConnectionRateLimiter {
 /// `known_human_clients` allowlist. If no entry matches, the client is
 /// classified as `Agent` (safer — more restrictive).
 /// Revoke delegation records for ended sessions and audit each revocation.
-/// Best-effort: the in-memory session is already gone (which alone kills the
-/// connection's access); the store row is the audit-side record.
+/// In-memory removal closes connections; durable rows also govern final task
+/// dispatch. A failed write retains a local identity fence and must not be
+/// acknowledged as a successful durable revocation.
 fn revoke_delegations(
     state: &DaemonState,
     identity: &ClientIdentity,
     client_type: ClientType,
     delegations: &[SessionDelegation],
-) {
+) -> Result<(), ()> {
     let Some(rt) = state.identity.as_ref() else {
-        return;
+        return Ok(());
     };
+    let mut failed = false;
     for d in delegations {
         match rt.store.revoke_delegation(&d.jti) {
             Ok(true) => {
@@ -3110,9 +3115,22 @@ fn revoke_delegations(
                 );
             }
             Ok(false) => {}
-            Err(e) => warn!("failed to revoke delegation record: {e}"),
+            Err(e) => {
+                failed = true;
+                warn!("failed to revoke delegation record: {e}");
+                emit_daemon_method_audit(
+                    state,
+                    AuditEventKind::OperationFailed,
+                    "agent_session_end",
+                    identity,
+                    client_type,
+                    "revocation_failed",
+                    None,
+                );
+            }
         }
     }
+    if failed { Err(()) } else { Ok(()) }
 }
 
 /// Build the full session review from trusted authority and bounded display hints.

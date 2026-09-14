@@ -22,12 +22,14 @@ import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import time
 import tomllib
 
 import check_llvm_coverage as gate
 from rust_coverage_scope import ScopeError, runtime_sources
 import synthesized_suite as suite
+import acceptance_coverage as acceptance
 
 TOOLCHAIN = "nightly-2026-09-13"
 COLLECTOR_VERSION = "0.9.1"
@@ -578,10 +580,19 @@ def stop_process(process):
 
 
 class Collector:
-    def __init__(self, root, output, target, collector, jobs=4, contained=False):
+    def __init__(self, root, output, target, collector, jobs=4, contained=False, *, acceptances=(),
+                 acceptance_only=False, acceptance_allow_dirty=False, browser_cache=None):
         self.root, self.output, self.target = root, output, target
         self.collector = collector
         self.contained = contained
+        require(len(acceptances) == len(set(acceptances)) and set(acceptances) <= acceptance.PURPOSES,
+                "invalid_acceptance_selection")
+        require(not acceptance_only or bool(acceptances), "acceptance_only_requires_selection")
+        require(not ({"model", "service"} & set(acceptances)) or (contained and sys.platform == "linux"), "model_or_service_coverage_requires_contained_linux")
+        self.acceptances = tuple(acceptances)
+        self.acceptance_only = acceptance_only
+        self.acceptance_allow_dirty = acceptance_allow_dirty
+        self.browser_cache = browser_cache
         self.cases = selected_cases(sys.platform, contained)
         self.flags = instrumentation_flags(sys.platform, os.sysconf("SC_PAGE_SIZE"))
         self.env = suite.environment()
@@ -601,7 +612,7 @@ class Collector:
                        "debug_symbol_settings": {"cargo_profile_environment": dict(BUILD_PROFILE_ENV),
                                                  "rustc_flag": "-Cdebuginfo=0",
                                                  "scope": "DWARF omitted at build; LLVM source/branch maps and counters retained; no post-build stripping"},
-                       "collector_version": COLLECTOR_VERSION, "executions": [], "profiles": [],
+                       "collector_version": COLLECTOR_VERSION, "executions": [], "profiles": [], "acceptance_executions": [],
                        "binaries": [], "failures": [], "test_targets": [], "skipped_tests": [],
                        "not_qualified": ["live vendor accounts", "real model completions", "native human approval",
                                          "contained Vault/OpenSSH/systemd service", "other native platforms"]}
@@ -642,6 +653,9 @@ class Collector:
         if self.contained:
             self.result["contained_service_profile"] = contained_prerequisites(sys.platform)
         self.result["source_before"] = suite.source_snapshot(self.root)
+        require(not self.acceptances or not self.result["source_before"]["dirty"] or self.acceptance_allow_dirty,
+                "acceptance_coverage_requires_clean_source_or_explicit_local_candidate")
+        self.env["OPAQUE_BUILD_REVISION"] = self.result["source_before"]["revision"]
         version = self.command("collector-version", [self.collector, "llvm-cov", "--version"]).decode().strip()
         require(version == f"cargo-llvm-cov {COLLECTOR_VERSION}", "unexpected_collector_version")
         verbose = self.command("compiler-identity", ["rustc", "-vV"]).decode()
@@ -876,8 +890,143 @@ class Collector:
                 "unmapped_source_scope": "no mapping emitted on this native target; may be test-only coverage(off), compiled-out, or uninstantiated code; not qualification from another OS",
                 "measured": summary["measured"], "binary_count": len(objects), "profile_count": len(profiles)}
 
+    def acceptance_input(self, purpose):
+        directory = fresh_directory(self.output / ("acceptance-" + purpose))
+        profiles = fresh_directory(self.output / "profiles" / ("acceptance-" + purpose), 0o1777)
+        normal = {name: path for (_package, name, _kind, is_test), path in self.normal.items() if not is_test}
+        names = (acceptance.BINARIES if purpose == "packaged" else {"opaqued", "opaque-web"} if purpose == "browser"
+                 else {"opaque", "opaqued"} if purpose == "service" else {"opaqued"})
+        require(names <= normal.keys(), "acceptance_missing_normal_workspace_binary")
+        objects = {name: normal[name] for name in names}
+        if purpose == "model":
+            objects["model-test"] = self.baseline[("opaqued", CONTAINED_TARGET, "test", True)]
+        value = {"schema": acceptance.SCHEMA, "purpose": purpose, "source": self.result["source_before"],
+                 "platform": sys.platform, "target": self.result["target"], "toolchain": TOOLCHAIN,
+                 "rustc": self.env["OPAQUE_COVERAGE_RUSTC"], "instrumentation": self.flags,
+                 "profile_dir": str(profiles),
+                 "qualification": "instrumented_local_candidate" if self.result["source_before"]["dirty"] else "instrumented_build_candidate",
+                 "objects": {name: {"path": str(path), "sha256": sha(path), "bytes": path.stat().st_size}
+                             for name, path in sorted(objects.items())}}
+        path = directory / "input.json"
+        save(path, value)
+        value = acceptance.load(path, root=self.root, purpose=purpose, source=self.result["source_before"])
+        return directory, path, value
+
+    def collect_acceptance(self):
+        for purpose in self.acceptances:
+            directory, input_path, value = self.acceptance_input(purpose)
+            report_path = directory / "suite/report.json"
+            if purpose == "packaged":
+                binary_dirs = {str(Path(row["path"]).parent) for row in value["objects"].values()}
+                require(len(binary_dirs) == 1, "packaged_binaries_do_not_share_build_directory")
+                candidate = directory / "candidate"
+                argv = [sys.executable, "-B", str(self.root / "tests/packaged/build.py"),
+                        "--binary-dir", next(iter(binary_dirs)), "--output", str(candidate)]
+                if self.acceptance_allow_dirty:
+                    argv.append("--allow-dirty")
+                self.command("build-instrumented-package", argv, timeout=300)
+                archive = candidate / "candidate.tar.gz"
+                archive_hash = sha(archive)
+                argv = [sys.executable, "-B", str(self.root / "scripts/synthesized_suite.py"), "--profile", "packaged",
+                        "--packaged-archive", str(archive), "--coverage-input", str(input_path),
+                        "--output", str(directory / "suite")]
+                if sys.platform == "linux":
+                    argv += ["--packaged-owner-user", "opaque", "--packaged-peer-user", "nobody"]
+                if self.acceptance_allow_dirty:
+                    argv.append("--packaged-allow-dirty")
+                self.command("execute-installed-package", argv, timeout=600)
+                report = json.loads(report_path.read_bytes())
+                require(report["status"] == "passed" and len(report["commands"]) == 1
+                        and report["counts"]["unique_tests_passed"] == 0
+                        and report["counts"]["command_scenarios_passed"] == 1, "installed_acceptance_did_not_pass")
+                qualified = report["commands"][0]["qualification"]
+                version = tomllib.loads((self.root / "Cargo.toml").read_text())["workspace"]["package"]["version"]
+                suite.packaged_report(qualified, source=self.result["source_before"], target=self.result["target"],
+                                      version=version, archive_sha256=archive_hash)
+                require(sha(archive) == archive_hash, "instrumented_archive_changed")
+                require(qualified["coverage"]["input_sha256"] == sha(input_path), "installed_coverage_input_not_executed")
+                profiles = acceptance.profiles(value, roles={"installed"})
+                require(profiles == qualified["coverage"]["profiles"], "installed_profiles_changed")
+                # codesign changes Mach-O bytes in the app. Retain those exact
+                # Rust objects as well as the untouched top-level tools.
+                if sys.platform == "darwin":
+                    for name in ("opaque-approver", "opaque-approve-helper"):
+                        self.objects.add(candidate / "payload/Opaque Reviewer.app/Contents/MacOS" / name)
+                checks = qualified["cases"]
+            elif purpose == "browser":
+                argv = [sys.executable, "-B", str(self.root / "tests/browser/run.py"),
+                        "--coverage-input", str(input_path), "--output", str(directory / "suite")]
+                if self.browser_cache:
+                    argv += ["--browser-cache", str(self.browser_cache)]
+                self.command("execute-real-chromium", argv, timeout=900)
+                report = json.loads(report_path.read_bytes())
+                require(report["status"] == "passed" and report["input_sha256"] == sha(input_path)
+                        and len(report["tests"]) == 4, "browser_acceptance_did_not_pass")
+                profiles = acceptance.profiles(value, roles={"web", "daemon"}, process_ids={p["pid"] for p in report["processes"]})
+                require(profiles == report["profiles"], "browser_profiles_changed")
+                checks = report["tests"]
+            elif purpose == "service":
+                require(os.environ.get("container") == "docker", "service_acceptance_requires_owned_container")
+                self.command("execute-real-user-service", [sys.executable, "-B", str(self.root / "tests/service/contained.py"),
+                    "--opaque", value["objects"]["opaque"]["path"], "--opaqued", value["objects"]["opaqued"]["path"],
+                    "--coverage-input", str(input_path), "--output", str(directory / "suite")],
+                    env={**self.env, "container": "docker"}, timeout=300)
+                report = json.loads(report_path.read_bytes())
+                checks = {"real-keyed-seal", "install-enabled-reachable-owned-daemon", "stop-reaped-daemon",
+                          "start-and-restart-new-reachable-pids", "uninstall-disabled-removed-and-reaped",
+                          "actual-systemctl-unavailable-manager-denied"}
+                require(report["schema"] == "opaque.contained-user-service.v1" and report["status"] == "passed"
+                        and report["cleanup_errors"] == [] and len(report["checks"]) == len(checks)
+                        and set(report["checks"]) == checks and report["coverage"]["input_sha256"] == sha(input_path),
+                        "real_user_service_not_qualified")
+                profiles = acceptance.profiles(value, roles={"service"}, process_ids=report["rust_process_ids"])
+                require(profiles == report["coverage"]["profiles"], "service_profiles_changed")
+                checks = report["checks"]
+            else:
+                self.command("execute-real-model", [sys.executable, "-B", str(self.root / "tests/real-model/service.py"),
+                    "--source-root", str(self.root), "--target-dir", str(self.target),
+                    "--coverage-input", str(input_path), "--output", str(directory / "model"),
+                    "--suite-output", str(directory / "suite")], timeout=2700)
+                report = json.loads(report_path.read_bytes())
+                service = json.loads((directory / "model-service.json").read_bytes())
+                require(service["status"] == "passed" and service["cleanup"] == service["suite_cleanup"] == "stopped_and_reaped"
+                        and service["tokens_before"] == 0 and service["tokens_after"] > 0
+                        and service["coverage"]["input_sha256"] == sha(input_path), "real_model_service_not_qualified")
+                require(report["status"] == "passed" and report["counts"]["unique_tests_passed"] == 1
+                        and len(report["tests"]) == 1 and report["tests"][0]["status"] == "passed"
+                        and report["instrumented_acceptance_input_sha256"] == sha(input_path), "real_model_case_not_qualified")
+                name = "contained_real_model_completions_require_signed_review_and_survive_restart"
+                require(report["tests"][0]["name"] == name, "real_model_case_identity_changed")
+                profiles, peers = profile_inventory(Path(value["profile_dir"]), CONTAINED_TARGET, name)
+                require(profiles == service["coverage"]["profiles"], "real_model_profiles_changed")
+                self.objects.update(peers)
+                self.result["executions"].append({"target": CONTAINED_TARGET, "package": "opaqued", "kind": "test",
+                    "test": name, "passed": 1, "ignored": [], "passed_test_names": [name], "qualification": "passed",
+                    "binary_sha256": value["objects"]["model-test"]["sha256"], "via": "actual_model_acceptance",
+                    "profiles": [p["path"] for p in profiles]})
+                for skipped in self.result["skipped_tests"]:
+                    if (skipped["package"], skipped["target"], skipped["test"]) == ("opaqued", CONTAINED_TARGET, name):
+                        skipped["executed_by_explicit_profile"] = True
+                self.result["not_qualified"].remove("real model completions")
+                checks = [name]
+            require(report["source_before"] == report["source_after"] == self.result["source_before"],
+                    "acceptance_source_identity_changed")
+            require(bool(profiles), "acceptance_has_no_native_profiles")
+            self.result["profiles"].extend(profiles)
+            self.result["acceptance_executions"].append({"purpose": purpose, "status": "passed",
+                "input_sha256": sha(input_path), "report_sha256": sha(report_path), "report_path": str(report_path),
+                "qualification": value["qualification"], "checks": checks, "profile_count": len(profiles),
+                "profile_process_ids": sorted({p["process_id"] for p in profiles}),
+                "scope": "Existing acceptance checks with fresh native Rust counters; check count is not additional Rust test count"})
+
     def collect(self):
         require(self.declared_inventory_validated, "declared_inventory_not_validated")
+        if self.acceptance_only:
+            self.collect_acceptance()
+            self.finish_collection()
+            self.result["status"] = "acceptance_only_collected"
+            self.result["comparison_scope"] = "Development acceptance-only counters; ordinary workspace tests and selected exact repeats were not executed."
+            return
         for (package, name, kind, is_test), binary in sorted(self.baseline.items()):
             if is_test:
                 self.execute(name, binary)
@@ -896,16 +1045,38 @@ class Collector:
             require(key in self.composition, "missing_composition_test_artifact")
             for name in names:
                 self.execute(target, self.composition[key], name)
+        self.collect_acceptance()
+        self.finish_collection()
+
+    def finish_collection(self):
         self.result["binaries"] = [{"path": str(path), "sha256": sha(path), "bytes": path.stat().st_size,
                                     "package": self.package_by_binary.get(path),
-                                    "kind": "cargo_artifact" if path in self.package_by_binary else "standalone_fixture_peer"}
+                                    "kind": "cargo_artifact" if path in self.package_by_binary else "retained_native_fixture_or_packaged_object"}
                                    for path in sorted(self.objects)]
         self.result.update(self.export("critical", self.objects, self.result["profiles"]))
+        if sys.platform == "linux":
+            # /target can disappear with the owned host. One deduplicated
+            # archive retains exact mapping bytes without a second Cargo cache.
+            # It stays private local output, never a public CI upload.
+            archive = self.output / "mapping-objects.tar.gz"
+            seen = set()
+            with tarfile.open(archive, "w:gz", compresslevel=1) as stream:
+                for row in self.result["binaries"]:
+                    path = Path(row["path"])
+                    require(sha(path) == row["sha256"] and not path.is_symlink(), "mapping_object_changed_before_retention")
+                    if row["sha256"] not in seen:
+                        stream.add(path, arcname="objects/" + row["sha256"], recursive=False)
+                        seen.add(row["sha256"])
+            self.result["retained_mapping_objects"] = {"path": str(archive), "sha256": sha(archive),
+                "unique_objects": len(seen), "member_format": "objects/<binary sha256>", "scope": "private local run output"}
+        else:
+            self.result["retained_mapping_objects"] = {"scope": "exact native object paths and hashes retained in local cache; caller archives before cache reuse"}
         self.result["source_after"] = suite.source_snapshot(self.root)
         self.result["counts"] = test_execution_counts(self.result["executions"], self.result["test_targets"], self.result["skipped_tests"])
+        self.result["counts"]["acceptance_command_scenarios"] = len(self.result["acceptance_executions"])
         require(self.result["source_after"] == self.result["source_before"], "source_changed_during_collection")
         self.result["status"] = "collected"
-        if self.contained:
+        if self.contained and not self.acceptance_only:
             self.result["not_qualified"].remove("contained Vault/OpenSSH/systemd service")
             self.result["contained_service_profile"]["executed_tests"] = list(CONTAINED_CASES)
         self.result["comparison_scope"] = (
@@ -926,6 +1097,11 @@ def main(argv=None):
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--contained", action="store_true",
                         help="Also require real SSH and controlled inference RPC scenarios inside the marked disposable host")
+    parser.add_argument("--acceptance", action="append", choices=sorted(acceptance.PURPOSES), default=[],
+                        help="Execute this existing acceptance against the same instrumented workspace objects")
+    parser.add_argument("--acceptance-only", action="store_true", help="development probe; no ordinary-test or full-collection qualification")
+    parser.add_argument("--acceptance-allow-dirty", action="store_true", help="explicit local instrumented candidate only")
+    parser.add_argument("--browser-cache", type=Path, help="explicit existing Playwright engine cache")
     args = parser.parse_args(argv)
     output = None
     collector = None
@@ -943,7 +1119,9 @@ def main(argv=None):
         else:
             target = fresh_directory(args.target_dir.absolute())
         fresh_directory(output / "profiles")
-        collector = Collector(root, output, target, args.collector, args.jobs, args.contained)
+        collector = Collector(root, output, target, args.collector, args.jobs, args.contained,
+                              acceptances=args.acceptance, acceptance_only=args.acceptance_only,
+                              acceptance_allow_dirty=args.acceptance_allow_dirty, browser_cache=args.browser_cache)
         collector.setup()
         if args.preflight_only:
             collector.result["status"] = "preflight_only"

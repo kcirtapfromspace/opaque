@@ -104,6 +104,10 @@ pub struct DelegationRecord {
 /// Thread-safe handle to the identity database.
 pub struct IdentityStore {
     conn: Mutex<Connection>,
+    // A failed SQLite write must not leave a previously captured delegation
+    // snapshot usable at the final dispatch fence. Access is ordered under
+    // `conn`, then this mutex, just like durable identity lifecycle changes.
+    failed_delegation_revocations: Mutex<BTreeSet<String>>,
 }
 
 impl IdentityStore {
@@ -126,6 +130,7 @@ impl IdentityStore {
         }
         Ok(Self {
             conn: Mutex::new(conn),
+            failed_delegation_revocations: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -138,6 +143,7 @@ impl IdentityStore {
         super::lifecycle::ensure_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            failed_delegation_revocations: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -657,13 +663,39 @@ impl IdentityStore {
     /// Revoke one delegation; returns true if a live row was revoked.
     pub fn revoke_delegation(&self, jti: &str) -> Result<bool, String> {
         let conn = self.lock();
-        let n = conn
-            .execute(
-                "UPDATE delegations SET revoked_at=?1 WHERE jti=?2 AND revoked_at IS NULL",
-                params![now_unix(), jti],
-            )
-            .map_err(|e| e.to_string())?;
-        Ok(n > 0)
+        let result = conn.execute(
+            "UPDATE delegations SET revoked_at=?1 WHERE jti=?2 AND revoked_at IS NULL",
+            params![now_unix(), jti],
+        );
+        let mut failed = self
+            .failed_delegation_revocations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        match result {
+            Ok(n) => {
+                if n > 0 {
+                    failed.remove(jti);
+                }
+                Ok(n > 0)
+            }
+            Err(error) => {
+                // Keep the identity writer lock through publication. A final
+                // authority check ordered after this failure must reject even
+                // though SQLite still reports the old row as live.
+                failed.insert(jti.to_owned());
+                Err(error.to_string())
+            }
+        }
+    }
+
+    /// Caller holds `lock()` through its dispatch callback. These tombstones
+    /// are local fail-closed fences, not successful durable revocation records.
+    /// Restart discards agent sessions and seals interrupted task reservations.
+    pub(super) fn delegation_revocation_failed(&self, jti: &str) -> bool {
+        self.failed_delegation_revocations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains(jti)
     }
 
     /// All delegation records, newest first.

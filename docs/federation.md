@@ -154,6 +154,13 @@ freshness **before** printing the report. Without `--key`, it uses the key
 supplied with the response: nonce and freshness checks do not authenticate
 a particular enrolled daemon.
 
+For automation, `opaque --json attest --key <hex>` performs the same checks and
+returns a verified verdict with `key_pinned`, `healthy`, `release_eligible`, and
+the signed `payload`. It exits 3 for invalid evidence or unhealthy posture.
+Healthy session mode exits 0 with `release_eligible: false`; automation that
+releases custody keys must require release eligibility as well as a pinned key.
+JSON output contains the verified verdict rather than the raw RPC response.
+
 ```toml
 [attestation]
 interval_secs = 900
