@@ -1,13 +1,20 @@
 # Real browser acceptance
 
-Build `cargo build --locked -p opaque-web -p opaqued`, then run:
+Build and run the native acceptance binaries:
 
 ```sh
+CARGO_PROFILE_DEV_DEBUG=0 cargo build --locked -p opaque-web -p opaqued
 cd tests/browser
 npm ci --ignore-scripts --no-audit --no-fund
 npx playwright install --with-deps chromium
 npm test
 ```
+
+The daemon hashes the connecting executable before accepting its handshake.
+Disabling DWARF debug symbols keeps that work within the existing production IPC
+deadline. The live fixture observes an authenticated dashboard status response
+from the real daemon before launching Chromium; token-file creation alone does
+not establish readiness.
 
 The pinned Chromium runtime drives actual `opaque-web` and `opaqued` processes
 through their loopback HTTP and Unix sockets. Tests do not intercept routes or

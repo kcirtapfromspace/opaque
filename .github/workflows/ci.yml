@@ -146,6 +146,10 @@ jobs:
       RUSTUP_TOOLCHAIN: nightly-2026-09-13
     steps:
       - uses: actions/checkout@v6
+        with:
+          # Resolve the immutable PR base / push-before object and historical
+          # baseline source identities; an unavailable object must fail closed.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
         with:
           toolchain: nightly-2026-09-13
@@ -203,21 +207,23 @@ jobs:
               --acceptance packaged --acceptance browser \
               --output "$RUNNER_TEMP/critical-coverage"
           fi
-      - name: Require 100 percent production lines and branches on this platform
-        # An independently passing platform cannot cover code compiled out here.
-        # Both targets remain exactly 100; uncovered production code fails.
+      - name: Enforce per-crate tiers and native-target coverage ratchet
+        # Every tier is mandatory now. A different OS or architecture cannot
+        # qualify this target, and a missing baseline is a failure. Event SHAs
+        # are data, validated as complete immutable commits by the gate.
+        env:
+          COVERAGE_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
-          python3 -B scripts/check_llvm_coverage.py \
+          coverage_target=$(rustc -vV | sed -n 's/^host: //p')
+          python3 -B scripts/check_coverage_policy.py \
             --report "$RUNNER_TEMP/critical-coverage/llvm-coverage.json" \
+            --collection "$RUNNER_TEMP/critical-coverage/collection.json" \
             --source-root "$GITHUB_WORKSPACE" \
-            --require-workspace \
-            --require-file crates/opaque-bounded-work/src/task_store.rs \
-            --require-file crates/opaque-bounded-work/src/task_api.rs \
-            --require-file crates/opaque-bounded-work/src/resource_authority.rs \
-            --require-file crates/opaque-core/src/task.rs \
-            --require-file crates/opaque-core/src/identity_lifecycle.rs \
-            --require-file crates/opaque-approval/src/approval_server/workstation.rs \
-            --require-branches \
+            --target "$coverage_target" \
+            --policy config/coverage-policy.json \
+            --baseline "config/coverage-baselines/$coverage_target.json" \
+            --baseline-reference "$COVERAGE_BASE_SHA" \
+            --allow-baseline-bootstrap \
             --output "$RUNNER_TEMP/critical-coverage/gate.json"
       - name: Restore generated artifact and cache ownership
         if: always() && matrix.platform == 'linux'
@@ -341,6 +347,10 @@ jobs:
           cache: npm
           cache-dependency-path: tests/browser/package-lock.json
       - name: Build the real dashboard and daemon
+        env:
+          # Keep executable identity hashing within the production IPC deadline;
+          # DWARF symbols are not part of the browser acceptance behavior.
+          CARGO_PROFILE_DEV_DEBUG: "0"
         run: cargo build --locked -p opaque-web -p opaqued
       - name: Install pinned Chromium test runtime
         working-directory: tests/browser

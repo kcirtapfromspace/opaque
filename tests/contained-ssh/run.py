@@ -270,8 +270,8 @@ def main():
         for number, handler in old_handlers.items():
             signal.signal(number, handler)
     print(json.dumps({"status": record["status"], "cleanup": record["cleanup"], "output": str(output)}))
-    # Successful collection does not mean the literal coverage gate passed.
-    # Consumers must enforce coverage/coverage-summary.json independently.
+    # Successful collection does not mean the per-crate coverage policy passed.
+    # Enforce tiers and the native-target ratchet with check_coverage_policy.py.
     return 0 if record["status"] in ("passed", "collected", "acceptance_only_collected") else 1
 
 

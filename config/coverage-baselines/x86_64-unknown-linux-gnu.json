@@ -1,0 +1,167 @@
+{
+  "schema": "opaque.coverage-baseline.v1",
+  "target": "x86_64-unknown-linux-gnu",
+  "platform": "linux",
+  "source": {
+    "revision": "a19cd816231b7326917b69ddf2b2ca95c651f7e0",
+    "tree_sha256": "9930b40cc1c4fa96b77a5bbd94043748d6e7accf3af422150f50e0fd69ca71e5",
+    "release_tree_sha256": "3b117062e8ee77cdff746d576977fa88676b6463cc9ee32aa2bc5f0f66abfb44",
+    "canonical_revision": "c5abd83e202aaab0360c32a83a89b355f04cf207"
+  },
+  "toolchain": "nightly-2026-09-13",
+  "feature_selection": "all workspace features; native compiler target",
+  "coverage_report_sha256": "a3b3e670388362926aadac848ab77c067502db99d62fc58700cc3f3efc822344",
+  "collection_sha256": "c86242f65db472533c22c7c8f55411bd33f614765b033e1e0accddb37af54385",
+  "packages": {
+    "opaque": {
+      "lines": {
+        "count": 7494,
+        "covered": 3485
+      },
+      "branches": {
+        "count": 1460,
+        "covered": 586
+      }
+    },
+    "opaque-approval": {
+      "lines": {
+        "count": 3000,
+        "covered": 2495
+      },
+      "branches": {
+        "count": 354,
+        "covered": 261
+      }
+    },
+    "opaque-approve-helper": {
+      "lines": {
+        "count": 202,
+        "covered": 53
+      },
+      "branches": {
+        "count": 48,
+        "covered": 22
+      }
+    },
+    "opaque-approver": {
+      "lines": {
+        "count": 682,
+        "covered": 396
+      },
+      "branches": {
+        "count": 152,
+        "covered": 75
+      }
+    },
+    "opaque-bounded-work": {
+      "lines": {
+        "count": 3813,
+        "covered": 3339
+      },
+      "branches": {
+        "count": 1194,
+        "covered": 822
+      }
+    },
+    "opaque-core": {
+      "lines": {
+        "count": 7044,
+        "covered": 6437
+      },
+      "branches": {
+        "count": 2168,
+        "covered": 1660
+      }
+    },
+    "opaque-federation-runtime": {
+      "lines": {
+        "count": 1492,
+        "covered": 1060
+      },
+      "branches": {
+        "count": 382,
+        "covered": 208
+      }
+    },
+    "opaque-mcp": {
+      "lines": {
+        "count": 1206,
+        "covered": 1039
+      },
+      "branches": {
+        "count": 146,
+        "covered": 100
+      }
+    },
+    "opaque-native-approval": {
+      "lines": {
+        "count": 239,
+        "covered": 146
+      },
+      "branches": {
+        "count": 42,
+        "covered": 23
+      }
+    },
+    "opaque-providers": {
+      "lines": {
+        "count": 7712,
+        "covered": 6522
+      },
+      "branches": {
+        "count": 1358,
+        "covered": 1009
+      }
+    },
+    "opaque-sandbox": {
+      "lines": {
+        "count": 1329,
+        "covered": 1113
+      },
+      "branches": {
+        "count": 186,
+        "covered": 127
+      }
+    },
+    "opaque-showcase": {
+      "lines": {
+        "count": 6640,
+        "covered": 5917
+      },
+      "branches": {
+        "count": 1968,
+        "covered": 1460
+      }
+    },
+    "opaque-tenant": {
+      "lines": {
+        "count": 190,
+        "covered": 173
+      },
+      "branches": {
+        "count": 62,
+        "covered": 46
+      }
+    },
+    "opaque-web": {
+      "lines": {
+        "count": 1047,
+        "covered": 919
+      },
+      "branches": {
+        "count": 78,
+        "covered": 58
+      }
+    },
+    "opaqued": {
+      "lines": {
+        "count": 10895,
+        "covered": 8925
+      },
+      "branches": {
+        "count": 1758,
+        "covered": 1151
+      }
+    }
+  }
+}

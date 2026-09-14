@@ -1,0 +1,1 @@
+{"schema_version":1,"title":"Publish fixture configuration","expires_in_secs":60,"github_api_url":"https://api.github.com","vault_api_url":"https://vault.example.com","actions":[{"repo":"example/fixture","repository_id":101,"secret_name":"FIXTURE_MARKER","value_ref":"vault:kv/data/fixture?version=7#MARKER","github_token_ref":"keychain:opaque/fixture"}]}

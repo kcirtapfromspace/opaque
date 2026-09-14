@@ -1,0 +1,12 @@
+[package]
+name = "opaque-policy-kernel"
+version.workspace = true
+edition = "2024"
+publish = false
+description = "Pure ordered policy decision kernel used by Opaque's policy engine"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }

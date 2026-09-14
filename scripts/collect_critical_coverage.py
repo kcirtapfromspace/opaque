@@ -1053,7 +1053,11 @@ class Collector:
         require(all(row["status"] != "unqualified_zero_native_mapping" for row in package_rows),
                 "eligible_workspace_package_missing_native_mapping:"
                 + ",".join(row["package"] for row in package_rows if row["status"] == "unqualified_zero_native_mapping"))
-        summary = gate.evaluate(report, source_root=self.root, required_files=REQUIRED_FILES, require_branches=True)
+        summary = gate.evaluate(report, source_root=self.root, required_files=REQUIRED_FILES,
+                                require_branches=True, minimum_lines=0, minimum_branches=0)
+        require(summary["status"] == "passed", "structural_coverage_validation_failed")
+        summary.update({"status": "measured", "thresholds": {"lines": None, "branches": None},
+                        "qualification": "measurements only; enforce per-crate tiers and native-target ratchet separately"})
         summary.update({"platform": sys.platform, "target": self.result["target"], "toolchain": TOOLCHAIN,
                         "coverage_packages": self.result["coverage_packages"], "workspace_packages": package_rows,
                         "input_sha256": hashlib.sha256(raw).hexdigest()})
@@ -1061,13 +1065,15 @@ class Collector:
         if label == "critical":
             original = package_report_subset(report, ORIGINAL_PACKAGES, self.root)
             original_summary = gate.evaluate(original, source_root=self.root, required_files=ORIGINAL_REQUIRED_FILES,
-                                             require_branches=True)
+                                             require_branches=True, minimum_lines=0, minimum_branches=0)
+            require(original_summary["status"] == "passed", "historical_scope_validation_failed")
+            original_summary.update({"status": "measured", "thresholds": {"lines": None, "branches": None}})
             original_summary.update({"platform": sys.platform, "target": self.result["target"],
                                      "toolchain": TOOLCHAIN, "input_sha256": hashlib.sha256(raw).hexdigest(),
                                      "coverage_packages": list(ORIGINAL_PACKAGES),
                                      "scope": "historical three-package comparison only; never whole-workspace qualification"})
             save(self.output / "original-scope-summary.json", original_summary)
-        return {"coverage_gate": summary["status"], "coverage_report_sha256": summary["input_sha256"],
+        return {"coverage_gate": "not_evaluated", "coverage_report_sha256": summary["input_sha256"],
                 "unfiltered_mapping_inventory_sha256": hashlib.sha256(unfiltered_raw).hexdigest(),
                 "native_mapped_source_files": sorted(native_mappings),
                 "merged_profile_sha256": sha(merged), "sources_without_mapping": missing,

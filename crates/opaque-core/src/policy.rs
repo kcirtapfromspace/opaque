@@ -680,46 +680,38 @@ impl PolicyEngine {
 
     /// Evaluate a request against the policy rules.
     ///
-    /// Applies additional safety-class enforcement:
-    /// - `REVEAL` operations are always denied for `Agent` clients.
-    /// - `SENSITIVE_OUTPUT` operations are denied for `Agent` clients unless
-    ///   the matching rule explicitly allows agent client types.
+    /// Agent `REVEAL` requests are denied before matching. `SENSITIVE_OUTPUT`
+    /// approval is clamped by the enclave; classification alone is not presence.
     pub fn evaluate(&self, request: &OperationRequest, safety: OperationSafety) -> PolicyDecision {
-        // Hard safety-class enforcement before rule evaluation.
-        if request.client_type == ClientType::Agent && safety == OperationSafety::Reveal {
-            return PolicyDecision::deny("REVEAL operations are never permitted for agent clients");
-        }
+        use opaque_policy_kernel::{Decision, RuleFacts};
 
-        // Find the first matching rule.
-        for rule in &self.rules {
-            if rule.matches(request) {
-                if !rule.allow {
-                    return PolicyDecision {
-                        allowed: false,
-                        required_factors: vec![],
-                        approval_requirement: ApprovalRequirement::Never,
-                        lease_ttl: None,
-                        one_time: false,
-                        budget: None,
-                        require_distinct_approver: false,
-                        matched_rule: Some(rule.name.clone()),
-                        denial_reason: Some(format!("denied by rule: {}", rule.name)),
-                    };
+        let decision = opaque_policy_kernel::evaluate(
+            request.client_type == ClientType::Agent,
+            safety == OperationSafety::Reveal,
+            self.rules.iter().map(|rule| RuleFacts {
+                matches: rule.matches(request),
+                allow: rule.allow,
+                first_use: rule.approval.require == ApprovalRequirement::FirstUse,
+                budget: rule.approval.budget,
+            }),
+        );
+        match decision {
+            Decision::AgentRevealDenied => {
+                PolicyDecision::deny("REVEAL operations are never permitted for agent clients")
+            }
+            Decision::RuleDenied(index) => {
+                let rule = &self.rules[index];
+                PolicyDecision {
+                    matched_rule: Some(rule.name.clone()),
+                    ..PolicyDecision::deny(format!("denied by rule: {}", rule.name))
                 }
-
-                // NOTE (software-first, C1): SensitiveOutput is no longer gated on
-                // client classification here. Classification is audit-only; the
-                // enclave clamps SensitiveOutput to mandatory out-of-band approval
-                // instead — a sound presence signal at a shared uid.
-                if rule.approval.budget.is_some()
-                    && (rule.approval.require != ApprovalRequirement::FirstUse
-                        || rule.approval.budget == Some(0))
-                {
-                    return PolicyDecision::deny(
-                        "approval budget requires first_use and a positive count",
-                    );
-                }
-                return PolicyDecision {
+            }
+            Decision::InvalidBudget => {
+                PolicyDecision::deny("approval budget requires first_use and a positive count")
+            }
+            Decision::Allow(index) => {
+                let rule = &self.rules[index];
+                PolicyDecision {
                     allowed: true,
                     required_factors: rule.approval.factors.clone(),
                     approval_requirement: rule.approval.require,
@@ -729,12 +721,12 @@ impl PolicyEngine {
                     require_distinct_approver: rule.approval.require_distinct_approver,
                     matched_rule: Some(rule.name.clone()),
                     denial_reason: None,
-                };
+                }
+            }
+            Decision::DefaultDenied => {
+                PolicyDecision::deny("no matching policy rule (default deny)")
             }
         }
-
-        // No matching rule: deny by default.
-        PolicyDecision::deny("no matching policy rule (default deny)")
     }
 }
 

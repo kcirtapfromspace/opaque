@@ -1,0 +1,39 @@
+name: Parser fuzz smoke
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  parsers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+        with:
+          toolchain: nightly-2026-09-13
+          components: rust-src
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12.11"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "fuzz -> target"
+          key: parser-fuzz-nightly-2026-09-13
+      - name: Install pinned fuzz runner
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Exercise every production parser target with AddressSanitizer
+        run: >-
+          python3 -B scripts/run_parser_fuzz.py
+          --output "$RUNNER_TEMP/parser-fuzz"
+          --target-dir "$GITHUB_WORKSPACE/fuzz/target"
+      - name: Retain bounded execution summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parser-fuzz-summary
+          path: ${{ runner.temp }}/parser-fuzz/report.json
+          if-no-files-found: error

@@ -1,0 +1,10 @@
+require_seal = true
+[[rules]]
+name = "fixture"
+operation_pattern = "github.*"
+client_types = ["human", "agent"]
+allow = true
+[rules.approval]
+require = "first_use"
+budget = 1
+lease_ttl = 60

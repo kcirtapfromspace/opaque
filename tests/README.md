@@ -100,12 +100,15 @@ Each `collection.json` records the source revision and content fingerprint,
 compiler target, exact test inventory, binary/profile hashes, measured counts
 and collection failures. `status: collected` means the collection completed;
 it does **not** mean the coverage target passed. The separate
-`coverage-summary.json` records the unchanged 100% line and branch gate.
-CI enforces that gate independently on Linux and macOS. Reports must not be
-averaged: one target cannot cover code compiled out on the other target.
-The gate also queries Cargo metadata independently with `--require-workspace`;
-a report that omits an entire package fails even if its remaining files show
-100%. Per-package line and branch counts expose that package's own gaps.
+`coverage-summary.json` records structural validation and measured counts.
+The separate `gate.json` enforces all 16 crates' immediate tiers and exact native
+line/branch ratchets: 100% lines and branches for the decision kernel, 85% branches
+for enforcement crates and 70% branches for general crates. See the
+[coverage and assertion guide](../docs/testing-coverage.md) for classification,
+trusted-base comparisons and baseline maintenance. Reports must not be averaged:
+one target cannot cover code compiled out on another. Independent Cargo metadata
+and source mapping checks still fail any omitted package; per-package counters
+expose each crate's remaining gaps.
 
 Raw command logs and runtime artifacts stay in local output. CI publishes only
 the collection inventory and sanitized coverage reports, never generated keys,

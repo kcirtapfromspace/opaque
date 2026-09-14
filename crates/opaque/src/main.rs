@@ -11,7 +11,7 @@ use console::style;
 use futures_util::{SinkExt, StreamExt};
 use opaque_core::audit::{AuditEventKind, AuditFilter, query_audit_db};
 use opaque_core::operation::{ClientIdentity, ClientType, OperationRequest, OperationSafety};
-use opaque_core::policy::{PolicyEngine, PolicyRule};
+use opaque_core::policy::PolicyEngine;
 use opaque_core::profile;
 use opaque_core::proto::{Request, Response};
 use opaque_core::socket::{socket_path, verify_socket_safety};
@@ -4287,15 +4287,7 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 // Policy config types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, serde::Deserialize)]
-struct PolicyConfig {
-    #[serde(default)]
-    rules: Vec<PolicyRule>,
-
-    /// When true, the daemon refuses to start if the config is not sealed.
-    #[serde(default)]
-    require_seal: bool,
-}
+use opaque_core::policy_document::PolicyDocument as PolicyConfig;
 
 // ---------------------------------------------------------------------------
 // policy check
@@ -4318,36 +4310,10 @@ fn policy_check_path(file: Option<&Path>) -> Result<String, String> {
     let contents = std::fs::read_to_string(&path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
 
-    let config: PolicyConfig = toml_edit::de::from_str(&contents)
+    let config: PolicyConfig = PolicyConfig::from_toml(&contents)
         .map_err(|e| format!("TOML parse error in {}: {e}", path.display()))?;
 
-    // Additional semantic validation.
-    let mut errors: Vec<String> = Vec::new();
-    for (i, rule) in config.rules.iter().enumerate() {
-        let prefix = format!("rules[{i}] ({:?})", rule.name);
-        if rule.name.is_empty() {
-            errors.push(format!("{prefix}: name must be non-empty"));
-        }
-        if rule.operation_pattern.is_empty() {
-            errors.push(format!("{prefix}: operation_pattern must be non-empty"));
-        }
-        if rule.client_types.is_empty() {
-            errors.push(format!("{prefix}: client_types must not be empty"));
-        }
-        if let Some(ttl) = rule.approval.lease_ttl
-            && ttl.as_secs() == 0
-        {
-            errors.push(format!("{prefix}: approval.lease_ttl must be > 0"));
-        }
-        if rule.approval.budget.is_some()
-            && (rule.approval.require != opaque_core::operation::ApprovalRequirement::FirstUse
-                || rule.approval.budget == Some(0))
-        {
-            errors.push(format!(
-                "{prefix}: approval.budget requires first_use and must be > 0"
-            ));
-        }
-    }
+    let errors = config.validation_errors();
 
     if !errors.is_empty() {
         return Err(format!(
@@ -4369,7 +4335,7 @@ fn policy_show(file: Option<&Path>) -> Result<(), String> {
     let contents = std::fs::read_to_string(&path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
 
-    let config: PolicyConfig = toml_edit::de::from_str(&contents)
+    let config: PolicyConfig = PolicyConfig::from_toml(&contents)
         .map_err(|e| format!("TOML parse error in {}: {e}", path.display()))?;
 
     if config.rules.is_empty() {
@@ -4537,7 +4503,7 @@ fn policy_simulate(
     let contents = std::fs::read_to_string(&path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
 
-    let config: PolicyConfig = toml_edit::de::from_str(&contents)
+    let config: PolicyConfig = PolicyConfig::from_toml(&contents)
         .map_err(|e| format!("TOML parse error in {}: {e}", path.display()))?;
 
     let client_type = match client_type_str {
@@ -4723,7 +4689,7 @@ fn policy_list_presets() {
             style(description).dim()
         );
         // Show a one-line summary of what the preset enables.
-        if let Ok(config) = toml_edit::de::from_str::<PolicyConfig>(content) {
+        if let Ok(config) = PolicyConfig::from_toml(content) {
             let ops: Vec<&str> = config
                 .rules
                 .iter()
@@ -6028,7 +5994,7 @@ async fn run_status(json_output: bool) {
         // Config
         let rule_count = std::fs::read_to_string(&config_path)
             .ok()
-            .and_then(|c| toml_edit::de::from_str::<PolicyConfig>(&c).ok())
+            .and_then(|c| PolicyConfig::from_toml(&c).ok())
             .map(|c| c.rules.len())
             .unwrap_or(0);
 
@@ -6236,7 +6202,7 @@ async fn run_doctor() {
     // 2. Config file
     if config_path.exists() {
         match std::fs::read_to_string(&config_path) {
-            Ok(contents) => match toml_edit::de::from_str::<PolicyConfig>(&contents) {
+            Ok(contents) => match PolicyConfig::from_toml(&contents) {
                 Ok(config) => {
                     doctor_pass(&format!("Config file valid ({} rules)", config.rules.len()));
                     pass_count += 1;
@@ -6313,7 +6279,7 @@ async fn run_doctor() {
     // 4. Require-seal setting
     if config_path.exists() {
         match std::fs::read_to_string(&config_path) {
-            Ok(contents) => match toml_edit::de::from_str::<PolicyConfig>(&contents) {
+            Ok(contents) => match PolicyConfig::from_toml(&contents) {
                 Ok(config) => {
                     if config.require_seal {
                         doctor_pass("require_seal is enabled (tamper protection active)");
@@ -7289,7 +7255,7 @@ fn generate_repo_policy(remote_url: &str, preset_content: Option<&str>) -> Strin
     let url_pattern = format!("*{}*", escaped_url);
 
     if let Some(preset) = preset_content
-        && let Ok(config) = toml_edit::de::from_str::<PolicyConfig>(preset)
+        && let Ok(config) = PolicyConfig::from_toml(preset)
     {
         let mut result = format!(
             "# Repo-scoped Opaque policy for {}\n\
@@ -7779,7 +7745,7 @@ lease_ttl = 0
     #[test]
     fn presets_are_valid_toml() {
         for (name, _, content) in available_presets() {
-            let result: Result<PolicyConfig, _> = toml_edit::de::from_str(content);
+            let result: Result<PolicyConfig, _> = PolicyConfig::from_toml(content);
             assert!(
                 result.is_ok(),
                 "preset '{name}' is not valid TOML: {result:?}"
@@ -8708,7 +8674,7 @@ BAZ=
 
     #[test]
     fn codex_agent_preset_is_valid_toml() {
-        let result: Result<PolicyConfig, _> = toml_edit::de::from_str(PRESET_CODEX_AGENT);
+        let result: Result<PolicyConfig, _> = PolicyConfig::from_toml(PRESET_CODEX_AGENT);
         assert!(
             result.is_ok(),
             "codex-agent preset should be valid TOML: {result:?}"

@@ -21,7 +21,7 @@ const hostileName = '<img src=x onerror="window.opaqueInjected=true">';
 async function waitFor(check, description, timeout = 20_000) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
-    if (await check()) return;
+    if (await check(Math.max(1, deadline - Date.now()))) return;
     await delay(25);
   }
   throw new Error(`Timed out: ${description}`);
@@ -61,6 +61,23 @@ async function fixture(t, {live = false, viewport} = {}) {
   const url = web.output.match(/opaque-web listening on (http:\/\/127\.0\.0\.1:\d+)/)[1];
   const token = (await readFile(join(directory, 'web.token'), 'utf8')).trim();
   assert.match(token, /^[a-zA-Z0-9_-]+$/);
+  if (live) {
+    // Token publication does not prove the dashboard can complete the daemon's
+    // authenticated handshake. Observe that real boundary before browser work.
+    await waitFor(async remaining => {
+      daemon.alive();
+      web.alive();
+      const response = await fetch(url + '/api/status', {
+        headers: {authorization: 'Bearer ' + token},
+        signal: AbortSignal.timeout(remaining),
+      });
+      assert.equal(response.status, 200, 'authenticated daemon readiness response');
+      const status = await response.json();
+      assert.ok(status.mode === 'live' || status.mode === 'disconnected', 'recognized daemon readiness mode');
+      assert.equal(status.daemon_running, status.mode === 'live', 'consistent daemon readiness state');
+      return status.mode === 'live';
+    }, 'authenticated dashboard-to-daemon readiness');
+  }
   const browser = await chromium.launch();
   cleanup.push(() => browser.close());
   const context = await browser.newContext({viewport});

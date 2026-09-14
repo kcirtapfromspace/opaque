@@ -1,0 +1,50 @@
+[package]
+name = "opaque-parser-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# This is executable test tooling, not a product library or an excluded product
+# crate. All product packages remain in the parent coverage workspace.
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+opaque-core = { path = "../crates/opaque-core" }
+opaque-mcp = { path = "../crates/opaque-mcp" }
+serde_json = "1"
+bytes = "1"
+tokio-util = { version = "0.7", features = ["codec"] }
+uuid = "1"
+
+[[bin]]
+name = "policy_document"
+path = "fuzz_targets/policy_document.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mcp_request"
+path = "fuzz_targets/mcp_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "daemon_response"
+path = "fuzz_targets/daemon_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "task_manifest"
+path = "fuzz_targets/task_manifest.rs"
+test = false
+doc = false
+bench = false
