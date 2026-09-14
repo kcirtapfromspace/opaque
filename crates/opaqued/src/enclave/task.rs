@@ -1526,6 +1526,440 @@ mod tests {
     }
 
     #[test]
+    fn task_admission_rejects_unknown_peer_target_and_unregistered_operation() {
+        let fixture = Fixture::new(true, true);
+        for (kind, expected) in [
+            (0, "task peer identity is unavailable"),
+            (1, "task has an unexpected target"),
+            (2, "task operation is not registered"),
+        ] {
+            let mut request = request();
+            match kind {
+                0 => request.client_identity.uid = u32::MAX,
+                1 => {
+                    request.target.insert(
+                        "caller_selected_destination".into(),
+                        "https://untrusted.invalid".into(),
+                    );
+                }
+                _ => request.operation = "unregistered.task".into(),
+            }
+            assert_eq!(
+                fixture.enclave.task_request_decision(&request).unwrap_err(),
+                expected
+            );
+        }
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+        let task = fixture.store.get(&fixture.id, "owner", now_unix()).unwrap();
+        assert_eq!(task.state, TaskState::Planned);
+        assert!(task.slots.iter().all(|slot| slot.reserved_at.is_none()));
+    }
+
+    #[test]
+    fn task_approval_uses_operation_default_and_refuses_an_empty_factor_floor() {
+        let mut fixture = Fixture::new(true, true);
+        let mut policy = rule("github.publish_manifest");
+        policy.approval.factors.clear();
+        fixture
+            .enclave
+            .swap_policy(PolicyEngine::with_rules(vec![policy]));
+        let (_, decision) = fixture.enclave.task_request_decision(&request()).unwrap();
+        assert_eq!(decision.required_factors, [ApprovalFactor::LocalBio]);
+        assert_eq!(decision.approval_requirement, ApprovalRequirement::Always);
+        let mut definition = task_operation();
+        definition.default_factors.clear();
+        let mut registry = OperationRegistry::new();
+        registry.register(definition).unwrap();
+        Arc::get_mut(&mut fixture.enclave).unwrap().registry = registry;
+        assert_eq!(
+            fixture
+                .enclave
+                .task_request_decision(&request())
+                .unwrap_err(),
+            "task approval factor is not configured"
+        );
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn child_approval_alternatives_cannot_weaken_parent_and_distinct_review_propagates() {
+        let fixture = Fixture::new(true, true);
+        let mut child = rule("github.set_actions_secret");
+        child.approval.factors.push(ApprovalFactor::Fido2);
+        fixture.enclave.swap_policy(PolicyEngine::with_rules(vec![
+            rule("github.publish_manifest"),
+            child.clone(),
+        ]));
+        assert_eq!(
+            fixture
+                .enclave
+                .preflight_task(&mut request(), &manifest())
+                .unwrap_err(),
+            "all task actions must require the same approval factors"
+        );
+        child.approval.factors = vec![ApprovalFactor::LocalBio];
+        child.approval.require_distinct_approver = true;
+        fixture.enclave.swap_policy(PolicyEngine::with_rules(vec![
+            rule("github.publish_manifest"),
+            child,
+        ]));
+        let (_, decision) = fixture
+            .enclave
+            .task_decision(&mut request(), &manifest())
+            .unwrap();
+        assert!(decision.require_distinct_approver);
+        assert_eq!(decision.required_factors, [ApprovalFactor::LocalBio]);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn publish_task_cannot_be_reinterpreted_as_read_only_workflow_observation() {
+        let fixture = Fixture::new(true, true);
+        assert_eq!(
+            fixture
+                .enclave
+                .preflight_task_observation(&request(), &manifest())
+                .unwrap_err(),
+            "only staging releases have workflow observations"
+        );
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn changed_principal_or_policy_after_task_approval_seals_without_reserving() {
+        for change_policy in [false, true] {
+            let fixture = InferenceFixture::new();
+            fixture.release.notify_one();
+            let outcome = fixture
+                .enclave
+                .execute_task(
+                    &fixture.store,
+                    &fixture.owner,
+                    &fixture.task.id,
+                    request(),
+                    TaskApprovalMode::InsecureTest,
+                    || {
+                        let context =
+                            if change_policy {
+                                fixture.enclave.swap_policy(PolicyEngine::with_rules(
+                                    inference_rules(&fixture.profile),
+                                ));
+                                None
+                            } else {
+                                ssh_request_fixture().principal
+                            };
+                        async move { Ok(context) }
+                    },
+                )
+                .await;
+            assert_eq!(
+                outcome.unwrap_err(),
+                "task authority changed; create a fresh task"
+            );
+            let task = fixture.assert_no_provider_attempt();
+            assert!(task.approved_at.is_some());
+            assert_eq!(task.state, TaskState::Partial);
+            assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+            assert!(
+                fixture
+                    .store
+                    .claim(&task.id, &fixture.owner, now_unix())
+                    .is_err()
+            );
+        }
+    }
+
+    async fn inference_dispatch_fixture() -> (InferenceFixture, wiremock::MockServer) {
+        use wiremock::{
+            Mock, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = wiremock::MockServer::start().await;
+        let mut fixture = InferenceFixture::new();
+        fixture.profile.config.api_url = server.uri();
+        fixture.profile.config.credential_ref = None;
+        fixture.profile.config.chat_template_sha256 =
+            opaque_core::inference::sha256(b"dispatch-fixture-template");
+        fixture.task = fixture
+            .store
+            .create(
+                &fixture.owner,
+                opaque_bounded_work::inference::public_demo_manifest(
+                    &fixture.profile,
+                    "Final authority fixture".into(),
+                    600,
+                )
+                .unwrap(),
+                now_unix(),
+            )
+            .unwrap();
+        Arc::get_mut(&mut fixture.enclave)
+            .unwrap()
+            .inference_profile = Some(fixture.profile.clone());
+        fixture
+            .enclave
+            .swap_policy(PolicyEngine::with_rules(vec![rule("inference.*")]));
+        for (endpoint, body) in [
+            ("/health", serde_json::json!({"status":"ok"})),
+            (
+                "/props",
+                serde_json::json!({"model_path":fixture.profile.model_path,"build_info":fixture.profile.server_build,"chat_template":"dispatch-fixture-template","total_slots":1,"default_generation_settings":{"n_ctx":2048}}),
+            ),
+            (
+                "/v1/models",
+                serde_json::json!({"data":[{"id":fixture.profile.model_id}]}),
+            ),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(endpoint))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path("/apply-template"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"prompt":"formatted public fixture"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/tokenize"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"tokens":[10,11,12]})),
+            )
+            .mount(&server)
+            .await;
+        (fixture, server)
+    }
+
+    #[tokio::test]
+    async fn final_task_authority_rejection_consumes_one_slot_without_model_completion() {
+        // Real loopback identity/tokenizer protocol and durable ledger; these
+        // denials intentionally never call the model completion endpoint.
+        for boundary in 0..4 {
+            let (mut fixture, server) = inference_dispatch_fixture().await;
+            let guard_calls = Arc::new(AtomicUsize::new(0));
+            if boundary == 2 {
+                let calls = guard_calls.clone();
+                Arc::get_mut(&mut fixture.enclave)
+                    .unwrap()
+                    .task_authority_guard = Some(Arc::new(move |_, _| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err("identity revoked at final synchronous fence".into())
+                }));
+            }
+            fixture.release.notify_one();
+            let context_calls = AtomicUsize::new(0);
+            let result = fixture
+                .enclave
+                .execute_task(
+                    &fixture.store,
+                    &fixture.owner,
+                    &fixture.task.id,
+                    request(),
+                    TaskApprovalMode::InsecureTest,
+                    || {
+                        let call = context_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                        let mut context = None;
+                        if call == 2 {
+                            match boundary {
+                                0 => context = ssh_request_fixture().principal,
+                                1 => {
+                                    fixture.enclave.swap_policy(PolicyEngine::with_rules(vec![
+                                        rule("inference.*"),
+                                    ]));
+                                }
+                                3 => {
+                                    fixture
+                                        .store
+                                        .revoke(&fixture.task.id, &fixture.owner, now_unix())
+                                        .unwrap();
+                                }
+                                _ => {}
+                            }
+                        }
+                        async move { Ok(context) }
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(context_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                guard_calls.load(Ordering::SeqCst),
+                usize::from(boundary == 2)
+            );
+            assert_eq!(
+                result
+                    .slots
+                    .iter()
+                    .filter(|slot| slot.reserved_at.is_some())
+                    .count(),
+                1
+            );
+            assert_eq!(result.slots[0].state, SlotState::Rejected);
+            assert_eq!(
+                result.slots[0].outcome.as_ref().unwrap().code,
+                match boundary {
+                    2 => "requester_or_task_authority_changed",
+                    3 => "revoked",
+                    _ => "policy_denied",
+                }
+            );
+            assert!(
+                result.slots[0]
+                    .outcome
+                    .as_ref()
+                    .unwrap()
+                    .inference_receipt
+                    .is_none()
+            );
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(
+                requests.len(),
+                8,
+                "two identity checks plus template and tokenizer"
+            );
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.url.path() != "/completion"
+                        && request.headers.get("authorization").is_none())
+            );
+            assert!(
+                fixture
+                    .store
+                    .claim(&fixture.task.id, &fixture.owner, now_unix())
+                    .is_err()
+            );
+            let retained = fixture
+                .store
+                .get(&fixture.task.id, &fixture.owner, now_unix())
+                .unwrap();
+            assert_eq!(retained.slots, result.slots);
+        }
+    }
+
+    #[tokio::test]
+    async fn guarded_task_retains_one_observed_completion_when_later_authority_is_withdrawn() {
+        let (mut fixture, server) = inference_dispatch_fixture().await;
+        let model = fixture.profile.model_id.clone();
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/completion"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(body["model"], model);
+                assert_eq!(body["prompt"], serde_json::json!([10, 11, 12]));
+                assert_eq!(body["n_predict"], 96);
+                assert_eq!(body["n_cmpl"], 1);
+                assert_eq!(body["stream"], false);
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "content":"Synthetic protocol completion observed.","model":model,
+                    "stop":true,"truncated":false,"stop_type":"eos","tokens_evaluated":3,
+                    "tokens_predicted":4,"tokens":[1,2,3,4],"generation_settings":{"n_predict":96}
+                }))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        let guard_calls = Arc::new(AtomicUsize::new(0));
+        let calls = guard_calls.clone();
+        let store = fixture.store.clone();
+        let owner = fixture.owner.clone();
+        let id = fixture.task.id.clone();
+        Arc::get_mut(&mut fixture.enclave)
+            .unwrap()
+            .task_authority_guard = Some(Arc::new(move |principal, dispatch| {
+            assert!(principal.is_none());
+            let task = store.get(&id, &owner, now_unix()).unwrap();
+            assert!(task.approved_at.is_some());
+            assert_eq!(task.slots[0].state, SlotState::Reserved);
+            assert!(
+                task.slots[1..]
+                    .iter()
+                    .all(|slot| slot.reserved_at.is_none())
+            );
+            calls.fetch_add(1, Ordering::SeqCst);
+            dispatch()
+        }));
+        fixture.release.notify_one();
+        let context_calls = AtomicUsize::new(0);
+        let result = fixture
+            .enclave
+            .execute_task(
+                &fixture.store,
+                &fixture.owner,
+                &fixture.task.id,
+                request(),
+                TaskApprovalMode::InsecureTest,
+                || {
+                    let call = context_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    async move {
+                        if call == 3 {
+                            Err("delegation withdrawn before next slot".into())
+                        } else {
+                            Ok(None)
+                        }
+                    }
+                },
+            )
+            .await;
+        assert_eq!(result.unwrap_err(), "delegation withdrawn before next slot");
+        assert_eq!(context_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(guard_calls.load(Ordering::SeqCst), 1);
+        let retained = fixture
+            .store
+            .get(&fixture.task.id, &fixture.owner, now_unix())
+            .unwrap();
+        assert_eq!(retained.state, TaskState::Partial);
+        assert_eq!(retained.slots[0].state, SlotState::ApiAccepted);
+        let outcome = retained.slots[0].outcome.as_ref().unwrap();
+        assert_eq!(outcome.code, "api_accepted");
+        outcome
+            .inference_receipt
+            .as_ref()
+            .unwrap()
+            .validate(retained.slots[0].action.as_inference().unwrap())
+            .unwrap();
+        assert!(
+            retained.slots[1..]
+                .iter()
+                .all(|slot| slot.state == SlotState::Pending
+                    && slot.reserved_at.is_none()
+                    && slot.outcome.is_none())
+        );
+        assert_eq!(
+            fixture
+                .audit
+                .events_of_kind(AuditEventKind::OperationStarted)
+                .len(),
+            1
+        );
+        assert_eq!(
+            fixture
+                .audit
+                .events_of_kind(AuditEventKind::OperationSucceeded)
+                .len(),
+            1
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 9);
+        assert!(
+            fixture
+                .store
+                .claim(&fixture.task.id, &fixture.owner, now_unix())
+                .is_err()
+        );
+        assert_eq!(
+            fixture
+                .store
+                .get(&fixture.task.id, &fixture.owner, now_unix())
+                .unwrap(),
+            retained
+        );
+    }
+
+    #[test]
     fn observation_requires_read_policy_for_exact_target_and_credential() {
         let mut registry = OperationRegistry::new();
         for operation in release_task_operations() {

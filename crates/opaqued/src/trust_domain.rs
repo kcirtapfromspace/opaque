@@ -426,6 +426,142 @@ mod tests {
     }
 
     #[test]
+    fn account_lookup_rejects_invalid_names_without_changing_process_identity() {
+        let before = (
+            unsafe { libc::getuid() },
+            unsafe { libc::geteuid() },
+            unsafe { libc::getgid() },
+            unsafe { libc::getegid() },
+            std::env::var_os("HOME"),
+        );
+        for (name, kind) in [
+            ("root\0ignored", io::ErrorKind::InvalidInput),
+            ("opaque-no-such-account-67ce9", io::ErrorKind::NotFound),
+        ] {
+            let error = resolve_user(name).err().expect("invalid account must fail");
+            assert_eq!(error.kind(), kind);
+            assert_eq!(
+                resolve_gid(name).unwrap_err().kind(),
+                kind,
+                "both account boundaries reject {name:?}"
+            );
+        }
+        let root = resolve_user("root").unwrap();
+        assert_eq!(root.uid, 0);
+        assert_eq!(root.gid, 0);
+        assert!(Path::new(&root.home).is_absolute());
+        assert_eq!(
+            before,
+            (
+                unsafe { libc::getuid() },
+                unsafe { libc::geteuid() },
+                unsafe { libc::getgid() },
+                unsafe { libc::getegid() },
+                std::env::var_os("HOME"),
+            ),
+            "read-only resolution must not apply the resolved identity"
+        );
+    }
+
+    fn socket_surface_failure_at(failed_index: usize, contains_nul: bool) {
+        use std::os::unix::{
+            ffi::OsStringExt,
+            fs::{MetadataExt, PermissionsExt},
+            net::UnixListener,
+        };
+        let owned = tempfile::tempdir().unwrap();
+        let directory = owned.path().join("run");
+        std::fs::create_dir(&directory).unwrap();
+        let socket = directory.join("opaqued.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let token = directory.join("daemon.token");
+        std::fs::write(&token, b"synthetic-token\n").unwrap();
+        let unrelated = owned.path().join("unrelated");
+        std::fs::write(&unrelated, b"must remain private").unwrap();
+        std::fs::set_permissions(&unrelated, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let original = [directory, socket, token];
+        for (path, mode) in original.iter().zip([0o700, 0o600, 0o600]) {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let owners = original.each_ref().map(|path| {
+            let m = std::fs::metadata(path).unwrap();
+            (m.uid(), m.gid(), m.ino())
+        });
+        let broken = if contains_nul {
+            let mut bytes = original[failed_index]
+                .as_os_str()
+                .as_encoded_bytes()
+                .to_vec();
+            bytes.extend_from_slice(b"\0unreachable");
+            std::path::PathBuf::from(std::ffi::OsString::from_vec(bytes))
+        } else {
+            owned.path().join("missing").join("must-not-be-created")
+        };
+        let mut supplied = original.clone();
+        supplied[failed_index] = broken.clone();
+        let gid = unsafe { libc::getegid() };
+        let error = apply_socket_group(&supplied[0], &supplied[1], &supplied[2], gid).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            if contains_nul {
+                io::ErrorKind::InvalidInput
+            } else {
+                io::ErrorKind::PermissionDenied
+            }
+        );
+        assert!(error.to_string().contains(if contains_nul {
+            "NUL byte"
+        } else {
+            "cannot set group"
+        }));
+        // Setup is sequential: only the successfully processed prefix changes.
+        // Later artifacts and the original artifact at the rejected position
+        // retain their private permissions, owners, inodes and contents.
+        for (i, path) in original.iter().enumerate() {
+            let m = std::fs::metadata(path).unwrap();
+            let expected_mode = if i < failed_index {
+                [0o750, 0o660, 0o640][i]
+            } else {
+                [0o700, 0o600, 0o600][i]
+            };
+            assert_eq!(m.permissions().mode() & 0o777, expected_mode);
+            assert_eq!((m.uid(), m.gid(), m.ino()), owners[i]);
+        }
+        assert_eq!(std::fs::read(&original[2]).unwrap(), b"synthetic-token\n");
+        assert_eq!(std::fs::read(&unrelated).unwrap(), b"must remain private");
+        assert_eq!(
+            std::fs::metadata(&unrelated).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(!broken.exists());
+        // Repairing the argument permits the real socket surface to initialize
+        // idempotently, without replacing its listener or secret file.
+        for _ in 0..2 {
+            apply_socket_group(&original[0], &original[1], &original[2], gid).unwrap();
+        }
+        for (i, path) in original.iter().enumerate() {
+            let m = std::fs::metadata(path).unwrap();
+            assert_eq!(m.permissions().mode() & 0o777, [0o750, 0o660, 0o640][i]);
+            assert_eq!((m.uid(), m.gid(), m.ino()), owners[i]);
+        }
+        assert_eq!(std::fs::read(&original[2]).unwrap(), b"synthetic-token\n");
+    }
+
+    #[test]
+    fn socket_surface_rejects_nul_at_each_position_and_preserves_unprocessed_custody() {
+        for index in 0..3 {
+            socket_surface_failure_at(index, true);
+        }
+    }
+
+    #[test]
+    fn socket_surface_reports_missing_path_without_creating_or_replacing_artifacts() {
+        for index in 0..3 {
+            socket_surface_failure_at(index, false);
+        }
+    }
+
+    #[test]
     fn apply_socket_group_sets_split_surface_modes() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 

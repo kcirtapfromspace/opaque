@@ -48,6 +48,9 @@ mod connection;
 mod connection_flow_tests;
 mod enclave;
 mod identity;
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod main_contract_tests;
 mod mcp_gateway;
 mod provisioning_api;
 #[cfg(test)]

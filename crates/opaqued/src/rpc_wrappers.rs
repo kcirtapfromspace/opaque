@@ -22,15 +22,14 @@ use opaque_core::identity::PrincipalContext;
 use opaque_core::operation::{ClientIdentity, ClientType, OperationRequest};
 use opaque_core::proto::{Request, Response};
 use opaque_core::validate::InputValidator;
-use tracing::warn;
 use uuid::Uuid;
 
-use crate::{DaemonState, truncate_for_error, verify_workspace};
+use crate::{DaemonState, truncate_for_error, verified_workspace};
 
 /// `execute`: the general-purpose entry point — the caller names the
 /// operation directly and supplies `target`/`secret_ref_names`/`params`/an
-/// optional `workspace` claim, which this verifies itself (unlike the other
-/// four wrappers below, which reuse `handle_request`'s pre-verified
+/// optional `workspace` claim, which this verifies through the shared helper.
+/// The other four wrappers reuse `handle_request`'s pre-verified
 /// `wrapper_workspace`, since `execute` is not in that pre-check's method
 /// list — see the comment at its call site in `handle_request`).
 pub async fn handle_execute(
@@ -79,37 +78,19 @@ pub async fn handle_execute(
         .cloned()
         .unwrap_or(serde_json::Value::Null);
 
-    let mut workspace: Option<opaque_core::operation::WorkspaceContext> = req
-        .params
-        .get("workspace")
-        .and_then(|v| serde_json::from_value(v.clone()).ok());
-
-    // Sanitize workspace remote_url to strip embedded credentials.
-    if let Some(ref mut ws) = workspace
-        && let Some(ref url) = ws.remote_url
-    {
-        ws.remote_url = Some(InputValidator::sanitize_url(url));
-    }
-
-    // Verify claimed workspace against actual process state.
-    // verify_workspace is async (offloads blocking git commands to spawn_blocking).
-    if let Some(ref ws) = workspace
-        && let Err(e) = verify_workspace(ws, identity.pid).await
-    {
-        warn!("workspace verification failed: {e}");
-        return Response::err(
-            Some(req.id),
-            "workspace_verification_failed",
-            "workspace verification failed",
-        );
-    }
-
-    // Mark workspace as verified — the daemon confirmed the claimed
-    // workspace state matches the actual process and git state.
-    // Policy rules with workspace constraints will check this flag.
-    if let Some(ref mut ws) = workspace {
-        ws.workspace_verified = true;
-    }
+    // Use the same fail-closed parsing and native peer binding as the
+    // convenience wrappers. Malformed claims must not silently become absent,
+    // and no workspace may be marked verified without a peer PID.
+    let workspace = match verified_workspace(&req.params, identity).await {
+        Ok(workspace) => workspace,
+        Err(_) => {
+            return Response::err(
+                Some(req.id),
+                "workspace_verification_failed",
+                "workspace verification failed",
+            );
+        }
+    };
 
     let op_req = OperationRequest {
         principal: principal_ctx.clone(),
@@ -382,3 +363,8 @@ pub async fn handle_exec(
     )
     .await
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "rpc_wrapper_contract_tests.rs"]
+mod contract_tests;

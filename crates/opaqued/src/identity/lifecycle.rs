@@ -1117,6 +1117,245 @@ mod tests {
         .collect()
     }
 
+    async fn exchange_frame(
+        service: Service,
+        length: u32,
+        body: &[u8],
+    ) -> (Result<(), String>, Vec<u8>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let (response, handled) = tokio::join!(
+                async {
+                    client.write_u32(length).await.unwrap();
+                    client.write_all(body).await.unwrap();
+                    client.shutdown().await.unwrap();
+                    let mut bytes = Vec::new();
+                    client.read_to_end(&mut bytes).await.unwrap();
+                    assert!(bytes.len() <= opaque_core::identity_lifecycle::MAX_RESPONSE_BYTES + 4);
+                    bytes
+                },
+                handle(service, server),
+            );
+            (handled, response)
+        })
+        .await
+        .expect("owned lifecycle frame exchange must finish")
+    }
+
+    fn decode_frame(bytes: &[u8]) -> LifecycleResponse {
+        let size = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
+        assert_eq!(size, bytes.len() - 4);
+        serde_json::from_slice(&bytes[4..]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn lifecycle_wire_bounds_preserve_authority_and_allow_a_fresh_valid_frame() {
+        let f = Fixture::new();
+        let token = "a".repeat(64);
+        let service = Service {
+            runtime: f.runtime.clone(),
+            binding: f.binding.clone(),
+            token_hash: Sha256::digest(token.as_bytes()).into(),
+        };
+        let before = retained_state(&f);
+        let (result, bytes) = exchange_frame(service.clone(), 0, &[]).await;
+        assert_eq!(result.unwrap_err(), "lifecycle request exceeds bound");
+        assert!(bytes.is_empty());
+        assert_eq!(retained_state(&f), before);
+        for size in [31, 129] {
+            let request = LifecycleRequest {
+                credential: "a".repeat(size),
+                batch: f.batch(1, true, &["reviewers"]),
+            };
+            let body = serde_json::to_vec(&request).unwrap();
+            let (result, bytes) = exchange_frame(service.clone(), body.len() as u32, &body).await;
+            result.unwrap();
+            assert!(
+                matches!(decode_frame(&bytes), LifecycleResponse::Rejected { error } if error == "dedicated lifecycle credential required")
+            );
+            assert_eq!(retained_state(&f), before);
+        }
+        let mut batch = f.batch(1, true, &["reviewers"]);
+        batch.updates[0].subject.clear();
+        let overhead = serde_json::to_vec(&batch).unwrap().len();
+        batch.updates[0].subject = "x".repeat(MAX_BATCH_BYTES + 1 - overhead);
+        assert_eq!(
+            serde_json::to_vec(&batch).unwrap().len(),
+            MAX_BATCH_BYTES + 1
+        );
+        let body = serde_json::to_vec(&LifecycleRequest {
+            credential: token.clone(),
+            batch,
+        })
+        .unwrap();
+        assert!(
+            body.len() <= MAX_REQUEST_BYTES,
+            "exercise authenticated batch bound, not frame bound"
+        );
+        let (result, bytes) = exchange_frame(service.clone(), body.len() as u32, &body).await;
+        result.unwrap();
+        assert!(
+            matches!(decode_frame(&bytes), LifecycleResponse::Rejected { error } if error == "lifecycle batch exceeds bound")
+        );
+        assert_eq!(retained_state(&f), before);
+        let batch = f.batch(1, true, &["reviewers"]);
+        let expected_digest = format!("{:x}", Sha256::digest(serde_json::to_vec(&batch).unwrap()));
+        let body = serde_json::to_vec(&LifecycleRequest {
+            credential: token,
+            batch,
+        })
+        .unwrap();
+        let (result, bytes) = exchange_frame(service, body.len() as u32, &body).await;
+        result.unwrap();
+        let LifecycleResponse::Applied { receipt } = decode_frame(&bytes) else {
+            panic!("valid authenticated frame was rejected")
+        };
+        assert_eq!(receipt.revision, 1);
+        assert_eq!(receipt.digest, expected_digest);
+        assert_eq!(receipt.binding, f.binding);
+        assert_eq!(receipt.issuer, f.runtime.config.issuer);
+        assert!(!f.principal().disabled);
+        assert_eq!(
+            f.principal().roles,
+            BTreeSet::from([Role::Approver, Role::Operator])
+        );
+    }
+
+    #[test]
+    fn unchanged_subject_at_next_source_revision_preserves_existing_live_authority() {
+        use opaque_core::identity::AccessMode;
+        let f = Fixture::new();
+        let first = f.apply(&f.batch(1, true, &["reviewers"])).unwrap();
+        let principal = f.principal();
+        let session = f
+            .runtime
+            .store
+            .create_human_session(&principal.id, 600, &f.runtime.config.issuer)
+            .unwrap();
+        let agent = f
+            .runtime
+            .store
+            .upsert_agent("unchanged-lifecycle-fixture")
+            .unwrap();
+        let now = now_unix();
+        let delegation = super::super::store::DelegationRecord {
+            jti: uuid::Uuid::new_v4().to_string(),
+            sub_principal: principal.id.clone(),
+            act_principal: agent.id,
+            mode: AccessMode::Delegated,
+            human_session_id: Some(session.id.clone()),
+            approved_by: Some(principal.id.clone()),
+            created_at: now,
+            expires_at: now + 300,
+            revoked_at: None,
+        };
+        f.runtime.store.record_delegation(&delegation).unwrap();
+        let before = retained_state(&f);
+        let revision = f.runtime.store.lifecycle_revision().unwrap();
+        let batch = f.batch(2, true, &["reviewers"]);
+        let receipt = f.apply(&batch).unwrap();
+        assert_eq!(receipt.revision, 2);
+        assert_ne!(receipt.digest, first.digest);
+        assert_eq!(f.runtime.store.lifecycle_revision().unwrap(), revision + 1);
+        let after = retained_state(&f);
+        for index in [0, 1, 2, 3, 5] {
+            assert_eq!(
+                after[index], before[index],
+                "only source configuration advances, table index {index}"
+            );
+        }
+        assert_ne!(after[4], before[4]);
+        assert!(
+            f.runtime
+                .store
+                .get_human_session(&session.id)
+                .unwrap()
+                .unwrap()
+                .revoked_at
+                .is_none()
+        );
+        assert!(
+            f.runtime
+                .store
+                .get_delegation(&delegation.jti)
+                .unwrap()
+                .unwrap()
+                .revoked_at
+                .is_none()
+        );
+        assert_eq!(f.apply(&batch).unwrap(), receipt);
+        assert_eq!(
+            retained_state(&f),
+            after,
+            "replay is an exact idempotent receipt"
+        );
+    }
+
+    #[test]
+    fn matching_foreign_api_and_batch_scope_cannot_rebind_persisted_lifecycle_custody() {
+        let f = Fixture::new();
+        f.apply(&f.batch(1, true, &["reviewers"])).unwrap();
+        let before = retained_state(&f);
+        for foreign_tenant in [true, false] {
+            let mut batch = f.batch(2, false, &[]);
+            if foreign_tenant {
+                batch.binding.broker_id = uuid::Uuid::new_v4();
+            } else {
+                batch.issuer = "https://foreign-issuer.example".into();
+            }
+            assert_eq!(
+                f.runtime
+                    .store
+                    .apply_lifecycle(&batch.binding, &batch.issuer, &batch)
+                    .unwrap_err(),
+                "management tenant/issuer not authorized"
+            );
+            assert_eq!(retained_state(&f), before);
+        }
+        f.apply(&f.batch(2, false, &[])).unwrap();
+        assert!(f.principal().disabled);
+    }
+
+    #[test]
+    fn persisted_lifecycle_probe_requires_private_regular_state_and_never_initializes_it() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.db");
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(
+            persisted_lifecycle(dir.path()).unwrap_err(),
+            "persisted identity must be privately owned"
+        );
+        assert!(path.is_dir());
+        std::fs::remove_dir(&path).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("CREATE TABLE unrelated(value TEXT); INSERT INTO unrelated VALUES('retained fixture');").unwrap();
+        drop(connection);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let content = std::fs::read(&path).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        assert_eq!(
+            persisted_lifecycle(dir.path()).unwrap_err(),
+            "persisted identity must be privately owned"
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        for _ in 0..2 {
+            assert!(!persisted_lifecycle(dir.path()).unwrap());
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), content);
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "read-only probe created no sidecar or authority state"
+        );
+    }
+
     #[test]
     fn invalid_lifecycle_batches_preserve_every_authority_row_and_next_revision() {
         let f = Fixture::new();
