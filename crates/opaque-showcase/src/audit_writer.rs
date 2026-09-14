@@ -71,6 +71,15 @@ impl AuditWriter {
             DEADLINE,
         )
     }
+    /// Test storage boundary using the production queue, deadlines and acknowledgments.
+    #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    pub(crate) fn test_persist(
+        persist: impl FnMut(&[u8]) -> io::Result<()> + Send + 'static,
+    ) -> Self {
+        Self::start(persist, None, CAPACITY, DEADLINE).unwrap()
+    }
+
     fn start(
         mut persist: impl FnMut(&[u8]) -> io::Result<()> + Send + 'static,
         custody: Option<Arc<StateLock>>,

@@ -31,7 +31,7 @@ impl Fixture {
         ];
         let admissions=members.iter().map(|member| json!({
             "tenant_id":"customer-a","subject":member["subject"],"client_id":member["oauth_client_id"],
-            "scopes":if member["subject"]=="engineer" {vec![ACTIVITY_SCOPE]} else {vec![ACTIVITY_SCOPE,"metrics:read"]},
+            "scopes":if member["subject"]=="engineer" {vec![ACTIVITY_SCOPE]} else {vec![ACTIVITY_SCOPE,"metrics:read","portfolio:read","portfolio:measure:manual_review_rate_percent"]},
         })).collect::<Vec<_>>();
         let cfg:GatewayConfig=serde_json::from_value(json!({
             "bind":format!("127.0.0.1:{port}"),"public_origin":origin,"tenant_id":"customer-a","customer_name":"Synthetic customer",
@@ -41,7 +41,7 @@ impl Fixture {
             "oauth":{"authorization_endpoint":format!("{}/authorize",server.uri()),"token_endpoint":format!("{}/token",server.uri()),
                 "client_id":"analyst-client","scopes":[ACTIVITY_SCOPE,"metrics:read"]},
             "source":{"tenant_id":"customer-a","source_id":"fixture-source","base_url":server.uri(),"credential_env":"CARGO_PKG_NAME",
-                "allowed_metrics":CREDIT_METRICS,"max_window_secs":300,"max_staleness_secs":60,"allow_loopback_http":true},
+                "allowed_metrics":CREDIT_METRICS,"allowed_portfolio_measures":["manual_review_rate_percent"],"max_window_secs":300,"max_staleness_secs":60,"allow_loopback_http":true},
             "model":{"kind":"fixture"},
             "organization_demo":{"id":"fixture-org","display_name":"Synthetic organization","members":members}
         })).unwrap();
@@ -200,4 +200,153 @@ async fn changed_active_persona_is_rejected_after_state_lock_succeeds() {
             .is_empty()
     );
     assert!(f.server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn persona_withdrawal_after_observed_audit_commit_still_withholds_portfolio_evidence() {
+    use std::io::Write;
+    use wiremock::{
+        Mock, ResponseTemplate,
+        matchers::{method, path},
+    };
+    for withdraw in [false, true] {
+        let mut f = Fixture::new().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/portfolio/query"))
+            .respond_with(|request: &wiremock::Request| {
+                let query: Value = request.body_json().unwrap();
+                let at = now();
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "tenant_id":"customer-a","query":query,"as_of":at,"watermark":at,
+                    "history_start":at-7205,"history_kind":"synthetic_seeded_and_live",
+                    "rows":[{"key":"all","period_start":at-60,"period_end":at,"sample_count":100,
+                        "values":{"manual_review_rate_percent":10}}],"comparison":[]
+                }))
+            })
+            .expect(1)
+            .mount(&f.server)
+            .await;
+        let audit_path = f.app.config.state_dir.join("audit.jsonl");
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&audit_path)
+            .unwrap();
+        let (entered, mut persisted) = tokio::sync::mpsc::unbounded_channel();
+        let (release, gate) = std::sync::mpsc::sync_channel(1);
+        let writer = crate::audit_writer::AuditWriter::test_persist(move |bytes| {
+            file.write_all(bytes)?;
+            file.sync_data()?;
+            let row: Value = serde_json::from_slice(bytes).map_err(std::io::Error::other)?;
+            if row["details"]["operation"] == "portfolio.query"
+                && row["details"]["outcome"] == "observed"
+            {
+                entered.send(()).map_err(std::io::Error::other)?;
+                gate.recv_timeout(Duration::from_secs(5))
+                    .map_err(std::io::Error::other)?;
+            }
+            Ok(())
+        });
+        // Keep original custody and its real writer alive for the serialized
+        // control transition while the portfolio writer is awaiting release.
+        let authority_writer =
+            std::mem::replace(&mut Arc::get_mut(&mut f.app).unwrap().audit, writer);
+        let access = f.access(Persona::CustomerAnalyst);
+        let engineer = f.access(Persona::Engineer);
+        let epoch = f.app.access_epoch(&access).unwrap();
+        let query: PortfolioQuery = serde_json::from_value(
+            json!({"view":"summary","window_secs":60,"measures":["manual_review_rate_percent"]}),
+        )
+        .unwrap();
+        let expected_query = serde_json::to_value(&query).unwrap();
+        let operation = portfolio_mcp(&f.app, &access, epoch, json!(91), query);
+        tokio::pin!(operation);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                _ = &mut operation => panic!("portfolio returned before observed audit acknowledgment"),
+                event = persisted.recv() => assert_eq!(event, Some(())),
+            }
+        }).await.unwrap();
+        let rows = || {
+            std::fs::read_to_string(&audit_path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            rows()
+                .iter()
+                .filter(|row| row["details"]["outcome"] == "observed")
+                .count(),
+            1
+        );
+        if withdraw {
+            f.app
+                .organization
+                .lock()
+                .unwrap()
+                .activate(
+                    f.app.config.organization_demo.as_ref().unwrap(),
+                    &engineer,
+                    Persona::Engineer,
+                    None,
+                    now(),
+                    |record| {
+                        authority_writer
+                            .append_blocking(&f.app.organization_record(&engineer, record))
+                    },
+                )
+                .unwrap();
+            assert_ne!(f.app.access_epoch(&engineer).unwrap(), epoch);
+        }
+        release.send(()).unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(5), &mut operation)
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            if withdraw {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::OK
+            }
+        );
+        let response: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 32768)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        if withdraw {
+            assert_eq!(response["error"]["code"], "organization_access_denied");
+            assert!(response.get("result").is_none());
+        } else {
+            assert_eq!(response["result"]["isError"], false);
+            assert_eq!(
+                response["result"]["structuredContent"]["query"],
+                expected_query
+            );
+        }
+        let audit = rows();
+        assert_eq!(
+            audit
+                .iter()
+                .filter(|row| row["details"]["operation"] == "portfolio.query"
+                    && row["details"]["outcome"] == "observed")
+                .count(),
+            1
+        );
+        let requests = f.server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "no retry or model request may follow the committed read"
+        );
+        assert_eq!(requests[0].url.path(), "/v1/portfolio/query");
+        let activity = f.activity(if withdraw { &engineer } else { &access });
+        assert_eq!(activity["records"].as_array().unwrap().len(), 1);
+        assert_eq!(activity["records"][0]["source_accessed"], true);
+        assert_eq!(activity["records"][0]["tool_calls"], 1);
+        assert_eq!(activity["records"][0]["outcome"], "observed");
+    }
 }
