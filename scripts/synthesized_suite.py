@@ -36,6 +36,13 @@ PACKAGED_CHECKS = (
     "installed_delegated_session_denial_before_custody",
     "installed_native_capability_protocol_without_prompt", "isolated_home_without_default_daemon_state",
 )
+# Match complete fixed diagnostics from tests/packaged/run.py. Never publish
+# arbitrary subprocess output, command arguments, or exception payloads.
+PACKAGED_FAILURES = {
+    b"packaged acceptance: installed binary identity differs from its selected revision\n": "installed_revision_mismatch",
+    b"packaged acceptance: acceptance prerequisite or subprocess failed\n": "prerequisite_or_subprocess_failed",
+    b"Packaged acceptance interrupted; no qualification produced.\n": "interrupted",
+}
 
 
 class Invalid(Exception):
@@ -553,7 +560,11 @@ def run_suite(manifest, root, profile, target_dir, *, executor=invoke, snapshot=
                     argv.extend(["--coverage-input", str(coverage_input)])
                 result = executor(argv, cwd=root, env=run_env, timeout=300)
                 entry.update(executed=True, output_sha256=digest(result.output), output_bytes=len(result.output),
-                             cleanup_forced=result.cleanup_forced)
+                             cleanup_forced=result.cleanup_forced,
+                             exit_code=result.returncode if result.returncode >= 0 else None,
+                             signal=-result.returncode if result.returncode < 0 else None)
+                if result.returncode != 0:
+                    entry["diagnostic"] = PACKAGED_FAILURES.get(result.output, "unrecognized_packaged_failure")
                 command_ok(result)
                 require(output.is_file() and not output.is_symlink(), "missing_packaged_report")
                 qualified = packaged_report(json_read(output), source=initial, target=toolchain["host"],

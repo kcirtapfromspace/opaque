@@ -382,6 +382,44 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(report["commands"][0]["reason"], "required_packaged_archive_missing")
         self.assertEqual(report["counts"]["command_scenario_executions"], 0)
 
+    def test_packaged_failure_metadata_never_publishes_unrecognized_output(self):
+        self.packaged_fixture()
+        known = b"packaged acceptance: installed binary identity differs from its selected revision\n"
+        cases = [
+            (known, 1, "installed_revision_mismatch"),
+            (known + b"SECRET_SUFFIX", 1, "unrecognized_packaged_failure"),
+            (b"SECRET_PREFIX" + known, 1, "unrecognized_packaged_failure"),
+            (b"packaged acceptance: acceptance prerequisite or subprocess failed\n", 1, "prerequisite_or_subprocess_failed"),
+            (b"Packaged acceptance interrupted; no qualification produced.\n", 130, "interrupted"),
+            (b"SECRET_SIGNAL_OUTPUT", -signal.SIGTERM, "unrecognized_packaged_failure"),
+        ]
+        for output, code, diagnostic in cases:
+            with self.subTest(diagnostic=diagnostic, code=code):
+                def execute(argv, **kwargs):
+                    if str(self.root / "tests/packaged/run.py") in argv:
+                        # A real owned subprocess exits or is signalled; only
+                        # its controlled output stands in for the runner.
+                        script = ("import os,signal,sys; "
+                                  "sys.stdout.buffer.write(bytes.fromhex(sys.argv[1])); sys.stdout.flush(); "
+                                  "code=int(sys.argv[2]); "
+                                  "os.kill(os.getpid(),-code) if code<0 else sys.exit(code)")
+                        return suite.invoke([sys.executable, "-B", "-c", script, output.hex(), str(code)],
+                                            cwd=self.root, env=suite.environment(), timeout=5)
+                    return self.packaged_fake(argv, **kwargs)
+                report = self.packaged_run(packaged_archive=self.archive, executor=execute)
+                command = report["commands"][0]
+                self.assertEqual(report["status"], "failed")
+                self.assertEqual(command["reason"], "command_failed")
+                self.assertEqual(command["diagnostic"], diagnostic)
+                self.assertEqual(command["exit_code"], code if code >= 0 else None)
+                self.assertEqual(command["signal"], -code if code < 0 else None)
+                self.assertEqual(command["output_sha256"], suite.digest(output))
+                self.assertEqual(command["output_bytes"], len(output))
+                self.assertFalse(command["cleanup_forced"])
+                self.assertEqual(report["counts"]["unique_tests_passed"], 0)
+                self.assertEqual(report["counts"]["command_scenarios_passed"], 0)
+                self.assertNotIn("SECRET", json.dumps(report))
+
     def test_packaged_registration_rejects_unknown_runners_and_vacuous_other_requirements(self):
         self.packaged_fixture()
         suite.validate_manifest(self.manifest)
