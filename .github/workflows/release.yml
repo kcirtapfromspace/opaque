@@ -236,12 +236,44 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Install Rust
+        # Keep in sync with rust-toolchain.toml (the action's RUSTUP_TOOLCHAIN
+        # export outranks the file). Present only so cargo-cyclonedx can resolve
+        # the workspace for the SBOMs below.
+        uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master
+        with:
+          toolchain: "1.95.0"
+
+      - name: Install cargo-cyclonedx
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-cyclonedx
+
+      - name: Generate SBOMs
+        # One CycloneDX SBOM per released binary that is its own workspace crate.
+        # --target all captures every release platform's dependency set, not
+        # only the runner host. The opaque-mcp-contract and opaque-evidence
+        # binaries ship inside other crates and are covered by those crates'
+        # SBOMs.
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          cargo cyclonedx --format json --spec-version 1.5 --target all -q
+          for bin in opaqued opaque opaque-mcp opaque-approve-helper opaque-approver opaque-web; do
+            cp "crates/$bin/$bin.cdx.json" "artifacts/opaque-${TAG#v}-${bin}.cdx.json"
+          done
+
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
 
       - name: Sign release artifacts
         run: |
           for file in artifacts/*.tar.gz; do
+            cosign sign-blob --yes "$file" --output-signature "${file}.sig" --output-certificate "${file}.pem"
+          done
+
+      - name: Sign SBOMs
+        run: |
+          for file in artifacts/*.cdx.json; do
             cosign sign-blob --yes "$file" --output-signature "${file}.sig" --output-certificate "${file}.pem"
           done
 
@@ -254,3 +286,6 @@ jobs:
             artifacts/*.tar.gz.sha256
             artifacts/*.tar.gz.sig
             artifacts/*.tar.gz.pem
+            artifacts/*.cdx.json
+            artifacts/*.cdx.json.sig
+            artifacts/*.cdx.json.pem
