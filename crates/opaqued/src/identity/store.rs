@@ -1128,6 +1128,51 @@ mod tests {
     }
 
     #[test]
+    fn session_issuance_rejects_foreign_issuer_and_disabled_identity_without_durable_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("identity.db");
+        let s = IdentityStore::open(&path).unwrap();
+        let issuer = "https://idp.example.com";
+        let human = s
+            .upsert_human(issuer, "subject", None, None, &BTreeSet::new())
+            .unwrap();
+        let count = |store: &IdentityStore| {
+            store
+                .lock()
+                .query_row("SELECT count(*) FROM human_sessions", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            s.create_human_session(&human.id, 600, "https://foreign.example.com")
+                .unwrap_err(),
+            "identity lifecycle changed during login; start a fresh login"
+        );
+        assert_eq!(count(&s), 0);
+        assert!(s.current_human_session().unwrap().is_none());
+        s.set_disabled(&human.id, true).unwrap();
+        assert_eq!(
+            s.create_human_session(&human.id, 600, issuer).unwrap_err(),
+            "identity lifecycle changed during login; start a fresh login"
+        );
+        assert_eq!(count(&s), 0);
+        drop(s);
+        let s = IdentityStore::open(&path).unwrap();
+        assert!(s.get_principal(&human.id).unwrap().unwrap().disabled);
+        assert_eq!(count(&s), 0);
+        s.set_disabled(&human.id, false).unwrap();
+        let granted = s.create_human_session(&human.id, 600, issuer).unwrap();
+        assert_eq!(granted.principal_id, human.id);
+        assert_eq!(granted.idp_issuer, issuer);
+        assert_eq!(count(&s), 1);
+        drop(s);
+        let s = IdentityStore::open(&path).unwrap();
+        assert_eq!(s.current_human_session().unwrap().unwrap().id, granted.id);
+        assert_eq!(count(&s), 1);
+    }
+
+    #[test]
     fn session_for_service_principal_rejected() {
         let s = store();
         let svc = s.upsert_service("ci").unwrap();

@@ -801,6 +801,61 @@ mod tests {
         }
     }
     #[test]
+    fn managed_login_upsert_requires_current_admission_and_cannot_replace_provisioned_roles() {
+        let f = Fixture::new();
+        let store = &f.runtime.store;
+        let issuer = &f.runtime.config.issuer;
+        let attempted_roles = BTreeSet::from([Role::Admin]);
+        let attempt = || {
+            store.upsert_human(
+                issuer,
+                "alice",
+                Some("changed@example.invalid"),
+                Some("Claimed name"),
+                &attempted_roles,
+            )
+        };
+        assert_eq!(
+            attempt().unwrap_err(),
+            "identity must be actively provisioned before login"
+        );
+        assert!(
+            store
+                .get_human_by_subject(issuer, "alice")
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.current_human_session().unwrap().is_none());
+        f.apply(&f.batch(1, true, &["reviewers"])).unwrap();
+        let provisioned = f.principal();
+        let refreshed = attempt().unwrap();
+        assert_eq!(refreshed.id, provisioned.id);
+        assert_eq!(
+            refreshed.roles,
+            BTreeSet::from([Role::Approver, Role::Operator])
+        );
+        assert!(!refreshed.roles.contains(&Role::Admin));
+        f.apply(&f.batch(2, false, &[])).unwrap();
+        let before = f.principal();
+        assert!(before.disabled);
+        assert_eq!(
+            attempt().unwrap_err(),
+            "identity must be actively provisioned before login"
+        );
+        let after = f.principal();
+        assert_eq!(after.kind, before.kind);
+        assert_eq!(after.roles, before.roles);
+        assert_eq!(after.last_seen, before.last_seen);
+        assert!(after.disabled);
+        let reopened = super::IdentityStore::open(&f.dir.path().join("identity.db")).unwrap();
+        let retained = reopened.get_principal(&before.id).unwrap().unwrap();
+        assert_eq!(retained.kind, before.kind);
+        assert_eq!(retained.roles, before.roles);
+        assert!(retained.disabled);
+        assert!(reopened.current_human_session().unwrap().is_none());
+    }
+
+    #[test]
     fn scope_revision_and_tombstones_are_authorized_by_core() {
         let f = Fixture::new();
         let batch = f.batch(1, true, &["reviewers"]);
