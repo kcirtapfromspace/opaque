@@ -3,14 +3,14 @@
   "target": "aarch64-apple-darwin",
   "platform": "darwin",
   "source": {
-    "revision": "c5abd83e202aaab0360c32a83a89b355f04cf207",
-    "tree_sha256": "9930b40cc1c4fa96b77a5bbd94043748d6e7accf3af422150f50e0fd69ca71e5",
-    "release_tree_sha256": "3b117062e8ee77cdff746d576977fa88676b6463cc9ee32aa2bc5f0f66abfb44"
+    "revision": "40a86e95425de73d5186b1cba9fdef5316d60b97",
+    "tree_sha256": "0b7aa3741e821a0ffb3b2403525b3d92030e390e2128c18cf13bc83b7250610e",
+    "release_tree_sha256": "2ef0d8533d88326e080abe818bacb89a87574a1951d7803dd6d935474e1a4af8"
   },
   "toolchain": "nightly-2026-09-13",
   "feature_selection": "all workspace features; native compiler target",
-  "coverage_report_sha256": "b4b4d9a3208b02f4d9ad605077df74257a4388a3d952bcfe8ff117081da39ed7",
-  "collection_sha256": "e1b8e4467f426c13f386438aa413fb1b4734f56dcf2d75621b66717a9e47401c",
+  "coverage_report_sha256": "c1110eb4c210a6f1ae0dec18c8c0fb99dfdac35d03863eae7dc2cbf97080bd01",
+  "collection_sha256": "ffafea40da4de701352fa775f8b95740efd698775ac2839871c637f871eafce9",
   "packages": {
     "opaque": {
       "lines": {
@@ -102,6 +102,16 @@
         "covered": 19
       }
     },
+    "opaque-policy-kernel": {
+      "lines": {
+        "count": 22,
+        "covered": 22
+      },
+      "branches": {
+        "count": 14,
+        "covered": 14
+      }
+    },
     "opaque-providers": {
       "lines": {
         "count": 7712,
@@ -162,5 +172,155 @@
         "covered": 1108
       }
     }
-  }
+  },
+  "new_kernel_packages": [
+    "opaque-policy-kernel"
+  ],
+  "package_provenance": {
+    "opaque-policy-kernel": {
+      "source": {
+        "revision": "40a86e95425de73d5186b1cba9fdef5316d60b97",
+        "tree_sha256": "0b7aa3741e821a0ffb3b2403525b3d92030e390e2128c18cf13bc83b7250610e",
+        "release_tree_sha256": "2ef0d8533d88326e080abe818bacb89a87574a1951d7803dd6d935474e1a4af8"
+      },
+      "coverage_report_sha256": "c1110eb4c210a6f1ae0dec18c8c0fb99dfdac35d03863eae7dc2cbf97080bd01",
+      "collection_sha256": "ffafea40da4de701352fa775f8b95740efd698775ac2839871c637f871eafce9"
+    },
+    "opaque-federation-runtime": {
+      "source": {
+        "revision": "c5abd83e202aaab0360c32a83a89b355f04cf207",
+        "tree_sha256": "9930b40cc1c4fa96b77a5bbd94043748d6e7accf3af422150f50e0fd69ca71e5",
+        "release_tree_sha256": "3b117062e8ee77cdff746d576977fa88676b6463cc9ee32aa2bc5f0f66abfb44"
+      },
+      "coverage_report_sha256": "b4b4d9a3208b02f4d9ad605077df74257a4388a3d952bcfe8ff117081da39ed7",
+      "collection_sha256": "e1b8e4467f426c13f386438aa413fb1b4734f56dcf2d75621b66717a9e47401c"
+    },
+    "opaque-sandbox": {
+      "source": {
+        "revision": "c5abd83e202aaab0360c32a83a89b355f04cf207",
+        "tree_sha256": "9930b40cc1c4fa96b77a5bbd94043748d6e7accf3af422150f50e0fd69ca71e5",
+        "release_tree_sha256": "3b117062e8ee77cdff746d576977fa88676b6463cc9ee32aa2bc5f0f66abfb44"
+      },
+      "coverage_report_sha256": "b4b4d9a3208b02f4d9ad605077df74257a4388a3d952bcfe8ff117081da39ed7",
+      "collection_sha256": "e1b8e4467f426c13f386438aa413fb1b4734f56dcf2d75621b66717a9e47401c"
+    },
+    "opaque-approval": {
+      "source": {
+        "revision": "c5abd83e202aaab0360c32a83a89b355f04cf207",
+        "tree_sha256": "9930b40cc1c4fa96b77a5bbd94043748d6e7accf3af422150f50e0fd69ca71e5",
+        "release_tree_sha256": "3b117062e8ee77cdff746d576977fa88676b6463cc9ee32aa2bc5f0f66abfb44"
+      },
+      "coverage_report_sha256": "b4b4d9a3208b02f4d9ad605077df74257a4388a3d952bcfe8ff117081da39ed7",
+      "collection_sha256": "e1b8e4467f426c13f386438aa413fb1b4734f56dcf2d75621b66717a9e47401c"
+    },
+    "opaque-web": {
+      "source": {
+        "revision": "c5abd83e202aaab0360c32a83a89b355f04cf207",
+        "tree_sha256": "9930b40cc1c4fa96b77a5bbd94043748d6e7accf3af422150f50e0fd69ca71e5",
+        "release_tree_sha256": "3b117062e8ee77cdff746d576977fa88676b6463cc9ee32aa2bc5f0f66abfb44"
+      },
+      "coverage_report_sha256": "b4b4d9a3208b02f4d9ad605077df74257a4388a3d952bcfe8ff117081da39ed7",
+      "collection_sha256": "e1b8e4467f426c13f386438aa413fb1b4734f56dcf2d75621b66717a9e47401c"
+    },
+    "opaque": {
+      "source": {
+        "revision": "c5abd83e202aaab0360c32a83a89b355f04cf207",
+        "tree_sha256": "9930b40cc1c4fa96b77a5bbd94043748d6e7accf3af422150f50e0fd69ca71e5",
+        "release_tree_sha256": "3b117062e8ee77cdff746d576977fa88676b6463cc9ee32aa2bc5f0f66abfb44"
+      },
+      "coverage_report_sha256": "b4b4d9a3208b02f4d9ad605077df74257a4388a3d952bcfe8ff117081da39ed7",
+      "collection_sha256": "e1b8e4467f426c13f386438aa413fb1b4734f56dcf2d75621b66717a9e47401c"
+    },
+    "opaque-mcp": {
+      "source": {
+        "revision": "c5abd83e202aaab0360c32a83a89b355f04cf207",
+        "tree_sha256": "9930b40cc1c4fa96b77a5bbd94043748d6e7accf3af422150f50e0fd69ca71e5",
+        "release_tree_sha256": "3b117062e8ee77cdff746d576977fa88676b6463cc9ee32aa2bc5f0f66abfb44"
+      },
+      "coverage_report_sha256": "b4b4d9a3208b02f4d9ad605077df74257a4388a3d952bcfe8ff117081da39ed7",
+      "collection_sha256": "e1b8e4467f426c13f386438aa413fb1b4734f56dcf2d75621b66717a9e47401c"
+    },
+    "opaque-showcase": {
+      "source": {
+        "revision": "c5abd83e202aaab0360c32a83a89b355f04cf207",
+        "tree_sha256": "9930b40cc1c4fa96b77a5bbd94043748d6e7accf3af422150f50e0fd69ca71e5",
+        "release_tree_sha256": "3b117062e8ee77cdff746d576977fa88676b6463cc9ee32aa2bc5f0f66abfb44"
+      },
+      "coverage_report_sha256": "b4b4d9a3208b02f4d9ad605077df74257a4388a3d952bcfe8ff117081da39ed7",
+      "collection_sha256": "e1b8e4467f426c13f386438aa413fb1b4734f56dcf2d75621b66717a9e47401c"
+    },
+    "opaque-approve-helper": {
+      "source": {
+        "revision": "c5abd83e202aaab0360c32a83a89b355f04cf207",
+        "tree_sha256": "9930b40cc1c4fa96b77a5bbd94043748d6e7accf3af422150f50e0fd69ca71e5",
+        "release_tree_sha256": "3b117062e8ee77cdff746d576977fa88676b6463cc9ee32aa2bc5f0f66abfb44"
+      },
+      "coverage_report_sha256": "b4b4d9a3208b02f4d9ad605077df74257a4388a3d952bcfe8ff117081da39ed7",
+      "collection_sha256": "e1b8e4467f426c13f386438aa413fb1b4734f56dcf2d75621b66717a9e47401c"
+    },
+    "opaqued": {
+      "source": {
+        "revision": "c5abd83e202aaab0360c32a83a89b355f04cf207",
+        "tree_sha256": "9930b40cc1c4fa96b77a5bbd94043748d6e7accf3af422150f50e0fd69ca71e5",
+        "release_tree_sha256": "3b117062e8ee77cdff746d576977fa88676b6463cc9ee32aa2bc5f0f66abfb44"
+      },
+      "coverage_report_sha256": "b4b4d9a3208b02f4d9ad605077df74257a4388a3d952bcfe8ff117081da39ed7",
+      "collection_sha256": "e1b8e4467f426c13f386438aa413fb1b4734f56dcf2d75621b66717a9e47401c"
+    },
+    "opaque-core": {
+      "source": {
+        "revision": "c5abd83e202aaab0360c32a83a89b355f04cf207",
+        "tree_sha256": "9930b40cc1c4fa96b77a5bbd94043748d6e7accf3af422150f50e0fd69ca71e5",
+        "release_tree_sha256": "3b117062e8ee77cdff746d576977fa88676b6463cc9ee32aa2bc5f0f66abfb44"
+      },
+      "coverage_report_sha256": "b4b4d9a3208b02f4d9ad605077df74257a4388a3d952bcfe8ff117081da39ed7",
+      "collection_sha256": "e1b8e4467f426c13f386438aa413fb1b4734f56dcf2d75621b66717a9e47401c"
+    },
+    "opaque-approver": {
+      "source": {
+        "revision": "c5abd83e202aaab0360c32a83a89b355f04cf207",
+        "tree_sha256": "9930b40cc1c4fa96b77a5bbd94043748d6e7accf3af422150f50e0fd69ca71e5",
+        "release_tree_sha256": "3b117062e8ee77cdff746d576977fa88676b6463cc9ee32aa2bc5f0f66abfb44"
+      },
+      "coverage_report_sha256": "b4b4d9a3208b02f4d9ad605077df74257a4388a3d952bcfe8ff117081da39ed7",
+      "collection_sha256": "e1b8e4467f426c13f386438aa413fb1b4734f56dcf2d75621b66717a9e47401c"
+    },
+    "opaque-providers": {
+      "source": {
+        "revision": "c5abd83e202aaab0360c32a83a89b355f04cf207",
+        "tree_sha256": "9930b40cc1c4fa96b77a5bbd94043748d6e7accf3af422150f50e0fd69ca71e5",
+        "release_tree_sha256": "3b117062e8ee77cdff746d576977fa88676b6463cc9ee32aa2bc5f0f66abfb44"
+      },
+      "coverage_report_sha256": "b4b4d9a3208b02f4d9ad605077df74257a4388a3d952bcfe8ff117081da39ed7",
+      "collection_sha256": "e1b8e4467f426c13f386438aa413fb1b4734f56dcf2d75621b66717a9e47401c"
+    },
+    "opaque-bounded-work": {
+      "source": {
+        "revision": "c5abd83e202aaab0360c32a83a89b355f04cf207",
+        "tree_sha256": "9930b40cc1c4fa96b77a5bbd94043748d6e7accf3af422150f50e0fd69ca71e5",
+        "release_tree_sha256": "3b117062e8ee77cdff746d576977fa88676b6463cc9ee32aa2bc5f0f66abfb44"
+      },
+      "coverage_report_sha256": "b4b4d9a3208b02f4d9ad605077df74257a4388a3d952bcfe8ff117081da39ed7",
+      "collection_sha256": "e1b8e4467f426c13f386438aa413fb1b4734f56dcf2d75621b66717a9e47401c"
+    },
+    "opaque-native-approval": {
+      "source": {
+        "revision": "c5abd83e202aaab0360c32a83a89b355f04cf207",
+        "tree_sha256": "9930b40cc1c4fa96b77a5bbd94043748d6e7accf3af422150f50e0fd69ca71e5",
+        "release_tree_sha256": "3b117062e8ee77cdff746d576977fa88676b6463cc9ee32aa2bc5f0f66abfb44"
+      },
+      "coverage_report_sha256": "b4b4d9a3208b02f4d9ad605077df74257a4388a3d952bcfe8ff117081da39ed7",
+      "collection_sha256": "e1b8e4467f426c13f386438aa413fb1b4734f56dcf2d75621b66717a9e47401c"
+    },
+    "opaque-tenant": {
+      "source": {
+        "revision": "c5abd83e202aaab0360c32a83a89b355f04cf207",
+        "tree_sha256": "9930b40cc1c4fa96b77a5bbd94043748d6e7accf3af422150f50e0fd69ca71e5",
+        "release_tree_sha256": "3b117062e8ee77cdff746d576977fa88676b6463cc9ee32aa2bc5f0f66abfb44"
+      },
+      "coverage_report_sha256": "b4b4d9a3208b02f4d9ad605077df74257a4388a3d952bcfe8ff117081da39ed7",
+      "collection_sha256": "e1b8e4467f426c13f386438aa413fb1b4734f56dcf2d75621b66717a9e47401c"
+    }
+  },
+  "previous_baseline_sha256": "e42e60ee8adb94e931be76067b2511deca9a2c77fc6551c25bc34e688076e596"
 }

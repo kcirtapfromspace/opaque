@@ -22,6 +22,27 @@ class SitePrivacyTests(unittest.TestCase):
     def test_valid_generated_site_is_accepted(self):
         self.assertEqual(privacy.inspect_site(self.site, "PRIVATEFIXTURE"), [])
 
+    def test_coverage_guide_is_public_without_admitting_neighbor_routes(self):
+        for route, accepted in (("testing-coverage", True), ("testing-coverage/unreviewed", False)):
+            with self.subTest(route=route):
+                page = self.site / route / "index.html"
+                page.parent.mkdir(parents=True, exist_ok=True)
+                page.write_text('<h1 id="gate">Coverage requirements</h1>')
+                (self.site / "search/search_index.json").write_text(json.dumps({
+                    "docs": [{"location": f"{route}/#gate", "text": "Coverage requirements"}],
+                }))
+                sitemap = self.site / "sitemap.xml"
+                sitemap.write_text(f'<urlset><url><loc>https://opaque.info/{route}/</loc></url></urlset>')
+                (self.site / "sitemap.xml.gz").write_bytes(gzip.compress(sitemap.read_bytes()))
+                failures = privacy.inspect_site(self.site, "PRIVATEFIXTURE")
+                if accepted:
+                    self.assertEqual(failures, [])
+                else:
+                    self.assertTrue(any("HTML page is not on the visitor allowlist" in item for item in failures))
+                    self.assertTrue(any("search/search_index.json: non-visitor route indexed" in item for item in failures))
+                    self.assertTrue(any("sitemap.xml: non-visitor route indexed" in item for item in failures))
+                page.unlink()
+
     def test_every_output_kind_is_scanned_for_private_source_content(self):
         for name in ("index.html", "assets/copy.bin", "assets/bundle.js", "assets/copy.txt.gz"):
             with self.subTest(name=name):

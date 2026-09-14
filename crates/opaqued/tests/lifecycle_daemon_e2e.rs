@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use std::os::unix::fs::PermissionsExt;
 use std::{
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Command},
     time::Duration,
 };
 
@@ -95,6 +95,7 @@ interval_secs=0
         daemon
     }
     async fn ready(&mut self) {
+        let mut reported_uncommitted = false;
         for _ in 0..150 {
             if let Some(status) = self.child.try_wait().unwrap() {
                 panic!(
@@ -102,8 +103,17 @@ interval_secs=0
                     std::fs::read_to_string(&self.log).unwrap()
                 );
             }
+            // The listener is bound before configure_lifecycle commits. A
+            // connect-only probe can kill the first daemon with no managed
+            // state and then incorrectly expect the persisted-state guard.
             if tokio::net::UnixStream::connect(&self.socket).await.is_ok() {
-                return;
+                if self.lifecycle_persisted() {
+                    return;
+                }
+                if !reported_uncommitted {
+                    eprintln!("lifecycle ingress bound; waiting for managed state commit");
+                    reported_uncommitted = true;
+                }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -111,6 +121,21 @@ interval_secs=0
             "Lifecycle startup timed out: {}",
             std::fs::read_to_string(&self.log).unwrap()
         );
+    }
+    fn lifecycle_persisted(&self) -> bool {
+        let Ok(db) = rusqlite::Connection::open_with_flags(
+            self.home.join(".opaque/identity.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ) else {
+            return false;
+        };
+        db.busy_timeout(Duration::ZERO).unwrap();
+        db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM lifecycle_config WHERE singleton=1)",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(false)
     }
     async fn restart(&mut self) {
         self.child.kill().unwrap();
@@ -120,13 +145,14 @@ interval_secs=0
     }
 }
 fn spawn(config: &Path, home: &Path, log: &Path) -> Child {
+    let output = std::fs::File::create(log).unwrap();
     Command::new(env!("CARGO_BIN_EXE_opaqued"))
         .env("HOME", home)
         .env("OPAQUE_CONFIG", config)
         .env_remove("OPAQUE_SOCK")
         .env_remove("OPAQUE_INSECURE_AUTO_APPROVE")
-        .stdout(Stdio::null())
-        .stderr(std::fs::File::create(log).unwrap())
+        .stdout(output.try_clone().unwrap())
+        .stderr(output)
         .spawn()
         .unwrap()
 }
@@ -149,8 +175,10 @@ fn write_local_seal(home: &Path, body: &str) {
 async fn persisted_lifecycle_cannot_be_removed_with_identity_or_optional_invalid_config() {
     let idp = wiremock::MockServer::start().await;
     let mut daemon = Daemon::start(&idp.uri()).await;
+    assert!(daemon.lifecycle_persisted());
     daemon.child.kill().unwrap();
     daemon.child.wait().unwrap();
+    assert!(daemon.lifecycle_persisted());
     let original = std::fs::read_to_string(&daemon.config).unwrap();
     for optional_invalid in [false, true] {
         let mut document = original.parse::<toml_edit::DocumentMut>().unwrap();
@@ -172,10 +200,23 @@ async fn persisted_lifecycle_cannot_be_removed_with_identity_or_optional_invalid
                 failed = true;
                 break;
             }
+            assert!(
+                tokio::net::UnixStream::connect(&daemon.socket)
+                    .await
+                    .is_err(),
+                "downgraded lifecycle ingress accepted a connection: {}",
+                std::fs::read_to_string(&daemon.log).unwrap()
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(failed, "downgraded daemon should refuse startup");
         let log = std::fs::read_to_string(&daemon.log).unwrap();
+        assert!(
+            failed,
+            "downgraded daemon did not exit within the existing startup rejection bound; \
+             optional_invalid={optional_invalid}, lifecycle_persisted={}, status={:?}: {log}",
+            daemon.lifecycle_persisted(),
+            daemon.child.try_wait().unwrap(),
+        );
         assert!(log.contains("persisted managed lifecycle"), "{log}");
     }
 }
