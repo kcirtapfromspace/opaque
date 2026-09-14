@@ -2856,6 +2856,144 @@ async fn run_portfolio_chat(
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod concurrency_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bounded_upstream_json_rejects_status_and_size_without_reflecting_bodies() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        for (status, body, expected) in [
+            (
+                503,
+                "private-upstream-error".to_owned(),
+                "upstream rejected request",
+            ),
+            (
+                302,
+                "private-redirect-body".to_owned(),
+                "upstream rejected request",
+            ),
+            (
+                200,
+                "private-invalid-json".to_owned(),
+                "invalid upstream JSON",
+            ),
+            (200, "x".repeat(32769), "upstream response exceeded limit"),
+        ] {
+            server.reset().await;
+            Mock::given(method("GET"))
+                .and(path("/response"))
+                .respond_with(ResponseTemplate::new(status).set_body_string(body))
+                .mount(&server)
+                .await;
+            let response = client
+                .get(format!("{}/response", server.uri()))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(bounded_json(response).await, Err(expected.to_owned()));
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].url.path(), "/response");
+        }
+        server.reset().await;
+        let payload = json!("x".repeat(32766));
+        let body = serde_json::to_vec(&payload).unwrap();
+        assert_eq!(body.len(), 32768);
+        Mock::given(method("GET"))
+            .and(path("/response"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+        let response = client
+            .get(format!("{}/response", server.uri()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bounded_json(response).await.unwrap(), payload);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    async fn delivered_event(event: Event) -> (String, Value) {
+        let response = Sse::new(futures_util::stream::once(async move {
+            Ok::<_, Infallible>(event)
+        }))
+        .into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        let mut lines = text.lines();
+        let kind = lines
+            .next()
+            .unwrap()
+            .strip_prefix("event:")
+            .unwrap()
+            .trim()
+            .to_owned();
+        let value =
+            serde_json::from_str(lines.next().unwrap().strip_prefix("data:").unwrap().trim())
+                .unwrap();
+        assert_eq!(lines.next(), Some(""));
+        assert!(lines.next().is_none());
+        (kind, value)
+    }
+
+    #[tokio::test]
+    async fn emitted_events_preserve_payload_and_classify_disclosure_sensitivity() {
+        for (kind, sensitive) in [
+            ("result", true),
+            ("portfolio_result", true),
+            ("answer", true),
+            ("tool", true),
+            ("interpretation", true),
+            ("policy", false),
+            ("error", false),
+            ("done", false),
+        ] {
+            let (tx, mut rx) = mpsc::channel(1);
+            let payload = json!({"kind":kind,"detail":"synthetic line one\nline two","count":7});
+            emit(&tx, kind, payload.clone()).await.unwrap();
+            let (event, requires_current_authority) = rx.recv().await.unwrap().unwrap();
+            assert_eq!(requires_current_authority, sensitive, "{kind}");
+            assert_eq!(delivered_event(event).await, (kind.to_owned(), payload));
+            drop(tx);
+            assert!(rx.recv().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_event_receiver_rejects_new_disclosure_without_losing_queued_event() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let queued = json!({"evidence_id":"synthetic-queued","value":7});
+        emit(&tx, "result", queued.clone()).await.unwrap();
+        // Closing is deterministic even with a full buffer and a still-owned
+        // receiver. A producer must observe disconnection instead of waiting
+        // forever or claiming the later disclosure was delivered.
+        rx.close();
+        assert!(tx.is_closed());
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                emit(&tx, "result", json!({"evidence_id":"must-not-arrive"})),
+            )
+            .await
+            .unwrap(),
+            Err("client disconnected".to_owned())
+        );
+        let (event, sensitive) = rx.recv().await.unwrap().unwrap();
+        assert!(sensitive);
+        assert_eq!(delivered_event(event).await, ("result".into(), queued));
+        assert!(rx.recv().await.is_none());
+    }
+
     #[test]
     fn organization_reads_and_control_admission_fail_closed_while_a_transaction_owns_state() {
         let state = Mutex::new(OrganizationState::default());

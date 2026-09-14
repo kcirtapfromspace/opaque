@@ -4217,10 +4217,16 @@ fn parse_duration_to_ms(s: &str) -> Result<i64, String> {
         return Err("empty duration string".into());
     }
 
-    let (num_str, suffix) = s.split_at(s.len() - 1);
+    // Split at a character boundary so malformed non-ASCII suffixes are errors,
+    // not panics before the duration can be validated.
+    let suffix_start = s.char_indices().next_back().unwrap().0;
+    let (num_str, suffix) = s.split_at(suffix_start);
     let num: i64 = num_str
         .parse()
         .map_err(|_| format!("invalid duration: '{s}' (expected e.g. '30m', '1h', '7d')"))?;
+    if num < 0 {
+        return Err("duration must be non-negative".into());
+    }
 
     let multiplier = match suffix {
         "s" => 1_000,
@@ -4234,7 +4240,8 @@ fn parse_duration_to_ms(s: &str) -> Result<i64, String> {
         }
     };
 
-    Ok(num * multiplier)
+    num.checked_mul(multiplier)
+        .ok_or_else(|| "duration exceeds the supported range".into())
 }
 
 /// Format a millisecond timestamp as a human-readable UTC string.

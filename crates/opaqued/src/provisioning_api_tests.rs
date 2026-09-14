@@ -1110,3 +1110,120 @@ async fn login_or_epoch_change_while_review_is_pending_never_publishes_a_challen
         );
     }
 }
+
+#[tokio::test]
+async fn credential_removal_rolls_back_failed_provisioning_revocation_before_deleting_key() {
+    for fault in ["denial-insert", "mandate-update"] {
+        let fixture = Fixture::new(true);
+        let mandate = fixture.mandate().await;
+        let service = fixture.service("provisioner").await;
+        let request = Fixture::issue(&mandate, &uuid::Uuid::new_v4().to_string());
+        let issued = ok(fixture
+            .call(
+                "identity.provisioning.issue",
+                request.clone(),
+                Some(&service),
+            )
+            .await);
+        let runtime = fixture.state.identity.as_ref().unwrap();
+        let binding = fixture.state.tenant.as_ref().unwrap().binding();
+        let grant = runtime
+            .store
+            .get_access_grant(binding, issued["grant"]["id"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            runtime
+                .store
+                .authorize_scopes(binding, &grant.recipient, now_unix(), 300, |principal| {
+                    runtime.principal_permitted(principal)
+                })
+                .unwrap(),
+            BTreeSet::from(["metrics:read".into()])
+        );
+        let rows_before = provisioning_rows(&fixture);
+        let credentials_path = fixture._directory.path().join("test-fido2.json");
+        let credentials_before = std::fs::read(&credentials_path).unwrap();
+        let db = database(&fixture);
+        let operation = if fault == "denial-insert" {
+            "INSERT ON provisioning_credential_denials"
+        } else {
+            "UPDATE OF revoked_at ON provisioning_mandates"
+        };
+        db.execute_batch(&format!(
+            "CREATE TRIGGER refuse_credential_revocation BEFORE {operation} BEGIN SELECT RAISE(ABORT, 'fixture revocation fault'); END;"
+        ))
+        .unwrap();
+        let response = fixture
+            .call("fido2_remove", json!({"credential_id":CREDENTIAL}), None)
+            .await;
+        assert!(response.result.is_none());
+        assert_eq!(response.error.unwrap().code, "revocation_failed");
+        assert_eq!(
+            std::fs::read(&credentials_path).unwrap(),
+            credentials_before
+        );
+        assert_eq!(provisioning_rows(&fixture), rows_before, "{fault}");
+        let denial_count = || {
+            db.query_row(
+                "SELECT count(*) FROM provisioning_credential_denials",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(denial_count(), 0, "an earlier insert must roll back too");
+        db.execute_batch("DROP TRIGGER refuse_credential_revocation")
+            .unwrap();
+        assert_eq!(
+            ok(fixture
+                .call("fido2_remove", json!({"credential_id":CREDENTIAL}), None)
+                .await)["removed"],
+            true
+        );
+        assert!(
+            fixture
+                .state
+                .fido2
+                .as_ref()
+                .unwrap()
+                .list_credentials()
+                .unwrap()
+                .is_empty()
+        );
+        let retained = runtime.store.get_mandate(binding, &mandate).unwrap();
+        assert!(retained.revoked_at.is_some());
+        assert_eq!(retained.issued_count, 1);
+        assert_eq!(denial_count(), 1);
+        assert!(
+            runtime
+                .store
+                .authorize_scopes(binding, &grant.recipient, now_unix(), 300, |principal| {
+                    runtime.principal_permitted(principal)
+                })
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            runtime
+                .store
+                .get_access_grant(binding, &grant.id)
+                .unwrap()
+                .revoked_at
+                .is_some()
+        );
+        // Both replay and a new request remain denied, with the original
+        // issuance still charged after successful credential removal.
+        let revoked_rows = provisioning_rows(&fixture);
+        for params in [
+            request,
+            Fixture::issue(&mandate, &uuid::Uuid::new_v4().to_string()),
+        ] {
+            denied(
+                fixture
+                    .call("identity.provisioning.issue", params, Some(&service))
+                    .await,
+            );
+            assert_eq!(provisioning_rows(&fixture), revoked_rows);
+        }
+    }
+}

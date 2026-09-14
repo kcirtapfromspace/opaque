@@ -36,6 +36,12 @@ use uuid::Uuid;
 const DAEMON_TOKEN_FILENAME: &str = "daemon.token";
 
 mod agent_session;
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod agent_session_contract_tests;
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod approver_rpc_tests;
 mod connection;
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -50,9 +56,15 @@ mod provisioning_api_tests;
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod resource_authority_provisioning_tests;
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod role_authority_tests;
 mod rpc_wrappers;
 mod trust_domain;
 mod workspace_process;
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod workspace_verification_tests;
 
 // `task_api`, `task_store`, `ssh`, `resource_authority`, and `inference`
 // moved to the `opaque-bounded-work` crate (the daemon's task-ledger/
