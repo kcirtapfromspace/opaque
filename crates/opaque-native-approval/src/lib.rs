@@ -332,11 +332,15 @@ fn prompt_macos_blocking_for(
     use objc2_foundation::{NSError, NSString};
     use objc2_local_authentication::{LAContext, LAPolicy};
 
+    // SAFETY: LAContext::new has no preconditions; objc2 manages the
+    // returned object's retain count.
     let ctx = unsafe { LAContext::new() };
 
     // Preflight: check if the UI session supports approval.
     // If not (e.g., no window server, LaunchDaemon, SSH), return Unavailable
     // so the enclave reports `approval_unavailable` to the client.
+    // SAFETY: `ctx` is a valid LAContext; objc2 converts the NSError**
+    // out-parameter into a Result.
     if unsafe { ctx.canEvaluatePolicy_error(LAPolicy::DeviceOwnerAuthentication) }.is_err() {
         return Err(ApprovalError::Unavailable);
     }
@@ -351,6 +355,8 @@ fn prompt_macos_blocking_for(
         deliver_authentication_result(&tx2, success.as_bool());
     });
 
+    // SAFETY: `reason_ns` and `reply` outlive the call; the reply block is
+    // 'static (owns its captures) and may run on any dispatch queue.
     unsafe {
         ctx.evaluatePolicy_localizedReason_reply(
             LAPolicy::DeviceOwnerAuthentication,
@@ -370,8 +376,19 @@ fn deliver_authentication_result(
     sender: &std::sync::Mutex<Option<std::sync::mpsc::Sender<bool>>>,
     approved: bool,
 ) {
-    if let Some(tx) = sender.lock().ok().and_then(|mut guard| guard.take()) {
-        let _ = tx.send(approved);
+    match sender.lock().ok().and_then(|mut guard| guard.take()) {
+        Some(tx) => {
+            let _ = tx.send(approved);
+        }
+        None => {
+            // LocalAuthentication promises a single reply but Apple does not
+            // formally guarantee it; a second invocation would otherwise vanish
+            // silently here, so make it visible.
+            eprintln!(
+                "opaque-native-approval: LocalAuthentication reply callback \
+                 invoked more than once; extra result dropped"
+            );
+        }
     }
 }
 

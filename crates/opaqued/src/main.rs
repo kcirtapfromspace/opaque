@@ -24,7 +24,10 @@ use opaque_core::operation::{
 use opaque_core::peer::peer_info_from_fd;
 use opaque_core::policy::{PolicyEngine, PolicyRule};
 use opaque_core::proto::{Request, Response};
-use opaque_core::socket::{ensure_socket_parent_dir, socket_path_for_client, validate_path_chain};
+use opaque_core::socket::{
+    bind_unix_listener_private, ensure_socket_parent_dir, socket_path_for_client,
+    validate_path_chain,
+};
 use opaque_core::validate::InputValidator;
 use serde::Deserialize;
 use tokio::net::{UnixListener, UnixStream};
@@ -1982,6 +1985,11 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         .unwrap_or_else(|| socket_path_for_client(false));
     ensure_socket_parent_dir(&socket)?;
 
+    // Validate no symlinks in the path chain before writing anything into
+    // it: the pid file, the stale-socket handling, and the bind below all
+    // trust this chain.
+    validate_path_chain(&socket)?;
+
     // Acquire PID file lock before anything else.
     let pid_path = socket
         .parent()
@@ -2009,10 +2017,15 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         }
     }
 
-    // Validate no symlinks in the path chain before binding.
-    validate_path_chain(&socket)?;
-
-    let listener = UnixListener::bind(&socket)?;
+    // SECURITY (C-6): bind under a temporary 0o177 umask so the socket file
+    // is 0600 from birth; it never exists with a mode any other process
+    // could connect through. Split deployments widen it to the client group
+    // only after the full surface is prepared (apply_socket_group below).
+    let listener = {
+        let std_listener = bind_unix_listener_private(&socket)?;
+        std_listener.set_nonblocking(true)?;
+        UnixListener::from_std(std_listener)?
+    };
     let workload_attestor =
         opaque_federation_runtime::workload_attest::ListenerAttestor::unix_listener();
     lock_down_socket_path(&socket)?;

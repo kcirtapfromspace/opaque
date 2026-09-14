@@ -68,12 +68,82 @@ pub fn ensure_socket_parent_dir(path: &Path) -> std::io::Result<()> {
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        // Refuse a parent in foreign custody before adopting it:
+        // `create_dir_all` follows symlinks, so an attacker-planted link at
+        // the directory itself would relocate the socket (and the pid and
+        // token files beside it) into a directory someone else controls.
+        // Symlinks deeper in the chain are caught by `validate_path_chain`.
+        let meta = parent.symlink_metadata()?;
+        // SAFETY: geteuid cannot fail and has no side effects.
+        let my_euid = unsafe { libc::geteuid() };
+        check_socket_dir_custody(
+            SocketFacts {
+                uid: meta.uid(),
+                mode: meta.mode() & 0o7777,
+                is_symlink: meta.file_type().is_symlink(),
+            },
+            my_euid,
+        )
+        .map_err(|msg| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("{msg} ({})", parent.display()),
+            )
+        })?;
+
         // Ensure only the user can access the runtime dir.
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
     }
 
     Ok(())
+}
+
+/// Custody rule for the directory the daemon puts its socket in.
+///
+/// A symlinked directory is always refused. Ownership must be the daemon's
+/// own effective uid or root (an installer pre-creating `/run/opaque` is
+/// root); any other owner could swap the socket out from under the daemon.
+/// A root daemon may adopt any directory: it can repair ownership, and the
+/// 0700 chmod that follows succeeds regardless.
+pub fn check_socket_dir_custody(dir: SocketFacts, my_euid: u32) -> Result<(), String> {
+    if dir.is_symlink {
+        return Err("socket parent directory is a symlink".into());
+    }
+    if my_euid != 0 && dir.uid != my_euid && dir.uid != 0 {
+        return Err(format!(
+            "socket parent directory owned by uid {}, expected uid {my_euid} or root",
+            dir.uid
+        ));
+    }
+    Ok(())
+}
+
+/// Bind a Unix listener whose socket file is private from its first instant.
+///
+/// `bind()` creates the socket file with mode `0777 & !umask`, so under a
+/// permissive process umask there is a window between `bind()` and a later
+/// `chmod()` in which any local process can connect (assessment C-6).
+/// Masking everything but owner read/write for the duration of the bind
+/// makes the socket 0600 at creation; no post-bind window exists. The umask
+/// is process-wide, so files created concurrently on other threads can only
+/// come out more restrictive during the guard, never looser.
+#[cfg(unix)]
+pub fn bind_unix_listener_private(
+    path: &Path,
+) -> std::io::Result<std::os::unix::net::UnixListener> {
+    struct UmaskGuard(libc::mode_t);
+    impl Drop for UmaskGuard {
+        fn drop(&mut self) {
+            // SAFETY: umask only swaps the process file-mode creation mask;
+            // it cannot fail.
+            unsafe { libc::umask(self.0) };
+        }
+    }
+    // SAFETY: see UmaskGuard::drop.
+    let _guard = UmaskGuard(unsafe { libc::umask(0o177) });
+    std::os::unix::net::UnixListener::bind(path)
 }
 
 /// Ownership + mode facts about the socket and its parent directory, fed to
@@ -232,6 +302,14 @@ pub fn validate_path_chain(path: &Path) -> std::io::Result<()> {
     }
     Ok(())
 }
+
+/// Serializes tests that open a process-wide umask window (which
+/// `bind_unix_listener_private` does) against tests elsewhere in the crate
+/// that create mode-sensitive temp directories. The test runner is
+/// multi-threaded and umask is process-global, so without this a concurrent
+/// temp dir can be created non-searchable and its later writes fail.
+#[cfg(test)]
+pub(crate) static UMASK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -395,6 +473,110 @@ mod tests {
         std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)).unwrap();
         let result = verify_socket_safety(&sock);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn socket_dir_custody_rules() {
+        // Own dir: fine. Root-installed dir: fine. Foreign dir: rejected.
+        assert!(check_socket_dir_custody(facts(ME, 0o700), ME).is_ok());
+        assert!(check_socket_dir_custody(facts(0, 0o755), ME).is_ok());
+        assert!(check_socket_dir_custody(facts(DAEMON, 0o700), ME).is_err());
+        // A root daemon may adopt any directory.
+        assert!(check_socket_dir_custody(facts(DAEMON, 0o700), 0).is_ok());
+        // A symlinked directory always fails, whoever owns it.
+        let link = SocketFacts {
+            uid: ME,
+            mode: 0o700,
+            is_symlink: true,
+        };
+        assert!(check_socket_dir_custody(link, ME).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_socket_parent_dir_creates_private_dir() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempdir();
+        let sock = dir.join("nested").join("opaqued.sock");
+        ensure_socket_parent_dir(&sock).unwrap();
+        let mode = std::fs::symlink_metadata(sock.parent().unwrap())
+            .unwrap()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_socket_parent_dir_rejects_symlinked_parent() {
+        use std::os::unix::fs;
+        let dir = tempdir();
+        let real = dir.join("real-run");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.join("link-run");
+        fs::symlink(&real, &link).unwrap();
+        let err = ensure_socket_parent_dir(&link.join("opaqued.sock")).unwrap_err();
+        assert!(err.to_string().contains("symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bind_unix_listener_private_is_0600_from_birth_and_restores_umask() {
+        use std::os::unix::fs::MetadataExt;
+        // Held for the whole test: the umask window below is process-global and
+        // would otherwise corrupt a concurrent test's temp dir creation.
+        let _serial = UMASK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Socket paths must stay under SUN_LEN (macOS: 104 bytes), so this
+        // lives directly under /tmp rather than in a nested tempdir.
+        let dir = PathBuf::from("/tmp")
+            .canonicalize()
+            .unwrap()
+            .join(format!("opq-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("s.sock");
+        let _ = std::fs::remove_file(&sock);
+        // Worst case: a fully permissive umask, under which a plain bind()
+        // would create the socket world-connectable.
+        // SAFETY: umask only swaps the process file-mode creation mask.
+        let prior = unsafe { libc::umask(0) };
+        let listener = bind_unix_listener_private(&sock);
+        // Restore before asserting so a failure never leaks umask 0.
+        // SAFETY: as above.
+        let during = unsafe { libc::umask(prior) };
+        let _listener = listener.unwrap();
+        assert_eq!(during, 0, "bind helper must restore the caller's umask");
+        let mode = std::fs::symlink_metadata(&sock).unwrap().mode() & 0o777;
+        assert_eq!(mode, 0o600, "socket must never exist with permissive mode");
+        // Error path: binding under a directory that was never created fails.
+        // Kept in this one test (rather than a second umask-touching test) so
+        // no two mask-manipulating tests run in parallel; the guard still
+        // restores the umask via Drop, as the assertion above confirms.
+        let missing = dir.join("gone").join("s.sock");
+        assert!(
+            bind_unix_listener_private(&missing).is_err(),
+            "bind under a missing directory must fail"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_socket_parent_dir_accepts_a_path_without_a_parent() {
+        // The filesystem root has no parent to create or vet, so the helper
+        // returns Ok without touching the filesystem.
+        assert!(ensure_socket_parent_dir(Path::new("/")).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_socket_parent_dir_fails_when_a_component_is_a_file() {
+        let dir = tempdir();
+        let file = dir.join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        // A regular file where a directory component is expected makes
+        // create_dir_all fail; the error must propagate.
+        let err = ensure_socket_parent_dir(&file.join("opaqued.sock")).unwrap_err();
+        assert!(!err.to_string().is_empty());
     }
 
     #[cfg(unix)]

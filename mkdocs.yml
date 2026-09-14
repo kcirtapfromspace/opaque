@@ -11,6 +11,7 @@ exclude_docs: |
   dogfood.md
   release-dogfood.md
   tenant-boundaries.md
+  compliance/**
 
 theme:
   name: material

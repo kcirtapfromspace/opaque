@@ -380,6 +380,12 @@ mod transport_tests {
 
     #[tokio::test]
     async fn unsafe_socket_custody_denies_delivery_before_credentials_leave() {
+        // Serialize against the socket module's umask-window tests: a process
+        // -global umask(0o177) can otherwise make the temp dir below
+        // non-searchable and fail the write.
+        let serial = crate::socket::UMASK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let uid = unsafe { libc::geteuid() };
         assert_eq!(
             validate_socket_path(std::path::Path::new("relative.sock"), uid).unwrap_err(),
@@ -392,6 +398,8 @@ mod transport_tests {
         let socket = dir.path().join("lifecycle.sock");
         std::fs::write(&socket, b"preserve this file").unwrap();
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // The umask-sensitive filesystem setup is done; release before awaiting.
+        drop(serial);
         assert_eq!(
             deliver(&socket, uid, "secret", &batch()).await.unwrap_err(),
             "lifecycle endpoint custody mismatch"
