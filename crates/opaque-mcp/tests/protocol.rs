@@ -3,7 +3,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Stdio;
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::UnixListener;
@@ -70,6 +70,91 @@ fn daemon_fixture() -> (tempfile::TempDir, UnixListener) {
     let listener = UnixListener::bind(&path).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
     (directory, listener)
+}
+
+#[tokio::test]
+async fn duplicate_ids_and_unmatched_cancellation_do_not_repeat_or_drop_dispatched_work() {
+    let (directory, listener) = daemon_fixture();
+    let mut server = Server::start(directory.path());
+    server
+        .send(json!({"jsonrpc":"2.0","id":71,"method":"tools/list","params":{}}))
+        .await;
+    let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
+    let handshake: Value = serde_json::from_slice(
+        &tokio::time::timeout(Duration::from_secs(5), framed.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        handshake,
+        json!({"handshake":"v1","daemon_token":"test-token"})
+    );
+    let request: Value = serde_json::from_slice(
+        &tokio::time::timeout(Duration::from_secs(5), framed.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(request, json!({"id":1,"method":"mcp_catalog","params":{}}));
+    // The broker has observed the first call but has not answered. These
+    // controls must neither abort that call nor create a second dispatch.
+    server.input.write_all(b"\n \t\r\n").await.unwrap();
+    server
+        .send(json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{}}))
+        .await;
+    server.send(json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"unknown"}})).await;
+    server
+        .send(json!({"jsonrpc":"2.0","id":71,"method":"tools/list","params":{}}))
+        .await;
+    server
+        .send(json!({"jsonrpc":"2.0","id":72,"method":"ping","params":{}}))
+        .await;
+    let duplicate = server.receive().await;
+    assert_eq!(duplicate["id"], 71);
+    assert_eq!(duplicate["error"]["code"], -32600);
+    assert_eq!(
+        duplicate["error"]["message"],
+        "request ID is already in use"
+    );
+    let ping = server.receive().await;
+    assert_eq!(ping["id"], 72);
+    assert_eq!(ping["result"], json!({}));
+    framed
+        .send(
+            serde_json::to_vec(&json!({"id":1,"result":{"tools":[]}}))
+                .unwrap()
+                .into(),
+        )
+        .await
+        .unwrap();
+    let completed = server.receive().await;
+    assert_eq!(completed["id"], 71);
+    assert!(completed.get("error").is_none());
+    assert!(
+        completed["result"]["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty())
+    );
+    server.stop().await;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), framed.next())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        listener.accept().now_or_never().is_none(),
+        "only one broker connection is permitted"
+    );
 }
 
 #[tokio::test]

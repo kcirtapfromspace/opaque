@@ -1029,6 +1029,120 @@ mod tests {
     }
 
     #[test]
+    fn tls_ca_parse_failures_never_construct_a_trusted_syslog_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let ca = directory.path().join("fixture-ca.pem");
+        assert!(
+            SyslogTarget::new("tls://localhost:6514", Some(&ca))
+                .unwrap_err()
+                .contains("unreadable")
+        );
+        for (bytes,expected) in [
+            (vec![255],"CA file is not UTF-8"),
+            (b"outside any certificate\n".to_vec(),"contains no certificates"),
+            (b"-----BEGIN CERTIFICATE-----\nnot-base64!\n-----END CERTIFICATE-----\n".to_vec(),"bad base64 in CA file"),
+            (b"ignored prefix\n-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\nignored suffix\n".to_vec(),"syslog CA cert rejected"),
+        ] {
+            std::fs::write(&ca,bytes).unwrap();
+            let error=SyslogTarget::new("tls://localhost:6514",Some(&ca)).unwrap_err();
+            assert!(error.contains(expected),"{error}");
+        }
+        assert_eq!(
+            rustls_pemfile_certs(b"-----BEGIN CERTIFICATE-----\nAAEC\n-----END CERTIFICATE-----\n")
+                .unwrap()[0]
+                .as_ref(),
+            [0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn export_configuration_and_cursor_bounds_reject_each_invalid_frontier() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = seed_db(directory.path());
+        assert!(!ExportConfig::default().configured());
+        for choice in 0..3 {
+            let mut config = ExportConfig::default();
+            match choice {
+                0 => config.spool_path = Some(directory.path().join("spool")),
+                1 => config.webhook_url = Some("https://collector.example".into()),
+                _ => config.syslog_addr = Some("tcp://127.0.0.1:6514".into()),
+            }
+            assert!(config.configured());
+        }
+        for (batch_size, poll_secs) in [
+            (Some(0), None),
+            (Some(1025), None),
+            (None, Some(0)),
+            (None, Some(3601)),
+        ] {
+            assert_eq!(
+                ExportPump::new(
+                    ExportConfig {
+                        batch_size,
+                        poll_secs,
+                        ..Default::default()
+                    },
+                    db.clone(),
+                    directory.path().join("cursor"),
+                    Arc::new(opaque_core::audit::InMemoryAuditEmitter::new())
+                )
+                .err()
+                .unwrap(),
+                "invalid export batch or polling limit"
+            );
+        }
+        let path = directory.path().join("cursor");
+        for field in ["spool", "webhook", "syslog", "detector"] {
+            let mut value = serde_json::to_value(Cursors::default()).unwrap();
+            value[field] = (-1).into();
+            std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            assert_eq!(
+                load_cursors(&path).unwrap_err().to_string(),
+                "inconsistent detector cursor state"
+            );
+        }
+        std::fs::write(&path, vec![b' '; 8 * 1024 * 1024 + 1]).unwrap();
+        assert_eq!(
+            load_cursors(&path).unwrap_err().to_string(),
+            "cursor exceeds limit"
+        );
+        let mut state = ApprovalDetector::default();
+        state.health.insert("x".repeat(8 * 1024 * 1024), 1);
+        let cursors = Cursors {
+            detector_state: Some(state),
+            ..Default::default()
+        };
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(
+            save_cursors(&path, &cursors).unwrap_err().to_string(),
+            "cursor exceeds limit"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn cursor_replacement_failure_removes_only_its_temporary_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("cursor");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("owned-marker"), "preserved").unwrap();
+        assert_eq!(
+            load_cursors(&target).unwrap_err().to_string(),
+            "cursor is not a regular file"
+        );
+        assert!(save_cursors(&target, &Cursors::default()).is_err());
+        assert_eq!(
+            std::fs::read_to_string(target.join("owned-marker")).unwrap(),
+            "preserved"
+        );
+        let names = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(names, [std::ffi::OsString::from("cursor")]);
+    }
+
+    #[test]
     fn syslog_timestamp_math_is_correct() {
         let mut record = ExportRecord {
             schema: EXPORT_SCHEMA.into(),

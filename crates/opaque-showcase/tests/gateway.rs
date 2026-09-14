@@ -42,6 +42,12 @@ mod bounded_demo;
 #[path = "gateway/exploration.rs"]
 mod exploration;
 
+#[path = "gateway/revoked_chat.rs"]
+mod revoked_chat;
+
+#[path = "gateway/held_portfolio.rs"]
+mod held_portfolio;
+
 struct TestDirectory(PathBuf);
 impl TestDirectory {
     fn new() -> Self {
@@ -102,6 +108,35 @@ impl Fixture {
         organization: bool,
         portfolio: bool,
     ) -> Self {
+        Self::setup_with_model(remote_model, experience, organization, portfolio, None).await
+    }
+
+    async fn setup_with_model(
+        remote_model: bool,
+        experience: Experience,
+        organization: bool,
+        portfolio: bool,
+        model_url: Option<String>,
+    ) -> Self {
+        Self::setup_with_transports(
+            remote_model,
+            experience,
+            organization,
+            portfolio,
+            model_url,
+            None,
+        )
+        .await
+    }
+
+    async fn setup_with_transports(
+        remote_model: bool,
+        experience: Experience,
+        organization: bool,
+        portfolio: bool,
+        model_url: Option<String>,
+        source_url: Option<String>,
+    ) -> Self {
         let issuer = MockServer::start().await;
         let source = MockServer::start().await;
         let model = MockServer::start().await;
@@ -143,7 +178,7 @@ impl Fixture {
             source: MetricsSourceConfig {
                 tenant_id: "customer-a".into(),
                 source_id: "fixture-aggregates".into(),
-                base_url: source.uri(),
+                base_url: source_url.unwrap_or_else(|| source.uri()),
                 credential_env: "CARGO_PKG_NAME".into(),
                 allowed_metrics: METRIC_NAMES.iter().map(|s| s.to_string()).collect(),
                 allowed_portfolio_measures: vec![],
@@ -153,7 +188,7 @@ impl Fixture {
             },
             model: if remote_model {
                 ModelConfig::OpenaiCompatible {
-                    base_url: model.uri(),
+                    base_url: model_url.unwrap_or_else(|| model.uri()),
                     model: "fixture-model".into(),
                     allow_loopback_http: true,
                 }

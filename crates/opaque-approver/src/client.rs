@@ -220,4 +220,50 @@ mod tests {
         );
         assert!(BrokerClient::new("https://broker.example/path", &"00".repeat(32)).is_err());
     }
+    #[test]
+    fn endpoint_and_pin_validation_reject_ambiguous_credentials_and_routes() {
+        let pin = "00".repeat(32);
+        for endpoint in [
+            "not a URL",
+            "https:///",
+            "https://broker.example?token=private",
+            "https://broker.example#fragment",
+            "https://:secret@broker.example",
+            "https://broker.example/nested/",
+        ] {
+            assert!(BrokerClient::new(endpoint, &pin).is_err(), "{endpoint}");
+        }
+        for pin in [
+            "".to_owned(),
+            "zz".repeat(32),
+            "00".repeat(31),
+            "00".repeat(33),
+        ] {
+            assert_eq!(
+                BrokerClient::new("https://broker.example", &pin)
+                    .err()
+                    .unwrap(),
+                "broker TLS pin must be a SHA256 fingerprint"
+            );
+        }
+        assert!(BrokerClient::new("https://broker.example/", &"AB".repeat(32)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn invalid_workstation_routes_are_refused_before_connecting() {
+        let client = BrokerClient::new("https://127.0.0.1:9", &"00".repeat(32)).unwrap();
+        for route in [
+            "/outside/route",
+            "/workstation/../admin",
+            "/workstation/approval?token=x",
+            "/workstation/%2e%2e",
+            "/workstation/é",
+        ] {
+            let error = client
+                .request::<serde_json::Value>(reqwest::Method::GET, route, None, None)
+                .await
+                .unwrap_err();
+            assert_eq!(error, "invalid workstation route");
+        }
+    }
 }

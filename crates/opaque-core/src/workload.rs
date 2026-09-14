@@ -167,6 +167,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn attestor_and_selector_names_enforce_the_same_exact_byte_boundary() {
+        let accepted = "a".repeat(64);
+        let oversized = "a".repeat(65);
+        let attestor: AttestorId = serde_json::from_value(serde_json::json!(accepted)).unwrap();
+        assert_eq!(attestor.as_str(), accepted);
+        assert!(serde_json::from_value::<AttestorId>(serde_json::json!(oversized)).is_err());
+        let selector = Selector::new(&accepted, &accepted, "sha256:fixture").unwrap();
+        assert_eq!(selector.source(), accepted);
+        assert_eq!(selector.key(), accepted);
+        assert!(Selector::new(&oversized, &accepted, "sha256:fixture").is_err());
+        assert!(Selector::new(&accepted, &oversized, "sha256:fixture").is_err());
+    }
+
+    #[test]
     fn canonical_sets_serialize_and_hash_identically() {
         let selectors = [
             "peercred:uid:501",

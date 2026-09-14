@@ -563,6 +563,195 @@ async fn execute_platform_sandbox(
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+
+    #[tokio::test]
+    async fn prepared_execution_reports_only_bounded_metadata_for_failed_large_output() {
+        let directory = tempfile::tempdir().unwrap();
+        for stderr in [false, true] {
+            let audit = Arc::new(InMemoryAuditEmitter::new());
+            let executor = SandboxExecutor::new(audit.clone(), Vec::new);
+            let mut profile = test_profile();
+            profile.sandbox = false;
+            profile.project_dir = directory.path().into();
+            profile.limits.max_output_bytes = 200_000;
+            let command = if stderr {
+                "head -c 65537 /dev/zero | tr '\\000' x >&2; exit 7"
+            } else {
+                "head -c 65537 /dev/zero | tr '\\000' x; exit 7"
+            };
+            let request = sandbox_request(
+                serde_json::json!({"profile":profile.name,"command":["/bin/sh","-c",command]}),
+            );
+            let result = executor
+                .prepare_with_loader(&request, |_| Ok(profile))
+                .unwrap()
+                .execute()
+                .await
+                .unwrap();
+            assert_eq!(result["exit_code"], 7);
+            assert_eq!(result["truncated"], true);
+            assert_eq!(
+                result[if stderr {
+                    "stderr_length"
+                } else {
+                    "stdout_length"
+                }],
+                65_537
+            );
+            assert!(result.get("stdout").is_none() && result.get("stderr").is_none());
+            assert!(
+                audit
+                    .events()
+                    .iter()
+                    .any(|e| e.kind == AuditEventKind::SandboxCompleted
+                        && e.outcome.as_deref() == Some("failed"))
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn platform_dispatch_obeys_detected_seatbelt_capability_without_unsandboxed_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut profile = test_profile();
+        profile.sandbox = true;
+        profile.project_dir = dir.path().into();
+        let (tx, mut rx) = mpsc::channel(16);
+        let result =
+            execute_platform_sandbox(&profile, vec!["/usr/bin/true".into()], HashMap::new(), tx)
+                .await;
+        if macos::MacOSSandboxCapabilities::detect().sandbox_exec_works {
+            assert_eq!(result.unwrap(), 0);
+        } else {
+            assert!(result.is_err());
+        }
+        let mut started = false;
+        while let Some(frame) = rx.recv().await {
+            if matches!(frame, ExecFrame::ExecStarted { .. }) {
+                started = true;
+            }
+        }
+        assert_eq!(
+            started,
+            macos::MacOSSandboxCapabilities::detect().sandbox_exec_works
+        );
+    }
+
+    #[test]
+    fn invalid_profile_inputs_never_resolve_or_authorize_execution() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let executor =
+            SandboxExecutor::new(audit.clone(), || panic!("must not resolve invalid input"));
+        for input in [
+            serde_json::json!(null),
+            serde_json::json!({"profile":"","command":["true"]}),
+        ] {
+            assert!(
+                executor
+                    .prepare_with_loader(&sandbox_request(input), |_| panic!("must not load"))
+                    .is_err()
+            );
+        }
+        let mut request = sandbox_request(serde_json::json!({"profile":"test","command":["true"]}));
+        request.operation = "sandbox.other".into();
+        assert!(
+            executor
+                .prepare_with_loader(&request, |_| panic!("must not load"))
+                .is_err()
+        );
+        request.operation = "sandbox.exec".into();
+        for secret in [false, true] {
+            let mut profile = test_profile();
+            if secret {
+                profile
+                    .secrets
+                    .insert("TOKEN".into(), "env:BAD\0REF".into());
+            } else {
+                profile.env.insert("TOKEN".into(), "BAD\0VALUE".into());
+            }
+            assert!(
+                executor
+                    .prepare_with_loader(&request, |_| Ok(profile))
+                    .is_err()
+            );
+        }
+        let mut profile = test_profile();
+        profile.env.insert("TOKEN".into(), "literal".into());
+        let values = HashMap::from([("TOKEN".into(), SecretValue::new(vec![0xff]))]);
+        assert_eq!(
+            SandboxExecutor::build_env(&profile, &values)["TOKEN"],
+            "literal"
+        );
+        assert!(audit.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn direct_output_enforces_byte_budget_utf8_and_reserved_environment() {
+        use opaque_core::proto::ExecStream;
+        let dir = tempfile::tempdir().unwrap();
+        for (script, limit, expected) in [
+            (
+                "printf stdout; printf stderr >&2; test -z \"${OPAQUE_SOCK+x}\"; exit 7",
+                64,
+                vec![
+                    (ExecStream::Stdout, "stdout"),
+                    (ExecStream::Stderr, "stderr"),
+                ],
+            ),
+            ("printf too-long", 0, vec![]),
+            ("printf too-long >&2", 0, vec![]),
+            ("printf '\\377'", 64, vec![]),
+            ("printf '\\377' >&2", 64, vec![]),
+        ] {
+            let (tx, mut rx) = mpsc::channel(32);
+            let code = execute_direct(
+                &["/bin/sh".into(), "-c".into(), script.into()],
+                HashMap::from([("OPAQUE_SOCK".into(), "must-not-inherit".into())]),
+                5,
+                limit,
+                tx,
+                Some(dir.path()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(code, if expected.is_empty() { 0 } else { 7 });
+            let mut outputs = vec![];
+            while let Some(frame) = rx.recv().await {
+                if let ExecFrame::Output { stream, data } = frame {
+                    outputs.push((stream, data));
+                }
+            }
+            assert_eq!(outputs.len(), expected.len());
+            for (stream, data) in expected {
+                assert!(
+                    outputs
+                        .iter()
+                        .any(|actual| actual.0 == stream && actual.1 == data)
+                );
+            }
+        }
+        let (tx, _rx) = mpsc::channel(1);
+        assert!(matches!(
+            execute_direct(&[], HashMap::new(), 1, 1, tx, None).await,
+            Err(DirectExecError::Configuration(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn frame_summary_accepts_closed_producer_without_completion_fabrication() {
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(ExecFrame::Output {
+            stream: opaque_core::proto::ExecStream::Stderr,
+            data: "failure".into(),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        let summary = summarize_frames(rx).await;
+        assert_eq!(summary.stderr_len, 7);
+        assert_eq!(summary.stdout_len, 0);
+        assert_eq!(summary.duration_ms, 0);
+    }
     use super::*;
 
     #[tokio::test]

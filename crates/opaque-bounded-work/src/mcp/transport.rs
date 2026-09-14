@@ -365,3 +365,185 @@ where
         _ => Outcome::rejected("admission_or_transport_rejected"),
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod decision_tests {
+    use super::*;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn public_address_boundaries_exclude_non_global_routes_and_keep_adjacent_global_ranges() {
+        for address in [
+            "0.1.2.3",
+            "100.64.0.1",
+            "100.127.255.254",
+            "169.254.1.1",
+            "172.16.0.1",
+            "172.31.255.254",
+            "192.0.2.1",
+            "192.168.1.1",
+            "198.18.0.1",
+            "198.19.0.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "2001:1ff::1",
+            "2001:db8::1",
+            "2002::1",
+        ] {
+            assert!(!public_ip(address.parse().unwrap()), "accepted {address}");
+        }
+        for address in [
+            "100.63.0.1",
+            "100.128.0.1",
+            "169.253.1.1",
+            "172.15.0.1",
+            "172.32.0.1",
+            "192.1.2.3",
+            "198.17.0.1",
+            "198.20.0.1",
+            "203.1.1.1",
+            "2001:200::1",
+            "2001:db9::1",
+            "2606:4700::1111",
+        ] {
+            assert!(public_ip(address.parse().unwrap()), "rejected {address}");
+        }
+        for origin in [
+            "http://127.0.0.1",
+            "http://:password@127.0.0.1:1234",
+            "http://127.0.0.1:1234/#fragment",
+        ] {
+            assert!(validate_fixture_origin(origin).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn loopback_protocol_rejects_ambiguous_jsonrpc_and_session_identity() {
+        let server = MockServer::start().await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let message = json!({"jsonrpc":"2.0","id":7,"method":"initialize"});
+        let good = json!({"jsonrpc":"2.0","id":7,"result":{}});
+        for body in [
+            json!([]),
+            json!({"id":7,"result":{}}),
+            json!({"jsonrpc":"2.0","id":8,"result":{}}),
+            json!({"jsonrpc":"2.0","id":7,"result":{},"method":"notify"}),
+            json!({"jsonrpc":"2.0","id":7}),
+            json!({"jsonrpc":"2.0","id":7,"result":{},"error":{}}),
+        ] {
+            server.reset().await;
+            Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&server)
+                .await;
+            assert!(
+                send(
+                    &client,
+                    &server.uri(),
+                    "fixture",
+                    None,
+                    message.clone(),
+                    4096,
+                    4096
+                )
+                .await
+                .is_err()
+            );
+        }
+        for session in [
+            "".to_owned(),
+            "x".repeat(257),
+            "contains space".into(),
+            "changed-session".into(),
+        ] {
+            server.reset().await;
+            Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Mcp-Session-Id", session.as_str())
+                        .set_body_json(good.clone()),
+                )
+                .mount(&server)
+                .await;
+            assert!(
+                send(
+                    &client,
+                    &server.uri(),
+                    "fixture",
+                    Some("original-session"),
+                    message.clone(),
+                    4096,
+                    4096
+                )
+                .await
+                .is_err()
+            );
+        }
+        server.reset().await;
+        assert!(
+            send(&client, &server.uri(), "fixture", None, message, 4096, 1)
+                .await
+                .is_err()
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn loopback_sse_requires_exactly_one_response_and_valid_frame_fields() {
+        let server = MockServer::start().await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let message = json!({"jsonrpc":"2.0","id":7,"method":"initialize"});
+        let data = "data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{}}\n\n";
+        for (body, valid) in [
+            (
+                format!(": keepalive\n\nevent: message\nid: event-1\n{data}"),
+                true,
+            ),
+            (format!("event: other\n{data}"), false),
+            (format!("retry: 10\n{data}"), false),
+            (format!("{data}{data}"), false),
+            (": comment\n\n".into(), false),
+        ] {
+            server.reset().await;
+            Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+                .mount(&server)
+                .await;
+            assert_eq!(
+                send(
+                    &client,
+                    &server.uri(),
+                    "fixture",
+                    None,
+                    message.clone(),
+                    4096,
+                    4096
+                )
+                .await
+                .is_ok(),
+                valid
+            );
+        }
+        for (status, body) in [(200, ""), (202, "unexpected")] {
+            server.reset().await;
+            Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(ResponseTemplate::new(status).set_body_string(body))
+                .mount(&server)
+                .await;
+            assert!(
+                send(
+                    &client,
+                    &server.uri(),
+                    "fixture",
+                    None,
+                    json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+                    4096,
+                    4096
+                )
+                .await
+                .is_err()
+            );
+        }
+    }
+}

@@ -98,3 +98,26 @@ pub(super) async fn send_frame(
 pub(super) fn completion_deadline() -> Instant {
     Instant::now() + std::time::Duration::from_secs(5)
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn reaped_child_disarms_custody_instead_of_signalling_a_reusable_group_id() {
+        let mut child = tokio::process::Command::new("/usr/bin/true")
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let mut custody = ProcessCustody::new(pid);
+        assert!(child.wait().await.unwrap().success());
+        assert_eq!(
+            custody.wait(&mut child).await.unwrap_err().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        assert!(!custody.armed);
+        custody.kill_group();
+    }
+}

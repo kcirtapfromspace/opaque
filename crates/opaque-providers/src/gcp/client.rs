@@ -1550,6 +1550,243 @@ mod boundary_tests {
             assert!(validate_version(value).is_err(), "{value}");
         }
     }
+
+    #[test]
+    fn explicit_references_tokens_and_selectors_reject_boundary_mutations() {
+        for reference in [
+            "env:".into(),
+            format!("env:{}", "a".repeat(257)),
+            "env:has-dash".into(),
+            "keychain:missing".into(),
+            "keychain:/a".into(),
+            "keychain:s/".into(),
+            format!("keychain:s/{}", "a".repeat(512)),
+            "keychain:s/white space".into(),
+            "raw-token".into(),
+        ] {
+            assert!(validate_ref(&reference).is_err());
+        }
+        for reference in ["env:NAME_1", "keychain:service/account"] {
+            validate_ref(reference).unwrap();
+        }
+        for value in ["".into(), "a".repeat(8193), "contains space".into()] {
+            assert!(matches!(
+                check_token(&value),
+                Err(GcpApiError::AuthError(_))
+            ));
+        }
+        for secret in ["".into(), "a".repeat(256), "has.dot".into()] {
+            assert!(matches!(
+                validate_secret(&secret),
+                Err(GcpApiError::InvalidUrl(_))
+            ));
+        }
+        for version in ["a".repeat(64), "starts.with.dot".into()] {
+            assert!(matches!(
+                validate_version(&version),
+                Err(GcpApiError::InvalidUrl(_))
+            ));
+        }
+        for url in [
+            "file:///private",
+            "https://user@secretmanager.googleapis.com/v1",
+            "https://:password@secretmanager.googleapis.com/v1",
+            "https://secretmanager.googleapis.com/v1#fragment",
+        ] {
+            assert!(matches!(
+                validate_url_scheme(url),
+                Err(GcpApiError::InvalidUrl(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn returned_resource_identity_requires_every_requested_component() {
+        let valid = "projects/123456789012/secrets/fixture/versions/2";
+        validate_returned_resource(valid, "123456789012", Some("fixture"), true, Some("2"))
+            .unwrap();
+        for value in [
+            "projects/123456789012/secrets/fixture",
+            "folders/123456789012/secrets/fixture/versions/2",
+            "projects/999999999999/secrets/fixture/versions/2",
+            "projects/123456789012/keys/fixture/versions/2",
+            "projects/123456789012/secrets/bad.name/versions/2",
+            "projects/123456789012/secrets/other/versions/2",
+            "projects/123456789012/secrets/fixture/aliases/2",
+            "projects/123456789012/secrets/fixture/versions/latest",
+            "projects/123456789012/secrets/fixture/versions/3",
+        ] {
+            assert!(
+                matches!(
+                    validate_returned_resource(
+                        value,
+                        "123456789012",
+                        Some("fixture"),
+                        true,
+                        Some("2")
+                    ),
+                    Err(GcpApiError::InvalidResponse)
+                ),
+                "{value}"
+            );
+        }
+        validate_returned_resource(valid, "123456789012", Some("fixture"), true, Some("latest"))
+            .unwrap();
+    }
+
+    #[test]
+    fn service_account_files_require_private_regular_bounded_custody() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("service-account.json");
+        let client = GcpSecretManagerClient::with_auth(
+            DEFAULT_BASE_URL,
+            AuthBinding::ServiceAccountFile {
+                path: path.to_str().unwrap().into(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            client.credentials(),
+            Err(GcpApiError::AuthError(_))
+        ));
+        std::fs::write(&path, b"disposable key bytes").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            client.credentials().unwrap().as_slice(),
+            b"disposable key bytes"
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(matches!(
+            client.credentials(),
+            Err(GcpApiError::AuthError(_))
+        ));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&path, vec![0; MAX_SECRET + 1]).unwrap();
+        assert!(matches!(
+            client.credentials(),
+            Err(GcpApiError::AuthError(_))
+        ));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(matches!(
+            client.credentials(),
+            Err(GcpApiError::AuthError(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_service_identity_and_oauth_success_never_populate_token_cache() {
+        use std::os::unix::fs::PermissionsExt;
+        let key = include_str!("../../tests/fixtures/test_rsa_key.pem");
+        for field in 0..7 {
+            let server = MockServer::start().await;
+            let directory = tempfile::tempdir().unwrap();
+            let file = directory.path().join("sa.json");
+            let email = match field {
+                0 => "foreign@example.test".into(),
+                1 => format!("{}@x.gserviceaccount.com", "a".repeat(320)),
+                _ => "fixture@project.iam.gserviceaccount.com".into(),
+            };
+            std::fs::write(
+                &file,
+                serde_json::to_vec(&json!({"client_email":email,"private_key":key})).unwrap(),
+            )
+            .unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let mut client = GcpSecretManagerClient::with_auth(
+                &server.uri(),
+                AuthBinding::ServiceAccountFile {
+                    path: file.to_str().unwrap().into(),
+                },
+            )
+            .unwrap();
+            client.token_endpoint_override = Some(format!("{}/token", server.uri()));
+            if field >= 2 {
+                let mut token =
+                    json!({"access_token":"synthetic","expires_in":3600,"token_type":"Bearer"});
+                match field {
+                    2 => token["expires_in"] = 0.into(),
+                    3 => token["expires_in"] = 86401.into(),
+                    4 => token["token_type"] = "Basic".into(),
+                    5 => token["access_token"] = "".into(),
+                    _ => token["access_token"] = "contains space".into(),
+                };
+                Mock::given(method("POST"))
+                    .and(path("/token"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(token))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+            assert!(matches!(
+                client.get_access_token().await,
+                Err(GcpApiError::AuthError(_))
+            ));
+            assert!(client.token_cache.lock().await.is_none());
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), usize::from(field >= 2));
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.url.path() == "/token")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn service_identity_change_invalidates_cached_token_before_reuse() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("sa.json");
+        let server = MockServer::start().await;
+        let mut client = GcpSecretManagerClient::with_auth(
+            &server.uri(),
+            AuthBinding::ServiceAccountFile {
+                path: file.to_str().unwrap().into(),
+            },
+        )
+        .unwrap();
+        client.token_endpoint_override = Some(format!("{}/token", server.uri()));
+        for name in ["first", "replacement"] {
+            std::fs::write(&file,serde_json::to_vec(&json!({"client_email":format!("{name}@project.iam.gserviceaccount.com"),"private_key":include_str!("../../tests/fixtures/test_rsa_key.pem")})).unwrap()).unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+            server.reset().await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"access_token":name,"expires_in":3600})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            assert_eq!(client.get_access_token().await.unwrap().as_str(), name);
+            assert_eq!(client.get_access_token().await.unwrap().as_str(), name);
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 1);
+            let form = reqwest::Url::parse(&format!(
+                "https://fixture.invalid/?{}",
+                std::str::from_utf8(&requests[0].body).unwrap()
+            ))
+            .unwrap();
+            let assertion = form
+                .query_pairs()
+                .find(|(key, _)| key == "assertion")
+                .unwrap()
+                .1
+                .into_owned();
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(assertion.split('.').nth(1).unwrap())
+                .unwrap();
+            let claims: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(
+                claims["iss"],
+                format!("{name}@project.iam.gserviceaccount.com")
+            );
+            assert_eq!(claims["aud"], OAUTH2_TOKEN_URL);
+        }
+    }
 }
 
 fn validate_production_endpoint(value: &str) -> Result<(), GcpApiError> {

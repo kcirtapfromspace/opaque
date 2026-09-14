@@ -597,6 +597,7 @@ const NOT_FOUND_PAGE: &str = "<!doctype html><html><body>not found</body></html>
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+    include!("login_settlement_tests.rs");
     use super::*;
     use crate::identity::oidc::tests::{base_claims, mount_discovery, sign_id_token};
     use crate::identity::{IdentityConfig, ServicePrincipalConfig};

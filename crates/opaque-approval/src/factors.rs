@@ -1584,4 +1584,49 @@ mod tests {
             .unwrap();
         assert_eq!(decision.approver.unwrap().principal_id, "local");
     }
+
+    #[test]
+    fn expired_fido_round_and_registration_do_not_consume_credentials_or_accept_signatures() {
+        let (approvals, key, _directory) = fido2_rig(true);
+        let key = key.unwrap();
+        let _receiver = approvals.begin_round("expired").unwrap();
+        let challenge = approvals.pending_rounds()[0].1.clone();
+        approvals
+            .rounds
+            .lock()
+            .unwrap()
+            .get_mut("expired")
+            .unwrap()
+            .started = std::time::Instant::now() - std::time::Duration::from_secs(6);
+        assert!(approvals.pending_rounds().is_empty());
+        assert_eq!(
+            approvals
+                .respond("expired", &sign_round_assertion(&key, &challenge, 1))
+                .unwrap_err(),
+            "FIDO2 round expired"
+        );
+        assert_eq!(approvals.list_credentials().unwrap()[0].counter, 0);
+        approvals.register_begin().unwrap();
+        approvals
+            .pending_registration
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .started = std::time::Instant::now() - std::time::Duration::from_secs(6);
+        let response = crate::fido2::Fido2RegistrationResponse {
+            credential_id: "unregistered".into(),
+            public_key: String::new(),
+            counter: 0,
+            authenticator_data: String::new(),
+        };
+        assert_eq!(
+            approvals
+                .register_complete(&response, "must not persist")
+                .unwrap_err(),
+            "registration window expired"
+        );
+        assert_eq!(approvals.list_credentials().unwrap().len(), 1);
+        assert!(approvals.pending_registration.lock().unwrap().is_some());
+    }
 }

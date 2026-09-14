@@ -385,14 +385,19 @@ mod tests {
                 1 => invalid.expires_at = now(),
                 2 => invalid.operation = "github.set_actions_secret".into(),
                 _ => {
-                    invalid.created_at = now() + 1;
-                    invalid.expires_at = now() + 60;
+                    // Keep a valid duration wholly in the future. A one-second
+                    // lead can elapse while signing or scheduling this test.
+                    // Exact clock boundaries are tested by validate with a
+                    // supplied observation time in opaque-core.
+                    invalid.created_at = i64::MAX - 60;
+                    invalid.expires_at = i64::MAX;
                 }
             }
             assert!(
                 manager
                     .verify_workstation_decision(&invalid, &sign(&invalid), &device.device_id, true)
-                    .is_err()
+                    .is_err(),
+                "signed mutation {field} was accepted"
             );
         }
         let legacy = manager.create_challenge(&valid.request_id, "Legacy mobile review");
@@ -404,5 +409,185 @@ mod tests {
                 .verify_approval(&legacy, &signature, &device.device_id, true)
                 .is_err()
         );
+    }
+
+    fn fixture() -> (
+        tempfile::TempDir,
+        PairingManager,
+        SigningKey,
+        WorkstationApproverConfig,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let key = SigningKey::from_bytes(&[61; 32]);
+        let config = WorkstationApproverConfig {
+            public_key_hex: hex(key.verifying_key().as_bytes()),
+            name: "Owned workstation".into(),
+            principal_id: Some("human-61".into()),
+        };
+        let manager = PairingManager::new(
+            "opq-test".into(),
+            SigningKey::from_bytes(&[62; 32]),
+            8443,
+            DeviceStore::new(directory.path().join("devices.json"), vec![8; 32]),
+        );
+        (directory, manager, key, config)
+    }
+
+    #[test]
+    fn malformed_workstation_names_and_principals_leave_no_persistent_identity() {
+        let (_directory, manager, _key, config) = fixture();
+        for name in [
+            "".to_owned(),
+            "x".repeat(65),
+            "embedded\nnewline".into(),
+            "nönascii".into(),
+        ] {
+            let mut invalid = config.clone();
+            invalid.name = name;
+            assert!(matches!(
+                manager.enroll_workstation(&invalid),
+                Err(PairingError::InvalidSignature)
+            ));
+            assert!(manager.device_store.list_devices().unwrap().is_empty());
+        }
+        for principal in [
+            "".to_owned(),
+            "x".repeat(257),
+            "has space".into(),
+            "tab\there".into(),
+        ] {
+            let mut invalid = config.clone();
+            invalid.principal_id = Some(principal);
+            assert!(matches!(
+                manager.enroll_workstation(&invalid),
+                Err(PairingError::InvalidSignature)
+            ));
+            assert!(manager.device_store.list_devices().unwrap().is_empty());
+        }
+        let device = manager.enroll_workstation(&config).unwrap();
+        assert_eq!(device.paired_by, config.principal_id);
+        assert_eq!(manager.device_store.list_devices().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn workstation_key_cannot_change_owner_or_promote_a_phone_identity() {
+        let (_directory, manager, _key, config) = fixture();
+        let device = manager.enroll_workstation(&config).unwrap();
+        let mut renamed = config.clone();
+        renamed.name = "Changed display label".into();
+        assert_eq!(
+            manager.enroll_workstation(&renamed).unwrap().device_id,
+            device.device_id
+        );
+        renamed.principal_id = Some("other-owner".into());
+        assert!(matches!(
+            manager.enroll_workstation(&renamed),
+            Err(PairingError::InvalidSignature)
+        ));
+        assert_eq!(
+            manager
+                .device_store
+                .get_device(&device.device_id)
+                .unwrap()
+                .paired_by,
+            config.principal_id
+        );
+        let (_directory, manager, _key, config) = fixture();
+        let mut phone = device.clone();
+        phone.kind = DeviceKind::Ios;
+        manager.device_store.add_device(phone.clone()).unwrap();
+        assert!(matches!(
+            manager.enroll_workstation(&config),
+            Err(PairingError::InvalidSignature)
+        ));
+        assert_eq!(
+            manager
+                .device_store
+                .get_device(&phone.device_id)
+                .unwrap()
+                .kind,
+            DeviceKind::Ios
+        );
+        assert!(!manager.workstation_allowed(&phone));
+        phone.kind = DeviceKind::Workstation;
+        phone.confirmed = false;
+        assert!(!manager.workstation_allowed(&phone));
+    }
+
+    #[test]
+    fn enrollment_capacity_expiry_nonce_and_revocation_preserve_pending_authority() {
+        let (_directory, manager, key, config) = fixture();
+        let device = manager.enroll_workstation(&config).unwrap();
+        let original = manager
+            .begin_workstation_enrollment(&config.public_key_hex)
+            .unwrap();
+        let mut request = EnrollmentRequest {
+            public_key_hex: config.public_key_hex.clone(),
+            nonce: "ab".repeat(32),
+            signature: hex(&key.sign(&enrollment_bytes(&original)).to_bytes()),
+        };
+        assert!(matches!(
+            manager.complete_workstation_enrollment(&request),
+            Err(PairingError::InvalidNonce)
+        ));
+        assert_eq!(
+            manager
+                .begin_workstation_enrollment(&config.public_key_hex)
+                .unwrap(),
+            original
+        );
+        assert!(!manager.has_workstation());
+        request.nonce = original.nonce.clone();
+        manager.revoke_device(&device.device_id).unwrap();
+        assert!(matches!(
+            manager.complete_workstation_enrollment(&request),
+            Err(PairingError::InvalidSignature)
+        ));
+        assert!(
+            manager
+                .device_store
+                .get_device(&device.device_id)
+                .unwrap()
+                .token_sha256
+                .is_none()
+        );
+
+        let (_directory, manager, _key, config) = fixture();
+        manager.enroll_workstation(&config).unwrap();
+        let original = manager
+            .begin_workstation_enrollment(&config.public_key_hex)
+            .unwrap();
+        let mut pending = manager.workstation_enrollments.lock().unwrap();
+        pending.get_mut(&config.public_key_hex).unwrap().expires_at = now() - 1;
+        drop(pending);
+        let replacement = manager
+            .begin_workstation_enrollment(&config.public_key_hex)
+            .unwrap();
+        assert_ne!(replacement.nonce, original.nonce);
+        assert!(replacement.expires_at > now());
+        let mut pending = manager.workstation_enrollments.lock().unwrap();
+        pending.clear();
+        for index in 0..64 {
+            pending.insert(format!("occupied-{index}"), replacement.clone());
+        }
+        drop(pending);
+        assert!(matches!(
+            manager.begin_workstation_enrollment(&config.public_key_hex),
+            Err(PairingError::InvalidNonce)
+        ));
+        assert_eq!(manager.workstation_enrollments.lock().unwrap().len(), 64);
+        manager
+            .workstation_enrollments
+            .lock()
+            .unwrap()
+            .values_mut()
+            .next()
+            .unwrap()
+            .expires_at = now() - 1;
+        let admitted = manager
+            .begin_workstation_enrollment(&config.public_key_hex)
+            .unwrap();
+        assert_eq!(admitted.public_key_hex, config.public_key_hex);
+        assert_eq!(manager.workstation_enrollments.lock().unwrap().len(), 64);
     }
 }

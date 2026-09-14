@@ -1226,7 +1226,8 @@ async fn run_github_publish_env(
         ));
     }
 
-    let mut items = Vec::with_capacity(env_names.len());
+    let total_discovered = env_names.len();
+    let mut items = Vec::with_capacity(total_discovered);
     let mut attempted = 0usize;
     let mut published = 0usize;
     let mut failed = 0usize;
@@ -1333,7 +1334,7 @@ async fn run_github_publish_env(
         env_file: env_file.display().to_string(),
         value_ref_template: value_ref_template.to_owned(),
         dry_run,
-        total_discovered: items.len(),
+        total_discovered,
         attempted,
         published,
         failed,
@@ -3236,6 +3237,26 @@ async fn main() {
                 }
             }
 
+            // A malformed receipt is a daemon failure in every output mode.
+            // Preserve raw JSON for inspection, but never report it as success.
+            let task_records = if method.starts_with("task_") && resp.error.is_none() {
+                match resp.result.as_ref().map(parse_task_records).transpose() {
+                    Ok(Some(records)) => Some(records),
+                    _ => {
+                        if json_output {
+                            println!("{}", serde_json::to_string_pretty(&resp).unwrap());
+                        } else {
+                            ui::error(
+                                "Daemon returned an invalid task receipt; use --json to inspect the response.",
+                            );
+                        }
+                        std::process::exit(EXIT_DAEMON);
+                    }
+                }
+            } else {
+                None
+            };
+
             if json_output {
                 // Raw JSON: output the full response as-is.
                 let output =
@@ -3273,8 +3294,8 @@ async fn main() {
                                 }
                             }
                         }
-                    } else if method.starts_with("task_") {
-                        format_task_response(result);
+                    } else if let Some(records) = task_records {
+                        format_task_response(result, records);
                     } else {
                         ui::format_response(method, result);
                     }
@@ -3511,23 +3532,17 @@ fn task_command_params(action: TaskAction) -> Result<(&'static str, serde_json::
     })
 }
 
-fn format_task_response(result: &serde_json::Value) {
-    let records: Result<Vec<opaque_core::task::TaskRecord>, _> = if let Some(tasks) =
-        result.get("tasks")
-    {
+fn parse_task_records(
+    result: &serde_json::Value,
+) -> Result<Vec<opaque_core::task::TaskRecord>, serde_json::Error> {
+    if let Some(tasks) = result.get("tasks") {
         serde_json::from_value(tasks.clone())
     } else {
         serde_json::from_value(result.get("task").unwrap_or(result).clone()).map(|task| vec![task])
-    };
-    let records = match records {
-        Ok(records) => records,
-        Err(_) => {
-            ui::error(
-                "Daemon returned an invalid task receipt; use --json to inspect the response.",
-            );
-            return;
-        }
-    };
+    }
+}
+
+fn format_task_response(result: &serde_json::Value, records: Vec<opaque_core::task::TaskRecord>) {
     if records.is_empty() {
         ui::info("No tasks for this authenticated owner.");
         return;
@@ -3747,6 +3762,8 @@ fn render_task_receipt(task: &opaque_core::task::TaskRecord) -> String {
         ),
         TaskState::Completed => output.push_str(if task.manifest.is_inference() {
             "\nThree model completions recorded. Further inference requires a new task and fresh approval. Provider usage does not attest GPU time or hardware isolation.\n"
+        } else if task.manifest.is_ssh() {
+            "\nSSH health observation recorded. Any further SSH operation requires a new task and fresh approval.\n"
         } else if task.manifest.is_release() {
             "\nDispatch recorded. Use task reconcile to observe the workflow; this does not establish deployment or service health.\n"
         } else { "\nGitHub accepted these writes; secret values cannot be read back for verification.\n" }),
@@ -4200,10 +4217,16 @@ fn parse_duration_to_ms(s: &str) -> Result<i64, String> {
         return Err("empty duration string".into());
     }
 
-    let (num_str, suffix) = s.split_at(s.len() - 1);
+    // Split at a character boundary so malformed non-ASCII suffixes are errors,
+    // not panics before the duration can be validated.
+    let suffix_start = s.char_indices().next_back().unwrap().0;
+    let (num_str, suffix) = s.split_at(suffix_start);
     let num: i64 = num_str
         .parse()
         .map_err(|_| format!("invalid duration: '{s}' (expected e.g. '30m', '1h', '7d')"))?;
+    if num < 0 {
+        return Err("duration must be non-negative".into());
+    }
 
     let multiplier = match suffix {
         "s" => 1_000,
@@ -4217,7 +4240,8 @@ fn parse_duration_to_ms(s: &str) -> Result<i64, String> {
         }
     };
 
-    Ok(num * multiplier)
+    num.checked_mul(multiplier)
+        .ok_or_else(|| "duration exceeds the supported range".into())
 }
 
 /// Format a millisecond timestamp as a human-readable UTC string.
@@ -5863,8 +5887,7 @@ fn run_setup_wizard(base: &Path, config_path: &Path, seal_file: &Path) -> Result
 
 /// Machine-readable JSON status output for scripting.
 async fn run_status_json() {
-    let base = default_opaque_dir();
-    let config_path = base.join("config.toml");
+    let config_path = resolve_config_path(None);
     let sock = socket_path();
 
     // Detect status
@@ -5924,8 +5947,7 @@ async fn run_status(json_output: bool) {
         "Approval-gated secrets broker for AI coding tools",
     );
 
-    let base = default_opaque_dir();
-    let config_path = base.join("config.toml");
+    let config_path = resolve_config_path(None);
     let sock = socket_path();
 
     // Detect whether this is a first-run or a returning user.

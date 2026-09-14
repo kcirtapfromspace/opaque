@@ -450,6 +450,173 @@ mod tests {
             .id
     }
 
+    fn stored_persona_row(store: &IdentityStore, id: &PrincipalId) -> (String, i64, i64, i64, i64) {
+        store.lock().query_row(
+            "SELECT groups_json,observed_at,issued_at,expires_at,revision FROM persona_snapshots WHERE principal_id=?1",
+            [id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+        ).unwrap()
+    }
+
+    #[test]
+    fn corrupt_stored_persona_is_rejected_without_repairing_or_overwriting_evidence() {
+        // Raw stored-input mutations deliberately test the decoder's defensive
+        // boundary, not states produced by the verified OIDC login flow.
+        for case in 0..7 {
+            let directory = tempfile::tempdir().unwrap();
+            let database = directory.path().join("identity.db");
+            let store = IdentityStore::open(&database).unwrap();
+            let id = principal(&store, "subject");
+            store
+                .record_persona_snapshot(&id, &verified(&["Engineering"], NOW), NOW)
+                .unwrap();
+            let valid = stored_persona_row(&store, &id);
+            let mut corrupt = valid.clone();
+            match case {
+                0 => corrupt.0 = "x".repeat(MAX_TOTAL_GROUP_BYTES * 2 + MAX_GROUPS * 3 + 3),
+                1 => corrupt.0 = r#"["z","a"]"#.into(),
+                2 => corrupt.4 = 0,
+                3 => corrupt.2 = -1,
+                4 => corrupt.2 = corrupt.1 + 1,
+                5 => corrupt.3 = corrupt.1,
+                _ => corrupt.0 = serde_json::to_string(&vec!["g"; MAX_GROUPS + 1]).unwrap(),
+            }
+            // A corrupt on-disk database can violate its original CHECK
+            // constraints. Disable checks only while staging that damaged row;
+            // normal writes and every production read keep their real guards.
+            store
+                .lock()
+                .execute_batch("PRAGMA ignore_check_constraints=ON")
+                .unwrap();
+            store.lock().execute(
+                "UPDATE persona_snapshots SET groups_json=?2,observed_at=?3,issued_at=?4,expires_at=?5,revision=?6 WHERE principal_id=?1",
+                params![id.as_str(),corrupt.0,corrupt.1,corrupt.2,corrupt.3,corrupt.4],
+            ).unwrap();
+            store
+                .lock()
+                .execute_batch("PRAGMA ignore_check_constraints=OFF")
+                .unwrap();
+            let expected = if case == 6 {
+                "persona groups exceed bounds or contain invalid strings"
+            } else {
+                "invalid stored persona snapshot"
+            };
+            assert_eq!(store.persona_snapshot(&id).unwrap_err(), expected);
+            assert_eq!(
+                store
+                    .record_persona_snapshot(&id, &verified(&["Engineering"], NOW + 1), NOW + 1)
+                    .unwrap_err(),
+                expected
+            );
+            assert_eq!(stored_persona_row(&store, &id), corrupt);
+            drop(store);
+            let store = IdentityStore::open(&database).unwrap();
+            assert_eq!(store.persona_snapshot(&id).unwrap_err(), expected);
+            assert_eq!(stored_persona_row(&store, &id), corrupt);
+            store.lock().execute(
+                "UPDATE persona_snapshots SET groups_json=?2,observed_at=?3,issued_at=?4,expires_at=?5,revision=?6 WHERE principal_id=?1",
+                params![id.as_str(),valid.0,valid.1,valid.2,valid.3,valid.4],
+            ).unwrap();
+            let restored = store.persona_snapshot(&id).unwrap().unwrap();
+            assert_eq!(restored.groups, ["Engineering"]);
+            assert_eq!(restored.revision, 1);
+            assert!(restored.is_fresh(NOW, 60));
+            assert!(store.get_principal(&id).unwrap().unwrap().roles.is_empty());
+        }
+    }
+
+    #[test]
+    fn persona_freshness_and_claim_name_limits_reject_invalid_boundary_values() {
+        let store = IdentityStore::open_in_memory().unwrap();
+        let id = principal(&store, "subject");
+        let valid = store
+            .record_persona_snapshot(&id, &verified(&["Engineering"], NOW), NOW)
+            .unwrap();
+        assert!(valid.is_fresh(NOW, 60));
+        for case in 0..3 {
+            let mut bad = valid.clone();
+            match case {
+                0 => bad.revision = 0,
+                1 => bad.issued_at = -1,
+                _ => bad.issued_at = bad.observed_at + 1,
+            }
+            assert!(!bad.is_fresh(NOW, 60));
+        }
+        let mut cfg = config();
+        cfg.groups_claim = "g".repeat(128);
+        cfg.validate().unwrap();
+        cfg.groups_claim.push('g');
+        assert_eq!(
+            cfg.validate().unwrap_err(),
+            "invalid [identity.persona] groups_claim"
+        );
+        let maximum = vec!["g".to_owned(); MAX_GROUPS];
+        assert_eq!(normalize_groups(&maximum).unwrap(), ["g"]);
+        let mut too_many = maximum;
+        too_many.push("g".into());
+        assert_eq!(
+            normalize_groups(&too_many).unwrap_err(),
+            "persona groups exceed bounds or contain invalid strings"
+        );
+        assert_eq!(
+            store.persona_snapshot(&id).unwrap().unwrap().revision,
+            valid.revision
+        );
+    }
+
+    #[test]
+    fn exhausted_persona_generation_cannot_commit_a_different_policy_or_reset_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("identity.db");
+        let store = IdentityStore::open(&database).unwrap();
+        let id = principal(&store, "subject");
+        store
+            .record_persona_snapshot(&id, &verified(&["Engineering"], NOW), NOW)
+            .unwrap();
+        store
+            .lock()
+            .execute("UPDATE persona_snapshots SET revision=?1", [i64::MAX])
+            .unwrap();
+        let old = stored_persona_row(&store, &id);
+        let fingerprint = |store: &IdentityStore| {
+            store
+                .lock()
+                .query_row(
+                    "SELECT fingerprint FROM identity_persona_policy WHERE singleton=1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+        };
+        let old_policy = fingerprint(&store);
+        let changed = PersonaConfig {
+            max_age_secs: 30,
+            ..config()
+        };
+        for next in [Some(&changed), None] {
+            assert_eq!(
+                store.sync_persona_policy(next).unwrap_err(),
+                "persona revision exhausted"
+            );
+            assert_eq!(fingerprint(&store), old_policy);
+            assert_eq!(stored_persona_row(&store, &id), old);
+        }
+        assert_eq!(
+            store
+                .record_persona_snapshot(&id, &verified(&["Other"], NOW + 1), NOW + 1)
+                .unwrap_err(),
+            "persona revision exhausted"
+        );
+        drop(store);
+        let store = IdentityStore::open(&database).unwrap();
+        store.sync_persona_policy(Some(&config())).unwrap();
+        assert_eq!(fingerprint(&store), old_policy);
+        assert_eq!(stored_persona_row(&store, &id), old);
+        assert_eq!(
+            store.persona_snapshot(&id).unwrap().unwrap().revision,
+            i64::MAX
+        );
+    }
+
     #[test]
     fn persona_config_rejects_unsafe_claim_names_and_freshness_ranges() {
         for groups_claim in [

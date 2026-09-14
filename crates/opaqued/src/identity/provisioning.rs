@@ -943,6 +943,354 @@ mod tests {
     }
 
     #[test]
+    fn stale_or_wrong_group_issuance_preserves_capacity_until_fresh_eligible_evidence() {
+        for stale in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let database = directory.path().join("identity.db");
+            let f = Fixture::with_store(IdentityStore::open(&database).unwrap());
+            let parent = f.mandate(2);
+            let request = Uuid::new_v4().to_string();
+            let denied_at = f.now + if stale { 301 } else { 1 };
+            if !stale {
+                f.snapshot(&["Other"], denied_at);
+            }
+            let before =
+                serde_json::to_value(f.store.get_mandate(&f.binding, &parent.id).unwrap()).unwrap();
+            assert_eq!(
+                f.store
+                    .issue_access(
+                        &f.binding,
+                        &parent.id,
+                        &f.service,
+                        &f.delegation,
+                        &f.recipient,
+                        &request,
+                        denied_at + 600,
+                        denied_at,
+                        300,
+                        |_| true
+                    )
+                    .unwrap_err(),
+                "verified persona is stale or outside eligible group"
+            );
+            assert_eq!(
+                serde_json::to_value(f.store.get_mandate(&f.binding, &parent.id).unwrap()).unwrap(),
+                before
+            );
+            assert!(f.store.list_access_grants(&f.binding).unwrap().is_empty());
+            let fresh = denied_at + 1;
+            f.snapshot(&["Engineering"], fresh);
+            let grant = f
+                .store
+                .issue_access(
+                    &f.binding,
+                    &parent.id,
+                    &f.service,
+                    &f.delegation,
+                    &f.recipient,
+                    &request,
+                    fresh + 600,
+                    fresh,
+                    300,
+                    |_| true,
+                )
+                .unwrap();
+            let replay = f
+                .store
+                .issue_access(
+                    &f.binding,
+                    &parent.id,
+                    &f.service,
+                    &f.delegation,
+                    &f.recipient,
+                    &request,
+                    fresh + 601,
+                    fresh + 1,
+                    300,
+                    |_| true,
+                )
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&replay).unwrap(),
+                serde_json::to_value(&grant).unwrap()
+            );
+            assert_eq!(
+                f.store
+                    .get_mandate(&f.binding, &parent.id)
+                    .unwrap()
+                    .issued_count,
+                1
+            );
+            assert_eq!(
+                f.store
+                    .authorize_scopes(&f.binding, &f.recipient, fresh, 300, |_| true)
+                    .unwrap(),
+                profile().scopes
+            );
+            let binding = f.binding.clone();
+            drop(f);
+            let reopened = IdentityStore::open(&database).unwrap();
+            assert_eq!(
+                reopened
+                    .get_mandate(&binding, &parent.id)
+                    .unwrap()
+                    .issued_count,
+                1
+            );
+            assert_eq!(
+                serde_json::to_value(reopened.list_access_grants(&binding).unwrap()).unwrap(),
+                serde_json::json!([grant])
+            );
+        }
+    }
+
+    #[test]
+    fn natural_parent_and_child_expiry_never_extend_or_refund_issued_access() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("identity.db");
+        let f = Fixture::with_store(IdentityStore::open(&database).unwrap());
+        let parent = f
+            .store
+            .create_mandate(
+                &f.binding,
+                &f.issuer,
+                &f.service,
+                "engineering-metrics",
+                f.store
+                    .provisioning_profile("engineering-metrics")
+                    .unwrap()
+                    .1,
+                f.store.provisioning_principal_epoch(&f.issuer).unwrap(),
+                &f.session,
+                f.now + 120,
+                2,
+                "credential-1",
+                f.now,
+                |_| true,
+            )
+            .unwrap();
+        let request = Uuid::new_v4().to_string();
+        assert_eq!(
+            f.issue(&parent, &request).unwrap_err(),
+            "access outlives its provisioning mandate"
+        );
+        assert_eq!(
+            f.store
+                .get_mandate(&f.binding, &parent.id)
+                .unwrap()
+                .issued_count,
+            0
+        );
+        assert!(f.store.list_access_grants(&f.binding).unwrap().is_empty());
+        let grant = f
+            .store
+            .issue_access(
+                &f.binding,
+                &parent.id,
+                &f.service,
+                &f.delegation,
+                &f.recipient,
+                &request,
+                f.now + 60,
+                f.now,
+                300,
+                |_| true,
+            )
+            .unwrap();
+        assert_eq!(grant.expires_at, f.now + 60);
+        assert_eq!(
+            f.store
+                .authorize_scopes(&f.binding, &f.recipient, f.now + 59, 300, |_| true)
+                .unwrap(),
+            profile().scopes
+        );
+        assert!(
+            f.store
+                .authorize_scopes(&f.binding, &f.recipient, f.now + 60, 300, |_| true)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            f.store
+                .issue_access(
+                    &f.binding,
+                    &parent.id,
+                    &f.service,
+                    &f.delegation,
+                    &f.recipient,
+                    &request,
+                    f.now + 120,
+                    f.now + 60,
+                    300,
+                    |_| true
+                )
+                .unwrap_err(),
+            "previous issuance is no longer active; request ID remains consumed"
+        );
+        assert_eq!(
+            f.store
+                .issue_access(
+                    &f.binding,
+                    &parent.id,
+                    &f.service,
+                    &f.delegation,
+                    &f.recipient,
+                    &Uuid::new_v4().to_string(),
+                    f.now + 180,
+                    f.now + 120,
+                    300,
+                    |_| true
+                )
+                .unwrap_err(),
+            "provisioning mandate inactive"
+        );
+        let retained = f.store.list_access_grants(&f.binding).unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].id, grant.id);
+        assert_eq!(retained[0].revoked_at, Some(f.now + 60));
+        assert_eq!(
+            f.store
+                .get_mandate(&f.binding, &parent.id)
+                .unwrap()
+                .issued_count,
+            1
+        );
+        let binding = f.binding.clone();
+        drop(f);
+        let reopened = IdentityStore::open(&database).unwrap();
+        assert_eq!(
+            reopened
+                .get_mandate(&binding, &parent.id)
+                .unwrap()
+                .issued_count,
+            1
+        );
+        assert_eq!(
+            serde_json::to_value(reopened.list_access_grants(&binding).unwrap()).unwrap(),
+            serde_json::to_value(retained).unwrap()
+        );
+    }
+
+    #[test]
+    fn current_runtime_admission_withdrawal_revokes_access_and_restoring_config_cannot_replay() {
+        use crate::identity::{IdentityConfig, IdentityRuntime};
+        for removed in ["admin", "onboarding", "new-hire"] {
+            let directory = tempfile::tempdir().unwrap();
+            let database = directory.path().join("identity.db");
+            let f = Fixture::with_store(IdentityStore::open(&database).unwrap());
+            let cfg:IdentityConfig=serde_json::from_value(serde_json::json!({
+                "issuer":"https://idp.example","client_id":"fixture","allowed_subjects":["admin","new-hire"],
+                "persona":{"groups_claim":"groups","max_age_secs":300},"service_principals":[{"name":"onboarding","roles":[]}]
+            })).unwrap();
+            let mut runtime = IdentityRuntime::initialize(cfg.clone(), directory.path()).unwrap();
+            let parent = f.mandate(3);
+            let request = Uuid::new_v4().to_string();
+            let grant = f.issue(&parent, &request).unwrap();
+            assert_eq!(
+                f.store
+                    .authorize_scopes(&f.binding, &f.recipient, f.now, 300, |p| runtime
+                        .principal_permitted(p))
+                    .unwrap(),
+                profile().scopes
+            );
+            if removed == "onboarding" {
+                runtime.config.service_principals.clear();
+            } else {
+                runtime.config.allowed_subjects.retain(|s| s != removed);
+            }
+            let expected = match removed {
+                "admin" => "provisioning issuer not admitted",
+                "onboarding" => "provisioning service not admitted",
+                _ => "provisioning recipient not admitted",
+            };
+            assert_eq!(
+                f.store
+                    .issue_access(
+                        &f.binding,
+                        &parent.id,
+                        &f.service,
+                        &f.delegation,
+                        &f.recipient,
+                        &Uuid::new_v4().to_string(),
+                        f.now + 600,
+                        f.now,
+                        300,
+                        |p| runtime.principal_permitted(p)
+                    )
+                    .unwrap_err(),
+                expected
+            );
+            assert_eq!(
+                f.store
+                    .get_mandate(&f.binding, &parent.id)
+                    .unwrap()
+                    .issued_count,
+                1
+            );
+            assert!(
+                f.store
+                    .authorize_scopes(&f.binding, &f.recipient, f.now + 1, 300, |p| runtime
+                        .principal_permitted(p))
+                    .unwrap()
+                    .is_empty()
+            );
+            f.store
+                .sync_provisioning_admission(|p| runtime.principal_permitted(p), f.now + 2)
+                .unwrap();
+            let retained = f.store.list_access_grants(&f.binding).unwrap();
+            assert_eq!(retained.len(), 1);
+            assert_eq!(retained[0].id, grant.id);
+            assert!(retained[0].revoked_at.is_some());
+            let parent = f.store.get_mandate(&f.binding, &parent.id).unwrap();
+            assert_eq!(parent.issued_count, 1);
+            assert_eq!(parent.revoked_at.is_some(), removed != "new-hire");
+            runtime.config = cfg.clone();
+            f.store
+                .sync_provisioning_admission(|p| runtime.principal_permitted(p), f.now + 3)
+                .unwrap();
+            assert!(
+                f.store
+                    .authorize_scopes(&f.binding, &f.recipient, f.now + 3, 300, |p| runtime
+                        .principal_permitted(p))
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                f.store
+                    .issue_access(
+                        &f.binding,
+                        &parent.id,
+                        &f.service,
+                        &f.delegation,
+                        &f.recipient,
+                        &request,
+                        f.now + 603,
+                        f.now + 3,
+                        300,
+                        |p| runtime.principal_permitted(p)
+                    )
+                    .is_err()
+            );
+            let binding = f.binding.clone();
+            drop(f);
+            drop(runtime);
+            let reopened = IdentityRuntime::initialize(cfg, directory.path()).unwrap();
+            assert_eq!(
+                reopened
+                    .store
+                    .get_mandate(&binding, &parent.id)
+                    .unwrap()
+                    .issued_count,
+                1
+            );
+            assert_eq!(
+                serde_json::to_value(reopened.store.list_access_grants(&binding).unwrap()).unwrap(),
+                serde_json::to_value(retained).unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn failed_delegation_revoke_cannot_issue_or_replay_access_from_a_live_durable_row() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("identity.db");
@@ -1577,6 +1925,382 @@ mod tests {
             if let Ok(mandate) = outcome {
                 assert!(f.issue(&mandate, &Uuid::new_v4().to_string()).is_err());
             }
+        }
+    }
+    #[test]
+    fn malformed_profile_updates_preserve_the_active_profile_and_existing_mandate() {
+        let f = Fixture::new();
+        let parent = f.mandate(2);
+        let original = f.store.provisioning_profile("engineering-metrics").unwrap();
+        for case in 0..13 {
+            let mut p = profile();
+            match case {
+                0 => p.id.clear(),
+                1 => p.id = "x".repeat(65),
+                2 => p.id = "UPPER".into(),
+                3 => p.revision = 0,
+                4 => p.revision = i64::MAX as u64 + 1,
+                5 => p.eligible_group.clear(),
+                6 => p.eligible_group = "x".repeat(129),
+                7 => p.eligible_group = " Engineering".into(),
+                8 => p.eligible_group = "bad\tgroup".into(),
+                9 => p.max_mandate_ttl_secs = 0,
+                10 => p.max_mandate_ttl_secs = MAX_MANDATE_TTL + 1,
+                11 => p.max_issuances = 0,
+                _ => p.scopes.clear(),
+            }
+            assert!(
+                f.store
+                    .sync_profiles(&ProvisioningConfig { profiles: vec![p] })
+                    .is_err(),
+                "case {case}"
+            );
+            assert_eq!(
+                f.store.provisioning_profile("engineering-metrics").unwrap(),
+                original
+            );
+            assert_eq!(f.store.get_mandate(&f.binding, &parent.id).unwrap(), parent);
+        }
+        let too_many = ProvisioningConfig {
+            profiles: (0..MAX_PROFILES + 1)
+                .map(|i| {
+                    let mut p = profile();
+                    p.id = format!("profile-{i}");
+                    p
+                })
+                .collect(),
+        };
+        assert_eq!(
+            f.store.sync_profiles(&too_many).unwrap_err(),
+            "too many provisioning profiles"
+        );
+        assert_eq!(
+            f.store.provisioning_profile("engineering-metrics").unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn mandate_commit_rejects_stale_epochs_invalid_credential_and_lifetime_without_rows() {
+        let f = Fixture::new();
+        let profile_epoch = f
+            .store
+            .provisioning_profile("engineering-metrics")
+            .unwrap()
+            .1;
+        let issuer_epoch = f.store.provisioning_principal_epoch(&f.issuer).unwrap();
+        for case in 0..10 {
+            let (mut profile, mut issuer, mut now, mut expires, mut count, mut credential) = (
+                profile_epoch,
+                issuer_epoch,
+                f.now,
+                f.now + 300,
+                1,
+                "credential-1".to_owned(),
+            );
+            match case {
+                0 => credential.clear(),
+                1 => credential = "x".repeat(513),
+                2 => credential = "bad\ncredential".into(),
+                3 => profile += 1,
+                4 => issuer += 1,
+                5 => count = 0,
+                6 => count = MAX_ISSUANCES,
+                7 => now = -1,
+                8 => expires = now,
+                _ => expires = now + MAX_MANDATE_TTL as i64 + 1,
+            }
+            assert!(
+                f.store
+                    .create_mandate(
+                        &f.binding,
+                        &f.issuer,
+                        &f.service,
+                        "engineering-metrics",
+                        profile,
+                        issuer,
+                        &f.session,
+                        expires,
+                        count,
+                        &credential,
+                        now,
+                        |_| true
+                    )
+                    .is_err(),
+                "case {case}"
+            );
+            assert!(f.store.list_mandates(&f.binding).unwrap().is_empty());
+            assert_eq!(
+                f.store.provisioning_principal_epoch(&f.issuer).unwrap(),
+                issuer_epoch
+            );
+        }
+        assert_eq!(f.mandate(1).issued_count, 0);
+    }
+
+    #[test]
+    fn invalid_request_ids_and_expiry_arithmetic_never_charge_a_mandate() {
+        let f = Fixture::new();
+        let parent = f.mandate(2);
+        for request in [
+            "".to_owned(),
+            Uuid::nil().to_string(),
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_uppercase(),
+            "a".repeat(32),
+            "not-a-uuid".into(),
+        ] {
+            assert!(f.issue(&parent, &request).is_err());
+            assert!(f.store.get_mandate(&f.binding, &request).is_err());
+            assert!(f.store.get_access_grant(&f.binding, &request).is_err());
+        }
+        for (now, expiry) in [
+            (-1, 1),
+            (f.now, f.now),
+            (f.now, f.now - 1),
+            (i64::MIN, i64::MAX),
+        ] {
+            assert!(
+                f.store
+                    .issue_access(
+                        &f.binding,
+                        &parent.id,
+                        &f.service,
+                        &f.delegation,
+                        &f.recipient,
+                        &Uuid::new_v4().to_string(),
+                        expiry,
+                        now,
+                        300,
+                        |_| true
+                    )
+                    .is_err()
+            );
+        }
+        assert_eq!(f.store.get_mandate(&f.binding, &parent.id).unwrap(), parent);
+        assert!(f.store.list_access_grants(&f.binding).unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_conditional_charge_or_grant_insert_rolls_back_and_same_request_can_commit_once() {
+        for suppress_charge in [false, true] {
+            let f = Fixture::new();
+            let parent = f.mandate(2);
+            let request = Uuid::new_v4().to_string();
+            let trigger = if suppress_charge {
+                "CREATE TRIGGER refuse_issue BEFORE UPDATE OF issued_count ON provisioning_mandates BEGIN SELECT RAISE(IGNORE); END;"
+            } else {
+                "CREATE TRIGGER refuse_issue BEFORE INSERT ON provisioning_access BEGIN SELECT RAISE(ABORT,'fixture grant insert failure'); END;"
+            };
+            f.store.lock().execute_batch(trigger).unwrap();
+            let error = f.issue(&parent, &request).unwrap_err();
+            assert_eq!(
+                error,
+                if suppress_charge {
+                    "provisioning issuance allowance exhausted"
+                } else {
+                    "provisioning store unavailable"
+                }
+            );
+            assert_eq!(f.store.get_mandate(&f.binding, &parent.id).unwrap(), parent);
+            assert!(f.store.list_access_grants(&f.binding).unwrap().is_empty());
+            f.store
+                .lock()
+                .execute_batch("DROP TRIGGER refuse_issue")
+                .unwrap();
+            let grant = f.issue(&parent, &request).unwrap();
+            assert_eq!(f.issue(&parent, &request).unwrap(), grant);
+            assert_eq!(
+                f.store
+                    .get_mandate(&f.binding, &parent.id)
+                    .unwrap()
+                    .issued_count,
+                1
+            );
+            assert_eq!(f.store.list_access_grants(&f.binding).unwrap(), vec![grant]);
+        }
+    }
+
+    #[test]
+    fn expired_parent_and_consumed_expired_request_cannot_issue_or_restore_access() {
+        for parent_expired in [false, true] {
+            let f = Fixture::new();
+            let parent = f.mandate(2);
+            let request = Uuid::new_v4().to_string();
+            let grant = f.issue(&parent, &request).unwrap();
+            if parent_expired {
+                f.store
+                    .lock()
+                    .execute(
+                        "UPDATE provisioning_mandates SET expires_at=?1 WHERE id=?2",
+                        params![f.now, parent.id],
+                    )
+                    .unwrap();
+            } else {
+                f.store
+                    .lock()
+                    .execute(
+                        "UPDATE provisioning_access SET expires_at=?1 WHERE id=?2",
+                        params![f.now, grant.id],
+                    )
+                    .unwrap();
+            }
+            let error = f.issue(&parent, &request).unwrap_err();
+            assert_eq!(
+                error,
+                if parent_expired {
+                    "provisioning mandate inactive"
+                } else {
+                    "previous issuance is no longer active; request ID remains consumed"
+                }
+            );
+            assert!(f.scopes().is_empty());
+            let revoked = f.store.get_access_grant(&f.binding, &grant.id).unwrap();
+            assert_eq!(revoked.revoked_at, Some(f.now));
+            f.store
+                .lock()
+                .execute(
+                    "UPDATE provisioning_mandates SET expires_at=?1 WHERE id=?2",
+                    params![parent.expires_at, parent.id],
+                )
+                .unwrap();
+            f.store
+                .lock()
+                .execute(
+                    "UPDATE provisioning_access SET expires_at=?1 WHERE id=?2",
+                    params![grant.expires_at, grant.id],
+                )
+                .unwrap();
+            assert!(f.scopes().is_empty());
+            assert!(f.issue(&parent, &request).is_err());
+            assert_eq!(
+                f.store
+                    .get_mandate(&f.binding, &parent.id)
+                    .unwrap()
+                    .issued_count,
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn corrupted_profile_identity_and_epoch_are_rejected_without_new_authority() {
+        // Explicit retained-store faults, not ordinarily reachable policy transitions.
+        for case in 0..4 {
+            let f = Fixture::new();
+            let parent = f.mandate(2);
+            let (original, epoch) = f.store.provisioning_profile("engineering-metrics").unwrap();
+            let mut altered = original.clone();
+            altered.id = "foreign-profile".into();
+            match case {
+                0 => {
+                    f.store
+                        .lock()
+                        .execute(
+                            "UPDATE provisioning_profiles SET profile_json=?1",
+                            [serde_json::to_string(&altered).unwrap()],
+                        )
+                        .unwrap();
+                }
+                1 => {
+                    let error = f
+                        .store
+                        .lock()
+                        .execute("UPDATE provisioning_profiles SET epoch=0", [])
+                        .unwrap_err();
+                    assert!(error.to_string().contains("CHECK constraint failed"));
+                }
+                2 => {
+                    f.store
+                        .lock()
+                        .execute(
+                            "UPDATE provisioning_profile_history SET profile_json=?1",
+                            [serde_json::to_string(&altered).unwrap()],
+                        )
+                        .unwrap();
+                }
+                _ => {
+                    f.store
+                        .lock()
+                        .execute(
+                            "UPDATE provisioning_mandates SET profile_epoch=profile_epoch+1",
+                            [],
+                        )
+                        .unwrap();
+                }
+            }
+            if case == 1 {
+                assert_eq!(
+                    f.store.provisioning_profile(&original.id).unwrap(),
+                    (original.clone(), epoch)
+                );
+            } else if case == 2 {
+                assert!(
+                    f.store
+                        .provisioning_profile_at(&original.id, epoch)
+                        .is_err()
+                );
+            } else {
+                assert!(f.issue(&parent, &Uuid::new_v4().to_string()).is_err());
+            }
+            assert_eq!(
+                f.store
+                    .get_mandate(&f.binding, &parent.id)
+                    .unwrap()
+                    .issued_count,
+                0
+            );
+            assert!(f.store.list_access_grants(&f.binding).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn grant_profile_mismatch_is_durably_revoked_without_replenishing_issuance() {
+        for epoch in [false, true] {
+            let f = Fixture::new();
+            let parent = f.mandate(2);
+            let request = Uuid::new_v4().to_string();
+            let grant = f.issue(&parent, &request).unwrap();
+            if epoch {
+                f.store
+                    .lock()
+                    .execute(
+                        "UPDATE provisioning_access SET profile_epoch=profile_epoch+1 WHERE id=?1",
+                        [&grant.id],
+                    )
+                    .unwrap();
+            } else {
+                f.store
+                    .lock()
+                    .execute(
+                        "UPDATE provisioning_access SET profile_id='foreign-profile' WHERE id=?1",
+                        [&grant.id],
+                    )
+                    .unwrap();
+            }
+            assert!(f.scopes().is_empty());
+            assert_eq!(
+                f.store
+                    .get_access_grant(&f.binding, &grant.id)
+                    .unwrap()
+                    .revoked_at,
+                Some(f.now)
+            );
+            f.store
+                .lock()
+                .execute(
+                    "UPDATE provisioning_access SET profile_epoch=?1,profile_id=?2 WHERE id=?3",
+                    params![grant.profile_epoch, grant.profile_id, grant.id],
+                )
+                .unwrap();
+            assert!(f.scopes().is_empty());
+            assert!(f.issue(&parent, &request).is_err());
+            assert_eq!(
+                f.store
+                    .get_mandate(&f.binding, &parent.id)
+                    .unwrap()
+                    .issued_count,
+                1
+            );
         }
     }
 }

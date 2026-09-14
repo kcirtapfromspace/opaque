@@ -347,6 +347,11 @@ mod hex {
         if !s.len().is_multiple_of(2) {
             return Err("odd-length hex string".into());
         }
+        // Slice only ASCII: a byte-even Unicode string may contain a code
+        // point spanning the two-byte boundary and must not panic a handler.
+        if !s.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("invalid hex string".into());
+        }
         (0..s.len())
             .step_by(2)
             .map(|i| {
@@ -1392,5 +1397,84 @@ mod tests {
         };
         let dbg = format!("{state:?}");
         assert!(dbg.contains("timeout"));
+    }
+
+    #[tokio::test]
+    async fn malformed_signature_text_and_foreign_device_preserve_pending_round() {
+        let rig = test_rig();
+        let (receiver, challenge) = submit(&rig, "req-text-guard").await;
+        let state = rig.server.state.clone();
+        let (server, addr) = rig.server.start().await.unwrap();
+        let client = test_client(&rig.identity);
+        let url = format!(
+            "https://127.0.0.1:{}/approvals/req-text-guard/respond",
+            addr.port()
+        );
+        for signature in ["0", "gg", "€€", "a€", "🛑", "１２"] {
+            let response = client.post(&url).header("Authorization",format!("Bearer {}",rig.device.token)).header("X-Opaque-Device",&rig.device.device_id)
+                .json(&serde_json::json!({"decision":"approve","device_id":rig.device.device_id,"signature":signature})).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{signature}");
+            assert!(state.pending.lock().await.contains_key("req-text-guard"));
+        }
+        let signed = hex_encode(
+            &rig.device
+                .signing_key
+                .sign(&decision_bytes(&challenge, true))
+                .to_bytes(),
+        );
+        let response = client.post(&url).header("Authorization",format!("Bearer {}",rig.device.token)).header("X-Opaque-Device",&rig.device.device_id)
+            .json(&serde_json::json!({"decision":"approve","device_id":"foreign-device","signature":signed})).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(state.pending.lock().await.contains_key("req-text-guard"));
+        let response = client.post(&url).header("Authorization",format!("Bearer {}",rig.device.token)).header("X-Opaque-Device",&rig.device.device_id)
+            .json(&serde_json::json!({"decision":"approve","device_id":rig.device.device_id,"signature":signed})).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(receiver.await.unwrap().approve);
+        assert!(!state.pending.lock().await.contains_key("req-text-guard"));
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn expired_round_is_gone_before_signature_verification_and_is_not_consumed() {
+        let rig = test_rig();
+        let (_receiver, _challenge) = submit(&rig, "expired").await;
+        rig.server
+            .state
+            .pending
+            .lock()
+            .await
+            .get_mut("expired")
+            .unwrap()
+            .created_at = Instant::now() - Duration::from_secs(61);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Bearer {}", rig.device.token).parse().unwrap(),
+        );
+        headers.insert("x-opaque-device", rig.device.device_id.parse().unwrap());
+        assert_eq!(
+            respond_handler(
+                State(rig.server.state.clone()),
+                headers,
+                AxumPath("expired".into()),
+                Json(RespondBody {
+                    device_id: rig.device.device_id,
+                    decision: ApprovalDecision::Approve,
+                    signature: "00".repeat(64)
+                })
+            )
+            .await
+            .unwrap_err(),
+            StatusCode::GONE
+        );
+        assert!(
+            rig.server
+                .state
+                .pending
+                .lock()
+                .await
+                .contains_key("expired")
+        );
     }
 }

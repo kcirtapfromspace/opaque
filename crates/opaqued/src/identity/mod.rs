@@ -20,6 +20,14 @@ pub mod persona;
 pub mod provisioning;
 pub mod store;
 
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod runtime_contract_tests;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod service_startup_contract_tests;
+
 use std::path::Path;
 use std::sync::Arc;
 
@@ -306,7 +314,8 @@ impl IdentityRuntime {
             .map_err(|e| format!("failed to load identity signing key: {e}"))?;
 
         // Upsert service principals from config. Invalid entries are skipped
-        // with a warning — a config typo must not take the daemon down.
+        // with a warning — a config typo must not take the daemon down. Any
+        // persistence failure must abort startup rather than publish stale roles.
         for sp in &config.service_principals {
             let roles = match roles_from_string(&sp.roles.join(",")) {
                 Ok(r) => r,
@@ -318,14 +327,19 @@ impl IdentityRuntime {
                     continue;
                 }
             };
-            match store.upsert_service(&sp.name) {
-                Ok(principal) => {
-                    if let Err(e) = store.set_roles(&principal.id, &roles) {
-                        warn!("failed to set roles for service '{}': {e}", sp.name);
-                    }
-                }
-                Err(e) => warn!("skipping service principal '{}': {e}", sp.name),
+            let kind = opaque_core::identity::PrincipalKind::Service {
+                name: sp.name.clone(),
+            };
+            if let Err(e) = kind.validate() {
+                warn!("skipping service principal '{}': {e}", sp.name);
+                continue;
             }
+            let principal = store
+                .upsert_service(&sp.name)
+                .map_err(|e| format!("failed to persist service principal '{}': {e}", sp.name))?;
+            store
+                .set_roles(&principal.id, &roles)
+                .map_err(|e| format!("failed to persist roles for service '{}': {e}", sp.name))?;
         }
 
         let http = reqwest::Client::builder()

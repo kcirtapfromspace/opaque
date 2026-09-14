@@ -352,4 +352,118 @@ mod tests {
             Err(TenantBoundaryError::UnboundExistingState)
         ));
     }
+
+    #[test]
+    fn unsafe_custody_paths_never_create_a_binding_or_lock() {
+        assert!(matches!(
+            TenantBoundary::open(&config("tenant-a"), Path::new("."), true),
+            Err(TenantBoundaryError::UnsafeState)
+        ));
+        for kind in ["file", "symlink", "readable", "setgid"] {
+            let parent = private_dir();
+            let path = parent.path().join("custody");
+            match kind {
+                "file" => std::fs::write(&path, b"not a directory").unwrap(),
+                "symlink" => std::os::unix::fs::symlink(parent.path(), &path).unwrap(),
+                _ => {
+                    std::fs::create_dir(&path).unwrap();
+                    let mode = if kind == "readable" { 0o750 } else { 0o2700 };
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+                }
+            }
+            assert!(
+                matches!(
+                    TenantBoundary::open(&config("tenant-a"), &path, true),
+                    Err(TenantBoundaryError::UnsafeState)
+                ),
+                "{kind}"
+            );
+            assert!(!parent.path().join(BINDING_FILE).exists());
+            assert!(!parent.path().join(LOCK_FILE).exists());
+            assert!(!path.join(BINDING_FILE).exists());
+            assert!(!path.join(LOCK_FILE).exists());
+        }
+    }
+
+    #[test]
+    fn ambiguous_bootstrap_entries_cannot_be_adopted_as_fresh_custody() {
+        use std::os::unix::ffi::OsStringExt;
+        for kind in [
+            "approval-file",
+            "config-directory",
+            "symlink",
+            // Linux permits byte filenames that macOS APFS rejects at create.
+            #[cfg(target_os = "linux")]
+            "non-utf8",
+        ] {
+            let directory = private_dir();
+            match kind {
+                "approval-file" => {
+                    std::fs::write(directory.path().join("approval"), b"state").unwrap()
+                }
+                "config-directory" => {
+                    std::fs::create_dir(directory.path().join("config.toml")).unwrap()
+                }
+                "symlink" => {
+                    std::os::unix::fs::symlink("missing", directory.path().join("config.toml"))
+                        .unwrap()
+                }
+                _ => std::fs::write(
+                    directory
+                        .path()
+                        .join(std::ffi::OsString::from_vec(vec![0xff])),
+                    b"state",
+                )
+                .unwrap(),
+            }
+            assert!(
+                matches!(
+                    TenantBoundary::open(&config("tenant-a"), directory.path(), true),
+                    Err(TenantBoundaryError::UnboundExistingState)
+                ),
+                "{kind}"
+            );
+            assert!(!directory.path().join(BINDING_FILE).exists());
+            // Failed initialization retains its witness: deleting the original
+            // entry cannot turn a later startup into a fresh tenant lineage.
+            for entry in std::fs::read_dir(directory.path()).unwrap() {
+                let path = entry.unwrap().path();
+                if path.file_name().unwrap() != LOCK_FILE {
+                    if path.symlink_metadata().unwrap().is_dir() {
+                        std::fs::remove_dir(path).unwrap();
+                    } else {
+                        std::fs::remove_file(path).unwrap();
+                    }
+                }
+            }
+            assert!(matches!(
+                TenantBoundary::open(&config("tenant-a"), directory.path(), true),
+                Err(TenantBoundaryError::UnboundExistingState)
+            ));
+        }
+    }
+
+    #[test]
+    fn oversized_or_non_file_marker_is_rejected_without_rebinding() {
+        for directory_marker in [false, true] {
+            let directory = private_dir();
+            drop(TenantBoundary::open(&config("tenant-a"), directory.path(), true).unwrap());
+            let marker = directory.path().join(BINDING_FILE);
+            std::fs::remove_file(&marker).unwrap();
+            if directory_marker {
+                std::fs::create_dir(&marker).unwrap();
+            } else {
+                std::fs::write(&marker, vec![b' '; 4097]).unwrap();
+                std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            assert!(matches!(
+                TenantBoundary::open(&config("tenant-a"), directory.path(), true),
+                Err(TenantBoundaryError::Corrupt)
+            ));
+            assert_eq!(marker.is_dir(), directory_marker);
+            if !directory_marker {
+                assert_eq!(std::fs::read(marker).unwrap(), vec![b' '; 4097]);
+            }
+        }
+    }
 }

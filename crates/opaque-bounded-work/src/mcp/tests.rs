@@ -709,3 +709,407 @@ async fn post_effect_authority_or_registry_change_erases_typed_values_but_keeps_
         assert_eq!(state.effects.load(Ordering::SeqCst), 1);
     }
 }
+
+#[test]
+fn corrupt_receipt_fields_block_reads_dispatch_and_restart_recovery() {
+    let fixture = Fixture::new(None);
+    let gateway = fixture.gateway();
+    let action = fixture.action(&gateway);
+    gateway.ledger.claim("alice", &action).unwrap();
+    let connection = rusqlite::Connection::open(fixture.dir.path().join("ledger.db")).unwrap();
+    let original: String = connection
+        .query_row(
+            "SELECT record FROM mcp_invocations WHERE id=?1",
+            [&action.invocation_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let record: Value = serde_json::from_str(&original).unwrap();
+    let mut mutations = vec![];
+    for (field, value) in [
+        ("invocation_id", json!(uuid::Uuid::new_v4().to_string())),
+        ("action_digest", json!("f".repeat(64))),
+        ("expires_at", json!(action.expires_at + 1)),
+        ("request_context_digest", json!("f".repeat(64))),
+        ("registry_digest", json!("f".repeat(64))),
+        ("route", json!("other")),
+        ("tool", json!("other")),
+        ("schema_digest", json!("f".repeat(64))),
+        ("upstream_schema_digest", json!("f".repeat(64))),
+        ("output_projection_digest", json!("f".repeat(64))),
+        ("credential_ref", json!("file:/different")),
+        ("output_policy", json!("typed_fields")),
+        ("dispatch_status", json!("attempted")),
+        ("projection_validated", json!(true)),
+        ("fixture_only", json!(true)),
+        ("attempt_charged", json!(true)),
+        ("state", json!("fabricated")),
+        ("response_sha256", json!("short")),
+        ("response_sha256", json!("g".repeat(64))),
+        ("response_bytes", json!(4097)),
+        ("response_bytes", json!(1)),
+        ("response_sha256", json!("a".repeat(64))),
+    ] {
+        let mut changed = record.clone();
+        changed["receipt"][field] = value;
+        mutations.push((field, changed));
+    }
+    for owner in ["".to_string(), "a".repeat(513)] {
+        let mut changed = record.clone();
+        changed["owner"] = json!(owner);
+        mutations.push(("owner", changed));
+    }
+    let mut changed = record.clone();
+    changed["action"]["invocation_id"] = json!(uuid::Uuid::new_v4().to_string());
+    mutations.push(("action invocation", changed));
+    for (name, changed) in mutations {
+        connection
+            .execute(
+                "UPDATE mcp_invocations SET record=?1 WHERE id=?2",
+                rusqlite::params![changed.to_string(), action.invocation_id],
+            )
+            .unwrap();
+        assert!(
+            gateway.ledger.get("alice", &action.invocation_id).is_err(),
+            "read accepted {name}"
+        );
+        assert!(
+            gateway.ledger.authorize_dispatch("alice", &action).is_err(),
+            "dispatch accepted {name}"
+        );
+        connection
+            .execute(
+                "UPDATE mcp_invocations SET record=?1 WHERE id=?2",
+                rusqlite::params![original, action.invocation_id],
+            )
+            .unwrap();
+        assert_eq!(
+            gateway
+                .ledger
+                .get("alice", &action.invocation_id)
+                .unwrap()
+                .state,
+            "reviewing"
+        );
+    }
+    connection
+        .execute(
+            "UPDATE mcp_invocations SET record=?1",
+            [" ".repeat(256 * 1024 + 1)],
+        )
+        .unwrap();
+    assert!(gateway.ledger.get("alice", &action.invocation_id).is_err());
+    drop(gateway);
+    drop(connection);
+    assert!(store::Ledger::open(&fixture.dir.path().join("ledger.db")).is_err());
+}
+
+#[test]
+fn ledger_rejects_out_of_order_transitions_without_refunding_reserved_attempts() {
+    let fixture = Fixture::new(None);
+    let gateway = fixture.gateway();
+    let action = fixture.action(&gateway);
+    for owner in ["".to_owned(), "x".repeat(513)] {
+        assert!(gateway.ledger.claim(&owner, &action).is_err());
+    }
+    gateway.ledger.claim("alice", &action).unwrap();
+    assert!(gateway.ledger.authorize_dispatch("alice", &action).is_err());
+    assert!(
+        gateway
+            .ledger
+            .authorize_disclosure("alice", &action)
+            .is_err()
+    );
+    assert!(gateway.ledger.authorize_result("alice", &action).is_err());
+    assert!(
+        gateway
+            .ledger
+            .finish("alice", &action, &transport::Outcome::rejected("denied"))
+            .is_err()
+    );
+    let mut changed = action.clone();
+    changed.expires_at -= 1;
+    assert!(gateway.ledger.reserve("alice", &changed).is_err());
+    gateway.ledger.reserve("alice", &action).unwrap();
+    assert!(
+        gateway
+            .ledger
+            .finish("alice", &changed, &transport::Outcome::rejected("denied"))
+            .is_err()
+    );
+    drop(gateway.ledger.guard("alice", &action.invocation_id));
+    let receipt = gateway.ledger.get("alice", &action.invocation_id).unwrap();
+    assert_eq!(receipt.state, "unknown");
+    assert!(receipt.attempt_charged);
+    gateway.ledger.authorize_result("alice", &action).unwrap();
+    assert!(gateway.ledger.reserve("alice", &action).is_err());
+    let next = fixture.action(&gateway);
+    gateway.ledger.claim("alice", &next).unwrap();
+    drop(gateway.ledger.guard("alice", &next.invocation_id));
+    assert_eq!(
+        gateway
+            .ledger
+            .get("alice", &next.invocation_id)
+            .unwrap()
+            .state,
+        "cancelled"
+    );
+    drop(gateway.ledger.guard("alice", "missing"));
+}
+
+#[test]
+fn gateway_configuration_and_private_files_fail_closed_before_ledger_creation() {
+    use std::os::unix::ffi::OsStringExt;
+    let fixture = Fixture::new(None);
+    for mode in 0..5 {
+        let mut config = fixture.config.clone();
+        match mode {
+            0 => config.bundle_path = "relative.bundle".into(),
+            1 => config.credentials.clear(),
+            2 => {
+                config.credentials = (0..129)
+                    .map(|i| (format!("c{i}"), fixture.dir.path().join("credential")))
+                    .collect()
+            }
+            3 => {
+                config.credentials.insert("notes".into(), "relative".into());
+            }
+            _ => {
+                config.credentials.insert(
+                    "notes".into(),
+                    std::path::PathBuf::from(std::ffi::OsString::from_vec(
+                        b"/tmp/invalid-\xff".to_vec(),
+                    )),
+                );
+            }
+        }
+        let ledger = fixture.dir.path().join(format!("invalid-{mode}.db"));
+        assert!(Gateway::new(config, &ledger, None, true).is_err());
+        assert!(!ledger.exists());
+    }
+    let credential = fixture.dir.path().join("credential");
+    let alias = fixture.dir.path().join("alias");
+    std::fs::hard_link(&credential, &alias).unwrap();
+    assert!(private_read(&credential, 1024, true).is_err());
+    std::fs::remove_file(alias).unwrap();
+    assert!(private_read(&credential, 1, true).is_err());
+    std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(private_read(&credential, 1024, true).is_err());
+    let gateway = fixture.gateway();
+    for expiry in [0, 301] {
+        assert!(
+            gateway
+                .prepare(CallInput {
+                    invocation_id: uuid::Uuid::new_v4().to_string(),
+                    route: "post_note".into(),
+                    arguments: serde_json::from_value(json!({"message":"ok"})).unwrap(),
+                    expires_in_secs: expiry
+                })
+                .is_err()
+        );
+    }
+    assert!(
+        gateway
+            .prepare(CallInput {
+                invocation_id: "not-a-uuid".into(),
+                route: "post_note".into(),
+                arguments: serde_json::from_value(json!({"message":"ok"})).unwrap(),
+                expires_in_secs: 1
+            })
+            .is_err()
+    );
+}
+
+#[test]
+fn every_registry_and_credential_binding_is_rechecked_before_dispatch() {
+    let fixture = Fixture::new(None);
+    let gateway = fixture.gateway();
+    let action = fixture.action(&gateway);
+    for mode in 0..8 {
+        let mut changed = action.clone();
+        match mode {
+            0 => changed.registry_org = "foreign".into(),
+            1 => changed.registry_version += 1,
+            2 => changed.registry_expires_at += 1,
+            3 => changed.expires_at = changed.registry_expires_at + 1,
+            4 => {
+                changed.tenant = Some(
+                    opaque_core::tenant::TenantBinding::new(
+                        opaque_core::tenant::TenantId::parse("other").unwrap(),
+                        uuid::Uuid::new_v4(),
+                    )
+                    .unwrap(),
+                )
+            }
+            5 => changed.fixture_origin = Some("http://127.0.0.1:1234".into()),
+            6 => changed.credential_ref = "file:/different".into(),
+            _ => {
+                let mut route = route();
+                route.max_response_bytes += 1;
+                let registry = Registry::from_document(&RegistryDocument {
+                    version: 1,
+                    routes: vec![route],
+                })
+                .unwrap();
+                changed.call = registry
+                    .prepare_json(
+                        br#"{"route":"post_note","arguments":{"message":"approved note"}}"#,
+                    )
+                    .unwrap();
+            }
+        }
+        assert!(
+            gateway.revalidate(&changed).is_err(),
+            "accepted mutation {mode}"
+        );
+    }
+    gateway.revalidate(&action).unwrap();
+}
+
+#[tokio::test]
+async fn loopback_mcp_contract_drift_distinguishes_pre_dispatch_rejection_from_uncertain_effect() {
+    for mode in 0..10 {
+        let server = MockServer::start().await;
+        let effects = Arc::new(AtomicUsize::new(0));
+        let observed = effects.clone();
+        Mock::given(wiremock::matchers::method("POST")).respond_with(move |request: &Request| {
+            let request: Value=serde_json::from_slice(&request.body).unwrap();
+            let method=request["method"].as_str().unwrap();
+            if method=="notifications/initialized" {return ResponseTemplate::new(202);}
+            let mut result=match method {
+                "initialize"=>json!({"protocolVersion":PROTOCOL_VERSION,"capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}}),
+                "tools/list"=>json!({"tools":[{"name":"post_note","inputSchema":schema()}]}),
+                "tools/call"=>{observed.fetch_add(1,Ordering::SeqCst);json!({"content":[],"isError":false})},
+                _=>panic!("unexpected request"),
+            };
+            match (mode,method) {
+                (0,"initialize")=>result["protocolVersion"]=json!("old"),
+                (1,"initialize")=>result["capabilities"]["tools"]=json!(false),
+                (2,"initialize")=>result["serverInfo"]=json!(null),
+                (3,"tools/list")=>result["nextCursor"]=json!("next"),
+                (4,"tools/list")=>result["tools"]=json!((0..129).map(|_|json!({"name":"other"})).collect::<Vec<_>>()),
+                (5,"tools/list")=>result["tools"]=json!([]),
+                (6,"tools/list")=>{let duplicate=result["tools"][0].clone();result["tools"].as_array_mut().unwrap().push(duplicate);},
+                (7,"tools/call")=>result=json!([]),
+                (8,"tools/call")=>result["content"]=json!(null),
+                (9,"tools/call")=>result["isError"]=json!("false"),
+                _=>{},
+            }
+            ResponseTemplate::new(200).set_body_json(json!({"jsonrpc":"2.0","id":request["id"],"result":result}))
+        }).mount(&server).await;
+        let fixture = Fixture::new(Some(server.uri()));
+        let gateway = fixture.gateway();
+        let action = fixture.action(&gateway);
+        gateway.ledger.claim("alice", &action).unwrap();
+        let result = gateway
+            .execute("alice", &action, || async { Ok(()) }, |commit| commit())
+            .await
+            .unwrap();
+        let receipt = gateway.ledger.get("alice", &action.invocation_id).unwrap();
+        assert_eq!(receipt.state, if mode < 7 { "rejected" } else { "unknown" });
+        assert!(receipt.attempt_charged);
+        assert_eq!(effects.load(Ordering::SeqCst), usize::from(mode >= 7));
+        assert!(result.output.is_none());
+        assert!(gateway.ledger.reserve("alice", &action).is_err());
+    }
+}
+
+#[test]
+fn projected_receipt_corruption_cannot_create_disclosure_authority_or_value_commitments() {
+    let fixture = Fixture::new(None);
+    let mut selected = route();
+    selected.upstream_input_schema = Some(schema());
+    selected.output_policy = OutputPolicy::TypedFields;
+    selected.output_projection=Some(serde_json::from_value(json!({"fields":[{"source":"id","name":"resource_id","value_type":{"kind":"integer_id","maximum":1000}}]})).unwrap());
+    fixture.write(1, selected, now() + 600);
+    let gateway = fixture.gateway();
+    let action = fixture.action(&gateway);
+    gateway.ledger.claim("alice", &action).unwrap();
+    let db = rusqlite::Connection::open(fixture.dir.path().join("ledger.db")).unwrap();
+    let original: String = db
+        .query_row(
+            "SELECT record FROM mcp_invocations WHERE id=?1",
+            [&action.invocation_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let record: Value = serde_json::from_str(&original).unwrap();
+    for (field, value) in [
+        ("dispatch_status", json!("fabricated")),
+        ("projection_validated", json!(true)),
+        ("response_sha256", json!("a".repeat(64))),
+        ("response_bytes", json!(1)),
+    ] {
+        let mut changed = record.clone();
+        changed["receipt"][field] = value;
+        db.execute(
+            "UPDATE mcp_invocations SET record=?1 WHERE id=?2",
+            rusqlite::params![changed.to_string(), action.invocation_id],
+        )
+        .unwrap();
+        assert!(
+            gateway.ledger.get("alice", &action.invocation_id).is_err(),
+            "accepted {field}"
+        );
+        assert!(
+            gateway
+                .ledger
+                .authorize_disclosure("alice", &action)
+                .is_err()
+        );
+    }
+    db.execute(
+        "UPDATE mcp_invocations SET record=?1 WHERE id=?2",
+        rusqlite::params![original, action.invocation_id],
+    )
+    .unwrap();
+    gateway.ledger.reserve("alice", &action).unwrap();
+    let outcome = transport::Outcome {
+        state: "accepted",
+        code: "tool_result_observed",
+        response_sha256: Some("a".repeat(64)),
+        response_bytes: Some(10),
+        output: None,
+        disclosure: Some("withheld_invalid_projection"),
+        dispatched: true,
+    };
+    let receipt = gateway.ledger.finish("alice", &action, &outcome).unwrap();
+    assert_eq!(receipt.projection_validated, Some(false));
+    assert!(receipt.response_sha256.is_none() && receipt.response_bytes.is_none());
+    assert!(
+        gateway
+            .ledger
+            .authorize_disclosure("alice", &action)
+            .is_err()
+    );
+    gateway.ledger.authorize_result("alice", &action).unwrap();
+}
+
+#[test]
+fn invocation_ledger_refuses_shared_database_or_writer_lock_inodes() {
+    for lock in [false, true] {
+        for shared in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("ledger.db");
+            let file = if lock {
+                dir.path().join("ledger.db.writer.lock")
+            } else {
+                db.clone()
+            };
+            std::fs::write(&file, []).unwrap();
+            std::fs::set_permissions(
+                &file,
+                std::fs::Permissions::from_mode(if shared { 0o600 } else { 0o644 }),
+            )
+            .unwrap();
+            if shared {
+                std::fs::hard_link(&file, dir.path().join("alias")).unwrap();
+            }
+            assert!(
+                store::Ledger::open(&db).is_err(),
+                "accepted lock={lock}, hardlink={shared}"
+            );
+            assert_eq!(std::fs::read(&file).unwrap(), b"");
+        }
+    }
+}

@@ -46,13 +46,7 @@ pub async fn prompt(reason: &str) -> Result<PromptOutcome, ApprovalError> {
 
     #[cfg(target_os = "macos")]
     {
-        return prompt_macos(reason).await.map(|approved| {
-            if approved {
-                PromptOutcome::Approved { account: None }
-            } else {
-                PromptOutcome::Denied
-            }
-        });
+        return prompt_macos(reason).await.map(device_owner_outcome);
     }
 
     #[cfg(target_os = "linux")]
@@ -235,44 +229,77 @@ async fn prompt_task_inner(
     let (review, digest) = task_review_text(reason)?;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        let deadline = remaining(expires_at, 90)?;
+        remaining(expires_at, 90)?;
         let helper = find_approve_helper()?;
-        if !run_task_review(&helper, &review, deadline).await? {
-            return Ok(PromptOutcome::Denied);
-        }
-        let short_reason = format!(
-            "Authorize the task just reviewed in Opaque. Review fingerprint: {}",
-            &digest[..16]
-        );
-        println!("opaque-review-stage: authenticating");
-        let timeout = remaining(expires_at, 60)?;
-        #[cfg(target_os = "macos")]
-        let outcome =
-            tokio::task::spawn_blocking(move || prompt_macos_blocking_for(&short_reason, timeout))
-                .await
-                .map_err(|_| ApprovalError::Unavailable)?
-                .map(|approved| {
-                    if approved {
-                        PromptOutcome::Approved { account: None }
+        review_then_authenticate(
+            &helper,
+            &review,
+            &digest,
+            expires_at,
+            |short_reason, timeout| async move {
+                #[cfg(target_os = "macos")]
+                {
+                    tokio::task::spawn_blocking(move || {
+                        prompt_macos_blocking_for(&short_reason, timeout)
+                    })
+                    .await
+                    .map_err(|_| ApprovalError::Unavailable)?
+                    .map(device_owner_outcome)
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    if expires_at.is_some() {
+                        prompt_linux_bounded(&short_reason, timeout).await
                     } else {
-                        PromptOutcome::Denied
+                        prompt(&short_reason).await
                     }
-                });
-        #[cfg(target_os = "linux")]
-        let outcome = if expires_at.is_some() {
-            prompt_linux_bounded(&short_reason, timeout).await
-        } else {
-            prompt(&short_reason).await
-        };
-        if outcome.is_err() {
-            eprintln!("opaque-review-stage: authentication-failed");
-        }
-        outcome
+                }
+            },
+        )
+        .await
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = (review, digest);
         Err(ApprovalError::Unsupported)
+    }
+}
+
+/// The review result and the configured native factor remain separate decisions.
+/// The closure is a private platform boundary, never a runtime bypass.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn review_then_authenticate<F, Fut>(
+    helper: &std::path::Path,
+    review: &str,
+    digest: &str,
+    expires_at: Option<i64>,
+    authenticate: F,
+) -> Result<PromptOutcome, ApprovalError>
+where
+    F: FnOnce(String, std::time::Duration) -> Fut,
+    Fut: std::future::Future<Output = Result<PromptOutcome, ApprovalError>>,
+{
+    if !run_task_review(helper, review, remaining(expires_at, 90)?).await? {
+        return Ok(PromptOutcome::Denied);
+    }
+    let short_reason = format!(
+        "Authorize the task just reviewed in Opaque. Review fingerprint: {}",
+        &digest[..16]
+    );
+    println!("opaque-review-stage: authenticating");
+    let outcome = authenticate(short_reason, remaining(expires_at, 60)?).await;
+    if outcome.is_err() {
+        eprintln!("opaque-review-stage: authentication-failed");
+    }
+    outcome
+}
+
+#[cfg(target_os = "macos")]
+fn device_owner_outcome(approved: bool) -> PromptOutcome {
+    if approved {
+        PromptOutcome::Approved { account: None }
+    } else {
+        PromptOutcome::Denied
     }
 }
 
@@ -321,10 +348,7 @@ fn prompt_macos_blocking_for(
     // The reply block can be invoked on an arbitrary private queue.
     let tx2 = tx.clone();
     let reply = RcBlock::new(move |success: Bool, _error: *mut NSError| {
-        let ok = success.as_bool();
-        if let Some(tx) = tx2.lock().ok().and_then(|mut g| g.take()) {
-            let _ = tx.send(ok);
-        }
+        deliver_authentication_result(&tx2, success.as_bool());
     });
 
     unsafe {
@@ -338,14 +362,31 @@ fn prompt_macos_blocking_for(
     // US-009: Reduced from 120s to 60s. The approval semaphore in the enclave
     // is released via future cancellation if the client disconnects, so a
     // shorter timeout here limits how long an orphaned prompt can block.
-    match rx.recv_timeout(timeout) {
-        Ok(ok) => Ok(ok),
-        Err(e) => {
-            unsafe {
-                ctx.invalidate();
-            }
+    receive_authentication_result(rx, timeout, || unsafe { ctx.invalidate() })
+}
+
+#[cfg(target_os = "macos")]
+fn deliver_authentication_result(
+    sender: &std::sync::Mutex<Option<std::sync::mpsc::Sender<bool>>>,
+    approved: bool,
+) {
+    if let Some(tx) = sender.lock().ok().and_then(|mut guard| guard.take()) {
+        let _ = tx.send(approved);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn receive_authentication_result(
+    receiver: std::sync::mpsc::Receiver<bool>,
+    timeout: std::time::Duration,
+    invalidate: impl FnOnce(),
+) -> Result<bool, ApprovalError> {
+    match receiver.recv_timeout(timeout) {
+        Ok(approved) => Ok(approved),
+        Err(error) => {
+            invalidate();
             Err(ApprovalError::Failed(format!(
-                "approval timed out or failed: {e}"
+                "approval timed out or failed: {error}"
             )))
         }
     }
@@ -356,8 +397,17 @@ async fn prompt_linux_bounded(
     reason: &str,
     timeout: std::time::Duration,
 ) -> Result<PromptOutcome, ApprovalError> {
-    use tokio::io::AsyncReadExt;
     let helper = find_approve_helper()?;
+    launch_bounded_helper(&helper, reason, timeout).await
+}
+
+#[cfg(target_os = "linux")]
+async fn launch_bounded_helper(
+    helper: &std::path::Path,
+    reason: &str,
+    timeout: std::time::Duration,
+) -> Result<PromptOutcome, ApprovalError> {
+    use tokio::io::AsyncReadExt;
     let mut child = tokio::process::Command::new(helper)
         .args(["--reason", reason])
         .stdin(std::process::Stdio::null())
@@ -426,6 +476,11 @@ fn launch_approve_helper(reason: &str) -> Result<PromptOutcome, ApprovalError> {
         .output()
         .map_err(|e| ApprovalError::Failed(format!("failed to launch approval helper: {e}")))?;
 
+    helper_outcome(output)
+}
+
+#[cfg(target_os = "linux")]
+fn helper_outcome(output: std::process::Output) -> Result<PromptOutcome, ApprovalError> {
     match output.status.code() {
         Some(0) => Ok(PromptOutcome::Approved {
             account: parse_helper_account(&output.stdout),
@@ -467,8 +522,21 @@ fn parse_helper_account(stdout: &[u8]) -> Option<UnixAccount> {
 /// 2. Well-known system paths
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn find_approve_helper() -> Result<std::path::PathBuf, ApprovalError> {
-    // Next to the daemon binary (works during development and standard installs).
-    if let Ok(exe) = std::env::current_exe()
+    find_helper_in(
+        std::env::current_exe().ok().as_deref(),
+        &[
+            std::path::Path::new("/usr/local/bin/opaque-approve-helper"),
+            std::path::Path::new("/usr/bin/opaque-approve-helper"),
+        ],
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn find_helper_in(
+    executable: Option<&std::path::Path>,
+    installed: &[&std::path::Path],
+) -> Result<std::path::PathBuf, ApprovalError> {
+    if let Some(exe) = executable
         && let Some(dir) = exe.parent()
     {
         let helper = dir.join("opaque-approve-helper");
@@ -476,18 +544,11 @@ fn find_approve_helper() -> Result<std::path::PathBuf, ApprovalError> {
             return Ok(helper);
         }
     }
-
-    // Well-known install paths.
-    for path in &[
-        "/usr/local/bin/opaque-approve-helper",
-        "/usr/bin/opaque-approve-helper",
-    ] {
-        let p = std::path::PathBuf::from(path);
-        if p.is_file() {
-            return Ok(p);
+    for path in installed {
+        if path.is_file() {
+            return Ok(path.to_path_buf());
         }
     }
-
     Err(ApprovalError::Unavailable)
 }
 
@@ -499,6 +560,89 @@ fn find_approve_helper() -> Result<std::path::PathBuf, ApprovalError> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bounded_authentication_uses_real_helper_status_and_reaps_expired_process() {
+        for scenario in [
+            "approved",
+            "anonymous",
+            "denied",
+            "unavailable",
+            "signal",
+            "timeout",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let helper = directory.path().join(format!("authentication-{scenario}"));
+            std::os::unix::fs::symlink(
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/authentication-helper.sh"
+                ),
+                &helper,
+            )
+            .unwrap();
+            let reason = "Authorize exact fixture fingerprint 0123456789abcdef";
+            let result =
+                launch_bounded_helper(&helper, reason, std::time::Duration::from_secs(2)).await;
+            assert_eq!(
+                std::fs::read_to_string(helper.with_extension("reason")).unwrap(),
+                reason
+            );
+            match scenario {
+                "approved" => assert_eq!(
+                    result.unwrap(),
+                    PromptOutcome::Approved {
+                        account: Some(UnixAccount {
+                            uid: 1234,
+                            username: "fixture-account".into()
+                        })
+                    }
+                ),
+                "anonymous" => {
+                    assert_eq!(result.unwrap(), PromptOutcome::Approved { account: None })
+                }
+                "denied" => assert_eq!(result.unwrap(), PromptOutcome::Denied),
+                _ => assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "approval failed: authentication expired or unavailable; no decision sent"
+                ),
+            }
+            let pid: i32 = std::fs::read_to_string(helper.with_extension("pid"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert_eq!(
+                unsafe { libc::kill(pid, 0) },
+                -1,
+                "{scenario} helper must be reaped"
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bounded_authentication_spawn_failures_never_report_a_decision() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let helper = directory.path().join("missing-or-not-executable");
+        for present in [false, true] {
+            if present {
+                std::fs::write(&helper, "private non-executable file").unwrap();
+                std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            assert!(matches!(
+                launch_bounded_helper(&helper, "fixture reason", std::time::Duration::from_secs(2))
+                    .await,
+                Err(ApprovalError::Unavailable)
+            ));
+        }
+    }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[tokio::test]
@@ -740,23 +884,37 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn helper_exit_code_mapping() {
-        // Test exit code interpretation without launching a real helper.
-        // We simulate by testing the match logic.
-        fn map_exit(code: Option<i32>) -> Result<bool, &'static str> {
-            match code {
-                Some(0) => Ok(true),
-                Some(1) => Ok(false),
-                Some(2) => Err("unavailable"),
-                Some(_) => Err("unexpected"),
-                None => Err("signal"),
+        for (script, expected) in [
+            (
+                "printf '%s' '{\"account\":{\"uid\":7,\"username\":\"fixture\"}}'; exit 0",
+                0,
+            ),
+            ("exit 1", 1),
+            ("exit 2", 2),
+            ("exit 42", 42),
+            ("kill -TERM $$", -1),
+        ] {
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", script])
+                .output()
+                .unwrap();
+            let result = helper_outcome(output);
+            match expected {
+                0 => assert_eq!(
+                    result.unwrap(),
+                    PromptOutcome::Approved {
+                        account: Some(UnixAccount {
+                            uid: 7,
+                            username: "fixture".into()
+                        })
+                    }
+                ),
+                1 => assert_eq!(result.unwrap(), PromptOutcome::Denied),
+                2 => assert!(matches!(result, Err(ApprovalError::Unavailable))),
+                42 => assert!(result.unwrap_err().to_string().contains("code 42")),
+                _ => assert!(result.unwrap_err().to_string().contains("killed by signal")),
             }
         }
-
-        assert_eq!(map_exit(Some(0)), Ok(true));
-        assert_eq!(map_exit(Some(1)), Ok(false));
-        assert!(map_exit(Some(2)).is_err());
-        assert!(map_exit(Some(42)).is_err());
-        assert!(map_exit(None).is_err());
     }
 
     #[test]
@@ -803,6 +961,158 @@ mod tests {
             Ok(path) => assert!(path.exists()),
             Err(ApprovalError::Unavailable) => {} // Expected in CI
             Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+
+    #[test]
+    fn helper_discovery_requires_regular_files_and_preserves_install_precedence() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("daemon");
+        let sibling = directory.path().join("opaque-approve-helper");
+        let system = directory.path().join("installed-helper");
+        assert!(matches!(
+            find_helper_in(None, &[]),
+            Err(ApprovalError::Unavailable)
+        ));
+        assert!(matches!(
+            find_helper_in(Some(std::path::Path::new("/")), &[]),
+            Err(ApprovalError::Unavailable)
+        ));
+        std::fs::create_dir(&sibling).unwrap();
+        assert!(matches!(
+            find_helper_in(Some(&executable), &[&system]),
+            Err(ApprovalError::Unavailable)
+        ));
+        std::fs::write(&system, "installed").unwrap();
+        assert_eq!(
+            find_helper_in(Some(&executable), &[&system]).unwrap(),
+            system
+        );
+        std::fs::remove_dir(&sibling).unwrap();
+        std::fs::write(&sibling, "sibling").unwrap();
+        assert_eq!(
+            find_helper_in(Some(&executable), &[&system]).unwrap(),
+            sibling
+        );
+    }
+
+    #[tokio::test]
+    async fn review_and_native_factor_are_independent_and_bind_the_same_digest() {
+        // The helper is a real process; authentication outcomes below are
+        // injected at the private OS boundary, not physical presence proofs.
+        let (text, digest) = task_review_text("Exact target and allowance=1").unwrap();
+        let (_directory, deny) = review_test_helper("deny");
+        assert_eq!(
+            review_then_authenticate(&deny, &text, &digest, None, |_, _| async {
+                panic!("a denied review must never authenticate")
+            })
+            .await
+            .unwrap(),
+            PromptOutcome::Denied
+        );
+        for choice in 0..3 {
+            let (_directory, approve) = review_test_helper("approve");
+            let calls = std::cell::Cell::new(0);
+            let outcome =
+                review_then_authenticate(&approve, &text, &digest, None, |reason, timeout| {
+                    calls.set(calls.get() + 1);
+                    assert!(reason.ends_with(&digest[..16]));
+                    assert_eq!(timeout, std::time::Duration::from_secs(60));
+                    async move {
+                        match choice {
+                            0 => Ok(PromptOutcome::Approved { account: None }),
+                            1 => Ok(PromptOutcome::Denied),
+                            _ => Err(ApprovalError::Unavailable),
+                        }
+                    }
+                })
+                .await;
+            assert_eq!(calls.get(), 1);
+            match choice {
+                0 => assert_eq!(outcome.unwrap(), PromptOutcome::Approved { account: None }),
+                1 => assert_eq!(outcome.unwrap(), PromptOutcome::Denied),
+                _ => assert!(matches!(outcome, Err(ApprovalError::Unavailable))),
+            }
+            assert_eq!(
+                std::fs::read_to_string(approve.with_extension("review")).unwrap(),
+                text
+            );
+        }
+        let (_directory, helper) = review_test_helper("unavailable");
+        assert!(
+            review_then_authenticate(&helper, &text, &digest, None, |_, _| async {
+                panic!("unavailable review must not authenticate")
+            })
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_text_deadlines_and_non_utf8_markers_fail_before_authorization() {
+        assert!(matches!(
+            prompt_task(" ").await,
+            Err(ApprovalError::InvalidReason)
+        ));
+        assert!(matches!(
+            remaining(Some(-1), 60),
+            Err(ApprovalError::Unavailable)
+        ));
+        let stage = std::sync::atomic::AtomicUsize::new(0);
+        read_review_stages(
+            &b"\xff\nopaque-review-stage: review-cancelled\n"[..],
+            &stage,
+        )
+        .await;
+        assert_eq!(
+            REVIEW_STAGES[stage.load(std::sync::atomic::Ordering::Relaxed)],
+            "review-cancelled"
+        );
+        assert!(parse_helper_account(b"\xff").is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_callback_is_single_use_and_timeout_invalidates_exactly_once() {
+        use std::sync::{Mutex, mpsc};
+        let timeout = std::time::Duration::from_millis(1);
+        for approved in [true, false] {
+            let (sender, receiver) = mpsc::channel();
+            let sender = Mutex::new(Some(sender));
+            deliver_authentication_result(&sender, approved);
+            deliver_authentication_result(&sender, !approved);
+            assert_eq!(
+                receive_authentication_result(receiver, timeout, || panic!(
+                    "completed callback must not invalidate"
+                ))
+                .unwrap(),
+                approved
+            );
+            assert!(sender.lock().unwrap().is_none());
+            assert_eq!(
+                device_owner_outcome(approved),
+                if approved {
+                    PromptOutcome::Approved { account: None }
+                } else {
+                    PromptOutcome::Denied
+                }
+            );
+        }
+        for disconnected in [false, true] {
+            let (sender, receiver) = mpsc::channel::<bool>();
+            let sender = if disconnected {
+                drop(sender);
+                None
+            } else {
+                Some(sender)
+            };
+            let calls = std::cell::Cell::new(0);
+            let error =
+                receive_authentication_result(receiver, timeout, || calls.set(calls.get() + 1))
+                    .unwrap_err();
+            assert!(error.to_string().contains("timed out or failed"));
+            assert_eq!(calls.get(), 1);
+            drop(sender);
         }
     }
 }

@@ -398,6 +398,106 @@ async fn assert_no_session_and_sanitized_failure(
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Drive the actual listener error path with bounded framing violations. More
+/// than one semaphore's capacity of rejected peers must not exhaust the daemon.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn malformed_peer_frames_release_listener_capacity_and_preserve_healthy_dispatch() {
+    use futures_util::{SinkExt, StreamExt};
+    use opaque_core::audit::{AuditEventKind, AuditFilter, query_audit_db, verify_audit_chain};
+    use tokio::io::AsyncWriteExt;
+    use tokio_util::codec::{Framed, LengthDelimitedCodec};
+
+    let _serial = serial_guard();
+    // Expected framing failures must not fill the harness's unread log pipe.
+    let mut daemon = TestDaemon::spawn_with_env(
+        "[attestation]\ninterval_secs = 0\n",
+        &[("RUST_LOG", "error")],
+    );
+    let expected = json!({"ok":true,"api_version":opaque_core::API_VERSION});
+    assert_eq!(daemon.call_ok("ping", Value::Null).await, expected);
+    let oversized = u32::try_from(opaque_core::MAX_FRAME_LENGTH + 1)
+        .unwrap()
+        .to_be_bytes();
+    for authenticated in [false, true] {
+        // This is one test with 130 connection scenarios, not 130 distinct tests.
+        for attempt in 0..65 {
+            let stream = tokio::net::UnixStream::connect(&daemon.sock).await.unwrap();
+            let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
+            if authenticated {
+                framed
+                    .send(
+                        serde_json::to_vec(
+                            &json!({"handshake":"v1","daemon_token":daemon.daemon_token}),
+                        )
+                        .unwrap()
+                        .into(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            // Bypass only the fixture's encoder: the daemon receives a real
+            // over-limit length prefix, without allocating its claimed body.
+            framed.get_mut().write_all(&oversized).await.unwrap();
+            if authenticated {
+                let frame = tokio::time::timeout(Duration::from_secs(5), framed.next())
+                    .await
+                    .expect("malformed peer response deadline")
+                    .expect("missing bad_frame response")
+                    .unwrap();
+                let response: Value = serde_json::from_slice(&frame).unwrap();
+                assert!(response["id"].is_null());
+                assert_eq!(
+                    response["error"]["code"], "bad_frame",
+                    "scenario {attempt}: {response}"
+                );
+                assert!(response.get("result").is_none_or(Value::is_null));
+            }
+            assert!(
+                matches!(
+                    tokio::time::timeout(Duration::from_secs(5), framed.next()).await,
+                    Ok(None) | Ok(Some(Err(_)))
+                ),
+                "malformed peer was not disconnected: authenticated={authenticated}, attempt={attempt}"
+            );
+        }
+        assert_eq!(daemon.call_ok("ping", Value::Null).await, expected);
+        assert!(daemon.child.try_wait().unwrap().is_none());
+    }
+    // Require a successful native shutdown before checking the flushed audit.
+    assert_eq!(
+        unsafe { libc::kill(daemon.child.id() as i32, libc::SIGTERM) },
+        0
+    );
+    let status = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if let Some(status) = daemon.child.try_wait().unwrap() {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("daemon failed to drain rejected connections");
+    assert_eq!(status.code(), Some(0));
+    let db = daemon.audit_db();
+    assert!(verify_audit_chain(&db).unwrap().ok);
+    let events = query_audit_db(&db, &AuditFilter::default()).unwrap();
+    let dispatched = events
+        .iter()
+        .filter(|e| e.kind == AuditEventKind::WorkloadAttested)
+        .collect::<Vec<_>>();
+    assert_eq!(dispatched.len(), 3);
+    assert!(
+        dispatched
+            .iter()
+            .all(|e| e.operation.as_deref() == Some("ping"))
+    );
+    let runtime = daemon.runtime_dir.clone();
+    drop(daemon);
+    assert!(!runtime.exists());
+}
+
 #[tokio::test]
 #[allow(clippy::await_holding_lock)] // same serialized real-daemon path as identity tests
 async fn workload_attestor_uses_listener_evidence_and_refuses_claims() {

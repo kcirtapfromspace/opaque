@@ -637,6 +637,346 @@ async fn run_transport(
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use serde_json::Value;
+
+    fn scripted_broker(
+        exchanges: Vec<(&'static str, serde_json::Value)>,
+    ) -> (
+        tempfile::TempDir,
+        DaemonClient,
+        tokio::task::JoinHandle<Vec<serde_json::Value>>,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(directory.path().join("daemon.token"), "test-token").unwrap();
+        let path = directory.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let task = tokio::spawn(async move {
+            use futures_util::{SinkExt, StreamExt};
+            let mut observed = Vec::new();
+            for (method, reply) in exchanges {
+                let (stream, _) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let mut framed = tokio_util::codec::Framed::new(
+                    stream,
+                    tokio_util::codec::LengthDelimitedCodec::new(),
+                );
+                let handshake: serde_json::Value =
+                    serde_json::from_slice(&framed.next().await.unwrap().unwrap()).unwrap();
+                assert_eq!(handshake["handshake"], "v1");
+                assert_eq!(handshake["daemon_token"], "test-token");
+                let request: serde_json::Value =
+                    serde_json::from_slice(&framed.next().await.unwrap().unwrap()).unwrap();
+                assert_eq!(request["id"], 1);
+                assert_eq!(request["method"], method);
+                observed.push(request);
+                framed
+                    .send(serde_json::to_vec(&reply).unwrap().into())
+                    .await
+                    .unwrap();
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_secs(5), framed.next())
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            // The caller has completed every exchange; no background retry or
+            // second effect request is permitted on this owned listener.
+            assert!(listener.accept().now_or_never().is_none());
+            observed
+        });
+        (directory, DaemonClient::new(Some(path)), task)
+    }
+
+    #[tokio::test]
+    async fn external_catalog_bounds_and_names_never_expand_the_admitted_tool_set() {
+        for catalog in [
+            json!({"tools":vec![json!({"name":"opaque_mcp_tool_test"});129]}),
+            json!({"tools":[{"name":"untrusted"},{"name":4},{"name":"opaque_mcp_tool_test","description":"test","inputSchema":{"type":"object"}}]}),
+            json!({"tools":null}),
+        ] {
+            let (directory, client, broker) =
+                scripted_broker(vec![("mcp_catalog", json!({"id":1,"result":catalog}))]);
+            let response = external::list(Some(json!(7)), &client).await;
+            assert_eq!(response.id, Some(json!(7)));
+            let tools = response.result.unwrap()["tools"]
+                .as_array()
+                .unwrap()
+                .clone();
+            let external_names: Vec<_> = tools
+                .iter()
+                .filter_map(|t| t["name"].as_str())
+                .filter(|n| n.starts_with("opaque_mcp_"))
+                .collect();
+            if catalog["tools"].as_array().is_some_and(|t| t.len() == 3) {
+                assert_eq!(
+                    external_names,
+                    vec![
+                        "opaque_mcp_tool_test",
+                        "opaque_mcp_invocation_get",
+                        "opaque_mcp_invocation_revoke"
+                    ]
+                );
+            } else {
+                assert!(external_names.is_empty());
+            }
+            assert_eq!(broker.await.unwrap().len(), 1);
+            drop(directory);
+        }
+    }
+
+    #[tokio::test]
+    async fn external_alias_and_schema_denials_send_only_read_only_discovery() {
+        for (catalog, args, message) in [
+            (json!({"tools":[]}), json!({}), "unknown tool"),
+            (
+                json!({"tools":[{"name":"opaque_mcp_tool_note","route":"different"}]}),
+                json!({}),
+                "unknown tool",
+            ),
+            (
+                json!({"tools":[{"name":"opaque_mcp_tool_note","route":"note","inputSchema":{"type":"object","required":["id"],"additionalProperties":false,"properties":{"id":{"type":"integer"}}}}]}),
+                json!({"id":"not an integer"}),
+                "tool arguments do not match the input schema",
+            ),
+            (
+                json!({"tools":[{"name":"opaque_mcp_tool_note","route":"note","inputSchema":{"type":"unsupported"}}]}),
+                json!({}),
+                "tool arguments do not match the input schema",
+            ),
+        ] {
+            let (_directory, client, broker) =
+                scripted_broker(vec![("mcp_catalog", json!({"id":1,"result":catalog}))]);
+            let response = handle_tools_call(
+                Some(json!(1)),
+                &json!({"name":"opaque_mcp_tool_note","arguments":args}),
+                &client,
+            )
+            .await;
+            assert!(response.result.is_none());
+            let error = response.error.unwrap();
+            assert_eq!(error.code, INVALID_PARAMS);
+            assert_eq!(error.message, message);
+            assert_eq!(
+                broker.await.unwrap(),
+                vec![json!({"id":1,"method":"mcp_catalog","params":{}})]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invocation_inspection_and_revocation_preserve_exact_reference_and_missing_result_uncertainty()
+     {
+        let id = "00000000-0000-4000-8000-000000000001";
+        for (name, method) in [
+            ("opaque_mcp_invocation_get", "mcp_get"),
+            ("opaque_mcp_invocation_revoke", "mcp_revoke"),
+        ] {
+            for result in [
+                json!({"receipt":{"state":"revoked","invocation_id":id}}),
+                Value::Null,
+            ] {
+                // An absent result differs from a present JSON null. Exercise
+                // the malformed missing-result envelope, which the production
+                // decoder rejects before the adapter can report success.
+                let reply = if result.is_null() {
+                    json!({"id":1})
+                } else {
+                    json!({"id":1,"result":result})
+                };
+                let (_directory, client, broker) = scripted_broker(vec![(method, reply)]);
+                let response = handle_tools_call(
+                    Some(json!(1)),
+                    &json!({"name":name,"arguments":{"invocation_id":id}}),
+                    &client,
+                )
+                .await;
+                let observed = broker.await.unwrap();
+                assert_eq!(
+                    observed,
+                    vec![json!({"id":1,"method":method,"params":{"invocation_id":id}})]
+                );
+                let returned = response.result.unwrap();
+                assert_eq!(returned["isError"], result.is_null());
+                if result.is_null() {
+                    assert!(
+                        returned["content"][0]["text"]
+                            .as_str()
+                            .unwrap()
+                            .contains("not retried")
+                    );
+                } else {
+                    assert_eq!(
+                        serde_json::from_str::<Value>(
+                            returned["content"][0]["text"].as_str().unwrap()
+                        )
+                        .unwrap(),
+                        result
+                    );
+                }
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let client = DaemonClient::new(Some(directory.path().join("absent")));
+        for arguments in [
+            json!({}),
+            json!({"invocation_id":id,"route":"forged"}),
+            json!({"invocation_id":1}),
+            json!({"invocation_id":"short"}),
+            json!([]),
+        ] {
+            let response = handle_tools_call(
+                Some(json!(1)),
+                &json!({"name":"opaque_mcp_invocation_get","arguments":arguments}),
+                &client,
+            )
+            .await;
+            assert_eq!(response.error.unwrap().code, INVALID_PARAMS);
+            assert!(response.result.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn task_state_and_provider_errors_are_not_reported_as_successful_tool_calls() {
+        for (tool, method, args, result, expected_error) in [
+            (
+                "opaque_task_run",
+                "task_run",
+                json!({"task_id":"task-1"}),
+                json!({"task":{"state":"completed"}}),
+                false,
+            ),
+            (
+                "opaque_task_run",
+                "task_run",
+                json!({"task_id":"task-1"}),
+                json!({"task":{"state":"unknown"}}),
+                true,
+            ),
+            (
+                "opaque_task_reconcile",
+                "task_reconcile",
+                json!({"task_id":"task-1"}),
+                json!({"task":{"release_observation":{"state":"failed"}}}),
+                true,
+            ),
+            (
+                "opaque_task_reconcile",
+                "task_reconcile",
+                json!({"task_id":"task-1"}),
+                json!({"task":{"release_observation":{"state":"ambiguous"}}}),
+                true,
+            ),
+            (
+                "opaque_task_reconcile",
+                "task_reconcile",
+                json!({"task_id":"task-1"}),
+                json!({"task":{"release_observation":{"state":"succeeded"}}}),
+                false,
+            ),
+            (
+                "opaque_task_get",
+                "task_get",
+                json!({"task_id":"task-1"}),
+                json!("fixed broker result"),
+                false,
+            ),
+        ] {
+            let (_directory, client, broker) =
+                scripted_broker(vec![(method, json!({"id":1,"result":result}))]);
+            let response = handle_tools_call(
+                Some(json!(9)),
+                &json!({"name":tool,"arguments":args}),
+                &client,
+            )
+            .await;
+            assert!(response.error.is_none(), "{tool}: {:?}", response.error);
+            let returned = response.result.unwrap();
+            assert_eq!(
+                returned
+                    .get("isError")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                expected_error,
+                "{tool}/{result}"
+            );
+            let text = returned["content"][0]["text"].as_str().unwrap();
+            if let Some(expected) = result.as_str() {
+                assert_eq!(text, expected);
+            } else {
+                assert_eq!(serde_json::from_str::<Value>(text).unwrap(), result);
+            }
+            let requests = broker.await.unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0]["params"]["task_id"], "task-1");
+        }
+        let (_directory, client, broker) = scripted_broker(vec![(
+            "task_run",
+            json!({"id":1,"error":{"code":"approval_denied","message":"review was rejected"}}),
+        )]);
+        let response = handle_tools_call(
+            Some(json!(10)),
+            &json!({"name":"opaque_task_run","arguments":{"task_id":"task-1"}}),
+            &client,
+        )
+        .await;
+        let result = response.result.unwrap();
+        assert_eq!(result["isError"], true);
+        assert_eq!(
+            result["content"][0]["text"],
+            "Opaque error [approval_denied]: review was rejected"
+        );
+        assert_eq!(broker.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn framed_sandbox_response_withholds_output_and_preserves_failure_metadata() {
+        let (_directory, client, broker) = scripted_broker(vec![(
+            "sandbox.exec",
+            json!({"id":1,"result":{"exit_code":1,"duration_ms":7,"stdout_length":21,"stderr_length":19,"truncated":false,"stdout":"synthetic-private-out","stderr":"synthetic-private-error"}}),
+        )]);
+        let response=handle_tools_call(Some(json!(11)), &json!({"name":"opaque_sandbox_exec","arguments":{"profile":"fixture","command":["fixture-command"]}}),&client).await;
+        let result = response.result.unwrap();
+        assert_eq!(result["isError"], true);
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("exit_code: 1")
+        );
+        assert!(
+            result["content"][1]["text"]
+                .as_str()
+                .unwrap()
+                .contains("withheld")
+        );
+        assert!(!result.to_string().contains("synthetic-private"));
+        assert_eq!(
+            broker.await.unwrap(),
+            vec![
+                json!({"id":1,"method":"sandbox.exec","params":{"profile":"fixture","command":["fixture-command"]}})
+            ]
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let client = DaemonClient::new(Some(directory.path().join("absent")));
+        let rejected = handle_tools_call(
+            Some(json!(12)),
+            &json!({"name":"opaque_task_run","arguments":{"task_id":null}}),
+            &client,
+        )
+        .await;
+        assert!(rejected.result.is_none());
+        assert_eq!(
+            rejected.error.unwrap().message,
+            "tool arguments do not match the input schema"
+        );
+    }
 
     #[tokio::test]
     async fn unknown_tool_handler_never_echoes_untrusted_names() {

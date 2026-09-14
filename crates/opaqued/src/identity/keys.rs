@@ -70,6 +70,21 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_key_location_preserves_existing_custody_without_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_directory = dir.path().join("identity.key");
+        std::fs::create_dir(&key_directory).unwrap();
+        let marker = key_directory.join("retained-evidence");
+        std::fs::write(&marker, b"must-remain-unchanged").unwrap();
+        let error = load_or_create_signing_key(&key_directory).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::IsADirectory);
+        assert!(key_directory.is_dir());
+        assert_eq!(std::fs::read(&marker).unwrap(), b"must-remain-unchanged");
+        assert_eq!(std::fs::read_dir(&key_directory).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
     fn rejects_wrong_length_key_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("identity.key");

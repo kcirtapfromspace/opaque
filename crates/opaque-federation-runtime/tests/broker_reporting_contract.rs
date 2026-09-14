@@ -205,3 +205,32 @@ fn unversioned_overlarge_and_unknown_field_envelopes_are_rejected() {
     bad["implicit_enrollment"] = true.into();
     assert!(serde_json::from_value::<Heartbeat>(bad).is_err());
 }
+
+#[test]
+fn heartbeat_envelope_validates_epoch_nonce_and_report_bounds_before_signature() {
+    let (original, key) = fixture(100);
+    for case in 0..5 {
+        let mut heartbeat = original.clone();
+        match case {
+            0 => heartbeat.challenge.epoch = 0,
+            1 => heartbeat.challenge.nonce = "a".repeat(31),
+            2 => heartbeat.challenge.nonce = "g".repeat(32),
+            3 => heartbeat.report = "x".repeat(128 * 1024 + 1),
+            _ => heartbeat.challenge.expires_at = i64::MIN,
+        }
+        assert_eq!(
+            verify_heartbeat(
+                &heartbeat,
+                &original.challenge.binding,
+                &key.verifying_key(),
+                101
+            )
+            .unwrap_err(),
+            if case == 4 {
+                "invalid challenge window"
+            } else {
+                "invalid heartbeat envelope"
+            }
+        );
+    }
+}

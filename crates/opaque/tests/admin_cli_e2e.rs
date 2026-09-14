@@ -2,6 +2,10 @@
 //! synthetic native-command boundaries; they do not claim launchd/systemd service
 //! execution. macOS sealing runs under a mandatory sandbox denying Keychain tools.
 #![cfg(unix)]
+#[path = "support/audit_contract.rs"]
+mod audit_contract;
+#[path = "support/status_contract.rs"]
+mod status_contract;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};

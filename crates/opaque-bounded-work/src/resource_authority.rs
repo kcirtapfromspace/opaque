@@ -415,3 +415,202 @@ impl ResourceAuthority {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod configuration_tests {
+
+    #[tokio::test]
+    async fn oversized_resource_frame_is_closed_before_identity_or_body_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let valid = config(directory.path());
+        let authority =
+            ResourceAuthority::new(valid.clone(), identity(), Some(&valid.binding), false).unwrap();
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        client.write_u32(32 * 1024 + 1).await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            authority.connection(server),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut byte = [0];
+        assert_eq!(client.read(&mut byte).await.unwrap(), 0);
+    }
+    use super::*;
+    struct NoIdentityIo {
+        required: bool,
+        issuer: &'static str,
+    }
+    impl IdentityAuthority for NoIdentityIo {
+        fn config_issuer(&self) -> &str {
+            self.issuer
+        }
+        fn config_required(&self) -> bool {
+            self.required
+        }
+        fn persona_max_age_secs(&self) -> Option<u64> {
+            panic!("configuration must not access identity state")
+        }
+        fn principal_permitted(&self, _: &Principal) -> bool {
+            panic!("configuration must not access identity state")
+        }
+        fn get_human_by_subject(&self, _: &str, _: &str) -> Result<Option<Principal>, String> {
+            panic!("configuration must not access identity state")
+        }
+        fn resource_token_revoked(&self, _: &str, _: &str, _: &str) -> Result<bool, String> {
+            panic!("configuration must not access identity state")
+        }
+        fn revoke_resource_token(&self, _: &str, _: &str, _: &str, _: i64) -> Result<(), String> {
+            panic!("configuration must not access identity state")
+        }
+        fn authorize_scopes(
+            &self,
+            _: &TenantBinding,
+            _: &PrincipalId,
+            _: i64,
+            _: u64,
+        ) -> Result<BTreeSet<String>, String> {
+            panic!("configuration must not access identity state")
+        }
+        fn emit_audit(&self, _: opaque_core::audit::AuditEvent) {
+            panic!("configuration must not emit authorization")
+        }
+    }
+    const PUBLIC_FIXTURE: &str = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA5+m4fkcL6cuTGRLTSSrF\n7zfrwFFnYRJG1yVmmCwn4q0PXhuWmUu9mo2wg9ftf9BLFspkMqyzxpdfzGTan6J9\n5w7Ad7gbP5R2aDGnVJRTX9dph3cKBgwnDsUa751mYWfr1rsTnoiMIDWzOGsRSdOi\nRzZGCYo3yo4YNB+sNIOFMQ/tc3X558HGCZl3boecDmlwt1lHebe6/+kXRTYLLpIl\nf7u1mw98TYtOenu2SIUOrJKY9VGluMxvGH9e4SExpZaG61wTNsosD20tEBkWUjCo\nxo01adXNjPYKx/mJB3NgCIWacU4NwbZxVRUg5HYR85cq+5I2oNQDwuyNDv7kZQfA\nywIDAQAB\n-----END PUBLIC KEY-----\n";
+    fn identity() -> Arc<dyn IdentityAuthority> {
+        Arc::new(NoIdentityIo {
+            required: true,
+            issuer: "https://issuer.example.com",
+        })
+    }
+    fn config(directory: &std::path::Path) -> ResourceAuthorityConfig {
+        let binding = TenantBinding::new(
+            opaque_core::tenant::TenantId::parse("tenant-a").unwrap(),
+            uuid::Uuid::new_v4(),
+        )
+        .unwrap();
+        let credential_file = directory.join("key");
+        std::fs::write(&credential_file, [42; 32]).unwrap();
+        std::fs::set_permissions(&credential_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        ResourceAuthorityConfig {
+            socket_path: directory.join("authority.sock"),
+            credential_file,
+            allowed_gateway_uids: BTreeSet::from([u32::MAX - 1]),
+            binding: binding.clone(),
+            fixture_mode: false,
+            role_scopes: BTreeMap::from([(Role::Admin, BTreeSet::from(["metrics:read".into()]))]),
+            auth: AuthConfig {
+                issuer: "https://issuer.example.com".into(),
+                resource_audience: "https://resource.example.com".into(),
+                public_key_pem: PUBLIC_FIXTURE.into(),
+                admissions: vec![opaque_core::resource_auth::Admission {
+                    tenant_id: binding.tenant_id,
+                    subject: "human".into(),
+                    client_id: "gateway".into(),
+                    scopes: BTreeSet::from(["metrics:read".into()]),
+                }],
+                revoked_jtis: BTreeSet::new(),
+                max_token_ttl_secs: 900,
+                clock_skew_secs: 0,
+                allow_loopback_http: false,
+            },
+        }
+    }
+    #[test]
+    fn production_authority_requires_isolated_identity_exact_scopes_and_private_credential() {
+        let directory = tempfile::tempdir().unwrap();
+        let valid = config(directory.path());
+        ResourceAuthority::new(valid.clone(), identity(), Some(&valid.binding), false).unwrap();
+        for mode in 0..12 {
+            let mut changed = valid.clone();
+            match mode {
+                0 => changed.allowed_gateway_uids = BTreeSet::from([0]),
+                1 => changed.allowed_gateway_uids = BTreeSet::from([unsafe { libc::geteuid() }]),
+                2 => changed.auth.allow_loopback_http = true,
+                3 => changed.allowed_gateway_uids.clear(),
+                4 => changed.allowed_gateway_uids = (u32::MAX - 18..u32::MAX - 1).collect(),
+                5 => changed.role_scopes.clear(),
+                6 => {
+                    changed.role_scopes.insert(Role::Admin, BTreeSet::new());
+                }
+                7 => {
+                    changed
+                        .role_scopes
+                        .insert(Role::Admin, BTreeSet::from(["metrics:*".into()]));
+                }
+                8 => changed.socket_path = "relative.sock".into(),
+                9 => changed.credential_file = "relative.key".into(),
+                10 => changed.socket_path = changed.credential_file.clone(),
+                _ => {
+                    changed.auth.admissions[0].tenant_id =
+                        opaque_core::tenant::TenantId::parse("foreign").unwrap()
+                }
+            }
+            assert!(
+                ResourceAuthority::new(changed, identity(), Some(&valid.binding), false).is_err(),
+                "accepted mutation {mode}"
+            );
+        }
+        assert!(ResourceAuthority::new(valid.clone(), identity(), None, false).is_err());
+        for (required, issuer) in [
+            (false, "https://issuer.example.com"),
+            (true, "https://foreign.example.com"),
+        ] {
+            assert!(
+                ResourceAuthority::new(
+                    valid.clone(),
+                    Arc::new(NoIdentityIo { required, issuer }),
+                    Some(&valid.binding),
+                    false
+                )
+                .is_err()
+            );
+        }
+        for (mode, bytes) in [(0o644, 32), (0o600, 31), (0o600, 33)] {
+            std::fs::write(&valid.credential_file, vec![42; bytes]).unwrap();
+            std::fs::set_permissions(
+                &valid.credential_file,
+                std::fs::Permissions::from_mode(mode),
+            )
+            .unwrap();
+            assert!(
+                ResourceAuthority::new(valid.clone(), identity(), Some(&valid.binding), false)
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_listener_refuses_writable_symlinked_or_occupied_socket_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        let valid = config(directory.path());
+        let authority =
+            ResourceAuthority::new(valid.clone(), identity(), Some(&valid.binding), false).unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(authority.bind().is_err());
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let listener = authority.bind().unwrap();
+        assert!(
+            authority.bind().is_err(),
+            "must not replace active listener"
+        );
+        assert_eq!(
+            std::fs::metadata(&valid.socket_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o660
+        );
+        drop(listener);
+        let alias = directory.path().join("alias");
+        std::os::unix::fs::symlink(directory.path(), &alias).unwrap();
+        let mut changed = valid.clone();
+        changed.socket_path = alias.join("other.sock");
+        let authority =
+            ResourceAuthority::new(changed, identity(), Some(&valid.binding), false).unwrap();
+        assert!(authority.bind().is_err());
+    }
+}

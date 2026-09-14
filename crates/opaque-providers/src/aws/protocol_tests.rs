@@ -618,3 +618,209 @@ async fn live_aws_read_only_identity_and_selected_resources() {
         );
     }
 }
+
+#[test]
+fn credential_signing_guards_reject_each_invalid_field_before_request_creation() {
+    let client = AwsClient::for_region("us-east-1").unwrap();
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+    let bad = vec![
+        (String::new(), "valid".into(), None),
+        ("a".repeat(129), "valid".into(), None),
+        ("access-".into(), "valid".into(), None),
+        ("ACCESS".into(), String::new(), None),
+        ("ACCESS".into(), "a".repeat(513), None),
+        ("ACCESS".into(), "contains space".into(), None),
+        ("ACCESS".into(), "valid".into(), Some(String::new())),
+        ("ACCESS".into(), "valid".into(), Some("a".repeat(16385))),
+        ("ACCESS".into(), "valid".into(), Some("line\nbreak".into())),
+    ];
+    for (access, secret, token) in bad {
+        assert!(matches!(
+            client.signed_request(
+                &client.ssm_url,
+                "ssm",
+                None,
+                vec![],
+                &access,
+                &secret,
+                token.as_deref(),
+                now
+            ),
+            Err(AwsApiError::Configuration)
+        ));
+    }
+    assert!(matches!(
+        client.signed_request(
+            &client.ssm_url,
+            "ssm",
+            None,
+            vec![0; 1024 * 1024 + 1],
+            "ACCESS",
+            "valid",
+            None,
+            now
+        ),
+        Err(AwsApiError::BadRequest)
+    ));
+    let fixture = AwsClient::new_single("http://127.0.0.1:9");
+    for (access, secret, token) in [
+        ("OTHER", FIXTURE_SECRET_KEY, None),
+        (FIXTURE_ACCESS_KEY, "OTHER", None),
+        (FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY, Some("OTHER")),
+    ] {
+        assert!(matches!(
+            fixture.signed_request(
+                &fixture.ssm_url,
+                "ssm",
+                None,
+                vec![],
+                access,
+                secret,
+                token,
+                now
+            ),
+            Err(AwsApiError::MockOnly)
+        ));
+    }
+}
+
+#[test]
+fn region_and_reference_boundaries_preserve_explicit_authority() {
+    for reference in [
+        "".into(),
+        "x".repeat(513),
+        "env:A\n".into(),
+        "env:".into(),
+        "env:bad-name".into(),
+        "keychain:/account".into(),
+        "keychain:service/".into(),
+        "keychain:missing".into(),
+    ] {
+        assert!(!valid_credential_ref(&reference), "{reference:?}");
+        assert!(matches!(
+            AwsClient::for_region("us-east-1")
+                .unwrap()
+                .with_session_token_ref(&reference),
+            Err(AwsApiError::Configuration)
+        ));
+    }
+    for reference in ["env:EXPLICIT_SESSION_1", "keychain:service/account"] {
+        let client = AwsClient::for_region("us-east-1")
+            .unwrap()
+            .with_session_token_ref(reference)
+            .unwrap();
+        assert_eq!(client.session_token_ref(), Some(reference));
+        assert_eq!(client.backend(), "aws_sigv4");
+    }
+    for region in [
+        "us-a-1".repeat(12),
+        "us-east".into(),
+        "us--1".into(),
+        "us-east-x".into(),
+        "zz-east-1".into(),
+    ] {
+        assert!(matches!(
+            region_suffix(&region),
+            Err(AwsApiError::Configuration)
+        ));
+    }
+    assert!(matches!(
+        validate_fixture_url("ftp://127.0.0.1"),
+        Err(AwsApiError::MockOnly)
+    ));
+}
+
+#[tokio::test]
+async fn malformed_write_acknowledgments_never_retry_or_claim_success() {
+    for (operation, body) in [
+        (
+            "create",
+            json!({"ARN":"arn","Name":"foreign","VersionId":"v"}),
+        ),
+        (
+            "create",
+            json!({"ARN":"arn","Name":"fixture","VersionId":""}),
+        ),
+        ("put", json!({"ARN":"arn","Name":"","VersionId":"v"})),
+        ("put", json!({"ARN":"arn","Name":"fixture","VersionId":""})),
+        ("delete", json!({"Name":"","DeletionDate":1.0})),
+        ("delete", json!({"Name":"fixture","DeletionDate":0.0})),
+        ("delete", json!({"Name":"fixture"})),
+        ("parameter", json!({"unexpected":"not an acknowledgment"})),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = AwsClient::new_single(&server.uri());
+        let result = match operation {
+            "create" => client
+                .create_secret(
+                    FIXTURE_ACCESS_KEY,
+                    FIXTURE_SECRET_KEY,
+                    "fixture",
+                    "disposable",
+                    None,
+                )
+                .await
+                .map(|_| ()),
+            "put" => {
+                client
+                    .put_secret_value(
+                        FIXTURE_ACCESS_KEY,
+                        FIXTURE_SECRET_KEY,
+                        "fixture",
+                        "disposable",
+                    )
+                    .await
+            }
+            "delete" => {
+                client
+                    .delete_secret(FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY, "fixture")
+                    .await
+            }
+            _ => {
+                client
+                    .delete_parameter(FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY, "/fixture")
+                    .await
+            }
+        };
+        assert!(matches!(result, Err(AwsApiError::ParseError)));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn collection_shape_and_budget_failures_never_return_partial_results() {
+    for (body, collection_limit) in [
+        (json!([]), false),
+        (json!({"SecretList":[],"foreign":true}), false),
+        (json!({"SecretList":"not an array"}), false),
+        (json!({"SecretList":[],"NextToken":""}), true),
+        (json!({"SecretList":[],"NextToken":"x".repeat(8193)}), true),
+        (json!({"SecretList":[],"NextToken":3}), true),
+        (
+            json!({"SecretList":vec![json!({});MAX_COLLECTION_ITEMS+1]}),
+            true,
+        ),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let error = AwsClient::new_single(&server.uri())
+            .list_secrets(FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY)
+            .await
+            .unwrap_err();
+        assert!(if collection_limit {
+            matches!(error, AwsApiError::CollectionLimit)
+        } else {
+            matches!(error, AwsApiError::ParseError)
+        });
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+}

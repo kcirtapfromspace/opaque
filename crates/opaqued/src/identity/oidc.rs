@@ -108,10 +108,18 @@ impl OidcClient {
             ("token_endpoint", &doc.token_endpoint),
             ("jwks_uri", &doc.jwks_uri),
         ] {
-            if !(endpoint.starts_with("https://")
-                || endpoint.starts_with("http://127.0.0.1")
-                || endpoint.starts_with("http://localhost"))
-            {
+            // Parse the authority: a string prefix also accepts remote hosts
+            // such as localhost.attacker.example and localhost@attacker.example.
+            let allowed = reqwest::Url::parse(endpoint).ok().is_some_and(|url| {
+                url.has_host()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.fragment().is_none()
+                    && (url.scheme() == "https"
+                        || (url.scheme() == "http"
+                            && matches!(url.host_str(), Some("127.0.0.1" | "localhost"))))
+            });
+            if !allowed {
                 return Err(format!("OIDC {name} has disallowed scheme"));
             }
         }
@@ -438,6 +446,7 @@ pub fn urldecode(s: &str) -> Option<String> {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) mod tests {
+    include!("oidc_verification_tests.rs");
     use super::*;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
