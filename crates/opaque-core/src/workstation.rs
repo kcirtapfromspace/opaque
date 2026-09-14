@@ -479,7 +479,9 @@ mod tests {
     #[test]
     fn review_requires_full_unchanged_content_and_exact_deadline() {
         let mut review = review();
+        assert!(review.validate("opq-broker", 99).is_err());
         review.validate("opq-broker", 100).unwrap();
+        review.validate("opq-broker", 199).unwrap();
         assert!(review.validate("opq-broker", 200).is_err());
         assert!(review.validate("other", 101).is_err());
         review.review_text.push_str("\nAnother target");

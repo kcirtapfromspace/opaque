@@ -385,14 +385,19 @@ mod tests {
                 1 => invalid.expires_at = now(),
                 2 => invalid.operation = "github.set_actions_secret".into(),
                 _ => {
-                    invalid.created_at = now() + 1;
-                    invalid.expires_at = now() + 60;
+                    // Keep a valid duration wholly in the future. A one-second
+                    // lead can elapse while signing or scheduling this test.
+                    // Exact clock boundaries are tested by validate with a
+                    // supplied observation time in opaque-core.
+                    invalid.created_at = i64::MAX - 60;
+                    invalid.expires_at = i64::MAX;
                 }
             }
             assert!(
                 manager
                     .verify_workstation_decision(&invalid, &sign(&invalid), &device.device_id, true)
-                    .is_err()
+                    .is_err(),
+                "signed mutation {field} was accepted"
             );
         }
         let legacy = manager.create_challenge(&valid.request_id, "Legacy mobile review");
