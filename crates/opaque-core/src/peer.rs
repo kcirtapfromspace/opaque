@@ -20,6 +20,9 @@ pub fn peer_info_from_fd(fd: RawFd) -> io::Result<PeerInfo> {
             gid: 0,
         };
         let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: `ucred` is a zero-initialized stack value and `len` is its
+        // exact size, so the kernel writes only within it. `fd` is borrowed
+        // from a live socket by the caller; the return code is checked.
         let rc = unsafe {
             libc::getsockopt(
                 fd,
@@ -44,6 +47,8 @@ pub fn peer_info_from_fd(fd: RawFd) -> io::Result<PeerInfo> {
     {
         let mut uid: libc::uid_t = 0;
         let mut gid: libc::gid_t = 0;
+        // SAFETY: `uid` and `gid` are stack out-parameters; getpeereid only
+        // writes through the given pointers. The return code is checked.
         let rc = unsafe { libc::getpeereid(fd, &mut uid, &mut gid) };
         if rc != 0 {
             return Err(io::Error::last_os_error());
@@ -100,6 +105,9 @@ fn local_peer_pid(fd: RawFd) -> io::Result<i32> {
 
     let mut pid: libc::pid_t = 0;
     let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    // SAFETY: `pid` is a stack out-parameter and `len` its exact size;
+    // SOL_LOCAL and LOCAL_PEERPID are ABI-stable on macOS. The return code
+    // is checked, and an invalid fd surfaces as EBADF rather than UB.
     let rc = unsafe {
         libc::getsockopt(
             fd,
