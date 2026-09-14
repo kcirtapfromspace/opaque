@@ -163,6 +163,7 @@ fn output_with_deadline(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use std::os::unix::ffi::OsStrExt;

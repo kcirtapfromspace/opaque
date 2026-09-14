@@ -97,6 +97,7 @@ impl VaultResolver {
     }
 
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn with_token_ref(client: VaultClient, token_ref: String) -> Self {
         Self { client, token_ref }
     }
@@ -390,6 +391,7 @@ impl VaultResolver {
     }
 
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn clear_cache_for_tests() {
         Self::lock_cache().clear();
     }
@@ -407,6 +409,7 @@ impl SecretResolver for VaultResolver {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use std::sync::{Arc, OnceLock};
@@ -1089,5 +1092,6 @@ mod tests {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "snapshot_tests.rs"]
 mod snapshot_tests;

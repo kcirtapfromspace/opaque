@@ -322,6 +322,7 @@ impl OperationHandler for OnePasswordHandler {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;

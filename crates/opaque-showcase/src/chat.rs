@@ -1350,6 +1350,7 @@ fn fixture_exploration_plan(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "chat_exploration_tests.rs"]
 mod exploration_tests;
 
@@ -2129,6 +2130,7 @@ pub fn unit(metric: &str) -> &'static str {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use wiremock::matchers::{method, path};
@@ -2593,6 +2595,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod portfolio_planner_tests {
     use super::*;
     use crate::portfolio::{Dimension, Measure, View};

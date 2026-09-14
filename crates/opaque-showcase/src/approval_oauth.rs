@@ -746,6 +746,7 @@ fn invalid_identity() -> String {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use aws_lc_rs::{

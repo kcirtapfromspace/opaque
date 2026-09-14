@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 //! Opaque federation runtime: the SIEM-export / signed-attestation surface.
 //!
 //! Cooperating components of the public broker runtime, independently

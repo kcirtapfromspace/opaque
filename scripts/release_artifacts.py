@@ -29,6 +29,13 @@ def run(args, **kwargs):
     return subprocess.run(args, check=True, capture_output=True, timeout=60, **kwargs)
 
 
+def source_git_command(source, *args):
+    # A contained installer may read a host-owned checkout. Trust only the
+    # explicit canonical source root for this command, never global config.
+    root = str(Path(source).resolve())
+    return ["git", "-c", "safe.directory=" + root, "-C", root, *args]
+
+
 def digest(data):
     return hashlib.sha256(data).hexdigest()
 
@@ -48,16 +55,16 @@ def create_manifest(source, binary_dir, target, version, revision, allow_dirty=F
     source, binary_dir = Path(source).resolve(), Path(binary_dir).resolve()
     if target not in TARGETS or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?", version):
         raise ValueError("unsupported target or invalid version")
-    head = run(["git", "-C", str(source), "rev-parse", "HEAD"]).stdout.decode().strip()
+    head = run(source_git_command(source, "rev-parse", "HEAD")).stdout.decode().strip()
     if head != revision or not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise ValueError("expected revision does not match source HEAD")
     cargo = tomllib.loads((source / "Cargo.toml").read_text())
     if cargo["workspace"]["package"]["version"] != version:
         raise ValueError("release version does not match Cargo.toml")
-    dirty = bool(run(["git", "-C", str(source), "status", "--porcelain", "--untracked-files=all"]).stdout)
+    dirty = bool(run(source_git_command(source, "status", "--porcelain", "--untracked-files=all")).stdout)
     if dirty and not allow_dirty:
         raise ValueError("release source must be clean; --allow-dirty creates a local candidate only")
-    source_names = run(["git", "-C", str(source), "ls-files", "-z", "--cached", "--others", "--exclude-standard"]).stdout
+    source_names = run(source_git_command(source, "ls-files", "-z", "--cached", "--others", "--exclude-standard")).stdout
     source_hash = hashlib.sha256()
     for raw in sorted(set(source_names.split(b"\0")) - {b""}):
         name = os.fsdecode(raw)

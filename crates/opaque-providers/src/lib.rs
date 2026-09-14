@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 //! Credential provider integrations for the Opaque broker.
 //!
 //! Each provider implements [`opaque_core::operation_handler::OperationHandler`]

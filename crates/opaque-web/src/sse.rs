@@ -141,6 +141,7 @@ fn query_new_events(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use axum::response::IntoResponse;

@@ -12,6 +12,7 @@
 pub mod client;
 pub mod crypto;
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod prepared_tests;
 pub mod release;
 mod rpc;
@@ -74,6 +75,7 @@ impl GitHubHandler {
     }
 
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     #[allow(dead_code)]
     pub fn with_client(audit: Arc<dyn AuditSink>, client: GitHubClient) -> Self {
         Self { audit, client }
@@ -526,6 +528,7 @@ fn prepare_scope(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn parse_scope(params: &serde_json::Value) -> Result<PreparedScope, String> {
     let input: ListInput = parse_params(params)?;
     prepare_scope(input.scope, input.repo, input.org, input.environment)
@@ -824,6 +827,7 @@ impl GitHubHandler {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

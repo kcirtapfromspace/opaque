@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 //! Tenant custody boundary and the shared, daemon-state-free protocol types
 //! behind delegated IdP provisioning.
 //!

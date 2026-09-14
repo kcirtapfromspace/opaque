@@ -15,6 +15,7 @@ use std::sync::atomic::Ordering;
 const PUBLISH_CHILD_OPERATION: &str = "github.set_actions_secret";
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "task_remote_tests.rs"]
 mod remote_tests;
 
@@ -865,6 +866,7 @@ impl opaque_bounded_work::task_facade::BoundedWorkFacade for Enclave {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use opaque_core::audit::InMemoryAuditEmitter;

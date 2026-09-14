@@ -325,6 +325,7 @@ impl AwsClient {
         })
     }
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn new_single(url: &str) -> Self {
         Self::new(url, url, url).expect("literal loopback fixture")
     }
@@ -918,5 +919,6 @@ fn error_response(status: u16, bytes: &[u8]) -> AwsApiError {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "protocol_tests.rs"]
 mod tests;

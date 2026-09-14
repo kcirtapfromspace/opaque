@@ -118,6 +118,7 @@ pub(super) fn validated_team_id(audit_token: &[u32; 8]) -> Option<String> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

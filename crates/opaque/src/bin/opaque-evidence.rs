@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 //! Offline evidence custody tools. Every source and destination is explicit.
 use clap::{Parser, Subcommand};
 use ed25519_dalek::{SigningKey, VerifyingKey};

@@ -294,6 +294,7 @@ impl AzureKeyVaultClient {
             .and_then(|s| s.strip_suffix(".vault.azure.net"))
     }
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn test_new(
         base: &str,
         tenant: String,
@@ -305,6 +306,7 @@ impl AzureKeyVaultClient {
         Ok(c)
     }
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn with_token_endpoint(mut self, endpoint: String) -> Self {
         self.token_endpoint_override = Some(endpoint);
         self
@@ -583,6 +585,7 @@ async fn read_json<T: DeserializeOwned>(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
@@ -1231,6 +1234,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod boundary_tests {
     use super::*;
     use serde_json::json;
@@ -1448,6 +1452,7 @@ mod boundary_tests {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[test]
 fn production_vault_guard_is_independent_of_fixture_transport() {
     assert!(

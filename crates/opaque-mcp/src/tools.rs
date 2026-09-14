@@ -665,6 +665,7 @@ pub fn tool_to_daemon_method(tool_name: &str) -> Option<&'static str> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

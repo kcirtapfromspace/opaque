@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import xml.etree.ElementTree as ET
 
 SCHEMA = "opaque.synthesized-suite.v1"
@@ -28,6 +29,20 @@ LIMIT = 8 * 1024 * 1024
 ID = re.compile(r"[a-z][a-z0-9_.-]{0,127}\Z")
 NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_:.-]{0,255}\Z")
 SOFTWARE = ("protocol", "contained", "model", "packaged")
+PACKAGED_CHECKS = (
+    "complete_source_bound_native_payload", "real_installer_checksum_and_exact_payload",
+    "installed_cli_help_and_revision", "installed_custody_owner_permissions_restart_and_reinit_denial",
+    "installed_custody_mode_symlink_hardlink_and_identity_mutations",
+    "installed_delegated_session_denial_before_custody",
+    "installed_native_capability_protocol_without_prompt", "isolated_home_without_default_daemon_state",
+)
+# Match complete fixed diagnostics from tests/packaged/run.py. Never publish
+# arbitrary subprocess output, command arguments, or exception payloads.
+PACKAGED_FAILURES = {
+    b"packaged acceptance: installed binary identity differs from its selected revision\n": "installed_revision_mismatch",
+    b"packaged acceptance: acceptance prerequisite or subprocess failed\n": "prerequisite_or_subprocess_failed",
+    b"Packaged acceptance interrupted; no qualification produced.\n": "interrupted",
+}
 
 
 class Invalid(Exception):
@@ -111,15 +126,24 @@ def validate_manifest(value):
         tests[test["id"]] = test
     referenced = set()
     for requirement in value["requirements"]:
-        fields(requirement, ("id", "profile", "status", "tests", "description"))
+        fields(requirement, ("id", "profile", "status", "tests", "description"), ("runner", "platforms"))
         valid_name(requirement["id"])
         require(requirement["profile"] in (*SOFTWARE, "external"), "invalid_requirement_profile")
         require(requirement["status"] in ("implemented", "missing", "external"), "invalid_requirement_status")
         require(isinstance(requirement["description"], str) and 1 <= len(requirement["description"]) <= 1000, "invalid_requirement_description")
         names = requirement["tests"]
         require(isinstance(names, list) and len(names) == len(set(names)) and set(names) <= set(tests), "invalid_requirement_tests")
+        if "platforms" in requirement:
+            platforms = requirement["platforms"]
+            require(isinstance(platforms, list) and platforms and len(platforms) == len(set(platforms))
+                    and set(platforms) <= {"linux", "darwin"}, "invalid_requirement_platforms")
+        runner = requirement.get("runner")
+        if "runner" in requirement:
+            require(runner == "installed-artifacts" and requirement["profile"] == "packaged"
+                    and requirement["status"] == "implemented" and not names
+                    and len(requirement.get("platforms", [])) == 1, "invalid_requirement_runner")
         if requirement["status"] == "implemented":
-            require(bool(names) and requirement["profile"] != "external", "vacuous_requirement")
+            require((bool(names) or runner == "installed-artifacts") and requirement["profile"] != "external", "vacuous_requirement")
         else:
             require(not names, "unimplemented_requirement_has_tests")
         require((requirement["profile"] == "external") == (requirement["status"] == "external"), "invalid_external_requirement")
@@ -140,25 +164,39 @@ class CommandResult:
 def stop_group(process):
     """Terminate only the process group created for this invocation."""
     forced = False
-    for sig, grace in ((signal.SIGTERM, 0.5), (signal.SIGKILL, 0.5)):
-        try:
-            os.killpg(process.pid, sig)
-            forced = True
-        except ProcessLookupError:
-            break
-        deadline = time.monotonic() + grace
-        while time.monotonic() < deadline:
-            process.poll()
+    denied = None
+    try:
+        for sig, grace in ((signal.SIGTERM, 0.5), (signal.SIGKILL, 0.5)):
             try:
-                os.killpg(process.pid, 0)
+                os.killpg(process.pid, sig)
+                forced = True
             except ProcessLookupError:
                 return forced
-            time.sleep(0.02)
-    try:
-        process.wait(timeout=1)
-    except subprocess.TimeoutExpired:
-        pass
-    return forced
+            except PermissionError as error:
+                denied = error
+            deadline = time.monotonic() + grace
+            while time.monotonic() < deadline:
+                process.poll()
+                try:
+                    os.killpg(process.pid, 0)
+                except ProcessLookupError:
+                    return forced
+                except PermissionError as error:
+                    # Darwin can return EPERM for an exited, zombie-only group.
+                    # Reap/poll within the same deadline and require real ESRCH;
+                    # permission denial alone never proves group removal.
+                    denied = error
+                time.sleep(0.02)
+        if denied is not None:
+            raise Invalid("process_group_cleanup_permission_denied") from denied
+        return forced
+    finally:
+        # An inspection error must not bypass retirement of our direct child.
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=1)
 
 
 def invoke(argv, *, cwd, env, timeout):
@@ -226,6 +264,7 @@ def source_snapshot(root, executor=invoke):
     require(len(names) <= 20000, "source_inventory_limit")
     total = 0
     hasher = hashlib.sha256(b"opaque.synthesized-source.v1\0")
+    release_hasher = hashlib.sha256()
     for name in names:
         relative = Path(os.fsdecode(name))
         require(not relative.is_absolute() and ".." not in relative.parts, "invalid_source_path")
@@ -243,12 +282,22 @@ def source_snapshot(root, executor=invoke):
             body, kind, mode = b"", b"missing", 0
         total += len(body)
         require(total <= 256 * 1024 * 1024, "source_total_limit")
+        # Also retain the production archive manifest's digest format so an
+        # installed candidate is bound to these exact source bytes, including
+        # uncommitted changes, rather than its commit label alone.
+        release_hasher.update(name + b"\0")
+        if kind == b"file":
+            release_hasher.update(b"file\0" + hashlib.sha256(body).digest())
+        elif kind == b"symlink":
+            release_hasher.update(b"symlink\0" + body)
+        else:
+            release_hasher.update(b"absent\0")
         for part in (name, kind, str(mode).encode(), hashlib.sha256(body).digest()):
             hasher.update(len(part).to_bytes(8, "big"))
             hasher.update(part)
     status = git("status", "--porcelain=v1", "-z", "--untracked-files=all")
     return {"revision": revision, "dirty": bool(status), "tree_sha256": hasher.hexdigest(),
-            "status_sha256": digest(status), "file_count": len(names)}
+            "release_tree_sha256": release_hasher.hexdigest(), "status_sha256": digest(status), "file_count": len(names)}
 
 
 def inventory(output):
@@ -338,21 +387,65 @@ def toolchain_snapshot(root, executor):
     return metadata
 
 
-def run_suite(manifest, root, profile, target_dir, *, executor=invoke, snapshot=source_snapshot):
+def packaged_report(value, *, source, target, version, archive_sha256):
+    fields(value, ("schema", "status", "version", "target", "source_revision", "source_tree_sha256",
+                   "archive_sha256", "candidate_qualification", "transport", "published_signature_verified",
+                   "native_human_approval", "service_registration", "cases", "native_capability"), ("coverage",))
+    require(value["schema"] == "opaque.packaged-acceptance.v1" and value["status"] == "passed", "packaged_runner_did_not_pass")
+    require(value["source_revision"] == source["revision"] and value["version"] == version
+            and value["source_tree_sha256"] == source["release_tree_sha256"], "packaged_source_identity_mismatch")
+    require(value["target"] == target and value["archive_sha256"] == archive_sha256, "packaged_artifact_identity_mismatch")
+    require(value["candidate_qualification"] in ("local_candidate", "build_candidate")
+            and value["transport"] == "controlled_local_archive_via_real_installer", "invalid_packaged_qualification")
+    require(all(value[field] is False for field in ("published_signature_verified", "native_human_approval", "service_registration")),
+            "invalid_packaged_external_claim")
+    require(value["native_capability"] in ("capability_available_no_human_decision", "capability_unavailable_fail_closed"),
+            "invalid_packaged_native_capability")
+    platform_check = ("installed_linux_distinct_uid_and_spoofed_home_denial" if target.endswith("unknown-linux-gnu")
+                      else "installed_macos_relocated_signed_app_runtime")
+    checks = value["cases"]
+    require(isinstance(checks, list) and len(checks) == len(set(checks))
+            and set(checks) == {*PACKAGED_CHECKS, platform_check}, "missing_or_unexpected_packaged_checks")
+    return value
+
+
+def run_suite(manifest, root, profile, target_dir, *, executor=invoke, snapshot=source_snapshot, model_profile=None,
+              packaged_archive=None, packaged_owner_user=None, packaged_peer_user=None, packaged_allow_dirty=False,
+              coverage_input=None):
     validate_manifest(manifest)
     require(profile in (*SOFTWARE, "all"), "unknown_profile")
     selected = set(SOFTWARE if profile == "all" else (profile,))
-    requirements = [r for r in manifest["requirements"] if r["profile"] in selected]
+    requirements = [r for r in manifest["requirements"] if r["profile"] in selected
+                    and sys.platform in r.get("platforms", [sys.platform])]
+    packaged_selected = any(r.get("runner") == "installed-artifacts" for r in requirements)
+    require(packaged_selected or not any((packaged_archive, packaged_owner_user, packaged_peer_user, packaged_allow_dirty)),
+            "packaged_input_without_selected_runner")
     selected_ids = {name for r in requirements for name in r["tests"]}
+    model_tests = {name for r in requirements if r["profile"] == "model" for name in r["tests"]}
+    model_digest = None
+    if model_profile is not None:
+        require(bool(model_tests), "model_input_without_selected_model_test")
+        model_profile = Path(model_profile).absolute()
+        require(model_profile.is_file() and not model_profile.is_symlink()
+                and 0 < model_profile.stat().st_size <= 64 * 1024, "invalid_model_profile_input")
+        model_digest = digest(model_profile.read_bytes())
     tests = [t for t in manifest["tests"] if t["id"] in selected_ids]
     started = time.time()
     try:
         initial = snapshot(root)
     except (Invalid, OSError, ValueError, UnicodeError):
         initial = None
+    coverage = None
+    if coverage_input is not None:
+        import acceptance_coverage
+        require(profile in ("model", "packaged") and initial is not None, "coverage_requires_explicit_native_acceptance_profile")
+        coverage = acceptance_coverage.load(coverage_input, root=root, purpose=profile, source=initial)
     results = {}
+    commands = []
     artifacts = {}
     gates = [] if initial is not None else ["initial_source_unavailable"]
+    if not requirements:
+        gates.append("no_requirements_for_platform")
     try:
         toolchain = toolchain_snapshot(root, executor)
     except (Invalid, OSError, ValueError, UnicodeError):
@@ -371,14 +464,26 @@ def run_suite(manifest, root, profile, target_dir, *, executor=invoke, snapshot=
                 require(not target["root"] or os.geteuid() == 0, "root_required")
                 require(not target.get("requires_sys_ptrace") or has_sys_ptrace(), "sys_ptrace_required")
                 require(all(shutil.which(tool) for tool in ("cargo", "git", *target["tools"])), "tool_unavailable")
-                built = executor(build_argv(target, target_dir), cwd=root, env=environment(),
-                                 timeout=target["build_timeout_seconds"])
-                command_ok(built)
-                binary = artifact(built.output, target, target_dir)
+                if coverage:
+                    require(profile == "model" and target["package"] == "opaqued"
+                            and target["kind"] == "test" and target["name"] == "contained_ssh_e2e",
+                            "coverage_prebuilt_target_mismatch")
+                    require(toolchain["host"] == coverage["target"] and "-nightly" in toolchain["release"],
+                            "coverage_native_toolchain_mismatch")
+                    binary = Path(coverage["objects"]["model-test"]["path"])
+                    require(binary.resolve().is_relative_to(target_dir.resolve()), "coverage_target_directory_mismatch")
+                else:
+                    built = executor(build_argv(target, target_dir), cwd=root, env=environment(),
+                                     timeout=target["build_timeout_seconds"])
+                    command_ok(built)
+                    binary = artifact(built.output, target, target_dir)
                 binary_hash = digest(binary.read_bytes())
                 # Libtest's terse listing omits its inventory-count footer.
                 # The ordinary format lets us reject a truncated listing.
-                listed = executor([str(binary), "--list"], cwd=root, env=run_env, timeout=30)
+                inventory_env = run_env.copy()
+                if coverage:
+                    inventory_env["LLVM_PROFILE_FILE"] = str(Path(temporary) / "inventory-%p-%m-%c.profraw")
+                listed = executor([str(binary), "--list"], cwd=root, env=inventory_env, timeout=30)
                 command_ok(listed)
                 discovered = inventory(listed.output)
                 require(all(case["name"] in discovered for case in cases), "required_test_missing")
@@ -402,7 +507,14 @@ def run_suite(manifest, root, profile, target_dir, *, executor=invoke, snapshot=
                         argv.append("--include-ignored")
                     if case.get("proof"):
                         argv.append("--show-output")
-                    result = executor(argv, cwd=root, env=run_env, timeout=case["timeout_seconds"])
+                    case_env = run_env.copy()
+                    if case["id"] in model_tests:
+                        require(model_profile is not None, "required_real_model_profile_missing")
+                        require(digest(model_profile.read_bytes()) == model_digest, "model_profile_changed")
+                        case_env["OPAQUE_TEST_REAL_MODEL_PROFILE"] = str(model_profile)
+                        if coverage:
+                            case_env.update(acceptance_coverage.environment(coverage))
+                    result = executor(argv, cwd=root, env=case_env, timeout=case["timeout_seconds"])
                     entry.update(executed=True, output_sha256=digest(result.output),
                                  output_bytes=len(result.output), cleanup_forced=result.cleanup_forced)
                     command_ok(result)
@@ -410,11 +522,67 @@ def run_suite(manifest, root, profile, target_dir, *, executor=invoke, snapshot=
                     if case.get("proof") == "task_state_model":
                         entry["proof"] = model_proof(result.output)
                     require(digest(binary.read_bytes()) == binary_hash, "test_artifact_changed")
+                    if case["id"] in model_tests:
+                        require(digest(model_profile.read_bytes()) == model_digest, "model_profile_changed")
                     entry.update(status="passed", reason=None)
                 except (Invalid, OSError, ValueError, UnicodeError) as error:
                     entry.update(status="failed", reason=str(error) if isinstance(error, Invalid) else "test_execution_failed")
                 entry["elapsed_ms"] = round((time.monotonic() - begin) * 1000)
                 results[case["id"]] = entry
+        if packaged_selected:
+            begin = time.monotonic()
+            entry = {"id": "installed-artifacts", "executed": False}
+            try:
+                require(initial is not None and toolchain is not None, "packaged_source_or_toolchain_unavailable")
+                if coverage:
+                    require(toolchain["host"] == coverage["target"] and "-nightly" in toolchain["release"],
+                            "coverage_native_toolchain_mismatch")
+                require(not initial["dirty"] or packaged_allow_dirty, "packaged_clean_source_required")
+                require(toolchain["host"].endswith({"linux": "unknown-linux-gnu", "darwin": "apple-darwin"}.get(sys.platform, "unsupported")),
+                        "packaged_native_target_required")
+                require(packaged_archive is not None, "required_packaged_archive_missing")
+                archive = Path(packaged_archive).absolute()
+                require(archive.is_file() and not archive.is_symlink()
+                        and 0 < archive.stat().st_size <= 2 * 1024**3, "invalid_packaged_archive_input")
+                with archive.open("rb") as stream:
+                    archive_hash = hashlib.file_digest(stream, "sha256").hexdigest()
+                version = tomllib.loads((root / "Cargo.toml").read_text())["workspace"]["package"]["version"]
+                output = Path(temporary) / "packaged-report.json"
+                argv = [sys.executable, "-B", str(root / "tests/packaged/run.py"),
+                        "--archive", str(archive), "--version", version, "--revision", initial["revision"],
+                        "--target", toolchain["host"], "--output", str(output)]
+                for flag, value in (("--owner-user", packaged_owner_user), ("--peer-user", packaged_peer_user)):
+                    if value is not None:
+                        argv.extend([flag, value])
+                if packaged_allow_dirty:
+                    argv.append("--allow-dirty")
+                if coverage:
+                    argv.extend(["--coverage-input", str(coverage_input)])
+                result = executor(argv, cwd=root, env=run_env, timeout=300)
+                entry.update(executed=True, output_sha256=digest(result.output), output_bytes=len(result.output),
+                             cleanup_forced=result.cleanup_forced,
+                             exit_code=result.returncode if result.returncode >= 0 else None,
+                             signal=-result.returncode if result.returncode < 0 else None)
+                if result.returncode != 0:
+                    entry["diagnostic"] = PACKAGED_FAILURES.get(result.output, "unrecognized_packaged_failure")
+                command_ok(result)
+                require(output.is_file() and not output.is_symlink(), "missing_packaged_report")
+                qualified = packaged_report(json_read(output), source=initial, target=toolchain["host"],
+                                            version=version, archive_sha256=archive_hash)
+                if coverage:
+                    require(qualified.get("coverage", {}).get("input_sha256") == acceptance_coverage.digest(coverage_input),
+                            "packaged_coverage_input_not_executed")
+                else:
+                    require("coverage" not in qualified, "unsolicited_packaged_coverage_claim")
+                require(qualified["candidate_qualification"] != "local_candidate" or packaged_allow_dirty,
+                        "packaged_dirty_candidate_not_allowed")
+                with archive.open("rb") as stream:
+                    require(hashlib.file_digest(stream, "sha256").hexdigest() == archive_hash, "packaged_archive_changed")
+                entry.update(status="passed", reason=None, qualification=qualified)
+            except (Invalid, OSError, ValueError, TypeError, KeyError, UnicodeError) as error:
+                entry.update(status="failed", reason=str(error) if isinstance(error, Invalid) else "packaged_execution_failed")
+            entry["elapsed_ms"] = round((time.monotonic() - begin) * 1000)
+            commands.append(entry)
     try:
         final = snapshot(root)
         if initial != final:
@@ -428,31 +596,42 @@ def run_suite(manifest, root, profile, target_dir, *, executor=invoke, snapshot=
             state = "not_selected_external"
         elif requirement["profile"] not in selected:
             state = "not_selected"
+        elif sys.platform not in requirement.get("platforms", [sys.platform]):
+            state = "not_selected_platform"
         elif requirement["status"] == "missing":
             state = "missing"
         elif gates:
             state = "blocked"
+        elif requirement.get("runner") == "installed-artifacts":
+            state = commands[0]["status"]
         elif all(results[name]["status"] == "passed" for name in requirement["tests"]):
             state = "passed"
         else:
             state = "failed"
         requirement_results.append({"id": requirement["id"], "profile": requirement["profile"],
-                                    "status": state, "tests": requirement["tests"]})
-    selected_requirements = [r for r in requirement_results if r["profile"] in selected]
+                                    "status": state, "tests": requirement["tests"],
+                                    **({"runner": requirement["runner"]} if "runner" in requirement else {})})
+    selected_requirements = [r for r in requirement_results if r["profile"] in selected and r["status"] != "not_selected_platform"]
     passed = sum(r["status"] == "passed" for r in selected_requirements)
     return {"schema": "opaque.synthesized-suite-result.v1", "profile": profile,
             "scope": manifest["scope"], "status": "passed" if passed == len(selected_requirements) and not gates else "failed",
             "manifest_sha256": digest(json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()),
             "source_before": initial, "source_after": final, "gates": gates,
+            "model_profile_sha256": model_digest,
+            "instrumented_acceptance_input_sha256": coverage["_input_sha256"] if coverage else None,
             "runtime": {"platform": sys.platform, "architecture": platform.machine(),
                         "effective_uid": os.geteuid(), "rustc": toolchain},
             "started_unix": started, "finished_unix": time.time(), "artifacts": artifacts,
             "tests": [{"id": case["id"], "target": case["target"], "name": case["name"], **results[case["id"]]} for case in tests],
+            "commands": commands,
             "requirements": requirement_results,
             "counts": {"unique_tests_selected": len(tests),
                        "unique_tests_passed": sum(r["status"] == "passed" for r in results.values()),
                        "scenario_executions": sum(r["executed"] for r in results.values()),
                        "scenario_execution_scope": "exact test process invocations; finite model sequences reported separately",
+                       "command_scenarios_selected": len(commands),
+                       "command_scenarios_passed": sum(r["status"] == "passed" for r in commands),
+                       "command_scenario_executions": sum(r["executed"] for r in commands),
                        "selected_requirements": len(selected_requirements), "selected_requirements_passed": passed,
                        "declared_software_requirements": sum(r["profile"] != "external" for r in requirement_results)},
             "coverage": {"scope": "selected requirements in this manifest only",
@@ -468,9 +647,11 @@ def write_reports(report, output):
     cases = []
     for test in report["tests"]:
         cases.append((test["id"], test["status"], test.get("reason"), test["elapsed_ms"] / 1000))
+    for command in report.get("commands", []):
+        cases.append(("command." + command["id"], command["status"], command.get("reason"), command["elapsed_ms"] / 1000))
     represented = {name for r in report["requirements"] if r["status"] in ("failed", "missing", "blocked") for name in r["tests"]}
     for requirement in report["requirements"]:
-        if requirement["status"] in ("missing", "blocked") or (requirement["status"] == "failed" and not represented):
+        if requirement["status"] in ("missing", "blocked") or (requirement["status"] == "failed" and not represented and "runner" not in requirement):
             cases.append(("requirement." + requirement["id"], "failed", requirement["status"], 0))
     for gate in report["gates"]:
         cases.append(("gate." + gate, "failed", gate, 0))
@@ -508,13 +689,23 @@ def main():
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--target-dir", type=Path)
+    parser.add_argument("--model-profile", type=Path,
+                        help="explicit profile produced by the owned real-model service harness; never inherited from the environment")
+    parser.add_argument("--packaged-archive", type=Path, help="explicit trusted native archive for installed-artifacts acceptance")
+    parser.add_argument("--packaged-owner-user", help="existing non-root Linux custody owner in a disposable runner")
+    parser.add_argument("--packaged-peer-user", help="existing distinct non-root Linux peer in a disposable runner")
+    parser.add_argument("--packaged-allow-dirty", action="store_true", help="local candidate only; never release qualification")
+    parser.add_argument("--coverage-input", type=Path, help="explicit collector-built native acceptance input; never inherited")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     manifest = validate_manifest(json_read(args.manifest or root / "tests/synthesized-suite.json"))
     output = args.output or Path(tempfile.gettempdir()) / ("opaque-synthesized-" + os.urandom(8).hex())
     output = safe_output(root, output)
     target = (args.target_dir or Path(os.environ.get("CARGO_TARGET_DIR", str(root / "target")))).resolve()
-    report = run_suite(manifest, root, args.profile, target)
+    report = run_suite(manifest, root, args.profile, target, model_profile=args.model_profile,
+                       packaged_archive=args.packaged_archive, packaged_owner_user=args.packaged_owner_user,
+                       packaged_peer_user=args.packaged_peer_user, packaged_allow_dirty=args.packaged_allow_dirty,
+                       coverage_input=args.coverage_input)
     write_reports(report, output)
     print(json.dumps({"status": report["status"], "profile": args.profile, "counts": report["counts"],
                       "overall_product_coverage": "not_measured", "report_directory": str(output)}))

@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 use clap::Parser;
 use opaque_showcase::server::{App, GatewayConfig, router};
 use std::path::PathBuf;

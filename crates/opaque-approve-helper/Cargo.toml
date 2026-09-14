@@ -15,3 +15,6 @@ libc = { workspace = true }
 objc2 = "0.6.3"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSGeometry"] }
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "NSApplication", "NSAlert", "NSButton", "NSControl", "NSScrollView", "NSTextView", "NSText", "NSTextContainer", "NSView", "NSFont", "NSWindow", "NSRunningApplication", "NSResponder", "NSGraphics", "NSScreen"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }

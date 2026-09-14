@@ -160,6 +160,7 @@ pub async fn submit(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use opaque_core::workstation::{WorkstationChallenge, review_hash};

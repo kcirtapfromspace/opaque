@@ -1,21 +1,16 @@
 //! Explicit executable fixture for the official bws command boundary.
 use super::client::BitwardenClient;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 pub(super) const PROJECT_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 pub(super) const SECRET_ID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 pub(super) const OTHER_ID: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
-pub(super) const TOKEN: &str = "disposable-fixture-token";
 
 pub(super) struct Fixture {
     pub dir: tempfile::TempDir,
     pub executable: PathBuf,
     pub client: BitwardenClient,
-}
-
-fn quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
+    pub token: String,
 }
 
 impl Fixture {
@@ -26,28 +21,16 @@ impl Fixture {
     /// `prefix` is authored test code, never provider/user content.
     pub fn script(prefix: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let executable = dir.path().join("bws-fixture");
-        let p = quote(dir.path().to_str().unwrap());
-        let script = format!(
-            r#"#!/bin/sh
-set -eu
-printf '%s\n' "$@" >> {p}/args
-/bin/cat "$2" > {p}/config
-[ "${{BWS_ACCESS_TOKEN-}}" = '{TOKEN}' ] || exit 9
-[ -z "${{BWS_SERVER_URL-}}" ] || exit 10
-[ -z "${{BWS_CONFIG_FILE-}}" ] || exit 11
-[ -z "${{OPAQUE_BWS_PARENT_ONLY-}}" ] || exit 12
-{prefix}
-case "$9 ${{10}}" in
-  'project list') /bin/cat {p}/projects.json ;;
-  'secret list') /bin/cat {p}/secrets.json ;;
-  'secret get') /bin/cat {p}/secret.json ;;
-  *) exit 13 ;;
-esac
-"#
-        );
-        std::fs::write(&executable, script).unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/bws.sh"
+        ));
+        // The executable is never opened for writing while tests spawn.
+        // Only sidecar data changes, avoiding inherited writer FDs/ETXTBSY.
+        // The client clears ambient env, so its disposable token identifies
+        // this fixture through the actual credential-delivery boundary.
+        let token = format!("disposable-fixture-token:{}", dir.path().to_str().unwrap());
+        std::fs::write(dir.path().join("behavior"), prefix).unwrap();
         std::fs::write(
             dir.path().join("projects.json"),
             serde_json::json!([
@@ -73,6 +56,7 @@ esac
             dir,
             executable,
             client,
+            token,
         }
     }
 

@@ -71,6 +71,7 @@ impl VerifiedPersonaClaims {
     /// Synthetic evidence for daemon integration tests only. Production callers
     /// must use the signed OIDC verifier; this constructor is absent in builds.
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(crate) fn test_claims(
         issuer: &str,
         subject: &str,
@@ -413,6 +414,7 @@ impl IdentityStore {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use std::collections::BTreeSet;

@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -6,10 +8,13 @@ use futures_util::future::{AbortHandle, Abortable, BoxFuture};
 use futures_util::stream::FuturesUnordered;
 use futures_util::{FutureExt, StreamExt};
 
-use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use opaque_mcp::protocol::JsonRpcRequest;
+use opaque_mcp::protocol::{McpLines, parse_request};
+use serde::Serialize;
 use serde_json::json;
 use tokio::io::AsyncWriteExt;
-use tokio_util::codec::{Decoder, FramedRead, LinesCodec, LinesCodecError};
+use tokio_util::codec::FramedRead;
 use tracing::{debug, error, info};
 
 mod daemon_client;
@@ -26,15 +31,6 @@ const fn version_string() -> &'static str {
 // ---------------------------------------------------------------------------
 // MCP JSON-RPC types
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-struct JsonRpcRequest {
-    jsonrpc: String,
-    id: Option<serde_json::Value>,
-    method: String,
-    #[serde(default)]
-    params: serde_json::Value,
-}
 
 #[derive(Debug, Serialize)]
 struct JsonRpcResponse {
@@ -530,42 +526,6 @@ async fn main() {
     info!("opaque-mcp shutting down");
 }
 
-/// Oversized or non-UTF-8 lines are recoverable protocol items. Returning a
-/// decoder error would terminate FramedRead and discard the next valid request.
-type McpLine = Result<String, &'static str>;
-struct McpLines(LinesCodec);
-impl Decoder for McpLines {
-    type Item = McpLine;
-    type Error = std::io::Error;
-
-    fn decode(&mut self, source: &mut bytes::BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        Self::classify(self.0.decode(source))
-    }
-
-    fn decode_eof(
-        &mut self,
-        source: &mut bytes::BytesMut,
-    ) -> Result<Option<Self::Item>, Self::Error> {
-        Self::classify(self.0.decode_eof(source))
-    }
-}
-impl McpLines {
-    fn classify(
-        result: Result<Option<String>, LinesCodecError>,
-    ) -> std::io::Result<Option<McpLine>> {
-        match result {
-            Ok(line) => Ok(line.map(Ok)),
-            Err(LinesCodecError::MaxLineLengthExceeded) => {
-                Ok(Some(Err("MCP frame exceeds the size limit")))
-            }
-            Err(LinesCodecError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData => {
-                Ok(Some(Err("MCP frame is not UTF-8")))
-            }
-            Err(LinesCodecError::Io(error)) => Err(error),
-        }
-    }
-}
-
 /// Keep the reader and control messages independent of potentially slow tool
 /// calls. Pending work is bounded; overload never creates an unbounded queue.
 async fn run_transport(
@@ -574,12 +534,7 @@ async fn run_transport(
     client: DaemonClient,
 ) -> std::io::Result<()> {
     type Completion = (String, Option<JsonRpcResponse>);
-    let mut lines = FramedRead::new(
-        input,
-        McpLines(LinesCodec::new_with_max_length(
-            opaque_core::MAX_FRAME_LENGTH,
-        )),
-    );
+    let mut lines = FramedRead::new(input, McpLines::new());
     let mut pending: FuturesUnordered<BoxFuture<'static, Completion>> = FuturesUnordered::new();
     let mut cancellations: HashMap<String, AbortHandle> = HashMap::new();
     let mut draining = false;
@@ -608,12 +563,11 @@ async fn run_transport(
                     Ok(Err(message)) => Some(JsonRpcResponse::error(None, -32700, message)),
                     Ok(Ok(line)) => {
                         if line.trim().is_empty() { continue; }
-                        match serde_json::from_str::<JsonRpcRequest>(&line) {
-                            Err(_) => Some(JsonRpcResponse::error(None, -32700, "invalid JSON-RPC request")),
+                        match parse_request(line.as_bytes()) {
+                            Err(error) => Some(JsonRpcResponse::error(None, error.code(), error.message())),
                             Ok(request) => {
-                                if request.jsonrpc != "2.0" || request.id.as_ref().is_some_and(|id| !id.is_string() && !id.is_number()) {
-                                    Some(JsonRpcResponse::error(None, INVALID_REQUEST, "invalid JSON-RPC version or request ID"))
-                                } else if request.id.is_none() {
+                                match &request.id {
+                                    None => {
                                     if request.method == "notifications/cancelled"
                                         && let Some(id) = request.params.get("requestId")
                                         && let Some(handle) = cancellations.get(&id.to_string())
@@ -622,8 +576,9 @@ async fn run_transport(
                                         handle.abort();
                                     }
                                     None
-                                } else {
-                                    let key = request.id.as_ref().expect("checked ID").to_string();
+                                    }
+                                    Some(id) => {
+                                    let key = id.to_string();
                                     if cancellations.contains_key(&key) {
                                         Some(JsonRpcResponse::error(request.id, INVALID_REQUEST, "request ID is already in use"))
                                     } else {
@@ -649,6 +604,7 @@ async fn run_transport(
                                             _ => Some(JsonRpcResponse::error(request.id, METHOD_NOT_FOUND, "method not found")),
                                         }
                                     }
+                                }
                                 }
                             }
                         }
@@ -678,6 +634,7 @@ async fn run_transport(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

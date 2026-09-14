@@ -2,6 +2,7 @@
 import copy
 import json
 import os
+import re
 import signal
 from pathlib import Path
 import sys
@@ -36,13 +37,42 @@ class CollectionContracts(unittest.TestCase):
         path.write_bytes(body)
         return path
 
+    def workspace(self, extra=()):
+        names = sorted({path.split("/")[1] for path in collector.REQUIRED_FILES})
+        packages = []
+        for name, kind in [*((name, "lib") for name in names), *extra]:
+            directory = self.root / ("components" if name.startswith("new-") else "crates") / name
+            directory.mkdir(parents=True, exist_ok=True)
+            manifest = directory / "Cargo.toml"
+            manifest.write_text(f'[package]\nname = "{name}"\n')
+            source = directory / "src" / ("main.rs" if kind == "bin" else "lib.rs")
+            source.parent.mkdir(exist_ok=True)
+            source.write_text("fn production() {}\n")
+            packages.append({"id": "workspace:" + name, "name": name, "manifest_path": str(manifest),
+                             "features": {"acceptance": []}, "targets": [{"name": name.replace("-", "_") if kind == "lib" else name,
+                             "kind": [kind], "src_path": str(source), "test": True, "required-features": ["acceptance"]}]})
+        for name in collector.REQUIRED_FILES:
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("fn production_guard() {}\n")
+        metadata = {"workspace_root": str(self.root), "workspace_members": [p["id"] for p in packages],
+                    "workspace_default_members": [packages[0]["id"]], "packages": packages}
+        return metadata, collector.workspace_inventory(metadata, self.root)
+
+    def workspace_run(self, workspace):
+        run = collector.Collector(self.root, self.root, self.target, "cargo-llvm-cov")
+        run.workspace = workspace
+        run.result["coverage_packages"] = [p["name"] for p in workspace]
+        run.result["source_inventory"] = collector.source_inventory(self.root, workspace)
+        return run
+
     def test_linux_requires_existing_split_uid_tests_and_macos_reports_its_own_scope(self):
         linux = collector.selected_cases("linux")
         macos = collector.selected_cases("darwin")
         self.assertEqual(set(linux) - set(macos), {"synthesized_review_e2e"})
         self.assertEqual(len(linux["synthesized_review_e2e"]), 4)
-        self.assertEqual(sum(map(len, linux.values())), 26)
-        self.assertEqual(sum(map(len, macos.values())), 22)
+        self.assertEqual(sum(map(len, linux.values())), 28)
+        self.assertEqual(sum(map(len, macos.values())), 23)
         for cases in (linux, macos):
             self.assertIn("ssh_planning_without_tenant_is_denied_before_provider_io",
                           cases["task_api_e2e"])
@@ -56,7 +86,7 @@ class CollectionContracts(unittest.TestCase):
         contained = collector.selected_cases("linux", True)
         self.assertEqual({key: contained[key] for key in baseline}, baseline)
         self.assertEqual(contained[collector.CONTAINED_TARGET], collector.CONTAINED_CASES)
-        self.assertEqual(sum(map(len, contained.values())), 29)
+        self.assertEqual(sum(map(len, contained.values())), 36)
         self.assertEqual(collector.role_requirements(collector.CONTAINED_TARGET, collector.CONTAINED_CASES[0]),
                          {"test", "daemon", "peer"})
         with self.assertRaisesRegex(suite.Invalid, "contained_profile_requires_linux"):
@@ -108,6 +138,28 @@ class CollectionContracts(unittest.TestCase):
             self.assertFalse(any("runtime-counter-relocation" in flag for flag in macos))
         with self.assertRaisesRegex(suite.Invalid, "invalid_native_page_size"):
             collector.instrumentation_flags("darwin", 1234)
+
+    def test_debug_symbol_settings_preserve_coverage_flags_for_cargo_and_bare_peers(self):
+        with patch.dict(os.environ, {"CARGO_PROFILE_DEV_DEBUG": "2", "CARGO_PROFILE_TEST_DEBUG": "2"}):
+            run = collector.Collector(self.root, self.root, self.target, "cargo-llvm-cov")
+        self.assertEqual(run.env["CARGO_PROFILE_DEV_DEBUG"], "0")
+        self.assertEqual(run.env["CARGO_PROFILE_TEST_DEBUG"], "0")
+        settings = run.result["debug_symbol_settings"]
+        self.assertEqual(settings["cargo_profile_environment"],
+                         {"CARGO_PROFILE_DEV_DEBUG": "0", "CARGO_PROFILE_TEST_DEBUG": "0"})
+        self.assertEqual(settings["rustc_flag"], "-Cdebuginfo=0")
+        for platform in ("linux", "darwin"):
+            flags = collector.instrumentation_flags(platform, 4096)
+            self.assertEqual(flags[:len(collector.BASE_FLAGS)], list(collector.BASE_FLAGS))
+            self.assertIn("-Zcoverage-options=branch", flags)
+            self.assertIn("-Cdebuginfo=0", flags)
+            self.assertFalse(any("strip" in flag or "opt-level" in flag for flag in flags))
+            raw = ("__CARGO_LLVM_COV_RUSTC_WRAPPER=1\nCARGO_LLVM_COV=1\n"
+                   "RUSTC_WRAPPER=/fixture/cargo-llvm-cov\n"
+                   "__CARGO_LLVM_COV_RUSTC_WRAPPER_RUSTFLAGS='"
+                   + "\x1f".join(collector.BASE_FLAGS) + "'\n").encode()
+            parsed = collector.parse_environment(raw, flags)
+            self.assertEqual(parsed["__CARGO_LLVM_COV_RUSTC_WRAPPER_RUSTFLAGS"].split("\x1f"), flags)
 
     def test_show_env_is_parsed_without_shell_evaluation_and_missing_flags_fail(self):
         flags = collector.instrumentation_flags("linux", 4096)
@@ -161,7 +213,7 @@ class CollectionContracts(unittest.TestCase):
 
     def test_test_process_profile_alone_never_qualifies_daemon_collection(self):
         self.profile("test")
-        for target in ("task_api_e2e", "resource_authority_e2e", "mcp_gateway_e2e", "synthesized_review_e2e"):
+        for target in ("task_api_e2e", "resource_authority_e2e", "mcp_gateway_e2e"):
             with self.assertRaisesRegex(suite.Invalid, "missing_required_child_profiles"):
                 collector.profile_inventory(self.root, target)
 
@@ -178,16 +230,226 @@ class CollectionContracts(unittest.TestCase):
         self.assertEqual(len(collector.profile_inventory(self.root, "mcp_gateway_e2e", cases[0])[0]), 3)
 
     def test_split_uid_caller_profiles_require_retained_mapping_objects(self):
+        case = collector.CASES["synthesized_review_e2e"][0]
         for role in ("test", "daemon", "peer"):
             self.profile(role)
         with self.assertRaisesRegex(suite.Invalid, "missing_instrumented_peer_object"):
-            collector.profile_inventory(self.root, "synthesized_review_e2e")
+            collector.profile_inventory(self.root, "synthesized_review_e2e", case)
         peer = self.root / "peer-binary-fixture"
         peer.write_bytes(b"retained caller mapping")
-        profiles, objects = collector.profile_inventory(self.root, "synthesized_review_e2e")
+        profiles, objects = collector.profile_inventory(self.root, "synthesized_review_e2e", case)
         self.assertEqual(objects, [peer])
         self.assertEqual(len(profiles), 3)
         self.assertTrue(all(len(item["sha256"]) == 64 for item in profiles))
+
+    def test_ordinary_oidc_baselines_do_not_claim_ignored_daemon_peer_ceremonies(self):
+        self.profile("test")
+        targets = {"synthesized_review_e2e": collector.CASES["synthesized_review_e2e"],
+                   collector.CONTAINED_TARGET: (*collector.CONTAINED_CASES,
+                       "contained_real_model_completions_require_signed_review_and_survive_restart")}
+        for target, cases in targets.items():
+            profiles, objects = collector.profile_inventory(self.root, target)
+            self.assertEqual({entry["role"] for entry in profiles}, {"test"})
+            self.assertEqual(objects, [])
+            for case in cases:
+                with self.subTest(target=target, case=case), self.assertRaisesRegex(suite.Invalid, "missing_required_child_profiles"):
+                    collector.profile_inventory(self.root, target, case)
+        self.profile("daemon")
+        self.profile("peer")
+        for target, cases in targets.items():
+            with self.assertRaisesRegex(suite.Invalid, "missing_instrumented_peer_object"):
+                collector.profile_inventory(self.root, target, cases[0])
+        (self.root / "peer-binary-fixture").write_bytes(b"retained caller mapping")
+        for target, cases in targets.items():
+            for case in cases:
+                profiles, objects = collector.profile_inventory(self.root, target, case)
+                self.assertEqual({entry["role"] for entry in profiles}, {"test", "daemon", "peer"})
+                self.assertEqual(len(objects), 1)
+
+    def test_workspace_rpc_requires_actual_peer_profile_and_mapping_on_each_platform(self):
+        name = "task_rpc_rechecks_changed_workspace_after_source_read_without_publishing"
+        for native_platform in ("linux", "darwin"):
+            self.assertIn(name, collector.selected_cases(native_platform)["task_api_e2e"])
+        self.profile("test")
+        self.profile("daemon")
+        peer = self.root / "peer-binary-fixture"
+        peer.write_bytes(b"retained caller mapping")
+        with self.assertRaisesRegex(suite.Invalid, "missing_required_child_profiles"):
+            collector.profile_inventory(self.root, "task_api_e2e", name)
+        self.profile("peer")
+        peer.unlink()
+        with self.assertRaisesRegex(suite.Invalid, "missing_instrumented_peer_object"):
+            collector.profile_inventory(self.root, "task_api_e2e", name)
+        peer.symlink_to(self.binary)
+        with self.assertRaisesRegex(suite.Invalid, "invalid_instrumented_peer_object"):
+            collector.profile_inventory(self.root, "task_api_e2e", name)
+        peer.unlink()
+        peer.write_bytes(b"")
+        with self.assertRaisesRegex(suite.Invalid, "invalid_instrumented_peer_object"):
+            collector.profile_inventory(self.root, "task_api_e2e", name)
+        peer.write_bytes(b"retained caller mapping")
+        profiles, objects = collector.profile_inventory(self.root, "task_api_e2e", name)
+        self.assertEqual({entry["role"] for entry in profiles}, {"test", "daemon", "peer"})
+        self.assertEqual(objects, [peer])
+
+    def test_metadata_discovers_every_member_and_nonstandard_bin_only_package(self):
+        metadata, workspace = self.workspace((("new-cli", "bin"), ("new-library", "lib")))
+        inventory = collector.source_inventory(self.root, workspace)
+        self.assertEqual({item["package"] for item in inventory}, {p["name"] for p in metadata["packages"]})
+        self.assertGreater(len(workspace), len(metadata["workspace_default_members"]))
+        self.assertIn("components/new-cli/src/main.rs", {item["path"] for item in inventory})
+        self.assertTrue(all(len(item["sha256"]) == 64 for item in inventory))
+        missing = copy.deepcopy(metadata)
+        missing["packages"].pop()
+        with self.assertRaisesRegex(suite.Invalid, "missing_or_duplicate_workspace_package"):
+            collector.workspace_inventory(missing, self.root)
+        unknown_feature = copy.deepcopy(metadata)
+        unknown_feature["packages"][0]["targets"][0]["required-features"] = ["not-declared"]
+        with self.assertRaisesRegex(suite.Invalid, "undeclared_required_target_features"):
+            collector.workspace_inventory(unknown_feature, self.root)
+        for package in workspace:
+            source = self.root / package["targets"][0]["source"]
+            directory = source.parent
+            directory.rename(directory.with_name("missing-src"))
+            try:
+                with self.assertRaisesRegex(suite.Invalid, "empty_declared_source_package|workspace_runtime_entrypoint_missing_from_scope"):
+                    collector.source_inventory(self.root, workspace)
+            finally:
+                directory.with_name("missing-src").rename(directory)
+
+    def test_workspace_build_requires_all_libraries_bins_and_exact_package_identities(self):
+        binding = patch.object(collector.Collector, "bind_workspace_cache")
+        binding.start()
+        self.addCleanup(binding.stop)
+        metadata, workspace = self.workspace((("new-cli", "bin"),))
+        events = {}
+        for package in metadata["packages"]:
+            target = package["targets"][0]
+            binary = self.target / (package["name"] + "-test")
+            binary.write_bytes(b"compiled mapping fixture")
+            events[package["name"]] = self.event(executable=str(binary), package_id=package["id"],
+                manifest_path=package["manifest_path"], target={"name": target["name"], "kind": target["kind"]})
+        normal_event = json.loads(events["new-cli"])
+        normal_event["profile"]["test"] = False
+        normal = json.dumps(normal_event).encode()
+        for package in metadata["packages"]:
+            run = self.workspace_run(workspace)
+            raw = b"\n".join(event for name, event in events.items() if name != package["name"])
+            with self.subTest(missing=package["name"]), patch.object(run, "command", side_effect=[normal, raw]) as command:
+                with self.assertRaisesRegex(suite.Invalid, "missing_workspace_test_artifacts"):
+                    run.build()
+                for call in command.call_args_list:
+                    self.assertIn("--workspace", call.args[1])
+                    self.assertIn("--all-features", call.args[1])
+                    self.assertNotIn("-p", call.args[1])
+        wrong = json.loads(events["new-cli"])
+        wrong["manifest_path"] = metadata["packages"][0]["manifest_path"]
+        with self.assertRaisesRegex(suite.Invalid, "artifact_workspace_package_mismatch"):
+            collector.artifact_packages(json.dumps(wrong).encode(), {Path(wrong["executable"])}, self.root, workspace)
+        run = self.workspace_run(workspace)
+        with patch.object(run, "command", side_effect=[normal, b"\n".join(events.values())]):
+            run.build()
+        self.assertEqual(set(run.baseline), collector.expected_artifacts(workspace, tests=True))
+        with self.assertRaisesRegex(suite.Invalid, "missing_workspace_binary_artifacts"):
+            collector.validate_workspace_artifacts(workspace, {}, tests=False)
+
+    def test_unbound_cache_cleans_every_metadata_package_and_preserves_other_cache_scopes(self):
+        _metadata, workspace = self.workspace((("new-cli", "bin"),))
+        run = self.workspace_run(workspace)
+        dependency = self.target / "registry-dependency"
+        dependency.write_bytes(b"cached dependency")
+        sibling = self.target / "cli-admin-next"
+        sibling.mkdir()
+        (sibling / "retained").write_bytes(b"separate target")
+        with patch.object(run, "command", return_value=b"") as command:
+            run.bind_workspace_cache()
+        argv = command.call_args.args[1]
+        self.assertEqual(argv[:6], ["cargo", "clean", "--manifest-path", str(self.root / "Cargo.toml"),
+                                   "--target-dir", str(self.target)])
+        self.assertEqual(argv[6::2], ["--package"] * len(workspace))
+        self.assertEqual(argv[7::2], sorted(p["name"] for p in workspace))
+        self.assertEqual(dependency.read_bytes(), b"cached dependency")
+        self.assertEqual((sibling / "retained").read_bytes(), b"separate target")
+        self.assertEqual(run.result["workspace_cache"]["reason"], "unbound_cache")
+        marker = json.loads((self.target / collector.CACHE_BINDING).read_text())
+        self.assertEqual(marker["source_root"], str(self.root))
+        self.assertEqual(marker["workspace_packages"], argv[7::2])
+        self.assertTrue((self.target / "CACHEDIR.TAG").read_bytes().startswith(collector.CACHE_TAG_SIGNATURE))
+
+    def test_same_source_cache_reuses_but_moved_root_or_new_workspace_member_invalidates(self):
+        _metadata, workspace = self.workspace()
+        run = self.workspace_run(workspace)
+        with patch.object(run, "command", return_value=b""):
+            run.bind_workspace_cache()
+        with patch.object(run, "command") as command:
+            run.bind_workspace_cache()
+            command.assert_not_called()
+        self.assertEqual(run.result["workspace_cache"]["status"], "same_source_root_reused")
+        run.root = self.root / "moved-checkout"
+        with patch.object(run, "command", return_value=b"") as command:
+            run.bind_workspace_cache()
+            command.assert_called_once()
+        self.assertEqual(run.result["workspace_cache"]["reason"], "source_root_or_workspace_changed")
+        run.workspace.append({"name": "newly-discovered-package"})
+        with patch.object(run, "command", return_value=b"") as command:
+            run.bind_workspace_cache()
+        self.assertIn("newly-discovered-package", command.call_args.args[1])
+
+    def test_failed_cache_cleanup_never_rebinds_or_builds_workspace_objects(self):
+        _metadata, workspace = self.workspace()
+        run = self.workspace_run(workspace)
+        marker = self.target / collector.CACHE_BINDING
+        previous = {"schema": collector.CACHE_SCHEMA, "source_root": "/previous-checkout",
+                    "workspace_packages": sorted(p["name"] for p in workspace)}
+        marker.write_text(json.dumps(previous))
+        with patch.object(run, "command", side_effect=suite.Invalid("cleanup_failed")) as command:
+            with self.assertRaisesRegex(suite.Invalid, "cleanup_failed"):
+                run.build()
+        command.assert_called_once()
+        self.assertEqual(command.call_args.args[0], "invalidate-workspace-source-cache")
+        self.assertEqual(json.loads(marker.read_text()), previous)
+        self.assertNotIn("workspace_cache", run.result)
+
+    def test_malformed_or_symlink_cache_binding_fails_before_any_cleanup(self):
+        _metadata, workspace = self.workspace()
+        run = self.workspace_run(workspace)
+        marker = self.target / collector.CACHE_BINDING
+        valid = {"schema": collector.CACHE_SCHEMA, "source_root": str(self.root),
+                 "workspace_packages": ["opaque-core"]}
+        for value in ([], {**valid, "schema": "unknown"}, {**valid, "source_root": "relative"},
+                      {**valid, "workspace_packages": ["opaque-core", "opaque-core"]},
+                      {**valid, "workspace_packages": ["--unsafe"]}):
+            marker.write_text(json.dumps(value))
+            with self.subTest(value=value), patch.object(run, "command") as command:
+                with self.assertRaisesRegex(suite.Invalid, "invalid_workspace_cache_binding"):
+                    run.bind_workspace_cache()
+                command.assert_not_called()
+        marker.write_text('{"schema": "one", "schema": "two"}')
+        with self.assertRaisesRegex(suite.Invalid, "invalid_workspace_cache_binding"):
+            run.bind_workspace_cache()
+        marker.unlink()
+        marker.symlink_to(self.binary)
+        with patch.object(run, "command") as command:
+            with self.assertRaisesRegex(suite.Invalid, "symlink_workspace_cache_binding"):
+                run.bind_workspace_cache()
+            command.assert_not_called()
+
+    def test_existing_invalid_cargo_cache_tag_is_never_overwritten_or_cleaned(self):
+        _metadata, workspace = self.workspace()
+        run = self.workspace_run(workspace)
+        tag = self.target / "CACHEDIR.TAG"
+        tag.write_bytes(b"unrelated file")
+        with patch.object(run, "command") as command:
+            with self.assertRaisesRegex(suite.Invalid, "invalid_cargo_cache_tag"):
+                run.bind_workspace_cache()
+            command.assert_not_called()
+        self.assertEqual(tag.read_bytes(), b"unrelated file")
+        tag.unlink()
+        tag.symlink_to(self.binary)
+        with patch.object(run, "command") as command:
+            with self.assertRaisesRegex(suite.Invalid, "symlink_cargo_cache_tag"):
+                run.bind_workspace_cache()
+            command.assert_not_called()
 
     def test_empty_unknown_and_symlink_profiles_fail_before_merge(self):
         for role, contents, reason in (("test", b"", "empty_or_invalid_execution_profile"),
@@ -200,6 +462,140 @@ class CollectionContracts(unittest.TestCase):
         link.symlink_to(self.binary)
         with self.assertRaisesRegex(suite.Invalid, "empty_or_invalid_execution_profile"):
             collector.profile_inventory(self.root, "opaque_core")
+
+    def test_target_names_are_qualified_by_workspace_package_before_collision_checks(self):
+        other = self.target / "other-package-test"
+        other.write_bytes(b"second mapping fixture")
+        first = self.event(package_id="workspace:first")
+        second = self.event(package_id="workspace:second", executable=str(other))
+        selected = collector.artifacts(first + b"\n" + second, self.target, qualified=True)
+        self.assertEqual(set(selected), {("workspace:first", "fixture", "test", True),
+                                         ("workspace:second", "fixture", "test", True)})
+        with self.assertRaisesRegex(suite.Invalid, "missing_compiler_package_id"):
+            collector.artifacts(self.event(), self.target, qualified=True)
+
+    def test_new_ignored_tests_require_reviewed_package_target_and_prerequisite(self):
+        accepted = collector.reviewed_ignored_tests("opaqued", "opaqued", {collector.DAEMON_ROOT_CASE})
+        self.assertIn("irreversible", accepted[collector.DAEMON_ROOT_CASE])
+        for package, target, names in (("opaqued", "opaqued", {"silently_disabled_guard"}),
+                                       ("other-package", "opaqued", {collector.DAEMON_ROOT_CASE}),
+                                       ("opaqued", "other-target", {collector.DAEMON_ROOT_CASE})):
+            with self.assertRaisesRegex(suite.Invalid, "unreviewed_ignored_workspace_tests"):
+                collector.reviewed_ignored_tests(package, target, names)
+        live = collector.reviewed_ignored_tests("opaque-providers", "opaque_providers", {"onepassword::op_cli::tests::live_read_field"})
+        self.assertIn("separate explicit opt-in", next(iter(live.values())))
+
+    def test_zero_test_target_preserves_mapping_inventory_without_a_vacuous_pass(self):
+        zero = collector.ZERO_COUNTER_DIAGNOSTIC + b"\n0 tests, 0 benchmarks\n"
+        self.assertEqual(collector.test_inventory(zero), set())
+        with self.assertRaises(suite.Invalid):
+            suite.inventory(zero)
+        summary = collector.ZERO_COUNTER_DIAGNOSTIC + b"\nrunning 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;\n"
+        with self.assertRaisesRegex(suite.Invalid, "vacuous_or_incomplete_suite_result"):
+            collector.suite_pass(summary, set())
+        run = collector.Collector(self.root, self.root, self.target, "cargo-llvm-cov")
+        (self.root / "profiles").mkdir()
+        run.package_by_binary[self.binary] = "opaque-approver"
+        run.test_inventories[self.binary] = (set(), set())
+        run.objects = {self.binary}
+        with patch.object(run, "command", side_effect=[zero, summary]):
+            run.execute("opaque-approver", self.binary)
+        entry = run.result["executions"][0]
+        self.assertEqual(entry["passed"], 0)
+        self.assertEqual(entry["qualification"], "no_tests_executed")
+        self.assertEqual(entry["counter_diagnostics"], ["no_continuous_counters_in_zero_test_harness"])
+        self.assertEqual(entry["profiles"], [])
+        self.assertIn(self.binary, run.objects)
+
+    def test_only_exact_zero_counter_diagnostic_is_allowed_with_observed_zero_tests(self):
+        self.assertEqual(collector.test_inventory(b"\n0 tests, 0 benchmarks\n"), set())
+        diagnostic = collector.ZERO_COUNTER_DIAGNOSTIC + b"\n"
+        for raw in (diagnostic + b"fixture: test\n1 test, 0 benchmarks\n",
+                    b"LLVM Profile Error: failed to write counters\n0 tests, 0 benchmarks\n",
+                    diagnostic * 2 + b"0 tests, 0 benchmarks\n",
+                    diagnostic + b"unexpected output\n0 tests, 0 benchmarks\n"):
+            with self.subTest(raw=raw), self.assertRaisesRegex(suite.Invalid, "unexpected_llvm_profile_error"):
+                collector.test_inventory(raw)
+        with self.assertRaisesRegex(suite.Invalid, "unexpected_llvm_profile_error"):
+            collector.counter_diagnostics(diagnostic, zero_tests=False)
+        with self.assertRaisesRegex(suite.Invalid, "unexpected_llvm_profile_error"):
+            collector.counter_diagnostics(b"LLVM Profile Error: failed to write counters\n", zero_tests=True)
+
+    def test_named_collection_captures_diagnostics_and_preserves_exact_result_guards(self):
+        name = "split_daemon_custody_and_signature_bound_approver"
+        listing = f"{name}: test\n\n1 test, 0 benchmarks\n".encode()
+        result = b"test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;\n"
+        captured = f"test {name} ... ok\n".encode() + result
+        interleaved = f"test {name} ... audit tail:\nfixture diagnostic\nok\n".encode() + result
+        with self.assertRaisesRegex(suite.Invalid, "missing_or_nonpassing_named_result"):
+            suite.named_pass(interleaved, name)
+        run = collector.Collector(self.root, self.root, self.target, "cargo-llvm-cov")
+        (self.root / "profiles").mkdir()
+        run.package_by_binary[self.binary] = "opaqued"
+        run.test_inventories[self.binary] = ({name}, {name})
+        run.objects = {self.binary}
+        def command(label, argv, env, timeout, test_context=None):
+            if "--list" in argv:
+                return listing
+            self.assertIn("--exact", argv)
+            self.assertIn(name, argv)
+            self.assertIn("--include-ignored", argv)
+            self.assertNotIn("--nocapture", argv)
+            self.assertEqual(test_context, ("opaqued", "trust_domain_e2e", name, {name}))
+            profiles = Path(env["OPAQUE_COVERAGE_PROFILE_DIR"])
+            for role, pid in (("test", 100), ("daemon", 200)):
+                (profiles / f"{role}-{pid}-500-.profraw").write_bytes(b"fixture profile")
+            run.last_command_pid = 100
+            return captured
+        with patch.object(run, "command", side_effect=command):
+            run.execute("trust_domain_e2e", self.binary, name)
+        entry = run.result["executions"][0]
+        self.assertEqual(entry["passed_test_names"], [name])
+        self.assertEqual(entry["passed"], 1)
+        self.assertEqual(entry["additional_profile_process_ids"], [200])
+
+    def test_ignored_only_target_reports_reason_without_child_profile_or_ignored_execution(self):
+        name = collector.CONTAINED_CASES[0]
+        listing = f"{name}: test\n\n1 test, 0 benchmarks\n".encode()
+        summary = (f"test {name} ... ignored, requires marked systemd fixture\n"
+                   "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out;\n").encode()
+        run = collector.Collector(self.root, self.root, self.target, "cargo-llvm-cov")
+        (self.root / "profiles").mkdir()
+        run.package_by_binary[self.binary] = "opaqued"
+        run.test_inventories[self.binary] = ({name}, {name})
+        run.objects = {self.binary}
+        run.result["skipped_tests"] = [{"package": "opaqued", "target": collector.CONTAINED_TARGET,
+                                        "test": name, "executed_by_explicit_profile": False}]
+        with patch.object(run, "command", side_effect=[listing, summary]) as command:
+            run.execute(collector.CONTAINED_TARGET, self.binary)
+        self.assertFalse(any("--include-ignored" in call.args[1] for call in command.call_args_list))
+        self.assertEqual(run.result["executions"][0]["qualification"], "no_tests_executed")
+        self.assertEqual(run.result["skipped_tests"][0]["reason"], "requires marked systemd fixture")
+        self.assertFalse(run.result["skipped_tests"][0]["executed_by_explicit_profile"])
+
+    def test_inherited_child_profiles_preserve_distinct_process_identity_without_forged_roles(self):
+        self.profile("test")
+        (self.root / "test-200-500-.profraw").write_bytes(b"inherited child profile")
+        profiles, _ = collector.profile_inventory(self.root, "other-target")
+        self.assertEqual({p["process_id"] for p in profiles}, {100, 200})
+        self.assertEqual({p["role"] for p in profiles}, {"test"})
+        with self.assertRaisesRegex(suite.Invalid, "missing_required_child_profiles"):
+            collector.profile_inventory(self.root, "trust_domain_e2e")
+
+    def test_unique_test_counts_never_include_repeated_invocations_or_other_package_aliases(self):
+        baseline = {"package": "first-package", "target": "shared", "kind": "lib", "passed": 2,
+                    "passed_test_names": ["first", "second"], "qualification": "passed"}
+        repeated = {**baseline, "passed": 1, "passed_test_names": ["first"]}
+        foreign = {**repeated, "package": "second-package"}
+        binary = {**repeated, "kind": "bin"}
+        zero = {**baseline, "passed": 0, "passed_test_names": [], "qualification": "no_tests_executed"}
+        counts = collector.test_execution_counts([baseline, repeated, foreign, binary, zero],
+            [{"compiled_tests": 5, "non_ignored_tests": 4}], [{"executed_by_explicit_profile": False}])
+        self.assertEqual(counts["unique_passed_tests"], 4)
+        self.assertEqual(counts["passed_test_invocations"], 5)
+        self.assertEqual(counts["repeated_pass_invocations"], 1)
+        self.assertEqual(counts["zero_test_process_invocations"], 1)
+        self.assertEqual(counts["ignored_tests_not_executed"], 1)
 
     def test_suite_results_reject_zero_duplicate_missing_or_new_ignored_tests(self):
         valid = b"test fixture ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;\n"
@@ -215,9 +611,113 @@ class CollectionContracts(unittest.TestCase):
         names = {"passing", *collector.ALLOWED_IGNORED}
         raw = "test passing ... ok\n" + "".join(f"test {name} ... ignored, explicit prerequisite\n"
                                                 for name in sorted(collector.ALLOWED_IGNORED))
-        raw += "test result: ok. 1 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out;\n"
+        raw += f"test result: ok. 1 passed; 0 failed; {len(collector.ALLOWED_IGNORED)} ignored; 0 measured; 0 filtered out;\n"
         self.assertEqual(collector.suite_pass(raw.encode(), names),
                          {"passed": 1, "ignored": sorted(collector.ALLOWED_IGNORED)})
+
+    def coverage_report(self, original_complete):
+        self.coverage_workspace = self.workspace()[1]
+        files = []
+        for name in collector.REQUIRED_FILES:
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("pub fn production_guard() {}\n")
+            original = name in collector.ORIGINAL_REQUIRED_FILES
+            count = 10 if original else 1000
+            covered = count if original == original_complete else count - 1
+            summary = {metric: {"count": count, "covered": covered}
+                       for metric in ("lines", "branches")}
+            files.append({"filename": str(path), "summary": summary})
+        totals = {metric: {key: sum(item["summary"][metric][key] for item in files)
+                          for key in ("count", "covered")}
+                  for metric in ("lines", "branches")}
+        return {"type": "llvm.coverage.json.export", "data": [{"files": files, "totals": totals}]}
+
+    def test_original_scope_export_uses_its_own_counts_and_literal_gate(self):
+        for complete in (True, False):
+            with self.subTest(original_complete=complete):
+                report = self.coverage_report(complete)
+                unchanged = copy.deepcopy(report)
+                raw = json.dumps(report).encode()
+                run = self.workspace_run(self.coverage_workspace)
+                run.result["target"] = "fixture-native-target"
+                run.llvm_cov, run.llvm_profdata = "fixture-cov", "fixture-profdata"
+                def command(label, argv, **options):
+                    if label == "merge-critical":
+                        Path(argv[-1]).write_bytes(b"merged fixture profile")
+                        return b""
+                    self.assertIn(label, {"mapping-inventory-critical", "export-critical"})
+                    if label == "mapping-inventory-critical":
+                        self.assertNotIn("--sources", argv)
+                        self.assertIn("--summary-only", argv)
+                        self.assertFalse(any(arg.startswith("--include-filename-regex") for arg in argv))
+                    else:
+                        self.assertNotIn("--sources", argv)
+                        pattern = next(arg.split("=", 1)[1] for arg in argv if arg.startswith("--include-filename-regex="))
+                        self.assertTrue(all(re.fullmatch(pattern, item["filename"]) for item in report["data"][0]["files"]))
+                        self.assertIsNone(re.fullmatch(pattern, str(self.root / "uninventoried.rs")))
+                    options["export"].write_bytes(raw)
+                    return raw
+                with patch.object(run, "command", side_effect=command):
+                    result = run.export("critical", {self.binary}, [{"path": "fixture.profraw"}])
+                expanded = json.loads((self.root / "coverage-summary.json").read_text())
+                original = json.loads((self.root / "original-scope-summary.json").read_text())
+                self.assertEqual(result["coverage_gate"], "not_evaluated")
+                self.assertEqual(expanded["coverage_packages"], [p["name"] for p in self.coverage_workspace])
+                self.assertEqual(original["coverage_packages"], list(collector.ORIGINAL_PACKAGES))
+                self.assertEqual(original["required_source_files"], sorted(collector.ORIGINAL_REQUIRED_FILES))
+                self.assertEqual(original["status"], "measured")
+                self.assertEqual(expanded["status"], "measured")
+                self.assertEqual(expanded["failures"], [])
+                self.assertEqual(original["thresholds"], {"lines": None, "branches": None})
+                self.assertEqual(original["input_sha256"], expanded["input_sha256"])
+                self.assertEqual(original["target"], "fixture-native-target")
+                for metric in ("lines", "branches"):
+                    self.assertEqual(original["measured"][metric]["count"], 60)
+                    self.assertEqual(original["measured"][metric]["covered"], 60 if complete else 54)
+                    self.assertEqual(original["measured"][metric]["percent"], 100.0 if complete else 90.0)
+                    self.assertEqual(expanded["measured"][metric]["count"], 3060)
+                self.assertEqual(report, unchanged)
+
+    def test_expanded_export_cannot_hide_invalid_totals_by_rebuilding_the_subset(self):
+        report = self.coverage_report(True)
+        report["data"][0]["totals"]["lines"]["covered"] -= 1
+        raw = json.dumps(report).encode()
+        run = self.workspace_run(self.coverage_workspace)
+        run.result["target"] = "fixture-native-target"
+        run.llvm_cov, run.llvm_profdata = "fixture-cov", "fixture-profdata"
+        with patch.object(run, "command", return_value=raw):
+            with self.assertRaisesRegex(collector.gate.CoverageError, "merged totals disagree"):
+                run.export("critical", {self.binary}, [{"path": "fixture.profraw"}])
+        self.assertFalse((self.root / "original-scope-summary.json").exists())
+
+    def test_workspace_export_cannot_omit_a_new_package_even_when_other_packages_are_complete(self):
+        report = self.coverage_report(True)
+        _, workspace = self.workspace((("new-public-api", "lib"),))
+        run = self.workspace_run(workspace)
+        run.result["target"] = "fixture-native-target"
+        run.llvm_cov, run.llvm_profdata = "fixture-cov", "fixture-profdata"
+        rows = collector.workspace_package_coverage(report, run.result["source_inventory"], workspace, self.root)
+        missing = next(row for row in rows if row["package"] == "new-public-api")
+        self.assertEqual(missing["status"], "unqualified_zero_native_mapping")
+        self.assertEqual(missing["measured"]["lines"]["count"], 0)
+        with patch.object(run, "command", return_value=json.dumps(report).encode()):
+            with self.assertRaisesRegex(suite.Invalid, "eligible_workspace_package_missing_native_mapping:new-public-api"):
+                run.export("critical", {self.binary}, [{"path": "fixture.profraw"}])
+        self.assertEqual(run.result["workspace_package_coverage"], rows)
+        self.assertFalse((self.root / "coverage-summary.json").exists())
+
+    def test_metadata_preserves_feature_eligibility_and_explicit_nonruntime_targets(self):
+        metadata, _ = self.workspace((("new-runtime", "bin"),))
+        target = copy.deepcopy(metadata["packages"][-1]["targets"][0])
+        target.update(name="not-runtime", kind=["example"], test=False)
+        metadata["packages"][-1]["targets"].append(target)
+        workspace = collector.workspace_inventory(metadata, self.root)
+        package = next(p for p in workspace if p["name"] == "new-runtime")
+        self.assertEqual(package["features"], ["acceptance"])
+        self.assertEqual(package["targets"][0]["required_features"], ["acceptance"])
+        self.assertFalse(package["targets"][1]["eligible"])
+        self.assertNotIn(("new-runtime", "not-runtime", "example", True), collector.expected_artifacts(workspace, tests=True))
 
     def test_report_scope_cannot_grow_to_other_packages_or_drop_required_handlers(self):
         sources = [{"path": name} for name in collector.REQUIRED_FILES]
@@ -231,6 +731,74 @@ class CollectionContracts(unittest.TestCase):
         report["data"][0]["files"].pop()
         with self.assertRaisesRegex(suite.Invalid, "required_source_missing_from_collection"):
             collector.validate_report_scope(report, sources, self.root)
+
+    def test_shared_runtime_module_tracks_all_packages_without_directory_broadening(self):
+        metadata, workspace = self.workspace((("new-first", "lib"), ("new-second", "bin")))
+        shared = self.root / "assets" / "shared.rs"
+        shared.parent.mkdir()
+        shared.write_text("pub fn shared() {}")
+        shared.with_name("unrelated.rs").write_text("pub fn unrelated() {}")
+        for package in metadata["packages"]:
+            if package["name"].startswith("new-"):
+                Path(package["targets"][0]["src_path"]).write_text(
+                    '#[path="../../../assets/shared.rs"] mod shared;')
+        inventory = collector.source_inventory(self.root, workspace)
+        row = next(item for item in inventory if item["path"] == "assets/shared.rs")
+        self.assertEqual(row["packages"], ["new-first", "new-second"])
+        self.assertTrue(row["required_native_mapping"])
+        self.assertNotIn("assets/unrelated.rs", {item["path"] for item in inventory})
+        report = {"data": [{"files": [{"filename": str(shared), "summary": {
+            metric: {"count": 1, "covered": 1} for metric in ("lines", "branches")}}]}]}
+        counts = collector.workspace_package_coverage(report, inventory, workspace, self.root)
+        for name in ("new-first", "new-second"):
+            package = next(item for item in counts if item["package"] == name)
+            self.assertEqual(package["measured"]["lines"], {"count": 1, "covered": 1})
+            self.assertEqual(package["shared_source_files"], ["assets/shared.rs"])
+        self.assertEqual(len(report["data"][0]["files"]), 1)
+
+    def test_unknown_compiler_mapping_is_rejected_before_filtering_sources(self):
+        report = self.coverage_report(True)
+        inventory = collector.source_inventory(self.root, self.coverage_workspace)
+        unknown = self.root / "assets" / "unfollowed.rs"
+        unknown.parent.mkdir()
+        unknown.write_text("pub fn runtime() {}")
+        report["data"][0]["files"].append({"filename": str(unknown)})
+        with self.assertRaisesRegex(suite.Invalid, "uninventoried_workspace_runtime_mapping:assets/unfollowed.rs"):
+            collector.unfiltered_runtime_mappings(report, inventory, self.coverage_workspace, self.root, self.target)
+        # Harness mappings may exist in test objects, but never join production.
+        report["data"][0]["files"][-1]["filename"] = str(self.root / "crates/opaque-web/tests/fixture.rs")
+        actual = collector.unfiltered_runtime_mappings(report, inventory, self.coverage_workspace, self.root, self.target)
+        self.assertEqual(set(actual), set(collector.REQUIRED_FILES))
+
+    def test_compiler_literal_parent_path_is_retained_for_llvm_source_selection(self):
+        report = self.coverage_report(True)
+        inventory = collector.source_inventory(self.root, self.coverage_workspace)
+        literal = str(self.root / "crates/opaque-web/src/routes/../../../../assets/brand/embedded.rs")
+        report["data"][0]["files"].append({"filename": literal})
+        inventory.append({"path": "assets/brand/embedded.rs"})
+        mappings = collector.unfiltered_runtime_mappings(report, inventory, self.coverage_workspace, self.root, self.target)
+        self.assertEqual(mappings["assets/brand/embedded.rs"], literal)
+
+    def test_distinct_compiler_aliases_of_one_physical_source_fail_instead_of_double_counting(self):
+        report = self.coverage_report(True)
+        inventory = collector.source_inventory(self.root, self.coverage_workspace)
+        first = str(self.root / "crates/opaque-web/src/routes/../../../../assets/shared.rs")
+        second = str(self.root / "assets/shared.rs")
+        report["data"][0]["files"].extend({"filename": name} for name in (first, second))
+        inventory.append({"path": "assets/shared.rs", "packages": ["opaque-web", "opaque-core"]})
+        with self.assertRaisesRegex(suite.Invalid, "unsupported_compiler_source_alias"):
+            collector.unfiltered_runtime_mappings(report, inventory, self.coverage_workspace, self.root, self.target)
+
+    def test_filter_cannot_drop_observed_native_mapping_or_required_shared_source(self):
+        report = self.coverage_report(True)
+        inventory = collector.source_inventory(self.root, self.coverage_workspace)
+        name = "assets/shared.rs"
+        native = {*collector.REQUIRED_FILES, name}
+        conditional = {"path": name, "shared_runtime_source": True}
+        with self.assertRaisesRegex(suite.Invalid, "filtered_report_dropped_native_runtime_mapping"):
+            collector.validate_report_scope(report, [*inventory, conditional], self.root, native)
+        with self.assertRaisesRegex(suite.Invalid, "required_shared_runtime_source_missing_from_collection"):
+            collector.validate_report_scope(report, [*inventory, {**conditional, "required_native_mapping": True}], self.root)
 
     def test_fresh_output_refuses_stale_or_existing_directory(self):
         with self.assertRaises(FileExistsError):
@@ -270,8 +838,82 @@ class CollectionContracts(unittest.TestCase):
             run.command("fixture", [sys.executable, "-c", "raise SystemExit(17)"], timeout=2)
         with self.assertRaisesRegex(suite.Invalid, "command_timeout|process_group_cleanup_denied"):
             run.command("deadline", [sys.executable, "-c", "import time; time.sleep(60)"], timeout=0.1)
+        with self.assertRaises(FileNotFoundError):
+            run.command("missing-tool", [str(self.root / "SECRET_EXECUTABLE_ARGUMENT")])
+        failures = run.result["failed_commands"]
+        self.assertEqual(failures[0]["classification"], "nonzero_exit")
+        self.assertEqual(failures[0]["exit_code"], 17)
+        self.assertEqual(failures[1]["classification"], "deadline_exceeded")
+        self.assertEqual(failures[2]["classification"], "process_start_error")
+        self.assertEqual(failures[2]["os_error_number"], 2)
+        self.assertNotIn("SECRET_EXECUTABLE_ARGUMENT", json.dumps(failures))
         for path in self.root.glob("command-*.log"):
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_failure_metadata_keeps_only_known_test_names_and_local_source_locations(self):
+        source = self.root / "crates/fixture/tests/gateway.rs"
+        source.parent.mkdir(parents=True)
+        source.write_text("// known fixture source\n")
+        log = self.root / "command-001.log"
+        log.write_text("test actual_guard ... FAILED\n"
+            "test SECRET_SESSION_VALUE ... FAILED\n"
+            "thread 'actual_guard' (123) panicked at crates/fixture/tests/gateway.rs:42:9:\n"
+            "assertion `left == right` failed\n  left: SECRET_PAYLOAD\n right: bearer SECRET_TOKEN\n"
+            "thread 'SECRET_SESSION_VALUE' panicked at crates/fixture/tests/gateway.rs:1:1:\n"
+            "thread 'actual_guard' panicked at /private/SECRET_PATH.rs:8:2:\n"
+            "private URL https://secret.invalid/?token=SECRET_URL\nText file busy (os error 26)\n")
+        report = collector.command_failure_metadata("execute-gateway", log, classification="nonzero_exit",
+            returncode=101, root=self.root, test_context=("fixture", "gateway", None, {"actual_guard"}))
+        self.assertEqual(report["failed_tests"], ["actual_guard"])
+        self.assertEqual(report["panic_locations"], [{"test": "actual_guard", "source": "crates/fixture/tests/gateway.rs",
+                                                      "line": 42, "column": 9}])
+        self.assertEqual(report["failure_indicators"], ["assertion_failed"])
+        self.assertEqual(report["observed_os_error_numbers"], [26])
+        self.assertNotIn("SECRET", json.dumps(report))
+        self.assertNotIn("https://", json.dumps(report))
+        self.assertIn("SECRET_PAYLOAD", log.read_text())
+        source.unlink()
+        source.symlink_to(Path(__file__).resolve())
+        report = collector.command_failure_metadata("execute-gateway", log, classification="nonzero_exit",
+            root=self.root, test_context=("fixture", "gateway", None, {"actual_guard"}))
+        self.assertEqual(report["panic_locations"], [])
+        with self.assertRaisesRegex(suite.Invalid, "invalid_failure_requested_test"):
+            collector.command_failure_metadata("fixture", log, classification="nonzero_exit", root=self.root,
+                test_context=("fixture", "gateway", "unvalidated_test", {"actual_guard"}))
+        with self.assertRaisesRegex(suite.Invalid, "invalid_failure_test_identity"):
+            collector.command_failure_metadata("fixture", log, classification="nonzero_exit", root=self.root,
+                test_context=("https://SECRET", "gateway", None, {"actual_guard"}))
+
+    def test_python_failure_diagnostics_omit_exception_payload_and_external_frames(self):
+        source = self.root / "tests/packaged/build.py"
+        source.parent.mkdir(parents=True)
+        source.write_text("# known package builder\n")
+        log = self.root / "command-002.log"
+        log.write_text(f'  File "{source}", line 37, in main\n'
+            '  File "/outside/SECRET_PATH.py", line 123, in run\n'
+            "fatal: detected dubious ownership in repository at '/private/SECRET_CHECKOUT'\n"
+            "subprocess.CalledProcessError: command SECRET_ARGUMENT returned non-zero exit status 128\n"
+            "ValueError: release source must be clean; --allow-dirty creates a local candidate only\n")
+        report = collector.command_failure_metadata("build-instrumented-package", log,
+            classification="nonzero_exit", returncode=1, root=self.root)
+        self.assertEqual(report["python_locations"], [{"source": "tests/packaged/build.py", "line": 37}])
+        self.assertEqual(report["python_exception_classes"], ["CalledProcessError", "ValueError"])
+        self.assertEqual(report["failure_indicators"], ["git_checkout_ownership_rejected", "release_source_dirty"])
+        self.assertNotIn("SECRET", json.dumps(report))
+        self.assertNotIn("test_context", report)
+
+    def test_failure_diagnostic_windows_are_bounded_without_echoing_untrusted_output(self):
+        log = self.root / "command-003.log"
+        log.write_bytes(b"SECRET_FILLER" * 65536 + b"\ntest actual_guard ... FAILED\n")
+        report = collector.command_failure_metadata("invalid SECRET label", log,
+            classification="process_signal", returncode=-9, root=self.root,
+            test_context=("fixture", "gateway", None, {"actual_guard"}))
+        self.assertTrue(report["diagnostic_window_truncated"])
+        self.assertEqual(report["failed_tests"], ["actual_guard"])
+        self.assertEqual(report["signal"], 9)
+        self.assertEqual(report["command"], "unrecognized")
+        self.assertNotIn("SECRET", json.dumps(report))
+        self.assertLess(len(json.dumps(report)), 2000)
 
 
 if __name__ == "__main__":

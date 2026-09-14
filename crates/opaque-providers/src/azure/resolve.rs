@@ -75,6 +75,7 @@ impl SecretResolver for AzureResolver {
     }
 }
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     #[test]

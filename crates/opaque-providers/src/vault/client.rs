@@ -123,6 +123,7 @@ fn scalar_field_value(value: &serde_json::Value) -> Option<String> {
 
 /// Extract a string field from KV v1/v2 style response payloads.
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn extract_field_value(body: &serde_json::Value, field: &str) -> Option<String> {
     // KV v2 style: { "data": { "data": { <field>: <value> } } }
     if let Some(v2) = body
@@ -239,6 +240,7 @@ impl VaultClient {
 
     /// Create a client at custom base URL (for tests).
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn with_base_url(base_url: String) -> Self {
         let http = reqwest::Client::builder()
             .user_agent(Self::user_agent())
@@ -486,6 +488,7 @@ impl Default for VaultClient {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use wiremock::matchers::{body_json, header, method, path, query_param};

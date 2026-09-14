@@ -47,6 +47,7 @@ pub fn peer_uid_allowed(peer_uid: u32, daemon_uid: u32, enforce: bool) -> bool {
 /// each is logged, making the daemon's actual security posture visible
 /// without breaking shared-uid developer setups.
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub fn startup_custody_check(
     enforce: bool,
     home: &Path,
@@ -319,6 +320,7 @@ pub fn apply_socket_group(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

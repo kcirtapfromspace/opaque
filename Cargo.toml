@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+  "crates/opaque-policy-kernel",
   "crates/opaque-core",
   "crates/opaque-native-approval",
   "crates/opaque-providers",
@@ -27,6 +28,7 @@ members = [
 # Use `cargo build --workspace` / `cargo test --workspace`, or
 # `cargo build -p opaque-showcase`, to include it explicitly.
 default-members = [
+  "crates/opaque-policy-kernel",
   "crates/opaque-core",
   "crates/opaque-native-approval",
   "crates/opaque-providers",

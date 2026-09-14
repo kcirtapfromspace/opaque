@@ -17,6 +17,9 @@ use serde_json::{Value, json};
 #[path = "support/oidc.rs"]
 mod oidc;
 use oidc::{Counts, MockOidc, TestIdentity};
+#[cfg(coverage_nightly)]
+#[path = "support/coverage.rs"]
+mod coverage;
 const CLIENT_ID: &str = "opaque-e2e";
 
 /// Each test spawns a real daemon + a wiremock IdP + reqwest clients; running
@@ -86,6 +89,8 @@ impl TestDaemon {
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
+        #[cfg(coverage_nightly)]
+        coverage::subprocess(&mut cmd, "daemon");
         let child = cmd.spawn().expect("spawn opaqued");
 
         let sock = runtime_dir.join("opaque").join("opaqued.sock");
@@ -818,4 +823,242 @@ async fn login_rejects_replayed_code_after_logout_without_restoring_session() {
         }
     );
     assert_no_session_and_sanitized_failure(daemon, &failed, &code, 1).await;
+}
+
+/// Qualify actual CLI wrapping and pinned attestation against a real daemon,
+/// synthetic signed OIDC issuer and durable identity/audit databases. Approval
+/// is explicitly the guarded test backend, never claimed as native consent.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn cli_wrapping_revokes_durable_delegations_and_verifies_pinned_attestation() {
+    let _serial = serial_guard();
+    let cli = Path::new(env!("CARGO_BIN_EXE_opaqued"))
+        .with_file_name("opaque")
+        .canonicalize()
+        .expect("build workspace binaries before identity E2E: cargo build --workspace --bins");
+    let idp = MockOidc::start(CLIENT_ID).await;
+    let top = format!(
+        "enforce_agent_sessions = true\napproval_backend = \"insecure_auto_approve\"\n[[known_human_clients]]\nname = \"actual-cli\"\nexe_path = {}",
+        serde_json::to_string(cli.to_str().unwrap()).unwrap()
+    );
+    let daemon = TestDaemon::spawn_with_env(
+        &identity_config_with(&idp.uri(), &top),
+        &[("OPAQUE_INSECURE_AUTO_APPROVE", "1")],
+    );
+    let login = drive_login(&daemon, &idp, "cli@example.com", None).await;
+    assert_eq!(login["status"], "complete");
+    let command = || {
+        let mut cmd = Command::new(&cli);
+        cmd.env_clear()
+            .env("HOME", daemon.home.as_ref().unwrap().path())
+            .env("PATH", "/usr/bin:/bin")
+            .env("NO_COLOR", "1")
+            .env("PRIVATE_SENTINEL", "must-not-reach-child")
+            .args(["--socket", daemon.sock.to_str().unwrap(), "--json"]);
+        #[cfg(coverage_nightly)]
+        {
+            coverage::subprocess(&mut cmd, "peer");
+        }
+        let mut cmd = tokio::process::Command::from(cmd);
+        cmd.kill_on_drop(true);
+        cmd
+    };
+    for (args, code) in [
+        (
+            vec![
+                "agent",
+                "run",
+                "--",
+                "/bin/sh",
+                "-c",
+                "test -z \"$PRIVATE_SENTINEL\" && test -n \"$OPAQUE_SESSION_TOKEN\" && test -n \"$OPAQUE_AGENT_SESSION_ID\" || exit 90; exit 17",
+            ],
+            17,
+        ),
+        (
+            vec!["agent", "run", "--", "/definitely/missing/opaque-agent"],
+            1,
+        ),
+    ] {
+        let output = tokio::time::timeout(Duration::from_secs(20), command().args(args).output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(code),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            daemon.call_ok("agent_session_list", Value::Null).await["count"],
+            0
+        );
+        let records = daemon
+            .call_ok("identity.delegation_list", Value::Null)
+            .await;
+        assert!(
+            records["delegations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| !row["revoked_at"].is_null())
+        );
+    }
+    // A readiness marker, not elapsed time, establishes that the actual child
+    // is running and the delegation is active before terminating its wrapper.
+    let marker = daemon.home.as_ref().unwrap().path().join("child.pid");
+    let mut wrapper = command()
+        .args([
+            "agent",
+            "run",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo $$ > \"$1\"; exec /bin/sleep 60",
+            "opaque-test",
+        ])
+        .arg(&marker)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !marker.exists() {
+        assert!(
+            wrapper.try_wait().unwrap().is_none(),
+            "wrapper exited before child readiness"
+        );
+        assert!(Instant::now() < deadline, "child readiness deadline");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let child_pid: i32 = std::fs::read_to_string(&marker)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        daemon.call_ok("agent_session_list", Value::Null).await["count"],
+        1
+    );
+    unsafe {
+        assert_eq!(libc::kill(wrapper.id().unwrap() as i32, libc::SIGTERM), 0);
+    }
+    let output = tokio::time::timeout(Duration::from_secs(10), wrapper.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(128 + libc::SIGTERM),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        unsafe { libc::kill(child_pid, 0) },
+        -1,
+        "wrapped child survived termination"
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+    assert_eq!(
+        daemon.call_ok("agent_session_list", Value::Null).await["count"],
+        0
+    );
+
+    // Pin comes from the fixture's isolated custody file, independently of the
+    // report being verified. No runtime key bytes are logged or retained.
+    let bytes = std::fs::read(
+        daemon
+            .home
+            .as_ref()
+            .unwrap()
+            .path()
+            .join(".opaque/attestation.key"),
+    )
+    .unwrap();
+    let signing = ed25519_dalek::SigningKey::from_bytes(&bytes.try_into().unwrap());
+    let pin: String = signing
+        .verifying_key()
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let output = tokio::time::timeout(
+        Duration::from_secs(15),
+        command().args(["attest", "--key", &pin]).output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let verdict: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(verdict["verified"], true);
+    assert_eq!(verdict["key_pinned"], true);
+    assert_eq!(verdict["healthy"], true);
+    assert_eq!(
+        verdict["release_eligible"], false,
+        "session mode must not qualify key release"
+    );
+    let records = daemon
+        .call_ok("identity.delegation_list", Value::Null)
+        .await;
+    assert_eq!(records["delegations"].as_array().unwrap().len(), 3);
+    assert!(
+        records["delegations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| !row["revoked_at"].is_null())
+    );
+    let (audit, _home) = daemon.shutdown();
+    let identity = rusqlite::Connection::open_with_flags(
+        audit.with_file_name("identity.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let (total, active): (u64, u64) = identity
+        .query_row(
+            "SELECT COUNT(*), SUM(revoked_at IS NULL) FROM delegations",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (total, active),
+        (3, 0),
+        "revocation must survive connection teardown and database reopen"
+    );
+    assert!(opaque_core::audit::verify_audit_chain(&audit).unwrap().ok);
+    let events =
+        opaque_core::audit::query_audit_db(&audit, &opaque_core::audit::AuditFilter::default())
+            .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.kind.to_string() == "delegation.issued")
+            .count(),
+        3
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.operation.as_deref() == Some("agent_session_end")
+                && e.kind == opaque_core::audit::AuditEventKind::OperationSucceeded)
+            .count(),
+        3
+    );
+    assert!(
+        events
+            .iter()
+            .filter_map(|e| e.approver.as_ref())
+            .all(|a| a.source == opaque_core::audit::ApproverSource::InsecureAutoApprove)
+    );
 }

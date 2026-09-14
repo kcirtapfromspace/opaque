@@ -186,6 +186,7 @@ pub fn demo_sessions() -> Vec<serde_json::Value> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

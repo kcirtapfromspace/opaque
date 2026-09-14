@@ -1,7 +1,6 @@
 //! Coverage-only collection for real fixture subprocesses. Normal test and
 //! production binaries never compile this module or inherit these settings.
 
-#[cfg(target_os = "linux")]
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -36,8 +35,7 @@ pub fn subprocess(command: &mut Command, role: &str) {
 /// A bare rustc fixture must use the collector's exact compiler and flags.
 /// Cargo does not instrument ad-hoc rustc invocations automatically. Retain
 /// the resulting mapping object before the fixture's temporary tree is gone.
-#[cfg(target_os = "linux")]
-#[allow(dead_code)] // Only split-UID fixtures compile a separate peer binary.
+#[allow(dead_code)] // Only subprocess-peer fixtures compile a separate binary.
 pub fn compile_peer(source: &Path, output: &Path) {
     let compiler = PathBuf::from(
         std::env::var_os("OPAQUE_COVERAGE_RUSTC")

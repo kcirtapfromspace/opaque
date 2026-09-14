@@ -460,7 +460,13 @@ pub async fn handle_end(
         sessions.retain(|_, s| s.created_by_uid != identity.uid);
         let ended_count = before.saturating_sub(sessions.len());
         drop(sessions);
-        revoke_delegations(state, identity, client_type, &ended_delegations);
+        if revoke_delegations(state, identity, client_type, &ended_delegations).is_err() {
+            return Response::err(
+                Some(req.id),
+                "revocation_failed",
+                "local sessions were removed, but durable revocation could not be confirmed",
+            );
+        }
         emit_daemon_method_audit(
             state,
             AuditEventKind::OperationSucceeded,
@@ -518,8 +524,14 @@ pub async fn handle_end(
 
     let removed = sessions.remove(session_id);
     drop(sessions);
-    if let Some(d) = removed.as_ref().and_then(|s| s.delegation.clone()) {
-        revoke_delegations(state, identity, client_type, &[d]);
+    if let Some(d) = removed.as_ref().and_then(|s| s.delegation.clone())
+        && revoke_delegations(state, identity, client_type, &[d]).is_err()
+    {
+        return Response::err(
+            Some(req.id),
+            "revocation_failed",
+            "the local session was removed, but durable revocation could not be confirmed",
+        );
     }
     let label = removed.as_ref().and_then(|s| s.label.clone());
     let status = if removed.is_some() {

@@ -248,7 +248,9 @@ impl OperationHandler for BitwardenHandler {
 // ---------------------------------------------------------------------------
 
 #[cfg(all(test, unix))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod test_support;
 #[cfg(all(test, unix))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "handler_tests.rs"]
 mod tests;

@@ -354,6 +354,7 @@ impl TaskStore {
     }
 
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn list(&self, owner: &str, now: i64) -> Result<Vec<TaskRecord>, TaskStoreError> {
         validate_owner(owner)?;
         self.validate_owner_boundary(owner)?;
@@ -2577,6 +2578,350 @@ mod tests {
             assert!(
                 restarted.claim(&task.id, &owner, NOW + 2).is_err(),
                 "{mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_readonly_and_full_errors_preserve_charges_and_atomic_rows() {
+        let (directory, store) = fixture();
+        let task = approved(&store, 2);
+        store
+            .reserve_slot(&task.id, OWNER, &task.slots[0].id, "charged-before-io", NOW)
+            .unwrap();
+        let charged = store.get(&task.id, OWNER, NOW).unwrap();
+        let encoded_before: String = store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT record FROM bounded_tasks WHERE id=?1",
+                [&task.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        store
+            .connection()
+            .unwrap()
+            .execute_batch("PRAGMA query_only=ON")
+            .unwrap();
+        // SQLite itself rejects writes: no substituted TaskStore errors, error
+        // hooks, elevated-user permission assumptions or filesystem mutation.
+        let failures = [
+            store
+                .reserve_slot(&task.id, OWNER, &task.slots[1].id, "not-charged", NOW)
+                .map(|_| ()),
+            store
+                .finalize_slot(
+                    &task.id,
+                    OWNER,
+                    &task.slots[0].id,
+                    "charged-before-io",
+                    accepted(),
+                    NOW,
+                )
+                .map(|_| ()),
+            store.revoke(&task.id, OWNER, NOW).map(|_| ()),
+            store.create(OWNER, manifest(1), NOW).map(|_| ()),
+        ];
+        for result in failures {
+            assert!(
+                matches!(result, Err(TaskStoreError::Sqlite(rusqlite::Error::SqliteFailure(error, _)))
+                if error.code == rusqlite::ErrorCode::ReadOnly)
+            );
+        }
+        store
+            .connection()
+            .unwrap()
+            .execute_batch("PRAGMA query_only=OFF")
+            .unwrap();
+        let (page_limit, page_count): (i64, i64) = {
+            let connection = store.connection().unwrap();
+            let limit = connection
+                .query_row("PRAGMA max_page_count", [], |r| r.get(0))
+                .unwrap();
+            let pages = connection
+                .query_row("PRAGMA page_count", [], |r| r.get(0))
+                .unwrap();
+            (limit, pages)
+        };
+        store
+            .connection()
+            .unwrap()
+            .pragma_update(None, "max_page_count", page_count)
+            .unwrap();
+        // A maximal valid manifest requires new pages. Exhaust only this
+        // connection's SQLite page budget, never the host filesystem.
+        let full = store.create(OWNER, manifest(32), NOW);
+        assert!(
+            matches!(full, Err(TaskStoreError::Sqlite(rusqlite::Error::SqliteFailure(error, _)))
+            if error.code == rusqlite::ErrorCode::DiskFull)
+        );
+        store
+            .connection()
+            .unwrap()
+            .pragma_update(None, "max_page_count", page_limit)
+            .unwrap();
+        let connection = store.connection().unwrap();
+        let rows: i64 = connection
+            .query_row("SELECT count(*) FROM bounded_tasks", [], |r| r.get(0))
+            .unwrap();
+        let encoded_after: String = connection
+            .query_row(
+                "SELECT record FROM bounded_tasks WHERE id=?1",
+                [&task.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "failed create published a partial authority row");
+        assert_eq!(
+            encoded_after, encoded_before,
+            "storage errors changed a committed charge"
+        );
+        drop(connection);
+        assert_eq!(store.get(&task.id, OWNER, NOW).unwrap(), charged);
+        // The identical large request succeeds after removing the page limit;
+        // the negative control did not rely on a malformed manifest.
+        let control = store.create(OWNER, manifest(32), NOW).unwrap();
+        assert_eq!(control.state, TaskState::Planned);
+        drop(store);
+        let reopened = TaskStore::open(&directory.path().join("tasks.sqlite3")).unwrap();
+        let recovered = reopened.get(&task.id, OWNER, NOW).unwrap();
+        let mut expected = charged;
+        expected.state = TaskState::Partial;
+        expected.slots[0].state = SlotState::Unknown;
+        expected.slots[0].outcome = Some(SlotOutcome {
+            state: SlotState::Unknown,
+            code: "interrupted".into(),
+            provider_run_id: None,
+            inference_receipt: None,
+            ssh_receipt: None,
+        });
+        assert_eq!(recovered, expected);
+        assert_eq!(reopened.get(&control.id, OWNER, NOW).unwrap(), control);
+        for slot in &recovered.slots {
+            assert!(matches!(
+                reopened.reserve_slot(&task.id, OWNER, &slot.id, "retry", NOW),
+                Err(TaskStoreError::NotApproved)
+            ));
+        }
+        assert_eq!(reopened.get(&task.id, OWNER, NOW).unwrap(), recovered);
+    }
+
+    #[test]
+    fn killed_writer_recovers_committed_charges_and_discards_uncommitted_rows() {
+        use std::io::Write;
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{Child, Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        const CHILD_DIRECTORY: &str = "OPAQUE_TASKSTORE_CRASH_TEST_DIRECTORY";
+        const CHILD_PHASE: &str = "OPAQUE_TASKSTORE_CRASH_TEST_PHASE";
+        const TEST_NAME: &str = "task_store::tests::killed_writer_recovers_committed_charges_and_discards_uncommitted_rows";
+
+        fn ready(directory: &Path, committed: &TaskRecord) -> ! {
+            let path = directory.join("ready.tmp");
+            let mut file = File::create(&path).unwrap();
+            file.write_all(&serde_json::to_vec(committed).unwrap())
+                .unwrap();
+            file.sync_all().unwrap();
+            std::fs::rename(path, directory.join("ready.json")).unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+
+        if let Some(directory) = std::env::var_os(CHILD_DIRECTORY) {
+            let directory = std::path::PathBuf::from(directory);
+            let phase = std::env::var(CHILD_PHASE).unwrap();
+            let path = directory.join("tasks.sqlite3");
+            let store = TaskStore::open(&path).unwrap();
+            let task = approved(&store, 3);
+            store
+                .reserve_slot(&task.id, OWNER, &task.slots[0].id, "finished", NOW)
+                .unwrap();
+            store
+                .finalize_slot(
+                    &task.id,
+                    OWNER,
+                    &task.slots[0].id,
+                    "finished",
+                    accepted(),
+                    NOW + 1,
+                )
+                .unwrap();
+            store
+                .reserve_slot(&task.id, OWNER, &task.slots[1].id, "inflight", NOW + 1)
+                .unwrap();
+            if phase == "committed-revoke" {
+                store.revoke(&task.id, OWNER, NOW + 2).unwrap();
+            }
+            let committed = store.get(&task.id, OWNER, NOW + 2).unwrap();
+            if phase.starts_with("uncommitted-") {
+                // These are deliberate pre-commit SQLite faults. The actual
+                // TaskStore reservation above is committed; only this valid
+                // candidate update is uncommitted when the process is killed.
+                let mut candidate = committed.clone();
+                if phase == "uncommitted-finalize" {
+                    candidate.slots[1].state = SlotState::ApiAccepted;
+                    candidate.slots[1].finished_at = Some(NOW + 2);
+                    candidate.slots[1].outcome = Some(accepted());
+                } else {
+                    assert_eq!(phase, "uncommitted-reserve-and-revoke");
+                    candidate.slots[2].state = SlotState::Reserved;
+                    candidate.slots[2].request_id = Some("uncommitted".into());
+                    candidate.slots[2].reserved_at = Some(NOW + 2);
+                    candidate.state = TaskState::Revoked;
+                }
+                verify_record(&candidate).unwrap();
+                let mut connection = store.connection().unwrap();
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .unwrap();
+                save_record(&transaction, &candidate).unwrap();
+                transaction.cache_flush().unwrap();
+                assert!(
+                    std::fs::metadata(directory.join("tasks.sqlite3-journal"))
+                        .unwrap()
+                        .len()
+                        > 512
+                );
+                let visible: String = transaction
+                    .query_row(
+                        "SELECT record FROM bounded_tasks WHERE id=?1",
+                        [&task.id],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    serde_json::from_str::<TaskRecord>(&visible).unwrap(),
+                    candidate
+                );
+                ready(&directory, &committed);
+            }
+            assert!(matches!(
+                phase.as_str(),
+                "committed-reserve" | "committed-revoke"
+            ));
+            ready(&directory, &committed);
+        }
+
+        struct OwnedChild(Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        for phase in [
+            "committed-reserve",
+            "committed-revoke",
+            "uncommitted-finalize",
+            "uncommitted-reserve-and-revoke",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let log = File::create(directory.path().join("child.log")).unwrap();
+            let mut child = OwnedChild(
+                Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
+                    .env(CHILD_DIRECTORY, directory.path())
+                    .env(CHILD_PHASE, phase)
+                    .stdin(Stdio::null())
+                    .stdout(log.try_clone().unwrap())
+                    .stderr(log)
+                    .spawn()
+                    .unwrap(),
+            );
+            let ready_path = directory.path().join("ready.json");
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !ready_path.exists() {
+                assert!(
+                    child.0.try_wait().unwrap().is_none(),
+                    "child exited before {phase}: {}",
+                    std::fs::read_to_string(directory.path().join("child.log")).unwrap()
+                );
+                assert!(Instant::now() < deadline, "child did not reach {phase}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let committed: TaskRecord =
+                serde_json::from_slice(&std::fs::read(ready_path).unwrap()).unwrap();
+            let path = directory.path().join("tasks.sqlite3");
+            assert!(
+                matches!(TaskStore::open(&path), Err(TaskStoreError::Locked)),
+                "live child writer must stay exclusive: {phase}"
+            );
+            child.0.kill().unwrap();
+            assert_eq!(
+                child.0.wait().unwrap().signal(),
+                Some(libc::SIGKILL),
+                "not an actual abrupt process death: {phase}"
+            );
+            if phase.starts_with("uncommitted-") {
+                assert!(
+                    std::fs::metadata(directory.path().join("tasks.sqlite3-journal"))
+                        .unwrap()
+                        .len()
+                        > 512
+                );
+            }
+            let reopened = TaskStore::open(&path).unwrap();
+            let recovered = reopened.get(&committed.id, OWNER, NOW + 3).unwrap();
+            let mut expected = committed.clone();
+            expected.state = if phase == "committed-revoke" {
+                TaskState::Revoked
+            } else {
+                TaskState::Partial
+            };
+            expected.slots[1].state = SlotState::Unknown;
+            expected.slots[1].outcome = Some(SlotOutcome {
+                state: SlotState::Unknown,
+                code: "interrupted".into(),
+                provider_run_id: None,
+                inference_receipt: None,
+                ssh_receipt: None,
+            });
+            assert_eq!(
+                recovered, expected,
+                "committed evidence changed or pre-commit data escaped: {phase}"
+            );
+            for slot in &recovered.slots {
+                assert!(
+                    reopened
+                        .reserve_slot(&committed.id, OWNER, &slot.id, "retry", NOW + 3)
+                        .is_err()
+                );
+                assert!(
+                    reopened
+                        .authorize_dispatch(
+                            &committed.id,
+                            OWNER,
+                            &slot.id,
+                            slot.request_id.as_deref().unwrap_or("never-reserved"),
+                            NOW + 3
+                        )
+                        .is_err()
+                );
+                assert!(matches!(
+                    reopened.finalize_slot(
+                        &committed.id,
+                        OWNER,
+                        &slot.id,
+                        slot.request_id.as_deref().unwrap_or("never-reserved"),
+                        accepted(),
+                        NOW + 3
+                    ),
+                    Err(TaskStoreError::SlotConsumed)
+                ));
+            }
+            assert_eq!(
+                reopened.get(&committed.id, OWNER, NOW + 3).unwrap(),
+                expected
+            );
+            drop(reopened);
+            let second_restart = TaskStore::open(&path).unwrap();
+            assert_eq!(
+                second_restart.get(&committed.id, OWNER, NOW + 4).unwrap(),
+                expected
             );
         }
     }

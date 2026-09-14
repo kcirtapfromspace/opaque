@@ -29,13 +29,39 @@ network isolation. The signed OIDC issuer, scripted reviewer and HTTP inference
 responses are explicit test implementations. They test the production protocols;
 actual model completions and native human approval remain separate qualifications.
 
+## Actual model and browser acceptance
+
+The model profile adds a pinned CPU llama.cpp build and a checksum-verified
+SmolLM2 model to the disposable host:
+
+```sh
+python3 -B tests/contained-ssh/run.py --real-model --output /tmp/opaque-model-run
+```
+
+It checks signed rejection before generation, then actual completions after
+scripted signed approval, the model server's generation counter, durable
+receipts and replay denial. The service verifies its executable/model hashes
+before and after the run and must stop and reap its process group. This qualifies
+the pinned engine's bounded response contract on fixed public prompts; it does
+not measure model answer quality or native human authentication.
+
+[Browser acceptance](browser/README.md) drives real Chromium, dashboard and daemon
+processes without HTTP route mocks. [Installed-artifact acceptance](packaged/README.md)
+uses actual compiled tools and the installer in temporary homes. These remain
+separate from published-release signatures and platform distribution approval.
+
 ## Collect production coverage
 
-The collector executes existing library tests and selected daemon task,
-resource-authority, provisioning, MCP and composed-review scenarios. It builds
+The collector discovers every Cargo workspace package, including binary-only
+packages and members excluded from Cargo's default member list. It executes
+workspace tests and additional daemon task, resource-authority, provisioning,
+MCP and composed-review scenarios. It builds
 the daemon, adapter and bare-rustc peer with the same pinned instrumentation,
 requires fresh child profiles, and verifies that branch counters survive a real
 SIGKILL before collecting any results. It preserves crash behavior in the tests.
+Coverage builds omit DWARF debug symbols while retaining LLVM source and branch
+maps. This keeps the real executable-hashing checks within existing test
+deadlines without skipping identity checks or stripping coverage objects.
 
 On macOS, install the pinned tools and run the native collector:
 
@@ -58,8 +84,13 @@ reduce repeated build time. Do not share a target cache with an active build.
 The native collector accepts `--reuse-target-dir` for the same purpose. Neither
 option reuses coverage profiles.
 
-The measured production source scope is `opaque-core`, `opaque-bounded-work`
-and `opaque-approval`, with an explicit file inventory. Test-only modules remain
+The production source scope is the entire Cargo workspace, with a package,
+target and source-file inventory derived from Cargo metadata. A newly added
+workspace package enters collection automatically. Missing eligible package
+artifacts or coverage cannot silently narrow the report.
+`original-scope-summary.json` preserves the original three-package scope only
+for historical comparison, using the same run's counters. Rust coverage does
+not measure JavaScript or Python. Test-only modules remain
 excluded through compiler coverage annotations; production functions they call
 remain instrumented. Unmapped source files are listed explicitly. Library-only
 and expanded exports retain separate denominators because additional daemon
@@ -69,9 +100,15 @@ Each `collection.json` records the source revision and content fingerprint,
 compiler target, exact test inventory, binary/profile hashes, measured counts
 and collection failures. `status: collected` means the collection completed;
 it does **not** mean the coverage target passed. The separate
-`coverage-summary.json` records the unchanged 100% line and branch gate.
-CI enforces that gate independently on Linux and macOS. Reports must not be
-averaged: one target cannot cover code compiled out on the other target.
+`coverage-summary.json` records structural validation and measured counts.
+The separate `gate.json` enforces all 16 crates' immediate tiers and exact native
+line/branch ratchets: 100% lines and branches for the decision kernel, 85% branches
+for enforcement crates and 70% branches for general crates. See the
+[coverage and assertion guide](../docs/testing-coverage.md) for classification,
+trusted-base comparisons and baseline maintenance. Reports must not be averaged:
+one target cannot cover code compiled out on another. Independent Cargo metadata
+and source mapping checks still fail any omitted package; per-package counters
+expose each crate's remaining gaps.
 
 Raw command logs and runtime artifacts stay in local output. CI publishes only
 the collection inventory and sanitized coverage reports, never generated keys,
@@ -83,5 +120,11 @@ The suite checks durable single-use consumption, retained charges after unknown
 outcomes, replay denial after restart, authority changes before dispatch, and
 corrupt-row rejection. The finite TaskStore model explores its declared bounded
 state space; explicit concurrency and fault scenarios cover other cases.
+The original one-slot model retains its fixed bounds. A separate two-slot model
+checks 720 declared interleavings, and actual concurrent runs are compared with
+permitted serial histories. Killed SQLite writers exercise committed and
+uncommitted recovery; SQLite READONLY/FULL cases check atomic rollback and a
+positive write control after the limit is restored. These do not exhaust
+concurrent schedules or simulate every physical storage failure.
 Neither a bounded model nor 100% source coverage proves every possible
 execution, deployment, provider account or human ceremony.

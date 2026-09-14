@@ -1656,6 +1656,7 @@ impl SqliteAuditSink {
     /// Pause the writer thread (for testing only). Events sent while paused
     /// will accumulate in the channel and eventually be dropped.
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(crate) fn pause_writer(&self) {
         let (lock, _cvar) = &*self.writer_pause;
         let mut paused = lock.lock().expect("pause lock poisoned");
@@ -1664,6 +1665,7 @@ impl SqliteAuditSink {
 
     /// Resume the writer thread (for testing only).
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(crate) fn resume_writer(&self) {
         let (lock, cvar) = &*self.writer_pause;
         let mut paused = lock.lock().expect("pause lock poisoned");
@@ -1672,6 +1674,7 @@ impl SqliteAuditSink {
     }
 
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(crate) fn flush_dropped_events(&self) {
         Self::report_drops(&self.progress, &self.dropped_count);
     }

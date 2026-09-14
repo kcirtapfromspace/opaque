@@ -687,6 +687,7 @@ pub fn persisted_lifecycle(state_dir: &Path) -> Result<bool, String> {
     )
 }
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use opaque_core::identity_lifecycle::SubjectUpdate;

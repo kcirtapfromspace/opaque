@@ -9,6 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+opaque-policy-kernel = { path = "../opaque-policy-kernel" }
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
 getrandom = { workspace = true }
@@ -32,6 +33,7 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+proptest = "=1.11.0"
 tempfile = "3"
 
 [[bench]]

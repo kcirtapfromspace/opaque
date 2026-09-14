@@ -40,6 +40,7 @@ use uuid::Uuid;
 
 mod action;
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod action_tests;
 mod audit_durability;
 mod mcp;
@@ -68,6 +69,7 @@ pub use task::{
 /// Non-string, empty, or missing values are skipped (params schema validation
 /// has already run by this point).
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn render_secret_ref_template(
     template: &str,
     params: &serde_json::Map<String, serde_json::Value>,
@@ -103,6 +105,7 @@ fn render_secret_ref_template(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn derive_secret_ref_names(param_keys: &[String], params: &serde_json::Value) -> Vec<String> {
     let mut refs = Vec::new();
     if let serde_json::Value::Object(map) = params {
@@ -1664,6 +1667,7 @@ impl NativeApprovalGate {
     /// Create a gate with only the local (biometric/polkit) factor — the
     /// pre-registry shape, kept for tests.
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn new() -> Self {
         let mut registry = opaque_approval::factors::FactorRegistry::new();
         registry.register(Arc::new(opaque_approval::factors::LocalBioVerifier::new(
@@ -1675,6 +1679,7 @@ impl NativeApprovalGate {
     /// Attach an approver resolver (identity runtime hook) to a default
     /// local-only gate (test builder mirroring the daemon's wiring).
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn with_approver_resolver(self, resolver: ApproverResolver) -> Self {
         let mut registry = opaque_approval::factors::FactorRegistry::new();
         registry.register(Arc::new(opaque_approval::factors::LocalBioVerifier::new(
@@ -1841,6 +1846,7 @@ pub(crate) fn sanitize_for_display(s: &str, max_len: usize) -> String {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod test_support {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -2005,6 +2011,7 @@ mod test_support {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::test_support::*;
     use super::*;
@@ -5078,6 +5085,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod operation_catalog_tests {
     use super::test_support::{AlwaysDenyGate, StubHandler};
     use super::*;

@@ -24,3 +24,6 @@ block2 = "0.6.2"
 objc2 = { version = "0.6.3", default-features = false, features = ["std"] }
 objc2-foundation = "0.3.2"
 objc2-local-authentication = { version = "0.3.2", default-features = false, features = ["std", "block2", "LAContext"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }

@@ -736,6 +736,7 @@ fn filter_secret_refs(env_keys: &[String], secret_refs: &[String]) -> Vec<String
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use opaque_core::audit::InMemoryAuditEmitter;

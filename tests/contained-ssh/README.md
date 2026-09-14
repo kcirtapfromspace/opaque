@@ -13,7 +13,7 @@ It publishes no host ports. Normal completion, failures and interrupt handling
 remove only the container carrying this run's exact ownership label. Existing
 Docker containers, networks and cache volumes are preserved.
 
-Two SSH tests in the synthesized `contained` profile establish:
+The synthesized `contained` profile establishes:
 
 - Signed controlled OIDC identities, delegated agent authority and a scripted
   workstation decision over the production pinned TLS review protocol.
@@ -36,12 +36,16 @@ Two SSH tests in the synthesized `contained` profile establish:
   The fixed probe does not fork; this does not claim arbitrary descendant
   workload acceptance.
 
-A third test covers inference task RPC with a controlled HTTP peer. It rejects
+A separate test covers inference task RPC with a controlled HTTP peer. It rejects
 planning authority revoked during a metadata read, verifies three typed
 protocol completions, and revokes a reserved task during execution metadata.
 No further completion is dispatched, the reservation remains charged, and
 restart retains the revoked state. These responses are synthetic protocol
 data; they do not qualify actual model completions or model quality.
+
+Three further SSH cases deny absent/disabled principals and foreign tenant or
+broker bindings, and revoke a grant during an observed probe. The latter checks
+retained charges, stopped process identities and replay denial after restart.
 
 These are Linux service and protocol checks in one disposable host. They do not
 qualify inter-host network isolation, customer Vault deployments, macOS custody
@@ -49,14 +53,14 @@ or native human presence. The scripted review is explicitly recorded as
 `insecure_test`; production approval checks remain enabled.
 
 To collect actual production counters, including daemon subprocesses and the
-three contained cases, use a separate fresh output:
+six contained cases, use a separate fresh output:
 
 ```sh
 python3 -B tests/contained-ssh/run.py --coverage --output /tmp/opaque-contained-coverage-1
 ```
 
 This installs the collector's pinned nightly compiler and LLVM tools in the
-disposable container, then runs the critical coverage collector with
+disposable container, then runs the workspace coverage collector with
 `--contained`. A completed collection reports `collected`; the literal 100%
 gate is a separate result in `container/coverage/coverage-summary.json` and must
 be enforced independently by CI. Normal acceptance runs do not measure source

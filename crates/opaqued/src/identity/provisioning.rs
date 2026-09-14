@@ -540,6 +540,9 @@ impl IdentityStore {
             )
         );
         let mut conn = self.lock();
+        if self.delegation_revocation_failed(delegation_jti) {
+            return Err("provisioning delegation revocation could not be persisted".into());
+        }
         ensure_schema(&conn)?;
         let tx = db(conn.transaction_with_behavior(TransactionBehavior::Immediate))?;
         let parent = read_mandate(&tx, binding, parent_id)?;
@@ -757,6 +760,7 @@ impl IdentityStore {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::identity::persona::{PersonaConfig, VerifiedPersonaClaims};
@@ -936,6 +940,75 @@ mod tests {
                 .authorize_scopes(&self.binding, &self.recipient, self.now, 300, |_| true)
                 .unwrap()
         }
+    }
+
+    #[test]
+    fn failed_delegation_revoke_cannot_issue_or_replay_access_from_a_live_durable_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("identity.db");
+        let fixture = Fixture::with_store(IdentityStore::open(&database).unwrap());
+        let parent = fixture.mandate(3);
+        let first_request = Uuid::new_v4().to_string();
+        let first = fixture.issue(&parent, &first_request).unwrap();
+        let fault = rusqlite::Connection::open(&database).unwrap();
+        fault.execute_batch("CREATE TRIGGER refuse_revoke BEFORE UPDATE OF revoked_at ON delegations BEGIN SELECT RAISE(FAIL, 'fixture revoke write failed'); END;").unwrap();
+        assert!(
+            fixture
+                .store
+                .revoke_delegation(&fixture.delegation)
+                .unwrap_err()
+                .contains("fixture revoke write failed")
+        );
+        assert!(
+            fixture
+                .store
+                .get_delegation(&fixture.delegation)
+                .unwrap()
+                .unwrap()
+                .revoked_at
+                .is_none()
+        );
+        for request in [&first_request, &Uuid::new_v4().to_string()] {
+            assert_eq!(
+                fixture.issue(&parent, request).unwrap_err(),
+                "provisioning delegation revocation could not be persisted"
+            );
+        }
+        let observed = fixture.store.list_access_grants(&fixture.binding).unwrap();
+        assert_eq!(
+            serde_json::to_value(observed).unwrap(),
+            serde_json::json!([first])
+        );
+        assert_eq!(
+            fixture
+                .store
+                .get_mandate(&fixture.binding, &parent.id)
+                .unwrap()
+                .issued_count,
+            1
+        );
+        fault.execute_batch("DROP TRIGGER refuse_revoke").unwrap();
+        assert!(
+            fixture
+                .store
+                .revoke_delegation(&fixture.delegation)
+                .unwrap()
+        );
+        assert!(fixture.issue(&parent, &Uuid::new_v4().to_string()).is_err());
+        let binding = fixture.binding.clone();
+        drop(fixture);
+        let reopened = IdentityStore::open(&database).unwrap();
+        assert_eq!(
+            reopened
+                .get_mandate(&binding, &parent.id)
+                .unwrap()
+                .issued_count,
+            1
+        );
+        assert_eq!(
+            serde_json::to_value(reopened.list_access_grants(&binding).unwrap()).unwrap(),
+            serde_json::json!([first])
+        );
     }
 
     #[test]

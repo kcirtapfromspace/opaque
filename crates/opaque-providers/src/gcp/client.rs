@@ -18,6 +18,7 @@ const MAX_BODY: usize = 256 * 1024;
 const MAX_SECRET: usize = 64 * 1024;
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|p| p.into_inner())
@@ -663,6 +664,7 @@ fn crc32c(bytes: &[u8]) -> u32 {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
@@ -1266,6 +1268,7 @@ impl std::fmt::Debug for GcpAccessSecretVersionResponse {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod boundary_tests {
     use super::*;
     use serde_json::json;
@@ -1558,6 +1561,7 @@ fn validate_production_endpoint(value: &str) -> Result<(), GcpApiError> {
     Ok(())
 }
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[test]
 fn production_endpoint_is_independent_of_fixture_transport() {
     assert!(validate_production_endpoint(DEFAULT_BASE_URL).is_ok());

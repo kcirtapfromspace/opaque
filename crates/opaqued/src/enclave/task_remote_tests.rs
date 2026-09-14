@@ -135,6 +135,9 @@ enum Mutation {
     ReviewerRoleRemoved,
     ReviewerRoleRegranted,
     DeviceRevoked,
+    TaskRevoked,
+    PolicyReplaced,
+    DelegationRevokeWriteFailed,
 }
 
 struct Fixture {
@@ -441,6 +444,42 @@ impl Fixture {
                     .unwrap();
             }
             Mutation::DeviceRevoked => self.pairing.revoke_device(&self.device_id).unwrap(),
+            Mutation::TaskRevoked => {
+                let revoked = self
+                    .store
+                    .revoke(&self.task.id, &self.owner, now_unix())
+                    .unwrap();
+                assert_eq!(revoked.state, TaskState::Revoked);
+                assert_eq!(revoked.slots[0].state, SlotState::Reserved);
+                assert!(revoked.workstation_receipt.is_some());
+            }
+            Mutation::PolicyReplaced => {
+                // This public policy publication happens after review, slot
+                // reservation and HTTP preparation, at the context barrier.
+                self.enclave.swap_policy(PolicyEngine::with_rules(vec![]));
+            }
+            Mutation::DelegationRevokeWriteFailed => {
+                let fault =
+                    rusqlite::Connection::open(self._directory.path().join("identity.db")).unwrap();
+                fault.execute_batch("CREATE TRIGGER refuse_revoke BEFORE UPDATE OF revoked_at ON delegations BEGIN SELECT RAISE(FAIL, 'fixture revoke write failed'); END;").unwrap();
+                assert!(
+                    self.identity
+                        .store
+                        .revoke_delegation(&self.context.jti)
+                        .unwrap_err()
+                        .contains("fixture revoke write failed")
+                );
+                assert!(
+                    self.identity
+                        .store
+                        .get_delegation(&self.context.jti)
+                        .unwrap()
+                        .unwrap()
+                        .revoked_at
+                        .is_none(),
+                    "the stale durable row must really remain live"
+                );
+            }
         }
     }
     async fn run(&self, mutation: Mutation) -> Result<TaskRecord, String> {
@@ -604,4 +643,128 @@ async fn requester_reviewer_and_device_revocation_at_real_dispatch_fence_block_a
         assert!(f.effects().await.is_empty());
         assert_eq!(f.prompts.load(Ordering::SeqCst), 1);
     }
+}
+
+#[tokio::test]
+async fn task_revocation_after_reservation_preserves_charge_and_receipt_without_dispatch() {
+    final_dispatch_denial_survives_restart(
+        Mutation::TaskRevoked,
+        TaskState::Revoked,
+        "reviewer_or_task_authority_changed",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn policy_publication_after_reservation_preserves_charge_without_dispatch() {
+    final_dispatch_denial_survives_restart(
+        Mutation::PolicyReplaced,
+        TaskState::Partial,
+        "policy_denied",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn failed_durable_delegation_revoke_fences_reserved_task_despite_live_sqlite_row() {
+    final_dispatch_denial_survives_restart(
+        Mutation::DelegationRevokeWriteFailed,
+        TaskState::Partial,
+        "reviewer_or_task_authority_changed",
+    )
+    .await;
+}
+
+async fn final_dispatch_denial_survives_restart(mutation: Mutation, state: TaskState, code: &str) {
+    let f = Fixture::new().await;
+    let denied = f.run(mutation).await.unwrap();
+    assert_eq!(denied.state, state);
+    assert!(denied.approved_at.is_some());
+    assert!(denied.workstation_receipt.is_some());
+    assert_eq!(denied.slots[0].state, SlotState::Rejected);
+    assert_eq!(denied.slots[0].outcome.as_ref().unwrap().code, code);
+    assert!(denied.slots[0].reserved_at.is_some());
+    assert!(denied.slots[0].finished_at.is_some());
+    assert!(denied.slots[0].request_id.is_some());
+    assert!(
+        denied.slots[1..]
+            .iter()
+            .all(|slot| slot.state == SlotState::Pending
+                && slot.reserved_at.is_none()
+                && slot.request_id.is_none()
+                && slot.outcome.is_none())
+    );
+    assert_eq!(f.authorized_dispatches.load(Ordering::SeqCst), 0);
+    assert!(f.effects().await.is_empty());
+    let prepared = f.provider.received_requests().await.unwrap();
+    assert_eq!(
+        prepared
+            .iter()
+            .filter(|request| request.url.path() == "/tokenize")
+            .count(),
+        1,
+        "denial must occur after real HTTP preparation"
+    );
+    let receipt = f.receipt.lock().unwrap().clone().unwrap();
+    receipt.verify().unwrap();
+    assert_eq!(
+        f.remote
+            .store
+            .receipt(&receipt.review.challenge.approval_id)
+            .unwrap(),
+        Some(receipt)
+    );
+    assert!(f.run(Mutation::None).await.is_err());
+    assert_eq!(f.prompts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        f.provider.received_requests().await.unwrap().len(),
+        prepared.len(),
+        "replay must not repeat even provider preparation"
+    );
+
+    let path = f._directory.path().join("tasks.db");
+    let tenant = denied.tenant.clone();
+    let expected = serde_json::to_value(&denied).unwrap();
+    let Fixture {
+        _directory: _directory_guard,
+        store,
+        enclave,
+        remote,
+        ..
+    } = f;
+    drop(enclave);
+    drop(remote);
+    drop(store);
+    let reopened = TaskStore::open_for_tenant(&path, tenant).unwrap();
+    let recovered = reopened
+        .get(&denied.id, &denied.owner_key, now_unix())
+        .unwrap();
+    assert_eq!(serde_json::to_value(recovered).unwrap(), expected);
+    assert!(
+        reopened
+            .claim(&denied.id, &denied.owner_key, now_unix())
+            .is_err()
+    );
+    for slot in &denied.slots {
+        assert!(
+            reopened
+                .reserve_slot(
+                    &denied.id,
+                    &denied.owner_key,
+                    &slot.id,
+                    "replay",
+                    now_unix()
+                )
+                .is_err()
+        );
+    }
+    assert_eq!(
+        serde_json::to_value(
+            reopened
+                .get(&denied.id, &denied.owner_key, now_unix())
+                .unwrap()
+        )
+        .unwrap(),
+        expected
+    );
 }

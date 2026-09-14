@@ -2853,6 +2853,7 @@ async fn run_portfolio_chat(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod concurrency_tests {
     use super::*;
     #[test]

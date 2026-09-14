@@ -18,6 +18,7 @@ pub enum ServiceOp {
     Status,
     Start,
     Stop,
+    Restart,
     Logs,
 }
 
@@ -42,6 +43,7 @@ pub fn run(op: ServiceOp) -> Result<(), String> {
         ServiceOp::Status => status(),
         ServiceOp::Start => start(),
         ServiceOp::Stop => stop(),
+        ServiceOp::Restart => restart(),
         ServiceOp::Logs => logs(),
     }
 }
@@ -92,6 +94,8 @@ fn uninstall() -> Result<(), String> {
     std::fs::remove_file(&service_file)
         .map_err(|e| format!("failed to remove {}: {e}", service_file.display()))?;
 
+    #[cfg(target_os = "linux")]
+    reload_service_manager()?;
     Ok(())
 }
 
@@ -133,6 +137,13 @@ fn stop() -> Result<(), String> {
     }
     stop_service()?;
     Ok(())
+}
+
+fn restart() -> Result<(), String> {
+    if !service_file_path().exists() {
+        return Err("service is not installed".into());
+    }
+    restart_service()
 }
 
 // ---------------------------------------------------------------------------
@@ -266,6 +277,25 @@ fn stop_service() -> Result<(), String> {
 }
 
 #[cfg(target_os = "macos")]
+fn restart_service() -> Result<(), String> {
+    let output = Command::new("launchctl")
+        .args([
+            "kickstart",
+            "-k",
+            &format!("gui/{}/{LABEL}", unsafe { libc::geteuid() }),
+        ])
+        .output()
+        .map_err(|e| format!("failed to run launchctl: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "launchctl restart failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 pub fn query_status() -> ServiceStatus {
     let service_file = service_file_path();
     let installed = service_file.exists();
@@ -333,6 +363,12 @@ fn show_logs() -> Result<(), String> {
         .output()
         .map_err(|e| format!("failed to read logs: {e}"))?;
 
+    if !output.status.success() {
+        return Err(format!(
+            "failed to read service logs: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
     let content = String::from_utf8_lossy(&output.stdout);
     if content.is_empty() {
         crate::ui::info("Log file is empty.");
@@ -389,15 +425,7 @@ WantedBy=default.target
 
 #[cfg(target_os = "linux")]
 fn load_service(_unit_path: &Path) -> Result<(), String> {
-    // Reload systemd to pick up the new unit file.
-    let reload = Command::new("systemctl")
-        .args(["--user", "daemon-reload"])
-        .output()
-        .map_err(|e| format!("failed to run systemctl: {e}"))?;
-    if !reload.status.success() {
-        let stderr = String::from_utf8_lossy(&reload.stderr);
-        return Err(format!("systemctl daemon-reload failed: {}", stderr.trim()));
-    }
+    reload_service_manager()?;
 
     // Enable and start.
     let enable = Command::new("systemctl")
@@ -408,6 +436,21 @@ fn load_service(_unit_path: &Path) -> Result<(), String> {
         let stderr = String::from_utf8_lossy(&enable.stderr);
         return Err(format!("systemctl enable failed: {}", stderr.trim()));
     }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn reload_service_manager() -> Result<(), String> {
+    // Reload systemd to pick up the new unit file.
+    let reload = Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .output()
+        .map_err(|e| format!("failed to run systemctl: {e}"))?;
+    if !reload.status.success() {
+        let stderr = String::from_utf8_lossy(&reload.stderr);
+        return Err(format!("systemctl daemon-reload failed: {}", stderr.trim()));
+    }
+
     Ok(())
 }
 
@@ -424,11 +467,6 @@ fn unload_service(_unit_path: &Path) -> Result<(), String> {
             return Err(format!("systemctl disable failed: {}", stderr.trim()));
         }
     }
-
-    // Reload so systemd forgets the unit.
-    let _ = Command::new("systemctl")
-        .args(["--user", "daemon-reload"])
-        .output();
 
     Ok(())
 }
@@ -455,6 +493,21 @@ fn stop_service() -> Result<(), String> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("systemctl stop failed: {}", stderr.trim()));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn restart_service() -> Result<(), String> {
+    let output = Command::new("systemctl")
+        .args(["--user", "restart", UNIT_NAME])
+        .output()
+        .map_err(|e| format!("failed to run systemctl: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "systemctl restart failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
     Ok(())
 }
@@ -507,6 +560,12 @@ fn show_logs() -> Result<(), String> {
         .output()
         .map_err(|e| format!("failed to run journalctl: {e}"))?;
 
+    if !output.status.success() {
+        return Err(format!(
+            "failed to read service logs: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
     let content = String::from_utf8_lossy(&output.stdout);
     if content.is_empty() {
         crate::ui::info("No log entries found.");
@@ -548,6 +607,11 @@ fn start_service() -> Result<(), String> {
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn stop_service() -> Result<(), String> {
+    Err("service management is not supported on this platform".into())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn restart_service() -> Result<(), String> {
     Err("service management is not supported on this platform".into())
 }
 
@@ -634,6 +698,7 @@ fn find_opaqued() -> Result<PathBuf, String> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

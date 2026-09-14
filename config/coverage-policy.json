@@ -1,0 +1,21 @@
+{
+  "schema": "opaque.coverage-policy.v1",
+  "packages": {
+    "opaque": "general",
+    "opaque-approval": "enforcement",
+    "opaque-approve-helper": "enforcement",
+    "opaque-approver": "enforcement",
+    "opaque-bounded-work": "enforcement",
+    "opaque-core": "enforcement",
+    "opaque-federation-runtime": "enforcement",
+    "opaque-mcp": "enforcement",
+    "opaque-native-approval": "enforcement",
+    "opaque-policy-kernel": "kernel",
+    "opaque-providers": "enforcement",
+    "opaque-sandbox": "enforcement",
+    "opaque-showcase": "general",
+    "opaque-tenant": "enforcement",
+    "opaque-web": "general",
+    "opaqued": "enforcement"
+  }
+}

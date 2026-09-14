@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 //! Offline registry lint/preparation. Never connects to a daemon or upstream.
 
 use std::io::Read;

@@ -4,7 +4,10 @@ FROM hashicorp/vault:1.21.4@sha256:4e33b126a59c0c333b76fb4e894722462659a6bec7c48
 FROM rust:1.95.0-slim-trixie@sha256:e14e87345b4d5964ddcc3491d27ee046a0f23820f340c3c1e24da6880141f7c0
 RUN apt-get update && apt-get install -y --no-install-recommends \
       systemd systemd-sysv dbus openssh-server openssh-client python3 \
-      python3-cryptography ca-certificates git pkg-config libssl-dev \
+      python3-cryptography ca-certificates git pkg-config libssl-dev nodejs npm \
+      libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libatspi2.0-0 libx11-6 \
+      libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 libgbm1 libdrm2 \
+      libxkbcommon0 libasound2t64 libcups2t64 libdbus-1-3 libpango-1.0-0 libcairo2 fonts-liberation \
     && rm -rf /var/lib/apt/lists/* /etc/ssh/ssh_host_* \
     && useradd --uid 7382 --user-group --home-dir /nonexistent \
       --shell /bin/sh --password x opaque \

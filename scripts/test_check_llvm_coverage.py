@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 SPEC = importlib.util.spec_from_file_location(
@@ -113,6 +114,144 @@ class MeasuredCoverageTests(unittest.TestCase):
                             "--output", str(output)])
         self.assertEqual(result, 1)
         self.assertEqual(json.loads(output.read_text())["status"], "failed")
+
+    def workspace(self):
+        packages = []
+        for name, kind, filename in (("library", "lib", "lib.rs"), ("excluded-cli", "bin", "main.rs")):
+            directory = self.root / name
+            (directory / "src").mkdir(parents=True)
+            (directory / "Cargo.toml").write_text(f'[package]\nname = "{name}"\nversion = "0.1.0"\n')
+            source = directory / "src" / filename
+            source.write_text("pub fn run() {}\n")
+            packages.append({"id": name, "name": name, "manifest_path": str(directory / "Cargo.toml"),
+                             "targets": [{"kind": [kind], "src_path": str(source)}]})
+        return {"workspace_members": [item["id"] for item in packages],
+                "workspace_default_members": ["library"], "packages": packages}
+
+    def workspace_report(self, metadata):
+        report = copy.deepcopy(self.report)
+        summary = report["data"][0]["totals"]
+        report["data"][0]["files"] = [
+            {"filename": package["targets"][0]["src_path"], "summary": copy.deepcopy(summary)}
+            for package in metadata["packages"]]
+        for metric in ("lines", "branches"):
+            for key in ("count", "covered"):
+                summary[metric][key] *= len(metadata["packages"])
+        return report
+
+    def test_default_excluded_binary_package_cannot_disappear_from_full_workspace_gate(self):
+        metadata = self.workspace()
+        report = self.workspace_report(metadata)
+        complete = self.check(report, required_files=[], workspace_metadata=metadata)
+        self.assertEqual(complete["status"], "passed")
+        self.assertEqual([item["package"] for item in complete["workspace_packages"]], ["excluded-cli", "library"])
+        report["data"][0]["files"].pop()
+        report["data"][0]["totals"] = copy.deepcopy(report["data"][0]["files"][0]["summary"])
+        omitted = self.check(report, required_files=[], workspace_metadata=metadata)
+        self.assertEqual(omitted["measured"]["lines"]["percent"], 100)
+        self.assertEqual(omitted["unmeasured_workspace_packages"], ["excluded-cli"])
+        self.assertEqual(omitted["status"], "failed")
+
+    def test_zero_mapping_and_test_sources_cannot_qualify_a_workspace_package(self):
+        metadata = self.workspace()
+        for mode in ("zero", "test"):
+            report = self.workspace_report(metadata)
+            item = report["data"][0]["files"][1]
+            if mode == "zero":
+                for metric in ("lines", "branches"):
+                    for key in ("count", "covered"):
+                        item["summary"][metric][key] = 0
+                        report["data"][0]["totals"][metric][key] //= 2
+            else:
+                test = self.root / "excluded-cli" / "tests" / "cli.rs"
+                test.parent.mkdir()
+                test.write_text("#[test] fn test() {}\n")
+                item["filename"] = str(test)
+            result = self.check(report, required_files=[], workspace_metadata=metadata)
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["unmeasured_workspace_packages"], ["excluded-cli"])
+
+    def test_shared_module_requires_mapping_and_preserves_all_exact_package_owners(self):
+        metadata = self.workspace()
+        shared = self.root / "assets" / "brand.rs"
+        shared.parent.mkdir()
+        shared.write_text("pub fn get(value: [u8; 4]) -> [u8; 4] { value }")
+        for package in metadata["packages"]:
+            Path(package["targets"][0]["src_path"]).write_text(
+                '#[path="../../assets/brand.rs"] mod shared; pub fn run() { shared::get(); }')
+        report = self.workspace_report(metadata)
+        missing = self.check(report, required_files=[], workspace_metadata=metadata)
+        self.assertEqual(missing["missing_required_source_files"], ["assets/brand.rs"])
+        self.assertEqual(missing["status"], "failed")
+        summary = copy.deepcopy(report["data"][0]["files"][0]["summary"])
+        report["data"][0]["files"].append({"filename": str(shared), "summary": summary})
+        for metric in ("lines", "branches"):
+            for key in ("count", "covered"):
+                report["data"][0]["totals"][metric][key] += summary[metric][key]
+        complete = self.check(report, required_files=[], workspace_metadata=metadata)
+        self.assertEqual(complete["status"], "passed")
+        self.assertEqual(complete["measured"]["lines"]["count"], 30)
+        self.assertEqual(complete["sources_without_unique_workspace_owner"], [])
+        self.assertTrue(all(row["shared_sources"] == ["assets/brand.rs"] for row in complete["workspace_packages"]))
+        # Exact source edges confer no ownership of neighboring assets.
+        unrelated = shared.with_name("unrelated.rs")
+        unrelated.write_text("pub fn unrelated() {}")
+        report["data"][0]["files"][-1]["filename"] = str(unrelated)
+        result = self.check(report, required_files=[], workspace_metadata=metadata)
+        self.assertIn("assets/unrelated.rs", result["sources_without_unique_workspace_owner"])
+        self.assertEqual(result["status"], "failed")
+
+    def test_shared_native_cfg_is_declared_without_qualifying_compiled_out_code(self):
+        metadata = self.workspace()
+        shared = self.root / "assets" / "native.rs"
+        shared.parent.mkdir()
+        shared.write_text("pub fn native() {}")
+        Path(metadata["packages"][0]["targets"][0]["src_path"]).write_text(
+            '#[cfg(target_os="linux")] #[path="../../assets/native.rs"] mod native; pub fn run() {}')
+        scope = GATE.workspace_scope(metadata, self.root)
+        package = next(item for item in scope if item["package"] == "library")
+        self.assertEqual(package["shared_sources"], ["assets/native.rs"])
+        self.assertEqual(package["required_shared_sources"], [])
+        result = self.check(self.workspace_report(metadata), required_files=[], workspace_metadata=metadata)
+        self.assertEqual(result["measured"]["lines"]["count"], 20)
+        self.assertNotIn("assets/native.rs", result["required_source_files"])
+
+    def test_invalid_or_missing_workspace_members_fail_closed(self):
+        metadata = self.workspace()
+        variants = [None, {}, {**metadata, "workspace_members": []},
+                    {**metadata, "workspace_members": ["library", "library"]},
+                    {**metadata, "workspace_members": ["missing"]},
+                    {**metadata, "packages": metadata["packages"] * 2}]
+        foreign = copy.deepcopy(metadata)
+        foreign["packages"][1]["manifest_path"] = str(self.root.parent / "Cargo.toml")
+        variants.append(foreign)
+        for variant in variants:
+            with self.subTest(variant=variant), self.assertRaises(GATE.CoverageError):
+                GATE.workspace_scope(variant, self.root)
+
+    def test_workspace_cli_discovers_metadata_independently_of_report(self):
+        metadata = self.workspace()
+        report, output = self.root / "coverage.json", self.root / "gate.json"
+        report.write_text(json.dumps(self.workspace_report(metadata)))
+        with patch.object(GATE.subprocess, "run") as run:
+            run.return_value.stdout = json.dumps(metadata).encode()
+            status = GATE.main(["--report", str(report), "--source-root", str(self.root),
+                                "--require-workspace", "--output", str(output)])
+            self.assertIn("--all-features", run.call_args.args[0])
+            self.assertIn("--no-deps", run.call_args.args[0])
+        self.assertEqual(status, 0)
+        self.assertEqual(len(json.loads(output.read_text())["workspace_packages"]), 2)
+
+    def test_null_metadata_cannot_turn_off_requested_workspace_requirement(self):
+        report, output = self.root / "coverage.json", self.root / "gate.json"
+        report.write_text(json.dumps(self.report))
+        with patch.object(GATE.subprocess, "run") as run:
+            run.return_value.stdout = b"null"
+            status = GATE.main(["--report", str(report), "--source-root", str(self.root),
+                                "--require-workspace", "--require-file", "state.rs",
+                                "--output", str(output)])
+        self.assertEqual(status, 2)
+        self.assertEqual(json.loads(output.read_text())["status"], "invalid")
 
 
 if __name__ == "__main__":

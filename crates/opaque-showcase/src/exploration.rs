@@ -136,6 +136,7 @@ pub fn answer(catalog: &[Finding], ids: &[String], fallback: bool) -> Result<Str
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::portfolio::{

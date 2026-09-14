@@ -8,8 +8,14 @@
 //! An independent authority/charge model generates the reachable abstract graph.
 //! Every outgoing edge is replayed from its shortest witness in a fresh database;
 //! the complete observable record is checked after every prefix, including reopen.
+//! Four workers overlap independent databases' durable I/O. Each witness remains
+//! sequential; this scheduling does not add concurrent histories to the model.
 //! Histories reaching the same model state are merged. This is a bounded model
 //! check, not exhaustive concurrent, multi-slot, corruption, or crash-I/O testing.
+//!
+//! The separate two-slot tests below enumerate a declared interleaving alphabet
+//! and compare actual concurrent outcomes with its independent serial oracle.
+//! They do not extend or replace the original one-slot graph's fixed counts.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
@@ -256,10 +262,14 @@ struct Database {
 }
 impl Database {
     fn plan() -> Self {
+        Self::plan_manifest(manifest())
+    }
+
+    fn plan_manifest(manifest: TaskManifest) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("tasks.sqlite3");
         let store = TaskStore::open(&path).unwrap();
-        let original = store.create(OWNER, manifest(), CREATED).unwrap();
+        let original = store.create(OWNER, manifest, CREATED).unwrap();
         Self {
             store: Some(store),
             path,
@@ -464,6 +474,48 @@ fn replay(case: &str, sequence: &[Action]) -> usize {
     sequence.len() + 1
 }
 
+fn replay_independent_databases(sequences: &[(String, Vec<Action>)]) -> usize {
+    // FULL-sync writes and independent read-only observations remain unchanged.
+    // Bound simultaneous databases rather than serializing thousands of fsyncs
+    // against a hosted runner's variable disk latency. Strided assignment keeps
+    // work deterministic without sharing a ledger or any mutable model state.
+    const WORKERS: usize = 4;
+    let mut completed = std::thread::scope(|scope| {
+        let workers = (0..WORKERS)
+            .map(|worker| {
+                scope.spawn(move || {
+                    sequences
+                        .iter()
+                        .enumerate()
+                        .skip(worker)
+                        .step_by(WORKERS)
+                        .map(|(index, (case, sequence))| (index, replay(case, sequence)))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        workers
+            .into_iter()
+            .flat_map(|worker| match worker.join() {
+                Ok(completed) => completed,
+                Err(panic) => std::panic::resume_unwind(panic),
+            })
+            .collect::<Vec<_>>()
+    });
+    // Missing or duplicate work must not be hidden by an equal aggregate
+    // transition count. Every original witness has exactly one completion.
+    completed.sort_unstable_by_key(|(index, _)| *index);
+    assert_eq!(completed.len(), sequences.len());
+    completed
+        .into_iter()
+        .enumerate()
+        .map(|(expected, (actual, checks))| {
+            assert_eq!(actual, expected, "missing or duplicate state-model witness");
+            checks
+        })
+        .sum()
+}
+
 #[test]
 fn bounded_task_store_matches_reference_state_graph() {
     use Action::*;
@@ -561,10 +613,10 @@ fn bounded_task_store_matches_reference_state_graph() {
             .len(),
         cases.len()
     );
-    let mut checks = 0;
-    for (id, sequence) in &cases {
-        checks += replay(id, sequence);
-    }
+    let mut sequences = cases
+        .iter()
+        .map(|(id, sequence)| ((*id).to_owned(), sequence.to_vec()))
+        .collect::<Vec<_>>();
 
     let initial = Model::planned();
     let mut seen = BTreeSet::from([initial.clone()]);
@@ -593,13 +645,14 @@ fn bounded_task_store_matches_reference_state_graph() {
             }
             let mut sequence = witness.clone();
             sequence.push(action);
-            checks += replay(&format!("TSM-GRAPH-{edges:04}"), &sequence);
+            sequences.push((format!("TSM-GRAPH-{edges:04}"), sequence.clone()));
             edges += 1;
             if seen.insert(next.clone()) {
                 queue.push_back((next, sequence));
             }
         }
     }
+    let checks = replay_independent_databases(&sequences);
     assert_eq!(edges, seen.len() * ACTIONS.len());
     // Fixed coverage for this declared alphabet/model. Change these only with
     // a reviewed scope change; a smaller or truncated graph must fail loudly.
@@ -650,4 +703,391 @@ fn bounded_task_store_matches_reference_state_graph() {
             "wall_clock_sleeps": 0, "provider_calls": 0
         })
     );
+}
+
+// This oracle has no SQLite/TaskStore transitions. Authority and immutable
+// charges are independent facts; record construction is observation mapping.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum MultiAction {
+    Reserve(usize),
+    Dispatch(usize),
+    Complete(usize, ResultKind),
+    Revoke,
+    Reopen,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct Charge {
+    reserved: bool,
+    result: Option<ResultKind>,
+    finished: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MultiModel {
+    authority: Authority,
+    slots: [Charge; 2],
+}
+
+impl MultiModel {
+    fn approved() -> Self {
+        Self {
+            authority: Authority::Claimed,
+            slots: [Charge::default(); 2],
+        }
+    }
+
+    fn apply(&mut self, action: MultiAction) -> bool {
+        match action {
+            MultiAction::Reserve(index)
+                if self.authority == Authority::Claimed && !self.slots[index].reserved =>
+            {
+                self.slots[index].reserved = true;
+            }
+            MultiAction::Dispatch(index)
+                if self.authority == Authority::Claimed
+                    && self.slots[index].reserved
+                    && self.slots[index].result.is_none() => {}
+            MultiAction::Complete(index, result)
+                if self.slots[index].reserved && self.slots[index].result.is_none() =>
+            {
+                self.slots[index].result = Some(result);
+                self.slots[index].finished = true;
+                if self.authority == Authority::Claimed
+                    && self.slots.iter().all(|slot| slot.result.is_some())
+                {
+                    self.authority = if self
+                        .slots
+                        .iter()
+                        .all(|slot| slot.result == Some(ResultKind::Accepted))
+                    {
+                        Authority::Succeeded
+                    } else {
+                        Authority::Closed
+                    };
+                }
+            }
+            MultiAction::Revoke => {
+                if self.authority == Authority::Claimed {
+                    self.authority = Authority::Withdrawn;
+                }
+            }
+            MultiAction::Reopen => {
+                for slot in &mut self.slots {
+                    if slot.reserved && slot.result.is_none() {
+                        slot.result = Some(ResultKind::Interrupted);
+                    }
+                }
+                if self.authority == Authority::Claimed {
+                    self.authority = Authority::Closed;
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn record(&self, plan: &TaskRecord) -> TaskRecord {
+        let mut expected = plan.clone();
+        expected.state = match self.authority {
+            Authority::Claimed => TaskState::Running,
+            Authority::Succeeded => TaskState::Completed,
+            Authority::Closed => TaskState::Partial,
+            Authority::Withdrawn => TaskState::Revoked,
+            other => panic!("outside the two-slot model: {other:?}"),
+        };
+        expected.approved_at = Some(CREATED);
+        expected.approval_mode = Some(TaskApprovalMode::InsecureTest);
+        for (index, charge) in self.slots.iter().enumerate() {
+            let slot = &mut expected.slots[index];
+            slot.state = match charge.result {
+                Some(result) => result.wire().state,
+                None if charge.reserved => SlotState::Reserved,
+                None => SlotState::Pending,
+            };
+            slot.request_id = charge.reserved.then(|| multi_request(index).into());
+            slot.reserved_at = charge.reserved.then_some(CREATED);
+            slot.finished_at = charge.finished.then_some(CREATED);
+            slot.outcome = charge.result.map(ResultKind::wire);
+        }
+        expected
+    }
+}
+
+fn multi_request(index: usize) -> &'static str {
+    ["multi-worker-first", "multi-worker-second"][index]
+}
+
+fn multi_database() -> Database {
+    let mut manifest = manifest();
+    let mut second = manifest.actions[0].as_publish().unwrap().clone();
+    second.secret_name = "MODEL_SECOND_VALUE".into();
+    manifest.actions.push(second.into());
+    let database = Database::plan_manifest(manifest);
+    let store = database.store.as_ref().unwrap();
+    store.claim(&database.original.id, OWNER, CREATED).unwrap();
+    store
+        .approve(
+            &database.original.id,
+            OWNER,
+            &database.original.manifest_digest,
+            TaskApprovalMode::InsecureTest,
+            CREATED,
+        )
+        .unwrap();
+    database
+}
+
+fn multi_operation(store: &TaskStore, task: &TaskRecord, action: MultiAction) -> bool {
+    let result = match action {
+        MultiAction::Reserve(index) => store
+            .reserve_slot(
+                &task.id,
+                OWNER,
+                &task.slots[index].id,
+                multi_request(index),
+                CREATED,
+            )
+            .map(|_| ()),
+        MultiAction::Dispatch(index) => store.authorize_dispatch(
+            &task.id,
+            OWNER,
+            &task.slots[index].id,
+            multi_request(index),
+            CREATED,
+        ),
+        MultiAction::Complete(index, result) => store
+            .finalize_slot(
+                &task.id,
+                OWNER,
+                &task.slots[index].id,
+                multi_request(index),
+                result.wire(),
+                CREATED,
+            )
+            .map(|_| ()),
+        MultiAction::Revoke => store.revoke(&task.id, OWNER, CREATED).map(|_| ()),
+        MultiAction::Reopen => panic!("reopen requires exclusive process ownership"),
+    };
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            assert!(
+                matches!(
+                    error,
+                    TaskStoreError::Revoked
+                        | TaskStoreError::NotApproved
+                        | TaskStoreError::SlotConsumed
+                        | TaskStoreError::InvalidTransition
+                ),
+                "non-authority failure for {action:?}: {error:?}"
+            );
+            false
+        }
+    }
+}
+
+fn multi_apply(database: &mut Database, action: MultiAction) -> bool {
+    if action == MultiAction::Reopen {
+        drop(database.store.take());
+        database.store = Some(TaskStore::open(&database.path).unwrap());
+        true
+    } else {
+        multi_operation(database.store.as_ref().unwrap(), &database.original, action)
+    }
+}
+
+fn permutations(actions: &[MultiAction]) -> Vec<Vec<MultiAction>> {
+    if actions.is_empty() {
+        return vec![Vec::new()];
+    }
+    let mut result = Vec::new();
+    for (index, action) in actions.iter().enumerate() {
+        let mut remaining = actions.to_vec();
+        remaining.remove(index);
+        for mut suffix in permutations(&remaining) {
+            suffix.insert(0, *action);
+            result.push(suffix);
+        }
+    }
+    result
+}
+
+#[test]
+fn two_slot_reserve_finalize_revoke_restart_histories_match_reference() {
+    use MultiAction::*;
+    use ResultKind::{Accepted, Rejected, Unknown};
+    // Four explicit outcome pairs; every interleaving preserves each worker's
+    // reserve-before-complete program order. Revoke/reopen may occur anywhere.
+    // This is a bounded history set, not a claim about all concurrent programs.
+    let outcomes = [
+        (Accepted, Accepted),
+        (Accepted, Unknown),
+        (Rejected, Accepted),
+        (Unknown, Rejected),
+    ];
+    let mut histories = 0;
+    let mut checks = 0;
+    let mut observed_states = BTreeSet::new();
+    let mut observed_charge_counts = BTreeSet::new();
+    let mut recovered_unknown = false;
+    for (first, second) in outcomes {
+        let histories_for_pair = permutations(&[
+            Reserve(0),
+            Complete(0, first),
+            Reserve(1),
+            Complete(1, second),
+            Revoke,
+            Reopen,
+        ])
+        .into_iter()
+        .filter(|history| {
+            (0..2).all(|index| {
+                history.iter().position(|a| *a == Reserve(index)).unwrap()
+                    < history
+                        .iter()
+                        .position(|a| matches!(a, Complete(slot, _) if *slot == index))
+                        .unwrap()
+            })
+        })
+        .collect::<BTreeSet<_>>();
+        assert_eq!(histories_for_pair.len(), 180);
+        for history in histories_for_pair {
+            let mut database = multi_database();
+            let mut model = MultiModel::approved();
+            assert_eq!(database.observe(), model.record(&database.original));
+            checks += 1;
+            for (index, &action) in history.iter().enumerate() {
+                let before = model.clone();
+                let expected = model.apply(action);
+                assert_eq!(
+                    multi_apply(&mut database, action),
+                    expected,
+                    "history prefix={:?}",
+                    &history[..=index]
+                );
+                for slot in 0..2 {
+                    assert!(!before.slots[slot].reserved || model.slots[slot].reserved);
+                }
+                assert_eq!(
+                    database.observe(),
+                    model.record(&database.original),
+                    "history prefix={:?}",
+                    &history[..=index]
+                );
+                observed_states.insert(model.authority);
+                observed_charge_counts.insert(model.slots.iter().filter(|s| s.reserved).count());
+                recovered_unknown |= model
+                    .slots
+                    .iter()
+                    .any(|s| s.result == Some(ResultKind::Interrupted) && !s.finished);
+                checks += 1;
+            }
+            // A second restart and every formerly charged or still-pending
+            // slot remain closed; failed attempts preserve the complete row.
+            let closed = database.observe();
+            assert!(multi_apply(&mut database, Reopen));
+            assert_eq!(database.observe(), closed);
+            for slot in 0..2 {
+                for attempt in [Reserve(slot), Dispatch(slot), Complete(slot, Accepted)] {
+                    assert!(!multi_apply(&mut database, attempt));
+                    assert_eq!(database.observe(), closed);
+                }
+            }
+            histories += 1;
+        }
+    }
+    assert_eq!((histories, checks), (720, 5040));
+    assert_eq!(observed_charge_counts, BTreeSet::from([0, 1, 2]));
+    assert_eq!(
+        observed_states,
+        BTreeSet::from([
+            Authority::Claimed,
+            Authority::Succeeded,
+            Authority::Closed,
+            Authority::Withdrawn,
+        ])
+    );
+    assert!(recovered_unknown);
+    println!(
+        "TASK_MULTI_SLOT_HISTORY_COVERAGE {}",
+        serde_json::json!({"slots": 2, "worker_programs": 2, "outcome_pairs": 4,
+            "interleavings_per_pair": 180, "fresh_database_histories": histories,
+            "persisted_prefix_comparisons": checks, "terminal_replay_comparisons": histories * 7,
+            "provider_calls": 0})
+    );
+}
+
+#[test]
+fn concurrent_two_slot_effects_match_a_serial_history_and_remain_charged_on_restart() {
+    use MultiAction::*;
+    use ResultKind::{Accepted, Unknown};
+    let mut runs = 0;
+    for outcome in [Accepted, Unknown] {
+        let operations = [Complete(0, outcome), Reserve(1), Revoke, Dispatch(0)];
+        let serial_orders = permutations(&operations);
+        assert_eq!(serial_orders.len(), 24);
+        // Barrier races supplement deterministic interleavings. No assertion
+        // depends on the OS choosing a particular order or covering all orders.
+        for _ in 0..16 {
+            let mut database = multi_database();
+            let mut initial = MultiModel::approved();
+            assert!(initial.apply(Reserve(0)));
+            assert!(multi_apply(&mut database, Reserve(0)));
+            let barrier = std::sync::Barrier::new(operations.len());
+            let actual_results = std::thread::scope(|scope| {
+                let store = database.store.as_ref().unwrap();
+                let task = &database.original;
+                let handles = operations
+                    .iter()
+                    .map(|&action| {
+                        let barrier = &barrier;
+                        scope.spawn(move || {
+                            barrier.wait();
+                            multi_operation(store, task, action)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            let committed = database.observe();
+            let candidates = serial_orders
+                .iter()
+                .filter_map(|history| {
+                    let mut model = initial.clone();
+                    let mut results = [false; 4];
+                    for &action in history {
+                        let index = operations.iter().position(|a| *a == action).unwrap();
+                        results[index] = model.apply(action);
+                    }
+                    (results.as_slice() == actual_results
+                        && model.record(&database.original) == committed)
+                        .then_some(model)
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                !candidates.is_empty(),
+                "concurrent results have no legal serial witness: {actual_results:?} {committed:?}"
+            );
+            assert_eq!(committed.state, TaskState::Revoked);
+            assert!(multi_apply(&mut database, Reopen));
+            let recovered = database.observe();
+            for mut candidate in candidates {
+                candidate.apply(Reopen);
+                assert_eq!(recovered, candidate.record(&database.original));
+            }
+            for slot in 0..2 {
+                assert!(!multi_apply(&mut database, Reserve(slot)));
+                assert!(!multi_apply(&mut database, Dispatch(slot)));
+                assert!(!multi_apply(&mut database, Complete(slot, Accepted)));
+            }
+            assert_eq!(database.observe(), recovered);
+            runs += 1;
+        }
+    }
+    assert_eq!(runs, 32);
+    println!("TASK_CONCURRENT_HISTORY_RUNS {runs}");
 }

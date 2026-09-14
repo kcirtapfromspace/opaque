@@ -1,0 +1,7 @@
+[[rules]]
+name = "invalid"
+operation_pattern = "*"
+client_types = ["human"]
+[rules.approval]
+require = "never"
+budget = 0

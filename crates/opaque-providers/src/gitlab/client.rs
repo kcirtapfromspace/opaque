@@ -173,6 +173,7 @@ impl GitLabClient {
 
     /// Create a client at custom base URL (for tests).
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn with_base_url(base_url: String) -> Self {
         Self::from_base_url(base_url).expect("invalid test GitLab API endpoint")
     }
@@ -275,6 +276,7 @@ impl Default for GitLabClient {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use wiremock::matchers::{header, method, path};

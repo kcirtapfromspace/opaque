@@ -434,5 +434,6 @@ fn validate_snapshot(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "metrics_tests.rs"]
 mod tests;

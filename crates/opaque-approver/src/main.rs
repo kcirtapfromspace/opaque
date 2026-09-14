@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 //! Interactive trusted-workstation application; deliberately no autoapprove.
 use clap::{Parser, Subcommand};
 use ed25519_dalek::Signer;

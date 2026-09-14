@@ -16,6 +16,7 @@ pub mod operation;
 pub mod operation_handler;
 pub mod peer;
 pub mod policy;
+pub mod policy_document;
 pub mod policy_regression;
 pub mod profile;
 pub mod proto;

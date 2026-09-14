@@ -323,6 +323,7 @@ impl KeyReleaseClient {
 
 /// Load (or create) the daemon's attestation signing key from the custody set.
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub fn load_or_create_key(home: &Path) -> std::io::Result<SigningKey> {
     load_or_create_key_in(&home.join(".opaque"))
 }
@@ -337,6 +338,7 @@ pub fn load_or_create_key_in(state_dir: &Path) -> std::io::Result<SigningKey> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use opaque_core::attest::{AttestError, verify_report};

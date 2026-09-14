@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -9,14 +11,16 @@ use console::style;
 use futures_util::{SinkExt, StreamExt};
 use opaque_core::audit::{AuditEventKind, AuditFilter, query_audit_db};
 use opaque_core::operation::{ClientIdentity, ClientType, OperationRequest, OperationSafety};
-use opaque_core::policy::{PolicyEngine, PolicyRule};
+use opaque_core::policy::PolicyEngine;
 use opaque_core::profile;
 use opaque_core::proto::{Request, Response};
 use opaque_core::socket::{socket_path, verify_socket_safety};
 use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
+mod agent_process;
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod ipc_tests;
 mod policy_regression;
 mod service;
@@ -337,6 +341,8 @@ enum ServiceAction {
     Start,
     /// Stop the daemon service.
     Stop,
+    /// Restart the daemon service.
+    Restart,
     /// Show recent daemon logs.
     Logs,
 }
@@ -1915,12 +1921,31 @@ async fn run_agent_wrapped(
     json_output: bool,
 ) -> Result<i32, String> {
     let start_params = agent_session_start_params(command, ttl_secs, mode, service)?;
+    // Install cancellation handlers before minting a session, so setup failure
+    // cannot strand an already-authorized delegation.
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .map_err(|e| format!("cannot watch agent interruption: {e}"))?;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|e| format!("cannot watch agent termination: {e}"))?;
 
     maybe_warn_opaque_mcp_skew(command, json_output);
 
-    let session_start = call(sock, "agent_session_start", start_params)
-        .await
-        .map_err(|e| format!("failed to start agent session: {e}"))?;
+    let mut cancellation = None;
+    let start = call(sock, "agent_session_start", start_params);
+    tokio::pin!(start);
+    let session_start = tokio::select! {
+        biased;
+        _ = interrupt.recv() => {
+            cancellation = Some(libc::SIGINT);
+            start.await
+        }
+        _ = terminate.recv() => {
+            cancellation = Some(libc::SIGTERM);
+            start.await
+        }
+        result = &mut start => result,
+    }
+    .map_err(|e| format!("failed to start agent session: {e}"))?;
     if let Some(err) = session_start.error {
         return Err(format!("{}: {}", err.code, err.message));
     }
@@ -1928,78 +1953,109 @@ async fn run_agent_wrapped(
     let result = session_start
         .result
         .ok_or_else(|| "agent_session_start returned no result".to_string())?;
-    if mode == "autonomous" && result.get("mode").and_then(|v| v.as_str()) != Some("autonomous") {
-        return Err("broker did not create the requested autonomous identity delegation".into());
-    }
     let session_id = result
         .get("session_id")
         .and_then(|v| v.as_str())
+        .filter(|id| !id.trim().is_empty())
         .ok_or_else(|| "agent_session_start missing session_id".to_string())?
         .to_owned();
-    let session_token = result
-        .get("session_token")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "agent_session_start missing session_token".to_string())?
-        .to_owned();
-
-    if !json_output {
-        ui::header("Agent Wrapper Session");
-        ui::kv("session_id", &session_id);
-        if let Some(expires) = result.get("expires_at_utc_ms").and_then(|v| v.as_i64()) {
-            ui::kv("expires_at_utc_ms", &expires.to_string());
+    // Every path after receiving an identifiable grant attempts revocation,
+    // including malformed grants and failures before the child can execute.
+    let outcome = async {
+        // Finish the in-flight mint to obtain its ID for revocation, but never
+        // launch a child after cancellation while approval was pending.
+        if let Some(signal) = cancellation {
+            return Ok(128 + signal);
         }
-        // Present when the daemon minted a delegation (identity configured).
-        if let Some(mode) = result.get("mode").and_then(|v| v.as_str()) {
-            ui::kv("mode", mode);
+        if mode == "autonomous" && result.get("mode").and_then(|v| v.as_str()) != Some("autonomous")
+        {
+            return Err(
+                "broker did not create the requested autonomous identity delegation".into(),
+            );
         }
-        if let Some(label) = result.get("on_behalf_of_label").and_then(|v| v.as_str()) {
-            ui::kv("on behalf of", label);
-        }
-    }
+        let session_token = result
+            .get("session_token")
+            .and_then(|v| v.as_str())
+            .filter(|token| !token.trim().is_empty())
+            .ok_or_else(|| "agent_session_start missing session_token".to_string())?
+            .to_owned();
 
-    let mut child = tokio::process::Command::new(&command[0]);
-    if command.len() > 1 {
-        child.args(&command[1..]);
-    }
-
-    if !inherit_env {
-        child.env_clear();
-        for key in BASELINE_ENV_KEYS {
-            if let Ok(val) = std::env::var(key) {
-                child.env(key, val);
+        if !json_output {
+            ui::header("Agent Wrapper Session");
+            ui::kv("session_id", &session_id);
+            if let Some(expires) = result.get("expires_at_utc_ms").and_then(|v| v.as_i64()) {
+                ui::kv("expires_at_utc_ms", &expires.to_string());
+            }
+            // Present when the daemon minted a delegation (identity configured).
+            if let Some(mode) = result.get("mode").and_then(|v| v.as_str()) {
+                ui::kv("mode", mode);
+            }
+            if let Some(label) = result.get("on_behalf_of_label").and_then(|v| v.as_str()) {
+                ui::kv("on behalf of", label);
             }
         }
-        for key in pass_env {
-            if let Ok(val) = std::env::var(key) {
-                child.env(key, val);
+
+        let mut child = tokio::process::Command::new(&command[0]);
+        if command.len() > 1 {
+            child.args(&command[1..]);
+        }
+
+        if !inherit_env {
+            child.env_clear();
+            for key in BASELINE_ENV_KEYS {
+                if let Ok(val) = std::env::var(key) {
+                    child.env(key, val);
+                }
+            }
+            for key in pass_env {
+                if let Ok(val) = std::env::var(key) {
+                    child.env(key, val);
+                }
             }
         }
+
+        child.env("OPAQUE_SESSION_TOKEN", &session_token);
+        child.env("OPAQUE_AGENT_SESSION_ID", &session_id);
+        child.env("OPAQUE_AGENT_WRAPPED", "1");
+        child.env("OPAQUE_SOCK", sock.display().to_string());
+        child.stdin(std::process::Stdio::inherit());
+        child.stdout(std::process::Stdio::inherit());
+        child.stderr(std::process::Stdio::inherit());
+        tokio::select! {
+            biased;
+            _ = interrupt.recv() => return Ok(128 + libc::SIGINT),
+            _ = terminate.recv() => return Ok(128 + libc::SIGTERM),
+            _ = std::future::ready(()) => {},
+        }
+        agent_process::run(child, &mut interrupt, &mut terminate).await
     }
+    .await;
 
-    child.env("OPAQUE_SESSION_TOKEN", &session_token);
-    child.env("OPAQUE_AGENT_SESSION_ID", &session_id);
-    child.env("OPAQUE_AGENT_WRAPPED", "1");
-    child.env("OPAQUE_SOCK", sock.display().to_string());
-    child.stdin(std::process::Stdio::inherit());
-    child.stdout(std::process::Stdio::inherit());
-    child.stderr(std::process::Stdio::inherit());
-
-    let status = child
-        .spawn()
-        .map_err(|e| format!("failed to spawn agent command: {e}"))?
-        .wait()
-        .await
-        .map_err(|e| format!("agent command failed to run: {e}"))?;
-
-    // Best-effort cleanup.
-    let _ = call(
+    let cleanup = call(
         sock,
         "agent_session_end",
         serde_json::json!({ "session_id": session_id }),
     )
-    .await;
-
-    Ok(status.code().unwrap_or(1))
+    .await
+    .map_err(|e| format!("agent session cleanup failed: {e}"))
+    .and_then(|response| match response.error {
+        Some(error) => Err(format!(
+            "agent session cleanup failed: {}: {}",
+            error.code, error.message
+        )),
+        None => match response.result {
+            Some(result)
+                if matches!(result.get("status").and_then(|v| v.as_str()), Some("ended" | "not_found"))
+                    && result.get("session_id").and_then(|v| v.as_str()) == Some(session_id.as_str()) => Ok(()),
+            _ => Err("agent session cleanup failed: broker did not acknowledge this session's revocation".into()),
+        },
+    });
+    match (outcome, cleanup) {
+        (Ok(code), Ok(())) => Ok(code),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(cleanup)) => Err(format!("{error}; {cleanup}")),
+    }
 }
 
 fn maybe_warn_opaque_mcp_skew(command: &[String], json_output: bool) {
@@ -2563,6 +2619,7 @@ async fn main() {
                 ServiceAction::Status => service::ServiceOp::Status,
                 ServiceAction::Start => service::ServiceOp::Start,
                 ServiceAction::Stop => service::ServiceOp::Stop,
+                ServiceAction::Restart => service::ServiceOp::Restart,
                 ServiceAction::Logs => service::ServiceOp::Logs,
             };
             match service::run(op) {
@@ -2580,6 +2637,9 @@ async fn main() {
                         }
                         service::ServiceOp::Stop => {
                             ui::success("Daemon service stopped");
+                        }
+                        service::ServiceOp::Restart => {
+                            ui::success("Daemon service restarted");
                         }
                         service::ServiceOp::Status | service::ServiceOp::Logs => {
                             // Status and logs handle their own output.
@@ -3146,6 +3206,36 @@ async fn main() {
                 sp.finish_and_clear();
             }
 
+            // Verification is mandatory for every output format. JSON consumers
+            // must never receive an unverified report as a successful command.
+            if method == "attestation_report" && resp.error.is_none() {
+                let verification = resp
+                    .result
+                    .as_ref()
+                    .ok_or_else(|| "daemon returned no attestation result".to_string())
+                    .and_then(|result| {
+                        verify_attestation(
+                            result,
+                            &attest_nonce,
+                            attest_expected_key.as_deref(),
+                            attest_raw,
+                            json_output,
+                        )
+                    });
+                match verification {
+                    Ok(true) => return,
+                    Ok(false) => std::process::exit(EXIT_DAEMON),
+                    Err(error) => {
+                        if json_output {
+                            println!("{}", serde_json::json!({"verified": false, "error": error}));
+                        } else {
+                            ui::error(&error);
+                        }
+                        std::process::exit(EXIT_DAEMON);
+                    }
+                }
+            }
+
             if json_output {
                 // Raw JSON: output the full response as-is.
                 let output =
@@ -3166,29 +3256,6 @@ async fn main() {
                     std::process::exit(exit_code);
                 }
                 if let Some(result) = &resp.result {
-                    // Attestation is verified CLIENT-SIDE before anything is
-                    // printed: an unverifiable report must never render as a
-                    // healthy posture.
-                    if method == "attestation_report" {
-                        match verify_attestation(
-                            result,
-                            &attest_nonce,
-                            attest_expected_key.as_deref(),
-                            attest_raw,
-                            json_output,
-                        ) {
-                            Ok(healthy) => {
-                                if !healthy {
-                                    std::process::exit(EXIT_DAEMON);
-                                }
-                            }
-                            Err(e) => {
-                                ui::error(&e);
-                                std::process::exit(EXIT_DAEMON);
-                            }
-                        }
-                        return;
-                    }
                     if quiet {
                         // Quiet mode: only show essential output (no decorative formatting).
                         // For methods that have data, print minimal JSON.
@@ -4220,15 +4287,7 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 // Policy config types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, serde::Deserialize)]
-struct PolicyConfig {
-    #[serde(default)]
-    rules: Vec<PolicyRule>,
-
-    /// When true, the daemon refuses to start if the config is not sealed.
-    #[serde(default)]
-    require_seal: bool,
-}
+use opaque_core::policy_document::PolicyDocument as PolicyConfig;
 
 // ---------------------------------------------------------------------------
 // policy check
@@ -4251,36 +4310,10 @@ fn policy_check_path(file: Option<&Path>) -> Result<String, String> {
     let contents = std::fs::read_to_string(&path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
 
-    let config: PolicyConfig = toml_edit::de::from_str(&contents)
+    let config: PolicyConfig = PolicyConfig::from_toml(&contents)
         .map_err(|e| format!("TOML parse error in {}: {e}", path.display()))?;
 
-    // Additional semantic validation.
-    let mut errors: Vec<String> = Vec::new();
-    for (i, rule) in config.rules.iter().enumerate() {
-        let prefix = format!("rules[{i}] ({:?})", rule.name);
-        if rule.name.is_empty() {
-            errors.push(format!("{prefix}: name must be non-empty"));
-        }
-        if rule.operation_pattern.is_empty() {
-            errors.push(format!("{prefix}: operation_pattern must be non-empty"));
-        }
-        if rule.client_types.is_empty() {
-            errors.push(format!("{prefix}: client_types must not be empty"));
-        }
-        if let Some(ttl) = rule.approval.lease_ttl
-            && ttl.as_secs() == 0
-        {
-            errors.push(format!("{prefix}: approval.lease_ttl must be > 0"));
-        }
-        if rule.approval.budget.is_some()
-            && (rule.approval.require != opaque_core::operation::ApprovalRequirement::FirstUse
-                || rule.approval.budget == Some(0))
-        {
-            errors.push(format!(
-                "{prefix}: approval.budget requires first_use and must be > 0"
-            ));
-        }
-    }
+    let errors = config.validation_errors();
 
     if !errors.is_empty() {
         return Err(format!(
@@ -4302,7 +4335,7 @@ fn policy_show(file: Option<&Path>) -> Result<(), String> {
     let contents = std::fs::read_to_string(&path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
 
-    let config: PolicyConfig = toml_edit::de::from_str(&contents)
+    let config: PolicyConfig = PolicyConfig::from_toml(&contents)
         .map_err(|e| format!("TOML parse error in {}: {e}", path.display()))?;
 
     if config.rules.is_empty() {
@@ -4470,7 +4503,7 @@ fn policy_simulate(
     let contents = std::fs::read_to_string(&path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
 
-    let config: PolicyConfig = toml_edit::de::from_str(&contents)
+    let config: PolicyConfig = PolicyConfig::from_toml(&contents)
         .map_err(|e| format!("TOML parse error in {}: {e}", path.display()))?;
 
     let client_type = match client_type_str {
@@ -4656,7 +4689,7 @@ fn policy_list_presets() {
             style(description).dim()
         );
         // Show a one-line summary of what the preset enables.
-        if let Ok(config) = toml_edit::de::from_str::<PolicyConfig>(content) {
+        if let Ok(config) = PolicyConfig::from_toml(content) {
             let ops: Vec<&str> = config
                 .rules
                 .iter()
@@ -5364,7 +5397,7 @@ fn verify_attestation(
                 "{} bundle v{} ({})",
                 f.org,
                 f.version,
-                &f.digest[..16.min(f.digest.len())]
+                f.digest.chars().take(16).collect::<String>()
             ),
         ),
         None => ui::kv("federation", "no bundle applied"),
@@ -5417,13 +5450,15 @@ fn run_setup(seal_only: bool, reset: bool, verify: bool) -> Result<(), String> {
                 ui::kv("expected", &expected);
                 ui::kv("actual", &actual);
                 ui::info("Run 'opaque setup --reset' to unseal, then reconfigure.");
+                return Err("config seal verification failed: config was modified".into());
             }
             SealStatus::KeyMissing => {
                 ui::error("Config has a keyed seal but the seal key (config.seal.key) is missing.");
                 ui::info("Restore the key, or 'opaque setup --reset' then 'opaque setup --seal'.");
+                return Err("config seal verification failed: seal key missing".into());
             }
             SealStatus::Unsealed => {
-                ui::warn("Config is unsealed — run 'opaque setup --seal' to protect it.");
+                return Err("Config is unsealed — run 'opaque setup --seal' to protect it.".into());
             }
         }
         return Ok(());
@@ -5959,7 +5994,7 @@ async fn run_status(json_output: bool) {
         // Config
         let rule_count = std::fs::read_to_string(&config_path)
             .ok()
-            .and_then(|c| toml_edit::de::from_str::<PolicyConfig>(&c).ok())
+            .and_then(|c| PolicyConfig::from_toml(&c).ok())
             .map(|c| c.rules.len())
             .unwrap_or(0);
 
@@ -6121,16 +6156,21 @@ async fn run_doctor() {
     let mut fail_count = 0u32;
 
     let base = default_opaque_dir();
+    let config_path = resolve_config_path(None);
+    let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
 
     // 1. Config directory
-    if base.exists() {
+    if config_dir.exists() {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = std::fs::metadata(&base) {
+            if let Ok(meta) = std::fs::metadata(config_dir) {
                 let mode = meta.permissions().mode() & 0o777;
                 if mode == 0o700 {
-                    doctor_pass(&format!("Config directory exists ({})", base.display()));
+                    doctor_pass(&format!(
+                        "Config directory exists ({})",
+                        config_dir.display()
+                    ));
                     pass_count += 1;
                 } else {
                     doctor_warn(&format!(
@@ -6139,13 +6179,19 @@ async fn run_doctor() {
                     warn_count += 1;
                 }
             } else {
-                doctor_pass(&format!("Config directory exists ({})", base.display()));
+                doctor_pass(&format!(
+                    "Config directory exists ({})",
+                    config_dir.display()
+                ));
                 pass_count += 1;
             }
         }
         #[cfg(not(unix))]
         {
-            doctor_pass(&format!("Config directory exists ({})", base.display()));
+            doctor_pass(&format!(
+                "Config directory exists ({})",
+                config_dir.display()
+            ));
             pass_count += 1;
         }
     } else {
@@ -6154,10 +6200,9 @@ async fn run_doctor() {
     }
 
     // 2. Config file
-    let config_path = base.join("config.toml");
     if config_path.exists() {
         match std::fs::read_to_string(&config_path) {
-            Ok(contents) => match toml_edit::de::from_str::<PolicyConfig>(&contents) {
+            Ok(contents) => match PolicyConfig::from_toml(&contents) {
                 Ok(config) => {
                     doctor_pass(&format!("Config file valid ({} rules)", config.rules.len()));
                     pass_count += 1;
@@ -6234,7 +6279,7 @@ async fn run_doctor() {
     // 4. Require-seal setting
     if config_path.exists() {
         match std::fs::read_to_string(&config_path) {
-            Ok(contents) => match toml_edit::de::from_str::<PolicyConfig>(&contents) {
+            Ok(contents) => match PolicyConfig::from_toml(&contents) {
                 Ok(config) => {
                     if config.require_seal {
                         doctor_pass("require_seal is enabled (tamper protection active)");
@@ -6265,7 +6310,7 @@ async fn run_doctor() {
             use std::os::unix::fs::PermissionsExt;
             if let Ok(meta) = std::fs::metadata(&sock) {
                 let mode = meta.permissions().mode() & 0o777;
-                if mode <= 0o600 {
+                if mode & 0o177 == 0 {
                     doctor_pass(&format!(
                         "Socket exists with secure permissions ({mode:04o})"
                     ));
@@ -7210,7 +7255,7 @@ fn generate_repo_policy(remote_url: &str, preset_content: Option<&str>) -> Strin
     let url_pattern = format!("*{}*", escaped_url);
 
     if let Some(preset) = preset_content
-        && let Ok(config) = toml_edit::de::from_str::<PolicyConfig>(preset)
+        && let Ok(config) = PolicyConfig::from_toml(preset)
     {
         let mut result = format!(
             "# Repo-scoped Opaque policy for {}\n\
@@ -7432,6 +7477,7 @@ fn preset_checklist(preset_name: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use std::fs;
@@ -7699,7 +7745,7 @@ lease_ttl = 0
     #[test]
     fn presets_are_valid_toml() {
         for (name, _, content) in available_presets() {
-            let result: Result<PolicyConfig, _> = toml_edit::de::from_str(content);
+            let result: Result<PolicyConfig, _> = PolicyConfig::from_toml(content);
             assert!(
                 result.is_ok(),
                 "preset '{name}' is not valid TOML: {result:?}"
@@ -8628,7 +8674,7 @@ BAZ=
 
     #[test]
     fn codex_agent_preset_is_valid_toml() {
-        let result: Result<PolicyConfig, _> = toml_edit::de::from_str(PRESET_CODEX_AGENT);
+        let result: Result<PolicyConfig, _> = PolicyConfig::from_toml(PRESET_CODEX_AGENT);
         assert!(
             result.is_ok(),
             "codex-agent preset should be valid TOML: {result:?}"

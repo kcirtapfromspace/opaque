@@ -77,6 +77,7 @@ pub fn load_web_config(path: &Path) -> Result<WebConfig, String> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
