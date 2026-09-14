@@ -15,9 +15,9 @@ const OPERATION: &str = "test.connection_effect";
 const SESSION: &str = "connection-flow-session";
 const TOKEN: &str = "connection-flow-token";
 const BOUND: Duration = Duration::from_secs(1);
-// Match the existing real daemon identity RPC fixture: a response includes
-// freshly hashing the actual caller executable before the handshake. The
-// one-second handler shutdown bound stays separate from that setup cost.
+// Start response deadlines after real listener identity setup. A debug test
+// executable can take longer to hash than a small production CLI; that setup
+// must not consume the request's response deadline.
 const RESPONSE_BOUND: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
@@ -153,7 +153,22 @@ impl Fixture {
         std::fs::remove_file(path).unwrap();
         let (shutdown, rx) = tokio::sync::watch::channel(false);
         let state = self.state.clone();
-        let task = tokio::spawn(handle_conn(state, server, rx));
+        let mut handler = Box::pin(handle_conn(state, server, rx));
+        if !self.state.config.trust_domain.enforce {
+            // No handshake bytes have been sent. The real handler's first poll
+            // performs UID/PID/executable attestation, then waits for those
+            // bytes. Finish that synchronous setup before starting any client
+            // response deadline, without replacing or caching its identity.
+            let first_poll =
+                std::future::poll_fn(|cx| std::task::Poll::Ready(handler.as_mut().poll(cx))).await;
+            assert!(
+                first_poll.is_pending(),
+                "admitted peer must await handshake"
+            );
+        }
+        // Enforced-mode denial deliberately remains unpolled, so its test can
+        // queue a valid request before the handler rejects the actual UID.
+        let task = tokio::spawn(handler);
         Connection {
             client: Framed::new(
                 client,
