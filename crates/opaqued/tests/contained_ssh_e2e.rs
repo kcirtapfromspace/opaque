@@ -876,12 +876,27 @@ async fn contained_guard_crash_preserves_unknown_and_kills_probe_without_replay(
     fixture.workstation.respond(&review, true).await.unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if Services::call("snapshot", &[])["reads"] == 1 {
+        let observed = Services::call("snapshot", &[]);
+        if observed["reads"] == 1 {
             break;
+        }
+        if pending.is_finished() {
+            let result = pending.await.unwrap().unwrap();
+            panic!(
+                "SSH completed before the crash boundary: error={}, state={}, outcome={}, reads={}, sign_requests={}",
+                result["error"]["code"],
+                result["result"]["task"]["slots"][0]["state"],
+                result["result"]["task"]["slots"][0]["outcome"]["code"],
+                observed["reads"],
+                observed["vault_sign_requests"],
+            );
         }
         assert!(
             Instant::now() < deadline,
-            "real SSH probe did not enter health service"
+            "real SSH probe did not enter health service: reads={}, sign_requests={}, guard_idle={}",
+            observed["reads"],
+            observed["vault_sign_requests"],
+            observed["guard_idle"],
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

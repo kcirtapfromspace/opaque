@@ -195,7 +195,12 @@ def host_ready():
         if error.code != 403:
             return False
     with socket.create_connection(("127.0.0.1", 2222), timeout=1) as peer:
-        return peer.recv(256).startswith(b"SSH-2.0-")
+        if not peer.recv(256).startswith(b"SSH-2.0-"):
+            return False
+    # Type=simple being active does not prove the health listener is bound.
+    # A TCP-only check leaves the one authorized HTTP read unconsumed.
+    with socket.create_connection(("127.0.0.1", 8080), timeout=1):
+        return True
 
 
 def configure(task_path):
