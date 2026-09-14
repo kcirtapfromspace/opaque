@@ -3010,3 +3010,8 @@ mod concurrency_tests {
         assert!(try_organization_state(&state).is_ok());
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "server_state_contract_tests.rs"]
+mod state_contract_tests;

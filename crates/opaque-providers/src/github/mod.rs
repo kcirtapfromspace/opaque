@@ -974,6 +974,7 @@ mod tests {
     fn github_handler_debug() {
         use opaque_core::audit::InMemoryAuditEmitter;
         let audit = Arc::new(InMemoryAuditEmitter::new());
+        let _environment = TEST_ENV_LOCK.blocking_lock();
         let handler = GitHubHandler::new(audit).unwrap();
         let debug = format!("{handler:?}");
         assert!(debug.contains("GitHubHandler"));
@@ -1010,6 +1011,7 @@ mod tests {
     async fn missing_repo_param_rejected() {
         use opaque_core::audit::InMemoryAuditEmitter;
         let audit = Arc::new(InMemoryAuditEmitter::new());
+        let _environment = TEST_ENV_LOCK.lock().await;
         let handler = GitHubHandler::new(audit).unwrap();
         let request = make_request("github.set_actions_secret", serde_json::json!({}));
         let result = handler.execute(&request).await;
@@ -1021,6 +1023,7 @@ mod tests {
     async fn missing_secret_name_rejected() {
         use opaque_core::audit::InMemoryAuditEmitter;
         let audit = Arc::new(InMemoryAuditEmitter::new());
+        let _environment = TEST_ENV_LOCK.lock().await;
         let handler = GitHubHandler::new(audit).unwrap();
         let request = make_request(
             "github.set_actions_secret",
@@ -1035,6 +1038,7 @@ mod tests {
     async fn raw_value_ref_rejected() {
         use opaque_core::audit::InMemoryAuditEmitter;
         let audit = Arc::new(InMemoryAuditEmitter::new());
+        let _environment = TEST_ENV_LOCK.lock().await;
         let handler = GitHubHandler::new(audit).unwrap();
         let request = make_request(
             "github.set_actions_secret",
@@ -1053,6 +1057,7 @@ mod tests {
     async fn invalid_repo_format_rejected() {
         use opaque_core::audit::InMemoryAuditEmitter;
         let audit = Arc::new(InMemoryAuditEmitter::new());
+        let _environment = TEST_ENV_LOCK.lock().await;
         let handler = GitHubHandler::new(audit).unwrap();
         let request = make_request(
             "github.set_actions_secret",
@@ -1071,6 +1076,7 @@ mod tests {
     async fn invalid_environment_name_rejected() {
         use opaque_core::audit::InMemoryAuditEmitter;
         let audit = Arc::new(InMemoryAuditEmitter::new());
+        let _environment = TEST_ENV_LOCK.lock().await;
         let handler = GitHubHandler::new(audit).unwrap();
         let request = make_request(
             "github.set_actions_secret",
@@ -1092,6 +1098,7 @@ mod tests {
     async fn codespaces_missing_secret_name_rejected() {
         use opaque_core::audit::InMemoryAuditEmitter;
         let audit = Arc::new(InMemoryAuditEmitter::new());
+        let _environment = TEST_ENV_LOCK.lock().await;
         let handler = GitHubHandler::new(audit).unwrap();
         let request = make_request("github.set_codespaces_secret", serde_json::json!({}));
         let result = handler.execute(&request).await;
@@ -1103,6 +1110,7 @@ mod tests {
     async fn codespaces_missing_value_ref_rejected() {
         use opaque_core::audit::InMemoryAuditEmitter;
         let audit = Arc::new(InMemoryAuditEmitter::new());
+        let _environment = TEST_ENV_LOCK.lock().await;
         let handler = GitHubHandler::new(audit).unwrap();
         let request = make_request(
             "github.set_codespaces_secret",
@@ -1119,6 +1127,7 @@ mod tests {
     async fn dependabot_missing_repo_rejected() {
         use opaque_core::audit::InMemoryAuditEmitter;
         let audit = Arc::new(InMemoryAuditEmitter::new());
+        let _environment = TEST_ENV_LOCK.lock().await;
         let handler = GitHubHandler::new(audit).unwrap();
         let request = make_request(
             "github.set_dependabot_secret",
@@ -1138,6 +1147,7 @@ mod tests {
     async fn org_secret_missing_org_rejected() {
         use opaque_core::audit::InMemoryAuditEmitter;
         let audit = Arc::new(InMemoryAuditEmitter::new());
+        let _environment = TEST_ENV_LOCK.lock().await;
         let handler = GitHubHandler::new(audit).unwrap();
         let request = make_request(
             "github.set_org_secret",
@@ -1155,6 +1165,7 @@ mod tests {
     async fn org_secret_invalid_org_name_rejected() {
         use opaque_core::audit::InMemoryAuditEmitter;
         let audit = Arc::new(InMemoryAuditEmitter::new());
+        let _environment = TEST_ENV_LOCK.lock().await;
         let handler = GitHubHandler::new(audit).unwrap();
         let request = make_request(
             "github.set_org_secret",
@@ -1173,6 +1184,7 @@ mod tests {
     async fn org_secret_invalid_visibility_rejected() {
         use opaque_core::audit::InMemoryAuditEmitter;
         let audit = Arc::new(InMemoryAuditEmitter::new());
+        let _environment = TEST_ENV_LOCK.lock().await;
         let handler = GitHubHandler::new(audit).unwrap();
         let request = make_request(
             "github.set_org_secret",
@@ -1194,6 +1206,7 @@ mod tests {
     async fn unknown_operation_rejected() {
         use opaque_core::audit::InMemoryAuditEmitter;
         let audit = Arc::new(InMemoryAuditEmitter::new());
+        let _environment = TEST_ENV_LOCK.lock().await;
         let handler = GitHubHandler::new(audit).unwrap();
         let request = make_request("github.unknown_op", serde_json::json!({}));
         let result = handler.execute(&request).await;
@@ -1300,6 +1313,7 @@ mod tests {
     async fn list_secrets_missing_repo_rejected() {
         use opaque_core::audit::InMemoryAuditEmitter;
         let audit = Arc::new(InMemoryAuditEmitter::new());
+        let _environment = TEST_ENV_LOCK.lock().await;
         let handler = GitHubHandler::new(audit).unwrap();
         let request = make_request("github.list_secrets", serde_json::json!({}));
         let result = handler.execute(&request).await;
@@ -1311,6 +1325,7 @@ mod tests {
     async fn list_secrets_invalid_scope_rejected() {
         use opaque_core::audit::InMemoryAuditEmitter;
         let audit = Arc::new(InMemoryAuditEmitter::new());
+        let _environment = TEST_ENV_LOCK.lock().await;
         let handler = GitHubHandler::new(audit).unwrap();
         let request = make_request(
             "github.list_secrets",
@@ -1327,6 +1342,7 @@ mod tests {
     async fn delete_secret_missing_name_rejected() {
         use opaque_core::audit::InMemoryAuditEmitter;
         let audit = Arc::new(InMemoryAuditEmitter::new());
+        let _environment = TEST_ENV_LOCK.lock().await;
         let handler = GitHubHandler::new(audit).unwrap();
         let request = make_request(
             "github.delete_secret",
@@ -1341,6 +1357,7 @@ mod tests {
     async fn delete_secret_invalid_name_rejected() {
         use opaque_core::audit::InMemoryAuditEmitter;
         let audit = Arc::new(InMemoryAuditEmitter::new());
+        let _environment = TEST_ENV_LOCK.lock().await;
         let handler = GitHubHandler::new(audit).unwrap();
         let request = make_request(
             "github.delete_secret",

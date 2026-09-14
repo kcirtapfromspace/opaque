@@ -943,6 +943,354 @@ mod tests {
     }
 
     #[test]
+    fn stale_or_wrong_group_issuance_preserves_capacity_until_fresh_eligible_evidence() {
+        for stale in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let database = directory.path().join("identity.db");
+            let f = Fixture::with_store(IdentityStore::open(&database).unwrap());
+            let parent = f.mandate(2);
+            let request = Uuid::new_v4().to_string();
+            let denied_at = f.now + if stale { 301 } else { 1 };
+            if !stale {
+                f.snapshot(&["Other"], denied_at);
+            }
+            let before =
+                serde_json::to_value(f.store.get_mandate(&f.binding, &parent.id).unwrap()).unwrap();
+            assert_eq!(
+                f.store
+                    .issue_access(
+                        &f.binding,
+                        &parent.id,
+                        &f.service,
+                        &f.delegation,
+                        &f.recipient,
+                        &request,
+                        denied_at + 600,
+                        denied_at,
+                        300,
+                        |_| true
+                    )
+                    .unwrap_err(),
+                "verified persona is stale or outside eligible group"
+            );
+            assert_eq!(
+                serde_json::to_value(f.store.get_mandate(&f.binding, &parent.id).unwrap()).unwrap(),
+                before
+            );
+            assert!(f.store.list_access_grants(&f.binding).unwrap().is_empty());
+            let fresh = denied_at + 1;
+            f.snapshot(&["Engineering"], fresh);
+            let grant = f
+                .store
+                .issue_access(
+                    &f.binding,
+                    &parent.id,
+                    &f.service,
+                    &f.delegation,
+                    &f.recipient,
+                    &request,
+                    fresh + 600,
+                    fresh,
+                    300,
+                    |_| true,
+                )
+                .unwrap();
+            let replay = f
+                .store
+                .issue_access(
+                    &f.binding,
+                    &parent.id,
+                    &f.service,
+                    &f.delegation,
+                    &f.recipient,
+                    &request,
+                    fresh + 601,
+                    fresh + 1,
+                    300,
+                    |_| true,
+                )
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&replay).unwrap(),
+                serde_json::to_value(&grant).unwrap()
+            );
+            assert_eq!(
+                f.store
+                    .get_mandate(&f.binding, &parent.id)
+                    .unwrap()
+                    .issued_count,
+                1
+            );
+            assert_eq!(
+                f.store
+                    .authorize_scopes(&f.binding, &f.recipient, fresh, 300, |_| true)
+                    .unwrap(),
+                profile().scopes
+            );
+            let binding = f.binding.clone();
+            drop(f);
+            let reopened = IdentityStore::open(&database).unwrap();
+            assert_eq!(
+                reopened
+                    .get_mandate(&binding, &parent.id)
+                    .unwrap()
+                    .issued_count,
+                1
+            );
+            assert_eq!(
+                serde_json::to_value(reopened.list_access_grants(&binding).unwrap()).unwrap(),
+                serde_json::json!([grant])
+            );
+        }
+    }
+
+    #[test]
+    fn natural_parent_and_child_expiry_never_extend_or_refund_issued_access() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("identity.db");
+        let f = Fixture::with_store(IdentityStore::open(&database).unwrap());
+        let parent = f
+            .store
+            .create_mandate(
+                &f.binding,
+                &f.issuer,
+                &f.service,
+                "engineering-metrics",
+                f.store
+                    .provisioning_profile("engineering-metrics")
+                    .unwrap()
+                    .1,
+                f.store.provisioning_principal_epoch(&f.issuer).unwrap(),
+                &f.session,
+                f.now + 120,
+                2,
+                "credential-1",
+                f.now,
+                |_| true,
+            )
+            .unwrap();
+        let request = Uuid::new_v4().to_string();
+        assert_eq!(
+            f.issue(&parent, &request).unwrap_err(),
+            "access outlives its provisioning mandate"
+        );
+        assert_eq!(
+            f.store
+                .get_mandate(&f.binding, &parent.id)
+                .unwrap()
+                .issued_count,
+            0
+        );
+        assert!(f.store.list_access_grants(&f.binding).unwrap().is_empty());
+        let grant = f
+            .store
+            .issue_access(
+                &f.binding,
+                &parent.id,
+                &f.service,
+                &f.delegation,
+                &f.recipient,
+                &request,
+                f.now + 60,
+                f.now,
+                300,
+                |_| true,
+            )
+            .unwrap();
+        assert_eq!(grant.expires_at, f.now + 60);
+        assert_eq!(
+            f.store
+                .authorize_scopes(&f.binding, &f.recipient, f.now + 59, 300, |_| true)
+                .unwrap(),
+            profile().scopes
+        );
+        assert!(
+            f.store
+                .authorize_scopes(&f.binding, &f.recipient, f.now + 60, 300, |_| true)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            f.store
+                .issue_access(
+                    &f.binding,
+                    &parent.id,
+                    &f.service,
+                    &f.delegation,
+                    &f.recipient,
+                    &request,
+                    f.now + 120,
+                    f.now + 60,
+                    300,
+                    |_| true
+                )
+                .unwrap_err(),
+            "previous issuance is no longer active; request ID remains consumed"
+        );
+        assert_eq!(
+            f.store
+                .issue_access(
+                    &f.binding,
+                    &parent.id,
+                    &f.service,
+                    &f.delegation,
+                    &f.recipient,
+                    &Uuid::new_v4().to_string(),
+                    f.now + 180,
+                    f.now + 120,
+                    300,
+                    |_| true
+                )
+                .unwrap_err(),
+            "provisioning mandate inactive"
+        );
+        let retained = f.store.list_access_grants(&f.binding).unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].id, grant.id);
+        assert_eq!(retained[0].revoked_at, Some(f.now + 60));
+        assert_eq!(
+            f.store
+                .get_mandate(&f.binding, &parent.id)
+                .unwrap()
+                .issued_count,
+            1
+        );
+        let binding = f.binding.clone();
+        drop(f);
+        let reopened = IdentityStore::open(&database).unwrap();
+        assert_eq!(
+            reopened
+                .get_mandate(&binding, &parent.id)
+                .unwrap()
+                .issued_count,
+            1
+        );
+        assert_eq!(
+            serde_json::to_value(reopened.list_access_grants(&binding).unwrap()).unwrap(),
+            serde_json::to_value(retained).unwrap()
+        );
+    }
+
+    #[test]
+    fn current_runtime_admission_withdrawal_revokes_access_and_restoring_config_cannot_replay() {
+        use crate::identity::{IdentityConfig, IdentityRuntime};
+        for removed in ["admin", "onboarding", "new-hire"] {
+            let directory = tempfile::tempdir().unwrap();
+            let database = directory.path().join("identity.db");
+            let f = Fixture::with_store(IdentityStore::open(&database).unwrap());
+            let cfg:IdentityConfig=serde_json::from_value(serde_json::json!({
+                "issuer":"https://idp.example","client_id":"fixture","allowed_subjects":["admin","new-hire"],
+                "persona":{"groups_claim":"groups","max_age_secs":300},"service_principals":[{"name":"onboarding","roles":[]}]
+            })).unwrap();
+            let mut runtime = IdentityRuntime::initialize(cfg.clone(), directory.path()).unwrap();
+            let parent = f.mandate(3);
+            let request = Uuid::new_v4().to_string();
+            let grant = f.issue(&parent, &request).unwrap();
+            assert_eq!(
+                f.store
+                    .authorize_scopes(&f.binding, &f.recipient, f.now, 300, |p| runtime
+                        .principal_permitted(p))
+                    .unwrap(),
+                profile().scopes
+            );
+            if removed == "onboarding" {
+                runtime.config.service_principals.clear();
+            } else {
+                runtime.config.allowed_subjects.retain(|s| s != removed);
+            }
+            let expected = match removed {
+                "admin" => "provisioning issuer not admitted",
+                "onboarding" => "provisioning service not admitted",
+                _ => "provisioning recipient not admitted",
+            };
+            assert_eq!(
+                f.store
+                    .issue_access(
+                        &f.binding,
+                        &parent.id,
+                        &f.service,
+                        &f.delegation,
+                        &f.recipient,
+                        &Uuid::new_v4().to_string(),
+                        f.now + 600,
+                        f.now,
+                        300,
+                        |p| runtime.principal_permitted(p)
+                    )
+                    .unwrap_err(),
+                expected
+            );
+            assert_eq!(
+                f.store
+                    .get_mandate(&f.binding, &parent.id)
+                    .unwrap()
+                    .issued_count,
+                1
+            );
+            assert!(
+                f.store
+                    .authorize_scopes(&f.binding, &f.recipient, f.now + 1, 300, |p| runtime
+                        .principal_permitted(p))
+                    .unwrap()
+                    .is_empty()
+            );
+            f.store
+                .sync_provisioning_admission(|p| runtime.principal_permitted(p), f.now + 2)
+                .unwrap();
+            let retained = f.store.list_access_grants(&f.binding).unwrap();
+            assert_eq!(retained.len(), 1);
+            assert_eq!(retained[0].id, grant.id);
+            assert!(retained[0].revoked_at.is_some());
+            let parent = f.store.get_mandate(&f.binding, &parent.id).unwrap();
+            assert_eq!(parent.issued_count, 1);
+            assert_eq!(parent.revoked_at.is_some(), removed != "new-hire");
+            runtime.config = cfg.clone();
+            f.store
+                .sync_provisioning_admission(|p| runtime.principal_permitted(p), f.now + 3)
+                .unwrap();
+            assert!(
+                f.store
+                    .authorize_scopes(&f.binding, &f.recipient, f.now + 3, 300, |p| runtime
+                        .principal_permitted(p))
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                f.store
+                    .issue_access(
+                        &f.binding,
+                        &parent.id,
+                        &f.service,
+                        &f.delegation,
+                        &f.recipient,
+                        &request,
+                        f.now + 603,
+                        f.now + 3,
+                        300,
+                        |p| runtime.principal_permitted(p)
+                    )
+                    .is_err()
+            );
+            let binding = f.binding.clone();
+            drop(f);
+            drop(runtime);
+            let reopened = IdentityRuntime::initialize(cfg, directory.path()).unwrap();
+            assert_eq!(
+                reopened
+                    .store
+                    .get_mandate(&binding, &parent.id)
+                    .unwrap()
+                    .issued_count,
+                1
+            );
+            assert_eq!(
+                serde_json::to_value(reopened.store.list_access_grants(&binding).unwrap()).unwrap(),
+                serde_json::to_value(retained).unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn failed_delegation_revoke_cannot_issue_or_replay_access_from_a_live_durable_row() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("identity.db");

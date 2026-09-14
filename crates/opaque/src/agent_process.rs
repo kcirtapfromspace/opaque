@@ -198,11 +198,15 @@ fn signal_group(group: libc::pid_t, signal: libc::c_int) -> io::Result<()> {
     if group <= 0 || group == unsafe { libc::getpgrp() } {
         return Err(io::Error::from_raw_os_error(libc::EINVAL));
     }
-    match check(unsafe { libc::kill(-group, signal) }) {
+    completed_group_signal(group, check(unsafe { libc::kill(-group, signal) }))
+}
+
+fn completed_group_signal(_group: libc::pid_t, result: io::Result<()>) -> io::Result<()> {
+    match result {
         Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
         #[cfg(target_os = "macos")]
         Err(error)
-            if error.raw_os_error() == Some(libc::EPERM) && group_has_only_zombies(group) =>
+            if error.raw_os_error() == Some(libc::EPERM) && group_has_only_zombies(_group) =>
         {
             Ok(())
         }
@@ -328,6 +332,12 @@ async fn cancel(child: &mut Child, group: &mut OwnedGroup, signal: i32) -> io::R
     };
     // Kill remaining descendants while the unreaped leader still reserves its
     // PID, then reap. Even a successful handler can leave stubborn descendants.
+    // Darwin can reject SIGCONT while the terminated child is still moving
+    // into its zombie record. Recheck those errors against the complete group
+    // after waiting, while the unreaped leader still reserves the group ID.
+    // Live members, incomplete inspection and all other errors still fail.
+    let sent = completed_group_signal(group.id, sent);
+    let continued = completed_group_signal(group.id, continued);
     let finished = group.finish(child).await.map(|_| ());
     sent.and(continued).and(observed).and(finished)
 }
@@ -537,6 +547,32 @@ mod tests {
     use std::os::unix::process::CommandExt;
     use std::time::Instant;
 
+    #[tokio::test]
+    async fn rapid_cancellation_reaps_every_owned_child_without_false_permission_failure() {
+        for attempt in 0..128 {
+            let mut child = Command::new("/bin/sleep")
+                .arg("60")
+                .process_group(0)
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let pid = child.id().unwrap() as libc::pid_t;
+            let mut group = OwnedGroup {
+                id: pid,
+                active: true,
+            };
+            let outcome = cancel(&mut child, &mut group, libc::SIGTERM).await;
+            assert!(
+                child.try_wait().unwrap().is_some(),
+                "child was not reaped on attempt {attempt}"
+            );
+            assert!(!group.active, "group must be disarmed before PID reuse");
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+            assert!(outcome.is_ok(), "cancellation {attempt}: {outcome:?}");
+        }
+    }
+
     #[test]
     fn darwin_group_inspection_distinguishes_live_stopped_and_unreaped_zombie() {
         struct Fixture(std::process::Child);
@@ -555,6 +591,12 @@ mod tests {
         );
         let pid = child.0.id() as libc::pid_t;
         assert!(!group_has_only_zombies(pid));
+        assert_eq!(
+            completed_group_signal(pid, Err(io::Error::from_raw_os_error(libc::EPERM)))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EPERM)
+        );
         signal_group(pid, libc::SIGSTOP).unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
         while !child_stopped(pid).unwrap() {
@@ -573,5 +615,14 @@ mod tests {
         assert_eq!(unsafe { libc::kill(-pid, libc::SIGKILL) }, -1);
         assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
         signal_group(pid, libc::SIGKILL).unwrap();
+        // Reconciliation may clear the native zombie-group EPERM while this
+        // identity is retained, but cannot turn another error into success.
+        completed_group_signal(pid, Err(io::Error::from_raw_os_error(libc::EPERM))).unwrap();
+        assert_eq!(
+            completed_group_signal(pid, Err(io::Error::from_raw_os_error(libc::EINVAL)))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EINVAL)
+        );
     }
 }
