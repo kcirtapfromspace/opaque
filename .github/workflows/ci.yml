@@ -45,6 +45,13 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    # Real peer attestation hashes the test executable on each connection.
+    # Keep debug sections from dominating those bounded IPC checks, matching
+    # the existing native acceptance and coverage build profiles.
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - name: Checkout
         uses: actions/checkout@v6
