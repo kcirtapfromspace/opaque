@@ -31,14 +31,14 @@ ssh-key crate backend).
 
 | Crate | File | Primitive | Protects | Class |
 |---|---|---|---|---|
-| opaqued | `crates/opaqued/src/main.rs:718` | rustls ring provider, process default | All daemon TLS (installed once at startup) | a |
+| opaqued | `crates/opaqued/src/main.rs:744` | rustls ring provider, process default | All daemon TLS (installed once at startup) | a |
 | opaque-approver | `crates/opaque-approver/src/client.rs:94,191` (also 42, 56) | rustls ring provider, TLS 1.2/1.3 signature verification | Pinned TLS client to the approval server | a |
-| opaque-approval | `crates/opaque-approval/src/approval_server.rs:402` | tokio-rustls `TlsAcceptor` | Approval HTTPS server (mobile device pairing and decisions) | a |
-| opaque-approval | `crates/opaque-approval/src/approval_server.rs:249` | rcgen `PKCS_ED25519` keygen and self-signed certificate | Approval server TLS identity | a (rcgen 0.14 has an `aws_lc_rs` backend feature) |
-| opaque-federation-runtime | `crates/opaque-federation-runtime/src/export.rs:318-448` | tokio-rustls TLS client, custom roots | SIEM export streams | a |
-| eight crates | `reqwest` with `rustls-tls` (workspace `Cargo.toml:81`) | rustls via hyper-rustls | Outbound HTTPS: OIDC, cloud providers, push, federation fetch | a, with the graph caveat below |
+| opaque-approval | `crates/opaque-approval/src/approval_server.rs:416` | tokio-rustls `TlsAcceptor` | Approval HTTPS server (mobile device pairing and decisions) | a |
+| opaque-approval | `crates/opaque-approval/src/approval_server.rs:256` | rcgen `PKCS_ED25519` keygen and self-signed certificate | Approval server TLS identity | a (rcgen 0.14 has an `aws_lc_rs` backend feature) |
+| opaque-federation-runtime | `crates/opaque-federation-runtime/src/export.rs:388-455` | tokio-rustls TLS client, custom roots | SIEM export streams | a |
+| eight crates | `reqwest` with `rustls-tls` (workspace `Cargo.toml:83`) | rustls via hyper-rustls | Outbound HTTPS: OIDC, cloud providers, push, federation fetch | a, with the graph caveat below |
 | opaque-core (indirect) | `jsonschema` 0.45 pulls `reqwest` 0.13 | second rustls consumer | Schema reference fetching | a, same caveat |
-| test harnesses | `crates/opaque-approval/src/approval_server.rs:732`, `approval_server/workstation.rs:240`, `factors.rs:854,928` | rustls ring provider installs | Test TLS setup | a |
+| test harnesses | `crates/opaque-approval/src/approval_server.rs:754`, `approval_server/workstation.rs:426`, `factors.rs:912,987` | rustls ring provider installs | Test TLS setup | a |
 | opaqued | `crates/opaqued/Cargo.toml:43` | direct `ring` dependency | Nothing: no `ring::` usage exists in the crate | a (delete it) |
 
 Graph caveat for reqwest: `rustls` features are additive across the
@@ -62,11 +62,12 @@ trim even though it does not change runtime behavior. Both reqwest versions
 | opaque-core | `crates/opaque-core/src/workstation.rs:8` | ed25519-dalek verify | Workstation approval decisions | b |
 | opaqued | `crates/opaqued/src/identity/keys.rs:12-32` | ed25519-dalek keygen from a `getrandom` seed | Daemon identity signing key (`identity.key`, mode 0600) | b |
 | opaque-approval | `crates/opaque-approval/src/pairing/` (`mod.rs:15`, `challenge.rs:9`, `store.rs:11`) | ed25519-dalek sign/verify | Device pairing, approval decision signatures, paired-device store | b |
-| opaque-approver | `crates/opaque-approver/src/custody.rs:7`, `src/main.rs:3` | ed25519-dalek signing | Approver device key custody | b |
+| opaque-approver | `crates/opaque-approver/src/custody.rs:7`, `src/main.rs:5` | ed25519-dalek signing | Approver device key custody | b |
 | opaque-federation-runtime | `crates/opaque-federation-runtime/src/attest.rs:28`, `src/federation.rs:52,180` | ed25519-dalek sign/verify | Federation bundle signatures and trust anchors | b |
-| opaque | `crates/opaque/src/main.rs:572,5102` | Ed25519 key parsing | CLI trust anchors and attestation keys | b |
+| opaque | `crates/opaque/src/main.rs:5125,5309` | Ed25519 key parsing | CLI trust anchors and attestation keys | b |
 | opaque-approval | `crates/opaque-approval/src/fido2.rs:20-21` | p256 ECDSA P-256 verify | WebAuthn/FIDO2 ES256 assertion verification (human approval factor) | b |
-| opaque-bounded-work | `crates/opaque-bounded-work/src/ssh.rs:12,60` | ed25519-dalek via the `ssh-key` crate | Broker task-grant SSH certificates (issue and verify) | c (see below) |
+| opaque-bounded-work | `crates/opaque-bounded-work/src/ssh.rs:12,92` | ed25519-dalek via the `ssh-key` crate | Broker task-grant SSH certificates (issue and verify) | c (see below) |
+| opaque-core | `crates/opaque-core/src/evidence_checkpoint.rs:5,366,413` | ed25519-dalek sign/verify | Evidence checkpoint and retention receipts (bounded-work inference evidence chain) | b |
 
 Ed25519 is approved in FIPS 186-5, and aws-lc-rs provides Ed25519 including
 under the FIPS feature, so the ed25519-dalek rows are migrations, not
@@ -92,26 +93,33 @@ outside the validated boundary in the interim.
 | opaque-core | `crates/opaque-core/src/audit.rs:14,1004` | hmac + sha2 (HMAC-SHA-256) | Tamper-evident audit chain | b |
 | opaque-core | `crates/opaque-core/src/seal.rs:24,108` | HMAC-SHA-256 | Sealed state integrity | b |
 | opaque-core | `crates/opaque-core/src/resource_auth.rs:1051-1063` | HMAC-SHA-256 | Resource authority token integrity | b |
-| opaque-core | `crates/opaque-core/src/keyfile.rs:33` | `getrandom` key generation | HMAC key files (`audit.hmac`, store keys) | b (module DRBG for key material) |
+| opaque-core | `crates/opaque-core/src/keyfile.rs:34` | `getrandom` key generation | HMAC key files (`audit.hmac`, store keys) | b (module DRBG for key material) |
 | opaque-approval | `crates/opaque-approval/src/fido2.rs:320-323` | HMAC-SHA-256 | FIDO2 credential store integrity | b |
 | opaque-approval | `crates/opaque-approval/src/fido2.rs:538,752,771` | SHA-256 | WebAuthn rpIdHash and clientDataHash verification | b |
 | opaque-approval | `crates/opaque-approval/src/pairing/challenge.rs:69-111`, `pairing/store.rs:76` | SHA-256 | Pairing challenge derivation, key fingerprints | b |
-| opaqued | `crates/opaqued/src/enclave.rs:287,318` | SHA-256 | Lease keys: client fingerprint and canonical parameter hash (anti param-swapping) | b |
-| opaqued | `crates/opaqued/src/identity/persona.rs:156`, `identity/provisioning.rs:340,537` | SHA-256 | Identity and provisioning fingerprints | b |
+| opaqued | `crates/opaqued/src/enclave.rs:297,334` | SHA-256 | Lease keys: client fingerprint and canonical parameter hash (anti param-swapping) | b |
+| opaqued | `crates/opaqued/src/identity/persona.rs:157`, `identity/provisioning.rs:340,537` | SHA-256 | Identity and provisioning fingerprints | b |
 | opaqued | `crates/opaqued/src/identity/oidc.rs:395` | SHA-256 | OIDC PKCE challenge | b |
 | opaque-approver | `crates/opaque-approver/src/client.rs:28,180` | SHA-256 | TLS certificate pinning fingerprint | b |
-| opaque-native-approval | `crates/opaque-native-approval/src/lib.rs:165-170` | SHA-256 | Display digest of the approval reason (UI only) | b (low priority) |
+| opaque-native-approval | `crates/opaque-native-approval/src/lib.rs:174-183` | SHA-256 | Display digest of the approval reason (UI only) | b (low priority) |
+| opaque-core | `crates/opaque-core/src/inference.rs:31` | SHA-256 (`sha256`/`prompt_sha256` helpers) | Bounded-work inference receipt digests: profile, prompt, output, and source-snapshot hashes | b |
+| opaque-sandbox | `crates/opaque-sandbox/src/lib.rs:151` | SHA-256 | Sandbox profile fingerprint (`profile_sha256` in execution evidence) | b |
 | opaque-showcase | `src/approval_oauth.rs`, `src/server.rs`, `src/bounded_demo.rs` | SHA-256 | Demo PKCE and evidence hashes; showcase is sales collateral outside default members | b (lowest priority) |
 
 All of these are SHA-256 or HMAC-SHA-256 through RustCrypto crates. The
 algorithms are approved; the implementations are not validated. The
 migration to `aws_lc_rs::digest` and `aws_lc_rs::hmac` is mechanical but
-wide.
+wide. Beyond the rows above, the same SHA-256 helper appears in several more
+`opaque-core` digest sites that a complete migration must sweep:
+`mcp.rs:457` (registry document hash), `policy.rs:675`, `task.rs:621`,
+`operation.rs:450`, `identity_lifecycle.rs:185`, and
+`crates/opaque-bounded-work/src/mcp/transport.rs:355` (MCP response digest).
+All class (b), same treatment.
 
 ### JWT (already on the aws-lc-rs backend)
 
 The workspace declares `jsonwebtoken = { version = "10", features =
-["aws_lc_rs", "use_pem"] }` (workspace `Cargo.toml:88`), so these sites
+["aws_lc_rs", "use_pem"] }` (workspace `Cargo.toml:90`), so these sites
 already run on aws-lc-rs, and cargo feature unification means the FIPS build
 recompiles them against the FIPS module with no source change:
 
@@ -120,7 +128,7 @@ recompiles them against the FIPS module with no source change:
 | opaqued | `crates/opaqued/src/identity/oidc.rs:261-290` | RS256 verify | OIDC id_token validation |
 | opaque-core | `crates/opaque-core/src/resource_auth.rs:24` | RS256 verify | Resource authority JWTs |
 | opaque-approval | `crates/opaque-approval/src/push.rs:302` | ES256 sign | APNs push authentication |
-| opaque-providers | `crates/opaque-providers/src/gcp/client.rs:522-528` | RS256 sign | GCP service account tokens |
+| opaque-providers | `crates/opaque-providers/src/gcp/client.rs:648-650` | RS256 sign | GCP service account tokens |
 | opaque-showcase | `src/approval_oauth.rs` | RS256/JWKS | Demo OAuth flows |
 
 All class (a).
@@ -143,8 +151,8 @@ the deviation must disable the GitHub secrets feature.
 ### Non-issues
 
 `zeroize` is memory hygiene, not cryptography. `getrandom` uses for
-non-key material (session tokens at `crates/opaque-web/src/security.rs:101`,
-connection nonces at `crates/opaqued/src/main.rs:977`, PKCE verifiers) are
+non-key material (session tokens at `crates/opaque-web/src/security.rs:114`,
+daemon auth tokens at `crates/opaqued/src/main.rs:1063`, PKCE verifiers) are
 acceptable as-is, though routing them through the module DRBG is cheap once
 it is in place. The `p256` usages in `crates/opaque-approval/src/factors.rs`
 and `crates/opaqued/src/provisioning_api_tests.rs` are test-side signing
@@ -181,7 +189,7 @@ pregenerated bindings).
 All at `cargo check` level, on a warm cache. Baseline first: the untouched
 tree checks green in 28s.
 
-Attempt 1, feature-only swap. Changed workspace `Cargo.toml:99` from
+Attempt 1, feature-only swap. Changed workspace `Cargo.toml:101` from
 `rustls = { version = "0.23", features = ["ring"] }` to
 `features = ["aws-lc-rs"]`. Result: green, zero errors, but inert. The
 `rustls::crypto::ring` call sites still compiled because reqwest and
@@ -191,7 +199,7 @@ is still selected by the explicit `install_default()` calls.
 
 Attempt 2, real provider swap. Additionally changed the seven
 `rustls::crypto::ring::default_provider()` references to
-`rustls::crypto::aws_lc_rs::default_provider()` (`crates/opaqued/src/main.rs:718`,
+`rustls::crypto::aws_lc_rs::default_provider()` (`crates/opaqued/src/main.rs:744`,
 `crates/opaque-approver/src/client.rs:94,191`, plus four test-harness sites
 in opaque-approval). Result: `cargo check --workspace --all-targets` green,
 zero errors. The entire non-FIPS swap is one feature flag and seven lines.
@@ -235,7 +243,7 @@ relevant ones for the daemon).
    `cargo tree | grep ring` is empty. A day including verification, because
    reqwest then depends on the process-default provider being installed
    before any client is built, which needs an ordering audit around
-   `crates/opaqued/src/main.rs:718`.
+   `crates/opaqued/src/main.rs:744`.
 5. FIPS build variant: a `fips` cargo feature on opaqued (and the other
    binaries) forwarding to `rustls/fips`, default off, plus a startup
    assertion (`aws_lc_rs::try_fips_mode()`) so a FIPS-built daemon refuses

@@ -16,7 +16,7 @@ Ground rules for this document:
   physical, vendor management, business continuity) are the deploying
   customer's responsibility and are listed as such in the final section.
 
-Snapshot: workspace version 0.2.0 (`Cargo.toml`), 2026-09-14. Re-verify
+Snapshot: workspace version 0.3.0 (`Cargo.toml`), 2026-09-14. Re-verify
 citations against the tree you deploy.
 
 ## Product summary for assessors
@@ -125,7 +125,7 @@ environment or not addressed.
 
 | Control | What Opaque provides | Where | Gaps and limitations |
 |---|---|---|---|
-| SC-7 Boundary protection | Local Unix socket as the sole operation transport; in split mode the cross-domain surface is exactly three inodes (socket dir 0750, socket 0660, daemon token 0640) gated by a client group. Container deployments share only the socket volume between daemon and agent. | [deployment](../deployment.md), `deploy/systemd/opaqued.service`, `deploy/docker/compose.yaml`, `deploy/k8s/opaque.yaml` | A umask race between socket `bind()` and permission tightening remains open (finding C-6 in [security assessment](../security-assessment.md)); the 0700 parent directory narrows but does not close it. |
+| SC-7 Boundary protection | Local Unix socket as the sole operation transport; in split mode the cross-domain surface is exactly three inodes (socket dir 0750, socket 0660, daemon token 0640) gated by a client group. Container deployments share only the socket volume between daemon and agent. | [deployment](../deployment.md), `deploy/systemd/opaqued.service`, `deploy/docker/compose.yaml`, `deploy/k8s/opaque.yaml` | The former umask race between socket `bind()` and permission tightening (finding C-6) is closed: `bind_unix_listener_private` holds a `0o177` umask across `bind()` so the socket is 0600 from birth (`crates/opaque-core/src/socket.rs`). |
 | SC-8 Transmission confidentiality and integrity | rustls-based TLS for the approval server (generated Ed25519 certificate, fingerprint-pinned by devices), TLS syslog export with mandatory CA file (fails closed without one), HTTPS webhook export, HTTPS-only provider URLs, rustls-tls reqwest everywhere. | `crates/opaque-approval/src/approval_server.rs`, `crates/opaque-federation-runtime/src/export.rs` (`SyslogTarget`), `Cargo.toml` (`reqwest` with `rustls-tls`) | Spool export is a local file; its transport to the SIEM (forwarder config) is the customer's. |
 | SC-12 / SC-13 Cryptographic key establishment and use | Ed25519 (delegation tokens, bundles, attestation reports, device and workstation approvals), P-256 ECDSA (FIDO2), HMAC-SHA256 (audit chain, config seal), SHA-256 (content hashes, exe hashes), X25519 sealed boxes (`crypto_box`). Keys are 0600 files inside the custody set; under the split they are ownership-verified at startup. | `Cargo.toml` workspace dependencies (`ring`, `ed25519-dalek`, `p256`, `rustls` on `ring`, `crypto_box`, `sha2`; `jsonwebtoken` on `aws_lc_rs`), `crates/opaque-core/src/attest.rs`, `crates/opaque-core/src/audit.rs` | **Not FIPS-validated.** No module in the stack runs as a FIPS 140-2/140-3 validated module in this build. See the roadmap for the FIPS-capable build assessment. Keyfile-based custody; KMS/HSM-backed keys are a documented seam, not shipped (`deploy/k8s/opaque.yaml` header). |
 | SC-28 Protection at rest | State files (audit db, identity store, pairing store, cursors, keys) are created 0600/0700 and custody-verified under the split. Secret values are never persisted by Opaque; secret references resolve at use time from the OS keychain or provider. | `crates/opaque-core/src/audit.rs` (key file 0600), `crates/opaque-federation-runtime/src/export.rs` (spool and cursors 0600), `crates/opaque-tenant/src/tenant.rs` (0600/0700 checks) | No application-level encryption at rest: the audit database and identity store are plain SQLite protected by file permissions and the integrity chain. Disk encryption is the customer's platform control. |
@@ -138,7 +138,7 @@ environment or not addressed.
 | CM-3 / CM-5 Change control and access restrictions | Sealed config (`require_seal`, `opaque setup --seal`); under the split, config and seal are owned by the service account and unwritable at the agent uid. Central policy changes arrive only as signed bundles with anti-rollback. | `crates/opaqued/src/main.rs`, `crates/opaque/src/main.rs` (setup wizard), `crates/opaque-federation-runtime/src/federation.rs` | none beyond the session-mode caveat |
 | CM-6 Configuration settings | Hardened reference configurations shipped in-tree: systemd unit with a hardening block, launchd daemon plist, compose and Kubernetes manifests with non-root users, dropped capabilities, read-only root filesystems. | `deploy/systemd/opaqued.service`, `deploy/launchd/com.opaque.opaqued.plist`, `deploy/docker/`, `deploy/k8s/opaque.yaml`, [hardening guide](hardening.md) | none noted |
 | CM-7 Least functionality | Deny-by-default operation registry; MCP surface exposes `Safe` operations plus a small withheld-output set; agents cannot reach `Reveal` operations at all. | [enterprise architecture](../enterprise-architecture.md), [MCP integration](../mcp-integration.md) | Provider connectors are compiled into the shipped daemon even when feature-gated at the crate level ([enterprise architecture](../enterprise-architecture.md) notes this honestly). |
-| CM-14 Signed components | Release tarballs signed with Sigstore cosign (keyless) plus SHA-256 checksums; policy bundles Ed25519-signed. | `.github/workflows/release.yml`, `crates/opaque-core/src/bundle.rs` | No SBOM published with releases yet (in progress, see [roadmap](certification-roadmap.md)). Reproducible builds are not implemented. |
+| CM-14 Signed components | Release tarballs signed with Sigstore cosign (keyless) plus SHA-256 checksums; policy bundles Ed25519-signed; per-binary CycloneDX SBOMs (`cargo cyclonedx`) generated, cosign-signed, and attached to each GitHub release. | `.github/workflows/release.yml`, `crates/opaque-core/src/bundle.rs` | Reproducible builds are not implemented. |
 
 ### SI: system and information integrity
 
@@ -198,12 +198,10 @@ Stated plainly so nobody discovers these during an audit:
 Tracked in [security assessment](../security-assessment.md) (status notes
 dated 2026-09-09) and restated here so this document does not overclaim:
 
-- C-6: umask race between socket `bind()` and permission tightening (parent
-  dir 0700 narrows it; not closed).
 - H-8: macOS session-detection preflight at daemon startup specified but not
   implemented; screen-lock and Fast User Switching behavior untested.
 - Frozen appendix data (dependency counts, file lists) in that document dates
-  to 2026-02-12 and does not describe the current 15-crate workspace.
+  to 2026-02-12 and does not describe the current 16-crate workspace.
 
 The 2026-02-14 adversarial review's six findings (P0 1-4, P1 1-2) are all
 resolved; see [adversarial security review](../adversarial-security-review-2026-02-14.md).

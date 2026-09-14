@@ -96,10 +96,11 @@ Loose modes on daemon-owned files are self-healed at startup; foreign
 ownership is fatal ([deployment](../deployment.md)).
 
 Session-mode deployments should verify the socket directory is 0700 and the
-socket 0600 ([deployment](../deployment.md) checklist). Known limitation:
-there is an open umask race between `bind()` and permission tightening
-(finding C-6, [security assessment](../security-assessment.md)); the 0700
-parent directory narrows the window.
+socket 0600 ([deployment](../deployment.md) checklist). The socket is created
+0600 from its first instant: the daemon binds through
+`bind_unix_listener_private`, which holds a `0o177` umask across `bind()`
+(`crates/opaque-core/src/socket.rs`), closing the former umask race
+(finding C-6, [security assessment](../security-assessment.md)).
 
 ## 5. systemd unit hardening
 

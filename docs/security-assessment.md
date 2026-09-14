@@ -782,7 +782,7 @@ This means on many Linux setups, the user sees: `"Authentication is required to 
 - As specified in the PRD (US-006/FR-6): if the environment cannot display intent, fail closed with `approval_unavailable`.
 - Consider implementing a dedicated Opaque approval UI helper for Linux that shows full operation details, using polkit only for the authentication step.
 
-**Status (RESOLVED):** A two-step approval flow has been implemented in `approval.rs`. Step 1 shows an intent dialog via `zenity --question` or `kdialog --yesno` with full operation details. Step 2 performs the polkit authentication. This separates intent visibility (our code, always works) from authentication (polkit, always requires password). If no intent dialog UI is available (no zenity, no kdialog, no TTY), approval fails closed. Supported desktop tiers are documented in [Deployment](deployment.md).
+**Status (RESOLVED):** A two-step approval flow has been implemented in the Linux approval helper (`../crates/opaque-approve-helper/src/main.rs`). Step 1 shows an intent dialog via `zenity --question` or `kdialog --yesno` with full operation details. Step 2 performs the polkit authentication. This separates intent visibility (our code, always works) from authentication (polkit, always requires password). If no intent dialog UI is available (no zenity, no kdialog, no TTY), approval fails closed. Supported desktop tiers are documented in [Deployment](deployment.md).
 
 #### 4.2.2 Action ID Hijacking
 
