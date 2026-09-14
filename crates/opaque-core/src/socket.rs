@@ -536,7 +536,36 @@ mod tests {
         assert_eq!(during, 0, "bind helper must restore the caller's umask");
         let mode = std::fs::symlink_metadata(&sock).unwrap().mode() & 0o777;
         assert_eq!(mode, 0o600, "socket must never exist with permissive mode");
+        // Error path: binding under a directory that was never created fails.
+        // Kept in this one test (rather than a second umask-touching test) so
+        // no two mask-manipulating tests run in parallel; the guard still
+        // restores the umask via Drop, as the assertion above confirms.
+        let missing = dir.join("gone").join("s.sock");
+        assert!(
+            bind_unix_listener_private(&missing).is_err(),
+            "bind under a missing directory must fail"
+        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_socket_parent_dir_accepts_a_path_without_a_parent() {
+        // The filesystem root has no parent to create or vet, so the helper
+        // returns Ok without touching the filesystem.
+        assert!(ensure_socket_parent_dir(Path::new("/")).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_socket_parent_dir_fails_when_a_component_is_a_file() {
+        let dir = tempdir();
+        let file = dir.join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        // A regular file where a directory component is expected makes
+        // create_dir_all fail; the error must propagate.
+        let err = ensure_socket_parent_dir(&file.join("opaqued.sock")).unwrap_err();
+        assert!(!err.to_string().is_empty());
     }
 
     #[cfg(unix)]
