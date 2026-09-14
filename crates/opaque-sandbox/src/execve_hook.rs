@@ -738,6 +738,86 @@ fn filter_secret_refs(env_keys: &[String], secret_refs: &[String]) -> Vec<String
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+
+    #[test]
+    fn check_rejects_malformed_authority_fields_before_creating_pending_state() {
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let (check, approve) = create_execve_handlers(audit.clone(), Arc::new(test_mapper()));
+        let valid = serde_json::json!({"executable":"/usr/bin/git","args":["push"],"cwd":"/tmp","env_keys":["_TOKEN2"],"sandbox_id":"session"});
+        for (field, value) in [
+            ("executable", serde_json::json!("")),
+            ("executable", serde_json::json!("git\u{0}")),
+            ("args", serde_json::json!(["bad\u{0}"])),
+            ("cwd", serde_json::json!("/tmp\u{0}")),
+            ("sandbox_id", serde_json::json!("session\n")),
+            ("env_keys", serde_json::json!([""])),
+            ("env_keys", serde_json::json!(["2TOKEN"])),
+            ("env_keys", serde_json::json!(["TOKEN-X"])),
+        ] {
+            let mut input = valid.clone();
+            input[field] = value;
+            assert!(
+                check.prepare(&test_request(input)).is_err(),
+                "accepted {field}"
+            );
+        }
+        check.prepare(&test_request(valid.clone())).unwrap();
+        let mut wrong = test_request(valid);
+        wrong.operation = "sandbox.exec".into();
+        assert!(check.prepare(&wrong).is_err());
+        assert!(approve.prepare(&wrong).is_err());
+        assert!(check.pending_approvals.lock().unwrap().is_empty());
+        assert!(audit.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn denied_and_nonleased_approvals_consume_only_the_pending_generation() {
+        for (decision, lease) in [("deny", true), ("allow", false)] {
+            let audit = Arc::new(InMemoryAuditEmitter::new());
+            let (check, approve) = create_execve_handlers(audit.clone(), Arc::new(test_mapper()));
+            let request = test_request(
+                serde_json::json!({"executable":"git","args":["push","origin"],"env_keys":["GITHUB_TOKEN"],"sandbox_id":"one"}),
+            );
+            let pending = check.execute(&request).await.unwrap();
+            let approval = approve_request(
+                serde_json::json!({"approval_id":pending["approval_id"],"decision":decision,"lease_for_pattern":lease}),
+            );
+            assert_eq!(
+                approve.execute(&approval).await.unwrap()["lease_ttl_secs"],
+                0
+            );
+            assert!(approve.execute(&approval).await.is_err());
+            let next = check.execute(&request).await.unwrap();
+            assert_eq!(next["decision"], "prompt");
+            assert_ne!(pending["approval_id"], next["approval_id"]);
+            assert!(audit.events().iter().any(|event| event.operation.as_deref()
+                == Some("sandbox.execve_approve")
+                && event.kind
+                    == if decision == "deny" {
+                        AuditEventKind::ExecveDenied
+                    } else {
+                        AuditEventKind::ExecveAllowed
+                    }));
+        }
+    }
+
+    #[test]
+    fn expired_execve_lease_is_removed_without_touching_other_sandboxes() {
+        let cache = ExecveLeaseCache::new();
+        let key = ExecveLeaseKey {
+            pattern_or_command: "git push *".into(),
+            sandbox_id: "expired".into(),
+        };
+        let other = ExecveLeaseKey {
+            sandbox_id: "active".into(),
+            ..key.clone()
+        };
+        cache.grant(key.clone(), Duration::ZERO);
+        cache.grant(other.clone(), Duration::from_secs(300));
+        assert!(!cache.check(&key));
+        assert!(!cache.leases.lock().unwrap().contains_key(&key));
+        assert!(cache.check(&other));
+    }
     use super::*;
     use opaque_core::audit::InMemoryAuditEmitter;
     use opaque_core::execve_map::{ExecveDefault, ExecveDefaultDecision, ExecveRule};

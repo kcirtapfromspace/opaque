@@ -690,6 +690,30 @@ mod tests {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod reader_lifecycle_tests {
+
+    #[tokio::test]
+    async fn output_cap_keeps_exact_prefix_and_stops_at_zero_budget() {
+        for (limit, expected) in [(0, ""), (3, "abc"), (6, "abcdef"), (7, "abcdef")] {
+            let (tx, mut rx) = mpsc::channel(4);
+            stream_output(
+                &b"abcdef"[..],
+                tx,
+                ExecStream::Stdout,
+                limit,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+            let mut output = String::new();
+            while let Some(frame) = rx.recv().await {
+                if let ExecFrame::Output { stream, data } = frame {
+                    assert_eq!(stream, ExecStream::Stdout);
+                    output.push_str(&data);
+                }
+            }
+            assert_eq!(output, expected);
+        }
+    }
     use super::*;
 
     #[tokio::test(start_paused = true)]

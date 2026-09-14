@@ -62,4 +62,31 @@ mod tests {
         std::os::unix::fs::symlink(dir.path().join("other"), state.join("review.lock")).unwrap();
         assert!(ReviewLock::acquire(&state).is_err());
     }
+    #[test]
+    fn aliased_or_readable_lock_cannot_be_used_for_a_ceremony() {
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("state");
+        crate::custody::initialize(&path, "Reviewer").unwrap();
+        drop(ReviewLock::acquire(&path).unwrap());
+        let lock = path.join("review.lock");
+        let alias = path.join("aliased.lock");
+        std::fs::hard_link(&lock, &alias).unwrap();
+        assert!(
+            ReviewLock::acquire(&path)
+                .err()
+                .unwrap()
+                .contains("owned private regular file")
+        );
+        std::fs::remove_file(alias).unwrap();
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            ReviewLock::acquire(&path)
+                .err()
+                .unwrap()
+                .contains("owned private regular file")
+        );
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(ReviewLock::acquire(&path).is_ok());
+    }
 }

@@ -709,3 +709,218 @@ fn valid_signatures_do_not_replace_authenticated_device_or_durable_acceptance() 
     );
     remote.revalidate(&accepted).unwrap();
 }
+
+#[test]
+fn notice_credentials_require_exact_private_unaliased_bounded_bytes() {
+    use super::notices::token_hash;
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("notice.token");
+    for bytes in [
+        vec![b'a'; 31],
+        vec![b'a'; 129],
+        b"abcdefghijklmnopqrstuvwxyz01234!".to_vec(),
+        b"abcdefghijklmnopqrstuvwxyz01234\n".to_vec(),
+    ] {
+        std::fs::write(&path, &bytes).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(token_hash(&path).is_err());
+    }
+    for size in [32, 128] {
+        let bytes = "a_-0Z".repeat(26).into_bytes()[..size].to_vec();
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            token_hash(&path).unwrap(),
+            <[u8; 32]>::from(Sha256::digest(&bytes))
+        );
+    }
+    let alias = directory.path().join("alias");
+    std::fs::hard_link(&path, &alias).unwrap();
+    assert!(
+        token_hash(&path)
+            .unwrap_err()
+            .contains("owned private regular file")
+    );
+    std::fs::remove_file(alias).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+    assert!(
+        token_hash(&path)
+            .unwrap_err()
+            .contains("owned private regular file")
+    );
+    std::fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink("absent", &path).unwrap();
+    assert_eq!(
+        token_hash(&path).unwrap_err(),
+        "notice credential unavailable"
+    );
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert!(
+        token_hash(&path)
+            .unwrap_err()
+            .contains("owned private regular file")
+    );
+}
+
+#[test]
+fn remote_ledger_rejects_aliases_permissions_and_unsupported_schema_without_rebinding() {
+    use super::store::RemoteStore;
+    let rig = Rig::new();
+    let path = rig.dir.path().join("guarded.db");
+    let open = || RemoteStore::open(&path, rig.tenant.clone(), "opq-remote-test".into());
+    std::fs::set_permissions(rig.dir.path(), std::fs::Permissions::from_mode(0o750)).unwrap();
+    assert_eq!(
+        open().err().unwrap(),
+        "remote approval ledger requires an owner-only directory"
+    );
+    std::fs::set_permissions(rig.dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(&path, []).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+    assert_eq!(
+        open().err().unwrap(),
+        "remote approval ledger requires private regular files"
+    );
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let alias = rig.dir.path().join("alias.db");
+    std::fs::hard_link(&path, &alias).unwrap();
+    assert_eq!(
+        open().err().unwrap(),
+        "remote approval ledger requires private regular files"
+    );
+    std::fs::remove_file(alias).unwrap();
+    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    file.set_len(256 * 1024 * 1024 + 1).unwrap();
+    assert_eq!(
+        open().err().unwrap(),
+        "remote approval ledger exceeds storage limit"
+    );
+    file.set_len(0).unwrap();
+    drop(file);
+    for schema in [
+        "PRAGMA user_version=2;",
+        "CREATE TABLE foreign_table(id INTEGER);",
+        "PRAGMA user_version=1;",
+    ] {
+        std::fs::remove_file(&path).unwrap();
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch(schema).unwrap();
+        drop(db);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let error = open().err().unwrap();
+        assert!(
+            error.starts_with("invalid remote approval ledger"),
+            "{error}"
+        );
+    }
+    std::fs::remove_file(&path).unwrap();
+    let store = open().unwrap();
+    assert_eq!(
+        open().err().unwrap(),
+        "remote approval ledger already has a writer"
+    );
+    drop(store);
+    assert_eq!(
+        RemoteStore::open(&path, rig.tenant.clone(), "opq-foreign".into())
+            .err()
+            .unwrap(),
+        "remote approval ledger belongs to another broker"
+    );
+    assert!(
+        open().is_ok(),
+        "failed foreign binding must release its lock without rewriting custody"
+    );
+}
+
+#[test]
+fn retained_receipts_reject_corrupt_oversized_and_validly_signed_foreign_bindings() {
+    let rig = Rig::new();
+    let remote = rig.open();
+    let review = rig.review(&remote);
+    remote.enqueue(&review).unwrap();
+    let accepted = remote
+        .accept(&review, rig.response(&review, true), &rig.device)
+        .unwrap();
+    let db = rusqlite::Connection::open(rig.dir.path().join("remote.db")).unwrap();
+    let id = &review.challenge.approval_id;
+    for raw in ["invalid receipt".to_owned(), "x".repeat(256 * 1024 + 1)] {
+        db.execute(
+            "UPDATE rounds SET receipt=?1 WHERE id=?2",
+            rusqlite::params![raw, id],
+        )
+        .unwrap();
+        assert!(remote.store.receipt(id).is_err());
+    }
+    for field in 0..3 {
+        let mut foreign = accepted.clone();
+        if field == 0 {
+            foreign.review.challenge.broker_id = "opq-foreign".into();
+        }
+        if field == 1 {
+            foreign.review.challenge.approval_id = uuid::Uuid::new_v4().to_string();
+        }
+        if field == 2 {
+            foreign
+                .review
+                .challenge
+                .authority
+                .as_mut()
+                .unwrap()
+                .binding
+                .tenant
+                .broker_id = uuid::Uuid::new_v4();
+        }
+        foreign.response = rig.response(&foreign.review, true);
+        foreign.verify().unwrap();
+        db.execute(
+            "UPDATE rounds SET receipt=?1 WHERE id=?2",
+            rusqlite::params![serde_json::to_string(&foreign).unwrap(), id],
+        )
+        .unwrap();
+        assert!(remote.store.receipt(id).is_err());
+    }
+    db.execute(
+        "UPDATE rounds SET receipt=?1 WHERE id=?2",
+        rusqlite::params![serde_json::to_string(&accepted).unwrap(), id],
+    )
+    .unwrap();
+    assert_eq!(remote.store.receipt(id).unwrap(), Some(accepted));
+}
+
+#[test]
+fn retention_capacity_never_evicts_existing_approval_evidence() {
+    let rig = Rig::new();
+    let remote = rig.open();
+    let review = rig.review(&remote);
+    let db = rusqlite::Connection::open(rig.dir.path().join("remote.db")).unwrap();
+    db.execute_batch("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<10000) INSERT INTO rounds SELECT 'retained-'||x,'historical fixture',0,'cancelled',NULL,'disabled',0,0 FROM n;").unwrap();
+    assert_eq!(
+        remote.store.enqueue(&review, now()).unwrap_err(),
+        "remote approval ledger retention capacity reached"
+    );
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM rounds", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        10000
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM rounds WHERE id=?1",
+            [&review.challenge.approval_id],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    db.execute("DELETE FROM rounds WHERE id='retained-10000'", [])
+        .unwrap();
+    remote.store.enqueue(&review, now()).unwrap();
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM rounds", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        10000
+    );
+}

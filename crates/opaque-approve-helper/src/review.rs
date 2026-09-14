@@ -16,14 +16,9 @@ pub fn check_ui() -> Result<(), &'static str> {
         .map_err(|_| "cannot inspect the active macOS console session")?
         .uid();
     // SAFETY: geteuid has no preconditions and returns the calling account.
-    if console_uid == 0 || console_uid != unsafe { geteuid() } {
-        return Err("run the reviewer as the signed-in macOS console user");
-    }
+    require_console_user(console_uid, unsafe { geteuid() })?;
     let mtm = MainThreadMarker::new().ok_or("native review requires the main thread")?;
-    if NSScreen::mainScreen(mtm).is_none() {
-        return Err("no macOS screen is available; use an interactive desktop session");
-    }
-    Ok(())
+    require_screen(NSScreen::mainScreen(mtm).is_some())
 }
 
 #[cfg(target_os = "linux")]
@@ -75,11 +70,10 @@ pub fn show(reason: &str) -> Result<bool, &'static str> {
     stage("ui-ready");
     let mtm = MainThreadMarker::new().ok_or("native review requires the main thread")?;
     let application = NSApplication::sharedApplication(mtm);
-    if application.activationPolicy() == NSApplicationActivationPolicy::Prohibited
-        && !application.setActivationPolicy(NSApplicationActivationPolicy::Accessory)
-    {
-        return Err("macOS refused the native review activation policy");
-    }
+    prepare_activation(
+        application.activationPolicy() == NSApplicationActivationPolicy::Prohibited,
+        || application.setActivationPolicy(NSApplicationActivationPolicy::Accessory),
+    )?;
     // A standalone helper never calls NSApplication.run(), which normally
     // completes this launch sequence before servicing windows.
     application.finishLaunching();
@@ -126,18 +120,11 @@ pub fn show(reason: &str) -> Result<bool, &'static str> {
     // launched from a background broker does not rely on focus transfer alone.
     window.makeKeyAndOrderFront(None);
     window.orderFrontRegardless();
-    if !window.isVisible() {
-        return Err("macOS did not order the review window; inspect the desktop session");
-    }
+    require_ordered_window(window.isVisible())?;
     // This is AppKit window state, not proof a human observed the document.
     stage("window-ordered");
     let approved = alert.runModal() == NSAlertFirstButtonReturn;
-    stage(if approved {
-        "review-confirmed"
-    } else {
-        "review-cancelled"
-    });
-    Ok(approved)
+    Ok(record_review_decision(approved))
 }
 
 #[cfg(target_os = "linux")]
@@ -192,4 +179,54 @@ pub fn show(reason: &str) -> Result<bool, &'static str> {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn show(_reason: &str) -> Result<bool, &'static str> {
     Err("native review is unsupported on this platform")
+}
+
+// These boundaries consume observations from AppKit. Their result tests do not
+// establish window visibility or physical user presence.
+#[cfg(target_os = "macos")]
+pub(super) fn require_console_user(
+    console_uid: u32,
+    effective_uid: u32,
+) -> Result<(), &'static str> {
+    if console_uid == 0 || console_uid != effective_uid {
+        return Err("run the reviewer as the signed-in macOS console user");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn require_screen(available: bool) -> Result<(), &'static str> {
+    if !available {
+        return Err("no macOS screen is available; use an interactive desktop session");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn prepare_activation(
+    prohibited: bool,
+    activate: impl FnOnce() -> bool,
+) -> Result<(), &'static str> {
+    if prohibited && !activate() {
+        return Err("macOS refused the native review activation policy");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn require_ordered_window(visible: bool) -> Result<(), &'static str> {
+    if !visible {
+        return Err("macOS did not order the review window; inspect the desktop session");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn record_review_decision(approved: bool) -> bool {
+    stage(if approved {
+        "review-confirmed"
+    } else {
+        "review-cancelled"
+    });
+    approved
 }

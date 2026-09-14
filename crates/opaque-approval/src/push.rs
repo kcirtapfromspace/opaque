@@ -509,4 +509,51 @@ mod tests {
         assert_eq!(parsed["opaque"]["operation"], "github.set_actions_secret");
         assert!(parsed["opaque"]["challenge"].is_string());
     }
+
+    #[tokio::test]
+    async fn push_http_boundary_preserves_payload_and_reports_peer_rejection() {
+        // Real local HTTP exercises encoding/status handling, not APNs delivery.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (status, code) in [("200 OK", 200), ("410 Gone", 410)] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!(
+                "http://{}/3/device/disposable",
+                listener.local_addr().unwrap()
+            );
+            let peer = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut chunk = [0; 2048];
+                    let count = stream.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if bytes.ends_with(b"{\"fixture\":true}") {
+                        break;
+                    }
+                    assert!(bytes.len() < 8192);
+                }
+                stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 7\r\nConnection: close\r\n\r\nfixture").as_bytes()).await.unwrap();
+                String::from_utf8(bytes).unwrap()
+            });
+            let result = send_apns_request(
+                &url,
+                "disposable-jwt",
+                r#"{"fixture":true}"#,
+                "fixture.topic",
+            )
+            .await;
+            if code == 200 {
+                result.unwrap();
+            } else {
+                assert!(
+                    matches!(result,Err(PushError::ApnsError(ref message)) if message == "APNs returned 410: fixture")
+                );
+            }
+            let request = peer.await.unwrap();
+            assert!(request.contains("authorization: bearer disposable-jwt"));
+            assert!(request.contains("apns-topic: fixture.topic"));
+            assert!(request.contains("apns-push-type: alert"));
+        }
+    }
 }

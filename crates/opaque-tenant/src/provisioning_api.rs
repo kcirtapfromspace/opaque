@@ -217,4 +217,42 @@ mod tests {
         assert!(expiry(0).is_err());
         assert!(expiry(u64::MAX).is_err());
     }
+
+    #[test]
+    fn challenge_capacity_preserves_live_reviews_and_reclaims_only_expired_entries() {
+        let challenges = Challenges::default();
+        let ids: Vec<_> = (0..MAX_PENDING)
+            .map(|_| challenges.insert(pending(42, i64::MAX)).unwrap())
+            .collect();
+        assert_eq!(
+            challenges.insert(pending(42, i64::MAX)).unwrap_err(),
+            "too many pending provisioning reviews"
+        );
+        // Set a logical expiry under the ledger lock, without sleeping or
+        // weakening a production timeout. Other live challenges stay intact.
+        challenges
+            .0
+            .lock()
+            .unwrap()
+            .get_mut(&ids[0])
+            .unwrap()
+            .expires_at = 0;
+        let replacement = challenges.insert(pending(42, i64::MAX)).unwrap();
+        assert_eq!(
+            challenges.take(&ids[0], 42).err().unwrap(),
+            "unknown or consumed provisioning challenge"
+        );
+        assert_eq!(
+            challenges.take(&replacement, 43).err().unwrap(),
+            "provisioning challenge belongs to another peer"
+        );
+        assert_eq!(
+            challenges.take(&replacement, 42).unwrap().challenge,
+            "one-shot"
+        );
+        for id in &ids[1..] {
+            assert_eq!(challenges.take(id, 42).unwrap().human_session_id, "login");
+        }
+        assert!(challenges.0.lock().unwrap().is_empty());
+    }
 }

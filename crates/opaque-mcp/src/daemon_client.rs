@@ -161,6 +161,37 @@ mod tests {
     use tokio::net::UnixListener;
 
     #[tokio::test]
+    async fn oversized_request_is_rejected_before_handshake_or_dispatch() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(directory.path().join("daemon.token"), "fixture-token").unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let client = DaemonClient::new(Some(socket));
+        let error = client
+            .call(
+                "mcp_call",
+                serde_json::json!({"body":"x".repeat(opaque_core::MAX_FRAME_LENGTH)}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), "request exceeds the IPC frame limit");
+        let (stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), framed.next())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn entire_exchange_deadline_closes_a_stalled_response_without_replay() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();

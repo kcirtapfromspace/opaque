@@ -989,6 +989,171 @@ fn verify_tenant(
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+
+    #[test]
+    fn workstation_reference_cannot_attach_to_unapproved_or_malformed_authority() {
+        let (_dir, store) = fixture();
+        let original = approved(&store, 1);
+        let reference = opaque_core::task::WorkstationReceiptRef {
+            approval_id: uuid::Uuid::new_v4().to_string(),
+            sha256: "a".repeat(64),
+        };
+        let mut valid = original.clone();
+        valid.approval_mode = Some(TaskApprovalMode::PairedWorkstation);
+        valid.workstation_receipt = Some(reference);
+        verify_record(&valid).unwrap();
+        for mode in 0..4 {
+            let mut changed = valid.clone();
+            match mode {
+                0 => changed.approved_at = None,
+                1 => changed.approval_mode = Some(TaskApprovalMode::Native),
+                2 => changed.workstation_receipt.as_mut().unwrap().approval_id = "invalid".into(),
+                _ => changed.workstation_receipt.as_mut().unwrap().sha256 = "g".repeat(64),
+            }
+            assert!(
+                matches!(verify_record(&changed), Err(TaskStoreError::Corrupt)),
+                "accepted mutation {mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn record_validation_rejects_each_corrupt_identity_time_and_slot_binding() {
+        let (_dir, store) = fixture();
+        let planned = store.create(OWNER, manifest(2), NOW).unwrap();
+        let valid = serde_json::to_value(&planned).unwrap();
+        let mut variants = Vec::new();
+        for (field, value) in [
+            ("id", serde_json::json!("invalid-uuid")),
+            ("owner_key", serde_json::json!("")),
+            ("created_at", serde_json::json!(-1)),
+            ("expires_at", serde_json::json!(planned.expires_at + 1)),
+            ("slots", serde_json::json!([])),
+            ("approval_mode", serde_json::json!("native")),
+        ] {
+            let mut changed = valid.clone();
+            changed[field] = value;
+            variants.push((field, changed));
+        }
+        let mut changed = valid.clone();
+        changed["slots"][0]["id"] = serde_json::json!("foreign-slot");
+        variants.push(("slot id", changed));
+        let mut changed = valid.clone();
+        changed["slots"][0]["action"] = changed["slots"][1]["action"].clone();
+        variants.push(("slot action", changed));
+        let mut changed = valid.clone();
+        changed["manifest"]["actions"]
+            .as_array_mut()
+            .unwrap()
+            .reverse();
+        variants.push(("manifest canonical order", changed));
+        for (name, changed) in variants {
+            let changed: TaskRecord = serde_json::from_value(changed).unwrap();
+            assert!(
+                matches!(verify_record(&changed), Err(TaskStoreError::Corrupt)),
+                "accepted {name}"
+            );
+        }
+        let approved = approved(&store, 1);
+        let mut wrong_state = approved.clone();
+        wrong_state.state = TaskState::Planned;
+        assert!(matches!(
+            verify_record(&wrong_state),
+            Err(TaskStoreError::Corrupt)
+        ));
+        let mut completed = planned.clone();
+        completed.state = TaskState::Completed;
+        assert!(matches!(
+            verify_record(&completed),
+            Err(TaskStoreError::Corrupt)
+        ));
+        store
+            .reserve_slot(
+                &approved.id,
+                OWNER,
+                &approved.slots[0].id,
+                "reserved",
+                NOW + 1,
+            )
+            .unwrap();
+        let reserved = store.get(&approved.id, OWNER, NOW + 1).unwrap();
+        let mut partial = reserved.clone();
+        partial.state = TaskState::Partial;
+        assert!(matches!(
+            verify_record(&partial),
+            Err(TaskStoreError::Corrupt)
+        ));
+        let mut accepted = store
+            .finalize_slot(
+                &approved.id,
+                OWNER,
+                &approved.slots[0].id,
+                "reserved",
+                accepted(),
+                NOW + 2,
+            )
+            .unwrap();
+        accepted.slots[0].outcome.as_mut().unwrap().code = "unrecognized".into();
+        assert!(matches!(
+            verify_record(&accepted),
+            Err(TaskStoreError::Corrupt)
+        ));
+        verify_record(&planned).unwrap();
+        verify_record(&reserved).unwrap();
+    }
+
+    #[test]
+    fn task_store_rejects_invalid_callers_clocks_and_schema_before_authority_changes() {
+        let (_dir, store) = fixture();
+        for owner in ["".to_owned(), "x".repeat(1025), "contains space".into()] {
+            assert!(matches!(
+                store.create(&owner, manifest(1), NOW),
+                Err(TaskStoreError::InvalidInput)
+            ));
+        }
+        assert!(matches!(
+            store.create(OWNER, manifest(1), -1),
+            Err(TaskStoreError::InvalidInput)
+        ));
+        let task = approved(&store, 1);
+        for request in ["".to_owned(), "x".repeat(129)] {
+            assert!(matches!(
+                store.reserve_slot(&task.id, OWNER, &task.slots[0].id, &request, NOW),
+                Err(TaskStoreError::InvalidInput)
+            ));
+        }
+        assert_eq!(
+            store.get(&task.id, OWNER, NOW).unwrap().slots[0].state,
+            SlotState::Pending
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/ledger.db");
+        drop(TaskStore::open(&path).unwrap());
+        assert_eq!(
+            std::fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("PRAGMA user_version=99").unwrap();
+        drop(db);
+        assert!(matches!(
+            TaskStore::open(&path),
+            Err(TaskStoreError::Corrupt)
+        ));
+        let path = dir.path().join("nonempty.db");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE alien (id INTEGER)").unwrap();
+        drop(db);
+        assert!(matches!(
+            TaskStore::open(&path),
+            Err(TaskStoreError::Corrupt)
+        ));
+    }
+
     use super::*;
     use opaque_core::task::PublishAction;
     use std::sync::{Arc, Barrier};

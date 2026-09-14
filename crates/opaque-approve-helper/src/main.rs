@@ -106,29 +106,36 @@ fn main() -> ExitCode {
 /// only, and the daemon ignores it if malformed. Usernames outside the safe
 /// charset are skipped rather than escaped (no injection surface at all).
 fn report_account() {
-    // std-only uid lookup (this crate deliberately has no dependencies):
-    // the second field of the Uid: line is the effective uid.
-    let Some(uid) = std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("Uid:"))
-                .and_then(|l| l.split_whitespace().nth(2))
-                .and_then(|v| v.parse::<u32>().ok())
-        })
-    else {
+    let Some(status) = std::fs::read_to_string("/proc/self/status").ok() else {
         return;
     };
     let username = std::env::var("USER").unwrap_or_default();
+    if let Some(report) = account_report(&status, &username) {
+        println!("{report}");
+    }
+}
+
+/// Derive attribution from the actual process status and safe display label.
+/// This is not the authentication decision, which is carried by exit status.
+fn account_report(status: &str, username: &str) -> Option<String> {
+    let uid = status
+        .lines()
+        .find(|line| line.starts_with("Uid:"))?
+        .split_whitespace()
+        .nth(2)?
+        .parse::<u32>()
+        .ok()?;
     if username.is_empty()
         || username.len() > 256
         || !username
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
     {
-        return;
+        return None;
     }
-    println!("{{\"account\":{{\"uid\":{uid},\"username\":\"{username}\"}}}}");
+    Some(format!(
+        "{{\"account\":{{\"uid\":{uid},\"username\":\"{username}\"}}}}"
+    ))
 }
 
 /// Parse `--reason <text>` from command-line arguments.
@@ -279,5 +286,77 @@ mod tests {
         assert!(read_review(&[0xff][..]).is_err());
         assert!(read_review(&b"text\0hidden"[..]).is_err());
         assert!(read_review(&b" \n\t"[..]).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn appkit_observation_guards_fail_closed_and_never_activate_without_need() {
+        // Injected OS observations verify the decision contract, not a GUI ceremony.
+        assert!(review::require_console_user(0, 0).is_err());
+        assert!(review::require_console_user(501, 502).is_err());
+        assert_eq!(review::require_console_user(501, 501), Ok(()));
+        assert!(review::require_screen(false).is_err());
+        assert_eq!(review::require_screen(true), Ok(()));
+        assert!(review::require_ordered_window(false).is_err());
+        assert_eq!(review::require_ordered_window(true), Ok(()));
+        assert_eq!(
+            review::prepare_activation(false, || panic!(
+                "already active application must not change policy"
+            )),
+            Ok(())
+        );
+        let calls = std::cell::Cell::new(0);
+        assert!(
+            review::prepare_activation(true, || {
+                calls.set(calls.get() + 1);
+                false
+            })
+            .is_err()
+        );
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            review::prepare_activation(true, || {
+                calls.set(calls.get() + 1);
+                true
+            }),
+            Ok(())
+        );
+        assert_eq!(calls.get(), 2);
+        assert!(review::record_review_decision(true));
+        assert!(!review::record_review_decision(false));
+    }
+
+    #[test]
+    fn review_input_io_failure_and_duplicate_flags_never_produce_a_document() {
+        struct Broken;
+        impl std::io::Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("fixture input unavailable"))
+            }
+        }
+        assert!(read_review(Broken).is_err());
+        assert!(parse_request(vec!["--review-only".into(), "--review-only".into()]).is_err());
+    }
+
+    #[test]
+    fn account_attribution_uses_effective_uid_and_rejects_unusable_labels() {
+        let status = "Name: helper\nUid:\t100\t200\t300\t400\n";
+        assert_eq!(
+            account_report(status, "fixture.user_-9").unwrap(),
+            r#"{"account":{"uid":200,"username":"fixture.user_-9"}}"#
+        );
+        for name in [
+            "".to_owned(),
+            "x".repeat(257),
+            "newline\nvalue".into(),
+            "é".into(),
+            "quote\"".into(),
+        ] {
+            assert!(account_report(status, &name).is_none());
+        }
+        for status in ["", "Uid:", "Uid: 100 invalid", "Uid: 100 4294967296"] {
+            assert!(account_report(status, "fixture").is_none());
+        }
+        assert!(account_report(status, &"x".repeat(256)).is_some());
     }
 }

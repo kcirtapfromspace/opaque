@@ -228,4 +228,73 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(load(&path).is_err());
     }
+    #[test]
+    fn invalid_names_and_non_directory_custody_create_no_identity() {
+        let temporary = tempfile::tempdir().unwrap();
+        for name in [
+            "".to_owned(),
+            "x".repeat(65),
+            "line\nbreak".into(),
+            "é".into(),
+        ] {
+            let path = temporary.path().join("new");
+            assert!(
+                initialize(&path, &name)
+                    .unwrap_err()
+                    .contains("printable ASCII")
+            );
+            assert!(!path.exists());
+        }
+        let file = temporary.path().join("file");
+        std::fs::write(&file, b"retained bytes").unwrap();
+        assert!(
+            validate_directory(&file)
+                .unwrap_err()
+                .contains("0700 directory")
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), b"retained bytes");
+        assert!(
+            initialize(&temporary.path().join("missing/child"), "Reviewer")
+                .unwrap_err()
+                .contains("parent directory")
+        );
+    }
+
+    #[test]
+    fn malformed_key_state_and_schema_fail_before_credentials_are_returned() {
+        let temporary = tempfile::tempdir().unwrap();
+        for (index, bytes) in [vec![], vec![0; 31], vec![0; 33]].into_iter().enumerate() {
+            let path = temporary.path().join(format!("key-{index}"));
+            initialize(&path, "Reviewer").unwrap();
+            std::fs::write(path.join("workstation.key"), bytes).unwrap();
+            assert!(load(&path).unwrap_err().contains("key length"));
+        }
+        for (index, bytes) in [vec![b'x'; 16 * 1024 + 1], b"not JSON".to_vec()]
+            .into_iter()
+            .enumerate()
+        {
+            let path = temporary.path().join(format!("state-{index}"));
+            initialize(&path, "Reviewer").unwrap();
+            std::fs::write(path.join("workstation.json"), bytes).unwrap();
+            assert!(load(&path).is_err());
+        }
+        let path = temporary.path().join("schema");
+        let mut state = initialize(&path, "Reviewer").unwrap();
+        state.schema_version = 2;
+        save(&path, &state).unwrap();
+        assert!(load(&path).unwrap_err().contains("state/key mismatch"));
+    }
+
+    #[test]
+    fn credential_directories_and_readable_state_are_rejected() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("state");
+        initialize(&path, "Reviewer").unwrap();
+        let state = path.join("workstation.json");
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(load(&path).unwrap_err().contains("owned private file"));
+        std::fs::remove_file(&state).unwrap();
+        std::fs::create_dir(&state).unwrap();
+        assert!(load(&path).unwrap_err().contains("owned private file"));
+    }
 }

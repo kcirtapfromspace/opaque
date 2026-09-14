@@ -144,6 +144,59 @@ async fn capture(
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+
+    #[tokio::test]
+    async fn github_source_rejects_status_bounds_and_cross_workflow_snapshot_fields() {
+        let server = MockServer::start().await;
+        let source = GithubCiSource {
+            repository: "owner/repo".into(),
+            workflow_id: 7,
+            branch: "main".into(),
+        };
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for response in [
+            ResponseTemplate::new(403),
+            ResponseTemplate::new(200).set_body_bytes(vec![b' '; MAX_RESPONSE + 1]),
+        ] {
+            server.reset().await;
+            Mock::given(method("GET"))
+                .respond_with(response)
+                .mount(&server)
+                .await;
+            assert!(capture(&client, &server.uri(), &source).await.is_err());
+        }
+        for mode in 0..5 {
+            server.reset().await;
+            Mock::given(method("GET")).and(path("/repos/owner/repo")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":11,"full_name":if mode==0 {"other/repo"} else {"owner/repo"},"private":false}))).mount(&server).await;
+            let mut row = json!({"id":12,"run_attempt":1,"head_sha":"a".repeat(40),"workflow_id":7,"head_branch":"main","status":"completed","conclusion":"success","repository":{"id":11,"private":false}});
+            match mode {
+                1 => row["workflow_id"] = json!(8),
+                2 => row["head_branch"] = json!("other"),
+                3 => row["repository"]["private"] = json!(true),
+                _ => {}
+            }
+            let rows = if mode == 4 { vec![row; 4] } else { vec![row] };
+            Mock::given(method("GET"))
+                .and(path("/repos/owner/repo/actions/workflows/7/runs"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!({"workflow_runs":rows})),
+                )
+                .mount(&server)
+                .await;
+            assert!(
+                capture(&client, &server.uri(), &source).await.is_err(),
+                "accepted mutation {mode}"
+            );
+            assert!(
+                server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|r| !r.headers.contains_key("Authorization"))
+            );
+        }
+    }
     use super::*;
     use serde_json::json;
     use wiremock::{

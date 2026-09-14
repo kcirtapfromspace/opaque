@@ -220,6 +220,31 @@ pub fn resolve_all(
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+
+    #[test]
+    fn missing_cloud_providers_return_the_specific_error_in_single_and_batch_resolution() {
+        let resolver = CompositeResolver::new(vec![]);
+        assert!(matches!(
+            resolver.resolve("gcp:projects/test/secrets/key/versions/1"),
+            Err(ResolveError::GcpError(_, _))
+        ));
+        assert!(matches!(
+            resolver.resolve_batch(&["gcp:projects/test/secrets/key/versions/1"]),
+            Err(ResolveError::GcpError(_, _))
+        ));
+        assert!(matches!(
+            resolver.resolve("azure:vault/key/version"),
+            Err(ResolveError::AzureError(_, _))
+        ));
+        assert!(matches!(
+            resolver.resolve_batch(&["azure:vault/key/version"]),
+            Err(ResolveError::AzureError(_, _))
+        ));
+        // Invalid reference syntax is rejected before any keychain or profile access.
+        assert!(resolver.resolve_batch(&["keychain:"]).is_err());
+        assert!(resolver.resolve_batch(&["profile:"]).is_err());
+        assert!(resolver.resolve("keychain:").is_err());
+    }
     use super::*;
 
     #[derive(Debug)]

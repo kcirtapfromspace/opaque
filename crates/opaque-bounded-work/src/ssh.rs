@@ -939,6 +939,268 @@ where
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+
+    #[tokio::test]
+    async fn signer_http_rejections_and_uncertain_responses_never_reach_host_control() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let host = MockServer::start().await;
+        let mut profile = test_profile();
+        profile.config.allow_loopback_http = true;
+        profile.config.vault_url = server.uri();
+        profile.config.control_url = host.uri();
+        let action = test_action(&profile);
+        let subject =
+            ssh_key::PrivateKey::random(&mut rand::rngs::OsRng, ssh_key::Algorithm::Ed25519)
+                .unwrap();
+        for expiry in [now_unix() - 1, now_unix() + 600] {
+            assert_eq!(
+                request_certificate(
+                    &profile,
+                    &action,
+                    subject.public_key(),
+                    expiry,
+                    "synthetic-token"
+                )
+                .await
+                .unwrap_err(),
+                SignFailure::Rejected
+            );
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+        for (response, expected) in [
+            (ResponseTemplate::new(403), SignFailure::Rejected),
+            (ResponseTemplate::new(500), SignFailure::Unknown),
+            (
+                ResponseTemplate::new(200).set_body_bytes(vec![b' '; MAX_WIRE_BYTES + 1]),
+                SignFailure::Unknown,
+            ),
+            (
+                ResponseTemplate::new(200).set_body_json(json!({"data":{}})),
+                SignFailure::Unknown,
+            ),
+        ] {
+            server.reset().await;
+            Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(response)
+                .expect(1)
+                .mount(&server)
+                .await;
+            assert_eq!(
+                request_certificate(
+                    &profile,
+                    &action,
+                    subject.public_key(),
+                    now_unix() + 60,
+                    "synthetic-token"
+                )
+                .await
+                .unwrap_err(),
+                expected
+            );
+        }
+        assert!(host.received_requests().await.unwrap().is_empty());
+        let mut changed = action.clone();
+        changed.profile_id = "another".into();
+        assert_eq!(
+            execute_ssh_action(&changed, &profile, now_unix() + 60, || async {
+                panic!("invalid action must not reach final gate")
+            })
+            .await
+            .state,
+            SlotState::Rejected
+        );
+    }
+
+    #[tokio::test]
+    async fn control_acknowledgements_bind_exact_grant_revoke_and_broker_signature() {
+        use std::os::unix::fs::PermissionsExt;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let directory = tempfile::tempdir().unwrap();
+        let server = MockServer::start().await;
+        let mut profile = test_profile();
+        profile.config.allow_loopback_http = true;
+        profile.config.control_url = server.uri();
+        let broker = SigningKey::generate(&mut rand::rngs::OsRng);
+        let receipt_key = SigningKey::generate(&mut rand::rngs::OsRng);
+        profile.config.receipt_public_key_hex = hex(&receipt_key.verifying_key().to_bytes());
+        profile.config.grant_signing_key_path =
+            directory.path().canonicalize().unwrap().join("grant-key");
+        std::fs::write(&profile.grant_signing_key_path, broker.to_bytes()).unwrap();
+        std::fs::set_permissions(
+            &profile.grant_signing_key_path,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        profile.signing_key().unwrap();
+        let action = test_action(&profile);
+        validate_profile_action(&action, &profile).unwrap();
+        let expiry = now_unix() + 60;
+        for (operation, status, valid) in [
+            ("grant", "granted", true),
+            ("revoke", "revoked", true),
+            ("grant", "revoked", false),
+            ("revoke", "granted", false),
+        ] {
+            let payload = serde_json::to_vec(
+                &json!({"manifest":action,"expires_at":expiry,"response":{"status":status}}),
+            )
+            .unwrap();
+            let mut message = RECEIPT_DOMAIN.to_vec();
+            message.extend(&payload);
+            let envelope = SignedEnvelope {
+                payload: STANDARD.encode(payload),
+                signature: hex(&receipt_key.sign(&message).to_bytes()),
+            };
+            server.reset().await;
+            Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(envelope))
+                .expect(1)
+                .mount(&server)
+                .await;
+            assert_eq!(
+                control(&profile, &action, expiry, operation).await.is_ok(),
+                valid
+            );
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 1);
+            let request: SignedEnvelope = serde_json::from_slice(&requests[0].body).unwrap();
+            let payload = STANDARD.decode(request.payload).unwrap();
+            let mut message = CONTROL_DOMAIN.to_vec();
+            message.extend(&payload);
+            broker
+                .verifying_key()
+                .verify(
+                    &message,
+                    &Signature::from_bytes(&decode_hex::<64>(&request.signature).unwrap()),
+                )
+                .unwrap();
+            let body: Value = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(body["action"], operation);
+            assert_eq!(body["manifest"], serde_json::to_value(&action).unwrap());
+            assert_eq!(body["expires_at"], expiry);
+        }
+        for (mode, bytes) in [(0o644, 32), (0o600, 31), (0o600, 33)] {
+            std::fs::write(&profile.grant_signing_key_path, vec![42; bytes]).unwrap();
+            std::fs::set_permissions(
+                &profile.grant_signing_key_path,
+                std::fs::Permissions::from_mode(mode),
+            )
+            .unwrap();
+            assert!(profile.signing_key().is_err());
+        }
+    }
+
+    #[test]
+    fn ssh_profile_rejects_each_untrusted_endpoint_and_authority_boundary() {
+        let profile = test_profile();
+        profile.validate().unwrap();
+        for (field, value) in [
+            ("control_url", json!("file:///tmp/socket")),
+            ("control_url", json!("https://:password@example.com")),
+            ("control_url", json!("https://example.com/#fragment")),
+            ("control_url", json!("ftp://127.0.0.1")),
+            ("profile_id", json!("bad/label")),
+            ("destination_host", json!("example.com")),
+            ("destination_port", json!(0)),
+            ("source_address", json!("example.com")),
+            ("principal", json!("bad/label")),
+            ("login_user", json!("bad/label")),
+            ("login_user", json!("root")),
+            ("max_session_secs", json!(31)),
+            ("vault_mount", json!("bad/label")),
+            ("vault_role", json!("bad/label")),
+            ("host_key_sha256", json!("bad")),
+            ("host_key_sha256", json!("f".repeat(64))),
+            ("vault_ca_sha256", json!("f".repeat(64))),
+            ("grant_signing_key_path", json!("relative")),
+            ("vault_token_ref", json!(format!("env:{}", "A".repeat(513)))),
+            ("vault_token_ref", json!("unsupported:TOKEN")),
+            ("vault_token_ref", json!("env:bad\nref")),
+            ("receipt_public_key_hex", json!("0")),
+            ("receipt_public_key_hex", json!("G".repeat(64))),
+            ("tls_ca_pem", json!("a".repeat(16385))),
+            ("tls_ca_pem", json!("-----BEGIN PRIVATE KEY-----")),
+        ] {
+            let mut value_config = serde_json::to_value(&profile.config).unwrap();
+            value_config[field] = value;
+            let changed = TrustedSshProfile {
+                tenant: profile.tenant.clone(),
+                config: serde_json::from_value(value_config).unwrap(),
+            };
+            assert!(changed.validate().is_err(), "accepted {field}");
+        }
+    }
+
+    #[test]
+    fn ssh_action_cannot_substitute_any_valid_authority_field() {
+        let profile = test_profile();
+        let action = test_action(&profile);
+        for (field, value) in [
+            (
+                "tenant",
+                json!({"tenant_id": "another", "broker_id": uuid::Uuid::new_v4()}),
+            ),
+            ("profile_id", json!("another")),
+            ("destination_port", json!(1234)),
+            ("host_key_sha256", json!("f".repeat(64))),
+            ("login_user", json!("another")),
+            ("source_address", json!("127.0.0.2")),
+            ("max_session_secs", json!(1)),
+            ("vault_ca_sha256", json!("f".repeat(64))),
+        ] {
+            let mut changed = serde_json::to_value(&action).unwrap();
+            if field == "tenant" {
+                changed[field] = serde_json::to_value(&action.tenant).unwrap();
+                changed[field]["broker_id"] = json!(uuid::Uuid::new_v4());
+            } else {
+                changed[field] = value;
+            }
+            let changed: SshHealthAction = serde_json::from_value(changed).unwrap();
+            changed.validate().unwrap();
+            assert!(
+                validate_profile_action(&changed, &profile).is_err(),
+                "accepted {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn signed_host_rejections_preserve_unknown_without_disclosing_output() {
+        let mut profile = test_profile();
+        let action = test_action(&profile);
+        let now = now_unix();
+        let expiry = now + 60;
+        for (status, state) in [
+            ("timeout", SlotState::Unknown),
+            ("expired", SlotState::Rejected),
+            ("revoked", SlotState::Rejected),
+        ] {
+            let response = json!({"status":status,"output_text":"must not disclose", "receipt":{"grant_id":action.grant_id,"principal":action.principal,"operation":SSH_FIXED_COMMAND,"started_at":now-1,"finished_at":now}});
+            let bytes = signed_response(&mut profile, &action, expiry, response.clone());
+            let result = host_outcome(&profile, &action, expiry, &bytes).unwrap();
+            assert_eq!(result.state, state);
+            let receipt = result.ssh_receipt.unwrap();
+            assert!(receipt.output_text.is_none());
+            assert!(receipt.output_sha256.is_none());
+            for (field, value) in [
+                ("grant_id", json!("another")),
+                ("principal", json!("another")),
+                ("operation", json!("other")),
+                ("started_at", json!(0)),
+                ("started_at", json!(1e30)),
+                ("finished_at", json!(now + 30)),
+            ] {
+                let mut changed = response.clone();
+                changed["receipt"][field] = value;
+                let bytes = signed_response(&mut profile, &action, expiry, changed);
+                assert!(
+                    host_outcome(&profile, &action, expiry, &bytes).is_err(),
+                    "accepted {status} {field}"
+                );
+            }
+        }
+    }
     use super::*;
 
     fn test_action(profile: &TrustedSshProfile) -> SshHealthAction {

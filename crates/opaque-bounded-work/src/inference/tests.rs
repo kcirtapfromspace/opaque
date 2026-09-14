@@ -1043,3 +1043,111 @@ async fn streamed_body_limits_and_transport_loss_keep_effects_bounded_and_durabl
         );
     }
 }
+
+#[tokio::test]
+async fn invalid_profile_identity_fields_are_rejected_before_model_io() {
+    let (server, profile, _) = fixture().await;
+    for (field, value) in [
+        ("api_url", json!("file:///models/a")),
+        ("api_url", json!("https://:password@example.com")),
+        ("api_url", json!("https://example.com/#fragment")),
+        ("api_url", json!("ftp://127.0.0.1")),
+        ("api_url", json!("http://public.example.com")),
+        ("allow_loopback_http", json!(false)),
+        ("profile_id", json!("invalid/name")),
+        ("model_id", json!("invalid\nmodel")),
+        ("model_path", json!("relative.gguf")),
+        ("model_path", json!(format!("/{}", "a".repeat(512)))),
+        ("model_path", json!("/models/a space")),
+        ("server_build", json!("bad\nbuild")),
+        ("service_uid", json!(uuid::Uuid::nil())),
+        ("model_artifact_sha256", json!("bad")),
+        ("model_artifact_sha256", json!("0".repeat(64))),
+        ("chat_template_sha256", json!("bad")),
+        (
+            "credential_ref",
+            json!(format!("keychain:{}/a", "s".repeat(129))),
+        ),
+    ] {
+        let mut config = serde_json::to_value(&profile.config).unwrap();
+        config[field] = value;
+        let changed = TrustedInferenceProfile {
+            tenant: profile.tenant.clone(),
+            config: serde_json::from_value(config).unwrap(),
+        };
+        assert!(changed.validate().is_err(), "accepted {field}");
+        assert!(changed.digest().is_err(), "hashed invalid {field}");
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn action_prompt_requires_valid_profile_tenant_and_action_identity() {
+    let (server, profile, manifest) = fixture().await;
+    let action = manifest.actions[0].as_inference().unwrap();
+    assert!(action_prompt(&profile, action).is_some());
+    let mut invalid = action.clone();
+    invalid.ordinal = 0;
+    assert!(action_prompt(&profile, &invalid).is_none());
+    let mut invalid_profile = profile.clone();
+    invalid_profile.config.model_path = "relative".into();
+    assert!(action_prompt(&invalid_profile, action).is_none());
+    let mut other = action.clone();
+    other.tenant.broker_id = uuid::Uuid::new_v4();
+    assert!(action_prompt(&profile, &other).is_none());
+    let mut other = action.clone();
+    other.profile_id = "another-valid-profile".into();
+    assert!(action_prompt(&profile, &other).is_none());
+    let mut github = profile.clone();
+    github.config.github_ci = Some(GithubCiSource {
+        repository: "owner/repo".into(),
+        workflow_id: 7,
+        branch: "main".into(),
+    });
+    github.config.source_snapshot_sha256.clear();
+    assert!(
+        github.validate().is_err(),
+        "GitHub source must use the GitHub source ID"
+    );
+    github.config.source_id = GITHUB_SOURCE_ID.into();
+    github.config.github_ci.as_mut().unwrap().workflow_id = 0;
+    assert!(github.validate().is_err());
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn preattached_github_snapshot_cannot_bypass_broker_capture() {
+    use opaque_core::inference::github::{GithubCiRun, GithubCiSnapshot, RunConclusion, RunStatus};
+    let (server, mut profile, _) = fixture().await;
+    profile.config.source_id = GITHUB_SOURCE_ID.into();
+    profile.config.source_snapshot_sha256.clear();
+    profile.config.github_ci = Some(GithubCiSource {
+        repository: "owner/repo".into(),
+        workflow_id: 7,
+        branch: "main".into(),
+    });
+    let mut manifest = public_demo_manifest(&profile, "review".into(), 600).unwrap();
+    let snapshot = GithubCiSnapshot {
+        source: profile.github_ci.clone().unwrap(),
+        repository_id: 11,
+        observed_at: 100,
+        runs: vec![GithubCiRun {
+            id: 12,
+            attempt: 1,
+            head_sha: "a".repeat(40),
+            status: RunStatus::Completed,
+            conclusion: Some(RunConclusion::Success),
+        }],
+    };
+    let mut foreign = snapshot.clone();
+    foreign.source.workflow_id = 8;
+    assert!(attach_github_snapshot(&mut manifest, &profile, foreign).is_err());
+    attach_github_snapshot(&mut manifest, &profile, snapshot).unwrap();
+    assert_eq!(
+        plan_inference_manifest(manifest, &profile)
+            .await
+            .unwrap_err(),
+        "GitHub snapshots must be captured by the broker"
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+}

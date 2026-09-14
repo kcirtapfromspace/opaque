@@ -585,4 +585,55 @@ mod tests {
         let devices = store.list_devices().unwrap();
         assert_eq!(devices.len(), 3);
     }
+
+    #[test]
+    fn token_rotation_cannot_promote_revoked_unconfirmed_or_mobile_devices() {
+        for field in 0..3 {
+            let (_directory, store) = temp_store();
+            let mut device = sample_device("guarded", "Fixture");
+            device.kind = DeviceKind::Workstation;
+            if field == 0 {
+                device.revoked = true;
+            }
+            if field == 1 {
+                device.confirmed = false;
+            }
+            if field == 2 {
+                device.kind = DeviceKind::Ios;
+            }
+            store.add_device(device.clone()).unwrap();
+            let before = std::fs::read(store.path()).unwrap();
+            assert!(matches!(
+                store.rotate_workstation_token(&device.device_id, "ab".repeat(32)),
+                Err(DeviceStoreError::Integrity(_))
+            ));
+            assert_eq!(std::fs::read(store.path()).unwrap(), before);
+            assert!(
+                store
+                    .get_device(&device.device_id)
+                    .unwrap()
+                    .token_sha256
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_stored_keys_fail_closed_without_panicking_or_accepting_prefixes() {
+        for key in [
+            "0".to_owned(),
+            "gg".repeat(32),
+            "ab".repeat(31),
+            "ab".repeat(33),
+            "åå".repeat(16),
+        ] {
+            let mut device = sample_device("guarded", "Fixture");
+            device.public_key_hex = key;
+            assert!(matches!(
+                device.verifying_key(),
+                Err(DeviceStoreError::Integrity(_))
+            ));
+        }
+        assert_eq!(hex::decode("aB00").unwrap(), vec![0xab, 0]);
+    }
 }

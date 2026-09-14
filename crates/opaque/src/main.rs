@@ -1226,7 +1226,8 @@ async fn run_github_publish_env(
         ));
     }
 
-    let mut items = Vec::with_capacity(env_names.len());
+    let total_discovered = env_names.len();
+    let mut items = Vec::with_capacity(total_discovered);
     let mut attempted = 0usize;
     let mut published = 0usize;
     let mut failed = 0usize;
@@ -1333,7 +1334,7 @@ async fn run_github_publish_env(
         env_file: env_file.display().to_string(),
         value_ref_template: value_ref_template.to_owned(),
         dry_run,
-        total_discovered: items.len(),
+        total_discovered,
         attempted,
         published,
         failed,
