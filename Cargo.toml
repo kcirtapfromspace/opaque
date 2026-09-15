@@ -48,7 +48,7 @@ default-members = [
 [workspace.package]
 # The single source of truth for the release version: every crate inherits it,
 # and scripts/release-prep.sh rewrites this one line.
-version = "0.4.0"
+version = "0.4.1"
 license = "BUSL-1.1"
 repository = "https://github.com/kcirtapfromspace/opaque"
 homepage = "https://github.com/kcirtapfromspace/opaque"
