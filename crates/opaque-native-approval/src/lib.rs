@@ -320,6 +320,51 @@ fn prompt_macos_blocking(reason: &str) -> Result<bool, ApprovalError> {
     prompt_macos_blocking_for(reason, std::time::Duration::from_secs(60))
 }
 
+/// Probe whether `ctx` can ever complete device-owner authentication,
+/// without presenting any UI. Shared by the per-prompt fail-closed check in
+/// [`prompt_macos_blocking_for`] and the startup preflight in
+/// [`session_supports_local_authentication`], so both agree on exactly one
+/// definition of "this session can authenticate locally."
+#[cfg(target_os = "macos")]
+fn probe_device_owner_authentication(
+    ctx: &objc2_local_authentication::LAContext,
+) -> Result<(), ApprovalError> {
+    use objc2_local_authentication::LAPolicy;
+
+    // SAFETY: `ctx` is a valid LAContext; objc2 converts the NSError**
+    // out-parameter into a Result.
+    if unsafe { ctx.canEvaluatePolicy_error(LAPolicy::DeviceOwnerAuthentication) }.is_err() {
+        return Err(ApprovalError::Unavailable);
+    }
+    Ok(())
+}
+
+/// Probe whether this session can ever complete local device-owner
+/// authentication (macOS `LocalAuthentication`), independent of any specific
+/// approval request. Used as a startup preflight: a LaunchDaemon or SSH
+/// session with no window server fails this the same way `canEvaluatePolicy`
+/// fails it on every subsequent prompt, so the daemon can refuse to start
+/// instead of accepting connections it can never approve.
+///
+/// Platforms without this mechanism (Linux, where the `local_bio` factor
+/// means polkit, not `LocalAuthentication`) have nothing to probe here and
+/// report success.
+pub fn session_supports_local_authentication() -> Result<(), ApprovalError> {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_local_authentication::LAContext;
+
+        // SAFETY: LAContext::new has no preconditions; objc2 manages the
+        // returned object's retain count.
+        let ctx = unsafe { LAContext::new() };
+        probe_device_owner_authentication(&ctx)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(())
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn prompt_macos_blocking_for(
     reason: &str,
@@ -339,11 +384,7 @@ fn prompt_macos_blocking_for(
     // Preflight: check if the UI session supports approval.
     // If not (e.g., no window server, LaunchDaemon, SSH), return Unavailable
     // so the enclave reports `approval_unavailable` to the client.
-    // SAFETY: `ctx` is a valid LAContext; objc2 converts the NSError**
-    // out-parameter into a Result.
-    if unsafe { ctx.canEvaluatePolicy_error(LAPolicy::DeviceOwnerAuthentication) }.is_err() {
-        return Err(ApprovalError::Unavailable);
-    }
+    probe_device_owner_authentication(&ctx)?;
 
     let (tx, rx) = std::sync::mpsc::channel::<bool>();
     let tx = Arc::new(Mutex::new(Some(tx)));
@@ -1131,5 +1172,26 @@ mod tests {
             assert_eq!(calls.get(), 1);
             drop(sender);
         }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn session_supports_local_authentication_is_vacuous_off_macos() {
+        // local_bio means polkit here, not LocalAuthentication — nothing to
+        // probe, so the H-8 macOS startup preflight that consumes this must
+        // never treat this platform as unable to authenticate.
+        assert!(session_supports_local_authentication().is_ok());
+    }
+
+    // The macOS branch calls the real `canEvaluatePolicy` probe used by both
+    // the per-prompt fail-closed check and the H-8 startup preflight. Whether
+    // it returns Ok or Err depends on the runner's GUI session (an
+    // interactive dev Mac vs. a headless CI runner), so this only proves the
+    // probe completes without panicking; a decisive Err on a session with no
+    // window server is unexecuted here: needs GUI session hardware.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn session_supports_local_authentication_reports_a_result() {
+        let _ = session_supports_local_authentication();
     }
 }

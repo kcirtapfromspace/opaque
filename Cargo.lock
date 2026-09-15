@@ -2713,6 +2713,7 @@ dependencies = [
  "opaque-bounded-work",
  "opaque-core",
  "opaque-federation-runtime",
+ "opaque-native-approval",
  "opaque-providers",
  "opaque-sandbox",
  "opaque-showcase",
