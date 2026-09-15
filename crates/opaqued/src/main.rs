@@ -23,7 +23,8 @@ use opaque_core::operation::{
 };
 use opaque_core::peer::peer_info_from_fd;
 use opaque_core::policy::{
-    PolicyEngine, PolicyRule, codesign_team_id_is_platform_enforceable, platform_policy_warnings,
+    PolicyEngine, PolicyRule, codesign_team_id_is_platform_enforceable,
+    known_human_client_platform_warnings, platform_policy_warnings,
 };
 use opaque_core::proto::{Request, Response};
 use opaque_core::socket::{
@@ -859,6 +860,19 @@ fn load_config(path: &Path) -> DaemonConfig {
                 // than refusing the load.
                 for warning in platform_policy_warnings(
                     &config.rules,
+                    codesign_team_id_is_platform_enforceable(),
+                ) {
+                    warn!("{warning}");
+                }
+                // N1: the same gap applies to known_human_clients entries.
+                // Such an entry still loads. It simply never classifies a
+                // connection as human, so this warns rather than refusing
+                // the load.
+                for warning in known_human_client_platform_warnings(
+                    config
+                        .known_human_clients
+                        .iter()
+                        .map(|entry| (entry.name.as_str(), entry.codesign_team_id.is_some())),
                     codesign_team_id_is_platform_enforceable(),
                 ) {
                     warn!("{warning}");
