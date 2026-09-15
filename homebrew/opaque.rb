@@ -9,25 +9,25 @@ class Opaque < Formula
 
   on_macos do
     on_arm do
-      url "https://github.com/kcirtapfromspace/opaque/releases/download/v0.2.0/opaque-0.2.0-aarch64-apple-darwin.tar.gz"
-      sha256 "e186a9cbc10797242b6b5f3f425a776838876a594e63af8a8b245fd6530f2cef"
+      url "https://github.com/kcirtapfromspace/opaque/releases/download/v0.4.0/opaque-0.4.0-aarch64-apple-darwin.tar.gz"
+      sha256 "238e9a02e9ffff7d4525d57cb879558fae407f220b8ddb491d99f3632cef4d1d"
     end
 
     on_intel do
-      url "https://github.com/kcirtapfromspace/opaque/releases/download/v0.2.0/opaque-0.2.0-x86_64-apple-darwin.tar.gz"
-      sha256 "19f9e380b78724c3413ac98c05896cb7f4f7fcc804088fb5603ab60bde03e378"
+      url "https://github.com/kcirtapfromspace/opaque/releases/download/v0.4.0/opaque-0.4.0-x86_64-apple-darwin.tar.gz"
+      sha256 "ab574420f0eda3955b18284fe2962074299c0bf258deb484ac4de6d7571278dd"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/kcirtapfromspace/opaque/releases/download/v0.2.0/opaque-0.2.0-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "b5537279e7ed3c623a0977e2fee4f8d27b4f50081f6de1c3059acd4e3f875375"
+      url "https://github.com/kcirtapfromspace/opaque/releases/download/v0.4.0/opaque-0.4.0-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "e09d4e91c48d35326695bc7dcb67def6810bd090d4af54dd90d4a083d272ce8b"
     end
 
     on_intel do
-      url "https://github.com/kcirtapfromspace/opaque/releases/download/v0.2.0/opaque-0.2.0-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "3c09616dc16a72408f28749bc698e3385dfa42aef96ea39acd578ac00b6a089d"
+      url "https://github.com/kcirtapfromspace/opaque/releases/download/v0.4.0/opaque-0.4.0-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "063bb0bd8850e24c1e5730b975c08d831d8e9ab7ff0ece5fdae1f75d2d25ad9b"
     end
   end
 
