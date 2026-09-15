@@ -120,6 +120,60 @@ impl ClientMatch {
     }
 }
 
+/// Whether the current platform's connection attestor can ever populate
+/// `codesign_team_id` for a real client. Mirrors the platform gate on
+/// `opaque_federation_runtime::workload_attest::signing_team_for_peer`, which
+/// resolves a macOS code-signing Team ID from the kernel-verified peer audit
+/// token and has no equivalent elsewhere. `uid`, `exe_path` and `exe_sha256`
+/// are populated on every supported platform, so they need no such check.
+pub fn codesign_team_id_is_platform_enforceable() -> bool {
+    cfg!(target_os = "macos")
+}
+
+/// Rules whose [`ClientMatch`] requires `codesign_team_id` although the
+/// current platform can never populate it for a real client (N1): such a
+/// rule loads without error but can never match, an accepted-but-unenforced
+/// constraint rather than a visible one. Pure over `codesign_enforceable` so
+/// the decision is unit-testable independent of the host platform running
+/// the test; production callers pass
+/// [`codesign_team_id_is_platform_enforceable`].
+pub fn unenforceable_client_identity_rules(
+    rules: &[PolicyRule],
+    codesign_enforceable: bool,
+) -> Vec<(&PolicyRule, &'static str)> {
+    if codesign_enforceable {
+        return Vec::new();
+    }
+    rules
+        .iter()
+        .filter(|rule| rule.client.codesign_team_id.is_some())
+        .map(|rule| (rule, "codesign_team_id"))
+        .collect()
+}
+
+/// Operator-facing text for one unenforceable client-identity constraint:
+/// names the rule and the field, and points at the fields this platform does
+/// populate.
+pub fn client_identity_platform_warning(rule_name: &str, field: &str) -> String {
+    format!(
+        "policy rule {rule_name:?} requires client.{field}, which this platform cannot \
+         populate for a real client. The rule will never match. Pin the caller with \
+         client.exe_sha256 or client.exe_path on this platform instead."
+    )
+}
+
+/// Warning strings for every rule in `rules` that requires a client-identity
+/// field this platform cannot enforce. Empty when there is nothing to warn
+/// about. Shared by the CLI policy-check path, the daemon's config-load
+/// path, and the federation bundle-apply path, so all three phrase the same
+/// condition identically.
+pub fn platform_policy_warnings(rules: &[PolicyRule], codesign_enforceable: bool) -> Vec<String> {
+    unenforceable_client_identity_rules(rules, codesign_enforceable)
+        .into_iter()
+        .map(|(rule, field)| client_identity_platform_warning(&rule.name, field))
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Identity match pattern (Phase 1 identity substrate)
 // ---------------------------------------------------------------------------
@@ -1073,6 +1127,92 @@ mod tests {
         let mut id = test_identity();
         id.codesign_team_id = None;
         assert!(!cm.matches(&id));
+    }
+
+    /// N1: a rule naming `client`, with every other field at its default.
+    fn client_rule(name: &str, client: ClientMatch) -> PolicyRule {
+        PolicyRule {
+            name: name.into(),
+            client,
+            operation_pattern: "*".into(),
+            target: TargetMatch::default(),
+            workspace: WorkspaceMatch::default(),
+            secret_names: SecretNameMatch::default(),
+            allow: true,
+            client_types: vec![],
+            identity: IdentityMatch::default(),
+            approval: ApprovalConfig::default(),
+        }
+    }
+
+    #[test]
+    fn unenforceable_client_identity_rules_flags_codesign_only_when_unenforceable() {
+        let rules = vec![
+            client_rule(
+                "requires-team",
+                ClientMatch {
+                    codesign_team_id: Some("TEAM_A".into()),
+                    ..Default::default()
+                },
+            ),
+            client_rule(
+                "requires-exe",
+                ClientMatch {
+                    exe_sha256: Some("deadbeef".into()),
+                    exe_path: Some("/usr/bin/claude*".into()),
+                    ..Default::default()
+                },
+            ),
+            client_rule("requires-nothing", ClientMatch::default()),
+        ];
+
+        // Enforceable (macOS): nothing is flagged, regardless of what any
+        // rule requires.
+        assert!(unenforceable_client_identity_rules(&rules, true).is_empty());
+
+        // Not enforceable: only the codesign_team_id rule is flagged, by
+        // name, and exe_sha256/exe_path rules are left alone (they ARE
+        // populated on every platform).
+        let flagged = unenforceable_client_identity_rules(&rules, false);
+        assert_eq!(flagged.len(), 1);
+        assert_eq!(flagged[0].0.name, "requires-team");
+        assert_eq!(flagged[0].1, "codesign_team_id");
+    }
+
+    #[test]
+    fn client_identity_platform_warning_names_the_rule_field_and_alternative() {
+        let warning = client_identity_platform_warning("requires-team", "codesign_team_id");
+        assert!(warning.contains("requires-team"));
+        assert!(warning.contains("codesign_team_id"));
+        assert!(warning.contains("exe_sha256"));
+        assert!(warning.contains("exe_path"));
+        assert!(warning.contains("never match"));
+    }
+
+    #[test]
+    fn platform_policy_warnings_is_empty_when_enforceable_or_nothing_to_flag() {
+        let team_rule = client_rule(
+            "requires-team",
+            ClientMatch {
+                codesign_team_id: Some("TEAM_A".into()),
+                ..Default::default()
+            },
+        );
+        assert!(platform_policy_warnings(std::slice::from_ref(&team_rule), true).is_empty());
+
+        let exe_rule = client_rule(
+            "requires-exe",
+            ClientMatch {
+                exe_sha256: Some("deadbeef".into()),
+                ..Default::default()
+            },
+        );
+        assert!(platform_policy_warnings(std::slice::from_ref(&exe_rule), false).is_empty());
+
+        let warnings = platform_policy_warnings(std::slice::from_ref(&team_rule), false);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("requires-team"));
+        assert!(warnings[0].contains("codesign_team_id"));
     }
 
     #[test]

@@ -14,7 +14,9 @@ use std::sync::Arc;
 use opaque_core::audit::{AuditEvent, AuditEventKind, AuditLevel, AuditSink};
 use opaque_core::bundle::{self, BundleError, BundleState, Team, VerifiedBundle, parse_anchor};
 use opaque_core::enclave_facade::EnclaveFacade;
-use opaque_core::policy::PolicyEngine;
+use opaque_core::policy::{
+    PolicyEngine, codesign_team_id_is_platform_enforceable, platform_policy_warnings,
+};
 use serde::Deserialize;
 use tracing::{info, warn};
 
@@ -260,6 +262,20 @@ impl BundleApplier {
         )
         .map_err(|e| format!("bundle state persist failed: {e}"))?;
 
+        // N1: a bundle rule can require a client-identity field this
+        // platform's connection attestor never populates (codesign_team_id
+        // off macOS). Such a rule still applies. It simply never matches a
+        // real client, so this warns rather than refusing the bundle.
+        for warning in platform_policy_warnings(
+            &verified.payload.rules,
+            codesign_team_id_is_platform_enforceable(),
+        ) {
+            warn!(
+                "federation bundle from org {}: {warning}",
+                verified.payload.org
+            );
+        }
+
         // A failed state write must leave the active policy unchanged. Policy
         // publication is infallible and follows its rollback record.
         let engine = PolicyEngine::with_rules(verified.payload.rules.clone());
@@ -482,6 +498,32 @@ mod tests {
                 .version,
             1
         );
+    }
+
+    /// N1: a bundle rule requiring `codesign_team_id` must apply rather than
+    /// be refused — the field genuinely populates on macOS, and elsewhere the
+    /// daemon warns instead of rejecting (see
+    /// `opaque_core::policy::platform_policy_warnings`, consulted here the
+    /// same way `apply_text` does internally).
+    #[test]
+    fn bundle_rule_requiring_unenforceable_codesign_still_applies() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let enclave = Arc::new(FakeEnclave::new());
+        let mut applier = test_applier(directory.path(), &key);
+        applier.enclave = enclave.clone();
+        let mut payload = payload_with_rules(1);
+        payload.rules[0].client.codesign_team_id = Some("TEAMFIXTURE".into());
+        let text = sign_bundle(&payload, &key).unwrap();
+
+        applier.apply_text(&text, "fixture", true).unwrap();
+        assert_eq!(enclave.policy.read().unwrap().rule_count(), 1);
+
+        let warnings = platform_policy_warnings(&payload.rules, false);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("bundle-allows-noop"));
+        assert!(warnings[0].contains("codesign_team_id"));
+        assert!(platform_policy_warnings(&payload.rules, true).is_empty());
     }
 
     #[tokio::test]

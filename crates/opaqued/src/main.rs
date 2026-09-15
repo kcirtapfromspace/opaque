@@ -22,7 +22,9 @@ use opaque_core::operation::{
     OperationRegistry, OperationRequest, OperationSafety,
 };
 use opaque_core::peer::peer_info_from_fd;
-use opaque_core::policy::{PolicyEngine, PolicyRule};
+use opaque_core::policy::{
+    PolicyEngine, PolicyRule, codesign_team_id_is_platform_enforceable, platform_policy_warnings,
+};
 use opaque_core::proto::{Request, Response};
 use opaque_core::socket::{
     bind_unix_listener_private, ensure_socket_parent_dir, socket_path_for_client,
@@ -849,6 +851,17 @@ fn load_config(path: &Path) -> DaemonConfig {
                             }
                         }
                     }
+                }
+                // N1: a rule can require a client-identity field this
+                // platform's connection attestor never populates
+                // (codesign_team_id off macOS). Such a rule still loads. It
+                // simply never matches a real client, so this warns rather
+                // than refusing the load.
+                for warning in platform_policy_warnings(
+                    &config.rules,
+                    codesign_team_id_is_platform_enforceable(),
+                ) {
+                    warn!("{warning}");
                 }
                 info!(
                     "loaded config from {} ({} known human clients, {} policy rules)",
