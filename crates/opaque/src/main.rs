@@ -11,7 +11,9 @@ use console::style;
 use futures_util::{SinkExt, StreamExt};
 use opaque_core::audit::{AuditEventKind, AuditFilter, query_audit_db};
 use opaque_core::operation::{ClientIdentity, ClientType, OperationRequest, OperationSafety};
-use opaque_core::policy::PolicyEngine;
+use opaque_core::policy::{
+    PolicyEngine, codesign_team_id_is_platform_enforceable, platform_policy_warnings,
+};
 use opaque_core::profile;
 use opaque_core::proto::{Request, Response};
 use opaque_core::socket::{socket_path, verify_socket_safety};
@@ -4330,6 +4332,23 @@ fn resolve_config_path(file: Option<&Path>) -> PathBuf {
 
 /// Validate a policy config file. Returns a success message or an error string.
 fn policy_check_path(file: Option<&Path>) -> Result<String, String> {
+    let (message, warnings) =
+        policy_check_report(file, codesign_team_id_is_platform_enforceable())?;
+    for warning in &warnings {
+        ui::warn(warning);
+    }
+    Ok(message)
+}
+
+/// The actual check, with the platform's codesign-enforceability taken as a
+/// parameter rather than read from `cfg!` directly, and any N1 platform
+/// warnings returned rather than printed. This makes the full behavior,
+/// including the fact that such a rule loads instead of being refused,
+/// unit-testable independent of the host platform running the test.
+fn policy_check_report(
+    file: Option<&Path>,
+    codesign_enforceable: bool,
+) -> Result<(String, Vec<String>), String> {
     let path = resolve_config_path(file);
     let contents = std::fs::read_to_string(&path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
@@ -4346,7 +4365,16 @@ fn policy_check_path(file: Option<&Path>) -> Result<String, String> {
         ));
     }
 
-    Ok(format!("policy OK: {} rules loaded", config.rules.len()))
+    // N1: a rule can require a client-identity field this platform's
+    // connection attestor never populates (codesign_team_id off macOS). Such
+    // a rule still loads. It simply never matches a real client, so this
+    // warns rather than failing the check.
+    let warnings = platform_policy_warnings(&config.rules, codesign_enforceable);
+
+    Ok((
+        format!("policy OK: {} rules loaded", config.rules.len()),
+        warnings,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -7567,6 +7595,65 @@ lease_ttl = 300
         let result = check_toml(toml);
         assert!(result.is_ok());
         assert!(result.unwrap().contains("0 rules loaded"));
+    }
+
+    /// Write a TOML string to a temp file and run policy_check_report on it
+    /// with a simulated (not necessarily real) platform enforceability.
+    fn check_toml_for_platform(
+        content: &str,
+        codesign_enforceable: bool,
+    ) -> Result<(String, Vec<String>), String> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, content).unwrap();
+        policy_check_report(Some(path.as_path()), codesign_enforceable)
+    }
+
+    /// N1: a rule requiring `codesign_team_id` loads (never refused) and
+    /// warns by name only when this platform cannot enforce it. A rule
+    /// pinning the caller with exe_sha256/exe_path is populated on every
+    /// platform, so it never warns either way.
+    #[test]
+    fn policy_check_warns_only_for_unenforceable_codesign_rules() {
+        let codesign_rule = r#"
+[[rules]]
+name = "requires-team"
+operation_pattern = "github.*"
+client_types = ["agent", "human"]
+[rules.client]
+codesign_team_id = "TEAMFIXTURE"
+"#;
+        let exe_rule = r#"
+[[rules]]
+name = "requires-exe"
+operation_pattern = "github.*"
+client_types = ["agent", "human"]
+[rules.client]
+exe_sha256 = "deadbeef"
+exe_path = "/usr/bin/claude*"
+"#;
+
+        // Non-enforcing platform: the codesign rule loads and warns by name.
+        let (message, warnings) = check_toml_for_platform(codesign_rule, false).unwrap();
+        assert!(message.contains("1 rules loaded"));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("requires-team"));
+        assert!(warnings[0].contains("codesign_team_id"));
+        assert!(warnings[0].contains("exe_sha256"));
+
+        // Enforcing platform: same rule, no warning.
+        let (_, warnings) = check_toml_for_platform(codesign_rule, true).unwrap();
+        assert!(warnings.is_empty());
+
+        // exe_sha256/exe_path rule: never warns, on either platform.
+        let (_, warnings) = check_toml_for_platform(exe_rule, false).unwrap();
+        assert!(warnings.is_empty());
+        let (_, warnings) = check_toml_for_platform(exe_rule, true).unwrap();
+        assert!(warnings.is_empty());
+
+        // The real CLI entry point (this host's actual platform) also loads
+        // the codesign rule rather than refusing it.
+        assert!(check_toml(codesign_rule).is_ok());
     }
 
     #[test]

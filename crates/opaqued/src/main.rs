@@ -22,7 +22,10 @@ use opaque_core::operation::{
     OperationRegistry, OperationRequest, OperationSafety,
 };
 use opaque_core::peer::peer_info_from_fd;
-use opaque_core::policy::{PolicyEngine, PolicyRule};
+use opaque_core::policy::{
+    PolicyEngine, PolicyRule, codesign_team_id_is_platform_enforceable,
+    known_human_client_platform_warnings, platform_policy_warnings,
+};
 use opaque_core::proto::{Request, Response};
 use opaque_core::socket::{
     bind_unix_listener_private, ensure_socket_parent_dir, socket_path_for_client,
@@ -849,6 +852,30 @@ fn load_config(path: &Path) -> DaemonConfig {
                             }
                         }
                     }
+                }
+                // N1: a rule can require a client-identity field this
+                // platform's connection attestor never populates
+                // (codesign_team_id off macOS). Such a rule still loads. It
+                // simply never matches a real client, so this warns rather
+                // than refusing the load.
+                for warning in platform_policy_warnings(
+                    &config.rules,
+                    codesign_team_id_is_platform_enforceable(),
+                ) {
+                    warn!("{warning}");
+                }
+                // N1: the same gap applies to known_human_clients entries.
+                // Such an entry still loads. It simply never classifies a
+                // connection as human, so this warns rather than refusing
+                // the load.
+                for warning in known_human_client_platform_warnings(
+                    config
+                        .known_human_clients
+                        .iter()
+                        .map(|entry| (entry.name.as_str(), entry.codesign_team_id.is_some())),
+                    codesign_team_id_is_platform_enforceable(),
+                ) {
+                    warn!("{warning}");
                 }
                 info!(
                     "loaded config from {} ({} known human clients, {} policy rules)",
@@ -1842,6 +1869,70 @@ fn operation_registry() -> std::io::Result<OperationRegistry> {
     Ok(registry)
 }
 
+/// Outcome of the H-8 macOS startup session preflight (see
+/// [`local_auth_preflight`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionAuthPreflight {
+    /// This deployment never needs the session to authenticate locally:
+    /// either the session factor is an out-of-band one (`paired_workstation`,
+    /// on the way to `fido2`/`ios_faceid` for individual operations), or
+    /// `trust_domain.enforce` is on and pairs with those out-of-band factors
+    /// by design (see docs/deployment.md, "Approval factors in split mode").
+    NotGated,
+    /// `local_bio` is the configured session factor, trust-domain enforcement
+    /// is off, and the probe confirms this session can authenticate locally.
+    GatedOk,
+    /// `local_bio` is the configured session factor, trust-domain enforcement
+    /// is off, and the probe says this session never can: fail closed.
+    Fatal,
+}
+
+/// Pure gating decision for the H-8 preflight, kept free of I/O so the full
+/// truth table is unit-testable without a real GUI session: `probe` is the
+/// (possibly injected) outcome of the `canEvaluatePolicy` capability check.
+fn session_auth_preflight_decision(
+    local_bio_configured: bool,
+    trust_domain_enforced: bool,
+    probe: Result<(), opaque_native_approval::ApprovalError>,
+) -> SessionAuthPreflight {
+    if !local_bio_configured || trust_domain_enforced {
+        return SessionAuthPreflight::NotGated;
+    }
+    match probe {
+        Ok(()) => SessionAuthPreflight::GatedOk,
+        Err(_) => SessionAuthPreflight::Fatal,
+    }
+}
+
+/// H-8: refuse to start when this session is configured to require local
+/// biometric/password approval (`approval.session_factor` defaults to
+/// `local_bio`) but can never satisfy it — e.g. a LaunchDaemon or SSH session
+/// with no window server. Split deployments and out-of-band session factors
+/// are exempt: see docs/deployment.md, "Session Detection (Daemon Startup)".
+/// The existing per-prompt fail-closed check (`canEvaluatePolicy` on every
+/// approval) is unaffected by this startup-only gate.
+fn local_auth_preflight(
+    session_factor: ApprovalFactor,
+    trust_domain_enforced: bool,
+    probe: Result<(), opaque_native_approval::ApprovalError>,
+) -> std::io::Result<()> {
+    match session_auth_preflight_decision(
+        session_factor == ApprovalFactor::LocalBio,
+        trust_domain_enforced,
+        probe,
+    ) {
+        SessionAuthPreflight::Fatal => Err(std::io::Error::other(
+            "opaqued refuses to start: this session cannot complete local device \
+             authentication (canEvaluatePolicy failed), and approval.session_factor \
+             is local_bio with trust_domain.enforce off. Run opaqued as a LaunchAgent \
+             inside an active GUI session, set approval.session_factor to \
+             paired_workstation, or enable trust_domain.enforce with an out-of-band \
+             factor for a split deployment. See docs/deployment.md.",
+        )),
+        SessionAuthPreflight::NotGated | SessionAuthPreflight::GatedOk => Ok(()),
+    }
+}
+
 async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> {
     if config.legacy_scim.is_some() {
         return Err(std::io::Error::other(
@@ -1854,6 +1945,11 @@ async fn run(config: DaemonConfig, config_path: PathBuf) -> std::io::Result<()> 
         .approval
         .validated_session_factor()
         .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+    local_auth_preflight(
+        session_approval_factor,
+        config.trust_domain.enforce,
+        opaque_native_approval::session_supports_local_authentication(),
+    )?;
 
     // --- Trust domain: verify custody BEFORE opening or creating any state ---
     let td = &config.trust_domain;
@@ -7569,6 +7665,108 @@ exe_sha256 = "deadbeef"
         assert_eq!(
             config.approval.validated_session_factor().unwrap(),
             ApprovalFactor::PairedWorkstation
+        );
+    }
+
+    /// H-8: exhaustive truth table for the pure startup-preflight decision.
+    /// (local_bio configured?) x (trust-domain enforced?) x (probe ok/err).
+    #[test]
+    fn session_auth_preflight_decision_covers_the_full_truth_table() {
+        let ok = || Ok(());
+        let err = || Err(opaque_native_approval::ApprovalError::Unavailable);
+
+        // local_bio not configured: never gated, regardless of enforcement
+        // or probe outcome (paired_workstation/fido2/ios_faceid deployments
+        // never need this session to authenticate locally).
+        assert_eq!(
+            session_auth_preflight_decision(false, false, ok()),
+            SessionAuthPreflight::NotGated
+        );
+        assert_eq!(
+            session_auth_preflight_decision(false, false, err()),
+            SessionAuthPreflight::NotGated
+        );
+        assert_eq!(
+            session_auth_preflight_decision(false, true, ok()),
+            SessionAuthPreflight::NotGated
+        );
+        assert_eq!(
+            session_auth_preflight_decision(false, true, err()),
+            SessionAuthPreflight::NotGated
+        );
+
+        // local_bio configured, trust-domain enforced: still never gated —
+        // split deployments pair with out-of-band factors by design.
+        assert_eq!(
+            session_auth_preflight_decision(true, true, ok()),
+            SessionAuthPreflight::NotGated
+        );
+        assert_eq!(
+            session_auth_preflight_decision(true, true, err()),
+            SessionAuthPreflight::NotGated
+        );
+
+        // local_bio configured, trust-domain NOT enforced: gated on the
+        // probe. This is the only pair of cases that consults it at all.
+        assert_eq!(
+            session_auth_preflight_decision(true, false, ok()),
+            SessionAuthPreflight::GatedOk
+        );
+        assert_eq!(
+            session_auth_preflight_decision(true, false, err()),
+            SessionAuthPreflight::Fatal
+        );
+    }
+
+    #[test]
+    fn local_auth_preflight_rejects_only_the_gated_failing_case() {
+        // The exact scenario the daemon hits at startup: default config
+        // (local_bio, trust_domain.enforce absent/false) parsed from real
+        // TOML, with a failing probe injected in place of the real
+        // canEvaluatePolicy call.
+        let config: DaemonConfig = toml_edit::de::from_str("").unwrap();
+        assert!(!config.trust_domain.enforce);
+        let session_factor = config.approval.validated_session_factor().unwrap();
+        assert_eq!(session_factor, ApprovalFactor::LocalBio);
+
+        let error = local_auth_preflight(
+            session_factor,
+            config.trust_domain.enforce,
+            Err(opaque_native_approval::ApprovalError::Unavailable),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cannot complete local device"));
+        assert!(error.to_string().contains("docs/deployment.md"));
+
+        // A successful probe under the same config proceeds.
+        assert!(local_auth_preflight(session_factor, config.trust_domain.enforce, Ok(())).is_ok());
+
+        // An out-of-band session factor proceeds even with a failing probe.
+        let split: DaemonConfig =
+            toml_edit::de::from_str("[approval]\nsession_factor = 'paired_workstation'\n").unwrap();
+        let split_factor = split.approval.validated_session_factor().unwrap();
+        assert!(
+            local_auth_preflight(
+                split_factor,
+                split.trust_domain.enforce,
+                Err(opaque_native_approval::ApprovalError::Unavailable)
+            )
+            .is_ok()
+        );
+
+        // An enforced trust domain proceeds even with local_bio and a
+        // failing probe: split deployments pair with out-of-band factors.
+        let enforced: DaemonConfig = toml_edit::de::from_str(
+            "[trust_domain]\nenforce = true\nsocket_group = 'opaque-clients'\n",
+        )
+        .unwrap();
+        assert!(
+            local_auth_preflight(
+                ApprovalFactor::LocalBio,
+                enforced.trust_domain.enforce,
+                Err(opaque_native_approval::ApprovalError::Unavailable)
+            )
+            .is_ok()
         );
     }
 

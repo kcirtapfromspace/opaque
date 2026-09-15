@@ -120,6 +120,134 @@ impl ClientMatch {
     }
 }
 
+/// Whether the current platform's connection attestor can ever populate
+/// `codesign_team_id` for a real client. Mirrors the platform gate on
+/// `opaque_federation_runtime::workload_attest::signing_team_for_peer`, which
+/// resolves a macOS code-signing Team ID from the kernel-verified peer audit
+/// token and has no equivalent elsewhere. `uid`, `exe_path` and `exe_sha256`
+/// are populated on every supported platform, so they need no such check.
+pub fn codesign_team_id_is_platform_enforceable() -> bool {
+    cfg!(target_os = "macos")
+}
+
+/// True when a client-identity constraint requiring `codesign_team_id`
+/// cannot be satisfied by a real client on this platform. The one-field
+/// decision every N1 caller reduces to: a policy rule's `ClientMatch`, a
+/// `known_human_clients` entry, or any future caller all just need to know
+/// whether they name the field and whether this platform can enforce it.
+fn codesign_requirement_is_unenforceable(
+    requires_codesign_team_id: bool,
+    codesign_enforceable: bool,
+) -> bool {
+    requires_codesign_team_id && !codesign_enforceable
+}
+
+/// Rules whose [`ClientMatch`] requires `codesign_team_id` although the
+/// current platform can never populate it for a real client (N1): such a
+/// rule loads without error but can never match, an accepted-but-unenforced
+/// constraint rather than a visible one. Pure over `codesign_enforceable` so
+/// the decision is unit-testable independent of the host platform running
+/// the test; production callers pass
+/// [`codesign_team_id_is_platform_enforceable`].
+pub fn unenforceable_client_identity_rules(
+    rules: &[PolicyRule],
+    codesign_enforceable: bool,
+) -> Vec<(&PolicyRule, &'static str)> {
+    rules
+        .iter()
+        .filter(|rule| {
+            codesign_requirement_is_unenforceable(
+                rule.client.codesign_team_id.is_some(),
+                codesign_enforceable,
+            )
+        })
+        .map(|rule| (rule, "codesign_team_id"))
+        .collect()
+}
+
+/// The shared sentence behind every N1 warning: names what kind of thing
+/// (`kind`) requires `field`, by `name`, states the consequence, and points
+/// at the fields this platform does populate. Every caller routes through
+/// this one format string so the wording cannot drift between them.
+fn unenforceable_field_warning(kind: &str, name: &str, field: &str, consequence: &str) -> String {
+    format!(
+        "{kind} {name:?} requires {field}, which this platform cannot populate \
+         for a real client. {consequence} Pin the caller with exe_sha256 or \
+         exe_path on this platform instead."
+    )
+}
+
+/// Operator-facing text for one unenforceable client-identity constraint on
+/// a policy rule: names the rule and the field, and points at the fields
+/// this platform does populate.
+pub fn client_identity_platform_warning(rule_name: &str, field: &str) -> String {
+    unenforceable_field_warning(
+        "policy rule",
+        rule_name,
+        field,
+        "The rule will never match.",
+    )
+}
+
+/// Warning strings for every rule in `rules` that requires a client-identity
+/// field this platform cannot enforce. Empty when there is nothing to warn
+/// about. Shared by the CLI policy-check path, the daemon's config-load
+/// path, and the federation bundle-apply path, so all three phrase the same
+/// condition identically.
+pub fn platform_policy_warnings(rules: &[PolicyRule], codesign_enforceable: bool) -> Vec<String> {
+    unenforceable_client_identity_rules(rules, codesign_enforceable)
+        .into_iter()
+        .map(|(rule, field)| client_identity_platform_warning(&rule.name, field))
+        .collect()
+}
+
+/// Names of `known_human_clients` entries requiring `codesign_team_id`
+/// although the current platform can never populate it for a real client
+/// (N1). The one-field adapter for [`unenforceable_client_identity_rules`]:
+/// `HumanClientEntry` lives in the daemon crate, not here, so callers adapt
+/// each entry into a `(name, requires_codesign_team_id)` pair before calling
+/// this. Pure over `codesign_enforceable` for the same reason as its rule
+/// counterpart: unit-testable independent of the host platform.
+pub fn unenforceable_codesign_entries<'a>(
+    entries: impl IntoIterator<Item = (&'a str, bool)>,
+    codesign_enforceable: bool,
+) -> Vec<&'a str> {
+    entries
+        .into_iter()
+        .filter(|&(_, requires_codesign)| {
+            codesign_requirement_is_unenforceable(requires_codesign, codesign_enforceable)
+        })
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// Operator-facing text for one `known_human_clients` entry that requires
+/// `codesign_team_id` although this platform cannot populate it: names the
+/// entry, states that it can never classify a connection as human, and
+/// points at the fields this platform does populate.
+pub fn known_human_client_platform_warning(entry_name: &str) -> String {
+    unenforceable_field_warning(
+        "known_human_clients entry",
+        entry_name,
+        "codesign_team_id",
+        "The entry will never classify a client as human.",
+    )
+}
+
+/// Warning strings for every `known_human_clients` entry (adapted to
+/// `(name, requires_codesign_team_id)` pairs by the caller) that requires a
+/// field this platform cannot enforce. Empty when there is nothing to warn
+/// about. The `known_human_clients` counterpart to [`platform_policy_warnings`].
+pub fn known_human_client_platform_warnings<'a>(
+    entries: impl IntoIterator<Item = (&'a str, bool)>,
+    codesign_enforceable: bool,
+) -> Vec<String> {
+    unenforceable_codesign_entries(entries, codesign_enforceable)
+        .into_iter()
+        .map(known_human_client_platform_warning)
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Identity match pattern (Phase 1 identity substrate)
 // ---------------------------------------------------------------------------
@@ -1073,6 +1201,137 @@ mod tests {
         let mut id = test_identity();
         id.codesign_team_id = None;
         assert!(!cm.matches(&id));
+    }
+
+    /// N1: a rule naming `client`, with every other field at its default.
+    fn client_rule(name: &str, client: ClientMatch) -> PolicyRule {
+        PolicyRule {
+            name: name.into(),
+            client,
+            operation_pattern: "*".into(),
+            target: TargetMatch::default(),
+            workspace: WorkspaceMatch::default(),
+            secret_names: SecretNameMatch::default(),
+            allow: true,
+            client_types: vec![],
+            identity: IdentityMatch::default(),
+            approval: ApprovalConfig::default(),
+        }
+    }
+
+    #[test]
+    fn unenforceable_client_identity_rules_flags_codesign_only_when_unenforceable() {
+        let rules = vec![
+            client_rule(
+                "requires-team",
+                ClientMatch {
+                    codesign_team_id: Some("TEAM_A".into()),
+                    ..Default::default()
+                },
+            ),
+            client_rule(
+                "requires-exe",
+                ClientMatch {
+                    exe_sha256: Some("deadbeef".into()),
+                    exe_path: Some("/usr/bin/claude*".into()),
+                    ..Default::default()
+                },
+            ),
+            client_rule("requires-nothing", ClientMatch::default()),
+        ];
+
+        // Enforceable (macOS): nothing is flagged, regardless of what any
+        // rule requires.
+        assert!(unenforceable_client_identity_rules(&rules, true).is_empty());
+
+        // Not enforceable: only the codesign_team_id rule is flagged, by
+        // name, and exe_sha256/exe_path rules are left alone (they ARE
+        // populated on every platform).
+        let flagged = unenforceable_client_identity_rules(&rules, false);
+        assert_eq!(flagged.len(), 1);
+        assert_eq!(flagged[0].0.name, "requires-team");
+        assert_eq!(flagged[0].1, "codesign_team_id");
+    }
+
+    #[test]
+    fn client_identity_platform_warning_names_the_rule_field_and_alternative() {
+        let warning = client_identity_platform_warning("requires-team", "codesign_team_id");
+        assert!(warning.contains("requires-team"));
+        assert!(warning.contains("codesign_team_id"));
+        assert!(warning.contains("exe_sha256"));
+        assert!(warning.contains("exe_path"));
+        assert!(warning.contains("never match"));
+    }
+
+    #[test]
+    fn platform_policy_warnings_is_empty_when_enforceable_or_nothing_to_flag() {
+        let team_rule = client_rule(
+            "requires-team",
+            ClientMatch {
+                codesign_team_id: Some("TEAM_A".into()),
+                ..Default::default()
+            },
+        );
+        assert!(platform_policy_warnings(std::slice::from_ref(&team_rule), true).is_empty());
+
+        let exe_rule = client_rule(
+            "requires-exe",
+            ClientMatch {
+                exe_sha256: Some("deadbeef".into()),
+                ..Default::default()
+            },
+        );
+        assert!(platform_policy_warnings(std::slice::from_ref(&exe_rule), false).is_empty());
+
+        let warnings = platform_policy_warnings(std::slice::from_ref(&team_rule), false);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("requires-team"));
+        assert!(warnings[0].contains("codesign_team_id"));
+    }
+
+    /// N1: the `known_human_clients` one-field adapter, exhaustive over
+    /// (requires codesign_team_id?) x (platform enforceable?).
+    #[test]
+    fn unenforceable_codesign_entries_flags_only_the_unenforceable_ones() {
+        let entries = [
+            ("requires-team", true),
+            ("requires-exe", false),
+            ("requires-nothing", false),
+        ];
+
+        // Enforceable (macOS): nothing is flagged, regardless of what any
+        // entry requires.
+        assert!(unenforceable_codesign_entries(entries, true).is_empty());
+
+        // Not enforceable: only the entry that actually requires
+        // codesign_team_id is flagged, by name.
+        assert_eq!(
+            unenforceable_codesign_entries(entries, false),
+            ["requires-team"]
+        );
+    }
+
+    #[test]
+    fn known_human_client_platform_warning_names_the_entry_and_alternative() {
+        let warning = known_human_client_platform_warning("requires-team");
+        assert!(warning.contains("requires-team"));
+        assert!(warning.contains("codesign_team_id"));
+        assert!(warning.contains("exe_sha256"));
+        assert!(warning.contains("exe_path"));
+        assert!(warning.contains("never classify"));
+    }
+
+    #[test]
+    fn known_human_client_platform_warnings_is_empty_when_enforceable_or_nothing_to_flag() {
+        let entries = [("requires-team", true), ("requires-exe", false)];
+
+        assert!(known_human_client_platform_warnings(entries, true).is_empty());
+        assert!(known_human_client_platform_warnings([entries[1]], false).is_empty());
+
+        let warnings = known_human_client_platform_warnings(entries, false);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("requires-team"));
+        assert!(warnings[0].contains("codesign_team_id"));
     }
 
     #[test]

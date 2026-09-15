@@ -116,6 +116,98 @@ roles = ["admin"]
     assert_eq!(std::fs::read_to_string(path).unwrap(), source);
 }
 
+/// N1: a policy rule requiring `codesign_team_id` must load rather than be
+/// refused — the field genuinely populates on macOS, and elsewhere the daemon
+/// warns instead of rejecting (see `opaque_core::policy::platform_policy_warnings`,
+/// wired into `load_config`). An exe_sha256-requiring rule is populated on
+/// every platform and never triggers the warning.
+#[test]
+fn actual_config_loading_never_refuses_a_rule_requiring_unenforceable_codesign_team_id() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let source = r#"
+[[rules]]
+name = "requires-team"
+operation_pattern = "github.*"
+[rules.client]
+codesign_team_id = "TEAMFIXTURE"
+
+[[rules]]
+name = "requires-exe"
+operation_pattern = "gitlab.*"
+[rules.client]
+exe_sha256 = "deadbeef"
+"#;
+    std::fs::write(&path, source).unwrap();
+
+    // The load path itself must not refuse this config.
+    let loaded = load_config(&path);
+    assert_eq!(loaded.rules.len(), 2);
+    assert_eq!(
+        loaded.rules[0].client.codesign_team_id.as_deref(),
+        Some("TEAMFIXTURE")
+    );
+
+    // The same decision load_config() consults internally, exercised on the
+    // rules it actually parsed: flags only the codesign rule under a
+    // simulated non-enforcing platform, and nothing under an enforcing one.
+    let warnings = platform_policy_warnings(&loaded.rules, false);
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("requires-team"));
+    assert!(warnings[0].contains("codesign_team_id"));
+    assert!(platform_policy_warnings(&loaded.rules, true).is_empty());
+}
+
+/// N1: a `known_human_clients` entry requiring only `codesign_team_id` must
+/// load rather than be refused (and not be filtered out as an "empty"
+/// entry) — the field genuinely populates on macOS, and elsewhere the
+/// daemon warns instead of rejecting (see
+/// `opaque_core::policy::known_human_client_platform_warnings`, wired into
+/// `load_config`). An entry pinned by exe_sha256 is populated on every
+/// platform and never triggers the warning.
+#[test]
+fn actual_config_loading_never_refuses_a_known_human_client_requiring_unenforceable_codesign_team_id()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let source = r#"
+[[known_human_clients]]
+name = "requires-team"
+codesign_team_id = "TEAMFIXTURE"
+
+[[known_human_clients]]
+name = "requires-exe"
+exe_sha256 = "deadbeef"
+"#;
+    std::fs::write(&path, source).unwrap();
+
+    // The load path itself must not refuse this config, or filter the
+    // codesign-only entry out as if it named no criteria.
+    let loaded = load_config(&path);
+    assert_eq!(loaded.known_human_clients.len(), 2);
+    assert_eq!(
+        loaded.known_human_clients[0].codesign_team_id.as_deref(),
+        Some("TEAMFIXTURE")
+    );
+
+    // The same decision load_config() consults internally, exercised on the
+    // entries it actually parsed: flags only the codesign entry under a
+    // simulated non-enforcing platform, and nothing under an enforcing one.
+    let named = |entries: &[HumanClientEntry], enforceable| {
+        known_human_client_platform_warnings(
+            entries
+                .iter()
+                .map(|e| (e.name.as_str(), e.codesign_team_id.is_some())),
+            enforceable,
+        )
+    };
+    let warnings = named(&loaded.known_human_clients, false);
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("requires-team"));
+    assert!(warnings[0].contains("codesign_team_id"));
+    assert!(named(&loaded.known_human_clients, true).is_empty());
+}
+
 #[tokio::test]
 async fn direct_attestation_rpc_rejects_invalid_nonces_and_signs_exact_boundary_controls() {
     let mut fixture = Fixture::new(false);
