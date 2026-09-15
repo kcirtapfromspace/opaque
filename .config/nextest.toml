@@ -1,0 +1,13 @@
+# Scheduling shape for `cargo nextest run`; test semantics are unchanged.
+
+[[profile.default.overrides]]
+# The counted-allowance test races 101 concurrent operations, deliberately
+# above confirm_audit's 64-permit durability capacity. Nextest's
+# process-per-test starts a cold tokio blocking pool, and on a busy runner
+# fresh flush threads are scheduled too slowly for permits to recycle, so one
+# attempt fails closed as internal_error (reproducible under the plain libtest
+# harness at 24-way process load, 50/50 clean in isolation). Give the test the
+# whole machine so flushes drain the way they do in an ordinary `cargo test`
+# process.
+filter = 'package(opaqued) & test(counted_allowance_serializes_first_approval_and_admits_exactly_100_attempts)'
+threads-required = "num-test-threads"
