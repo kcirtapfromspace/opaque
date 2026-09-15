@@ -6,6 +6,12 @@ on:
     branches:
       - main
 
+# Superseded pushes to the same PR cancel their in-flight run; pushes to main
+# never cancel so every mainline commit keeps a complete CI record.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   fmt:
     runs-on: ubuntu-latest
@@ -39,6 +45,8 @@ jobs:
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
 
       - name: Run clippy
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
@@ -66,9 +74,20 @@ jobs:
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
 
       - name: Run workspace tests
-        run: cargo test --locked --workspace --all-features
+        run: cargo nextest run --locked --workspace --all-features
+
+      - name: Run documentation tests
+        # nextest does not execute doctests; keep them covered separately.
+        run: cargo test --locked --doc --workspace --all-features
 
       - name: Build independent core consumer
         run: cargo run --locked --manifest-path examples/embedded-policy/Cargo.toml
@@ -91,6 +110,8 @@ jobs:
         with:
           toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -275,8 +296,17 @@ jobs:
         with:
           toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
       - name: Run native workspace tests
-        run: cargo test --locked --workspace --all-features
+        run: cargo nextest run --locked --workspace --all-features
+      - name: Run documentation tests
+        # nextest does not execute doctests; keep them covered separately.
+        run: cargo test --locked --doc --workspace --all-features
       - name: Verify native reviewer package without installing
         run: |
           cargo build --locked -p opaque-approver -p opaque-approve-helper
@@ -350,6 +380,8 @@ jobs:
         with:
           toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
       - uses: actions/setup-node@v6
         with:
           node-version: "26.8.1"
@@ -417,6 +449,8 @@ jobs:
         with:
           toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
@@ -504,6 +538,8 @@ jobs:
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
 
       - name: Kernel capability probe (landlock + seccomp must be enforceable)
         run: ./scripts/linux-harness.sh probe
