@@ -733,6 +733,33 @@ test('unlock and reconnect never replay an in-flight reconciliation POST', async
   assert.equal(Object.keys(fixture.ui.state.reconcileErrors).length, 0);
 });
 
+test('the owner token travels only in Authorization headers, never in a request URL, across every call type', async () => {
+  const fixture = authDashboard(path => Promise.resolve(
+    path === '/api/status' ? jsonResponse({mode:'live', daemon_running:true, audit_available:true})
+    : path.startsWith('/api/audit?') ? jsonResponse({events:[]})
+    : path === '/api/audit/stream'
+      ? {ok:true, status:200, headers:{get:()=>'text/event-stream'},
+         body:{getReader:()=>({read:()=>new Promise(()=>{}), cancel:async()=>{}})}}
+    : jsonResponse({tasks:[]})));
+  // A live daemon drives status polling, the tasks load, the audit snapshot and
+  // the audit SSE stream; the explicit reconcile adds the one mutation POST.
+  await fixture.unlock('secret-owner-token');
+  await nextTurn();
+  try { await fixture.ui.reconcileTask('some-task'); } catch (_) {}
+  const paths = fixture.calls.map(call => call.path);
+  assert.ok(paths.includes('/api/status'), 'status was exercised');
+  assert.ok(paths.some(path => path.startsWith('/api/audit?')), 'audit snapshot was exercised');
+  assert.ok(paths.includes('/api/audit/stream'), 'audit SSE stream was exercised');
+  assert.ok(paths.some(path => path.includes('/reconcile')), 'reconcile POST was exercised');
+  for (const call of fixture.calls) {
+    assert.ok(!call.path.includes('secret-owner-token'), 'no credential in URL: ' + call.path);
+    assert.equal(call.options.headers.Authorization, 'Bearer secret-owner-token');
+    assert.equal(call.options.cache, 'no-store');
+  }
+  fixture.ui.lockDashboard();
+  assert.equal(fixture.ui.authToken, '');
+});
+
 test('page lifecycle restoration and separate tabs require explicit unlock', async () => {
   const first = authDashboard(disconnectedResponse);
   const second = authDashboard(disconnectedResponse);

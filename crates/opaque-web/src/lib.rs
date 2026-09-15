@@ -419,6 +419,123 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn owner_file_token_is_the_sole_credential_and_no_anonymous_get_reveals_it() {
+        // SR-002, security-equivalent of the distinct-UID scenario. This host
+        // cannot spawn a distinct OS UID, so the literal "a second Unix account
+        // is refused" step is UNEXECUTED: environment cannot provide a distinct
+        // UID. What is proved here is the invariant that makes that refusal hold:
+        // the only working credential is the exact contents of the 0600 web.token
+        // file, no unauthenticated GET (shell or brand asset) discloses those
+        // bytes, and a token that is not the file's bytes is rejected. A separate
+        // UID that cannot read the 0600 file therefore has no path to a credential.
+        let dir = PathBuf::from("/tmp").join(format!("ow-token-file-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let token = security::generate_token();
+        let token_path = security::write_token_file(&dir, &token).unwrap();
+        // The credential the server accepts is whatever the private file holds.
+        let file_token = std::fs::read_to_string(&token_path).unwrap();
+        assert_eq!(file_token, token);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&token_path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "web.token must stay owner-only (0600)");
+        }
+
+        let socket = dir.join("run/opaqued.sock");
+        opaque_core::socket::ensure_socket_parent_dir(&socket).unwrap();
+        let state = AppState {
+            daemon: daemon_client::DaemonClient::new(Some(socket)),
+            config_path: dir.join("config.toml"),
+            audit_db_path: dir.join("audit.db"),
+            cancel: CancellationToken::new(),
+            auth_token: file_token.clone(),
+            demo: false,
+        };
+        let app = || application(state.clone(), 9389);
+        let bearer = format!("Bearer {file_token}");
+
+        for (method, uri) in [
+            ("GET", "/api/status"),
+            ("GET", "/api/tasks"),
+            ("GET", "/api/tasks/task-1"),
+            ("POST", "/api/tasks/task-1/reconcile"),
+            ("GET", "/api/audit"),
+            ("GET", "/api/audit/stream"),
+            ("GET", "/api/policy"),
+            ("GET", "/api/sessions"),
+            ("GET", "/api/operations"),
+        ] {
+            let anonymous = request(uri).method(method).body(Body::empty()).unwrap();
+            assert_eq!(
+                app().oneshot(anonymous).await.unwrap().status(),
+                StatusCode::UNAUTHORIZED,
+                "no credential must fail: {uri}"
+            );
+            let guessed = request(uri)
+                .method(method)
+                .header("authorization", "Bearer not-the-file-token")
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                app().oneshot(guessed).await.unwrap().status(),
+                StatusCode::UNAUTHORIZED,
+                "a token that is not the file's bytes must fail: {uri}"
+            );
+            let owner = request(uri)
+                .method(method)
+                .header("authorization", &bearer)
+                .body(Body::empty())
+                .unwrap();
+            let status = app().oneshot(owner).await.unwrap().status();
+            assert_ne!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "the exact file token must authorize: {uri}"
+            );
+            assert_ne!(
+                status,
+                StatusCode::FORBIDDEN,
+                "the exact file token must pass origin checks: {uri}"
+            );
+        }
+
+        // Nothing served without a credential discloses the credential.
+        let contains = |haystack: &[u8], needle: &[u8]| {
+            !needle.is_empty()
+                && haystack
+                    .windows(needle.len())
+                    .any(|window| window == needle)
+        };
+        let shell = app()
+            .oneshot(request("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(shell.status(), StatusCode::OK);
+        let shell_body = to_bytes(shell.into_body(), 5_000_000).await.unwrap();
+        assert!(
+            !contains(&shell_body, file_token.as_bytes()),
+            "the anonymous shell must not embed the owner token"
+        );
+        for asset in routes::brand::assets::ASSETS {
+            let uri = format!("/brand/{}", asset.path);
+            let response = app()
+                .oneshot(request(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let body = to_bytes(response.into_body(), 5_000_000).await.unwrap();
+            assert!(
+                !contains(&body, file_token.as_bytes()),
+                "brand asset must not embed the owner token: {uri}"
+            );
+        }
+
+        state.cancel.cancel();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn brand_assets_are_exact_public_bytes_under_existing_security_headers() {
         let fixture = Fixture::new(false);
         for asset in routes::brand::assets::ASSETS {
