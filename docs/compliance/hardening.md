@@ -387,5 +387,6 @@ volumes per tenant.
   [security assessment](../security-assessment.md) section 7.4 and
   the tenant boundaries design.
 - Only the latest release receives security updates (`SECURITY.md`); track
-  releases and verify them with the published cosign signatures and SHA-256
-  checksums (`.github/workflows/release.yml`).
+  releases and verify them before deploying, see
+  [verifying releases](verifying-releases.md) for the checksum, cosign
+  signature, SLSA provenance, and embedded dependency manifest checks.
