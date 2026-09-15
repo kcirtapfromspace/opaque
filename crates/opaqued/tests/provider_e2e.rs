@@ -418,16 +418,19 @@ async fn unlisted_provider_operation_is_policy_denied() {
 // over its real RPC socket, the same way the two tests above do.
 //
 // aws/onepassword/bitwarden/vault reach a real (mocked) HTTP backend and
-// assert a full success round-trip. azure/gcp/doppler/infisical are not
-// wired into `main.rs`'s `Enclave::builder()`/operation registry at all
-// today (dormant, compiled-but-unused — true before this extraction too;
-// verified by grepping `main.rs` for their operation names, which are
-// nowhere registered) — the most meaningful, honest test available for
-// those four is that the daemon rejects their operations as
+// assert a full success round-trip. azure/gcp ARE wired into `main.rs`'s
+// `Enclave::builder()`/operation registry when their env config is present
+// (see the `from_env()` guards in `main.rs`); their tests drive the real
+// registration and catalog, then prove preparation and policy fail closed —
+// including canonical-target substitution — without reaching authentication.
+// doppler/infisical remain unregistered (dormant, compiled-but-unused;
+// verified by grepping `main.rs`, where no `doppler.*`/`infisical.*`
+// operation is registered) — the most meaningful, honest test available for
+// those two is that the daemon rejects their operations as
 // `unknown_operation` rather than crashing, hanging, or silently
-// mis-dispatching. None of the four's own client/resolver code runs in
-// this build, so this specifically does NOT exercise it — see each test's
-// doc comment for exact coverage.
+// mis-dispatching. Neither's own client/resolver code runs in this build, so
+// this specifically does NOT exercise it — see each test's doc comment for
+// exact coverage.
 // ---------------------------------------------------------------------------
 
 /// AWS has no dedicated RPC method (unlike github/gitlab/onepassword/
@@ -1094,8 +1097,9 @@ async fn doppler_operation_is_unknown_end_to_end() {
 }
 
 /// Infisical is not wired into `main.rs` at all today (dormant, same as
-/// azure above — no `infisical.*` operation is registered). See
-/// `azure_operation_is_unknown_end_to_end` for the full rationale; this is
+/// doppler above — no `infisical.*` operation is registered; azure/gcp, by
+/// contrast, ARE registered when configured). See
+/// `doppler_operation_is_unknown_end_to_end` for the full rationale; this is
 /// the same shape for Infisical. Does NOT exercise
 /// `opaque_providers::infisical`'s own client/resolver code
 /// (inline-unit-tested only).
@@ -1230,6 +1234,68 @@ async fn canonical_action_rejects_target_substitution_before_approval_and_provid
         !events
             .iter()
             .any(|event| event.kind == opaque_core::audit::AuditEventKind::RequestReceived)
+    );
+}
+
+/// Companion to the `repo` substitution above: every OTHER server-derived
+/// destination field on the same operation — secret name, environment and scope
+/// — must also fail closed when the caller asserts a permitted target value but
+/// supplies a different valid one in `params`. Each rejection precedes policy,
+/// approval and any provider call, so the flagship write is proven safe across
+/// its whole target, not just the repository. (Organization/vault substitution
+/// is covered for gcp/azure above.)
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn canonical_action_rejects_secret_environment_and_scope_substitution() {
+    use opaque_core::audit::AuditEventKind;
+    let _serial = serial_guard();
+    let github = mock_github().await;
+    let fixture = Fixture::new();
+    let config = fixture.write_config_with_rules(REPOSITORY_POLICY);
+    let daemon = fixture.spawn(&config, &github.uri());
+    // Each payload asserts a permitted target field, but the params carry a
+    // different valid destination for that same field.
+    let substitutions = [
+        // Secret name: the target names the approved secret; params write another.
+        json!({
+            "operation":"github.set_actions_secret",
+            "target":{"secret_name":"TUTORIAL_KEY"},
+            "params":{"repo":"acme/widgets","secret_name":"STOLEN_KEY","value_ref":"env:OPAQUE_E2E_VALUE","github_token_ref":"env:OPAQUE_E2E_PAT"},
+        }),
+        // Environment: the target names an approved environment; params target another.
+        json!({
+            "operation":"github.set_actions_secret",
+            "target":{"environment":"staging"},
+            "params":{"repo":"acme/widgets","secret_name":"TUTORIAL_KEY","environment":"production","value_ref":"env:OPAQUE_E2E_VALUE","github_token_ref":"env:OPAQUE_E2E_PAT"},
+        }),
+        // Scope: set_actions_secret always derives scope=actions; assert a different one.
+        json!({
+            "operation":"github.set_actions_secret",
+            "target":{"scope":"dependabot"},
+            "params":github_action_params("acme/widgets"),
+        }),
+    ];
+    for payload in &substitutions {
+        let response = daemon.call("execute", payload.clone()).await;
+        assert_error(&response, "bad_request");
+    }
+    assert!(github.received_requests().await.unwrap().is_empty());
+    daemon.shutdown();
+    let events = audit_events(&fixture);
+    assert_no_approval_or_execution(&events);
+    // Every rejection happened at preparation, before any request metadata was
+    // published or policy ran.
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == AuditEventKind::RequestReceived)
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.detail.as_deref() == Some("action_preparation_rejected"))
+            .count(),
+        substitutions.len()
     );
 }
 

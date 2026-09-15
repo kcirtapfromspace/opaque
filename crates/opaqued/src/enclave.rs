@@ -4959,6 +4959,221 @@ mod tests {
         );
     }
 
+    /// SR-001 (P1): raw execution must not authorize one destination and act on
+    /// another. This drives the REAL GitHub preparer through the full enclave
+    /// funnel: a caller asserts a policy-permitted `target` but supplies a
+    /// DIFFERENT valid destination in `params`. Every generic destination field
+    /// — repository, secret name, environment, scope and organization — must
+    /// fail closed at action preparation, BEFORE policy, approval, credential
+    /// resolution or any provider call, because the server derives the target
+    /// from `params` and rejects the contradictory assertion. Unlike the
+    /// synthetic-handler cross-stage tests in `enclave/action_tests.rs`, this
+    /// exercises production provider code, and unlike `provider_e2e.rs` it needs
+    /// no daemon or network (rejection precedes the provider call), so it proves
+    /// SR-001 closed even where the e2e daemon cannot spawn.
+    #[tokio::test]
+    async fn real_github_preparer_rejects_destination_substitution_before_policy_and_dispatch() {
+        use opaque_providers::github::GitHubHandler;
+
+        fn github_registry() -> OperationRegistry {
+            let mut registry = OperationRegistry::new();
+            registry
+                .register(OperationDef {
+                    name: "github.set_actions_secret".into(),
+                    safety: OperationSafety::Safe,
+                    default_approval: ApprovalRequirement::Always,
+                    default_factors: vec![ApprovalFactor::LocalBio],
+                    description: "Set a GitHub Actions secret".into(),
+                    params_schema: None,
+                    allowed_target_keys: [
+                        "repo",
+                        "secret_name",
+                        "environment",
+                        "scope",
+                        "scope_kind",
+                        "github_api_url",
+                    ]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                    secret_ref_param_keys: vec!["value_ref".into(), "github_token_ref".into()],
+                })
+                .unwrap();
+            registry
+                .register(OperationDef {
+                    name: "github.list_secrets".into(),
+                    safety: OperationSafety::Safe,
+                    default_approval: ApprovalRequirement::Always,
+                    default_factors: vec![ApprovalFactor::LocalBio],
+                    description: "List GitHub secrets".into(),
+                    params_schema: None,
+                    allowed_target_keys: [
+                        "repo",
+                        "org",
+                        "environment",
+                        "scope",
+                        "scope_kind",
+                        "github_api_url",
+                    ]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                    secret_ref_param_keys: vec!["github_token_ref".into()],
+                })
+                .unwrap();
+            registry
+        }
+
+        // A policy that would allow EVERY github operation: the SR-001 scenario
+        // is precisely a broker credential whose authority exceeds the permitted
+        // target, so the guard must beat even an all-permitting policy. The
+        // denying gate keeps a hypothetical regression off the network.
+        fn allow_all_github() -> PolicyEngine {
+            PolicyEngine::with_rules(vec![PolicyRule {
+                identity: Default::default(),
+                name: "allow-all-github".into(),
+                client: ClientMatch::default(),
+                operation_pattern: "github.*".into(),
+                target: TargetMatch::default(),
+                workspace: WorkspaceMatch::default(),
+                secret_names: SecretNameMatch::default(),
+                allow: true,
+                client_types: vec![ClientType::Agent, ClientType::Human],
+                approval: ApprovalConfig {
+                    require: ApprovalRequirement::Always,
+                    factors: vec![ApprovalFactor::LocalBio],
+                    lease_ttl: None,
+                    one_time: false,
+                    budget: None,
+                    require_distinct_approver: false,
+                },
+            }])
+        }
+
+        fn enclave_with(audit: Arc<InMemoryAuditEmitter>) -> Enclave {
+            Enclave::builder()
+                .registry(github_registry())
+                .policy(allow_all_github())
+                .handler(
+                    "github.set_actions_secret",
+                    Box::new(GitHubHandler::new(audit.clone()).expect("github handler")),
+                )
+                .handler(
+                    "github.list_secrets",
+                    Box::new(GitHubHandler::new(audit.clone()).expect("github handler")),
+                )
+                // Denies if reached; a working guard rejects before approval, and
+                // a regressed one is stopped here rather than calling GitHub.
+                .approval_gate(Box::new(AlwaysDenyGate))
+                .audit(audit)
+                .build()
+                .unwrap()
+        }
+
+        // (label, operation, wire target asserting a PERMITTED value, params
+        // carrying a DIFFERENT but valid destination for that same field).
+        let cases: Vec<(&str, &str, serde_json::Value, serde_json::Value)> = vec![
+            (
+                "repository",
+                "github.set_actions_secret",
+                serde_json::json!({"repo": "acme/widgets"}),
+                serde_json::json!({"repo": "acme/attacker", "secret_name": "ALLOWED_SECRET", "value_ref": "env:OPAQUE_E2E_VALUE", "github_token_ref": "env:OPAQUE_E2E_PAT"}),
+            ),
+            (
+                "secret_name",
+                "github.set_actions_secret",
+                serde_json::json!({"secret_name": "ALLOWED_SECRET"}),
+                serde_json::json!({"repo": "acme/widgets", "secret_name": "STOLEN_SECRET", "value_ref": "env:OPAQUE_E2E_VALUE", "github_token_ref": "env:OPAQUE_E2E_PAT"}),
+            ),
+            (
+                "environment",
+                "github.set_actions_secret",
+                serde_json::json!({"environment": "staging"}),
+                serde_json::json!({"repo": "acme/widgets", "secret_name": "ALLOWED_SECRET", "environment": "production", "value_ref": "env:OPAQUE_E2E_VALUE", "github_token_ref": "env:OPAQUE_E2E_PAT"}),
+            ),
+            (
+                "scope",
+                "github.set_actions_secret",
+                // set_actions_secret always derives scope=actions; asserting a
+                // different scope is a destination contradiction.
+                serde_json::json!({"scope": "dependabot"}),
+                serde_json::json!({"repo": "acme/widgets", "secret_name": "ALLOWED_SECRET", "value_ref": "env:OPAQUE_E2E_VALUE", "github_token_ref": "env:OPAQUE_E2E_PAT"}),
+            ),
+            (
+                "organization",
+                "github.list_secrets",
+                serde_json::json!({"org": "acme"}),
+                serde_json::json!({"scope": "org", "org": "evilcorp", "github_token_ref": "env:OPAQUE_E2E_PAT"}),
+            ),
+        ];
+
+        for (label, operation, wire_target, params) in cases {
+            let audit = Arc::new(InMemoryAuditEmitter::new());
+            let enclave = enclave_with(audit.clone());
+            let mut req = test_request(operation, ClientType::Agent);
+            req.target = serde_json::from_value(wire_target.clone()).unwrap();
+            req.params = params.clone();
+            // A forged reference list must not matter either; the server derives
+            // the canonical refs from params.
+            req.secret_ref_names = vec![];
+            let resp = enclave.execute(req).await;
+            assert_eq!(
+                resp.error_code(),
+                Some("bad_request"),
+                "{label} substitution must fail closed at preparation (target={wire_target} params={params})"
+            );
+            // The rejection precedes metadata publication, policy, approval,
+            // credential resolution and the provider call: none of these stages
+            // ran. A prepared request would have emitted RequestReceived first.
+            for kind in [
+                AuditEventKind::RequestReceived,
+                AuditEventKind::ApprovalRequired,
+                AuditEventKind::ApprovalGranted,
+                AuditEventKind::OperationStarted,
+                AuditEventKind::SecretResolved,
+                AuditEventKind::ProviderFetchStarted,
+                AuditEventKind::OperationSucceeded,
+            ] {
+                assert!(
+                    audit.events_of_kind(kind).is_empty(),
+                    "{label} substitution reached {kind:?} instead of failing closed at preparation"
+                );
+            }
+        }
+
+        // Positive control (network-free): the SAME canonical destination
+        // asserted consistently is NOT rejected by the guard — it passes
+        // preparation (RequestReceived), is allowed by the permissive policy,
+        // and is stopped only by the denying approval gate, never reaching the
+        // provider. This proves the guard is specific to contradictions.
+        let audit = Arc::new(InMemoryAuditEmitter::new());
+        let enclave = enclave_with(audit.clone());
+        let mut req = test_request("github.set_actions_secret", ClientType::Agent);
+        req.target = HashMap::from([("repo".into(), "acme/widgets".into())]);
+        req.params = serde_json::json!({
+            "repo": "acme/widgets", "secret_name": "ALLOWED_SECRET",
+            "value_ref": "env:OPAQUE_E2E_VALUE", "github_token_ref": "env:OPAQUE_E2E_PAT",
+        });
+        req.secret_ref_names = vec![];
+        let resp = enclave.execute(req).await;
+        assert_eq!(
+            resp.error_code(),
+            Some("approval_not_granted"),
+            "a consistent target must pass preparation and reach the approval gate"
+        );
+        assert_eq!(
+            audit.events_of_kind(AuditEventKind::RequestReceived).len(),
+            1,
+            "the consistent request reached policy/approval with its canonical action"
+        );
+        assert!(
+            audit
+                .events_of_kind(AuditEventKind::OperationStarted)
+                .is_empty(),
+            "the denying gate must stop the consistent request before any provider call"
+        );
+    }
+
     #[test]
     fn derive_secret_ref_names_extracts_from_params() {
         let keys = vec!["value_ref".into(), "github_token_ref".into()];
