@@ -9,6 +9,8 @@ notes; `scripts/release-prep.sh` stamps the section below at release time.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-14
+
 ### Added
 
 - macOS workstation reviewer app with reference-only notices, pinned enrollment,
@@ -19,6 +21,9 @@ notes; `scripts/release-prep.sh` stamps the section below at release time.
   and require current authority. Existing v1 contracts retain their wire format.
 - Authenticated audit heads and portable producer-signed export checkpoints,
   with public verification of independently enrolled retention receipts.
+- Per-binary CycloneDX SBOMs, cosign-signed and attached to every release, with
+  a `docs/compliance/verifying-releases.md` guide to checksum, signature and
+  dependency verification.
 
 ### Changed
 
@@ -27,6 +32,14 @@ notes; `scripts/release-prep.sh` stamps the section below at release time.
   automatic upgrade or authority restore path. See `docs/evidence-checkpoints.md`.
 - Installation, review, MCP, evidence and recovery guides describe executable
   source commands and distinguish fixture validation from release qualification.
+- The daemon refuses to start when the configured session factor needs local
+  authentication the current session cannot provide and trust-domain enforcement
+  is off. Split and out-of-band deployments (paired device, FIDO2) are
+  unaffected, and the per-prompt fail-closed behavior is unchanged.
+- Policy load, bundle apply and `opaque policy check` warn when a rule or a
+  `known_human_clients` entry requires `codesign_team_id` on a platform that
+  cannot enforce it, and name `exe_sha256` and `exe_path` as the portable
+  controls. macOS enforcement is unchanged.
 
 ### Fixed
 
@@ -42,6 +55,11 @@ notes; `scripts/release-prep.sh` stamps the section below at release time.
   identity to the exact release workflow/tag. Missing required certificate or
   failed verification prevents installation when signature verification runs.
 - Isolate Infisical mock credential tests from parallel process-environment changes.
+
+### Security
+
+- Close a umask race when creating the daemon socket and verify socket-directory
+  custody at startup.
 
 ## [0.3.0] - 2026-09-09
 
