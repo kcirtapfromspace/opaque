@@ -1,0 +1,55 @@
+name: Update Homebrew tap
+
+# Keeps kcirtapfromspace/homebrew-tap pointed at the latest published release.
+# release.yml never touches the tap — a formula may only name assets that
+# already exist, so this runs after the fact, triggered by the release it
+# points at. scripts/update-tap.sh does the actual work (download every
+# asset, verify each against the .sha256 published beside it, rewrite
+# homebrew/opaque.rb, push it into the tap); this workflow only supplies the
+# tag and a token with write access to the tap repo.
+#
+# Also runnable by hand (Actions tab → Run workflow) to re-sync the tap
+# without cutting a release, e.g. after fixing a bad push.
+#
+# Needs a repo secret HOMEBREW_TAP_TOKEN: a fine-grained PAT with Contents:
+# Read and write, scoped to at least kcirtapfromspace/homebrew-tap (adding
+# kcirtapfromspace/opaque too keeps `gh release download` on the same token).
+# The default GITHUB_TOKEN cannot write to a different repository.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to sync the tap to (defaults to the latest published release)"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  update-tap:
+    if: ${{ github.repository == 'kcirtapfromspace/opaque' && github.event.repository.private == false }}
+    name: Sync tap formula
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Point the tap at this release
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          GIT_AUTHOR_NAME: opaque-release-bot
+          GIT_AUTHOR_EMAIL: releases@opaque.info
+          GIT_COMMITTER_NAME: opaque-release-bot
+          GIT_COMMITTER_EMAIL: releases@opaque.info
+          DISPATCH_TAG: ${{ github.event.inputs.tag }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          tag="${DISPATCH_TAG:-$RELEASE_TAG}"
+          if [ -n "$tag" ]; then
+            scripts/update-tap.sh "$tag" --push
+          else
+            scripts/update-tap.sh --push
+          fi
