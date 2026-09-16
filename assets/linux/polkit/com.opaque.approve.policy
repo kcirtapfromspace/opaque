@@ -4,7 +4,7 @@
   "http://www.freedesktop.org/standards/PolicyKit/1.0/policyconfig.dtd">
 <policyconfig>
   <vendor>Opaque</vendor>
-  <vendor_url>https://github.com/kcirtapfromspace/opaque</vendor_url>
+  <vendor_url>https://github.com/opaque-dev/opaque</vendor_url>
 
   <action id="com.opaque.approve">
     <description>Approve an Opaque secret operation</description>

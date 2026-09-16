@@ -70,7 +70,7 @@ so an agent driving the CLI cannot complete a login.
 ## Managed identity lifecycle
 
 A provider-neutral adapter can submit membership observations through the public
-[lifecycle contract](https://github.com/kcirtapfromspace/opaque/blob/main/crates/opaque-core/src/identity_lifecycle.rs). The broker
+[lifecycle contract](https://github.com/opaque-dev/opaque/blob/main/crates/opaque-core/src/identity_lifecycle.rs). The broker
 owns admission, role mapping, authority epochs and revocation. An adapter never
 opens its identity database or submits roles directly.
 

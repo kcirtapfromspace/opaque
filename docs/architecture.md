@@ -7,7 +7,7 @@ repository operation, such as publishing a GitHub Actions secret, with a known
 approver and an observable outcome.
 
 This page describes source at
-[83e7924](https://github.com/kcirtapfromspace/opaque/tree/83e7924960f809e87379a54996317dbe1422fe70).
+[83e7924](https://github.com/opaque-dev/opaque/tree/83e7924960f809e87379a54996317dbe1422fe70).
 Source implementation does not establish availability in an installed release.
 Check the selected version and the capability-specific qualification requirements.
 
@@ -114,11 +114,11 @@ prove an honest producer, independent custody or globally complete history. See
 
 Start with these source and test anchors at the revision above:
 
-- [Generic enforcement](https://github.com/kcirtapfromspace/opaque/blob/83e7924960f809e87379a54996317dbe1422fe70/crates/opaqued/src/enclave.rs): preparation, approval leases and dispatch checks.
-- [GitHub secret-write fixture](https://github.com/kcirtapfromspace/opaque/blob/83e7924960f809e87379a54996317dbe1422fe70/crates/opaqued/tests/provider_e2e.rs): broker dispatch to a mocked GitHub endpoint and checks that the response omits the secret and token.
-- [Task ledger tests](https://github.com/kcirtapfromspace/opaque/blob/83e7924960f809e87379a54996317dbe1422fe70/crates/opaque-bounded-work/src/task_store.rs): concurrent consumption, revocation and interrupted-attempt recovery.
-- [MCP integration tests](https://github.com/kcirtapfromspace/opaque/blob/83e7924960f809e87379a54996317dbe1422fe70/crates/opaqued/tests/mcp_gateway_e2e.rs): mocked effects, denied dispatch, restart replay rejection and withheld disclosure.
-- [Audit regression tests](https://github.com/kcirtapfromspace/opaque/blob/83e7924960f809e87379a54996317dbe1422fe70/crates/opaque-core/src/audit/regression_tests.rs): tampered storage, retention and durability faults.
+- [Generic enforcement](https://github.com/opaque-dev/opaque/blob/83e7924960f809e87379a54996317dbe1422fe70/crates/opaqued/src/enclave.rs): preparation, approval leases and dispatch checks.
+- [GitHub secret-write fixture](https://github.com/opaque-dev/opaque/blob/83e7924960f809e87379a54996317dbe1422fe70/crates/opaqued/tests/provider_e2e.rs): broker dispatch to a mocked GitHub endpoint and checks that the response omits the secret and token.
+- [Task ledger tests](https://github.com/opaque-dev/opaque/blob/83e7924960f809e87379a54996317dbe1422fe70/crates/opaque-bounded-work/src/task_store.rs): concurrent consumption, revocation and interrupted-attempt recovery.
+- [MCP integration tests](https://github.com/opaque-dev/opaque/blob/83e7924960f809e87379a54996317dbe1422fe70/crates/opaqued/tests/mcp_gateway_e2e.rs): mocked effects, denied dispatch, restart replay rejection and withheld disclosure.
+- [Audit regression tests](https://github.com/opaque-dev/opaque/blob/83e7924960f809e87379a54996317dbe1422fe70/crates/opaque-core/src/audit/regression_tests.rs): tampered storage, retention and durability faults.
 
 These are implementation evidence, not an independent security audit or customer
 production validation. Qualify actual credentials, provider behavior, reviewer

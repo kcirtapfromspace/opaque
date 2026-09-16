@@ -50,8 +50,8 @@ default-members = [
 # and scripts/release-prep.sh rewrites this one line.
 version = "0.4.0"
 license = "BUSL-1.1"
-repository = "https://github.com/kcirtapfromspace/opaque"
-homepage = "https://github.com/kcirtapfromspace/opaque"
+repository = "https://github.com/opaque-dev/opaque"
+homepage = "https://github.com/opaque-dev/opaque"
 
 [profile.release]
 opt-level = 3

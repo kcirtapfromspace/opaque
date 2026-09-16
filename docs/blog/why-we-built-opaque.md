@@ -128,7 +128,7 @@ to sync a secret. For Codex or other CLI-based agents, use `opaque agent run`
 to wrap the agent in a scoped session.
 
 Full documentation lives in the `docs/` directory of the
-[repository](https://github.com/kcirtapfromspace/opaque).
+[repository](https://github.com/opaque-dev/opaque).
 
 ## What's Next
 

@@ -1,8 +1,8 @@
 # Opaque
 
-![CI](https://github.com/kcirtapfromspace/opaque/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/opaque-dev/opaque/actions/workflows/ci.yml/badge.svg)
 [![License: BUSL-1.1](https://img.shields.io/badge/License-BUSL--1.1-orange.svg)](LICENSE)
-![Release](https://img.shields.io/github/v/release/kcirtapfromspace/opaque)
+![Release](https://img.shields.io/github/v/release/opaque-dev/opaque)
 
 **Approve the work. Keep secrets secret.**
 

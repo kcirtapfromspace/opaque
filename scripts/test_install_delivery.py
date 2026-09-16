@@ -72,7 +72,7 @@ assert args[0] == 'verify-blob'
 assert pathlib.Path(args[args.index('--certificate') + 1]).read_text() == 'synthetic-certificate'
 assert pathlib.Path(args[args.index('--signature') + 1]).read_text() == 'synthetic-signature'
 assert args[args.index('--certificate-oidc-issuer') + 1] == 'https://token.actions.githubusercontent.com'
-assert args[args.index('--certificate-identity') + 1] == 'https://github.com/kcirtapfromspace/opaque/.github/workflows/release.yml@refs/tags/v0.99.0'
+assert args[args.index('--certificate-identity-regexp') + 1] == '^https://github\\\\.com/(kcirtapfromspace|opaque-dev)/opaque/\\\\.github/workflows/release\\\\.yml@refs/tags/v0\\\\.99\\\\.0$'
 pathlib.Path(os.environ['FIXTURE_ROOT'], 'verified').touch()
 sys.exit(0 if os.environ['SIGNATURE_VALID'] == '1' else 1)
 """)

@@ -1,6 +1,6 @@
 # Opaque public core
 
-This is kcirtapfromspace/opaque. Core libraries, the local broker/CLI/MCP server,
+This is opaque-dev/opaque. Core libraries, the local broker/CLI/MCP server,
 trusted approval verification, independent evidence inspection and local dashboard
 belong here. Core must build and operate without private source or enterprise credentials.
 Keep public protocols provider-neutral and independently consumable.

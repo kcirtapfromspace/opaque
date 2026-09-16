@@ -18,7 +18,7 @@ notices and resolves them against explicitly selected local enrollment. Opening
 a notice does not approve it. A reviewer chooses to open the full immutable
 document, confirms review and authenticates natively before an approval is signed.
 Rejecting native review can submit a signed rejection; dismissing the notice
-locally sends no decision. See the [installation and enrollment guide](https://github.com/kcirtapfromspace/opaque/blob/main/crates/opaque-approver/README.md).
+locally sends no decision. See the [installation and enrollment guide](https://github.com/opaque-dev/opaque/blob/main/crates/opaque-approver/README.md).
 The app displays expiry and separates decision acceptance from execution. A
 missing acknowledgment triggers a read-only receipt lookup, never another POST
 or an operation retry. Signed/notarized distribution and fresh-user native testing

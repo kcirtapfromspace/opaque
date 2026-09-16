@@ -12,7 +12,7 @@ without private source, organization services or enterprise credentials.
 | `opaque-federation-runtime` | Signed policy application, attestation, audit export and broker reporting | Retain tenant/broker binding and consumer-owned replay state where specified |
 | `opaque-web` | Local dashboard application and trusted view composition | Route private data through protected APIs; honor lock, cancellation and response generations |
 
-The [independent policy example](https://github.com/kcirtapfromspace/opaque/tree/main/examples/embedded-policy) is a
+The [independent policy example](https://github.com/opaque-dev/opaque/tree/main/examples/embedded-policy) is a
 separate Cargo project. It demonstrates library consumption without private
 dependencies. Fleet wire verification also has a standalone example under
 `crates/opaque-federation-runtime/examples/`.
