@@ -88,7 +88,7 @@ and we would rather you know now.
    the exact commit they describe, so what you read is what you audit.
 
 Steps 2 and 3 are scripted, with no external accounts, in the
-[Harborlight quickstart](https://github.com/kcirtapfromspace/harborlight).
+[Harborlight quickstart](https://github.com/opaque-dev/harborlight).
 Its CI runs the same falsification weekly against the released package.
 
 ## Where to go next
