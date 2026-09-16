@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   qualify:
-    if: ${{ github.repository == 'kcirtapfromspace/opaque' && github.event.repository.private == false }}
+    if: ${{ github.repository == 'opaque-dev/opaque' && github.event.repository.private == false }}
     name: Qualify tagged source (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -33,7 +33,7 @@ jobs:
   build:
     needs: qualify
     # Release/signing automation belongs to the public product repository only.
-    if: ${{ github.repository == 'kcirtapfromspace/opaque' && github.event.repository.private == false }}
+    if: ${{ github.repository == 'opaque-dev/opaque' && github.event.repository.private == false }}
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -208,7 +208,7 @@ jobs:
             ${{ steps.tarball.outputs.archive }}.sha256
 
   release:
-    if: ${{ github.repository == 'kcirtapfromspace/opaque' && github.event.repository.private == false }}
+    if: ${{ github.repository == 'opaque-dev/opaque' && github.event.repository.private == false }}
     name: Create release
     needs: build
     runs-on: ubuntu-latest

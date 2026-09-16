@@ -4,29 +4,29 @@
 # Homebrew formula for Opaque — approval-gated secrets broker for AI coding tools
 class Opaque < Formula
   desc "Approval-gated secrets broker for AI coding tools"
-  homepage "https://github.com/kcirtapfromspace/opaque"
+  homepage "https://github.com/opaque-dev/opaque"
   license "BUSL-1.1"
 
   on_macos do
     on_arm do
-      url "https://github.com/kcirtapfromspace/opaque/releases/download/v0.4.0/opaque-0.4.0-aarch64-apple-darwin.tar.gz"
+      url "https://github.com/opaque-dev/opaque/releases/download/v0.4.0/opaque-0.4.0-aarch64-apple-darwin.tar.gz"
       sha256 "238e9a02e9ffff7d4525d57cb879558fae407f220b8ddb491d99f3632cef4d1d"
     end
 
     on_intel do
-      url "https://github.com/kcirtapfromspace/opaque/releases/download/v0.4.0/opaque-0.4.0-x86_64-apple-darwin.tar.gz"
+      url "https://github.com/opaque-dev/opaque/releases/download/v0.4.0/opaque-0.4.0-x86_64-apple-darwin.tar.gz"
       sha256 "ab574420f0eda3955b18284fe2962074299c0bf258deb484ac4de6d7571278dd"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/kcirtapfromspace/opaque/releases/download/v0.4.0/opaque-0.4.0-aarch64-unknown-linux-gnu.tar.gz"
+      url "https://github.com/opaque-dev/opaque/releases/download/v0.4.0/opaque-0.4.0-aarch64-unknown-linux-gnu.tar.gz"
       sha256 "e09d4e91c48d35326695bc7dcb67def6810bd090d4af54dd90d4a083d272ce8b"
     end
 
     on_intel do
-      url "https://github.com/kcirtapfromspace/opaque/releases/download/v0.4.0/opaque-0.4.0-x86_64-unknown-linux-gnu.tar.gz"
+      url "https://github.com/opaque-dev/opaque/releases/download/v0.4.0/opaque-0.4.0-x86_64-unknown-linux-gnu.tar.gz"
       sha256 "063bb0bd8850e24c1e5730b975c08d831d8e9ab7ff0ece5fdae1f75d2d25ad9b"
     end
   end
@@ -52,7 +52,7 @@ class Opaque < Formula
       The trusted reviewer is available at:
         #{prefix}/Opaque Reviewer.app
       Follow its enrollment guide before reviewing work:
-        https://github.com/kcirtapfromspace/opaque/blob/main/crates/opaque-approver/README.md
+        https://github.com/opaque-dev/opaque/blob/main/crates/opaque-approver/README.md
       Installing the formula does not enroll a broker or register a notice handler.
     EOS
   end

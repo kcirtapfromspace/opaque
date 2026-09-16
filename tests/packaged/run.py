@@ -192,7 +192,7 @@ def acceptance(args):
         shim.write_text(f"#!{sys.executable}\n" + (Path(__file__).with_name("transport.py")).read_text())
         shim.chmod(0o755)
         request_log = scratch / "transport-requests.jsonl"
-        archive_url = f"https://github.com/kcirtapfromspace/opaque/releases/download/v{args.version}/opaque-{args.version}-{args.target}.tar.gz"
+        archive_url = f"https://github.com/opaque-dev/opaque/releases/download/v{args.version}/opaque-{args.version}-{args.target}.tar.gz"
         install_environment = {**environment, "PATH": f"{transport}:/usr/bin:/bin",
                                "OPAQUE_VERSION": args.version, "OPAQUE_INSTALL": str(prefix),
                                "OPAQUE_PACKAGED_ARCHIVE": str(archive_copy), "OPAQUE_PACKAGED_URL": archive_url,

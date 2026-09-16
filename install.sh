@@ -1,6 +1,6 @@
 #!/bin/sh
 # install.sh — download and install Opaque binaries
-# Usage: curl -fsSL https://raw.githubusercontent.com/kcirtapfromspace/opaque/main/install.sh | sh
+# Usage: curl -fsSL https://raw.githubusercontent.com/opaque-dev/opaque/main/install.sh | sh
 #   or:  sh install.sh [--no-verify]
 #
 # Flags:
@@ -15,7 +15,7 @@
 #   GITHUB_TOKEN     — optional, for private repos or rate-limited API calls
 set -eu
 
-REPO="kcirtapfromspace/opaque"
+REPO="opaque-dev/opaque"
 INSTALL_DIR="${OPAQUE_INSTALL:-/usr/local/bin}"
 BINARIES="opaqued opaque opaque-mcp opaque-mcp-contract opaque-approve-helper opaque-approver opaque-evidence opaque-web"
 NO_VERIFY=0
@@ -265,10 +265,15 @@ verify_cosign_signature() {
             || die "signature certificate unavailable; refusing cosign verification without it"
     fi
 
+    # Releases up to v0.4.0 were signed before the repository moved to the
+    # opaque-dev organization, so their certificates carry the old owner.
+    # Both owners are accepted; the tag in the identity still must match
+    # the requested version exactly.
+    version_re=$(printf '%s' "$version" | sed 's/\./\\./g')
     if cosign verify-blob \
         --signature "${dir}/${archive}.sig" \
         --certificate "${dir}/${archive}.pem" \
-        --certificate-identity "https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/v${version}" \
+        --certificate-identity-regexp "^https://github\\.com/(kcirtapfromspace|opaque-dev)/opaque/\\.github/workflows/release\\.yml@refs/tags/v${version_re}\$" \
         --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
         "${dir}/${archive}" 2>/dev/null; then
         printf 'Cosign signature verified.\n'

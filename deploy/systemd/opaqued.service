@@ -16,7 +16,7 @@
 
 [Unit]
 Description=Opaque secrets broker daemon (trust-domain enforced)
-Documentation=https://github.com/kcirtapfromspace/opaque
+Documentation=https://github.com/opaque-dev/opaque
 After=network.target
 
 [Service]

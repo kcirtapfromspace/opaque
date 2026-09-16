@@ -53,7 +53,7 @@ class PackagedAcceptanceTests(unittest.TestCase):
             archive, checksum = root / "archive", root / "checksum"
             archive.write_bytes(b"controlled transport unit bytes\x00\xff")
             checksum.write_bytes(b"controlled checksum unit bytes")
-            url = "https://github.com/kcirtapfromspace/opaque/releases/download/v0.3.0/opaque-0.3.0-target.tar.gz"
+            url = "https://github.com/opaque-dev/opaque/releases/download/v0.3.0/opaque-0.3.0-target.tar.gz"
             log, output = root / "requests", root / "download"
             environment = {"OPAQUE_PACKAGED_ARCHIVE": str(archive), "OPAQUE_PACKAGED_CHECKSUM": str(checksum),
                            "OPAQUE_PACKAGED_URL": url, "OPAQUE_PACKAGED_REQUESTS": str(log)}

@@ -47,7 +47,7 @@ jobs:
   deploy:
     # This inherited workflow publishes to the public product's Pages project.
     # Private dogfood publication requires a separate reviewed deployment.
-    if: ${{ github.repository == 'kcirtapfromspace/opaque' && github.event.repository.private == false }}
+    if: ${{ github.repository == 'opaque-dev/opaque' && github.event.repository.private == false }}
     runs-on: ubuntu-latest
     # Fork pull requests cannot read secrets; build them, skip the upload.
     env:

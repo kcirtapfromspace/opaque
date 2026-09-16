@@ -11,7 +11,7 @@ Thank you for your interest in contributing to Opaque.
 ## Getting Started
 
 ```bash
-git clone https://github.com/kcirtapfromspace/opaque.git
+git clone https://github.com/opaque-dev/opaque.git
 cd opaque
 cargo build --workspace
 cargo test --workspace
@@ -121,7 +121,7 @@ It publishes to two places:
 | Target | Where | How |
 |---|---|---|
 | **opaque.info** (canonical) | Cloudflare Pages | `.github/workflows/deploy-site.yml` — Wrangler direct upload |
-| kcirtapfromspace.github.io/opaque | GitHub Pages | `.github/workflows/pages.yml` |
+| opaque-dev.github.io/opaque | GitHub Pages | `.github/workflows/pages.yml` |
 
 A push to `main` publishes production. Every other ref — including a pull
 request — publishes a **preview** at its own URL, so a landing-page change can

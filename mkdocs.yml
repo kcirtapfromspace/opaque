@@ -1,8 +1,8 @@
 site_name: Opaque
 site_description: Opaque runs sensitive operations for coding agents with policy, required human approval, broker-held credentials, and recorded outcomes.
 site_url: https://opaque.info/
-repo_url: https://github.com/kcirtapfromspace/opaque
-repo_name: kcirtapfromspace/opaque
+repo_url: https://github.com/opaque-dev/opaque
+repo_name: opaque-dev/opaque
 docs_dir: docs
 exclude_docs: |
   README.md
@@ -79,7 +79,7 @@ extra_css:
 extra:
   social:
     - icon: fontawesome/brands/github
-      link: https://github.com/kcirtapfromspace/opaque
+      link: https://github.com/opaque-dev/opaque
 
 copyright: "Copyright &copy; 2026 Patrick Deutsch"
 

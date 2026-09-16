@@ -404,7 +404,7 @@ fn generate_service_file(opaqued_path: &Path) -> String {
     format!(
         r#"[Unit]
 Description=Opaque Daemon
-Documentation=https://github.com/kcirtapfromspace/opaque
+Documentation=https://github.com/opaque-dev/opaque
 After=graphical-session.target
 
 [Service]

@@ -13,7 +13,7 @@ name: Update Homebrew tap
 #
 # Needs a repo secret HOMEBREW_TAP_TOKEN: a fine-grained PAT with Contents:
 # Read and write, scoped to at least kcirtapfromspace/homebrew-tap (adding
-# kcirtapfromspace/opaque too keeps `gh release download` on the same token).
+# opaque-dev/opaque too keeps `gh release download` on the same token).
 # The default GITHUB_TOKEN cannot write to a different repository.
 
 on:
@@ -30,7 +30,7 @@ permissions:
 
 jobs:
   update-tap:
-    if: ${{ github.repository == 'kcirtapfromspace/opaque' && github.event.repository.private == false }}
+    if: ${{ github.repository == 'opaque-dev/opaque' && github.event.repository.private == false }}
     name: Sync tap formula
     runs-on: ubuntu-latest
     steps:
