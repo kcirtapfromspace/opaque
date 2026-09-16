@@ -58,7 +58,7 @@ logged. See [evidence verification](docs/evidence-checkpoints.md).
 macOS and Linux are supported. For the published Homebrew package:
 
 ```sh
-brew install kcirtapfromspace/tap/opaque
+brew install opaque-dev/tap/opaque
 ```
 
 The workstation reviewer app, signed MCP v2 contracts, and portable evidence

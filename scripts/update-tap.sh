@@ -11,13 +11,13 @@
 #   scripts/update-tap.sh v0.2.0 --push
 #
 # --push also syncs the formula into the tap repository, which is what
-# `brew install kcirtapfromspace/tap/opaque` actually reads.
+# `brew install opaque-dev/tap/opaque` actually reads.
 
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-TAP_REPO="${OPAQUE_TAP_REPO:-kcirtapfromspace/homebrew-tap}"
+TAP_REPO="${OPAQUE_TAP_REPO:-opaque-dev/homebrew-tap}"
 FORMULA="homebrew/opaque.rb"
 TARGETS=(
   aarch64-apple-darwin

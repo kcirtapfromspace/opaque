@@ -34,7 +34,7 @@ existing installation to the current source writer, follow the
 === "macOS (Homebrew)"
 
     ```sh
-    brew install kcirtapfromspace/tap/opaque
+    brew install opaque-dev/tap/opaque
     ```
 
 === "Linux / macOS (script)"
