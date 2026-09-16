@@ -11,7 +11,6 @@ exclude_docs: |
   dogfood.md
   release-dogfood.md
   tenant-boundaries.md
-  compliance/**
 
 theme:
   name: material
@@ -97,6 +96,13 @@ nav:
       - Evidence Verification: evidence-checkpoints.md
       - Bounded Tasks: bounded-work.md
       - Workload Attestation: workload-attestation.md
+  - Evaluate:
+      - Evaluation Guide: evaluation-guide.md
+      - Control Mapping: compliance/control-mapping.md
+      - Hardening Guide: compliance/hardening.md
+      - FIPS Assessment: compliance/fips-assessment.md
+      - Verifying Releases: compliance/verifying-releases.md
+      - Certification Roadmap: compliance/certification-roadmap.md
   - Reference:
       - Configuration:
           - Policy: policy.md
