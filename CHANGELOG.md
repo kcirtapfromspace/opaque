@@ -9,6 +9,36 @@ notes; `scripts/release-prep.sh` stamps the section below at release time.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-16
+
+### Added
+
+- The Harborlight quickstart, a public companion repository at
+  `opaque-dev/harborlight`: four acts against the released package with no
+  external accounts, verified in its own CI on Linux and macOS. The README and
+  the evaluation guide link it.
+
+### Changed
+
+- The repositories moved to the `opaque-dev` GitHub organization, and the
+  Homebrew tap moved with them: `brew install opaque-dev/tap/opaque`. Every
+  workflow guard, documentation link, badge, package metadata field and the
+  systemd unit `Documentation=` URL the CLI generates now name the
+  organization. Release publishing had been silently skipped by the old
+  owner-pinned guards after the transfer; this release is the first cut under
+  the new owner.
+- Release verification spans both signing eras. Certificates for tags up to
+  v0.4.0 name `kcirtapfromspace/opaque`; this release and later ones name
+  `opaque-dev/opaque`. `install.sh` and
+  `docs/compliance/verifying-releases.md` accept exactly those two workflow
+  identities, and the docs state which owner signed which versions.
+
+### Fixed
+
+- `install.sh` no longer aborts cosign verification of a release signed under
+  the new organization; the identity check is an anchored regexp over the two
+  known owners with the version still pinned.
+
 ## [0.4.0] - 2026-09-14
 
 ### Added
