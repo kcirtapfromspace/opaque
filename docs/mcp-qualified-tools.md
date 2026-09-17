@@ -82,9 +82,9 @@ the upstream schema. `prepare` validates one concrete input against both schemas
 The synthetic fixtures demonstrate a GitHub-style comment schema containing
 unbounded strings, descriptions and an upstream number with stricter admitted input:
 
-- [Registry v2](https://github.com/kcirtapfromspace/opaque/blob/main/crates/opaque-mcp/tests/fixtures/gateway-registry-v2.json)
-- [Catalog](https://github.com/kcirtapfromspace/opaque/blob/main/crates/opaque-mcp/tests/fixtures/gateway-catalog-v2.json)
-- [Bounded call](https://github.com/kcirtapfromspace/opaque/blob/main/crates/opaque-mcp/tests/fixtures/gateway-call-v2.json)
+- [Registry v2](https://github.com/opaque-dev/opaque/blob/main/crates/opaque-mcp/tests/fixtures/gateway-registry-v2.json)
+- [Catalog](https://github.com/opaque-dev/opaque/blob/main/crates/opaque-mcp/tests/fixtures/gateway-catalog-v2.json)
+- [Bounded call](https://github.com/opaque-dev/opaque/blob/main/crates/opaque-mcp/tests/fixtures/gateway-call-v2.json)
 
 These are illustrative source-shape fixtures at `mcp.example.com`. They are not
 captured GitHub schemas or a ready-to-run GitHub integration. In particular, a real

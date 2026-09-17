@@ -35,10 +35,15 @@ than a long-lived private key. Verify the tarball:
 cosign verify-blob \
   --certificate opaque-0.3.0-x86_64-unknown-linux-gnu.tar.gz.pem \
   --signature   opaque-0.3.0-x86_64-unknown-linux-gnu.tar.gz.sig \
-  --certificate-identity-regexp 'https://github\.com/kcirtapfromspace/opaque/\.github/workflows/release\.yml@.*' \
+  --certificate-identity-regexp 'https://github\.com/(kcirtapfromspace|opaque-dev)/opaque/\.github/workflows/release\.yml@.*' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   opaque-0.3.0-x86_64-unknown-linux-gnu.tar.gz
 ```
+
+Releases up to and including v0.4.0 were signed before the repository moved
+to the `opaque-dev` organization, so their certificates name
+`kcirtapfromspace/opaque`; later releases name `opaque-dev/opaque`. The
+pattern above accepts exactly those two owners and nothing else.
 
 Verify the CycloneDX SBOM the same way, pointing at its own `.sig`/`.pem`
 pair:
@@ -47,7 +52,7 @@ pair:
 cosign verify-blob \
   --certificate opaque-0.3.0-opaque.cdx.json.pem \
   --signature   opaque-0.3.0-opaque.cdx.json.sig \
-  --certificate-identity-regexp 'https://github\.com/kcirtapfromspace/opaque/\.github/workflows/release\.yml@.*' \
+  --certificate-identity-regexp 'https://github\.com/(kcirtapfromspace|opaque-dev)/opaque/\.github/workflows/release\.yml@.*' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   opaque-0.3.0-opaque.cdx.json
 ```
@@ -73,14 +78,14 @@ directly:
 
 ```sh
 gh attestation verify opaque-0.3.0-x86_64-unknown-linux-gnu.tar.gz \
-  --repo kcirtapfromspace/opaque
+  --repo opaque-dev/opaque
 ```
 
 This checks a `https://slsa.dev/provenance/v1` predicate by default and
 confirms both the artifact's digest and the identity of the workflow that
 built it, giving you the commit-level linkage the signature check alone
 does not. It requires `gh` to reach the GitHub API (`gh auth status` should
-already be set up, or use `--owner kcirtapfromspace` in place of `--repo` if
+already be set up, or use `--owner opaque-dev` in place of `--repo` if
 you would rather not pin the exact repository name); offline verification
 against a locally downloaded attestation bundle is also available, see `gh
 attestation verify --help`.

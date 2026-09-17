@@ -201,6 +201,6 @@ hardware measurement of the running binary.
 > daemon and key holder remain trusted to report honestly. A compromised daemon
 > or signing key can produce false posture claims that pass signature checks.
 
-Inspect the [report format and verification tests](https://github.com/kcirtapfromspace/opaque/blob/83e7924960f809e87379a54996317dbe1422fe70/crates/opaque-core/src/attest.rs)
-and [posture observation and key-release client](https://github.com/kcirtapfromspace/opaque/blob/83e7924960f809e87379a54996317dbe1422fe70/crates/opaque-federation-runtime/src/attest.rs).
+Inspect the [report format and verification tests](https://github.com/opaque-dev/opaque/blob/83e7924960f809e87379a54996317dbe1422fe70/crates/opaque-core/src/attest.rs)
+and [posture observation and key-release client](https://github.com/opaque-dev/opaque/blob/83e7924960f809e87379a54996317dbe1422fe70/crates/opaque-federation-runtime/src/attest.rs).
 These source references describe implementation, not an independent security audit.

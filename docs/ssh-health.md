@@ -10,7 +10,7 @@ opaque task show TASK_ID_FROM_PLAN
 ```
 
 This source implementation requires a release containing the configurable SSH
-health contract and the [Linux host package](https://github.com/kcirtapfromspace/opaque/tree/main/packaging/ssh-host).
+health contract and the [Linux host package](https://github.com/opaque-dev/opaque/tree/main/packaging/ssh-host).
 The broker and host require separate deployment. Local tests establish protocol
 behavior; they do not establish qualification on your Vault/OpenSSH deployment.
 

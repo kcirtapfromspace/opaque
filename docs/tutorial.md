@@ -34,19 +34,19 @@ existing installation to the current source writer, follow the
 === "macOS (Homebrew)"
 
     ```sh
-    brew install kcirtapfromspace/tap/opaque
+    brew install opaque-dev/tap/opaque
     ```
 
 === "Linux / macOS (script)"
 
     ```sh
-    curl -sSfL https://raw.githubusercontent.com/kcirtapfromspace/opaque/main/install.sh | sh
+    curl -sSfL https://raw.githubusercontent.com/opaque-dev/opaque/main/install.sh | sh
     ```
 
 === "From source"
 
     ```sh
-    cargo install --locked --git https://github.com/kcirtapfromspace/opaque.git opaque opaqued opaque-mcp opaque-approve-helper
+    cargo install --locked --git https://github.com/opaque-dev/opaque.git opaque opaqued opaque-mcp opaque-approve-helper
     ```
 
 Check the installed version and binary paths:

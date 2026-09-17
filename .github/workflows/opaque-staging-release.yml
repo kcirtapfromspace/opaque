@@ -35,7 +35,7 @@ concurrency:
 jobs:
   staging-artifact:
     # Refuse the public upstream, another repository, or a visibility change.
-    if: ${{ github.repository == 'kcirtapfromspace/opaque-dogfood' && github.repository_id == '1357845081' && github.event.repository.private == true }}
+    if: ${{ github.repository == 'opaque-dev/opaque-dogfood' && github.repository_id == '1357845081' && github.event.repository.private == true }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: staging
@@ -57,9 +57,13 @@ jobs:
           test "$GITHUB_EVENT_NAME" = workflow_dispatch
           test "$GITHUB_RUN_ATTEMPT" = 1
           test "$OBSERVED_REPOSITORY_ID" = 1357845081
-          test "$GITHUB_REPOSITORY" = kcirtapfromspace/opaque-dogfood
+          test "$GITHUB_REPOSITORY" = opaque-dev/opaque-dogfood
           test "$GITHUB_REF" = refs/heads/main
           test "$REQUESTED_ENVIRONMENT" = staging
+          # GHCR namespaces do not follow a repository transfer: existing
+          # packages stay under the kcirtapfromspace account. Update this
+          # pin only when the packages themselves are republished under
+          # ghcr.io/opaque-dev.
           test "$IMAGE_REPOSITORY" = ghcr.io/kcirtapfromspace/opaque-dogfood
           [[ "$OPAQUE_TASK_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
           [[ "$OPAQUE_MANIFEST_DIGEST" =~ ^[0-9a-f]{64}$ ]]

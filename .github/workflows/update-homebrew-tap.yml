@@ -1,6 +1,6 @@
 name: Update Homebrew tap
 
-# Keeps kcirtapfromspace/homebrew-tap pointed at the latest published release.
+# Keeps opaque-dev/homebrew-tap pointed at the latest published release.
 # release.yml never touches the tap — a formula may only name assets that
 # already exist, so this runs after the fact, triggered by the release it
 # points at. scripts/update-tap.sh does the actual work (download every
@@ -12,9 +12,12 @@ name: Update Homebrew tap
 # without cutting a release, e.g. after fixing a bad push.
 #
 # Needs a repo secret HOMEBREW_TAP_TOKEN: a fine-grained PAT with Contents:
-# Read and write, scoped to at least kcirtapfromspace/homebrew-tap (adding
-# kcirtapfromspace/opaque too keeps `gh release download` on the same token).
+# Read and write, scoped to at least opaque-dev/homebrew-tap (adding
+# opaque-dev/opaque too keeps `gh release download` on the same token).
 # The default GITHUB_TOKEN cannot write to a different repository.
+# Since the repos moved to the opaque-dev org, the PAT must be minted with
+# opaque-dev as its resource owner; a personal-account PAT cannot reach
+# org repositories.
 
 on:
   release:
@@ -30,7 +33,7 @@ permissions:
 
 jobs:
   update-tap:
-    if: ${{ github.repository == 'kcirtapfromspace/opaque' && github.event.repository.private == false }}
+    if: ${{ github.repository == 'opaque-dev/opaque' && github.event.repository.private == false }}
     name: Sync tap formula
     runs-on: ubuntu-latest
     steps:

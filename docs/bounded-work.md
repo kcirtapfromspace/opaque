@@ -54,7 +54,7 @@ inference manifests. SSH health manifests require local native review; selecting
 paired-workstation policy does not add that operation to the remote protocol.
 
 Set `factors = ["paired_workstation"]` in the applicable approval policies to use
-the [trusted workstation reviewer](https://github.com/kcirtapfromspace/opaque/blob/main/crates/opaque-approver/README.md).
+the [trusted workstation reviewer](https://github.com/opaque-dev/opaque/blob/main/crates/opaque-approver/README.md).
 It fetches the complete broker-generated review over pinned TLS, verifies its hash
 and deadline, displays it for native review/authentication, rechecks the unchanged
 round and signs the exact decision. Run its custody and application in a trusted
@@ -146,6 +146,6 @@ fenced authority recovery remain separate responsibilities.
 ## Related docs
 
 - [Identity](identity.md): the delegation token an agent session presents when planning a task on a human's behalf
-- [Trusted workstation approvals](https://github.com/kcirtapfromspace/opaque/blob/main/crates/opaque-approver/README.md): installation, enrollment and the `paired_workstation` full-manifest review flow
+- [Trusted workstation approvals](https://github.com/opaque-dev/opaque/blob/main/crates/opaque-approver/README.md): installation, enrollment and the `paired_workstation` full-manifest review flow
 - [HashiCorp Vault](vault.md): the SSH certificate signer for `SshHealth` actions
 - [Enterprise architecture](enterprise-architecture.md): tenant/IdP wiring for `Inference` actions
